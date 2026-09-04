@@ -21,9 +21,11 @@ CONTROL_NAME_TERMS = (
     "agent",
     "peer",
     "a2a",
+    "parent",
     "child",
     "descendant",
     "delegate",
+    "control",
     "task",
     "cancel",
     "interrupt",
@@ -107,7 +109,7 @@ INDIRECT_DISPATCH_CALLS = {
 }
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/"
-    r"(?:server\.py::[^`]+|(?:features|host_features|endpoints)/[^`]+))`\s*\|"
+    r"(?:server\.py::[^`]+|(?:agent|features|host_features|endpoints)/[^`]+))`\s*\|"
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
@@ -378,6 +380,38 @@ def _discovered_runtime_generated_tool_surfaces() -> set[str]:
             tree.body,
             path.relative_to(REPO_ROOT).as_posix(),
         )
+
+    # Non-feature providers such as MCP register arbitrary runtime names in
+    # ``_direct_tools``.  Their concrete names cannot be recovered from the
+    # core checkout, so inventory the registration and both governed execution
+    # doors that can reach them.  Keep these explicit expected boundaries in
+    # the discovery result: renaming or moving any one fails the exact-set
+    # contract instead of silently shrinking its coverage.
+    dynamic_boundaries = {
+        REPO_ROOT / "kestrel_sovereign/agent/tool_registry.py": {
+            "register_dynamic_tools",
+        },
+        REPO_ROOT / "kestrel_sovereign/agent/orchestrator_engine.py": {
+            "execute_named_tool",
+            "_dispatch_direct_tool",
+        },
+    }
+    for path, names in dynamic_boundaries.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        discovered_names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in names
+        }
+        missing = names - discovered_names
+        if missing:
+            raise AssertionError(
+                f"Missing dynamic-tool boundary in {path.relative_to(REPO_ROOT)}: "
+                + ", ".join(sorted(missing))
+            )
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        surfaces.update(f"{relative}::{name}" for name in discovered_names)
     return surfaces
 
 
@@ -398,6 +432,39 @@ def _discovered_builtin_command_surfaces() -> set[str]:
     return surfaces
 
 
+def _core_cli_command_names(
+    tree: ast.Module,
+    string_constants: dict[str, str],
+) -> set[str]:
+    """Resolve the canonical dispatch dictionary without dropping keys."""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "commands"
+            for target in node.targets
+        ):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            raise AssertionError("Core CLI commands assignment is not a dictionary")
+        command_names: set[str] = set()
+        for key in node.value.keys:
+            if key is None:
+                raise AssertionError(
+                    "Core CLI command dispatch uses unresolved dictionary unpacking"
+                )
+            command = _resolved_string(key, string_constants)
+            if command is None:
+                raise AssertionError(
+                    "Unresolved core CLI command key expression: "
+                    f"{ast.unparse(key)}"
+                )
+            command_names.add(command)
+        return command_names
+    raise AssertionError("Could not find the core CLI command dispatch dictionary")
+
+
 def _discovered_core_cli_surfaces() -> set[str]:
     """Return every command dispatched by the canonical core CLI.
 
@@ -411,26 +478,69 @@ def _discovered_core_cli_surfaces() -> set[str]:
 
     cli_path = REPO_ROOT / "kestrel_sovereign/cli.py"
     tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "commands"
-            for target in node.targets
-        ):
-            continue
-        if not isinstance(node.value, ast.Dict):
-            continue
-        command_names = {
-            str(key.value)
-            for key in node.value.keys
-            if isinstance(key, ast.Constant) and isinstance(key.value, str)
-        }
-        return {
-            f"kestrel_sovereign/cli.py::kestrel {command}"
-            for command in command_names
-        }
-    raise AssertionError("Could not find the core CLI command dispatch dictionary")
+    string_constants = _module_string_constants(tree, cli_path)
+    return {
+        f"kestrel_sovereign/cli.py::kestrel {command}"
+        for command in _core_cli_command_names(tree, string_constants)
+    }
+
+
+def _discovered_dynamic_router_surfaces() -> set[str]:
+    """Return every function-scoped ``include_router`` extension boundary.
+
+    Decorators in out-of-tree agent and host features are unavailable to a
+    checkout-only scanner.  Their core publication calls are available, so an
+    exact inventory of those runtime calls is the fail-closed boundary.  Calls
+    at module scope mount checked-in routers whose decorators are already
+    enumerated by the HTTP inventory and are intentionally excluded here.
+    """
+
+    surfaces: set[str] = set()
+
+    class IncludeRouterVisitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.scope: list[str] = []
+            self.scope_counts: list[int] = []
+
+        def _visit_scope(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            self.scope.append(node.name)
+            self.scope_counts.append(0)
+            for statement in node.body:
+                self.visit(statement)
+            self.scope_counts.pop()
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_scope(node)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_scope(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self.scope.append(node.name)
+            for statement in node.body:
+                self.visit(statement)
+            self.scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            if self.scope_counts and _call_name(node) == "include_router":
+                ordinal = self.scope_counts[-1]
+                self.scope_counts[-1] += 1
+                qualified = ".".join(self.scope)
+                surfaces.add(
+                    f"{self.relative}::{qualified}.include_router[{ordinal}]"
+                )
+            self.generic_visit(node)
+
+    for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        IncludeRouterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
+    return surfaces
 
 
 def _router_prefix(
@@ -968,6 +1078,10 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
     """Runtime-generated names must not evade the exact tool inventory."""
 
     expected = {
+        "kestrel_sovereign/agent/orchestrator_engine.py::"
+        "_dispatch_direct_tool",
+        "kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool",
+        "kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools",
         "kestrel_sovereign/features/base.py::"
         "Feature.get_tools.DynamicTool.execute",
         "kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool",
@@ -987,6 +1101,21 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
         and _call_name(node) == "to_orchestrator_tool"
         for node in ast.walk(registry_tree)
     ), "The classified high-level Feature tool must remain wired into registration"
+
+
+def test_every_dynamic_router_publication_boundary_is_classified() -> None:
+    expected = {
+        "kestrel_sovereign/host_features/runtime.py::"
+        "mount_host_feature_routers.include_router[0]",
+        "kestrel_sovereign/server.py::"
+        "_mount_feature_routers._collect_routers_from_agent.include_router[0]",
+        "kestrel_sovereign/server.py::"
+        "_mount_feature_routers.include_router[0]",
+    }
+    assert _discovered_dynamic_router_surfaces() == expected
+    assert expected == _documented_surfaces(
+        "## Machine-checked dynamic router boundary inventory"
+    )
 
 
 def test_relation_free_control_names_are_still_discovered() -> None:
@@ -1026,6 +1155,31 @@ def test_core_cli_agent_and_fleet_controls_are_discovered() -> None:
     discovered = _discovered_core_cli_surfaces()
     for command in ("ask", "create", "terminate", "restart", "update"):
         assert f"kestrel_sovereign/cli.py::kestrel {command}" in discovered
+
+
+def test_core_cli_command_keys_resolve_constants_and_fail_closed() -> None:
+    resolved = ast.parse(
+        '_CONTROL = "restart"\n'
+        "def dispatch():\n"
+        "    commands = {_CONTROL: restart_agent}\n"
+    )
+    assert _core_cli_command_names(
+        resolved, _module_string_constants(resolved)
+    ) == {"restart"}
+
+    unresolved = ast.parse(
+        "def dispatch():\n"
+        "    commands = {make_command_name(): restart_agent}\n"
+    )
+    with pytest.raises(AssertionError, match="Unresolved core CLI command key"):
+        _core_cli_command_names(unresolved, {})
+
+    unpacked = ast.parse(
+        "def dispatch():\n"
+        "    commands = {**extension_commands}\n"
+    )
+    with pytest.raises(AssertionError, match="unresolved dictionary unpacking"):
+        _core_cli_command_names(unpacked, {})
 
 
 def test_every_cross_agent_http_route_is_classified() -> None:
@@ -1556,6 +1710,38 @@ def _identifier_tokens(node: ast.AST) -> set[str]:
     return tokens
 
 
+def _walk_lexical_scope(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    """Walk one function body without borrowing nested-scope semantics."""
+
+    nodes: list[ast.AST] = []
+
+    class ScopeVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+        def generic_visit(self, node: ast.AST) -> None:
+            nodes.append(node)
+            super().generic_visit(node)
+
+    visitor = ScopeVisitor()
+    for statement in function.body:
+        visitor.visit(statement)
+    return nodes
+
+
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
     tokens = _identifier_tokens(node)
     provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
@@ -1601,6 +1787,8 @@ def _provenance_aliases(
         ):
             return _has_provenance_token(value, aliases)
         if isinstance(value, ast.Call) and _call_name(value) in {
+            "all",
+            "any",
             "bool",
             "copy",
             "deepcopy",
@@ -1667,7 +1855,7 @@ def _provenance_aliases(
 
     aliases: set[str] = set()
     assignments: list[tuple[set[str], ast.AST]] = []
-    for node in ast.walk(function):
+    for node in _walk_lexical_scope(function):
         targets: list[ast.AST] = []
         value: ast.AST | None = None
         if isinstance(node, ast.Assign):
@@ -1692,9 +1880,14 @@ def _provenance_aliases(
     while changed:
         changed = False
         for names, value in assignments:
-            if is_provenance_derived(value, aliases) and not names.issubset(
-                aliases
-            ):
+            permission_shaped_target = any(
+                _is_permission_name(name) for name in names
+            )
+            derived = is_provenance_derived(value, aliases) or (
+                permission_shaped_target
+                and _has_provenance_token(value, aliases)
+            )
+            if derived and not names.issubset(aliases):
                 aliases.update(names)
                 changed = True
     return aliases
@@ -1745,6 +1938,16 @@ def _contains_cross_agent_control_call(nodes: ast.AST | list[ast.AST]) -> bool:
     return False
 
 
+def _is_cross_agent_control_reference(node: ast.AST) -> bool:
+    """Whether an expression selects a control callable without invoking it."""
+
+    if isinstance(node, ast.Name):
+        return _is_cross_agent_control_name(node.id)
+    if isinstance(node, ast.Attribute):
+        return _is_cross_agent_control_name(node.attr)
+    return False
+
+
 def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     lines: set[int] = set()
     functions = [
@@ -1760,7 +1963,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             or function_name.startswith(("can_", "may_"))
             or _is_cross_agent_control_name(function_name)
         )
-        for node in ast.walk(function):
+        for node in _walk_lexical_scope(function):
             if isinstance(node, ast.Call):
                 function_tokens = _identifier_tokens(node.func)
                 is_permission_call = any(
@@ -1840,10 +2043,15 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 guarded_nodes.extend([*node.body, *node.orelse])
             elif isinstance(node, ast.IfExp):
                 guarded_nodes.extend([node.body, node.orelse])
+            selects_control = isinstance(node, ast.IfExp) and any(
+                _is_cross_agent_control_reference(branch)
+                for branch in (node.body, node.orelse)
+            )
             if has_provenance and (
                 has_permission
                 or function_is_permission_boundary
                 or _contains_cross_agent_control_call(guarded_nodes)
+                or selects_control
             ):
                 lines.add(node.lineno)
     return lines
@@ -2039,6 +2247,67 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(stateful_aliases) == {3, 8}
     assert _authority_provenance_lines(loop_aliases) == {2, 3, 7, 8}
     assert _authority_provenance_lines(propagation_only_loop) == set()
+
+
+def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> None:
+    authority_vocabulary = ast.parse(
+        "def control_runtime(request):\n"
+        "    if request.causation_chain:\n"
+        "        mutate_runtime()\n\n"
+        "def verify_parent(request):\n"
+        "    if request.orchestrator:\n"
+        "        mutate_runtime()\n"
+    )
+    boolean_reducers = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decision = any(\n"
+        "        frame.agent_id == target\n"
+        "        for frame in request.causation_chain\n"
+        "    )\n"
+        "    if decision:\n"
+        "        terminate_child(target)\n\n"
+        "def adapter(request, target):\n"
+        "    result = all(check(frame) for frame in request.orchestrator_frames)\n"
+        "    if not result:\n"
+        "        stop_peer(target)\n"
+    )
+    neutral_predicate = ast.parse(
+        "def dispatch(request, target):\n"
+        "    allowed = compare_lineage(request.causation_chain, target)\n"
+        "    if allowed:\n"
+        "        terminate_child(target)\n"
+    )
+    selected_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = (\n"
+        "        terminate_child if request.causation_chain else noop\n"
+        "    )\n"
+        "    callback(target)\n"
+    )
+
+    assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
+    assert _authority_provenance_lines(boolean_reducers) == {6, 11}
+    assert _authority_provenance_lines(neutral_predicate) == {2, 3}
+    assert _authority_provenance_lines(selected_callback) == {3}
+
+
+def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
+    propagation_only_nested_helper = ast.parse(
+        "def authorize_request(request):\n"
+        "    def serialize_context():\n"
+        "        return request.causation_chain\n"
+        "    return serialize_context\n"
+    )
+    nested_authority = ast.parse(
+        "def adapter(request):\n"
+        "    def control_runtime():\n"
+        "        if request.causation_chain:\n"
+        "            mutate_runtime()\n"
+        "    return control_runtime\n"
+    )
+
+    assert _authority_provenance_lines(propagation_only_nested_helper) == set()
+    assert _authority_provenance_lines(nested_authority) == {3}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

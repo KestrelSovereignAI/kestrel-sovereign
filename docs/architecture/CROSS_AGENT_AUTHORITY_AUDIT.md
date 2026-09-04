@@ -101,21 +101,25 @@ machine-checked inventory below before shipping.
 
 The contract test discovers every core feature `@tool`, including tools that
 appear agent-local or external, plus every core runtime-generated `AgentTool`
-execution boundary and the generic `Feature.to_orchestrator_tool` registration
-boundary. Cross-agent capability is a property of the implementation and
-deployment, not a public-name convention: exact inventory of the complete
-registered set prevents a shared-host mutation from hiding behind an innocuous
-name. False positives remain explicitly classified. The inventory therefore
-also includes generic `execute_skill`, `execute_named_tool`, and
+execution boundary, the generic `Feature.to_orchestrator_tool` registration
+boundary, and the registration/execution boundaries for non-feature dynamic
+tools such as MCP tools. Cross-agent capability is a property of the
+implementation and deployment, not a public-name convention: exact inventory
+of the complete registered set prevents a shared-host mutation from hiding
+behind an innocuous name. False positives remain explicitly classified. The
+inventory therefore also includes generic `execute_skill`, `execute_named_tool`, and
 `_create_schedule` dispatchers; those meta-tools can reach an
 authority-bearing target even when their own names contain no relation or
-control words. Runtime-advertised isolated-feature names cannot be enumerated
-from the core checkout, so their single core forwarding boundary is classified
-here and each out-of-tree feature repository remains responsible for its own
-exact method inventory and target-specific authority.
+control words. Runtime-advertised provider names cannot be enumerated from the
+core checkout, so their core forwarding boundaries are classified here and
+each out-of-tree provider repository remains responsible for its own exact
+method inventory and target-specific authority.
 
 | Surface ID | Classification |
 |---|---|
+| `kestrel_sovereign/agent/orchestrator_engine.py::_dispatch_direct_tool` | Generic governed execution boundary for runtime-registered direct tools. PRE/POST_TOOL_USE and ordinary tool permission checks still apply, but the owning non-feature provider must inventory and enforce target-specific relation authority. |
+| `kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool` | Generic transport-neutral dispatcher that can resolve runtime-registered direct tools as well as feature tools. Dispatch supplies governance hooks, not relation authority; the selected tool retains its target-specific gate. |
+| `kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools` | Generic publication boundary for arbitrary runtime tool names, including MCP providers. The registry defaults unknown tools to ASK but cannot infer target authority; provider-owned controls require their own exact inventory and enforcement. |
 | `kestrel_sovereign/features/base.py::Feature.get_tools.DynamicTool.execute` | Generic runtime wrapper for the separately inventoried core `@tool` methods; it introduces no target authority and the wrapped method retains its target-specific gate. |
 | `kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool` | Generic high-level dispatcher registered once per visible feature, including `deploy_feature` and `restart_coordinator_feature`. PRE_SUBAGENT_CALL/PRE_TOOL_USE are operational consent gates, not relation authority; the selected downstream method retains its target-specific authority requirement and known defects #3223/#3148. |
 | `kestrel_sovereign/features/isolated_runtime.py::IsolatedFeatureTool.execute` | Generic forwarding boundary for runtime-advertised out-of-tree tools. Core preserves ordinary tool governance but cannot infer relation authority from child metadata; the owning feature must inventory and enforce every target-specific authority boundary. |
@@ -334,6 +338,21 @@ exact method inventory and target-specific authority.
 | `kestrel_sovereign/features/wellness/feature.py::wellness_check` | Caller runtime wellness state; no co-hosted-agent target. |
 | `kestrel_sovereign/features/wellness/feature.py::wellness_export` | Caller runtime wellness state; no co-hosted-agent target. |
 | `kestrel_sovereign/features/wellness/feature.py::wellness_history` | Caller runtime wellness state; no co-hosted-agent target. |
+
+## Machine-checked dynamic router boundary inventory
+
+Runtime-installed agent and host features can return routers whose decorators
+live outside this checkout. The contract therefore inventories every
+function-scoped `include_router` publication call in core. These generic doors
+do not grant relation authority: the contributed route must still bind a
+trusted principal and enforce its target-specific policy, and each out-of-tree
+provider remains responsible for its exact route inventory.
+
+| Surface ID | Classification |
+|---|---|
+| `kestrel_sovereign/host_features/runtime.py::mount_host_feature_routers.include_router[0]` | Generic host-feature router publication boundary. Host authentication and provider-owned target policy remain mandatory; mounting conveys no agent relation authority. |
+| `kestrel_sovereign/server.py::_mount_feature_routers._collect_routers_from_agent.include_router[0]` | Generic agent-feature router publication boundary. Core adds the feature-state gate, while the contributed handler retains authentication and target-authority responsibility. |
+| `kestrel_sovereign/server.py::_mount_feature_routers.include_router[0]` | Generic shared webhook-router publication boundary. Its live receiver selection and each receiver's configured source policy remain enforcement; mounting conveys no hierarchy authority. |
 
 ## Machine-checked built-in command inventory
 

@@ -226,6 +226,8 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/agent/orchestrator_engine.py",
+        "kestrel_sovereign/agent/tool_registry.py",
         "kestrel_sovereign/cli.py",
         "kestrel_sovereign/command_handler.py",
         "kestrel_sovereign/endpoints/agent.py",
