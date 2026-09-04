@@ -2105,6 +2105,54 @@ def test_routed_rasa_target_mismatch_is_recorded() -> None:
     assert "target binding" in row
 
 
+def test_shared_sovereignty_cache_reads_are_recorded_as_3225() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Browse sovereignty export cache |")
+    )
+    assert "Self for agent artifacts" in action_row
+    assert "sovereign/delegated" in action_row
+    assert "[#3225]" in action_row
+
+    for suffix in (
+        "api/sovereignty/files`",
+        "api/sovereignty/files/{filename}`",
+        "api/sovereignty/files/{filename}/preview`",
+    ):
+        row = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/sovereignty.py::GET " in line
+            and suffix in line
+        )
+        assert "D-3225" in row
+        assert "shared host export-cache" in row
+
+
+def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Inspect local IPFS node and pins |")
+    )
+    assert "Self for agent pins" in action_row
+    assert "sovereign/delegated" in action_row
+    assert "[#3226]" in action_row
+
+    row = next(
+        line
+        for line in audit.splitlines()
+        if "endpoints/models.py::GET "
+        "/api/agents/{selected_agent_name}/api/ipfs/status" in line
+    )
+    assert "D-3226" in row
+    assert "shared IPFS daemon" in row
+    assert "recursive pins" in row
+
+
 def _identifier_tokens(node: ast.AST) -> set[str]:
     tokens: set[str] = set()
     for child in ast.walk(node):
@@ -2284,10 +2332,22 @@ def _cross_agent_control_aliases(
     return aliases
 
 
+def _is_cross_agent_control_call(
+    node: ast.Call,
+    control_aliases: set[str] | None = None,
+) -> bool:
+    """Whether ``node`` invokes a known control or a local alias of one."""
+
+    call_name = _call_name(node).casefold()
+    return _is_cross_agent_control_name(call_name) or call_name in (
+        control_aliases or set()
+    )
+
+
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> set[str]:
-    """Resolve simple local aliases of provenance metadata to a fixed point."""
+) -> tuple[set[str], set[str]]:
+    """Resolve provenance aliases and provenance-selected control arguments."""
 
     def is_provenance_derived(value: ast.AST, aliases: set[str]) -> bool:
         # Awaiting a helper that merely *receives* causation metadata does not
@@ -2384,6 +2444,17 @@ def _provenance_aliases(
     aliases: set[str] = set()
     scope_nodes = _walk_lexical_scope(function)
     control_aliases = _cross_agent_control_aliases(function)
+    control_argument_names = {
+        token
+        for node in scope_nodes
+        if isinstance(node, ast.Call)
+        and _is_cross_agent_control_call(node, control_aliases)
+        for argument in [
+            *node.args,
+            *(keyword.value for keyword in node.keywords),
+        ]
+        for token in _identifier_tokens(argument)
+    }
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
     for node in scope_nodes:
         targets: list[ast.AST] = []
@@ -2403,6 +2474,19 @@ def _provenance_aliases(
         if value is None:
             continue
         names = {name for target in targets for name in target_names(target)}
+        # A provenance-selected member of a container passed to a control call
+        # can choose the target through ``**kwargs`` or a structured argument.
+        # Taint that container only when it is actually an argument at this
+        # control boundary; do not broadly taint every ``state``/``self`` base.
+        names.update(
+            control_name
+            for control_name in control_argument_names
+            if any(
+                name.startswith(f"{control_name}.")
+                or name.startswith(f"{control_name}[")
+                for name in names
+            )
+        )
         if names:
             assignments.append((names, value, node))
 
@@ -2411,7 +2495,13 @@ def _provenance_aliases(
     # then walk local assignment dependencies backwards. Merely passing
     # causation metadata to a helper remains propagation unless its result
     # reaches such a control gate.
-    authority_decision_names: set[str] = set()
+    assignment_names = {
+        name for names, _value, _node in assignments for name in names
+    }
+    authority_target_names = assignment_names.intersection(
+        control_argument_names
+    )
+    authority_decision_names: set[str] = set(authority_target_names)
     for node in scope_nodes:
         guarded: list[ast.AST] = []
         decision_expression: ast.AST | None = None
@@ -2468,9 +2558,16 @@ def _provenance_aliases(
     # Guard clauses and assertions govern the statements that follow them,
     # rather than a syntactically nested branch. Mark their conditions as
     # authority decisions before walking assignment dependencies backwards.
-    def collect_guard_decisions(statements: list[ast.stmt]) -> None:
+    def collect_guard_decisions(
+        statements: list[ast.stmt],
+        enclosing_continuation: list[ast.stmt] | None = None,
+    ) -> None:
+        enclosing_continuation = enclosing_continuation or []
         for index, statement in enumerate(statements):
-            continuation = statements[index + 1 :]
+            continuation = [
+                *statements[index + 1 :],
+                *enclosing_continuation,
+            ]
             if continuation and _contains_cross_agent_control_call(
                 continuation, control_aliases
             ):
@@ -2485,14 +2582,16 @@ def _provenance_aliases(
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
                     )
+            child_continuation = (
+                []
+                if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
+                else continuation
+            )
             for block in _child_statement_blocks(statement):
-                collect_guard_decisions(block)
+                collect_guard_decisions(block, child_continuation)
 
     collect_guard_decisions(function.body)
 
-    assignment_names = {
-        name for names, _value, _node in assignments for name in names
-    }
     changed = True
     while changed:
         changed = False
@@ -2557,9 +2656,13 @@ def _provenance_aliases(
         return selected
 
     changed = True
+    provenance_selected_targets: set[str] = set()
     while changed:
         changed = False
         selected_decisions = provenance_selected_decisions(function.body)
+        provenance_selected_targets.update(
+            selected_decisions.intersection(authority_target_names)
+        )
         new_selected = selected_decisions - aliases
         if new_selected:
             aliases.update(new_selected)
@@ -2568,17 +2671,26 @@ def _provenance_aliases(
             permission_shaped_target = any(
                 _is_permission_name(name) for name in names
             )
+            target_names = names.intersection(authority_target_names)
+            target_derived = bool(target_names) and is_provenance_derived(
+                value, aliases
+            )
+            guard_decision_names = names.intersection(
+                authority_decision_names - authority_target_names
+            )
             derived = is_provenance_derived(value, aliases) or (
                 (
                     permission_shaped_target
-                    or bool(names.intersection(authority_decision_names))
+                    or bool(guard_decision_names)
                 )
                 and _has_provenance_token(value, aliases)
             )
+            if target_derived:
+                provenance_selected_targets.update(target_names)
             if derived and not names.issubset(aliases):
                 aliases.update(names)
                 changed = True
-    return aliases
+    return aliases, provenance_selected_targets
 
 
 def _contains_cross_agent_control_call(
@@ -2612,10 +2724,7 @@ def _contains_cross_agent_control_call(
         found = False
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast API
-            call_name = _call_name(node).casefold()
-            if _is_cross_agent_control_name(call_name) or call_name in (
-                control_aliases or set()
-            ):
+            if _is_cross_agent_control_call(node, control_aliases):
                 self.found = True
                 return
             self.generic_visit(node)
@@ -2681,9 +2790,16 @@ def _guard_clause_provenance_lines(
 
     lines: set[int] = set()
 
-    def scan_block(statements: list[ast.stmt]) -> None:
+    def scan_block(
+        statements: list[ast.stmt],
+        enclosing_continuation: list[ast.stmt] | None = None,
+    ) -> None:
+        enclosing_continuation = enclosing_continuation or []
         for index, statement in enumerate(statements):
-            continuation = statements[index + 1 :]
+            continuation = [
+                *statements[index + 1 :],
+                *enclosing_continuation,
+            ]
             controls_continuation = bool(continuation) and (
                 _contains_cross_agent_control_call(
                     continuation, control_aliases
@@ -2702,8 +2818,18 @@ def _guard_clause_provenance_lines(
                     )
                 ):
                     lines.add(statement.lineno)
+            # ``break``/``continue`` inside a loop do not prevent statements
+            # after the loop from running, so do not inherit that outer
+            # continuation into loop bodies. Other compound statements retain
+            # the enclosing continuation: a return/raise nested under ``with``
+            # or ``try`` still gates the later control call.
+            child_continuation = (
+                []
+                if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
+                else continuation
+            )
             for block in _child_statement_blocks(statement):
-                scan_block(block)
+                scan_block(block, child_continuation)
 
     scan_block(function.body)
     return lines
@@ -2719,7 +2845,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     for function in functions:
         function_name = function.name.casefold()
         control_aliases = _cross_agent_control_aliases(function)
-        provenance_aliases = _provenance_aliases(function)
+        provenance_aliases, provenance_selected_targets = (
+            _provenance_aliases(function)
+        )
         lines.update(
             _guard_clause_provenance_lines(
                 function, provenance_aliases, control_aliases
@@ -2739,6 +2867,15 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if is_permission_call and any(
                     _has_provenance_token(argument, provenance_aliases)
+                    for argument in arguments
+                ):
+                    lines.add(node.lineno)
+                if _is_cross_agent_control_call(node, control_aliases) and any(
+                    bool(
+                        _identifier_tokens(argument).intersection(
+                            provenance_selected_targets
+                        )
+                    )
                     for argument in arguments
                 ):
                     lines.add(node.lineno)
@@ -3205,7 +3342,7 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(short_circuit_controls) == {2, 5}
     assert _authority_provenance_lines(comprehension_control) == {2}
     assert _authority_provenance_lines(propagation_only_helper) == set()
-    assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 14}
+    assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 10, 14}
     assert _authority_provenance_lines(ownership_predicate) == {2}
     assert _authority_provenance_lines(guard_clauses) == {2, 7, 15}
     assert _authority_provenance_lines(loop_guard_clauses) == {3, 9}
@@ -3247,6 +3384,69 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
     )
 
     assert _authority_provenance_lines(callbacks) == {3, 7}
+
+
+def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> None:
+    with_guard = ast.parse(
+        "def dispatch(request, target, lock):\n"
+        "    with lock:\n"
+        "        if not request.causation_chain:\n"
+        "            return\n"
+        "    terminate_child(target)\n"
+    )
+    try_guard = ast.parse(
+        "def dispatch(request, target):\n"
+        "    try:\n"
+        "        if not request.orchestrator:\n"
+        "            raise PermissionError\n"
+        "    finally:\n"
+        "        cleanup()\n"
+        "    stop_peer(target)\n"
+    )
+    derived_with_guard = ast.parse(
+        "def dispatch(request, target, lock):\n"
+        "    decision = compare_lineage(request.causation_chain)\n"
+        "    with lock:\n"
+        "        if not decision:\n"
+        "            return\n"
+        "    terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(with_guard) == {3}
+    assert _authority_provenance_lines(try_guard) == {3}
+    assert _authority_provenance_lines(derived_with_guard) == {4}
+
+
+def test_provenance_scanner_taints_control_targets_selected_by_provenance() -> None:
+    branch_selected_target = ast.parse(
+        "def dispatch(request, candidate, own):\n"
+        "    destination = own\n"
+        "    if request.causation_chain:\n"
+        "        destination = candidate\n"
+        "    terminate_child(destination)\n"
+    )
+    conditional_target = ast.parse(
+        "def dispatch(request, candidate, own):\n"
+        "    destination = candidate if request.orchestrator else own\n"
+        "    stop_peer(destination)\n"
+    )
+    conditional_kwargs = ast.parse(
+        "def dispatch(request, candidate):\n"
+        "    kwargs = {'target': candidate} if request.causation_chain else {}\n"
+        "    terminate_child(**kwargs)\n"
+    )
+    branch_selected_member = ast.parse(
+        "def dispatch(request, candidate):\n"
+        "    params = {}\n"
+        "    if request.orchestrator:\n"
+        "        params['target'] = candidate\n"
+        "    stop_peer(**params)\n"
+    )
+
+    assert _authority_provenance_lines(branch_selected_target) == {5}
+    assert _authority_provenance_lines(conditional_target) == {3}
+    assert _authority_provenance_lines(conditional_kwargs) == {3}
+    assert _authority_provenance_lines(branch_selected_member) == {5}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
