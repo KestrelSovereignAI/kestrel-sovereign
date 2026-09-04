@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - POSIX has no Windows byte-range locks
 from kestrel_sovereign.private_storage import (
     PrivateStorageError,
     absolute_without_following_leaf,
+    ensure_private_directory,
     open_private_file,
     path_exists,
 )
@@ -44,6 +45,7 @@ _SCHEMA_LOCK = "hold_state_v1"
 _HISTORY_LOCK_KEY = "kestrel:hold:history-anchor"
 _WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
 _INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
+_SQLITE_CUSTODY_MARKER_HEADER = b"kestrel-hold-sqlite-custody-v1\n"
 _BOOTSTRAP_INTENT_PAYLOAD = b"kestrel-hold-bootstrap-pending-v1\n"
 _HISTORY_ANCHOR_HEADER = b"kestrel-hold-history-v1\n"
 _HISTORY_ANCHOR_MAX_BYTES = 256
@@ -78,6 +80,36 @@ _HOLD_SCHEMA_TABLES = frozenset(
         "hold_operation_witnesses",
         "hold_schema_migrations",
     }
+)
+_HOLD_REQUIRED_UNIQUE_INDEXES = (
+    ("idx_hold_latches_scope_target_unique", "hold_latches", "scope, target_id"),
+    ("idx_hold_receipts_receipt_id_unique", "hold_receipts", "receipt_id"),
+    ("idx_hold_receipts_operation_id_unique", "hold_receipts", "operation_id"),
+    (
+        "idx_hold_receipt_witnesses_scope_target_unique",
+        "hold_receipt_witnesses",
+        "scope, target_id",
+    ),
+    (
+        "idx_hold_receipt_content_witnesses_receipt_id_unique",
+        "hold_receipt_content_witnesses",
+        "receipt_id",
+    ),
+    (
+        "idx_hold_operation_witnesses_operation_id_unique",
+        "hold_operation_witnesses",
+        "operation_id",
+    ),
+    (
+        "idx_hold_operation_witnesses_receipt_id_unique",
+        "hold_operation_witnesses",
+        "receipt_id",
+    ),
+    (
+        "idx_hold_schema_migrations_name_unique",
+        "hold_schema_migrations",
+        "name",
+    ),
 )
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
@@ -775,6 +807,53 @@ def hold_history_anchor_path(control_db_path: str | Path) -> Path:
 
     path = absolute_without_following_leaf(Path(control_db_path))
     return Path(f"{path}.hold-history-v1")
+
+
+def hold_sqlite_custody_marker_path(control_db_path: str | Path) -> Path:
+    """Return the directory-level marker for one SQLite Hold database.
+
+    The marker deliberately does not share the database basename.  Backup or
+    replacement tooling commonly treats ``<database>*`` as one replaceable
+    SQLite family; keeping this witness in a private sibling directory leaves
+    an independent fact that distinguishes a first boot from total family
+    loss.  The filename binds that fact to the absolute database identity.
+    """
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(str(path))).hexdigest()
+    return path.parent / ".hold-custody" / f"{identity}.initialized-v1"
+
+
+def _sqlite_custody_marker_payload(control_db_path: str | Path) -> bytes:
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(str(path))).hexdigest().encode("ascii")
+    return _SQLITE_CUSTODY_MARKER_HEADER + identity + b"\n"
+
+
+def _validate_sqlite_custody_evidence(
+    *,
+    marker_payload: bytes | None,
+    expected_payload: bytes,
+    initialized: bool,
+    bootstrap_pending: bool,
+) -> bool:
+    """Validate the independent marker/local-witness state machine."""
+
+    if marker_payload is not None and marker_payload != expected_payload:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker has invalid durable evidence"
+        )
+    marked = marker_payload is not None
+    if marked and not initialized:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker proves prior initialization but the "
+            "database family or its initialization witness is missing"
+        )
+    if initialized and not marked and not bootstrap_pending:
+        raise HoldCorruptStateError(
+            "SQLite Hold custody marker is missing for an initialized database"
+        )
+    return marked
 
 
 def _terminal_authority_ids(
@@ -1610,6 +1689,24 @@ class HoldStore:
         else:
             self._history_anchor_path = None
 
+        if getattr(db, "backend_type", "") == "sqlite":
+            backend = getattr(db, "backend", None)
+            db_path = getattr(backend, "db_path", None)
+            if db_path and db_path != ":memory:":
+                control_path = absolute_without_following_leaf(Path(db_path))
+                self._custody_marker_path = hold_sqlite_custody_marker_path(
+                    control_path
+                )
+                self._custody_marker_payload = _sqlite_custody_marker_payload(
+                    control_path
+                )
+            else:
+                self._custody_marker_path = None
+                self._custody_marker_payload = None
+        else:
+            self._custody_marker_path = None
+            self._custody_marker_payload = None
+
         if self._history_anchor_path is None:
             self._history_candidate_path = None
             self._bootstrap_intent_path = None
@@ -2084,6 +2181,47 @@ class HoldStore:
                 "Hold initialization witness has invalid durable evidence"
             )
         return True
+
+    def _read_sqlite_custody_marker(self) -> bytes | None:
+        """Read the directory-level fact that this database was initialized."""
+
+        path = self._custody_marker_path
+        payload = self._custody_marker_payload
+        if path is None or payload is None:
+            return None
+        return self._read_file_evidence(
+            path,
+            label="SQLite Hold custody marker",
+            max_bytes=len(payload),
+        )
+
+    def _write_sqlite_custody_marker(self) -> None:
+        """Publish initialization outside the replaceable SQLite family."""
+
+        path = self._custody_marker_path
+        payload = self._custody_marker_payload
+        if path is None or payload is None:
+            return
+        try:
+            ensure_private_directory(path.parent, label="Hold custody evidence")
+        except PrivateStorageError as exc:
+            raise HoldStateError(
+                f"could not prepare SQLite Hold custody marker: {exc}"
+            ) from exc
+        existing = self._read_sqlite_custody_marker()
+        if existing is not None:
+            _validate_sqlite_custody_evidence(
+                marker_payload=existing,
+                expected_payload=payload,
+                initialized=True,
+                bootstrap_pending=False,
+            )
+            return
+        self._write_file_evidence(
+            path,
+            payload,
+            label="SQLite Hold custody marker",
+        )
 
     async def _read_initialization_witness(self) -> bool:
         """Read initialization evidence from restart-surviving custody."""
@@ -2727,6 +2865,15 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold bootstrap intent conflicts with the stable history anchor"
             )
+        custody_marked = False
+        if self._custody_marker_path is not None:
+            assert self._custody_marker_payload is not None
+            custody_marked = _validate_sqlite_custody_evidence(
+                marker_payload=self._read_sqlite_custody_marker(),
+                expected_payload=self._custody_marker_payload,
+                initialized=initialized,
+                bootstrap_pending=bootstrap_history is not None,
+            )
         if initialized:
             missing = sorted(_HOLD_SCHEMA_TABLES - existing)
             if missing:
@@ -2737,6 +2884,8 @@ class HoldStore:
             await self._recover_history_publication()
             await self._ensure_schema_transaction(initialized=True)
             await self._assert_history_anchor_intact()
+            if not custody_marked:
+                self._write_sqlite_custody_marker()
             if bootstrap_history is not None:
                 await self._remove_external_bootstrap_intent()
             return
@@ -2758,6 +2907,7 @@ class HoldStore:
         # evidence, then retire the recovery authority last.
         await self._write_history_anchor()
         await self._write_initialization_witness()
+        self._write_sqlite_custody_marker()
         await self._remove_external_bootstrap_intent()
 
     async def _ensure_schema_transaction(
@@ -2849,10 +2999,6 @@ class HoldStore:
                 "CREATE TABLE IF NOT EXISTS hold_schema_migrations ("
                 "name TEXT NOT NULL PRIMARY KEY)"
             )
-            migration_complete = await self._db.fetchone(
-                "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
-                (_WITNESS_BACKFILL,),
-            )
             duplicate_operation = await self._db.fetchone(
                 "SELECT operation_id FROM hold_receipts "
                 "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
@@ -2861,6 +3007,41 @@ class HoldStore:
                 raise HoldCorruptStateError(
                     "Hold receipt history contains a duplicate operation id"
                 )
+            # ``CREATE TABLE IF NOT EXISTS`` cannot repair imported pre-v1
+            # tables.  Mutations rely on every one of these conflict keys, so
+            # establish them before an initialization witness can call the
+            # store ready.  Duplicate legacy evidence is corrupt rather than a
+            # row for a migration to choose between.
+            for index, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+                try:
+                    await self._db.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS {index} "
+                        f"ON {table}({columns})"
+                    )
+                except Exception as exc:
+                    raise HoldCorruptStateError(
+                        f"Hold {table} schema cannot enforce its required "
+                        "unique key"
+                    ) from exc
+            try:
+                # Prove the conflict target itself, not just our index name. A
+                # pre-existing corrupt index may occupy that name while
+                # covering different columns; EXPLAIN asks the database to
+                # resolve the arbiter without inserting the probe row.
+                await self._db.fetchall(
+                    "EXPLAIN INSERT INTO hold_latches (scope, target_id) "
+                    "VALUES (?, ?) ON CONFLICT (scope, target_id) DO NOTHING",
+                    ("agent", "__kestrel_hold_schema_probe__"),
+                )
+            except Exception as exc:
+                raise HoldCorruptStateError(
+                    "Hold latch schema cannot resolve its required "
+                    "scope/target conflict key"
+                ) from exc
+            migration_complete = await self._db.fetchone(
+                "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+                (_WITNESS_BACKFILL,),
+            )
             if migration_complete is not None:
                 await self._assert_completed_witness_migration_intact()
                 return
@@ -3940,12 +4121,15 @@ def validate_sqlite_hold_readiness(
     candidate_path = Path(f"{history_path}.pending")
     bootstrap_path = Path(f"{history_path}.bootstrap")
     lock_path = Path(f"{history_path}.lock")
+    custody_path = hold_sqlite_custody_marker_path(database)
+    custody_payload = _sqlite_custody_marker_payload(database)
     evidence_paths = (
         initialization_path,
         history_path,
         candidate_path,
         bootstrap_path,
         lock_path,
+        custody_path,
     )
     if not path_exists(database):
         leftovers = tuple(
@@ -4015,6 +4199,11 @@ def validate_sqlite_hold_readiness(
                     label="Hold bootstrap intent",
                     max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
                 ),
+                HoldStore._read_file_evidence(
+                    custody_path,
+                    label="SQLite Hold custody marker",
+                    max_bytes=len(custody_payload),
+                ),
             )
 
         evidence_before = evidence()
@@ -4063,6 +4252,12 @@ def validate_sqlite_hold_readiness(
                     "SQLite Hold database changed during the diagnostic snapshot"
                 )
 
+        _validate_sqlite_custody_evidence(
+            marker_payload=evidence_after[4],
+            expected_payload=custody_payload,
+            initialized=evidence_after[0] is not None,
+            bootstrap_pending=evidence_after[3] is not None,
+        )
         return validate_hold_readiness_snapshot(
             snapshot=snapshot,
             initialization_witness=evidence_after[0],
@@ -4086,6 +4281,7 @@ __all__ = [
     "HoldState",
     "HoldStateError",
     "HoldStore",
+    "hold_sqlite_custody_marker_path",
     "validate_hold_database_snapshot",
     "validate_hold_readiness_snapshot",
     "validate_postgres_hold_readiness_snapshot",

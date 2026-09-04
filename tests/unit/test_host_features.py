@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
-
 from kestrel_sdk.features.host_base import HostFeature
 from kestrel_sdk.features.ui import UIContributions
 
@@ -25,9 +24,9 @@ from kestrel_sovereign.host_features.context import (
     FleetSessionFactory,
     SovereignHostContext,
     build_host_context,
+    close_host_context_resources,
 )
 from kestrel_sovereign.security import csrf
-
 
 # ---------------------------------------------------------------------------
 # A minimal host feature used across the tests.
@@ -306,7 +305,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
     """
     from kestrel_sovereign import server
     from kestrel_sovereign.a2a import did_registry
-    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+    from kestrel_sovereign.multi_agent import agent_manager
+    from kestrel_sovereign.multi_agent import config as ma_config
     from kestrel_sovereign.security import demo_isolation
 
     events: list[str] = []
@@ -431,7 +431,8 @@ async def test_server_retains_control_context_after_optional_mount_failure(
 
     from kestrel_sovereign import server
     from kestrel_sovereign.a2a import did_registry
-    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+    from kestrel_sovereign.multi_agent import agent_manager
+    from kestrel_sovereign.multi_agent import config as ma_config
     from kestrel_sovereign.security import demo_isolation
 
     config_path = tmp_path / "multi_agent.toml"
@@ -567,6 +568,42 @@ async def test_build_host_context_provides_fleet_session_factory(tmp_path: Path)
             await ctx.session_factory.close()
         if ctx.db is not None and hasattr(ctx.db, "close"):
             await ctx.db.close()
+
+
+@pytest.mark.asyncio
+async def test_host_context_refuses_silent_rebootstrap_after_sqlite_custody_loss(
+    tmp_path: Path,
+):
+    """Losing the database family cannot silently erase a durable host Hold."""
+
+    custody = tmp_path / "custody"
+    custody.mkdir(mode=0o700)
+    database = custody / "host.db"
+    first = await build_host_context(db_path=str(database))
+    try:
+        assert first.hold_store is not None, first.backend_error
+        mutation = await first.hold_store.set_hold(
+            scope="host",
+            actor_id="did:sovereign:operator",
+            reason="must survive custody loss",
+            operation_id="host-hold-before-custody-loss",
+        )
+        assert mutation.current is not None
+    finally:
+        await close_host_context_resources(first)
+
+    # Model replacement of the complete SQLite family and all evidence that
+    # used to be named beside it.  The independent installation marker is the
+    # only durable fact that may distinguish this from a genuine first boot.
+    for artifact in custody.glob("host.db*"):
+        artifact.unlink()
+
+    reopened = await build_host_context(db_path=str(database))
+    try:
+        assert reopened.hold_store is None
+        assert "custody marker" in reopened.backend_error
+    finally:
+        await close_host_context_resources(reopened)
 
 
 def test_host_context_satisfies_sdk_protocol():

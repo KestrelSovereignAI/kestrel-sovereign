@@ -42,6 +42,14 @@ history/pending-publication witnesses with the agent database. Custom images
 must provide an equivalent persistent mount; the process-home default is not a
 durability boundary inside a replaceable container.
 
+SQLite Hold also writes a path-bound initialization marker under the private
+`<host-data>/.hold-custody/` directory. Its filename does not share the database
+basename: replacing `host-features.db*` therefore leaves a durable fact that the
+store existed, and a later boot refuses to reinterpret the missing family as a
+new empty installation. The marker is evidence, not a backup; operators must
+preserve it with the host-data directory and restore the database family rather
+than deleting the marker to make a failed custody check pass.
+
 ## Secure SQLite creation
 
 Kestrel opens or pre-creates the main database with `O_NOFOLLOW` where the

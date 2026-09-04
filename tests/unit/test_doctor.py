@@ -2735,14 +2735,16 @@ async def test_sqlite_doctor_rejects_missing_hold_history_anchor(
         env_file.write(f"KESTREL_HOST_DB_PATH={host_db}\n")
 
     before = {
-        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in host_dir.iterdir()
+        str(path.relative_to(host_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in host_dir.rglob("*")
+        if path.is_file()
     }
     ready = diagnose(tmp_path)
     assert ready.ready, ready.fail
     after = {
-        path.name: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in host_dir.iterdir()
+        str(path.relative_to(host_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in host_dir.rglob("*")
+        if path.is_file()
     }
     assert after == before
 

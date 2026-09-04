@@ -1558,6 +1558,10 @@ async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
     store = HoldStore(db)
     await store.ensure_schema()
     try:
+        # Model an out-of-band constraint loss after the migration proved and
+        # published a usable schema. Runtime validation remains a second line
+        # of defence rather than relying on the repaired index forever.
+        await db.execute("DROP INDEX idx_hold_receipts_operation_id_unique")
         for suffix in ("one", "two"):
             receipt_id = f"duplicate-operation-receipt-{suffix}"
             target_id = f"did:agent:{suffix}"
@@ -1852,8 +1856,13 @@ async def test_every_global_read_rejects_duplicate_operation_witness(hold_db):
     )
     await db.execute("DROP TABLE hold_operation_witnesses_valid")
 
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="cannot enforce its required unique key",
+    ):
+        await store.ensure_schema()
+
     readers = (
-        store.ensure_schema,
         store.read_boot_state,
         lambda: store.get_hold(held.receipt.scope, held.receipt.target_id),
     )
@@ -3937,7 +3946,8 @@ async def test_initialization_witness_is_not_visible_until_payload_is_complete(
     real_write = os.write
 
     def observe_before_write(descriptor, payload):
-        observed_final_path.append(witness_path.exists())
+        if bytes(payload) == hold_state_module._INITIALIZATION_WITNESS_PAYLOAD:
+            observed_final_path.append(witness_path.exists())
         return real_write(descriptor, payload)
 
     monkeypatch.setattr(hold_state_module.os, "write", observe_before_write)
@@ -4159,15 +4169,10 @@ async def test_ensure_schema_does_not_self_chain_typed_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["get", "set", "release"])
-async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
-    tmp_path,
-    monkeypatch,
-    operation,
-):
-    """A legacy table without its key cannot make one duplicate authoritative."""
+async def test_imported_duplicate_latch_fails_closed_before_schema_ready(tmp_path):
+    """A legacy table cannot publish readiness with ambiguous projections."""
 
-    db = await AsyncDatabase.sqlite(str(tmp_path / f"duplicate-{operation}.db"))
+    db = await AsyncDatabase.sqlite(str(tmp_path / "duplicate-latch.db"))
     await db.execute(
         "CREATE TABLE hold_latches ("
         "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
@@ -4185,33 +4190,67 @@ async def test_imported_duplicate_latch_fails_closed_on_single_target_paths(
         ("agent", "did:agent:duplicate"),
     )
     store = HoldStore(db)
-    await store.ensure_schema()
-    if operation != "get":
-        # The imported rows already exist. Bypass the insert-if-absent helper,
-        # whose ON CONFLICT target also depends on the missing legacy key, so
-        # this regression reaches the shared single-latch read itself.
-        monkeypatch.setattr(store, "_ensure_latch_row", AsyncMock())
     try:
-        with pytest.raises(HoldCorruptStateError, match="duplicate hold latch key"):
-            if operation == "get":
-                await store.get_hold("agent", "did:agent:duplicate")
-            elif operation == "set":
-                await store.set_hold(
-                    scope="agent",
-                    target_id="did:agent:duplicate",
-                    actor_id="did:sovereign:operator",
-                    reason="must reject ambiguous projection",
-                    operation_id="set-duplicate-projection",
-                )
-            else:
-                await store.release_hold(
-                    scope="agent",
-                    target_id="did:agent:duplicate",
-                    actor_id="did:sovereign:operator",
-                    reason="must reject ambiguous projection",
-                    operation_id="release-duplicate-projection",
-                    expected_hold_receipt_id="unknown-authority",
-                )
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="cannot enforce its required unique key",
+        ):
+            await store.ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_latch_without_unique_key_is_repaired_before_ready(tmp_path):
+    """Boot must not publish a store whose first upsert cannot execute."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "keyless-latch.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0)"
+    )
+    store = HoldStore(db)
+    try:
+        await store.ensure_schema()
+        mutation = await store.set_hold(
+            scope="agent",
+            target_id="did:agent:keyless-legacy",
+            actor_id="did:sovereign:operator",
+            reason="prove the migrated upsert",
+            operation_id="keyless-legacy-upsert",
+        )
+        assert mutation.current is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_latch_rejects_wrong_index_occupying_migration_name(tmp_path):
+    """Index-name presence cannot stand in for the conflict key itself."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "wrong-latch-index.db"))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0)"
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_hold_latches_scope_target_unique "
+        "ON hold_latches(target_id)"
+    )
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="cannot resolve its required scope/target conflict key",
+        ):
+            await HoldStore(db).ensure_schema()
     finally:
         await db.close()
 
