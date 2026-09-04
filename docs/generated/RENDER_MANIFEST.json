@@ -3845,7 +3845,9 @@
       "type": "Developer Note"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "scripts/check_co_change.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

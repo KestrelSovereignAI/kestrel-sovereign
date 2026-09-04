@@ -116,6 +116,24 @@ Advisory, not blocking — most of the time some sites are legitimately differen
 and the check cannot know which. The point is that the remainder is on screen
 **before** the commit rather than in review two hours later.
 
+**Implemented** as `scripts/check_co_change.py` (#3124). It reads modified
+function bodies and both added *and removed* string literals — a rename at one
+of N sites leaves the siblings under the old name, which never appears on the
+new side at all. Unchanged sites are ranked by proximity (same file, then same
+directory) because `git grep` returns path order, which buried the four sibling
+sites *below* thirty unrelated hits when the round-2 case was reproduced.
+
+Validated against that case: changing `action="tool_execution"` at one of the
+five `approval_queue.py` sites reports the other four first, followed by
+`hooks.py:107,118,137` — the r2/r3 and r4/r5 findings, which together cost six
+review rounds, in the first eight lines of output.
+
+It is **not yet a `quality.yaml` check**: it exits 0 by design, and
+`failure_summary()` builds from failed checks only, so its report would be
+captured and discarded. Only its unit tests run per iteration today. The
+surfacing invocation lands as a check when kestrel-talon#230 adds an advisory
+state; until then it is a manual `uv run python scripts/check_co_change.py`.
+
 ### 4.2 Caller coverage on signature change
 
 A changed function signature lists its callers; each must appear in the diff or
@@ -156,7 +174,7 @@ and the model is a stage inside it.
 |---|---|---|
 | **workflows** | the sequence — durable, ordered, resumable stages | load-bearing; do first |
 | **kestrel-talon** | an advisory check state | kestrel-talon#230 |
-| **kestrel-sovereign** | the three check scripts + `quality.yaml` entries | #3124; useful standalone |
+| **kestrel-sovereign** | the three check scripts + `quality.yaml` entries | §4.1 shipped (#3124); §4.2 and §4.3 open |
 
 ### The harness already exists
 
