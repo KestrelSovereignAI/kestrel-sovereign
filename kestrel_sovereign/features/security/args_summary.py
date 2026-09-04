@@ -188,7 +188,14 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
             nested_repairs: list = []
             masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM, reconstructed=nested_repairs)
             return prefix, masked, altered or bool(nested_repairs)
-    return None
+    # No region repaired. A bracket is not JSON: a prose-only row such as
+    # "Tool 'files[0]' is not in the known tool allowlist" (tool_audit with
+    # no args) has nothing to mask and stays; only structure the repair
+    # could not parse AND that carries a value is withheld — by the same
+    # rule the prefix uses (round 29 review).
+    if _UNREPAIRED_STRUCTURE.search(text):
+        return "(prefix withheld: unmaskable structure) ", None, False
+    return text, None, False
 
 
 #: Placeholder written in place of a sensitive value.
@@ -332,7 +339,7 @@ def _remask_text(summary: str) -> str:
             return "(summary truncated past repair; not shown)"
         prefix, masked, altered = repaired
         if masked is None:
-            return summary
+            return prefix  # the text as written, or the withheld placeholder
         shown = prefix + json.dumps(masked, default=str)
         # Only a RECONSTRUCTED row is marked: an intact tool_audit row reaches
         # this path for its prose prefix alone, and marking it made a plain

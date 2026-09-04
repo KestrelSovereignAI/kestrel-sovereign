@@ -53,7 +53,11 @@ def fold_query(text):
     """
     if not text:
         return text
-    return _decode_unicode_escapes(text).casefold()
+    # The needle crosses into SQLite as a bound parameter exactly as the
+    # stored side's fold does; a lone surrogate in it (a cut emoji in
+    # model-emitted text) raised a codec error and failed the whole search
+    # (round 29 review). Same replacement, same reason.
+    return _decode_unicode_escapes(text).casefold().encode("utf-8", "replace").decode("utf-8")
 
 
 def fold_stored_summary(text):
@@ -1354,7 +1358,7 @@ class PermissionStore:
 
         if tool_name:
             clauses.append("tool_name = ?")
-            params.append(tool_name)
+            params.append(tool_name.encode("utf-8", "replace").decode("utf-8"))
 
         if days is not None:
             cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))

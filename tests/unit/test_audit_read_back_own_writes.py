@@ -2108,8 +2108,8 @@ def test_a_row_whose_json_cannot_be_repaired_is_withheld_not_shown_raw():
     from kestrel_sovereign.features.security.permissions import fold_stored_summary
 
     broken = '{"api_key": "sk-live-LEAK"] "memo": "orphaned worker"'   # misnested: no repair
-    assert remask_summary(broken) == "(summary truncated past repair; not shown)"
-    assert fold_stored_summary(broken) == ""
+    assert remask_summary(broken) == "(prefix withheld: unmaskable structure) "
+    assert "leak" not in fold_stored_summary(broken) and "orphaned" not in fold_stored_summary(broken)
 
 
 # --------------------------------------------------------------------------
@@ -2643,3 +2643,61 @@ def test_a_nested_reconstruction_under_an_intact_prefixed_row_is_marked():
     shown = remask_summary(row)
     assert shown.startswith("refused create_issue | args=") and "sk-live" not in shown
     assert "***MASKED***" in shown and shown.endswith("..."), shown
+
+
+# --------------------------------------------------------------------------
+# Round 30: a bracket is not JSON; the query side gets the surrogate guard.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_prose_only_row_with_a_bracket_is_shown_and_searchable(tmp_path):
+    """"Tool 'files[0]' is not in the known tool allowlist" is exactly what
+    tool_audit writes when args is empty. No region repaired, so the row was
+    withheld from the operator page and removed from the search corpus."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    rows = (
+        "Tool 'files[0]' is not in the known tool allowlist",
+        "Tool 'x' argument 'files[0]' exceeds maximum length (600 > 500)",
+        "see docs [here](http://x) for details",
+    )
+    for row in rows:
+        assert remask_summary(row) == row, row
+        assert fold_stored_summary(row) == row.casefold(), row
+    # Unparsed structure that can carry a value is still withheld; a bare
+    # array of strings has no key position and is data.
+    assert remask_summary("{'api_key': 'sk-live-LEAK'}") == "(prefix withheld: unmaskable structure) "
+    assert "leak" not in fold_stored_summary("{'api_key': 'sk-live-LEAK'}")
+    assert remask_summary('foo["x"]') == 'foo["x"]'
+
+    store = PermissionStore(str(tmp_path / "prose-bracket.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Guardrail", tool_name="files[0]", action="tool_validation",
+        decision="blocked", args_summary=rows[0],
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    found = await feature.security_audit_search(query="known tool allowlist")
+    assert found.data["count"] == 1 and rows[0] in found.confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_lone_surrogate_in_the_query_or_tool_name_does_not_error_the_search(tmp_path):
+    """fold_stored_summary replaces a lone surrogate before the value crosses
+    into SQLite; the needle crosses too, as a bound parameter, and did not."""
+    from kestrel_sovereign.features.security.permissions import fold_query
+
+    assert fold_query("build \ud83d") == "build ?"
+    store = PermissionStore(str(tmp_path / "surrogate-query.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+        decision="auto_mode_allowed", args_summary=json.dumps({"title": "build \ud83d"}),
+    )
+    rows, _ = await store.search_audit_log("build \ud83d")
+    assert len(rows) == 1
+    rows, _ = await store.search_audit_log("build", tool_name="create_github_issue\ud83d")
+    assert rows == []
