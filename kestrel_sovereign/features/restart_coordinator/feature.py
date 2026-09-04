@@ -907,9 +907,17 @@ class RestartCoordinatorFeature(Feature):
                 origin_session_id=origin_session_id,
                 delegation_id=delegation_id,
             )
-        except RestartAuthorityError as error:
+        except (RestartAuthorityError, TransactionError) as error:
+            authority_error = (
+                error.__cause__
+                if isinstance(error, TransactionError)
+                and isinstance(error.__cause__, RestartAuthorityError)
+                else error
+            )
+            if not isinstance(authority_error, RestartAuthorityError):
+                raise
             return ToolResult.failed(
-                str(error),
+                str(authority_error),
                 data={"created": False, "authority": "required"},
             )
         logger.info(

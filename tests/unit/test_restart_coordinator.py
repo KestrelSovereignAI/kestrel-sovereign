@@ -962,6 +962,67 @@ async def test_executor_rechecks_delegation_revocation_after_request_filing(
 
 
 @pytest.mark.asyncio
+async def test_request_insert_rechecks_delegation_after_initial_authorization(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+
+    async def revoke_at_insert(db, **kwargs):
+        with caller_context_scope(CallerContext.sovereign(
+            identity="test-sovereign",
+            credential="restart-authority-test-key",
+        )):
+            revoked = await feat.revoke_restart_delegation(delegation_id)
+        assert revoked.status is ToolResultStatus.OK
+        return await insert_request(db, **kwargs)
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature.insert_request",
+            side_effect=revoke_at_insert,
+        ),
+    ):
+        requested = await feat.request_restart(
+            reason="revoked between check and insert",
+            delegation_id=delegation_id,
+        )
+
+    assert requested.status is ToolResultStatus.ERROR
+    assert "delegation was revoked" in requested.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_execution_claim_rechecks_live_delegation_state(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(
+        subject_agent_did=feat.agent.did,
+    )
+    delegation_id = granted.data["delegation"]["delegation_id"]
+    with caller_context_scope(None):
+        requested = await feat.request_restart(
+            reason="claim seam", delegation_id=delegation_id,
+        )
+    row = await get_request(backend, requested.data["request"]["id"])
+    await feat.revoke_restart_delegation(delegation_id)
+
+    claimed = await claim_request_for_execution(
+        backend,
+        row,
+        status="executing",
+        status_reason="must not land",
+    )
+
+    assert claimed == "invalid"
+    assert (await get_request(backend, row.id)).status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_executor_rechecks_delegation_at_final_restart_boundary(tmp_path):
     feat, backend = await _make_feature(tmp_path)
     granted = await feat.grant_restart_delegation(
