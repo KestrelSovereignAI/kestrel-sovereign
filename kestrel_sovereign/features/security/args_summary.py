@@ -188,7 +188,9 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
             return None
         parsed, altered = repair_json_text(text[start:])
         if parsed is not None:
-            return prefix, mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM), altered
+            nested_repairs: list = []
+            masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM, reconstructed=nested_repairs)
+            return prefix, masked, altered or bool(nested_repairs)
     return None
 
 
@@ -196,7 +198,9 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
 MASK = "***MASKED***"
 
 
-def mask_sensitive(data: Any, *, repair_slack: int = 0) -> Any:
+def mask_sensitive(
+    data: Any, *, repair_slack: int = 0, reconstructed: Optional[list] = None
+) -> Any:
     """Recursively mask values whose key looks sensitive.
 
     Dicts and lists are walked recursively; a key matching any
@@ -223,14 +227,19 @@ def mask_sensitive(data: Any, *, repair_slack: int = 0) -> Any:
         try:
             nested, end = _JSON_PREFIX.raw_decode(stripped)
         except (ValueError, RecursionError):
-            nested = complete_truncated_json(stripped, max_trim=repair_slack) if repair_slack else None
+            nested, altered = repair_json_text(stripped, max_trim=repair_slack) if repair_slack else (None, False)
             end = len(stripped)
+            if nested is not None and altered and reconstructed is not None:
+                # A nested payload the READ path reconstructed: the display
+                # must mark it exactly as it marks a top-level reconstruction
+                # (round 25 review) — the caller's flag carries the fact out.
+                reconstructed.append(True)
         if not isinstance(nested, (dict, list)):
             return data
         try:
-            masked = mask_sensitive(nested, repair_slack=repair_slack)
+            masked = mask_sensitive(nested, repair_slack=repair_slack, reconstructed=reconstructed)
             if masked == nested:
-                return data
+                return data if not (reconstructed and reconstructed[-1] is True and altered) else json.dumps(masked, default=str)
             replaced = json.dumps(masked, default=str)
         except RecursionError:
             # The decoder accepts a payload nested deeper than this walk (or
@@ -245,10 +254,10 @@ def mask_sensitive(data: Any, *, repair_slack: int = 0) -> Any:
             if any(s in str(key).lower() for s in SENSITIVE_KEY_SUBSTRINGS):
                 result[key] = MASK
             else:
-                result[key] = mask_sensitive(value, repair_slack=repair_slack)
+                result[key] = mask_sensitive(value, repair_slack=repair_slack, reconstructed=reconstructed)
         return result
     if isinstance(data, list):
-        return [mask_sensitive(item, repair_slack=repair_slack) for item in data]
+        return [mask_sensitive(item, repair_slack=repair_slack, reconstructed=reconstructed) for item in data]
     return data
 
 
@@ -332,15 +341,22 @@ def _remask_text(summary: str) -> str:
     if isinstance(parsed, str):
         # The whole row is a JSON string — the payload the walker masks one
         # level down, carried at the top (round 21 review).
-        masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
-        return summary if masked == parsed else json.dumps(masked)
+        nested_repairs: list = []
+        masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM, reconstructed=nested_repairs)
+        if masked == parsed:
+            return summary
+        return json.dumps(masked) + (_TRUNCATION_MARK if nested_repairs else "")
     if not isinstance(parsed, (dict, list)):
         return summary
     try:
         # READ path: a nested JSON-encoded payload can be cut inside a row
         # whose outer JSON parses, so the string branch gets the repair slack
-        # here exactly as it does under repair_unparseable_summary.
-        return json.dumps(mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM), default=str)
+        # here exactly as it does under repair_unparseable_summary — and a
+        # nested payload it reconstructed is marked exactly as a top-level
+        # reconstruction is (round 25 review).
+        nested_repairs = []
+        shown = json.dumps(mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM, reconstructed=nested_repairs), default=str)
+        return shown + _TRUNCATION_MARK if nested_repairs else shown
     except (TypeError, ValueError):
         return "(summary could not be re-masked; not shown)"
 

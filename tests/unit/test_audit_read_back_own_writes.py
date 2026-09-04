@@ -2489,3 +2489,30 @@ def test_an_intact_row_reaching_the_repair_path_is_not_marked_as_reconstructed()
     assert repair_json_text('{"a": 1}...') == ({"a": 1}, True)
     assert repair_json_text('{"a": 1') == ({"a": 1}, True)
     assert repair_json_text('{"a": tr') == ({"a": None}, True)
+
+
+# --------------------------------------------------------------------------
+# Round 26: a nested reconstruction is marked like a top-level one.
+# --------------------------------------------------------------------------
+
+def test_a_reconstructed_nested_payload_is_marked_in_the_display():
+    """The read path repairs a cut nested payload (closing its string,
+    inventing null for a cut key) and showed the result unmarked while the
+    identical reconstruction at the top level carried the marker — the
+    false precision the marker exists to prevent."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+
+    cut_inside = json.dumps({"payload": '{"api_key": "sk-live-SECRET", "body": "the quick brown fo', "note": "x"})
+    shown = remask_summary(cut_inside)
+    assert "SECRET" not in shown and "***MASKED***" in shown
+    assert shown.endswith("..."), shown
+    assert json.loads(shown[:-3])["note"] == "x"
+    # The same shape carried as a top-level JSON string.
+    top = json.dumps('{"api_key": "sk-live-SECRET", "body": "the quick brown fo')
+    assert remask_summary(top).endswith("...") and "SECRET" not in remask_summary(top)
+    # An INTACT nested payload is masked without a marker; a row with no
+    # nested payload at all is untouched.
+    intact = json.dumps({"payload": json.dumps({"api_key": "sk-live-SECRET", "body": "fine"}), "note": "x"})
+    assert not remask_summary(intact).endswith("...") and "SECRET" not in remask_summary(intact)
+    plain = json.dumps({"note": "x", "body": "the quick brown fo"})
+    assert remask_summary(plain) == plain
