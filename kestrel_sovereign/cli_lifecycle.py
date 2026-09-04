@@ -305,13 +305,27 @@ def _start_inprocess_mode(
     # fleets already have a complete operator-authentication lane and do not
     # need a parallel API key.
     env = pm._load_env()
-    from kestrel_sovereign.auth import normalize_api_key
+    from kestrel_sovereign.auth import (
+        normalize_api_key,
+        required_oauth_is_configured,
+    )
 
     host_api_key = normalize_api_key(env.get("KESTREL_API_KEY")) or ""
-    oauth_required = env.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
-        "1", "true", "yes", "on",
+    oauth_required = env.get("KESTREL_REQUIRE_OAUTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
     }
-    if not host_api_key.strip() and not oauth_required:
+    keyless_oauth_configured = required_oauth_is_configured(env)
+    if not host_api_key.strip() and not keyless_oauth_configured:
+        if oauth_required:
+            print(
+                "❌ Keyless multi-agent OAuth requires configured Google OAuth "
+                "credentials (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET). "
+                "Otherwise run `kestrel setup keys` and retry."
+            )
+            return 1
         print(
             "❌ Multi-agent host requires a stable KESTREL_API_KEY in the "
             "project .env. Run `kestrel setup keys` and retry."

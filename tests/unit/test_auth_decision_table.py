@@ -183,9 +183,25 @@ def test_oauth_only_multi_agent_server_does_not_require_api_key(monkeypatch):
 
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "operator-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "operator-client-secret")
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
 
     assert server._require_multi_agent_host_api_key(os.environ) == ""
+
+
+def test_multi_agent_server_rejects_keyless_unconfigured_oauth(monkeypatch):
+    """The OAuth flag alone must not create an inaccessible fleet host."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="Google OAuth credentials"):
+        server._require_multi_agent_host_api_key(os.environ)
 
 
 @pytest.mark.asyncio

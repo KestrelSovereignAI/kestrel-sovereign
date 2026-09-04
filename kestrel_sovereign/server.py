@@ -48,7 +48,7 @@ from kestrel_sovereign.a2a.transport_auth import (
     is_a2a_transport_path,
     is_a2a_transport_only_process,
 )
-from kestrel_sovereign.auth import normalize_api_key
+from kestrel_sovereign.auth import normalize_api_key, required_oauth_is_configured
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -551,18 +551,25 @@ def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
     A runtime-generated key cannot be handed to local clients safely once
     managed peers share the host's loopback namespace. Fleet launchers and the
     server therefore meet on the project-provisioned key in API-key mode;
-    OAuth-required hosts need no parallel sovereign API-key credential.
+    OAuth-required hosts need no parallel sovereign API-key credential once
+    their Google client credentials are actually configured.
     Localhost bootstrap remains a standalone-only compatibility lane.
     """
     api_key = normalize_api_key(environ.get("KESTREL_API_KEY")) or ""
-    if _oauth_required(environ):
+    if api_key.strip():
         return api_key
-    if not api_key.strip():
+    if required_oauth_is_configured(environ):
+        return ""
+    if _oauth_required(environ):
         raise RuntimeError(
-            "Multi-agent hosts require a stable KESTREL_API_KEY provisioned "
-            "out of band; run `kestrel setup keys` before startup"
+            "Keyless multi-agent OAuth requires configured Google OAuth "
+            "credentials (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET); "
+            "otherwise run `kestrel setup keys` before startup"
         )
-    return api_key
+    raise RuntimeError(
+        "Multi-agent hosts require a stable KESTREL_API_KEY provisioned "
+        "out of band; run `kestrel setup keys` before startup"
+    )
 
 
 def get_api_key():

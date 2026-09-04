@@ -1,4 +1,5 @@
 """Caller context for threading authentication identity into agent operations."""
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -13,6 +14,21 @@ def normalize_api_key(value: Optional[str]) -> Optional[str]:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
         return value[1:-1]
     return value
+
+
+def required_oauth_is_configured(environ: Mapping[str, str]) -> bool:
+    """Return whether required Google OAuth can authenticate an operator."""
+
+    required = environ.get("KESTREL_REQUIRE_OAUTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return required and all(
+        isinstance(environ.get(name), str) and bool(environ[name].strip())
+        for name in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")
+    )
 
 
 class AuthMethod(str, Enum):
