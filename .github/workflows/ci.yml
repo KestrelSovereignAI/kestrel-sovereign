@@ -668,7 +668,7 @@ jobs:
         # Parallelizing this tier (#2794) is the fix that would actually
         # lower the number; runner sizing is #2795.
         #
-        # budget-basis: slowest-pass=20.6 worst-runner-ratio=1.85 samples=19
+        # budget-basis: slowest-pass=20.6 worst-runner-ratio=1.85 samples=19 longest-test=180
         timeout-minutes: 50
         env:
           KESTREL_AUDIT_MODE: skip

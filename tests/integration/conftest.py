@@ -5,8 +5,73 @@ Provides fixtures and utilities specific to integration testing,
 including handling of bootstrap state for test agents.
 """
 import os
+import re
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
+
+
+# The tier's wall clock is budgeted in ci.yml: pytest stops the session at
+# `--session-timeout`, and the runner's `timeout-minutes` is a backstop it
+# must never reach. Between those two sits the longest a single test may
+# still run after the session deadline passes, because the deadline is
+# checked BETWEEN tests (#3212).
+#
+# So a test that claims a larger per-test timeout than the budget allows
+# for does not merely run long — it can push pytest past the runner's
+# backstop, and the runner's kill prints no FAILED line. That makes it a
+# collection-time error here rather than a mystery red later.
+#
+# Asked of pytest rather than parsed out of the source: `pytestmark`,
+# `pytest.param(marks=...)` and `timeout=` are all valid ways to set this
+# marker, and enumerating spellings is writing a parser for someone
+# else's grammar (codex round 2 on #3212).
+_CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+_LONGEST_TEST = re.compile(r"budget-basis:.*?longest-test=(\d+)")
+
+
+def _declared_per_test_ceiling() -> int | None:
+    """The per-test ceiling ci.yml budgeted for, in seconds."""
+    try:
+        match = _LONGEST_TEST.search(_CI_WORKFLOW.read_text())
+    except OSError:
+        return None  # Running outside a checkout; nothing to enforce against.
+    return int(match[1]) if match else None
+
+
+def _effective_timeout(item: pytest.Item) -> int | None:
+    """What pytest-timeout will actually enforce for this test."""
+    marker = item.get_closest_marker("timeout")
+    if marker is None:
+        return None
+    if marker.args:
+        return int(marker.args[0])
+    if "timeout" in marker.kwargs:
+        return int(marker.kwargs["timeout"])
+    return None
+
+
+def pytest_collection_modifyitems(config, items):
+    """Refuse a per-test timeout the tier's wall-clock budget cannot hold."""
+    ceiling = _declared_per_test_ceiling()
+    if ceiling is None:
+        return
+
+    over = {
+        f"{item.nodeid} ({timeout}s)"
+        for item in items
+        if (timeout := _effective_timeout(item)) is not None and timeout > ceiling
+    }
+    if over:
+        raise pytest.UsageError(
+            f"These tests claim a per-test timeout above the {ceiling}s that "
+            f"ci.yml budgets for, so the session deadline could overrun the "
+            f"runner's backstop and the failure would print no FAILED line "
+            f"(#3212). Raise `longest-test` in the ci.yml `budget-basis` "
+            f"marker (and the timeout-minutes that depends on it), or lower "
+            f"the test's: " + ", ".join(sorted(over))
+        )
 
 
 @pytest.fixture(autouse=True)

@@ -24,26 +24,28 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
-INTEGRATION_TESTS = REPO / "tests" / "integration"
-
-# A test may raise its own ceiling, and pytest-timeout gives the marker
-# precedence over the command line. Three tests in
-# test_session_id_column_backend_parity.py do exactly that at 180s, so
-# the CLI value is a floor, not the maximum (codex P2).
-_TIMEOUT_MARKER = re.compile(r"@pytest\.mark\.timeout\(\s*(\d+)")
 
 # What the step still has to do once pytest returns. Measured on the
 # event in #3212: pytest printed its summary at 29:49 and the runner
 # killed the step at 30:00 — eleven seconds of teardown and reporting.
 _POST_SUITE_MARGIN_MINUTES = 1.0
 
-# The declared inputs: the slowest passing run observed, and the slowest
-# runner observed relative to a normal one. Their product is the longest
-# a healthy suite can credibly take.
+# The declared inputs. `slowest-pass` x `worst-runner-ratio` is the
+# longest a healthy suite can credibly take; `longest-test` is how far
+# past the session deadline one already-running test can carry it.
+#
+# `longest-test` is a declaration, not an observation, and the integration
+# tier enforces it: tests/integration/conftest.py refuses to collect a
+# test whose effective timeout marker exceeds it. That split is
+# deliberate — pytest is the only thing that knows a marker's effective
+# value across `pytestmark`, `pytest.param(marks=...)` and `timeout=`,
+# and a regex over the source knows only the spelling it was taught
+# (codex round 2). Here the number is arithmetic; there it is a fact.
 _BUDGET_BASIS = re.compile(
     r"budget-basis:\s*slowest-pass=(?P<slowest>[\d.]+)\s+"
     r"worst-runner-ratio=(?P<ratio>[\d.]+)\s+"
-    r"samples=(?P<samples>\d+)"
+    r"samples=(?P<samples>\d+)\s+"
+    r"longest-test=(?P<longest_test>\d+)"
 )
 
 
@@ -80,26 +82,13 @@ def _pytest_deadlines() -> tuple[float, float]:
         "run is killed by the runner, which prints no FAILED line (#3212)"
     )
     assert per_test is not None, "the integration step has no per-test --timeout"
-    return int(session[1]) / 60, _longest_single_test_minutes(int(per_test[1])) / 60
 
-
-def _longest_single_test_minutes(cli_timeout_seconds: int) -> int:
-    """The largest per-test ceiling any selected test can claim, in seconds.
-
-    The command line sets the default; a `@pytest.mark.timeout` marker
-    overrides it, upward included. Taking the CLI value as the maximum
-    under-counts by whatever the loudest marker asks for.
-    """
-    markers = [
-        int(match[1])
-        for path in INTEGRATION_TESTS.rglob("test_*.py")
-        for match in _TIMEOUT_MARKER.finditer(path.read_text())
-    ]
-    assert markers, (
-        "found no @pytest.mark.timeout markers under tests/integration — "
-        "the scan is broken, and without it this bound is only the CLI value"
-    )
-    return max([cli_timeout_seconds, *markers])
+    match = _BUDGET_BASIS.search(WORKFLOW.read_text())
+    assert match is not None, "budget-basis marker missing"
+    # The CLI value is the default ceiling; a marker may raise it, up to
+    # the declared `longest-test` that the integration tier enforces.
+    longest = max(int(per_test[1]), int(match["longest_test"]))
+    return int(session[1]) / 60, longest / 60
 
 
 def test_the_budget_basis_is_declared_and_parsable():
@@ -116,6 +105,7 @@ def test_the_budget_basis_is_declared_and_parsable():
     assert float(match["slowest"]) > 0
     assert float(match["ratio"]) >= 1.0
     assert int(match["samples"]) >= 5, "too few samples to call anything worst"
+    assert int(match["longest_test"]) > 0
 
 
 def test_the_integration_budget_outlasts_the_slowest_run_on_the_slowest_runner():
