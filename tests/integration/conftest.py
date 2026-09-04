@@ -40,16 +40,36 @@ def _declared_per_test_ceiling() -> int | None:
     return int(match[1]) if match else None
 
 
+# Returned for a marker that sets no enforceable limit — `timeout(0)`,
+# a negative value, `timeout(None)`. All of them mean "no timer", which
+# is the case this guard most needs to catch and the one a naive
+# `> ceiling` comparison lets through.
+_UNBOUNDED = -1
+
+
 def _effective_timeout(item: pytest.Item) -> int | None:
-    """What pytest-timeout will actually enforce for this test."""
+    """What pytest-timeout will actually enforce, or None for the default."""
     marker = item.get_closest_marker("timeout")
     if marker is None:
         return None
+
     if marker.args:
-        return int(marker.args[0])
-    if "timeout" in marker.kwargs:
-        return int(marker.kwargs["timeout"])
-    return None
+        declared = marker.args[0]
+    elif "timeout" in marker.kwargs:
+        declared = marker.kwargs["timeout"]
+    else:
+        # e.g. `@pytest.mark.timeout(func_only=True)` — no limit set, so
+        # the command line's default still applies.
+        return None
+
+    try:
+        seconds = int(float(declared))
+    except (TypeError, ValueError):
+        # `timeout(None)` and anything else this cannot read: refuse
+        # rather than raise, so an unreadable marker is a stated refusal
+        # and not a collection crash.
+        return _UNBOUNDED
+    return seconds if seconds > 0 else _UNBOUNDED
 
 
 def pytest_collection_modifyitems(config, items):
@@ -58,19 +78,30 @@ def pytest_collection_modifyitems(config, items):
     if ceiling is None:
         return
 
-    over = {
-        f"{item.nodeid} ({timeout}s)"
-        for item in items
-        if (timeout := _effective_timeout(item)) is not None and timeout > ceiling
-    }
-    if over:
+    refused = []
+    for item in items:
+        timeout = _effective_timeout(item)
+        if timeout is None:
+            continue  # Inherits the command line's default.
+        if timeout == _UNBOUNDED:
+            # pytest-timeout reads a non-positive value as "no timer at
+            # all", not as "a very short one" — measured: a 4s test with
+            # `@pytest.mark.timeout(0)` passes under `--timeout=1`. An
+            # unbounded test is the worst case this guard exists for, so
+            # it cannot be the one case that slips past a `> ceiling`
+            # comparison (codex round 3).
+            refused.append(f"{item.nodeid} (timeout disabled)")
+        elif timeout > ceiling:
+            refused.append(f"{item.nodeid} ({timeout}s)")
+
+    if refused:
         raise pytest.UsageError(
-            f"These tests claim a per-test timeout above the {ceiling}s that "
+            f"These tests are not bounded by the {ceiling}s per-test ceiling "
             f"ci.yml budgets for, so the session deadline could overrun the "
             f"runner's backstop and the failure would print no FAILED line "
             f"(#3212). Raise `longest-test` in the ci.yml `budget-basis` "
-            f"marker (and the timeout-minutes that depends on it), or lower "
-            f"the test's: " + ", ".join(sorted(over))
+            f"marker (and the timeout-minutes that depends on it), or bound "
+            f"the test: " + ", ".join(sorted(refused))
         )
 
 
