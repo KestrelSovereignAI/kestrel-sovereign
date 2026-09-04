@@ -235,6 +235,7 @@
         "kestrel_sovereign/endpoints/restart_events.py",
         "kestrel_sovereign/endpoints/spawn.py",
         "kestrel_sovereign/features/bootstrap/feature.py",
+        "kestrel_sovereign/features/bridge/router.py",
         "kestrel_sovereign/features/deploy/feature.py",
         "kestrel_sovereign/features/peers/feature.py",
         "kestrel_sovereign/features/restart_coordinator/feature.py",
@@ -242,7 +243,8 @@
         "kestrel_sovereign/features/tasks/feature.py",
         "kestrel_sovereign/features/todo/feature.py",
         "kestrel_sovereign/features/web_search/feature.py",
-        "kestrel_sovereign/features/webhooks/receiver.py"
+        "kestrel_sovereign/features/webhooks/receiver.py",
+        "kestrel_sovereign/server.py"
       ],
       "findings": [],
       "missing_code_refs": [],

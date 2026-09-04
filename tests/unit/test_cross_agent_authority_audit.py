@@ -10,6 +10,7 @@ from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
+AUTH_SURFACE_MATRIX_PATH = REPO_ROOT / "docs/audit/AUTH_SURFACE_MATRIX.md"
 CONTROL_NAME_TERMS = (
     "agent",
     "peer",
@@ -45,10 +46,21 @@ HTTP_SEGMENTS = {
     # their self-only/read-only false positives explicitly in the audit.
     "features",
     "observability",
+    # Bridge endpoints can invoke the routed agent without an agent-shaped
+    # suffix, while app-level /api/host routes issue host-wide UI credentials
+    # or describe shared host state.
+    "bridge",
+    "host",
 }
-HTTP_EXACT_ROUTES = {"/api/agent/invoke"}
+HTTP_EXACT_ROUTES = {
+    "/api/agent/invoke",
+    "/api/agent/stream",
+    "/api/auth/key",
+    "/v1/chat/completions",
+}
 SURFACE_ID = re.compile(
-    r"\|\s*`(kestrel_sovereign/(?:features|endpoints)/[^`]+)`\s*\|"
+    r"\|\s*`(kestrel_sovereign/"
+    r"(?:server\.py::[^`]+|(?:features|endpoints)/[^`]+))`\s*\|"
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
@@ -162,7 +174,10 @@ def _discovered_http_surfaces() -> set[str]:
         REPO_ROOT / "kestrel_sovereign/endpoints",
         REPO_ROOT / "kestrel_sovereign/features",
     )
-    paths = sorted({path for root in roots for path in root.rglob("*.py")})
+    paths = sorted(
+        {path for root in roots for path in root.rglob("*.py")}
+        | {REPO_ROOT / "kestrel_sovereign/server.py"}
+    )
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         prefix = _router_prefix(tree)
@@ -269,6 +284,36 @@ def test_host_feature_and_shared_observability_routes_are_discovered() -> None:
         assert surface in discovered
 
 
+def test_every_live_agent_invocation_route_is_discovered() -> None:
+    discovered = _discovered_http_surfaces()
+    for surface in (
+        "kestrel_sovereign/endpoints/agent.py::POST /api/agent/invoke",
+        "kestrel_sovereign/endpoints/agent.py::POST /api/agent/stream",
+        "kestrel_sovereign/features/bridge/router.py::POST /api/bridge/invoke",
+        "kestrel_sovereign/features/bridge/router.py::POST /api/bridge/stream",
+        "kestrel_sovereign/endpoints/models.py::POST /v1/chat/completions",
+    ):
+        assert surface in discovered
+
+
+def test_app_level_host_authority_routes_are_discovered() -> None:
+    discovered = _discovered_http_surfaces()
+    for surface in (
+        "kestrel_sovereign/server.py::GET /api/auth/key",
+        "kestrel_sovereign/server.py::GET /api/host/ui/contributions",
+        "kestrel_sovereign/server.py::GET /api/host/csrf",
+        "kestrel_sovereign/server.py::POST /api/host/phoenix/session",
+    ):
+        assert surface in discovered
+
+    # The cross-agent audit and the general auth ledger must agree that the
+    # bootstrap credential is a narrow public-localhost exception, not an
+    # ordinary authenticated agent route.
+    auth_matrix = AUTH_SURFACE_MATRIX_PATH.read_text(encoding="utf-8")
+    assert "| `Public-Localhost`" in auth_matrix
+    assert "/api/auth/key" in auth_matrix
+
+
 def test_api_route_declarations_expand_every_registered_method() -> None:
     decorator = ast.parse(
         '@router.api_route("/api/tasks", methods=["POST", "PUT"])\n'
@@ -322,6 +367,44 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
         )
         assert issue in row
         assert "Defect:" in row
+
+
+def test_task_reads_remain_labeled_unscoped_until_3145_lands() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Read task inbox/status/result |")
+    )
+    assert "[#3145]" in action_row
+    assert "unscoped" in action_row.casefold()
+
+    for surface in (
+        "features/tasks/feature.py::check_task_status",
+        "features/tasks/feature.py::get_task_result",
+        "features/tasks/feature.py::list_my_tasks",
+        "command_handler.py::!tasks",
+        "endpoints/agent.py::GET /api/agent/tasks",
+        "endpoints/agent.py::GET /api/agent/tasks/{task_id}",
+        "endpoints/agent.py::GET /api/agent/tasks/{task_id}/subscribe",
+    ):
+        row = next(line for line in audit.splitlines() if surface in line)
+        assert "[#3145]" in row
+        assert "unscoped" in row.casefold()
+
+
+def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| General webhook ingress |")
+    )
+    assert "[#3216]" in row
+    assert "Defect:" in row
+    assert 'auth_type="none"' in row
+    assert "rate_limit=0" in row
+    assert "allow_unauthenticated" in row
 
 
 def _identifier_tokens(node: ast.AST) -> set[str]:
