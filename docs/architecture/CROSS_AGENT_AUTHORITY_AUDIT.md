@@ -66,6 +66,7 @@ narrow, revocable, signed delegation.
 | Bootstrap host API credential | `GET /api/auth/key` | The host-wide API authentication boundary | Public-localhost provisioning exception that yields runtime sovereign authority | The endpoint is disabled unless bootstrap policy enables it, restricts callers to loopback/Docker gateway/explicit allowed hosts, and is rate-limited. It returns the host API key. Runtime authentication maps that key to `CallerRole.SOVEREIGN`, so it satisfies the current #3149 host-lifecycle gate and can create or withdraw hosted agents. The API key remains distinct from the constitutional sovereign signing key; bootstrap policy is nevertheless a path to host administration. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Authenticate a host user / inspect credentials | `/auth/login`, `/auth/callback`, `/auth/logout`, `/auth/token`, `/auth/me`, `/auth/verify` | The host-wide OAuth session or JWT authentication boundary | Outside agent hierarchy; configured human authentication | Login, callback, logout, and token are self-authenticating entrypoints; token issuance is allowlist/password checked and rate-limited. `me` and `verify` first require central host authentication and apply their endpoint semantics. A synthesized `/api/agents/{name}/auth/*` prefix is host-authenticated by the outer middleware and does not make these host credential handlers target-agent-local or confer relation authority. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Read host UI state / issue browser tokens | `GET /api/host/ui/contributions`; `GET /api/host/csrf`; `POST /api/host/phoenix/session` | Shared host UI manifest, CSRF token, or Phoenix embed session | Host-authenticated external operation | Central API-key/JWT/session middleware protects these app-level routes. The CSRF token is a double-submit value rather than standalone authority; the Phoenix route mints a short-lived path-scoped cookie only after host authentication and backend reachability. |
+| Read API documentation or mounted UI assets | FastAPI-generated `/openapi.json`, `/docs*`, and `/redoc`; core and feature `app.mount(...)` boundaries | Host API schema/documentation and static UI asset trees | Outside agent hierarchy; host publication policy | Generated routes and programmatic mounts are entry doors even though they have no decorator. The contract inventories FastAPI constructor defaults, concrete core mount prefixes, and a stable expression marker for runtime-computed feature mount paths. A selected-agent prefix only rewrites to the same host/static tree and grants no agent relation authority. |
 | Use the host GitHub credential | `GET /api/github/repos`; `GET /api/github/{path:path}` | Repositories visible to the process-wide GitHub token and host configuration | Outside agent hierarchy; host-authenticated external operation | Global authentication protects both routes. The handlers do not bind `get_agent`; repository allowlisting constrains the process-wide token. A synthesized selected-agent prefix therefore remains host-scoped and grants no agent relation authority. |
 | Manage authenticated-user or platform service keys | `/api/keys/user*`; `GET /api/keys/platform` | The authenticated user's BYOK namespace, or the platform-global key catalog | Outside agent hierarchy; authenticated-user or host policy | User-key handlers key storage on the request-context `request.state.user_id` principal; the selected agent supplies only PostgreSQL connectivity. Missing platform/user context makes the routes unavailable. The platform catalog is host-global, so neither family becomes agent-local when reached through a selected-agent prefix. |
 | Read host/fleet health or process metrics | `GET /health`; `GET /health/detailed`; `GET /metrics` | Public aggregate readiness, authenticated per-agent fleet diagnostics, or public process-wide Prometheus telemetry | Outside agent hierarchy; deployment/operator observation policy | `/health` intentionally exposes only aggregate readiness and `/metrics` is an explicitly public scraper surface. Global authentication protects `/health/detailed`, whose multi-agent response names agents and their checks. None of these observations creates control authority. |
@@ -417,7 +418,8 @@ outside core and must define their own operator policy.
 
 ## Machine-checked HTTP inventory
 
-This inventory includes canonical HTTP routes and the live #871 `/agent/*`
+This inventory includes canonical HTTP routes, programmatic route/mount
+registrations, FastAPI-generated documentation routes, and the live #871 `/agent/*`
 compatibility spellings synthesized from every `/api/agent/*` declaration.
 The compatibility middleware rewrites those deprecated entry doors before
 downstream authentication and FastAPI dispatch, so they carry the same
@@ -514,12 +516,19 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/features/bridge/router.py::POST /api/bridge/session` | Host-authenticated session creation within the request-routed agent's Bridge feature. |
 | `kestrel_sovereign/features/web_search/feature.py::GET /api/features/web_search/test` | Request-routed agent connectivity test; not a cross-agent grant. |
 | `kestrel_sovereign/features/webhooks/receiver.py::POST /webhooks/{webhook_name}` | Agent-prefixed requests are scoped; the unprefixed route has ambiguous duplicate ownership (defect [#3216](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3216)). `auth_type="none"` plus `rate_limit=0` is intentionally open and unlimited; `allow_unauthenticated` only acknowledges it. No mode creates agent hierarchy. |
+| `kestrel_sovereign/host_features/runtime.py::MOUNT <dynamic:mount_path>` | Generic host-feature static-asset mount boundary. Its concrete host path is runtime feature metadata; the expression marker prevents the programmatic registration from escaping the exact inventory. |
 | `kestrel_sovereign/server.py::GET /api/auth/key` | Public-localhost, rate-limited host API-key bootstrap; reconciled with the checked-in auth-surface ledger. |
 | `kestrel_sovereign/server.py::GET /api/host/ui/contributions` | Host-authenticated read of the shared UI manifest. |
 | `kestrel_sovereign/server.py::GET /api/host/csrf` | Host-authenticated issuance of a double-submit CSRF token; the token is not standalone authority. |
 | `kestrel_sovereign/server.py::POST /api/host/phoenix/session` | Host-authenticated minting of a short-lived, path-scoped Phoenix embed cookie. |
+| `kestrel_sovereign/server.py::GET /docs` | FastAPI-generated host API documentation; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::GET /docs/oauth2-redirect` | FastAPI-generated documentation OAuth redirect; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::HEAD /docs` | FastAPI-generated host API documentation metadata; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::HEAD /docs/oauth2-redirect` | FastAPI-generated documentation OAuth redirect metadata; publication grants no agent relation authority. |
 | `kestrel_sovereign/server.py::GET /health` | Intentionally public aggregate readiness; no agent names or control authority. |
 | `kestrel_sovereign/server.py::GET /health/detailed` | Host-authenticated fleet diagnostics, including named per-agent health. |
+| `kestrel_sovereign/server.py::GET /openapi.json` | FastAPI-generated host API schema; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::HEAD /openapi.json` | FastAPI-generated host API schema metadata; publication grants no agent relation authority. |
 | `kestrel_sovereign/server.py::GET /phoenix` | Host-authenticated proxy read from the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::GET /phoenix/{path:path}` | Host-authenticated proxy read from the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::POST /phoenix` | Host-authenticated proxy mutation of the fleet-scoped Phoenix trace store. |
@@ -532,13 +541,20 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/server.py::DELETE /phoenix/{path:path}` | Host-authenticated proxy mutation of the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::HEAD /phoenix` | Host-authenticated proxy metadata read from the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::HEAD /phoenix/{path:path}` | Host-authenticated proxy metadata read from the fleet-scoped Phoenix trace store. |
+| `kestrel_sovereign/server.py::GET /redoc` | FastAPI-generated host ReDoc UI; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::HEAD /redoc` | FastAPI-generated host ReDoc metadata; publication grants no agent relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /js` | Programmatic mount of host UI assets; no agent relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /shared` | Programmatic mount of host UI assets; no agent relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /static` | Programmatic mount of host UI assets; no agent relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /utils` | Programmatic mount of host UI assets; no agent relation authority. |
+| `kestrel_sovereign/server.py::MOUNT <dynamic:mount_path>` | Generic agent-feature static-asset mount boundary. Its concrete path is runtime feature metadata; the selected mount grants no agent relation authority. |
 
 ## Machine-checked request-routed alias inventory
 
 The host routing middleware accepts
 `/api/agents/{selected_agent_name}/{remaining_path}` and rewrites the remainder before
 FastAPI dispatch. The table therefore spells the synthesized alias for every
-decorated core HTTP or WebSocket route, including handlers that do not consume `Request`
+declared core HTTP/WebSocket route and programmatic mount, including handlers that do not consume `Request`
 and routes whose canonical spelling contains no agent-shaped word. The
 canonical root is excluded because the router regex requires a non-empty
 remainder. Authentication sees the
@@ -712,14 +728,21 @@ known focused defect n.
 | `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/stream` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/features/web_search/feature.py::GET /api/agents/{selected_agent_name}/api/features/web_search/test` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/features/webhooks/receiver.py::POST /api/agents/{selected_agent_name}/webhooks/{webhook_name}` | W — target-selected configured webhook policy; authentication and rate limiting apply only when configured, while explicit open/unlimited mode grants no hierarchy authority. |
+| `kestrel_sovereign/host_features/runtime.py::MOUNT /api/agents/{selected_agent_name}/<dynamic:mount_path>` | H — runtime-computed host-feature asset mount; selected-agent context grants no target-local or relation authority. |
 | `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/auth/key` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/host/csrf` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/host/ui/contributions` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/assets/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/docs` | H — FastAPI-generated host documentation; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/docs/oauth2-redirect` | H — FastAPI-generated documentation redirect; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/docs` | H — FastAPI-generated host documentation metadata; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/docs/oauth2-redirect` | H — FastAPI-generated documentation redirect metadata; selected-agent context grants no target-local or relation authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/health` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/health/detailed` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/openapi.json` | H — FastAPI-generated host API schema; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/openapi.json` | H — FastAPI-generated host API schema metadata; selected-agent context grants no target-local or relation authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/assets/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
@@ -732,6 +755,13 @@ known focused defect n.
 | `kestrel_sovereign/server.py::POST /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::PUT /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::PUT /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/redoc` | H — FastAPI-generated host ReDoc UI; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/redoc` | H — FastAPI-generated host ReDoc metadata; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/js` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/shared` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/static` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/utils` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/<dynamic:mount_path>` | H — runtime-computed agent-feature asset mount; selected-agent context grants no relation authority. |
 
 ## Review rule
 

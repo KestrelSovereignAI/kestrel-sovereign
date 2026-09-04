@@ -79,11 +79,15 @@ HTTP_SEGMENTS = {
     "github",
 }
 HTTP_EXACT_ROUTES = {
+    "/docs",
+    "/docs/oauth2-redirect",
     "/health",
     "/health/detailed",
     "/metrics",
+    "/openapi.json",
     "/phoenix",
     "/phoenix/{path:path}",
+    "/redoc",
     "/api/agent/invoke",
     "/api/agent/stream",
     "/api/auth/key",
@@ -103,7 +107,7 @@ INDIRECT_DISPATCH_CALLS = {
 }
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/"
-    r"(?:server\.py::[^`]+|(?:features|endpoints)/[^`]+))`\s*\|"
+    r"(?:server\.py::[^`]+|(?:features|host_features|endpoints)/[^`]+))`\s*\|"
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
@@ -502,6 +506,91 @@ def _route_receiver_name(decorator: ast.Call) -> str | None:
     return receiver.id if isinstance(receiver, ast.Name) else None
 
 
+def _programmatic_route_path(
+    call: ast.Call,
+    constants: dict[str, str],
+) -> str:
+    """Resolve a registered path, retaining a stable marker when dynamic.
+
+    Runtime mount helpers legitimately receive a computed feature path.  Such
+    a call is still an entry-door boundary and must not disappear from the
+    exact inventory merely because its concrete path is runtime data.  The
+    expression marker changes when the registration wiring changes, forcing a
+    corresponding audit update.
+    """
+
+    path_node: ast.expr | None = call.args[0] if call.args else None
+    if path_node is None:
+        path_node = next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"path", "path_format"}
+            ),
+            None,
+        )
+    if path_node is None:
+        raise AssertionError(
+            "Programmatic route registration has no path: "
+            f"{ast.unparse(call)}"
+        )
+    resolved = _resolved_string(path_node, constants)
+    if resolved is not None:
+        return resolved
+    return f"<dynamic:{ast.unparse(path_node)}>"
+
+
+def _fastapi_generated_route_declarations(
+    statements: list[ast.stmt],
+    constants: dict[str, str],
+) -> list[tuple[tuple[str, ...], str]]:
+    """Return FastAPI's constructor-generated OpenAPI/documentation doors."""
+
+    declarations: list[tuple[tuple[str, ...], str]] = []
+
+    def optional_path(call: ast.Call, keyword_name: str, default: str) -> str | None:
+        keyword = next(
+            (item for item in call.keywords if item.arg == keyword_name),
+            None,
+        )
+        if keyword is None:
+            return default
+        if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+            return None
+        resolved = _resolved_string(keyword.value, constants)
+        if resolved is None:
+            raise AssertionError(
+                f"Unresolved FastAPI {keyword_name} expression: "
+                f"{ast.unparse(keyword.value)}"
+            )
+        return resolved
+
+    for statement in statements:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = statement.value
+        if not isinstance(value, ast.Call) or _call_name(value) != "FastAPI":
+            continue
+        openapi_path = optional_path(value, "openapi_url", "/openapi.json")
+        if openapi_path is None:
+            continue
+        declarations.append((("GET", "HEAD"), openapi_path))
+        docs_path = optional_path(value, "docs_url", "/docs")
+        if docs_path is not None:
+            declarations.append((("GET", "HEAD"), docs_path))
+            oauth_redirect_path = optional_path(
+                value,
+                "swagger_ui_oauth2_redirect_url",
+                "/docs/oauth2-redirect",
+            )
+            if oauth_redirect_path is not None:
+                declarations.append((("GET", "HEAD"), oauth_redirect_path))
+        redoc_path = optional_path(value, "redoc_url", "/redoc")
+        if redoc_path is not None:
+            declarations.append((("GET", "HEAD"), redoc_path))
+    return declarations
+
+
 def _route_declarations(
     tree: ast.Module,
     string_constants: dict[str, str],
@@ -509,7 +598,9 @@ def _route_declarations(
 ) -> list[tuple[tuple[str, ...], str]]:
     """Return methods and canonical paths with receiver/scoped prefixes."""
 
-    declarations: list[tuple[tuple[str, ...], str]] = []
+    declarations = _fastapi_generated_route_declarations(
+        tree.body, string_constants
+    )
 
     def walk_scope(
         statements: list[ast.stmt],
@@ -544,6 +635,32 @@ def _route_declarations(
             if isinstance(node, ast.ClassDef):
                 walk_scope(node.body, prefixes)
                 return
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                registration = node.func.attr.casefold()
+                if registration in {
+                    "add_api_route",
+                    "add_api_websocket_route",
+                    "add_route",
+                    "add_websocket_route",
+                    "mount",
+                }:
+                    receiver = _route_receiver_name(node)
+                    if receiver == "app":
+                        prefix = ""
+                    elif receiver is not None and receiver in prefixes:
+                        prefix = prefixes[receiver]
+                    else:
+                        raise AssertionError(
+                            "Unresolved programmatic route receiver: "
+                            f"{ast.unparse(node.func)}"
+                        )
+                    declarations.append(
+                        (
+                            _route_methods(node, method_constants),
+                            prefix
+                            + _programmatic_route_path(node, string_constants),
+                        )
+                    )
             for child in ast.iter_child_nodes(node):
                 visit(child)
 
@@ -611,8 +728,15 @@ def _route_methods(
     if not isinstance(decorator.func, ast.Attribute):
         return ()
     method = decorator.func.attr.lower()
-    if method in {"websocket", "websocket_route"}:
+    if method in {
+        "add_api_websocket_route",
+        "add_websocket_route",
+        "websocket",
+        "websocket_route",
+    }:
         return ("WEBSOCKET",)
+    if method == "mount":
+        return ("MOUNT",)
     if method in {
         "get",
         "post",
@@ -624,8 +748,43 @@ def _route_methods(
         "trace",
     }:
         return (method.upper(),)
-    if method != "api_route":
+    if method not in {"add_api_route", "add_route", "api_route", "route"}:
         return ()
+
+    def normalized(values: tuple[str, ...]) -> tuple[str, ...]:
+        methods = tuple(value.upper() for value in values)
+        if (
+            method in {"add_route", "route"}
+            and "GET" in methods
+            and "HEAD" not in methods
+        ):
+            methods = (*methods, "HEAD")
+        return methods
+
+    if method == "add_route" and len(decorator.args) >= 3:
+        positional_methods = decorator.args[2]
+        if isinstance(positional_methods, ast.Name):
+            values = (constants or {}).get(positional_methods.id)
+            if values is None:
+                raise AssertionError(
+                    "Unresolved add_route positional methods expression: "
+                    f"{ast.unparse(positional_methods)}"
+                )
+            return normalized(values)
+        if not isinstance(positional_methods, (ast.List, ast.Tuple, ast.Set)):
+            raise AssertionError(
+                "Unsupported add_route positional methods expression: "
+                f"{ast.unparse(positional_methods)}"
+            )
+        resolved = tuple(
+            _resolved_string(element) for element in positional_methods.elts
+        )
+        if any(value is None for value in resolved):
+            raise AssertionError(
+                "Unresolved add_route positional method expression: "
+                f"{ast.unparse(positional_methods)}"
+            )
+        return normalized(tuple(value for value in resolved if value is not None))
     for keyword in decorator.keywords:
         if keyword.arg != "methods":
             continue
@@ -636,7 +795,7 @@ def _route_methods(
                     "Unresolved api_route methods expression: "
                     f"{ast.unparse(keyword.value)}"
                 )
-            return tuple(value.upper() for value in values)
+            return normalized(values)
         if isinstance(keyword.value, (ast.List, ast.Tuple, ast.Set)):
             methods: list[str] = []
             for element in keyword.value.elts:
@@ -647,12 +806,12 @@ def _route_methods(
                         f"{ast.unparse(element)}"
                     )
                 methods.append(value.upper())
-            return tuple(methods)
+            return normalized(tuple(methods))
         raise AssertionError(
             "Unsupported api_route methods expression: "
             f"{ast.unparse(keyword.value)}"
         )
-    return ("GET",)
+    return normalized(("GET",))
 
 
 def _deprecated_agent_alias(route: str) -> str | None:
@@ -670,6 +829,7 @@ def _discovered_http_surfaces() -> set[str]:
     roots = (
         REPO_ROOT / "kestrel_sovereign/endpoints",
         REPO_ROOT / "kestrel_sovereign/features",
+        REPO_ROOT / "kestrel_sovereign/host_features",
     )
     paths = sorted(
         {path for root in roots for path in root.rglob("*.py")}
@@ -684,7 +844,8 @@ def _discovered_http_surfaces() -> set[str]:
         ):
             segments = {part for part in route.casefold().split("/") if part}
             if (
-                route.casefold() not in HTTP_EXACT_ROUTES
+                "MOUNT" not in methods
+                and route.casefold() not in HTTP_EXACT_ROUTES
                 and not segments.intersection(HTTP_SEGMENTS)
             ):
                 continue
@@ -704,12 +865,12 @@ def _agent_alias(route: str) -> str:
 
 
 def _discovered_request_routed_alias_surfaces() -> set[str]:
-    """Synthesize the host alias for every decorated core HTTP route.
+    """Synthesize the host alias for every declared core HTTP route.
 
     The routing middleware accepts ``/api/agents/{name}/{remaining_path}`` and
     rewrites the remainder before FastAPI dispatch.  Consequently every
-    canonical route is an agent-addressable door, even when its handler
-    does not consume ``Request`` and its path says only ``security``,
+    canonical or mounted route is an agent-addressable door, even when its
+    handler does not consume ``Request`` and its path says only ``security``,
     ``identity``, or ``conversations``.  This complete inventory complements
     the narrower set of intrinsically cross-agent/host routes above.
     """
@@ -718,6 +879,7 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
     roots = (
         REPO_ROOT / "kestrel_sovereign/endpoints",
         REPO_ROOT / "kestrel_sovereign/features",
+        REPO_ROOT / "kestrel_sovereign/host_features",
     )
     paths = sorted(
         {path for root in roots for path in root.rglob("*.py")}
@@ -1108,6 +1270,49 @@ def test_websocket_declarations_are_inventoried_as_agent_addressable() -> None:
     ]
 
 
+def test_programmatic_route_registrations_and_mounts_are_inventoried() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        "def mutate():\n    pass\n"
+        'router.add_api_route("/agents/{agent}/terminate", mutate, '
+        'methods=["POST", "DELETE"])\n'
+        'app.add_route(path="/host/status", route=mutate)\n'
+        'app.add_websocket_route("/events", mutate)\n'
+        'app.add_api_websocket_route("/api-events", mutate)\n'
+        'app.add_route("/host/mutate", mutate, ["PATCH"])\n'
+        "app.mount(mount_path, mutate)\n"
+    )
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST", "DELETE"), "/api/agents/{agent}/terminate"),
+        (("GET", "HEAD"), "/host/status"),
+        (("WEBSOCKET",), "/events"),
+        (("WEBSOCKET",), "/api-events"),
+        (("PATCH",), "/host/mutate"),
+        (("MOUNT",), "<dynamic:mount_path>"),
+    ]
+
+
+def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
+    defaults = ast.parse("app = FastAPI()\n")
+    assert _route_declarations(defaults, {}, {}) == [
+        (("GET", "HEAD"), "/openapi.json"),
+        (("GET", "HEAD"), "/docs"),
+        (("GET", "HEAD"), "/docs/oauth2-redirect"),
+        (("GET", "HEAD"), "/redoc"),
+    ]
+
+    disabled = ast.parse(
+        "app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)\n"
+    )
+    assert _route_declarations(disabled, {}, {}) == []
+
+    docs_disabled = ast.parse("app = FastAPI(docs_url=None)\n")
+    assert _route_declarations(docs_disabled, {}, {}) == [
+        (("GET", "HEAD"), "/openapi.json"),
+        (("GET", "HEAD"), "/redoc"),
+    ]
+
+
 def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
     tree = ast.parse(
         '_BASE = "/api"\n'
@@ -1356,6 +1561,7 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
     provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
     return any(
         token in provenance_tokens
+        or token.startswith("orchestrator_")
         or token == "causation"
         or token.startswith("causation_")
         or token == "causationframe"
@@ -1473,6 +1679,9 @@ def _provenance_aliases(
         elif isinstance(node, ast.NamedExpr):
             targets = [node.target]
             value = node.value
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets = [node.target]
+            value = node.iter
         if value is None:
             continue
         names = {name for target in targets for name in target_names(target)}
@@ -1606,6 +1815,15 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
                         [statement for case in node.cases for statement in case.body]
+                    )
+                ):
+                    lines.add(node.lineno)
+                continue
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                if _has_provenance_token(node.iter, provenance_aliases) and (
+                    function_is_permission_boundary
+                    or _contains_cross_agent_control_call(
+                        [*node.body, *node.orelse]
                     )
                 ):
                     lines.add(node.lineno)
@@ -1781,6 +1999,21 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    if state['lineage']:\n"
         "        cancel_task(request.target)\n"
     )
+    loop_aliases = ast.parse(
+        "def execute(request, target):\n"
+        "    for frame in request.causation_chain:\n"
+        "        if frame.agent_id == target:\n"
+        "            terminate_child(target)\n\n"
+        "async def dispatch(request, target):\n"
+        "    async for frame in request.orchestrator_frames:\n"
+        "        if frame.agent_id == target:\n"
+        "            stop_peer(target)\n"
+    )
+    propagation_only_loop = ast.parse(
+        "def dispatch(request, metadata):\n"
+        "    for frame in request.causation_chain:\n"
+        "        metadata.setdefault('frames', []).append(frame)\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
@@ -1804,6 +2037,8 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(neutral_guarded_control) == {2, 6, 9}
     assert _authority_provenance_lines(propagation_only_guard) == set()
     assert _authority_provenance_lines(stateful_aliases) == {3, 8}
+    assert _authority_provenance_lines(loop_aliases) == {2, 3, 7, 8}
+    assert _authority_provenance_lines(propagation_only_loop) == set()
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
