@@ -183,9 +183,13 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
         if _UNREPAIRED_STRUCTURE.search(prefix):
             # Text before this candidate carries structure the repair did not
             # parse — an earlier region that did not repair, in any quoting.
-            # It would be handed back RAW as the prefix, shown and searchable;
-            # the row is withheld instead (rounds 17 and 18).
-            return None
+            # It must not be handed back RAW, but the ROW is not discarded
+            # for it: tool_audit interpolates the caller's own tool name and
+            # argument keys into the reason, so a bracket the model chose
+            # was blanking its own refusal record from both read paths
+            # (round 27 review). The prefix is withheld; the masked args and
+            # the fact of the refusal survive.
+            prefix = "(prefix withheld: unmaskable structure) "
         parsed, altered = repair_json_text(text[start:])
         if parsed is not None:
             nested_repairs: list = []
@@ -347,7 +351,9 @@ def _remask_text(summary: str) -> str:
         nested_repairs: list = []
         masked = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM, reconstructed=nested_repairs)
         if masked == parsed:
-            return summary
+            # Nothing masked — but a reconstructed payload is still marked,
+            # as the dict/list branch marks it (round 27 review).
+            return summary + (_TRUNCATION_MARK if nested_repairs else "")
         return json.dumps(masked) + (_TRUNCATION_MARK if nested_repairs else "")
     if not isinstance(parsed, (dict, list)):
         return summary

@@ -2124,8 +2124,8 @@ async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_pa
     from kestrel_sovereign.features.security.permissions import fold_stored_summary
 
     row = '{"api_key": "sk-live-LEAK"] trailing {"b": 1}'
-    assert remask_summary(row) == "(summary truncated past repair; not shown)"
-    assert fold_stored_summary(row) == ""
+    assert remask_summary(row) == '(prefix withheld: unmaskable structure) {"b": 1}'
+    assert "leak" not in fold_stored_summary(row) and "prefix withheld" in fold_stored_summary(row)
 
     store = PermissionStore(str(tmp_path / "two-regions.db"))
     await store.initialize()
@@ -2137,6 +2137,7 @@ async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_pa
     feature.permission_store = store
     for probe in ("sk-live-L", "sk-live-LEAK", "trailing"):
         assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
+    assert (await feature.security_audit_search(query="prefix withheld")).data["count"] == 1
     # A prose prefix that merely brackets a word still keeps its embedded JSON.
     assert "***MASKED***" in remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"')
     # The guard is not keyed on a double-quoted key position: unrepairable
@@ -2146,8 +2147,13 @@ async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_pa
         '["sk-live-LEAK"] trailing {"b": 1}',
         "{'k': 1} then {\"b\": 1}",
     ):
-        assert remask_summary(shape) == "(summary truncated past repair; not shown)", shape
-        assert fold_stored_summary(shape) == "", shape
+        # The unrepairable PREFIX is withheld; the repairable region and the
+        # row survive (round 27: a bracket in the caller's own tool name was
+        # blanking its refusal record).
+        shown = remask_summary(shape)
+        assert shown.startswith("(prefix withheld: unmaskable structure) ") and "LEAK" not in shown, shape
+        assert '"b": 1' in shown, shape
+        assert "leak" not in fold_stored_summary(shape) and "prefix withheld" in fold_stored_summary(shape), shape
 
 
 # --------------------------------------------------------------------------
@@ -2474,8 +2480,8 @@ async def test_a_guardrail_reason_with_a_bracketed_argument_name_keeps_its_row(t
     feature = SecurityFeature.__new__(SecurityFeature)
     feature.permission_store = store
     assert (await feature.security_audit_search(query="orphans the worker")).data["count"] == 1
-    # Unrepaired structure INSIDE a bracket still withholds the row.
-    assert remask_summary("{'api_key': 'sk-live-LEAK'} then {\"b\": 1}") == "(summary truncated past repair; not shown)"
+    # Unrepaired structure INSIDE a bracket still withholds that prefix.
+    assert remask_summary("{'api_key': 'sk-live-LEAK'} then {\"b\": 1}") == '(prefix withheld: unmaskable structure) {"b": 1}'
 
 
 def test_an_intact_row_reaching_the_repair_path_is_not_marked_as_reconstructed():
@@ -2551,3 +2557,72 @@ async def test_a_non_positive_or_non_integer_limit_or_days_is_refused_not_a_fals
         assert "No recorded tool call matched" not in (result.error or "") + (result.confirmation or "")
     ok = await feature.security_audit_search(query="orphans the worker", limit=1, days=1)
     assert ok.data["count"] == 1
+
+
+# --------------------------------------------------------------------------
+# Round 28: every door marks a reconstruction; only a permission decision is
+# an authorization or a refusal; a caller's bracket cannot blank its own row.
+# --------------------------------------------------------------------------
+
+def test_a_top_level_string_row_marks_a_reconstructed_payload_with_nothing_to_mask():
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+
+    row = json.dumps('{"body": "the quick brown fo')
+    assert remask_summary(row) == row + "..."
+    assert remask_summary(json.dumps('{"body": "intact"}')) == json.dumps('{"body": "intact"}')
+
+
+@pytest.mark.asyncio
+async def test_a_non_permission_action_is_a_record_to_read_not_a_refusal(tmp_path):
+    """Every action other than a permission decision fell into the
+    authorize/refuse split by its decision value alone: a completed
+    ephemeral purge (kestrel_agent's own writer) read as work that may never
+    have happened, and an auto_mode_config row counted as 'authorized to run'."""
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+
+    store = PermissionStore(str(tmp_path / "actions.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="ephemeral_purge", tool_name="hard_purge_guard", action="ephemeral_session_close",
+        decision="leak_purged", args_summary='{"sweep": "session_close_orphan_sweep"}',
+    )
+    await store.log_decision(
+        feature_name="SecurityFeature", tool_name="auto_mode", action="auto_mode_config",
+        decision="auto_mode_allowed", args_summary='{"sweep": "session_close_orphan_sweep"}',
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    result = await feature.security_audit_search(query="session_close_orphan_sweep")
+    d = result.data
+    assert (d["authorized"], d["refused"], d["outcomes"], d["unclassified_outcomes"]) == (0, 0, 0, 2), d
+    assert "may never have happened" not in result.confirmation
+    assert "authorized to run" not in result.confirmation
+    assert result.confirmation.count("?") == 2 and "✗" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_a_bracket_in_the_refusal_reason_does_not_blank_the_row(tmp_path):
+    """tool_audit interpolates the caller's tool name into the reason; a
+    bracket the model chose withheld its own refusal record from both read
+    paths. The prefix is withheld, the masked args and the refusal survive."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = ("Tool 'delete_repo{\"x\":' is not in the known tool allowlist"
+           ' | args={"repo": "KestrelSovereignAI/kestrel-sovereign", "api_key": "sk-LEAK", "confirm": true}')
+    shown = remask_summary(row)
+    assert shown.startswith("(prefix withheld: unmaskable structure) ") and "sk-LEAK" not in shown
+    assert '"repo": "KestrelSovereignAI/kestrel-sovereign"' in shown and "***MASKED***" in shown
+    assert "kestrel-sovereign" in fold_stored_summary(row) and "sk-leak" not in fold_stored_summary(row)
+
+    store = PermissionStore(str(tmp_path / "bracket.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Guardrail", tool_name="delete_repo", action="tool_validation",
+        decision="blocked", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    found = await feature.security_audit_search(query="kestrel-sovereign")
+    assert found.data["count"] == 1 and found.data["refused"] == 1

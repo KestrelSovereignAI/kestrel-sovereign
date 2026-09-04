@@ -11,6 +11,8 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from kestrel_sovereign.features.security.permissions import SUBAGENT_DISPATCH_ACTION
+from kestrel_sovereign.security.tool_audit import ACTION_TOOL_RESOLUTION, ACTION_TOOL_VALIDATION
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import (
@@ -47,6 +49,19 @@ _AUTHORIZED_DECISIONS = frozenset({
 _COMPLETED_OUTCOME_DECISIONS = frozenset({
     "filed_and_dispatched",
     "github_write_ok",
+})
+
+#: The actions that record a PERMISSION decision about running a tool — the
+#: only rows whose ``decision`` means authorized or refused. Every other
+#: action in the table (``ephemeral_session_close``, ``mode_change``,
+#: ``permission_change``, ``auto_mode_config`` …) is a record to read, not a
+#: verdict: forcing it into the authorize/refuse split reported a completed
+#: purge as work that may never have happened (round 27 review).
+_PERMISSION_DECISION_ACTIONS = frozenset({
+    "tool_execution",
+    SUBAGENT_DISPATCH_ACTION,
+    ACTION_TOOL_VALIDATION,
+    ACTION_TOOL_RESOLUTION,
 })
 
 #: Above this many matches, ``security_audit_search`` tells the caller the
@@ -1355,6 +1370,8 @@ class SecurityFeature(Feature):
                     bounded_outcomes += 1
                 else:
                     bounded_unclassified += 1
+            elif e.get("action") not in _PERMISSION_DECISION_ACTIONS:
+                bounded_unclassified += 1
             elif e["decision"] in _AUTHORIZED_DECISIONS:
                 bounded_authorized += 1
             else:
@@ -1441,8 +1458,8 @@ class SecurityFeature(Feature):
             parts.append(f"{outcomes} completion(s) recorded")
         if unclassified:
             parts.append(
-                f"{unclassified} outcome record(s) with a decision this tool "
-                "does not classify — read them"
+                f"{unclassified} record(s) this tool does not classify as an "
+                "authorization, a refusal or a completion — read them"
             )
         if refused:
             parts.append(f"{refused} NOT authorized (refused or blocked)")
@@ -1460,6 +1477,8 @@ class SecurityFeature(Feature):
             # The same one-bucket rule as the counts above.
             if entry.get("action") == "tool_outcome":
                 marker = "✓" if entry["decision"] in _COMPLETED_OUTCOME_DECISIONS else "?"
+            elif entry.get("action") not in _PERMISSION_DECISION_ACTIONS:
+                marker = "?"
             elif entry["decision"] in _AUTHORIZED_DECISIONS:
                 marker = "→"
             else:
