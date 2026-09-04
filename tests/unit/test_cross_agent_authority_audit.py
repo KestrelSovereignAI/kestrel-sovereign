@@ -2558,6 +2558,8 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
     expected = {
         "Read observability summaries/metrics": "[#3215]",
         "Install/remove feature package": "[#3214]",
+        "Read consent history/statistics": "[#3229]",
+        "Anchor/status/verify audit history": "[#3230]",
     }
     for action, issue in expected.items():
         row = next(
@@ -2565,6 +2567,18 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
         )
         assert issue in row
         assert "Defect:" in row
+
+    tool_defects = {
+        "features/consent/feature.py::consent_log": "D-3229",
+        "features/consent/feature.py::consent_stats": "D-3229",
+        "features/audit_anchor/feature.py::audit_anchor": "D-3230",
+        "features/audit_anchor/feature.py::audit_anchor_status": "D-3230",
+        "features/audit_anchor/feature.py::audit_verify": "D-3230",
+    }
+    for surface, defect in tool_defects.items():
+        row = next(line for line in audit.splitlines() if surface in line)
+        assert defect in row
+        assert "shared PostgreSQL" in row
 
 
 def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
@@ -2914,34 +2928,7 @@ def _cross_agent_control_aliases(
             value = node.value
         if value is None:
             continue
-        if isinstance(value, ast.Name):
-            sources = {value.id.casefold()}
-        elif isinstance(value, ast.Attribute):
-            sources = {value.attr.casefold()}
-        elif isinstance(value, ast.Subscript):
-            receiver = value.value
-            sources = (
-                {receiver.id.casefold()}
-                if isinstance(receiver, ast.Name)
-                else {receiver.attr.casefold()}
-                if isinstance(receiver, ast.Attribute)
-                else set()
-            )
-        elif isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
-            elements = (
-                [*value.keys, *value.values]
-                if isinstance(value, ast.Dict)
-                else list(value.elts)
-            )
-            sources = {
-                element.id.casefold()
-                if isinstance(element, ast.Name)
-                else element.attr.casefold()
-                for element in elements
-                if isinstance(element, (ast.Name, ast.Attribute))
-            }
-        else:
-            sources = set()
+        sources = _control_reference_sources(value)
         if not sources:
             continue
         for target in targets:
@@ -2968,6 +2955,69 @@ def _cross_agent_control_aliases(
     return aliases
 
 
+def _control_reference_sources(node: ast.AST) -> set[str]:
+    """Return callable names preserved by static control factories.
+
+    A control remains a control when code obtains the bound method through a
+    static ``getattr`` or wraps it in ``functools.partial``.  Follow those
+    standard callable-producing forms, plus the collection/selector aliases
+    already supported by the scanner.  Dynamic attribute strings deliberately
+    resolve to no source: the repository contract cannot prove what they name.
+    """
+
+    while isinstance(node, (ast.Await, ast.Expr)):
+        node = node.value
+    if isinstance(node, ast.Name):
+        return {node.id.casefold()}
+    if isinstance(node, ast.Attribute):
+        return {node.attr.casefold()}
+    if isinstance(node, ast.Subscript):
+        receiver = node.value
+        return (
+            {receiver.id.casefold()}
+            if isinstance(receiver, ast.Name)
+            else {receiver.attr.casefold()}
+            if isinstance(receiver, ast.Attribute)
+            else set()
+        )
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+        elements = (
+            [*node.keys, *node.values]
+            if isinstance(node, ast.Dict)
+            else list(node.elts)
+        )
+        return {
+            source
+            for element in elements
+            if element is not None
+            for source in _control_reference_sources(element)
+        }
+    if not isinstance(node, ast.Call):
+        return set()
+
+    factory_name = _call_name(node).casefold()
+    if factory_name == "getattr":
+        attribute = (
+            node.args[1]
+            if len(node.args) > 1
+            else next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg in {"name", "attr"}
+                ),
+                None,
+            )
+        )
+        if attribute is None:
+            return set()
+        resolved = _resolved_string(attribute)
+        return {resolved.casefold()} if resolved is not None else set()
+    if factory_name in {"partial", "partialmethod"} and node.args:
+        return _control_reference_sources(node.args[0])
+    return set()
+
+
 def _is_cross_agent_control_call(
     node: ast.Call,
     control_aliases: set[str] | None = None,
@@ -2980,11 +3030,9 @@ def _is_cross_agent_control_call(
     # ``handlers["terminate_child"]`` is a control sink, while a neutral call
     # on ``task_manager`` must not become one merely because the receiver name
     # contains the broad inventory term ``task``.
-    callable_tokens = (
-        _identifier_tokens(node.func.slice)
-        if isinstance(node.func, ast.Subscript)
-        else set()
-    )
+    callable_tokens = set(_control_reference_sources(node.func))
+    if isinstance(node.func, ast.Subscript):
+        callable_tokens.update(_identifier_tokens(node.func.slice))
     return (
         _is_cross_agent_control_name(call_name)
         or call_name in (control_aliases or set())
@@ -3005,10 +3053,11 @@ def _is_unambiguous_control_sink(
     call_name = _call_name(call).casefold()
     if call_name in (known_helpers or set()):
         return True
-    selector_tokens = (
+    selector_tokens = set(_control_reference_sources(call.func))
+    selector_tokens.update(
         _identifier_tokens(call.func.slice)
         if isinstance(call.func, ast.Subscript)
-        else frozenset()
+        else ()
     )
     control_actions = (
         "cancel",
@@ -3633,11 +3682,10 @@ def _cached_contains_cross_agent_control_call(
 def _is_cross_agent_control_reference(node: ast.AST) -> bool:
     """Whether an expression selects a control callable without invoking it."""
 
-    if isinstance(node, ast.Name):
-        return _is_cross_agent_control_name(node.id)
-    if isinstance(node, ast.Attribute):
-        return _is_cross_agent_control_name(node.attr)
-    return False
+    return any(
+        _is_cross_agent_control_name(source)
+        for source in _control_reference_sources(node)
+    )
 
 
 def _guard_clause_provenance_lines(
@@ -4505,6 +4553,31 @@ def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers(
     assert _authority_provenance_lines(mapped_callback) == {2}
     assert _authority_provenance_lines(helper_selected_target) == {3}
     assert _authority_provenance_lines(container_selected_callback) == {4}
+
+
+def test_provenance_scanner_follows_callable_control_factories() -> None:
+    getattr_callback = ast.parse(
+        "def dispatch(request, manager, target):\n"
+        "    callback = getattr(manager, 'terminate_child')\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    partial_callback = ast.parse(
+        "from functools import partial\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    callback = partial(manager.terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    direct_getattr = ast.parse(
+        "def dispatch(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        getattr(manager, 'terminate_child')(target)\n"
+    )
+
+    assert _authority_provenance_lines(getattr_callback) == {3}
+    assert _authority_provenance_lines(partial_callback) == {5}
+    assert _authority_provenance_lines(direct_getattr) == {2}
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
