@@ -12,7 +12,7 @@ import asyncio
 import errno
 import hashlib
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -329,12 +329,52 @@ async def _gather_database_probes(
         raise
 
 
-async def _read_postgres_hold_custody_snapshot(
+@asynccontextmanager
+async def _postgres_custody_locks(
+    primary_db: Any,
+    evidence_db: Any,
+    *,
+    primary_cluster: str,
+    evidence_cluster: str,
+):
+    """Lock both custody clusters in one deterministic global order.
+
+    The same pair can be presented in opposite roles by two concurrent cold
+    starts. Locking only the configured evidence side would then give each
+    process a different serialization point and let both publish incompatible
+    roles. Cluster identities are immutable PostgreSQL ``initdb`` identities,
+    so sorting them gives every role ordering the same acquisition order.
+    """
+
+    if primary_cluster == evidence_cluster:
+        raise HoldStateError(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+    databases = sorted(
+        (
+            (primary_cluster, "primary", primary_db),
+            (evidence_cluster, "evidence", evidence_db),
+        ),
+        key=lambda item: item[0],
+    )
+    async with AsyncExitStack() as stack:
+        for _cluster, label, database in databases:
+            lock_owner = getattr(database, "backend", None) or database
+            locks = getattr(lock_owner, "advisory_locks", None)
+            if not callable(locks):
+                raise HoldStateError(
+                    f"PostgreSQL Hold {label} database cannot provide advisory locks"
+                )
+            await stack.enter_async_context(locks((_POSTGRES_EVIDENCE_LOCK,)))
+        yield
+
+
+async def _read_raw_postgres_cluster_identity(
     backend: Any,
     *,
     label: str,
-) -> PostgresHoldCustodySnapshot:
-    """Read custody evidence without creating or changing database objects."""
+) -> str:
+    """Return the cluster identity from one connected raw PostgreSQL pool."""
 
     try:
         cluster_rows = await backend.fetch_all(
@@ -355,7 +395,20 @@ async def _read_postgres_hold_custody_snapshot(
         raise HoldStateError(
             f"could not verify PostgreSQL Hold {label} cluster identity"
         )
-    cluster_identity = cluster_rows[0][0]
+    return cluster_rows[0][0]
+
+
+async def _read_postgres_hold_custody_snapshot(
+    backend: Any,
+    *,
+    label: str,
+) -> PostgresHoldCustodySnapshot:
+    """Read custody evidence without creating or changing database objects."""
+
+    cluster_identity = await _read_raw_postgres_cluster_identity(
+        backend,
+        label=label,
+    )
 
     try:
         table_rows = await backend.fetch_all(
@@ -472,17 +525,45 @@ async def _connect_postgres_hold_custody_backends(
             primary_backend.connect(),
             evidence_backend.connect(),
         )
-        primary, evidence = await _gather_database_probes(
-            _read_postgres_hold_custody_snapshot(
+        primary_cluster, evidence_cluster = await _gather_database_probes(
+            _read_raw_postgres_cluster_identity(
                 primary_backend,
                 label="primary",
             ),
-            _read_postgres_hold_custody_snapshot(
+            _read_raw_postgres_cluster_identity(
                 evidence_backend,
                 label="evidence",
             ),
         )
-        validate_postgres_hold_custody(primary, evidence)
+        async with _postgres_custody_locks(
+            primary_backend,
+            evidence_backend,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ):
+            # Re-read the entire pair only after both clusters are locked. A
+            # concurrent first boot publishes domain and role rows in stages;
+            # two unlocked per-database reads can otherwise construct a state
+            # that never existed as one custody snapshot.
+            primary, evidence = await _gather_database_probes(
+                _read_postgres_hold_custody_snapshot(
+                    primary_backend,
+                    label="primary",
+                ),
+                _read_postgres_hold_custody_snapshot(
+                    evidence_backend,
+                    label="evidence",
+                ),
+            )
+            if (
+                primary.cluster_identity != primary_cluster
+                or evidence.cluster_identity != evidence_cluster
+            ):
+                raise HoldStateError(
+                    "PostgreSQL Hold cluster identity changed while acquiring "
+                    "custody locks"
+                )
+            validate_postgres_hold_custody(primary, evidence)
     except BaseException as failure:
         close_errors: tuple[BaseException, ...] = ()
         try:
@@ -1092,12 +1173,14 @@ class HoldStore:
             )
         return rows[0][0]
 
-    async def _assert_postgres_clusters_independent(self) -> None:
-        """Reject databases sharing one cluster-level backup/restore unit."""
+    async def _assert_postgres_clusters_independent(self) -> tuple[str, str]:
+        """Reject one backup unit and return both immutable cluster identities."""
 
         evidence_db = self._evidence_db
         if evidence_db is None:
-            return
+            raise HoldStateError(
+                "PostgreSQL Hold requires an independent evidence database"
+            )
         primary, evidence = await _gather_database_probes(
             self._postgres_cluster_identity(self._db, label="primary"),
             self._postgres_cluster_identity(evidence_db, label="evidence"),
@@ -1106,6 +1189,7 @@ class HoldStore:
             raise HoldStateError(
                 "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
             )
+        return primary, evidence
 
     async def _read_postgres_binding(
         self,
@@ -1237,12 +1321,11 @@ class HoldStore:
                 _POSTGRES_PRIMARY_BINDING_KEY,
                 binding,
             )
-            # INSERT .. DO NOTHING is a compare-and-declare boundary. Another
-            # host may have won it while this host was preparing a different
-            # evidence domain, because their serialization locks live on those
-            # different evidence clusters. Adopt a compatible winner (same
-            # pair, different UUID), but reject an incompatible winner before
-            # writing anything into this host's evidence database.
+            # INSERT .. DO NOTHING is a compare-and-declare boundary. The pair
+            # locks serialize cooperating initializers, while the re-read also
+            # covers a role left by an interrupted older boot or an out-of-band
+            # writer. Adopt a compatible winner (same pair, different UUID),
+            # but reject an incompatible winner before writing into evidence.
             primary_binding = await self._read_postgres_binding(
                 self._db,
                 _POSTGRES_PRIMARY_BINDING_KEY,
@@ -1297,20 +1380,27 @@ class HoldStore:
 
     @asynccontextmanager
     async def _postgres_evidence_lock(self):
-        """Serialize a primary snapshot with external PostgreSQL evidence."""
+        """Serialize a primary snapshot across both PostgreSQL custody clusters."""
 
         evidence_db = self._evidence_db
         if evidence_db is None:
             yield
             return
-        await self._assert_postgres_clusters_independent()
-        lock_owner = getattr(evidence_db, "backend", evidence_db)
-        locks = getattr(lock_owner, "advisory_locks", None)
-        if not callable(locks):
-            raise HoldStateError(
-                "PostgreSQL Hold evidence database cannot provide advisory locks"
-            )
-        async with locks((_POSTGRES_EVIDENCE_LOCK,)):
+        primary_cluster, evidence_cluster = (
+            await self._assert_postgres_clusters_independent()
+        )
+        async with _postgres_custody_locks(
+            self._db,
+            evidence_db,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ):
+            locked_clusters = await self._assert_postgres_clusters_independent()
+            if locked_clusters != (primary_cluster, evidence_cluster):
+                raise HoldStateError(
+                    "PostgreSQL Hold cluster identity changed while acquiring "
+                    "custody locks"
+                )
             await self._assert_postgres_evidence_domain_independent()
             yield
 

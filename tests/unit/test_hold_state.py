@@ -82,7 +82,11 @@ class _PostgresCustodyFacade:
         self.metadata = {}
         if domain_identity is not None:
             self.metadata["hold_rollback_domain_id_v1"] = domain_identity
-        self.backend = backend
+        self.backend = backend if backend is not None else self
+
+    @asynccontextmanager
+    async def advisory_locks(self, _keys):
+        yield
 
     async def fetchall(self, query, params=()):
         if "pg_control_system" in query:
@@ -2731,32 +2735,36 @@ async def test_postgres_evidence_lock_rejects_same_database_identity():
 
 @pytest.mark.asyncio
 async def test_postgres_evidence_lock_uses_independent_service_session():
-    """The external session lock spans the caller's whole evidence boundary."""
+    """Both cluster sessions span the boundary in immutable cluster order."""
 
     events: list[object] = []
 
-    @asynccontextmanager
-    async def advisory_locks(keys):
-        events.append(("lock", keys))
-        try:
-            yield
-        finally:
-            events.append("unlock")
+    def lock_backend(label):
+        @asynccontextmanager
+        async def advisory_locks(keys):
+            events.append(("lock", label, keys))
+            try:
+                yield
+            finally:
+                events.append(("unlock", label))
+
+        return SimpleNamespace(advisory_locks=advisory_locks)
 
     primary = _PostgresCustodyFacade(
-        "cluster-primary",
+        "cluster-z-primary",
         domain_identity=(
             "kestrel-hold-rollback-domain-v1:"
             "00000000-0000-0000-0000-000000000001"
         ),
+        backend=lock_backend("primary"),
     )
     evidence = _PostgresCustodyFacade(
-        "cluster-evidence",
+        "cluster-a-evidence",
         domain_identity=(
             "kestrel-hold-rollback-domain-v1:"
             "00000000-0000-0000-0000-000000000002"
         ),
-        backend=SimpleNamespace(advisory_locks=advisory_locks),
+        backend=lock_backend("evidence"),
     )
     store = HoldStore(primary, evidence_db=evidence)
 
@@ -2764,9 +2772,11 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
         events.append("body")
 
     assert events == [
-        ("lock", ((0x004B4553, 0x484F4C44),)),
+        ("lock", "evidence", ((0x004B4553, 0x484F4C44),)),
+        ("lock", "primary", ((0x004B4553, 0x484F4C44),)),
         "body",
-        "unlock",
+        ("unlock", "primary"),
+        ("unlock", "evidence"),
     ]
 
 
@@ -2828,6 +2838,78 @@ async def test_postgres_evidence_lock_rejects_swapped_custody_roles():
 
     with pytest.raises(HoldStateError, match="custody role|binding"):
         async with HoldStore(evidence, evidence_db=primary)._postgres_evidence_lock():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_reversed_concurrent_custody_boots_cannot_poison_role_metadata():
+    """Opposite configurations serialize before either durable role write."""
+
+    cluster_locks = {
+        "cluster-a": asyncio.Lock(),
+        "cluster-b": asyncio.Lock(),
+    }
+
+    class _LockBackend:
+        def __init__(self, cluster):
+            self.cluster = cluster
+
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            assert keys == ((0x004B4553, 0x484F4C44),)
+            async with cluster_locks[self.cluster]:
+                yield
+
+    database_a = _PostgresCustodyFacade(
+        "cluster-a", backend=_LockBackend("cluster-a")
+    )
+    database_b = _PostgresCustodyFacade(
+        "cluster-b", backend=_LockBackend("cluster-b")
+    )
+    arrivals = asyncio.Barrier(2)
+
+    class _RacingStore(HoldStore):
+        def __init__(self, db, *, evidence_db):
+            super().__init__(db, evidence_db=evidence_db)
+            self._first_cluster_read = True
+
+        async def _assert_postgres_clusters_independent(self):
+            identities = await super()._assert_postgres_clusters_independent()
+            if self._first_cluster_read:
+                self._first_cluster_read = False
+                await arrivals.wait()
+            return identities
+
+    orientations = (
+        _RacingStore(database_a, evidence_db=database_b),
+        _RacingStore(database_b, evidence_db=database_a),
+    )
+
+    async def enter(store):
+        async with store._postgres_evidence_lock():
+            return None
+
+    results = await asyncio.gather(
+        *(enter(store) for store in orientations),
+        return_exceptions=True,
+    )
+
+    assert sum(result is None for result in results) == 1
+    assert sum(isinstance(result, HoldStateError) for result in results) == 1
+    role_keys = {
+        "hold_primary_custody_binding_v1",
+        "hold_evidence_custody_binding_v1",
+    }
+    assert len(role_keys & database_a.metadata.keys()) == 1
+    assert len(role_keys & database_b.metadata.keys()) == 1
+    assert not role_keys <= database_a.metadata.keys()
+    assert not role_keys <= database_b.metadata.keys()
+    winner = orientations[results.index(None)]
+    loser = orientations[1 - results.index(None)]
+    async with winner._postgres_evidence_lock():
+        pass
+    with pytest.raises(HoldStateError, match="custody role|binding"):
+        async with loser._postgres_evidence_lock():
             pass
 
 
@@ -2967,6 +3049,11 @@ async def test_postgres_custody_preflight_is_read_only_and_closes_raw_pools(
                 return [(None,)]
             raise AssertionError(f"unexpected preflight query: {query}")
 
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            assert keys == ((0x004B4553, 0x484F4C44),)
+            yield
+
         async def close(self):
             self.closed = True
 
@@ -2979,7 +3066,100 @@ async def test_postgres_custody_preflight_is_read_only_and_closes_raw_pools(
 
     assert len(backends) == 2
     assert all(backend.closed for backend in backends)
-    assert all(len(backend.queries) == 2 for backend in backends)
+    assert all(len(backend.queries) == 3 for backend in backends)
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_preflight_waits_out_partial_role_publication(
+    monkeypatch,
+):
+    """A two-database snapshot cannot straddle a publisher's role writes."""
+
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    primary_dsn = "postgresql://primary/db"
+    evidence_dsn = "postgresql://evidence/db"
+    clusters = {
+        primary_dsn: "cluster-a",
+        evidence_dsn: "cluster-b",
+    }
+    locks = {dsn: asyncio.Lock() for dsn in clusters}
+    metadata = {dsn: {} for dsn in clusters}
+    start_publisher = asyncio.Event()
+    publisher_done = asyncio.Event()
+    preflight_lock_depth = 0
+    primary_domain = _custody_domain(1)
+    evidence_domain = _custody_domain(2)
+    binding = postgres_hold_custody_binding_payload(
+        uuid4(), primary_domain, evidence_domain
+    )
+
+    class _Backend:
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            assert (min_pool_size, max_pool_size) == (1, 1)
+
+        async def connect(self):
+            return None
+
+        async def fetch_all(self, query, params=()):
+            if "pg_control_system" in query:
+                return [(clusters[self.dsn],)]
+            if "to_regclass" in query:
+                return [("agent_metadata",)]
+            if "SELECT key, value" in query:
+                if preflight_lock_depth:
+                    return list(metadata[self.dsn].items())
+                if self.dsn == primary_dsn:
+                    # The old unlocked preflight captures this empty side,
+                    # then its sibling query observes the completed publish.
+                    rows = list(metadata[self.dsn].items())
+                    start_publisher.set()
+                    await publisher_done.wait()
+                    return rows
+                await publisher_done.wait()
+                return list(metadata[self.dsn].items())
+            raise AssertionError(f"unexpected custody query: {query}")
+
+        @asynccontextmanager
+        async def advisory_locks(self, keys):
+            nonlocal preflight_lock_depth
+            assert keys == ((0x004B4553, 0x484F4C44),)
+            async with locks[self.dsn]:
+                preflight_lock_depth += 1
+                start_publisher.set()
+                try:
+                    yield
+                finally:
+                    preflight_lock_depth -= 1
+
+        async def close(self):
+            return None
+
+    async def publish_roles():
+        await start_publisher.wait()
+        async with locks[primary_dsn]:
+            async with locks[evidence_dsn]:
+                metadata[primary_dsn].update(
+                    {
+                        "hold_rollback_domain_id_v1": primary_domain,
+                        "hold_primary_custody_binding_v1": binding,
+                    }
+                )
+                metadata[evidence_dsn].update(
+                    {
+                        "hold_rollback_domain_id_v1": evidence_domain,
+                        "hold_evidence_custody_binding_v1": binding,
+                    }
+                )
+        publisher_done.set()
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+    publisher = asyncio.create_task(publish_roles())
+    await preflight_postgres_hold_custody(primary_dsn, evidence_dsn)
+    await publisher
+
+    assert metadata[evidence_dsn]["hold_rollback_domain_id_v1"] == evidence_domain
 
 
 @pytest.mark.asyncio
@@ -3015,8 +3195,11 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
 
         @asynccontextmanager
         async def advisory_locks(self, keys):
-            assert keys == ((0x004B4553, 0x5343484D),)
-            events.append(("schema-lock", self))
+            label = {
+                ((0x004B4553, 0x484F4C44),): "custody-lock",
+                ((0x004B4553, 0x5343484D),): "schema-lock",
+            }[keys]
+            events.append((label, self))
             yield
 
         async def close(self):
@@ -3104,7 +3287,10 @@ async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
 
         @asynccontextmanager
         async def advisory_locks(self, keys):
-            assert keys == ((0x004B4553, 0x5343484D),)
+            assert keys in {
+                ((0x004B4553, 0x484F4C44),),
+                ((0x004B4553, 0x5343484D),),
+            }
             async with schema_locks[self.dsn]:
                 yield
 
@@ -3190,7 +3376,10 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
 
         @asynccontextmanager
         async def advisory_locks(self, keys):
-            assert keys == ((0x004B4553, 0x5343484D),)
+            assert keys in {
+                ((0x004B4553, 0x484F4C44),),
+                ((0x004B4553, 0x5343484D),),
+            }
             yield
 
         async def close(self):
