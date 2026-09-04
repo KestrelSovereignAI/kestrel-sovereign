@@ -2129,5 +2129,14 @@ async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_pa
     feature.permission_store = store
     for probe in ("sk-live-L", "sk-live-LEAK", "trailing"):
         assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
-    # A prose prefix with no key position still keeps its embedded JSON.
+    # A prose prefix that merely brackets a word still keeps its embedded JSON.
     assert "***MASKED***" in remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"')
+    # The guard is not keyed on a double-quoted key position: unrepairable
+    # structure in any quoting before a repairable region withholds the row.
+    for shape in (
+        "{'api_key': 'sk-live-LEAK'} then {\"b\": 1}",
+        '["sk-live-LEAK"] trailing {"b": 1}',
+        "{'k': 1} then {\"b\": 1}",
+    ):
+        assert remask_summary(shape) == "(summary truncated past repair; not shown)", shape
+        assert fold_stored_summary(shape) == "", shape

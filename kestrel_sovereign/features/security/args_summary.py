@@ -37,8 +37,13 @@ SENSITIVE_KEY_SUBSTRINGS = (
 
 #: What ``summarize_args`` appends when it cuts a row; stripped before repair.
 _TRUNCATION_MARK = "..."
-#: A JSON key position (``"...":``) — the one shape that can carry a secret.
-_KEY_POSITION = re.compile(r'"\s*:')
+#: Structure the repair could not parse but that may carry a value: a bracket
+#: with a quote or a colon anywhere after it. A JSON key position is one such
+#: shape; a single-quoted dict or a bare array of strings is another, and a
+#: guard keyed on the double-quoted key alone let those through raw (round 18
+#: review). Prose that merely brackets a word (``[wallet] | args=``) has
+#: neither and stays.
+_UNREPAIRED_STRUCTURE = re.compile(r"[{\[][^{\[]*[\"':]")
 #: Trailing characters repair may drop to reach a parseable cut point: a cut
 #: inside a ``\\uXXXX`` escape needs up to six, a bare literal (``tru``) four.
 _MAX_REPAIR_TRIM = 8
@@ -152,11 +157,11 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
         return text, None
     for start in starts:
         prefix = text[:start]
-        if _KEY_POSITION.search(prefix):
-            # Text before this candidate carries a key position — an earlier
-            # JSON region that did not repair, or JSON-shaped prose. It would
-            # be handed back RAW as the prefix, shown and searchable; the row
-            # is withheld instead (round 17 review).
+        if _UNREPAIRED_STRUCTURE.search(prefix):
+            # Text before this candidate carries structure the repair did not
+            # parse — an earlier region that did not repair, in any quoting.
+            # It would be handed back RAW as the prefix, shown and searchable;
+            # the row is withheld instead (rounds 17 and 18).
             return None
         parsed = complete_truncated_json(text[start:])
         if parsed is not None:
