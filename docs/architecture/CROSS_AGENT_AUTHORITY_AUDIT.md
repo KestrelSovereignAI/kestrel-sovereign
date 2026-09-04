@@ -70,6 +70,7 @@ narrow, revocable, signed delegation.
 | Read observability summaries/metrics | `GET /api/observability/summary`; `GET /api/observability/metrics/{metric_name}` | The routed agent's events only | Self | A per-agent SQLite store happens to isolate the data, but shared PostgreSQL queries omit the trusted agent predicate and the metrics route accepts an arbitrary optional `agent_name`. Defect: [#3215](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3215). |
 | Inspect/configure routed feature state | Feature catalog/detail/config/skills routes; feature enable/disable/config mutation | The request-routed agent | Self or sovereign/delegated operator policy | `get_agent(request)` binds the target runtime. These namespace matches are classified explicitly so they cannot conceal a future cross-agent implementation; they currently do not grant one agent authority over another. |
 | Install/remove feature package | `POST /api/features/{name}/install`; `POST /api/features/{name}/remove` | Shared host interpreter and all loaded users of the package | Sovereign/delegated | The handlers currently require only an authenticated routed agent despite their sovereign-only docstrings. Defect: [#3214](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3214). |
+| Manage shared local models | `pull_model`; `cleanup_models(dry_run=False)` | Shared local-model service and model storage used by every co-hosted agent | Sovereign/delegated | The tools currently use ordinary feature permission and mutate the shared Ollama/model store. Cleanup protects only models used by the calling agent rather than accounting for all hosted agents. Defect: [#3221](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3221). |
 | Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Outbound records retain creator/recipient binding. Shared-store reads and HTTP/SSE still need durable principal predicates: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`, built-in `!tasks`; task GET/list/SSE endpoints | Today, any row found by an unscoped ID/full-table query; intended recipient inbox or creator-owned result | Self (recipient or creator, according to operation) | The current tool, command, HTTP, and SSE reads omit a durable recipient/creator predicate on shared PostgreSQL, so the required Self class is not enforced. Defect: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Enforced by [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144): each mutation binds the trusted caller DID and includes the recipient in the durable atomic predicate. |
@@ -93,16 +94,15 @@ machine-checked inventory below before shipping.
 
 ## Machine-checked tool inventory
 
-The contract test discovers every `@tool` whose public name names an agent
-relation (`agent`, `peer`, `a2a`, `child`, `descendant`, or `delegate`), a work
-object (`task`), a control verb (`cancel`, `interrupt`, `stop`, `hold`,
-`terminate`, `offboard`, or `withdraw`), or host/fleet/restart scope. Every
-match must remain classified here, including false positives, so a newly named
-cross-agent door cannot silently appear merely because it omits `agent`.
-The scanner also follows the generic `execute_skill`, `execute_named_tool`, and
-`_create_schedule` dispatch calls, because a meta-tool can reach an
-authority-bearing target even when its own public name contains none of those
-words.
+The contract test discovers every core feature `@tool`, including tools that
+appear agent-local or external. Cross-agent capability is a property of the
+implementation and deployment, not a public-name convention: exact inventory
+of the complete registered set prevents a shared-host mutation from hiding
+behind an innocuous name. False positives remain explicitly classified. The
+inventory therefore also includes generic `execute_skill`,
+`execute_named_tool`, and `_create_schedule` dispatchers; those meta-tools can
+reach an authority-bearing target even when their own names contain no relation
+or control words.
 
 | Surface ID | Classification |
 |---|---|
@@ -138,6 +138,189 @@ words.
 | `kestrel_sovereign/features/tasks/feature.py::respond_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/tasks/feature.py::run_workflow` | Self-owned indirect dispatcher through `TaskManager.execute_skill`; each selected feature tool retains its PRE_TOOL_USE and target-specific authority checks, so the workflow supplies sequence, not relation authority. |
 | `kestrel_sovereign/features/todo/feature.py::todo_link_task` | Self-owned todo metadata link; not an A2A task control. |
+| `kestrel_sovereign/features/attachments/feature.py::read_attachment` | Caller-bound attachment read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/audit_anchor/feature.py::audit_anchor` | Caller/runtime audit records anchored to or verified against an external transparency service; no agent relation authority. |
+| `kestrel_sovereign/features/audit_anchor/feature.py::audit_anchor_status` | Caller/runtime audit records anchored to or verified against an external transparency service; no agent relation authority. |
+| `kestrel_sovereign/features/audit_anchor/feature.py::audit_verify` | Caller/runtime audit records anchored to or verified against an external transparency service; no agent relation authority. |
+| `kestrel_sovereign/features/bootstrap/feature.py::bootstrap_add` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bootstrap/feature.py::bootstrap_list` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bootstrap/feature.py::bootstrap_reload` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bootstrap/feature.py::bootstrap_remove` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bootstrap/feature.py::bootstrap_status` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bootstrap/feature.py::skip_discovery` | Caller-owned bootstrap configuration or state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/bridge/feature.py::bridge_connections` | Caller-bound external bridge connection or history; no co-hosted-agent control. |
+| `kestrel_sovereign/features/bridge/feature.py::bridge_history` | Caller-bound external bridge connection or history; no co-hosted-agent control. |
+| `kestrel_sovereign/features/bridge/feature.py::bridge_status` | Caller-bound external bridge connection or history; no co-hosted-agent control. |
+| `kestrel_sovereign/features/channels/feature.py::channels_history` | Caller-configured external-channel operation; channel policy and ordinary tool consent remain enforcement, not agent hierarchy. |
+| `kestrel_sovereign/features/channels/feature.py::channels_list` | Caller-configured external-channel operation; channel policy and ordinary tool consent remain enforcement, not agent hierarchy. |
+| `kestrel_sovereign/features/channels/feature.py::channels_send` | Caller-configured external-channel operation; channel policy and ordinary tool consent remain enforcement, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::cli_status` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::git_diff` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::git_log` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::git_merge_base` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::git_show_file` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/cli/feature.py::git_status` | Read-only inspection of the configured repository checkout; shared-host observation is operational access, not agent hierarchy. |
+| `kestrel_sovereign/features/compute/feature.py::empty_trash` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::execution_history` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::get_compute_capabilities` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::get_compute_policy` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::list_scripts` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::list_trash` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::restore_from_trash` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::run_script` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::show_script` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/compute/feature.py::write_script` | Compute-workspace operation governed by configured sandbox, path, trash, and approval policy; any host reach is operational capability, not agent authority. |
+| `kestrel_sovereign/features/computer_use/feature.py::fs_edit` | Host-computer operation governed by filesystem/shell policy and consent; this strong operational capability grants no relation authority. |
+| `kestrel_sovereign/features/computer_use/feature.py::fs_list` | Host-computer operation governed by filesystem/shell policy and consent; this strong operational capability grants no relation authority. |
+| `kestrel_sovereign/features/computer_use/feature.py::fs_read` | Host-computer operation governed by filesystem/shell policy and consent; this strong operational capability grants no relation authority. |
+| `kestrel_sovereign/features/computer_use/feature.py::fs_write` | Host-computer operation governed by filesystem/shell policy and consent; this strong operational capability grants no relation authority. |
+| `kestrel_sovereign/features/computer_use/feature.py::shell` | Host-computer operation governed by filesystem/shell policy and consent; this strong operational capability grants no relation authority. |
+| `kestrel_sovereign/features/consent/feature.py::consent_log` | Caller-owned consent record read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/consent/feature.py::consent_stats` | Caller-owned consent record read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/constitution.py::constitution` | No co-hosted-agent target identified; caller-local or external-operation policy remains enforcement. |
+| `kestrel_sovereign/features/context/feature.py::compact_context` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_apply` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_drop` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_list` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_peek` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_pop` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_stash_save` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::context_status` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::exclude_from_context` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::hierarchical_compact` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::mark_content` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::recursive_query` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::restore_excluded` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/context/feature.py::summarize_section` | Caller-owned context mutation or read; no co-hosted-agent target. |
+| `kestrel_sovereign/features/delivery/feature.py::delivery_failed` | Caller-owned outbound delivery queue operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/delivery/feature.py::delivery_purge` | Caller-owned outbound delivery queue operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/delivery/feature.py::delivery_queue_list` | Caller-owned outbound delivery queue operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/delivery/feature.py::delivery_retry` | Caller-owned outbound delivery queue operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/delivery/feature.py::delivery_status` | Caller-owned outbound delivery queue operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::health_check` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::health_history` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::health_interval` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::heartbeat_check` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::heartbeat_interval` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/health/feature.py::heartbeat_status` | Caller runtime health or heartbeat state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::assess_substrate` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::export_identity` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::import_identity` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::lifecycle_status` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::migration_history` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/identity/feature.py::verify_identity` | Caller identity, custody, lifecycle, or migration operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/inference_lease/feature.py::inference_lease_acquire` | Owner-bound lease over shared inference capacity; lease ownership and provider policy apply, and no agent hierarchy is granted. |
+| `kestrel_sovereign/features/inference_lease/feature.py::inference_lease_release` | Owner-bound lease over shared inference capacity; lease ownership and provider policy apply, and no agent hierarchy is granted. |
+| `kestrel_sovereign/features/inference_lease/feature.py::inference_lease_status` | Owner-bound lease over shared inference capacity; lease ownership and provider policy apply, and no agent hierarchy is granted. |
+| `kestrel_sovereign/features/keys/feature.py::add_service_key` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::delete_service_key` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::get_key_usage` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::list_providers` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::list_service_keys` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::remove_service_key` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/keys/feature.py::rotate_service_key` | Caller-owned service-credential operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::confirm_person_match` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::delete_conversation` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::delete_message_by_id` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::delete_messages` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::get_episodes` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::list_conversations` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::list_trashed_messages` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::mark_superseded` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::memory_consolidate` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::memory_index_backfill` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::memory_status` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::purge_conversation` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::purge_message_by_id` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::recall_action_items` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::recall_decisions` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::recall_emotional` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::recall_interactions` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::recall_recent` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::restore_conversation` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::restore_message_by_id` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::search_case_law` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::search_documents` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::search_memory` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory/feature.py::update_action_item` | Caller-owned memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::forget_fact` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_admin_unpin_all` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_admin_unpin_oldest` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_pin` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_pin_stats` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_pinned` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::memory_release` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/memory_agency/feature.py::save_fact` | Caller-owned memory-agency namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/model/feature.py::cleanup_models` | D-3221 — deletes from shared model storage without sovereign/delegated authority or fleet-wide in-use accounting. |
+| `kestrel_sovereign/features/model/feature.py::get_current_model` | Caller-agent model preference read or mutation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/model/feature.py::get_model_info` | Read-only observation of the shared local-model service or storage; no agent relation authority. |
+| `kestrel_sovereign/features/model/feature.py::get_model_storage_info` | Read-only observation of the shared local-model service or storage; no agent relation authority. |
+| `kestrel_sovereign/features/model/feature.py::list_models` | Read-only observation of the shared local-model service or storage; no agent relation authority. |
+| `kestrel_sovereign/features/model/feature.py::pull_model` | D-3221 — mutates the shared local-model service without sovereign/delegated host authority. |
+| `kestrel_sovereign/features/model/feature.py::set_model` | Caller-agent model preference read or mutation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/response_audit/feature.py::audit_disable` | Caller-owned response-audit configuration or status; no co-hosted-agent target. |
+| `kestrel_sovereign/features/response_audit/feature.py::audit_enable` | Caller-owned response-audit configuration or status; no co-hosted-agent target. |
+| `kestrel_sovereign/features/response_audit/feature.py::audit_status` | Caller-owned response-audit configuration or status; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::recall` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::recall_delete` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::recall_get` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::recall_list` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::save_excerpt` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::save_item` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/save/feature.py::save_stash` | Caller-owned saved-memory namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_engagement` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_history` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_list` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_pause` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_record_outcome` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_remove` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_resume` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_update` | Caller-owned schedule state; scheduling conveys no authority to a downstream target. |
+| `kestrel_sovereign/features/security/feature.py::approve` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::deny` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::list_permissions` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::pending_approvals` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::security_audit` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::security_audit_search` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/security/feature.py::set_permission` | Caller-agent consent and permission state; no permission over a co-hosted agent. |
+| `kestrel_sovereign/features/skills/feature.py::skill_delete` | Caller-owned skill-library operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/skills/feature.py::skill_extract_candidates` | Caller-owned skill-library operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/skills/feature.py::skill_list` | Caller-owned skill-library operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/skills/feature.py::skill_save` | Caller-owned skill-library operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/skills/feature.py::skill_show` | Caller-owned skill-library operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/sovereignty/feature.py::check_sovereignty_status` | Caller-owned sovereignty data/status operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/sovereignty/feature.py::export_sovereignty` | Caller-owned sovereignty data/status operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/sovereignty/feature.py::import_sovereignty` | Caller-owned sovereignty data/status operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/state_of_mind.py::state_of_mind` | No co-hosted-agent target identified; caller-local or external-operation policy remains enforcement. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::backlog_hygiene` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::morning_signal` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::recall_blockers` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::recall_patterns` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::session_log` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_add_blocker` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_add_decision` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_add_pattern` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_reconcile_blockers` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_resolve_blocker` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_search` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_supersede_pattern` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/strategic_memory/feature.py::strategy_view` | Caller-owned strategic-memory operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/tasks/feature.py::list_available_skills` | Read-only caller-visible feature registry; no task or agent mutation. |
+| `kestrel_sovereign/features/todo/feature.py::todo_add` | Caller-owned todo namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/todo/feature.py::todo_complete` | Caller-owned todo namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/todo/feature.py::todo_list` | Caller-owned todo namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/todo/feature.py::todo_rollup` | Caller-owned todo namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/todo/feature.py::todo_update` | Caller-owned todo namespace operation; no co-hosted-agent target. |
+| `kestrel_sovereign/features/wait/feature.py::wait` | Current caller turn suspension; no co-hosted-agent control. |
+| `kestrel_sovereign/features/web_search/feature.py::web_search` | External search operation under ordinary tool policy; no co-hosted-agent target. |
+| `kestrel_sovereign/features/webhooks/feature.py::webhooks_history` | Caller-owned webhook receiver configuration/history; unprefixed target ambiguity remains #3216 and no mode grants agent hierarchy. |
+| `kestrel_sovereign/features/webhooks/feature.py::webhooks_list` | Caller-owned webhook receiver configuration/history; unprefixed target ambiguity remains #3216 and no mode grants agent hierarchy. |
+| `kestrel_sovereign/features/webhooks/feature.py::webhooks_register` | Caller-owned webhook receiver configuration/history; unprefixed target ambiguity remains #3216 and no mode grants agent hierarchy. |
+| `kestrel_sovereign/features/webhooks/feature.py::webhooks_remove` | Caller-owned webhook receiver configuration/history; unprefixed target ambiguity remains #3216 and no mode grants agent hierarchy. |
+| `kestrel_sovereign/features/wellness/feature.py::wellness_check` | Caller runtime wellness state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/wellness/feature.py::wellness_export` | Caller runtime wellness state; no co-hosted-agent target. |
+| `kestrel_sovereign/features/wellness/feature.py::wellness_history` | Caller runtime wellness state; no co-hosted-agent target. |
 
 ## Machine-checked built-in command inventory
 
@@ -288,7 +471,9 @@ Classification codes: **A** = sovereign/operator-authenticated,
 target-agent-local read or mutation, with routing selecting the target but
 granting no hierarchy authority;
 **H** = host/fleet handler whose explicit operator policy ignores agent
-selection as authority; **W** = webhook-self-authenticated ingress; **D-n** =
+selection as authority; **W** = configured webhook ingress policy, whose auth
+and rate limits apply only when configured (explicit open/unlimited modes are
+not described as enforced); **D-n** =
 known focused defect n.
 
 | Surface ID | Classification |
@@ -445,7 +630,7 @@ known focused defect n.
 | `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/session` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/stream` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/features/web_search/feature.py::GET /api/agents/{selected_agent_name}/api/features/web_search/test` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/features/webhooks/receiver.py::POST /api/agents/{selected_agent_name}/webhooks/{webhook_name}` | W — target-selected ingress; source auth/rate limit enforce; no hierarchy grant. |
+| `kestrel_sovereign/features/webhooks/receiver.py::POST /api/agents/{selected_agent_name}/webhooks/{webhook_name}` | W — target-selected configured webhook policy; authentication and rate limiting apply only when configured, while explicit open/unlimited mode grants no hierarchy authority. |
 | `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
 | `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/auth/key` | H — explicit operator/public policy; selected-agent context is not authority. |

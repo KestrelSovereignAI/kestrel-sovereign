@@ -30,6 +30,18 @@ CONTROL_NAME_TERMS = (
     "host",
     "fleet",
 )
+PERMISSION_NAME_TERMS = (
+    "authoriz",
+    "authority",
+    "permission",
+    "allowed",
+    "permitted",
+    "forbid",
+    "denied",
+    "access",
+    "gate",
+    "require",
+)
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
     # /api/agents/{name}/... alias in multi-agent mode.  Inventory the complete
@@ -113,6 +125,10 @@ def _is_cross_agent_control_name(name: str) -> bool:
     return any(term in name.casefold() for term in CONTROL_NAME_TERMS)
 
 
+def _is_permission_name(name: str) -> bool:
+    return any(term in name.casefold() for term in PERMISSION_NAME_TERMS)
+
+
 def _call_name(call: ast.Call) -> str:
     function = call.func
     if isinstance(function, ast.Name):
@@ -143,6 +159,14 @@ def _is_indirect_tool_dispatcher(
 
 
 def _discovered_tool_surfaces() -> set[str]:
+    """Return every core feature tool, including apparently local tools.
+
+    Cross-agent capability is a property of implementation and deployment,
+    not a public-name convention.  Exact inventory of the complete registered
+    tool set forces new tools to be classified even when their names do not
+    advertise shared-host reach.
+    """
+
     surfaces: set[str] = set()
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
@@ -154,11 +178,8 @@ def _discovered_tool_surfaces() -> set[str]:
                 public_name = _public_tool_name(decorator, node.name)
                 if public_name is None:
                     continue
-                if _is_cross_agent_control_name(
-                    public_name
-                ) or _is_indirect_tool_dispatcher(node):
-                    relative = path.relative_to(REPO_ROOT).as_posix()
-                    surfaces.add(f"{relative}::{public_name}")
+                relative = path.relative_to(REPO_ROOT).as_posix()
+                surfaces.add(f"{relative}::{public_name}")
     return surfaces
 
 
@@ -412,7 +433,7 @@ def _documented_cli_surfaces(section: str) -> set[str]:
     return set(CLI_SURFACE_ID.findall(body))
 
 
-def test_every_cross_agent_named_tool_is_classified() -> None:
+def test_every_core_tool_is_classified() -> None:
     assert _discovered_tool_surfaces() == _documented_surfaces(
         "## Machine-checked tool inventory"
     )
@@ -428,26 +449,22 @@ def test_generic_indirect_dispatch_tools_are_classified() -> None:
     ):
         assert surface in discovered
 
-
-def test_indirect_dispatch_discovery_follows_execution_wiring() -> None:
-    direct = ast.parse(
-        "async def renamed_meta_tool(manager):\n"
-        "    return await manager.execute_skill('feature', 'skill', {})\n"
-    ).body[0]
-    scheduled = ast.parse(
-        "async def later(self):\n"
-        "    return await self._create_schedule(task_name='anything')\n"
-    ).body[0]
-    named = ast.parse(
-        "async def dispatch(self):\n"
-        "    return await self.execute_named_tool('workflow_run', {})\n"
-    ).body[0]
-    assert isinstance(direct, ast.AsyncFunctionDef)
-    assert isinstance(scheduled, ast.AsyncFunctionDef)
-    assert isinstance(named, ast.AsyncFunctionDef)
-    assert _is_indirect_tool_dispatcher(direct)
-    assert _is_indirect_tool_dispatcher(scheduled)
-    assert _is_indirect_tool_dispatcher(named)
+        relative, public_name = surface.split("::", maxsplit=1)
+        tree = ast.parse(
+            (REPO_ROOT / relative).read_text(encoding="utf-8"),
+            filename=relative,
+        )
+        tool_nodes = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                _public_tool_name(decorator, node.name) == public_name
+                for decorator in node.decorator_list
+            )
+        ]
+        assert len(tool_nodes) == 1
+        assert _is_indirect_tool_dispatcher(tool_nodes[0])
 
 
 def test_relation_free_control_names_are_still_discovered() -> None:
@@ -679,6 +696,35 @@ def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
     assert "rate_limit=0" in row
     assert "allow_unauthenticated" in row
 
+    alias_row = next(
+        line
+        for line in audit.splitlines()
+        if "features/webhooks/receiver.py::POST "
+        "/api/agents/{selected_agent_name}/webhooks/{webhook_name}" in line
+    )
+    assert "only when configured" in alias_row
+    assert "open/unlimited" in alias_row
+    assert "source auth/rate limit enforce" not in alias_row
+
+
+def test_shared_local_model_mutations_are_recorded_as_3221() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Manage shared local models |")
+    )
+    assert "Sovereign/delegated" in action_row
+    assert "[#3221]" in action_row
+
+    for surface in (
+        "features/model/feature.py::pull_model",
+        "features/model/feature.py::cleanup_models",
+    ):
+        row = next(line for line in audit.splitlines() if surface in line)
+        assert "D-3221" in row
+        assert "shared" in row.casefold()
+
 
 def test_routed_rasa_target_mismatch_is_recorded() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
@@ -730,7 +776,7 @@ def _provenance_aliases(
         # boolean wrappers whose result still represents the metadata itself.
         while isinstance(value, (ast.Await, ast.Expr)):
             value = value.value
-        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript, ast.Constant)):
             return _has_provenance_token(value, aliases)
         if isinstance(value, ast.Call) and _call_name(value) in {
             "bool",
@@ -793,18 +839,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
         function_name = function.name.casefold()
         provenance_aliases = _provenance_aliases(function)
         function_is_permission_boundary = (
-            any(
-                term in function_name
-                for term in (
-                    "authoriz",
-                    "permission",
-                    "allowed",
-                    "permitted",
-                    "forbid",
-                    "denied",
-                    "has_access",
-                )
-            )
+            _is_permission_name(function_name)
             or function_name.startswith(("can_", "may_"))
             or _is_cross_agent_control_name(function_name)
         )
@@ -812,8 +847,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             if isinstance(node, ast.Call):
                 function_tokens = _identifier_tokens(node.func)
                 is_permission_call = any(
-                    "authoriz" in token or "permission" in token
-                    for token in function_tokens
+                    _is_permission_name(token) for token in function_tokens
                 )
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if is_permission_call and any(
@@ -835,10 +869,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             has_provenance = _has_provenance_token(
                 node.test, provenance_aliases
             )
-            has_permission = any(
-                "authoriz" in token or "permission" in token
-                for token in tokens
-            )
+            has_permission = any(_is_permission_name(token) for token in tokens)
             if has_provenance and (
                 has_permission or function_is_permission_boundary
             ):
@@ -894,6 +925,25 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    chain = request.causation_chain\n"
         "    return authorize(chain)\n"
     )
+    authority_helper = ast.parse(
+        "def scheduler_authority_for(request):\n"
+        "    return bool(request.causation_chain)\n"
+    )
+    access_helper = ast.parse(
+        "def check_access(request):\n"
+        "    if request.causation_frame:\n"
+        "        return True\n"
+    )
+    require_call = ast.parse(
+        "def check(request):\n"
+        "    chain = request.causation_chain\n"
+        "    return require_access(chain)\n"
+    )
+    dynamic_metadata_key = ast.parse(
+        "def check_access(request):\n"
+        '    key = "causation_chain"\n'
+        "    return bool(request.metadata.get(key))\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
@@ -902,6 +952,10 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(canonical_frame) == {2}
     assert _authority_provenance_lines(compared_alias) == {3}
     assert _authority_provenance_lines(permission_call_alias) == {3}
+    assert _authority_provenance_lines(authority_helper) == {2}
+    assert _authority_provenance_lines(access_helper) == {2}
+    assert _authority_provenance_lines(require_call) == {3}
+    assert _authority_provenance_lines(dynamic_metadata_key) == {3}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
