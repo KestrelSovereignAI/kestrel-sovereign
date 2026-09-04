@@ -2437,3 +2437,55 @@ def test_a_repaired_row_is_shown_with_the_truncation_marker():
     assert remask_summary('{"repo": "o/r"}') == '{"repo": "o/r"}'
     # tool_audit's prose prefix keeps its place before the repaired JSON.
     assert remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"').endswith('"m": "x"}...')
+
+
+# --------------------------------------------------------------------------
+# Round 25: prose that closes its bracket is prose; only a reconstruction
+# is marked.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_guardrail_reason_with_a_bracketed_argument_name_keeps_its_row(tmp_path):
+    """input_guardrails writes "argument 'files[0]' exceeds maximum length"
+    and tool_audit stores it as "<reason> | args=<json>". The prefix guard
+    scanned past the closing bracket to the quote and withheld the intact
+    row from both read paths — a false absence for the refused call."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = ("Tool 'create_github_issue' argument 'files[0]' exceeds maximum length (10001 > 10000)"
+           ' | args={"files": ["a.txt"], "api_key": "sk-LEAK", "memo": "orphans the worker"}')
+    shown = remask_summary(row)
+    assert shown.startswith("Tool 'create_github_issue' argument 'files[0]'") and "sk-LEAK" not in shown
+    assert "***MASKED***" in shown and "orphans the worker" in shown
+    assert "orphans the worker" in fold_stored_summary(row) and "sk-leak" not in fold_stored_summary(row)
+
+    store = PermissionStore(str(tmp_path / "guardrail.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Guardrail", tool_name="create_github_issue", action="tool_execution",
+        decision="blocked", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    assert (await feature.security_audit_search(query="orphans the worker")).data["count"] == 1
+    # Unrepaired structure INSIDE a bracket still withholds the row.
+    assert remask_summary("{'api_key': 'sk-live-LEAK'} then {\"b\": 1}") == "(summary truncated past repair; not shown)"
+
+
+def test_an_intact_row_reaching_the_repair_path_is_not_marked_as_reconstructed():
+    """tool_audit's '<reason> | args=<json>' fails json.loads only for its
+    prose prefix; its JSON parses as written, and marking it made a plain
+    record indistinguishable from a cut one."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary, repair_json_text
+
+    row = 'Unknown feature tool: wallet_feature | args={"task": "pay rent"}'
+    assert remask_summary(row) == row
+    assert remask_summary('refused [wallet] | args={"api_key": "sk-LEAK", "m": "x"}') == 'refused [wallet] | args={"api_key": "***MASKED***", "m": "x"}'
+    # ...and the same prefix with a CUT payload is marked.
+    assert remask_summary('Unknown feature tool: wallet_feature | args={"task": "pay re').endswith("...")
+    assert repair_json_text('{"a": 1}') == ({"a": 1}, False)
+    assert repair_json_text('{"a": 1}...') == ({"a": 1}, True)
+    assert repair_json_text('{"a": 1') == ({"a": 1}, True)
+    assert repair_json_text('{"a": tr') == ({"a": None}, True)

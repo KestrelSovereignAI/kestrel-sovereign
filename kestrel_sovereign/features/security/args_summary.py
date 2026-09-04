@@ -38,12 +38,14 @@ SENSITIVE_KEY_SUBSTRINGS = (
 #: What ``summarize_args`` appends when it cuts a row; stripped before repair.
 _TRUNCATION_MARK = "..."
 #: Structure the repair could not parse but that may carry a value: a bracket
-#: with a quote or a colon anywhere after it. A JSON key position is one such
-#: shape; a single-quoted dict or a bare array of strings is another, and a
-#: guard keyed on the double-quoted key alone let those through raw (round 18
-#: review). Prose that merely brackets a word (``[wallet] | args=``) has
-#: neither and stays.
-_UNREPAIRED_STRUCTURE = re.compile(r"[{\[][^{\[]*[\"':]")
+#: with a quote or a colon INSIDE it (before any closing bracket). A JSON key
+#: position is one such shape; a single-quoted dict or a bare array of
+#: strings is another, and a guard keyed on the double-quoted key alone let
+#: those through raw (round 18 review). Prose that merely brackets a word
+#: (``[wallet] | args=``, ``argument 'files[0]' exceeds``) closes its bracket
+#: before any quote or colon and stays — scanning past the closing bracket
+#: withheld intact guardrail rows from both read paths (round 24 review).
+_UNREPAIRED_STRUCTURE = re.compile(r"[{\[][^{\[\]}]*[\"':]")
 #: Trailing characters repair may drop to reach a parseable cut point: a cut
 #: inside a ``\\uXXXX`` escape needs up to six, a bare literal (``tru``) four.
 _MAX_REPAIR_TRIM = 8
@@ -108,7 +110,20 @@ def _close_open_structures(text: str) -> Optional[str]:
 
 
 def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> Any:
-    """Parse JSON text that a truncation cut, or return None.
+    """Parse JSON text that a truncation cut, or return None (see
+    :func:`repair_json_text` for whether the text had to be altered)."""
+    parsed, _altered = repair_json_text(text, max_trim=max_trim)
+    return parsed
+
+
+def repair_json_text(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> tuple[Any, bool]:
+    """Parse JSON text that a truncation cut: ``(parsed, altered)``.
+
+    ``altered`` is True when the parse needed the marker stripped, characters
+    trimmed or a structure closed — that is, when the result is a
+    reconstruction rather than the text as written, which the display marks
+    (round 24 review: an intact ``<reason> | args={...}`` row reaches this
+    path only because of its prose prefix and must not be marked).
 
     Tries the text as it is, then with its open string and containers
     closed, dropping up to ``max_trim`` trailing characters so a cut that
@@ -118,17 +133,18 @@ def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> A
     real cut; the write path, where nothing has been cut, passes 0.
     """
     if not isinstance(text, str):
-        return None
+        return None, False
     body = text.rstrip()
-    if body.endswith(_TRUNCATION_MARK):
+    marked = body.endswith(_TRUNCATION_MARK)
+    if marked:
         body = body[: -len(_TRUNCATION_MARK)]
     for trim in range(max_trim + 1):
         candidate = body[: len(body) - trim] if trim else body
         if not candidate:
-            return None
+            return None, False
         closed = _close_open_structures(candidate)
         if closed is None:
-            return None
+            return None, False
         try:
             parsed = json.loads(closed)
         except (ValueError, RecursionError):
@@ -136,11 +152,13 @@ def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> A
             # nested value escaped every guard, denied the call on the write
             # path and poisoned the query on the read path (round 23 review).
             continue
-        return parsed if isinstance(parsed, (dict, list)) else None
-    return None
+        if not isinstance(parsed, (dict, list)):
+            return None, False
+        return parsed, marked or trim > 0 or closed != candidate
+    return None, False
 
 
-def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
+def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any, bool]]:
     """Split a stored summary that will not parse into its prose prefix and
     the JSON it embeds, repaired and MASKED.
 
@@ -151,14 +169,15 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
     masking rule and no text scanner to get a value shape wrong (rounds
     13–16 each found one: a container, an escaped string, prose).
 
-    Returns ``(text, None)`` for prose that embeds no JSON at all (nothing
-    with a key position, so nothing to mask), ``(prefix, masked)`` when the
-    JSON repaired, and None when JSON was found but cannot be repaired — that
+    Returns ``(text, None, False)`` for prose that embeds no JSON at all
+    (nothing with a key position, so nothing to mask), ``(prefix, masked,
+    altered)`` when the JSON parsed — ``altered`` says whether it had to be
+    reconstructed — and None when JSON was found but cannot be repaired: that
     row cannot be masked, so it must not be shown or searched.
     """
     starts = sorted({m.start() for m in re.finditer(r"[{\[]", text)})[:8]
     if not starts:
-        return text, None
+        return text, None, False
     for start in starts:
         prefix = text[:start]
         if _UNREPAIRED_STRUCTURE.search(prefix):
@@ -167,9 +186,9 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
             # It would be handed back RAW as the prefix, shown and searchable;
             # the row is withheld instead (rounds 17 and 18).
             return None
-        parsed = complete_truncated_json(text[start:])
+        parsed, altered = repair_json_text(text[start:])
         if parsed is not None:
-            return prefix, mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
+            return prefix, mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM), altered
     return None
 
 
@@ -302,10 +321,14 @@ def _remask_text(summary: str) -> str:
         repaired = repair_unparseable_summary(summary)
         if repaired is None:
             return "(summary truncated past repair; not shown)"
-        prefix, masked = repaired
+        prefix, masked, altered = repaired
         if masked is None:
             return summary
-        return prefix + json.dumps(masked, default=str) + _TRUNCATION_MARK
+        shown = prefix + json.dumps(masked, default=str)
+        # Only a RECONSTRUCTED row is marked: an intact tool_audit row reaches
+        # this path for its prose prefix alone, and marking it made a plain
+        # record indistinguishable from a cut one (round 24 review).
+        return shown + _TRUNCATION_MARK if altered else shown
     if isinstance(parsed, str):
         # The whole row is a JSON string — the payload the walker masks one
         # level down, carried at the top (round 21 review).

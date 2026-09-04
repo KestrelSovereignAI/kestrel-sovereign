@@ -109,7 +109,7 @@ def _fold_text(text: str) -> str:
         repaired = repair_unparseable_summary(text)
         if repaired is None:
             return ""
-        prefix, masked = repaired
+        prefix, masked, _altered = repaired
         folded = prefix if masked is None else prefix + " " + _flatten_json(masked)
         return folded.casefold().encode("utf-8", "replace").decode("utf-8")
 
