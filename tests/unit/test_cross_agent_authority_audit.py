@@ -831,26 +831,39 @@ def _route_declarations(
     tree: ast.Module,
     string_constants: dict[str, str],
     method_constants: dict[str, tuple[str, ...]],
+    source_path: Path | None = None,
 ) -> list[tuple[tuple[str, ...], str]]:
-    """Return methods and canonical paths with receiver/scoped prefixes."""
+    """Return methods and canonical paths with receiver/scoped prefixes.
 
-    declarations = _fastapi_generated_route_declarations(
-        tree.body, string_constants
-    )
+    Module-level decorators and registrations execute in source order. Their
+    constants must therefore be resolved from the bindings that existed
+    before the containing statement, not from the module's final namespace.
+    """
+
+    declarations: list[tuple[tuple[str, ...], str]] = []
 
     def walk_scope(
         statements: list[ast.stmt],
         inherited_prefixes: dict[str, str],
+        *,
+        module_scope: bool = False,
     ) -> None:
         prefixes = dict(inherited_prefixes)
-        prefixes.update(_scope_router_prefixes(statements, string_constants))
+        if not module_scope:
+            prefixes.update(
+                _scope_router_prefixes(statements, string_constants)
+            )
 
-        def visit(node: ast.AST) -> None:
+        def visit(
+            node: ast.AST,
+            active_strings: dict[str, str],
+            active_methods: dict[str, tuple[str, ...]],
+        ) -> None:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
                     if not isinstance(decorator, ast.Call):
                         continue
-                    methods = _route_methods(decorator, method_constants)
+                    methods = _route_methods(decorator, active_methods)
                     if not methods:
                         continue
                     receiver = _route_receiver_name(decorator)
@@ -864,7 +877,7 @@ def _route_declarations(
                             f"{ast.unparse(decorator.func)}"
                         )
                     declarations.append(
-                        (methods, prefix + _route_path(decorator, string_constants))
+                        (methods, prefix + _route_path(decorator, active_strings))
                     )
                 walk_scope(node.body, prefixes)
                 return
@@ -892,18 +905,47 @@ def _route_declarations(
                         )
                     declarations.append(
                         (
-                            _route_methods(node, method_constants),
+                            _route_methods(node, active_methods),
                             prefix
-                            + _programmatic_route_path(node, string_constants),
+                            + _programmatic_route_path(node, active_strings),
                         )
                     )
             for child in ast.iter_child_nodes(node):
-                visit(child)
+                visit(child, active_strings, active_methods)
 
-        for statement in statements:
-            visit(statement)
+        for index, statement in enumerate(statements):
+            active_strings = string_constants
+            active_methods = method_constants
+            if module_scope:
+                preceding = ast.Module(
+                    body=statements[:index],
+                    type_ignores=[],
+                )
+                active_strings = _module_string_constants(
+                    preceding, source_path
+                )
+                active_methods = _module_string_collections(
+                    preceding, active_strings
+                )
+                declarations.extend(
+                    _fastapi_generated_route_declarations(
+                        [statement], active_strings
+                    )
+                )
+                new_prefixes = _scope_router_prefixes(
+                    [statement], active_strings
+                )
+                for receiver, prefix in new_prefixes.items():
+                    previous = prefixes.get(receiver)
+                    if previous is not None and previous != prefix:
+                        raise AssertionError(
+                            "Ambiguous APIRouter prefix for "
+                            f"{receiver!r}: {previous!r} and {prefix!r}"
+                        )
+                    prefixes[receiver] = prefix
+            visit(statement, active_strings, active_methods)
 
-    walk_scope(tree.body, {})
+    walk_scope(tree.body, {}, module_scope=True)
     return declarations
 
 
@@ -1090,7 +1132,7 @@ def _discovered_http_surfaces() -> set[str]:
         string_constants = _module_string_constants(tree, path)
         method_constants = _module_string_collections(tree, string_constants)
         for methods, route in _route_declarations(
-            tree, string_constants, method_constants
+            tree, string_constants, method_constants, path
         ):
             segments = {part for part in route.casefold().split("/") if part}
             if (
@@ -1140,7 +1182,7 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
         string_constants = _module_string_constants(tree, path)
         method_constants = _module_string_collections(tree, string_constants)
         for methods, canonical_route in _route_declarations(
-            tree, string_constants, method_constants
+            tree, string_constants, method_constants, path
         ):
             # The host regex requires a non-empty remaining path, so the
             # canonical root has no multi-agent alias.
@@ -1579,6 +1621,26 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
         _route_methods(reassigned_decorator, method_constants)
 
 
+def test_route_declarations_resolve_constants_at_decorator_execution() -> None:
+    tree = ast.parse(
+        'ROUTE = "/api/agents/{agent}/terminate"\n'
+        'METHODS = ["POST"]\n'
+        "router = APIRouter()\n"
+        "@router.api_route(ROUTE, methods=METHODS)\n"
+        "def terminate():\n    pass\n"
+        'ROUTE = "/benign"\n'
+        'METHODS = ["GET"]\n'
+    )
+    final_strings = _module_string_constants(tree)
+    final_methods = _module_string_collections(tree, final_strings)
+
+    assert final_strings["ROUTE"] == "/benign"
+    assert final_methods["METHODS"] == ("GET",)
+    assert _route_declarations(tree, final_strings, final_methods) == [
+        (("POST",), "/api/agents/{agent}/terminate")
+    ]
+
+
 def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
     tree = ast.parse(
         '_MUTATIONS = ["POST", "DELETE"]\n'
@@ -1854,6 +1916,26 @@ def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
     assert "source auth/rate limit enforce" not in alias_row
 
 
+def test_feature_static_alias_auth_exception_is_recorded() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    section_start = audit.index(
+        "## Machine-checked request-routed alias inventory"
+    )
+    introduction = audit[
+        section_start : audit.index("Classification codes:", section_start)
+    ]
+    row = next(
+        line
+        for line in audit.splitlines()
+        if "server.py::MOUNT "
+        "/api/agents/{selected_agent_name}/<dynamic:mount_path>" in line
+    )
+
+    assert "agent-feature static-asset aliases" in introduction
+    assert "host-authentication-exempt" in row
+    assert "| S —" in row
+
+
 def test_shared_local_model_mutations_are_recorded_as_3221() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
@@ -2111,7 +2193,7 @@ def _provenance_aliases(
 
     aliases: set[str] = set()
     scope_nodes = _walk_lexical_scope(function)
-    assignments: list[tuple[set[str], ast.AST]] = []
+    assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
     for node in scope_nodes:
         targets: list[ast.AST] = []
         value: ast.AST | None = None
@@ -2131,7 +2213,7 @@ def _provenance_aliases(
             continue
         names = {name for target in targets for name in target_names(target)}
         if names:
-            assignments.append((names, value))
+            assignments.append((names, value, node))
 
     # An arbitrary helper may compute an authority decision without advertising
     # that fact in its name. Mark assignment targets that later guard a control,
@@ -2214,12 +2296,12 @@ def _provenance_aliases(
     collect_guard_decisions(function.body)
 
     assignment_names = {
-        name for names, _value in assignments for name in names
+        name for names, _value, _node in assignments for name in names
     }
     changed = True
     while changed:
         changed = False
-        for names, value in assignments:
+        for names, value, _node in assignments:
             if not names.intersection(authority_decision_names):
                 continue
             dependencies = _identifier_tokens(value).intersection(assignment_names)
@@ -2228,10 +2310,66 @@ def _provenance_aliases(
                 authority_decision_names.update(new_dependencies)
                 changed = True
 
+    def provenance_selected_decisions(
+        statements: list[ast.stmt],
+        inherited_selection: bool = False,
+    ) -> set[str]:
+        """Return later control decisions selected by provenance branches."""
+
+        selected: set[str] = set()
+        for statement in statements:
+            if inherited_selection:
+                for names, _value, assignment in assignments:
+                    if assignment is statement:
+                        selected.update(
+                            names.intersection(authority_decision_names)
+                        )
+
+            if isinstance(statement, (ast.If, ast.While)):
+                branch_selection = inherited_selection or _has_provenance_token(
+                    statement.test, aliases
+                )
+                selected.update(
+                    provenance_selected_decisions(
+                        statement.body, branch_selection
+                    )
+                )
+                selected.update(
+                    provenance_selected_decisions(
+                        statement.orelse, branch_selection
+                    )
+                )
+                continue
+            if isinstance(statement, ast.Match):
+                subject_selection = inherited_selection or _has_provenance_token(
+                    statement.subject, aliases
+                )
+                for case in statement.cases:
+                    case_selection = subject_selection or (
+                        case.guard is not None
+                        and _has_provenance_token(case.guard, aliases)
+                    )
+                    selected.update(
+                        provenance_selected_decisions(
+                            case.body, case_selection
+                        )
+                    )
+                continue
+            for block in _child_statement_blocks(statement):
+                selected.update(
+                    provenance_selected_decisions(block, inherited_selection)
+                )
+        return selected
+
     changed = True
     while changed:
         changed = False
-        for names, value in assignments:
+        selected_decisions = provenance_selected_decisions(function.body)
+        new_selected = selected_decisions - aliases
+        if new_selected:
+            aliases.update(new_selected)
+            changed = True
+        for names, value, _node in assignments:
             permission_shaped_target = any(
                 _is_permission_name(name) for name in names
             )
@@ -2804,6 +2942,14 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
         "        case _ if decision:\n"
         "            stop_peer(target)\n"
     )
+    branch_assigned_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    allowed = False\n"
+        "    if request.causation_chain:\n"
+        "        allowed = True\n"
+        "    if allowed:\n"
+        "        terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
@@ -2818,6 +2964,7 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(guard_clauses) == {2, 7, 15}
     assert _authority_provenance_lines(loop_guard_clauses) == {3, 9}
     assert _authority_provenance_lines(match_guards) == {3, 9}
+    assert _authority_provenance_lines(branch_assigned_decision) == {5}
 
 
 def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:

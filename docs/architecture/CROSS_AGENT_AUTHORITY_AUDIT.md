@@ -609,9 +609,13 @@ and routes whose canonical spelling contains no agent-shaped word. The
 canonical root is excluded because the router regex requires a non-empty
 remainder. Authentication sees the
 prefixed path before routing: every alias below requires host authentication
-except the deliberately self-authenticating webhook family. The repeated
-agent-local classifications are intentional false-positive dispositions; an
-exact-set contract makes any new request-bound route fail until it is added.
+except the deliberately self-authenticating webhook family and the
+agent-feature static-asset aliases. The latter are narrowly matched by
+`FEATURE_STATIC_ASSET_RE` so browser module and stylesheet loads can omit an
+API-key header; they publish static content and grant no agent authority. The
+repeated agent-local classifications are intentional false-positive
+dispositions; an exact-set contract makes any new request-bound route fail
+until it is added.
 
 Classification codes: **A** = sovereign/operator-authenticated,
 target-agent-local read or mutation, with routing selecting the target but
@@ -620,7 +624,8 @@ granting no hierarchy authority;
 selection as authority; **U** = authenticated-user namespace whose
 `request.state.user_id` principal ignores agent selection; **W** = configured webhook ingress policy, whose auth
 and rate limits apply only when configured (explicit open/unlimited modes are
-not described as enforced); **D-n** =
+not described as enforced); **S** = deliberately unauthenticated static-asset
+publication whose selected-agent prefix grants no relation authority; **D-n** =
 known focused defect n.
 
 | Surface ID | Classification |
@@ -811,7 +816,7 @@ known focused defect n.
 | `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/shared` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
 | `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/static` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
 | `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/utils` | H — mounted host UI assets; selected-agent context grants no target-local or relation authority. |
-| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/<dynamic:mount_path>` | H — runtime-computed agent-feature asset mount; selected-agent context grants no relation authority. |
+| `kestrel_sovereign/server.py::MOUNT /api/agents/{selected_agent_name}/<dynamic:mount_path>` | S — runtime-computed, host-authentication-exempt agent-feature asset mount; selected-agent context grants no relation authority. |
 
 ## Review rule
 
