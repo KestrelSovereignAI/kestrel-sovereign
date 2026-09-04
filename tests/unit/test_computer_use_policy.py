@@ -2,6 +2,13 @@
 
 from pathlib import Path
 
+import itertools
+import shlex
+import shutil
+import string
+import subprocess
+import tempfile
+
 import pytest
 
 from kestrel_sovereign.features.computer_use.policy import (
@@ -9,6 +16,10 @@ from kestrel_sovereign.features.computer_use.policy import (
     Decision,
     PathPolicy,
     command_contains_unquoted_shell_control,
+    command_word_is_shell_grammar,
+    first_shell_significant_character,
+    first_unquoted_shell_control,
+    quote_words_containing_shell_syntax,
     split_command,
 )
 
@@ -110,6 +121,10 @@ def test_split_command():
         "echo 'cost $5'",
         # Single hyphen in arg name is fine.
         "rg -i pattern",
+        # An escaped control character composes nothing: bash reads
+        # `\;` as a literal semicolon, so there is no second command
+        # for the guard to warn about.
+        r"echo a\; b",
     ],
 )
 def test_compound_guard_clean_commands(cmd):
@@ -128,6 +143,12 @@ def test_compound_guard_clean_commands(cmd):
         ("ls > /etc/foo", ">"),
         ("cat < /etc/passwd", "<"),
         ("git status\nrm -rf /tmp/x", "newline"),
+        # codex review round 6: an ESCAPED quote is a literal to bash,
+        # so the separator after it is live. Reading it as opening a
+        # quoted region hid the `;` and auto-approved the line on the
+        # codex bridge, where a real shell then ran `sudo`.
+        (r"echo foo\'; sudo -n true", "escaped single quote"),
+        (r'echo foo\"; sudo -n true', "escaped double quote"),
         # Double-quoted but with a $ inside — still active (variable
         # expansion is enabled in "..."), so we treat $ as risky.
         ('echo "$HOME"', "$"),
@@ -136,6 +157,461 @@ def test_compound_guard_clean_commands(cmd):
 def test_compound_guard_flags_unquoted_metacharacters(cmd, trigger):
     assert command_contains_unquoted_shell_control(cmd) is True, (
         f"expected {trigger!r} to flag: {cmd!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        ("ls | grep secret", (3, "|")),
+        ("git status; rm -rf /tmp/x", (10, ";")),
+        # The FIRST one, not any one: an inert quoted ``;`` sits before
+        # the live ``|``, and reporting the quoted one would name a
+        # character the caller is allowed to keep.
+        ("""echo '; x' | wc -l""", (11, "|")),
+        ('echo "$HOME"', (6, "$")),
+        ("echo hi", None),
+    ],
+)
+def test_first_unquoted_shell_control_reports_where_and_which(cmd, expected):
+    """#3129 needs the character, not just its existence.
+
+    ``ComputerUseFeature.shell`` refuses a command it cannot honour and
+    has to say which character it could not honour — a caller told only
+    "no" cannot tell which part of what they wrote was the problem.
+    """
+    assert first_unquoted_shell_control(cmd) == expected
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo hi",
+        'echo "; rm -rf /"',
+        "ls | grep secret",
+        "git status && rm -rf /tmp/x",
+        "echo `whoami`",
+        None,
+        ["ls", "-la"],
+    ],
+)
+def test_the_boolean_guard_is_exactly_the_scanner(cmd):
+    """The compound-command guard is now a wrapper over the scanner.
+
+    #1694's downgrade and #3129's refusal must never disagree about
+    what counts as a shell control character: two answers to one
+    question is how a command gets refused on one path and queued on
+    another.
+    """
+    assert command_contains_unquoted_shell_control(cmd) is (
+        first_unquoted_shell_control(cmd) is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo hi",
+        "git diff -U2 -- kestrel_sovereign/policy.py",
+        "ls -la /tmp",
+        "python -m pytest -q",
+        "grep -E 'a|b' file.txt",
+        'echo "plain text"',
+        "curl -sS https://example.com/a,b+c@d",
+        "echo 'anything at all: | ; $x `y` *'",
+    ],
+)
+def test_an_inert_command_runs(cmd):
+    """The allow-list has to leave ordinary commands alone.
+
+    A sound rule that refused everything would also never run a command
+    whose argv differed, so this half is what makes the other half mean
+    something.
+    """
+    assert first_shell_significant_character(cmd) is None
+
+
+@pytest.mark.parametrize(
+    "cmd,char",
+    [
+        # Composition and redirection.
+        ("cat a.txt | tr a-z A-Z", "|"),
+        ("echo hi; true", ";"),
+        ("ls > /tmp/x", ">"),
+        ("echo a && b", "&"),
+        # Expansion, in all the spellings five review rounds turned up.
+        ("echo $HOME", "$"),
+        ('echo "$HOME"', "$"),
+        ("echo `whoami`", "`"),
+        ("echo $[1+1]", "$"),
+        ('echo $"hello"', "$"),
+        ("ls *.py", "*"),
+        ("echo {a,b}", "{"),
+        ("echo {a{b}c,d}", "{"),
+        ("echo ~", "~"),
+        ("echo HOME=~", "~"),
+        ("echo hi # note", "#"),
+        (r'echo "a\$HOME"', "\\"),
+        # Word structure the tokenizer and the shell disagree about.
+        ("echo a\nb", "\n"),
+        ("echo hi\r", "\r"),
+        ("echo a\\\nb", "\\"),
+    ],
+)
+def test_a_shell_significant_character_is_refused(cmd, char):
+    """Each of these ran and reported success with a different argv.
+
+    The list is the accumulated output of five review rounds. Under the
+    deny-list it took five rounds to cover them; under the allow-list
+    every one falls out of the same rule, and so does the next spelling
+    nobody has thought of.
+    """
+    found = first_shell_significant_character(cmd)
+    assert found is not None, cmd
+    assert found.char == char, (cmd, found)
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo price$",
+        "rg foo$ file",
+        'echo "$"',
+        "echo a[b",
+        "echo {a}",
+        "echo --foo=~",
+        'echo ""#x',
+    ],
+)
+def test_the_rule_is_sound_rather_than_exact(cmd):
+    """These reach the program identically either way, and are refused.
+
+    Stated as a test rather than hidden in a docstring, because it is
+    the cost of the design and someone may want to argue with it. The
+    exact answer means modelling every expansion bash performs — five
+    rounds of review each found another one, and each near-miss was a
+    command running with the wrong argv. The refusal offers quoting,
+    which makes these run unchanged.
+    """
+    assert first_shell_significant_character(cmd) is not None
+    rewritten = quote_words_containing_shell_syntax(cmd)
+    assert first_shell_significant_character(rewritten) is None, rewritten
+
+
+@pytest.mark.parametrize(
+    "cmd,refused,flagged",
+    [
+        # Both: a control character composes a command AND changes the argv.
+        ("echo hi; true", True, True),
+        ("cat a.txt | tr a-z A-Z", True, True),
+        ("echo $HOME", True, True),
+        # Refusal only: these change the argv but compose nothing. The
+        # guard gates the codex bridge, where a real shell runs the
+        # line, and widening it to every interpretable character would
+        # put the operator in front of `ls -la` for its hyphen.
+        ("ls *.py", True, False),
+        ("echo hi # note", True, False),
+        ("echo ~", True, False),
+        # Guard only: a literal `$` composes nothing, but reading it as
+        # suspicious costs only an approval prompt.
+        ('echo "$"', True, True),
+        ("echo hi", False, False),
+        ('echo "; rm -rf /"', False, False),
+    ],
+)
+def test_the_two_predicates_answer_two_questions(cmd, refused, flagged):
+    """They overlap and diverge on purpose.
+
+    An earlier version asserted containment — anything refused is also
+    flagged — and it passed only because its cases happened to hold no
+    counterexample. Each predicate reads what its own consequence
+    justifies: over-reading costs an approval prompt on one side and a
+    refused command on the other.
+    """
+    assert (first_shell_significant_character(cmd) is not None) is refused
+    assert command_contains_unquoted_shell_control(cmd) is flagged
+
+
+_SWEEP_TEMPLATES = [
+    "echo a{c}b",
+    "echo {c}",
+    "echo a {c} b",
+    "echo {c}b",
+    "echo 'a{c}b'",
+    'echo "a{c}b"',
+    "echo a\\{c}b",
+    'echo "a\\{c}b"',
+    "echo ${c}x",
+    'echo "${c}x"',
+]
+
+# Single characters are not enough: brace expansion, a tilde after an
+# assignment, a bracket glob that closes and an escaped blank before a
+# `#` all need two characters to exist, and round 4 of review found
+# every one of them in the gap that left.
+_SWEEP_PAIR_TEMPLATES = ["echo x{a}y{b}z", "echo {a}{b}", "echo {a}x {b}y"]
+
+# Constructs worth naming even though the sweeps generate most of them.
+_NAMED_CONSTRUCTS = [
+    "echo {a,b}", "echo {1..3}", "echo {a{b}c,d}", "echo x{a,b}y", "echo {a}",
+    "echo {}", "echo {a,}", "echo a{b}c", "echo HOME=~", "echo PATH=foo:~",
+    "echo a=~/x", "echo ~/x", "echo x~", "echo foo:~", "echo ~x",
+    "echo --foo=~", "echo a-b=~", "echo \\ #x", "echo \\ ~", "echo a\\ #b",
+    "echo hi\\\n", "echo [", "echo a[b", "echo [ab", "echo [a]", "echo a[bc]d",
+    "echo []", "echo a]b", "echo [a\\]", "echo {a\\,b}", 'echo ""#x',
+    'echo ""~', "echo hi \\\n there", "git diff -U2 -- a.py", "ls -la /tmp",
+]
+
+
+def _sweep_corpus():
+    """Every command the differential compares against bash."""
+    for char in string.punctuation + " \t\n\r":
+        for template in _SWEEP_TEMPLATES:
+            yield template.format(c=char)
+    for first, second in itertools.product(string.punctuation, repeat=2):
+        for template in _SWEEP_PAIR_TEMPLATES:
+            yield template.format(a=first, b=second)
+    yield from _NAMED_CONSTRUCTS
+
+
+def _bash_word_vector(cmd: str, cwd: str):
+    """The argv bash would build for *cmd*, or None if bash refuses it."""
+    result = subprocess.run(
+        ["bash", "-c", 'printf "%s\\0" ' + cmd],
+        capture_output=True,
+        cwd=cwd,
+    )
+    if result.returncode:
+        return None
+    return result.stdout.decode(errors="replace").split("\0")[:-1]
+
+
+@pytest.fixture(scope="module")
+def bash_differential():
+    """(cmd, bash_argv, shlex_argv) for the whole corpus, computed once."""
+    rows = []
+    with tempfile.TemporaryDirectory() as empty:
+        for cmd in _sweep_corpus():
+            expected = _bash_word_vector(cmd, empty)
+            if expected is None:
+                continue
+            try:
+                actual = shlex.split(cmd)
+            except ValueError:
+                continue
+            rows.append((cmd, expected, actual))
+    return rows
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_nothing_the_rule_allows_runs_differently_under_bash(bash_differential):
+    """The guarantee, checked against the thing it is about.
+
+    One-directional on purpose. "Refuses exactly when bash differs"
+    would need a model of every expansion bash performs, and five
+    rounds of review showed that model is a shell. "Never allows a
+    command bash would build differently" is what actually protects the
+    caller, and an allow-list of inert characters can satisfy it.
+
+    The corpus sweeps every punctuation character through ten
+    positions, every ordered pair through three more, and the named
+    constructs the review rounds turned up.
+    """
+    unsound = [
+        f"{cmd!r}: bash={expected!r} shlex={actual!r}"
+        for cmd, expected, actual in bash_differential
+        if first_shell_significant_character(cmd) is None and actual != expected
+    ]
+    assert unsound == [], (
+        "these were allowed but bash builds a different argv:\n  "
+        + "\n  ".join(unsound)
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_sweep_would_notice_a_gap(bash_differential):
+    """A positive control for the differential above.
+
+    A one-directional assertion passes trivially if the rule allows
+    nothing, or if the corpus holds no divergent command. Both halves
+    have to be present for the check above to mean anything.
+    """
+    allowed = [c for c, _e, _a in bash_differential
+               if first_shell_significant_character(c) is None]
+    divergent = [c for c, e, a in bash_differential if e != a]
+    assert allowed, "the rule allows nothing, so soundness is vacuous"
+    assert divergent, "the corpus holds no divergent command to catch"
+    # A collapse detector, not an exact count: the number moves when
+    # templates change, but should never fall to a handful.
+    assert len(bash_differential) > 1000, (
+        f"the corpus shrank to {len(bash_differential)} commands"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_quoting_remedy_is_bounded_by_construction(bash_differential):
+    """What the refusal hands back must be safe AND must work.
+
+    Round 2 removed a `bash -lc` suggestion because no check could
+    bound what it would run. Quoting is different in kind: the rewrite
+    is inert to bash and to shlex alike, so its argv is its words —
+    and this asserts exactly that, over every refused command in the
+    corpus, rather than trusting the argument.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        broken = []
+        for cmd, _expected, _actual in bash_differential:
+            if first_shell_significant_character(cmd) is None:
+                continue
+            rewritten = quote_words_containing_shell_syntax(cmd)
+            if rewritten is None:
+                continue
+            if first_shell_significant_character(rewritten) is not None:
+                broken.append(f"{cmd!r} -> {rewritten!r} is still refused")
+                continue
+            bash_argv = _bash_word_vector(rewritten, empty)
+            if bash_argv is not None and bash_argv != shlex.split(rewritten):
+                broken.append(f"{cmd!r} -> {rewritten!r} still diverges")
+        assert broken == [], "\n  ".join(broken)
+
+
+
+@pytest.mark.parametrize(
+    "word,expected",
+    [
+        ("eval", "builtin"),
+        ("exec", "builtin"),
+        ("source", "builtin"),
+        (".", "builtin"),
+        ("command", "builtin"),
+        ("builtin", "builtin"),
+        # codex round 8: `trap 'dd ...' EXIT` runs its command later,
+        # and naming it one-by-one is what the inversion avoids —
+        # these fall out of "a builtin is not a program" rather than
+        # from a list of the ones that dispatch.
+        ("trap", "builtin"),
+        ("mapfile", "builtin"),
+        ("readarray", "builtin"),
+        ("enable", "builtin"),
+        ("complete", "builtin"),
+        ("coproc", "keyword"),
+        ("FOO+=x", "assignment"),
+        ("arr[0]+=v", "assignment"),
+        # Builtins that are also real binaries behave the same either
+        # way, so refusing them would cost without buying anything.
+        ("test", None),
+        ("[", None),
+        ("true", None),
+        ("kill", None),
+        ("if", "keyword"),
+        ("time", "keyword"),
+        ("{", "keyword"),
+        ("FOO=x", "assignment"),
+        ("foo_1=y", "assignment"),
+        ("arr[0]=v", "assignment"),
+        # Not assignments: bash reports "command not found" for these,
+        # so treating them as grammar would be a false refusal — the
+        # class codex flagged in round 4 with `--foo=~`.
+        ("--foo=bar", None),
+        ("a-b=x", None),
+        ("=x", None),
+        # Ordinary programs, including builtins that are also real
+        # binaries and behave the same either way.
+        ("ls", None),
+        ("echo", None),
+        ("printf", None),
+        ("./script.sh", None),
+    ],
+)
+def test_command_position_grammar_is_named(word, expected):
+    """#3187, reached through #3129: a word in command position may be
+    grammar rather than a program.
+
+    The character allow-list cannot see this — every character in
+    ``eval`` and ``FOO=x`` is inert. It matters because one backend does
+    not exec the argv it is given: DockerSandboxBackend rebuilds a bash
+    script, where a bare word is read as grammar and ``BinaryPolicy``
+    has vetted ``eval`` rather than what eval runs.
+    """
+    result = command_word_is_shell_grammar(word)
+    if expected is None:
+        assert result is None, (word, result)
+    else:
+        assert result is not None and expected in result, (word, result)
+
+
+# Taken from bash 5.2, which is what the Linux CI runner has. Stored
+# rather than asked, because macOS ships bash 3.2: its `compgen -k`
+# omits `coproc` and its `compgen -b` omits mapfile/readarray/compopt,
+# so a differential that only asked the LOCAL shell passed on a
+# developer machine and would have failed on CI. Codex round 8 caught
+# exactly that.
+_BASH_5_RESERVED_WORDS = set(
+    "! [[ ]] { } case coproc do done elif else esac fi for function if "
+    "in select then time until while".split()
+)
+# Measured inside alpine:3.19 — the image DockerExecutor uses for a
+# script it calls "bash" and then runs with `sh`, where /bin/sh is
+# BusyBox. `chdir` is the one builtin ash has that bash does not, and it
+# ran successfully under the default backend while the local backend
+# reported command not found (codex round 9).
+_BUSYBOX_ASH_BUILTINS = {"chdir"}
+
+_BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS = set(
+    ". : alias bg bind break builtin caller cd command compgen compopt "
+    "complete continue declare dirs disown enable eval exec exit export "
+    "fc fg getopts hash help history jobs let local logout mapfile popd "
+    "pushd read readarray readonly return set shift shopt source suspend "
+    "times trap type typeset ulimit umask unalias unset wait".split()
+)
+
+
+@pytest.mark.parametrize(
+    "word",
+    sorted(
+        _BASH_5_RESERVED_WORDS
+        | _BASH_5_BUILTINS_THAT_ARE_NOT_PROGRAMS
+        | _BUSYBOX_ASH_BUILTINS
+    ),
+)
+def test_the_guard_knows_every_word_either_shell_treats_as_grammar(word):
+    """Version-proof AND shell-proof: stored snapshots, not this box.
+
+    The live check below still runs and catches anything a newer bash
+    adds. This one catches the two skews it cannot: a developer shell
+    OLDER than the runner's (how `coproc` reached review), and a
+    DIFFERENT shell than the one being asked — the default backend runs
+    BusyBox ash inside alpine, not the bash this test can call.
+    """
+    assert command_word_is_shell_grammar(word) is not None, word
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_guard_knows_what_the_local_bash_reports():
+    """And whatever this machine's bash adds on top.
+
+    A hard-coded list of shell grammar is the shape this ticket spent
+    six rounds learning to distrust, so it is checked from two
+    directions rather than trusted from none.
+    """
+    version = subprocess.run(
+        ["bash", "-c", "echo $BASH_VERSION"], capture_output=True, text=True
+    ).stdout.strip()
+    words = set()
+    for probe in ("compgen -k", "compgen -b"):
+        reported = subprocess.run(
+            ["bash", "-c", probe], capture_output=True, text=True
+        )
+        words |= set(reported.stdout.split())
+    assert words, "bash reported nothing; the probe is broken"
+
+    programs = {"echo", "printf", "test", "[", "true", "false", "pwd", "kill"}
+    missing = {
+        w for w in words - programs if command_word_is_shell_grammar(w) is None
+    }
+    assert missing == set(), (
+        f"bash {version} treats these as grammar and the guard does not "
+        f"know them: {missing}"
     )
 
 

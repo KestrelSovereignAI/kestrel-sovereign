@@ -495,3 +495,17 @@ def test_strategic_memory_passes_toolresult_contract():
 
     feat = StrategicMemoryFeature(agent=MagicMock())
     assert_feature_returns_tool_result(feat)
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_invalid_mode_names_a_reason_code():
+    """The sixth failed return of the tool #3184 is about. The other five
+    carry a reason_code; a scheduled row whose args_json holds a bad mode
+    failed with none, so its dispatch failure read as cause-free."""
+    feat = _make_feature({}, agent=_dispatch_agent(registration=None))
+
+    result = await feat.signal_dispatch(mode="bogus")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["reason_code"] == "INVALID_DISPATCH_MODE"
+    assert result.data["dispatched"] is False

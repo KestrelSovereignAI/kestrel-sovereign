@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
@@ -214,6 +214,16 @@ class Feature(_SdkFeature):
 
     # Node type used for persisting feature config in the knowledge graph.
     _CONFIG_NODE_TYPE = "feature_config"
+
+    #: The closed vocabulary of ``data["reason_code"]`` values each of this
+    #: feature's tools may return in a failed result, keyed by tool name.
+    #: When a scheduled tool fails, the scheduler names the cause in the
+    #: dispatch failure — text that leaves the redaction/cap boundary for
+    #: ``signal_log.error`` — only by membership here, never by shape (#3184).
+    #: A code that is not declared is dropped and logged as undeclared. Read
+    #: by attribute name, so an out-of-tree feature (subclassing the SDK
+    #: Feature) declares it the same way.
+    tool_reason_codes: ClassVar[Mapping[str, frozenset[str]]] = {}
 
     def __init__(self, agent):
         self.agent = agent
@@ -1557,8 +1567,8 @@ class Feature(_SdkFeature):
                 return (effective_args_value, result_value)
             return result_value
 
-        tool = tools_by_name.get(tool_name)
-        if tool is None:
+        selected_tool = tools_by_name.get(tool_name)
+        if selected_tool is None:
             return _shape(args, {
                 "success": False,
                 "error": (
@@ -1667,7 +1677,7 @@ class Feature(_SdkFeature):
                 # before the DENY/ASK branch.
 
             try:
-                result = await tool.execute(**effective_args)
+                result = await selected_tool.execute(**effective_args)
             except Exception as e:
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
@@ -1802,7 +1812,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {tool.name: tool for tool in self.get_tools()}
+        tools_by_name = {agent_tool.name: agent_tool for agent_tool in self.get_tools()}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit

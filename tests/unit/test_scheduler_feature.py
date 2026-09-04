@@ -2103,6 +2103,35 @@ class TestTaskExecutor:
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_direct_run_names_only_a_declared_reason_code(self):
+        # The direct-run path (#3184): a failed ToolResult's reason_code
+        # reaches the raised message only when the owning feature declared
+        # it in ``tool_reason_codes`` — the same door the cron sources use.
+        from kestrel_sdk.tools.result import ToolResult
+
+        feature = SchedulerFeature(MagicMock())
+        feature.agent.hooks_manager = self._passthrough_hooks_manager()
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_tool.execute = AsyncMock(return_value=ToolResult.failed(
+            "the score fell below threshold at /Users/someone/private",
+            data={"reason_code": "WELLNESS_DOWN"},
+        ))
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        feature.agent.features = {"WellnessFeature": mock_feature}
+
+        mock_feature.tool_reason_codes = {"wellness_check": frozenset({"WELLNESS_DOWN"})}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed (WELLNESS_DOWN)"
+
+        mock_feature.tool_reason_codes = {}
+        with pytest.raises(RuntimeError) as excinfo:
+            await feature._lookup_and_run_tool("wellness_check", {})
+        assert str(excinfo.value) == "scheduled tool wellness_check failed"
+
+    @pytest.mark.asyncio
     async def test_custom_signal_dispatch_schedule_routes_through_cron_source(
         self, feature,
     ):
@@ -3685,3 +3714,69 @@ def test_fetch_url_selects_endpoint_by_kind():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_raised_cycle_names_sleep_failed_as_its_reason_code():
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(side_effect=RuntimeError("cycle blew up"))
+    feature = SchedulerFeature(agent)
+    feature._agent_id = "test-agent"  # the exception path logs it
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "SLEEP_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_handle_sleep_failed_report_carries_the_reports_error_token():
+    class _Report:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": "semantic_artifact_expiry_sweep_failed",
+                "failure_code": "semantic_artifact_expiry_sweep_failed",
+                "failure_reason": "semantic_artifact_expiry_sweep_failed",
+            }
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.status == "failed"
+    assert outcome.reason_code == "semantic_artifact_expiry_sweep_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_reason, expected", [
+    ("export_failed", "export_failed"),
+    ("semantic_maintenance_failed", "semantic_maintenance_failed"),
+    (None, ""),
+])
+async def test_handle_sleep_failed_report_forwards_the_reports_failure_reason(
+    failure_reason, expected
+):
+    """The report resolves its own cause (failure_reason, carried by
+    to_dict); the door reads that and never parses the composed ``error``."""
+    class _Report:
+        def to_dict(self):
+            return {
+                "success": False,
+                "error": "consolidation_skipped; Export failed: remote backup unavailable",
+                "failure_code": None,
+                "failure_reason": failure_reason,
+            }
+
+    agent = _make_mock_agent()
+    agent.sleep = AsyncMock(return_value=_Report())
+    feature = SchedulerFeature(agent)
+
+    outcome = await feature._handle_sleep({})
+
+    assert isinstance(outcome, ScheduledTaskOutcome)
+    assert outcome.reason_code == expected

@@ -180,6 +180,21 @@ def test_classify_open_unread_rollup_is_pending():
     assert st.data["checks"] == "unknown"
 
 
+def test_classify_open_unread_runs_on_an_empty_page_is_pending_not_partial():
+    """``total_count`` above an empty page means gates the read never saw.
+    That is an evidence gap, not "no CI ran": PARTIAL is terminal and a
+    mode="signal" wait on it would fire once, reporting no CI for a head the
+    same payload says has 45 gates."""
+    st = classify_ci_state(
+        {"state": "open", "merged": False},
+        check_runs={"total_count": 45, "check_runs": []},
+        combined_status={"state": "pending", "total_count": 0, "statuses": []},
+        repo="o/r", number=7,
+    )
+    assert st.outcome is Outcome.PENDING
+    assert st.data["checks"] == "pending"
+
+
 # ---------------------------------------------------------------------------
 # #2939 regressions — the stale ``checks: "pending"`` stall
 # ---------------------------------------------------------------------------
@@ -482,7 +497,7 @@ async def test_poll_through_real_fetch_resolves_completed_rollup(monkeypatch):
                 "mergeable_state": "clean",
                 "head": {"sha": "362b6c0d85573b25ee4fba32278d6ad2f1cbf80c"},
             }
-        if url.endswith("/check-runs"):
+        if "/check-runs" in url:
             return _pr_2934_check_runs()
         if url.endswith("/status"):
             return _combined_status_actions_only()
@@ -494,7 +509,7 @@ async def test_poll_through_real_fetch_resolves_completed_rollup(monkeypatch):
 
     assert status.outcome is Outcome.DONE
     assert status.data["checks"] == "success"
-    assert any(u.endswith("/check-runs") for u in seen)
+    assert any("/check-runs?per_page=100" in u for u in seen)
 
 
 @pytest.mark.asyncio

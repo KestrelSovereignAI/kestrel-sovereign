@@ -3123,6 +3123,33 @@ async def test_sleep_reports_revocation_failure_as_failed_maintenance() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sleep_reports_a_revocation_storage_gap_with_its_own_code() -> None:
+    """The fourth failure exit of _run_semantic_maintenance: governed storage
+    without revoke_semantic_inference. Its sibling recorded
+    semantic_storage_unavailable; this exit set neither error nor code, so the
+    scheduler named the wrong phase (semantic_maintenance_failed)."""
+    class Storage:
+        pass  # no revoke_semantic_inference
+
+    class Agent(SleepMixin):
+        def __init__(self) -> None:
+            self.semantic_inference_profile = None
+            self.semantic_inference_configured = True
+            self.storage = Storage()
+
+    report = await Agent().sleep(
+        skip_consolidation=True,
+        skip_export=True,
+        skip_reflection=True,
+    )
+
+    assert report.success is False
+    assert report.failure_code == "semantic_storage_unavailable"
+    assert report.failure_reason() == "semantic_storage_unavailable"
+    assert "semantic_storage_unavailable" in (report.error or "")
+
+
+@pytest.mark.asyncio
 async def test_budget_exhaustion_is_durable_and_does_not_claim_closure(assertion_store) -> None:
     class_a = IRI("https://example.test/ClassA")
     class_b = IRI("https://example.test/ClassB")

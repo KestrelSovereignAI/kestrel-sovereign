@@ -2388,6 +2388,42 @@ class TestCodexApprovalBridge:
         )
 
     @pytest.mark.asyncio
+    async def test_an_escaped_quote_cannot_hide_a_command_separator(self):
+        """codex review round 6, P1 — a regression #3129 introduced.
+
+        Simplifying the quote walk dropped backslash handling, so
+        ``echo foo\'; sudo -n true`` opened a single-quoted region at
+        the ESCAPED apostrophe and the ``;`` after it looked quoted.
+        The compound guard saw nothing, ``BinaryPolicy`` saw an
+        allow-listed ``echo``, and this bridge auto-accepted — while a
+        real shell reads the apostrophe as a literal and runs the
+        second command. Verified against bash: it prints the second
+        command's output.
+
+        The tool that motivated #3129 was never exposed (a backslash is
+        not an inert character, so its own rule refuses the line). This
+        door was, which is why the test lives here as well as on the
+        predicate.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["echo"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+
+        reply = await handler({"command": "echo foo\\'; rm -rf /tmp/x"})
+
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "an escaped quote must not hide the separator from the queue"
+        )
+
+    @pytest.mark.asyncio
     async def test_compound_command_with_denied_token_hard_denies(self):
         """If the policy DENIES any argv in the batch via parsed
         ``commandActions``, the compound guard is irrelevant — DENY

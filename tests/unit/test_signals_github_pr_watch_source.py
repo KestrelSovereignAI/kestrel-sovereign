@@ -329,7 +329,7 @@ async def test_fetch_pr_state_derives_checks_from_real_apis(monkeypatch):
         calls.append(url)
         if url.endswith("/pulls/1614"):
             return _real_pr()
-        if url.endswith("/commits/abc123/check-runs"):
+        if "/commits/abc123/check-runs" in url:
             return {"check_runs": [
                 {"name": "build", "status": "completed", "conclusion": "success"},
             ]}
@@ -341,7 +341,9 @@ async def test_fetch_pr_state_derives_checks_from_real_apis(monkeypatch):
 
     state = await fetch_pr_state("owner/name", 1614, token="t", kind="pr")
     # Head-commit check/status endpoints were both queried.
-    assert any("check-runs" in u for u in calls)
+    assert any("check-runs?per_page=100" in u for u in calls), (
+        "the rollup must be read a full page at a time, not GitHub's default 30"
+    )
     assert any(u.endswith("/commits/abc123/status") for u in calls)
     # The derived summary reflects the real check run, not a synthetic field.
     assert "build=completed/success" in state["checks_status"]
@@ -359,7 +361,7 @@ async def test_fetch_pr_state_ci_transition_changes_fingerprint(monkeypatch):
     async def fake_get(url, *, token, timeout, ref):
         if url.endswith("/pulls/1614"):
             return _real_pr()
-        if url.endswith("/check-runs"):
+        if "/check-runs" in url:
             return check_runs_box["value"]
         if url.endswith("/status"):
             return status_box["value"]
@@ -410,3 +412,157 @@ async def test_fetch_pr_state_issue_skips_checks(monkeypatch):
     state = await fetch_pr_state("owner/name", 1614, token="t", kind="issue")
     assert not any("check-runs" in u or u.endswith("/status") for u in calls)
     assert normalize_pr_state(state)["checks_status"] == ""
+
+
+# --------------------------------------------------------------------------
+# #3191 — every run counts, and a combined verdict that can resolve.
+# --------------------------------------------------------------------------
+
+def test_summarize_checks_keeps_both_concurrent_suites_and_the_failing_one_decides():
+    """Measured on this repo: CI fires on both ``push`` and ``pull_request``,
+    so a PR head carries two same-named check runs from two concurrent check
+    suites, and which suite has the higher id is a coin flip. Keeping one
+    run per name erased a failing (or still-running) gate; both must count."""
+    runs = {"check_runs": [
+        {"name": "integration-tests", "status": "completed", "conclusion": "failure",
+         "id": 99755309896, "check_suite": {"id": 1}},
+        {"name": "integration-tests", "status": "completed", "conclusion": "skipped",
+         "id": 99755314204, "check_suite": {"id": 2}},
+    ]}
+    summary = summarize_checks(runs, {"state": "pending", "statuses": []})
+    assert "check:integration-tests=completed/failure" in summary
+    assert "check:integration-tests=completed/skipped" in summary
+    assert "combined=failure" in summary
+
+    running = {"check_runs": [
+        {"name": "unit-tests", "status": "in_progress", "conclusion": None,
+         "id": 1, "check_suite": {"id": 1}},
+        {"name": "unit-tests", "status": "completed", "conclusion": "cancelled",
+         "id": 2, "check_suite": {"id": 2}},
+    ]}
+    assert "combined=pending" in summarize_checks(running, {"state": "pending", "statuses": []})
+
+
+def test_summarize_checks_combined_resolves_from_check_runs():
+    """With no legacy status contexts, GitHub's combined status is ``pending``
+    forever; the verdict has to come from the runs that actually gate the PR —
+    the same rollup the CI wait provider uses."""
+    green = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+        {"name": "lint", "status": "completed", "conclusion": "skipped"},
+    ]}
+    assert "combined=success" in summarize_checks(green, {"state": "pending", "statuses": []})
+    red = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+        {"name": "test", "status": "completed", "conclusion": "timed_out"},
+    ]}
+    assert "combined=failure" in summarize_checks(red, {"state": "pending", "statuses": []})
+
+
+def test_summarize_checks_combined_still_honours_a_real_legacy_status():
+    runs = {"check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success"},
+    ]}
+    legacy = {"state": "failure", "statuses": [{"context": "ci/legacy", "state": "failure"}]}
+    summary = summarize_checks(runs, legacy)
+    assert "combined=failure" in summary
+    assert "status:ci/legacy=failure" in summary
+
+
+def test_check_verdict_treats_unreturned_runs_as_pending_but_never_hides_a_failure():
+    """A total_count above what came back means gates this verdict never saw.
+    An unread gate can only hide MORE failures, so it lowers success to
+    pending and leaves an observed failure alone."""
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    page = {"total_count": 45, "check_runs": [
+        {"name": f"job-{i}", "status": "completed", "conclusion": "success"} for i in range(30)
+    ]}
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "pending"
+    page["total_count"] = 30
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "success"
+    page["total_count"] = 45
+    page["check_runs"][7]["conclusion"] = "failure"
+    assert _check_verdict(page, {"state": "pending", "statuses": []}) == "failure"
+
+
+def test_check_verdict_unread_runs_on_an_empty_page_are_pending_not_none():
+    """``total_count`` says gates exist but none came back: that rollup is
+    unread, not empty. "none" is terminal downstream (PARTIAL, "no CI ran"),
+    so it must not be reached past a total the read never met. The rule
+    still never hides an observed failure, and a zero total is still none."""
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    empty_page = {"total_count": 45, "check_runs": []}
+    assert _check_verdict(empty_page, {"state": "pending", "statuses": []}) == "pending"
+    assert _check_verdict(empty_page, None) == "pending"
+    legacy_failure = {
+        "state": "failure", "statuses": [{"context": "ci/legacy", "state": "failure"}]
+    }
+    assert _check_verdict(empty_page, legacy_failure) == "failure"
+    assert _check_verdict({"total_count": 0, "check_runs": []}, None) == "none"
+
+
+@pytest.mark.asyncio
+async def test_fetch_check_runs_reads_a_rollup_larger_than_any_page_cap(monkeypatch):
+    """A 1,500-run head is read to the end and resolves terminal. A fixed page
+    cap read it short on every poll, and the unread-gate rule then pinned it
+    at "pending" for good — the one state class this module forbids."""
+    import re
+
+    import kestrel_sovereign.signals.sources.github_pr_watch as watch
+    from kestrel_sovereign.signals.sources.github_pr_watch import _check_verdict
+
+    total = 1500
+    calls = []
+
+    async def fake_get(url, *, token, timeout, ref):
+        calls.append(url)
+        m = re.search(r"[?&]page=(\d+)", url)
+        page = int(m.group(1)) if m else 1
+        lo = (page - 1) * 100
+        return {"total_count": total, "check_runs": [
+            {"name": f"job-{i}", "status": "completed", "conclusion": "success"}
+            for i in range(lo, min(lo + 100, total))
+        ]}
+
+    monkeypatch.setattr(watch, "_github_get", fake_get)
+    rollup = await watch._github_get_check_runs(
+        "https://api.github.com/repos/o/r", "deadbeef", token="t", timeout=5, ref="o/r#7"
+    )
+
+    assert len(calls) == 15
+    assert len(rollup["check_runs"]) == total
+    assert _check_verdict(rollup, {"state": "pending", "statuses": []}) == "success"
+
+
+@pytest.mark.asyncio
+async def test_fetch_pr_state_follows_check_run_pages(monkeypatch):
+    """The unread-page verdict must be a condition the fetch can clear: page
+    two is read, not merely detected."""
+    import kestrel_sovereign.signals.sources.github_pr_watch as watch
+
+    calls = []
+    page_one = [{"name": f"job-{i}", "status": "completed", "conclusion": "success"} for i in range(30)]
+    page_two = [{"name": f"job-{i}", "status": "completed", "conclusion": "failure" if i == 44 else "success"} for i in range(30, 45)]
+
+    async def fake_get(url, *, token, timeout, ref):
+        calls.append(url)
+        if url.endswith("/pulls/7"):
+            return {"state": "open", "merged": False, "head": {"sha": "deadbeef"}}
+        if "/check-runs" in url and "page=2" in url:
+            return {"total_count": 45, "check_runs": page_two}
+        if "/check-runs" in url:
+            return {"total_count": 45, "check_runs": page_one}
+        if url.endswith("/status"):
+            return {"state": "pending", "statuses": []}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(watch, "_github_get", fake_get)
+    raw = await watch.fetch_pr_state("org/repo", 7, kind="pr", token="t", timeout=5)
+
+    assert any("per_page=100&page=2" in u for u in calls)
+    summary = raw["checks_status"]
+    assert summary.count("check:") == 45
+    assert "check:job-44=completed/failure" in summary
+    assert "combined=failure" in summary

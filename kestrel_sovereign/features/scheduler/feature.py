@@ -59,10 +59,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sovereign.agent.sleep import SLEEP_FAILURE_REASONS
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -124,6 +126,16 @@ class SchedulerFeature(Feature):
     Standalone polling is armed only from ``on_agent_ready``; a shared
     PostgreSQL host owns one fleet runner instead.
     """
+
+    #: The reason codes this feature's own built-in tasks may return in a
+    #: failed ScheduledTaskOutcome: the sleep cycle's closed vocabulary plus
+    #: SLEEP_FAILED, the raised-cycle code ``_handle_sleep`` sets itself. The
+    #: signal boundary admits a code by membership here (see
+    #: ``Feature.tool_reason_codes``), so the vocabulary lives with its owner,
+    #: not in the core signals module.
+    tool_reason_codes = {
+        "sleep": frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS,
+    }
 
     @property
     def tool_description(self) -> str:
@@ -211,6 +223,7 @@ class SchedulerFeature(Feature):
         if registry is not None:
             cron_registrations = build_cron_registrations(
                 tool_lookup=self._lookup_raw_tool_result,
+                reason_codes_lookup=self._declared_reason_codes,
                 builtin_handlers={
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
@@ -1003,6 +1016,47 @@ class SchedulerFeature(Feature):
         """
         return bool(getattr(feature, "enabled", True))
 
+    def _declared_reason_codes(self, task_name: str) -> frozenset[str]:
+        """The ``reason_code`` vocabulary the owner of ``task_name`` declared.
+
+        This feature's own declaration applies by name (it owns every built-in
+        task and its own tools). Any other feature's applies only to a tool it
+        actually exposes, mirroring the ownership walk in
+        :meth:`_lookup_raw_tool_result`: a feature cannot widen the vocabulary
+        of a tool it does not own. ``tool_reason_codes`` is read by attribute
+        (see ``Feature.tool_reason_codes``), so an out-of-tree feature that
+        subclasses the SDK Feature declares it the same way. Nothing declared
+        means nothing crosses.
+        """
+        own = self._reason_codes_declared_by(self).get(task_name)
+        if own is not None:
+            return own
+        features = getattr(self.agent, "features", {})
+        for feature in features.values():
+            if not hasattr(feature, "get_tools") or not self._feature_enabled(feature):
+                continue
+            declared = self._reason_codes_declared_by(feature)
+            if task_name not in declared:
+                continue
+            try:
+                owned = {getattr(t, "name", None) for t in feature.get_tools()}
+            except Exception:  # noqa: BLE001 - a broken feature can't block others
+                continue
+            if task_name in owned:
+                return declared[task_name]
+        return frozenset()
+
+    @staticmethod
+    def _reason_codes_declared_by(feature: Any) -> Dict[str, frozenset[str]]:
+        declared = getattr(feature, "tool_reason_codes", None)
+        if not isinstance(declared, Mapping):
+            return {}
+        return {
+            str(name): frozenset(c for c in codes if isinstance(c, str))
+            for name, codes in declared.items()
+            if isinstance(codes, (frozenset, set, list, tuple))
+        }
+
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
         """Run a tool directly through the canonical scheduler result boundary.
 
@@ -1018,6 +1072,7 @@ class SchedulerFeature(Feature):
         return _prepare_scheduled_tool_result(
             task_name,
             await self._lookup_raw_tool_result(task_name, args),
+            declared_reason_codes=self._declared_reason_codes(task_name),
         )
 
     async def _lookup_raw_tool_result(self, task_name: str, args: dict) -> Any:
@@ -1301,6 +1356,7 @@ class SchedulerFeature(Feature):
                 status="failed",
                 result_text=json.dumps({"error": "sleep_failed"}),
                 pause_schedule=False,
+                reason_code="SLEEP_FAILED",
             )
 
         data = report.to_dict() if hasattr(report, "to_dict") else {}
@@ -1341,10 +1397,17 @@ class SchedulerFeature(Feature):
             and not consolidation_skipped
             and not maintenance_skipped
         ):
+            # ``SleepReport.failure_reason()`` is the one resolution of "why
+            # did this cycle fail" (the phase's recorded code, else the
+            # maintenance unit's status); ``to_dict`` carries it. ``error``
+            # is the composed human string; the only thing read from it here
+            # is the exact skip token above, which ``_record_failure_code``
+            # deliberately never records.
             return ScheduledTaskOutcome(
                 status="failed",
                 result_text=result_text,
                 pause_schedule=False,
+                reason_code=str(data.get("failure_reason") or ""),
             )
         return result_text
 

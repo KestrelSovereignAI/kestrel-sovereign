@@ -308,6 +308,7 @@ class TestTaskManager:
             task.id,
             TaskState.WORKING,
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
         assert updated.status.state == TaskState.WORKING
 
@@ -317,6 +318,7 @@ class TestTaskManager:
             TaskState.COMPLETED,
             message=Message(role="agent", parts=[TextPart(text="Done")]),
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
         assert updated.status.state == TaskState.COMPLETED
 
@@ -334,6 +336,7 @@ class TestTaskManager:
                 task.id,
                 TaskState.COMPLETED,
                 agent_name="test-agent",
+                recipient_agent_id="test-agent",
             )
 
     @pytest.mark.asyncio
@@ -345,13 +348,19 @@ class TestTaskManager:
         task = await task_manager.create_task(params, agent_name="test-agent")
 
         # Move to working first
-        await task_manager.update_status(task.id, TaskState.WORKING, agent_name="test-agent")
+        await task_manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
 
         # Complete
         completed = await task_manager.complete_task(
             task.id,
             response="The answer is 4.",
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
 
         assert completed.status.state == TaskState.COMPLETED
@@ -366,13 +375,19 @@ class TestTaskManager:
         task = await task_manager.create_task(params, agent_name="test-agent")
 
         # Move to working
-        await task_manager.update_status(task.id, TaskState.WORKING, agent_name="test-agent")
+        await task_manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
 
         # Fail
         failed = await task_manager.fail_task(
             task.id,
             error="Something went wrong",
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
 
         assert failed.status.state == TaskState.FAILED
@@ -407,7 +422,12 @@ class TestTaskManager:
             parts=[TextPart(text="Report content here")],
         )
 
-        updated = await task_manager.add_artifact(task.id, artifact, agent_name="test-agent")
+        updated = await task_manager.add_artifact(
+            task.id,
+            artifact,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
 
         assert updated.artifacts is not None
         assert len(updated.artifacts) == 1
@@ -939,6 +959,7 @@ class TestTaskWorker:
     @pytest.mark.asyncio
     async def test_task_worker_register_handler(self, task_manager):
         """Test registering handlers with TaskWorker."""
+        task_manager.host_agent_id = "did:test:worker"
         worker = TaskWorker(
             task_manager=task_manager,
             agent_name="test-worker",
@@ -1000,7 +1021,12 @@ class TestTaskManagerWorkerIntegration:
         assert task.status.state == TaskState.SUBMITTED
 
         # Worker picks up task and starts processing
-        await task_manager.update_status(task.id, TaskState.WORKING, agent_name="test-agent")
+        await task_manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
         working_task = await task_manager.get_task(task.id)
         assert working_task.status.state == TaskState.WORKING
 
@@ -1009,6 +1035,7 @@ class TestTaskManagerWorkerIntegration:
             task.id,
             response="Data processed successfully",
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
         assert completed_task.status.state == TaskState.COMPLETED
 
@@ -1026,22 +1053,38 @@ class TestTaskManagerWorkerIntegration:
         task = await task_manager.create_task(params, agent_name="test-agent")
 
         # Worker needs more input
-        await task_manager.update_status(task.id, TaskState.WORKING, agent_name="test-agent")
+        await task_manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
         await task_manager.update_status(
             task.id,
             TaskState.INPUT_REQUIRED,
             message=Message(role="agent", parts=[TextPart(text="What specifically?")]),
             agent_name="test-agent",
+            recipient_agent_id="test-agent",
         )
 
         task = await task_manager.get_task(task.id)
         assert task.status.state == TaskState.INPUT_REQUIRED
 
         # User provides input (simulated by resuming)
-        await task_manager.update_status(task.id, TaskState.WORKING, agent_name="test-agent")
+        await task_manager.update_status(
+            task.id,
+            TaskState.WORKING,
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
 
         # Now complete
-        await task_manager.complete_task(task.id, response="Done", agent_name="test-agent")
+        await task_manager.complete_task(
+            task.id,
+            response="Done",
+            agent_name="test-agent",
+            recipient_agent_id="test-agent",
+        )
 
         final_task = await task_manager.get_task(task.id)
         assert final_task.status.state == TaskState.COMPLETED

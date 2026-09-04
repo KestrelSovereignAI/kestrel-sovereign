@@ -34,7 +34,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, List
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
@@ -146,6 +146,119 @@ def compute_fingerprint(normalized: Dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+# GitHub check-run conclusions that mean the check did NOT pass. ``success``,
+# ``neutral`` and ``skipped`` are treated as non-blocking passes: they mean
+# the check did not need to run. ``cancelled`` deliberately stays a failure —
+# it means the check was stopped before it could tell us anything, which is an
+# absence of evidence rather than a pass (#2939).
+_FAIL_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "cancelled", "action_required", "stale",
+     "startup_failure"}
+)
+
+
+def _positive_count(value: Any) -> bool:
+    """Whether ``value`` is a GitHub ``total_count`` greater than zero.
+
+    Tolerates the field being absent, ``null``, or a string; anything that is
+    not a positive integer reads as "no statuses reported".
+    """
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_verdict(
+    check_runs: Any = None, combined_status: Any = None
+) -> str:
+    """Reduce raw check-runs + combined commit status to a coarse verdict.
+
+    Returns one of:
+      * ``"unknown"`` — the rollup was not read at all (neither payload was
+        fetched); an evidence gap, NOT a statement about the checks,
+      * ``"none"``    — read successfully and empty: no check runs and no
+        statuses exist for this commit (no CI ran),
+      * ``"pending"`` — at least one check/status is not yet terminal,
+      * ``"failure"`` — everything terminal and at least one failed,
+      * ``"success"`` — everything terminal and all passed.
+
+    A check run counts as terminal on ``status == "completed"`` whatever its
+    conclusion, so ``skipped``/``neutral`` never hold the rollup open.
+    """
+    runs_read = isinstance(check_runs, (dict, list))
+    runs: List[dict] = []
+    if isinstance(check_runs, dict):
+        raw_runs = check_runs.get("check_runs", []) or []
+    elif isinstance(check_runs, list):
+        raw_runs = check_runs
+    else:
+        raw_runs = []
+    for r in raw_runs:
+        if isinstance(r, dict):
+            runs.append(r)
+
+    status_read = isinstance(combined_status, dict)
+    combined_state = ""
+    statuses: List[dict] = []
+    if isinstance(combined_status, dict):
+        for s in combined_status.get("statuses", []) or []:
+            if isinstance(s, dict):
+                statuses.append(s)
+        # GitHub reports the combined ``state`` as "pending" for a commit that
+        # carries ZERO legacy statuses — the shape of every Actions-only repo,
+        # where CI reports through check runs instead. Reading that as "a
+        # check is still running" pins the verdict at pending forever (#2939),
+        # so the combined state is evidence only when a status backs it.
+        if statuses or _positive_count(combined_status.get("total_count")):
+            combined_state = str(combined_status.get("state", "") or "").lower()
+
+    if not runs_read and not status_read:
+        return "unknown"
+
+    # A ``total_count`` above what came back means gates this verdict never
+    # saw (a page the fetch could not follow, or a caller that read one
+    # page). An unread gate can only hide MORE failures, never turn an
+    # observed one into a pass, so it acts in exactly two places: it stops
+    # an empty page from reading as "no CI ran" (the rollup is not empty, it
+    # is unread), and it lowers "success" to "pending". It never touches an
+    # observed failure.
+    unread_runs = False
+    if isinstance(check_runs, dict):
+        total = check_runs.get("total_count")
+        unread_runs = isinstance(total, int) and total > len(runs)
+
+    if not runs and not statuses and not combined_state:
+        return "pending" if unread_runs else "none"
+
+    # Not terminal yet if any check run is still queued/in_progress, or the
+    # combined/legacy status is still pending.
+    for r in runs:
+        if str(r.get("status", "") or "").lower() != "completed":
+            return "pending"
+    if combined_state == "pending":
+        return "pending"
+    for s in statuses:
+        if str(s.get("state", "") or "").lower() == "pending":
+            return "pending"
+
+    # Everything terminal — any failure makes the verdict a failure.
+    for r in runs:
+        if str(r.get("conclusion", "") or "").lower() in _FAIL_CONCLUSIONS:
+            return "failure"
+    if combined_state in ("failure", "error"):
+        return "failure"
+    for s in statuses:
+        if str(s.get("state", "") or "").lower() in ("failure", "error"):
+            return "failure"
+
+    # Everything READ passed; gates never read keep it short of "success".
+    if unread_runs:
+        return "pending"
+
+    return "success"
+
+
 def summarize_checks(
     check_runs: Any = None, combined_status: Any = None
 ) -> str:
@@ -160,19 +273,23 @@ def summarize_checks(
       - ``combined_status`` is the JSON from ``/commits/{sha}/status``
         (``{"state", "statuses": [{"context", "state"}, ...]}``).
 
-    The summary captures each check's ``status``/``conclusion`` and each
-    legacy status context's ``state``, plus the combined ``state``, so a CI
-    transition — queued → in_progress → completed/success|failure — changes
-    the string (and therefore the fingerprint). It is order-independent
-    (parts are sorted) so the same set of checks always summarizes
-    identically. Returns ``""`` when there are no checks or statuses at all,
-    which is indistinguishable from "no checks key in payload".
+    The summary captures each check run's ``status``/``conclusion`` — EVERY
+    run, one entry each: ``/commits/{sha}/check-runs`` defaults to
+    ``filter=latest``, so re-run attempts are already collapsed upstream, and
+    the same-named duplicates that do arrive are two concurrent check suites
+    (this repo's CI fires on both ``push`` and ``pull_request``), each a real
+    gate that must count (#3191) — plus each legacy status context's
+    ``state``, plus a ``combined`` verdict from :func:`_check_verdict`, the
+    one rollup the CI wait provider also uses, so a CI transition — queued →
+    in_progress → completed/success|failure — changes the string (and
+    therefore the fingerprint). It is order-independent (parts are sorted)
+    so the same set of checks always summarizes identically. Returns ``""``
+    when there are no checks or statuses at all, which is indistinguishable
+    from "no checks key in payload".
     """
     parts = []
 
-    combined_state = ""
     if isinstance(combined_status, dict):
-        combined_state = str(combined_status.get("state", "") or "")
         for s in combined_status.get("statuses", []) or []:
             if isinstance(s, dict):
                 ctx = str(s.get("context", "") or "")
@@ -193,6 +310,10 @@ def summarize_checks(
             conclusion = str(r.get("conclusion", "") or "")
             parts.append(f"check:{name}={status}/{conclusion}")
 
+    # "unknown" (nothing fetched) and "none" (fetched, empty) both mean there
+    # is no verdict to fingerprint; the caller treats "" as "no checks".
+    verdict = _check_verdict(check_runs, combined_status)
+    combined_state = verdict if verdict in ("pending", "failure", "success") else ""
     if not parts and not combined_state:
         return ""
 
@@ -298,6 +419,48 @@ def evaluate_pr_watch(
 # ---------------------------------------------------------------------------
 
 
+async def _github_get_check_runs(
+    base: str, head_sha: str, *, token: str, timeout: int, ref: str
+) -> Any:
+    """Every check run for ``head_sha`` (GitHub's ``filter=latest`` default).
+
+    GitHub pages the rollup at 30 by default; this asks for 100 and follows
+    ``page=`` until ``total_count`` is met, so a gate on page two is read
+    rather than merely detected. Returns the first page's object with its
+    ``check_runs`` extended, so callers see the shape the API documents.
+
+    The crawl is bounded by GitHub's own ``total_count``: every non-empty
+    page grows ``runs`` and an empty page ends the loop, so it issues at most
+    ``ceil(total_count / 100)`` requests. There is deliberately no fixed page
+    cap on top of that — a rollup larger than a cap would be read short every
+    poll, and :func:`_check_verdict` would then hold it at ``"pending"``
+    forever, the one state class this rollup must never settle in (#2939).
+    """
+    first = await _github_get(
+        f"{base}/commits/{head_sha}/check-runs?per_page=100",
+        token=token, timeout=timeout, ref=ref,
+    )
+    if not isinstance(first, dict):
+        return first
+    runs = [r for r in (first.get("check_runs") or []) if isinstance(r, dict)]
+    total = first.get("total_count")
+    page = 1
+    while isinstance(total, int) and len(runs) < total:
+        page += 1
+        more = await _github_get(
+            f"{base}/commits/{head_sha}/check-runs?per_page=100&page={page}",
+            token=token, timeout=timeout, ref=f"{ref} page {page}",
+        )
+        batch = (
+            [r for r in (more.get("check_runs") or []) if isinstance(r, dict)]
+            if isinstance(more, dict) else []
+        )
+        if not batch:
+            break
+        runs.extend(batch)
+    return {**first, "check_runs": runs}
+
+
 async def _github_get(
     url: str, *, token: str, timeout: int, ref: str
 ) -> Any:
@@ -380,11 +543,8 @@ async def fetch_pr_state(
     head = raw.get("head")
     head_sha = head.get("sha") if isinstance(head, dict) else None
     if kind != "issue" and head_sha:
-        check_runs = await _github_get(
-            f"{base}/commits/{head_sha}/check-runs",
-            token=token,
-            timeout=timeout,
-            ref=f"{ref} check-runs",
+        check_runs = await _github_get_check_runs(
+            base, head_sha, token=token, timeout=timeout, ref=f"{ref} check-runs"
         )
         combined_status = await _github_get(
             f"{base}/commits/{head_sha}/status",
