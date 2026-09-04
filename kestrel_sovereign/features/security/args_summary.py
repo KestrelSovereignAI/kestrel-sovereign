@@ -224,6 +224,7 @@ def mask_sensitive(
         stripped = data.lstrip()
         if stripped[:1] not in "{[":
             return data
+        altered = False
         try:
             nested, end = _JSON_PREFIX.raw_decode(stripped)
         except (ValueError, RecursionError):
@@ -239,7 +240,9 @@ def mask_sensitive(
         try:
             masked = mask_sensitive(nested, repair_slack=repair_slack, reconstructed=reconstructed)
             if masked == nested:
-                return data if not (reconstructed and reconstructed[-1] is True and altered) else json.dumps(masked, default=str)
+                # Nothing to mask: the value stays as written (a cut one is
+                # still marked, through the flag set above).
+                return data
             replaced = json.dumps(masked, default=str)
         except RecursionError:
             # The decoder accepts a payload nested deeper than this walk (or

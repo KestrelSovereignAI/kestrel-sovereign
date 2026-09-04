@@ -2516,3 +2516,8 @@ def test_a_reconstructed_nested_payload_is_marked_in_the_display():
     assert not remask_summary(intact).endswith("...") and "SECRET" not in remask_summary(intact)
     plain = json.dumps({"note": "x", "body": "the quick brown fo"})
     assert remask_summary(plain) == plain
+    # A cut nested payload with NOTHING to mask stays as written and is
+    # marked; an intact sibling payload beside it does not unset that.
+    two = json.dumps({"a": '{"body": "the quick brown fo', "b": json.dumps({"k": "v"})})
+    shown = remask_summary(two)
+    assert shown.endswith("...") and json.loads(shown[:-3])["a"] == '{"body": "the quick brown fo'
