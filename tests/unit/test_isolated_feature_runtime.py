@@ -13002,6 +13002,60 @@ async def test_volatile_privacy_noop_allows_transition_without_durable_config(
 
 
 @pytest.mark.asyncio
+async def test_terminal_volatile_config_survives_failed_initialize_and_retry(
+    monkeypatch, tmp_path
+):
+    """A child opens on terminal volatile config even after one failed start."""
+
+    class VolatileStorage(_FakeStorage):
+        def allows_persistent_writes(self):
+            return False
+
+    attempted_configs = []
+
+    class FailFirstStartClient(FakeIsolatedClient):
+        async def start(self):
+            attempted_configs.append(dict(self.kwargs["config"]))
+            if len(attempted_configs) == 1:
+                raise RuntimeError("synthetic first start failure")
+            await super().start()
+
+    declared_config = {"mode": "declared", "token": "volatile-token"}
+    agent = Mock(did=_TEST_AGENT_DID, features={})
+    agent.storage = VolatileStorage()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    monkeypatch.setenv("KESTREL_FEATURE_TESTFEATURE_BIN", "/bin/test-service")
+    feature = ProxyFeature(
+        agent,
+        _cfg_runtime(),
+        client_factory=FailFirstStartClient,
+    )
+    try:
+        feature._latch_terminal_lifecycle()
+        receipt = await feature.set_config(declared_config)
+        assert receipt.persistent is False
+        assert feature._host_config == declared_config
+        assert agent.storage.nodes == {}
+
+        with pytest.raises(
+            RuntimeError,
+            match="child process could not start or advertise its runtime contract",
+        ):
+            await feature.initialize()
+
+        assert feature._volatile_terminal_config_pending_initialize is True
+        await feature.initialize()
+
+        assert attempted_configs == [declared_config, declared_config]
+        assert feature._host_config == declared_config
+        assert feature._traffic_gate.closed is False
+        assert feature._volatile_terminal_config_pending_initialize is False
+        assert agent.storage.nodes == {}
+    finally:
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_fenced_transition_failure_replaces_with_next_config(monkeypatch, tmp_path):
     """An unknown lifecycle outcome follows the SDK's required replacement path."""
 

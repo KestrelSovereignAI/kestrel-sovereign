@@ -2189,6 +2189,58 @@ class TestGetFeatureConfig:
 
 class TestUpdateFeatureConfig:
     @pytest.mark.asyncio
+    async def test_late_isolated_ingress_generation_change_returns_retryable_409(
+        self,
+    ):
+        """A lease lost under the lifecycle lock is a conflict, not a 500."""
+
+        from kestrel_sovereign.features.isolated_runtime import (
+            IsolatedRuntimeConfigGenerationChanged,
+        )
+
+        lease = object()
+
+        class LateGenerationChangeFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            async def get_config(self):
+                return {"mode": "old"}
+
+            async def set_config(self, _config):
+                raise IsolatedRuntimeConfigGenerationChanged(
+                    "private generation detail"
+                )
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                yield lease
+
+            def claim_config_transition_ingress_fence(self, candidate):
+                return candidate is lease
+
+        feature = LateGenerationChangeFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(HTTPException) as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "next"}),
+            )
+
+        assert error.value.status_code == 409
+        assert "retry against the current generation" in error.value.detail
+        assert "private generation detail" not in error.value.detail
+        agent.refresh_feature_context_clauses.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_live_turn_can_call_isolated_tool_after_config_fence_closes(
         self, monkeypatch, tmp_path
     ):

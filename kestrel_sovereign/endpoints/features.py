@@ -18,6 +18,9 @@ from kestrel_sovereign.features.config_validation import (
     FeatureConfigInvalid,
     validate_feature_config,
 )
+from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeConfigGenerationChanged,
+)
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
@@ -1166,7 +1169,20 @@ async def _update_feature_config_generation(
                     "retry against the current generation"
                 ),
             )
-    return await _update_feature_config_locked(agent, current, name, body)
+    try:
+        return await _update_feature_config_locked(agent, current, name, body)
+    except IsolatedRuntimeConfigGenerationChanged:
+        # A reload/recovery owner can move the isolated client after the
+        # endpoint's initial lease claim but before the setter acquires the
+        # lifecycle lock. The setter re-proves that generation under the lock
+        # and raises this narrow retry condition before mutating config.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Feature '{name}' changed while configuration was queued; "
+                "retry against the current generation"
+            ),
+        ) from None
 
 
 @asynccontextmanager
@@ -1308,6 +1324,11 @@ async def _update_feature_config_locked(
             )
         else:
             commit_receipt = await feature.set_config(incoming)
+    except IsolatedRuntimeConfigGenerationChanged:
+        # The exact generation changed before the setter could mutate it. Do
+        # not run the ambiguous-commit reconciliation path below: this narrow
+        # exception certifies that no stage or live hook was attempted.
+        raise
     except (Exception, asyncio.CancelledError):
         # A setter can durably mutate and then surface an internally-originated
         # CancelledError (or another late error). With no returned receipt its

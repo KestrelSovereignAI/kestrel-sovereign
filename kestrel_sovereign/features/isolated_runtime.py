@@ -2618,6 +2618,10 @@ class IsolatedRuntimePreparationError(RuntimeError):
     """
 
 
+class IsolatedRuntimeConfigGenerationChanged(IsolatedRuntimePreparationError):
+    """A config ingress lease lost its exact client or gate generation."""
+
+
 class _IsolatedRuntimeLaunchTargetPreparationError(
     IsolatedRuntimePreparationError
 ):
@@ -6522,6 +6526,13 @@ class ProxyFeature(Feature):
         # explicit later ``initialize()`` begins a fresh cycle.
         self._terminal_lifecycle_latched = False
         self._stopping = False
+        # Volatile privacy deliberately has no graph row from which a later
+        # enable can reload a config written while this proxy is terminal. Keep
+        # only a boolean ownership marker beside the existing in-memory config:
+        # no second secret-bearing copy is created. Initialize clears the marker
+        # only after a child has opened on that exact config, so a failed startup
+        # can retry without silently falling back to an empty generation.
+        self._volatile_terminal_config_pending_initialize = False
         # Every terminal request invalidates an initializer that has not yet
         # acquired ``_reload_lock``.  A re-enable may clear only the terminal
         # cycle it observed *after* cleanup; a shutdown racing in that queue
@@ -7927,11 +7938,19 @@ class ProxyFeature(Feature):
             self._stopping = False
             self._idle_retired = False
             self._process_identity = None
-            # A previous enable cycle may have left an intentional empty config (or
-            # a stopped client) on this same object. A fresh initialize must never
-            # let that in-memory state stand in for the durable read below.
-            self._host_config = {}
-            self._host_config_loaded = False
+            # A previous enable cycle may have left an intentional empty config
+            # (or a stopped client) on this same object. Ordinarily a fresh
+            # initialize must not let that cache stand in for the durable read
+            # below. Volatile privacy is the one exception: a terminal config
+            # write has no durable row, so its boolean marker binds the existing
+            # in-memory value to this next child startup.
+            preserve_volatile_terminal_config = (
+                self._volatile_terminal_config_pending_initialize
+                and self._host_config_loaded
+            )
+            if not preserve_volatile_terminal_config:
+                self._host_config = {}
+                self._host_config_loaded = False
             self._prepare_runtime_workspace()
             self._venv_path, self._bin_path = self.resolve_runtime_paths()
             if self._bin_path is None:
@@ -7948,6 +7967,7 @@ class ProxyFeature(Feature):
             # A previously quarantined instance is only made reachable after its
             # fresh child was initialized from durable config.
             await self._reset_traffic_gate_after_initialize()
+            self._volatile_terminal_config_pending_initialize = False
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
             self._last_used_monotonic = asyncio.get_running_loop().time()
@@ -9256,7 +9276,7 @@ class ProxyFeature(Feature):
                 yield inherited
                 return
             if inherited.active:
-                raise IsolatedRuntimePreparationError(
+                raise IsolatedRuntimeConfigGenerationChanged(
                     "Isolated feature changed during config ingress transition."
                 )
 
@@ -9434,7 +9454,7 @@ class ProxyFeature(Feature):
                 # Waiting for the lock here would deadlock with the outer task
                 # that owns it. Fail closed; the endpoint returns a retryable
                 # generation conflict after the outer boundary unwinds.
-                raise IsolatedRuntimePreparationError(
+                raise IsolatedRuntimeConfigGenerationChanged(
                     "Isolated feature changed during config ingress transition."
                 )
         async with self._config_ingress_transition_lock:
@@ -9514,7 +9534,7 @@ class ProxyFeature(Feature):
                         require_current_task=True,
                     )
                 ):
-                    raise IsolatedRuntimePreparationError(
+                    raise IsolatedRuntimeConfigGenerationChanged(
                         "Isolated feature changed during config ingress transition."
                     )
             if self._terminal_lifecycle_latched:
@@ -9874,9 +9894,15 @@ class ProxyFeature(Feature):
 
             transition_settled = True
             # There is no applied child to keep in sync.  This is the durable
-            # config that a later explicit initialize will load.
+            # config that a later explicit initialize will load. Volatile
+            # privacy has no durable row, so retain a boolean marker telling the
+            # next initialize to use this existing in-memory value instead of
+            # clearing it. The value itself is not duplicated.
             self._host_config = dict(transition.next_config)
             self._host_config_loaded = True
+            self._volatile_terminal_config_pending_initialize = (
+                not transition.persistent
+            )
             if promotion.error is not None:
                 self._raise_promotion_failure(promotion)
             return self._config_commit_receipt(transition)
