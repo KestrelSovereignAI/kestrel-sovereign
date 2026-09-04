@@ -312,6 +312,34 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
         validate_cloudrun_persistence(multi_prod)
 
 
+def test_durable_cloudrun_rejects_identical_hold_database_secret_refs(live_config):
+    """A statically identical secret cannot represent independent custody."""
+    from dataclasses import replace
+
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+    from kestrel_sovereign.features.deploy.persistence import (
+        validate_cloudrun_persistence,
+    )
+
+    manager = DeployManager(config=live_config)
+    prod = manager.get_profile("prod")
+    primary_ref = prod.secrets["KESTREL_DATABASE_URL"]
+    unsafe = replace(
+        prod,
+        env_vars={
+            **prod.env_vars,
+            "KESTREL_EXPECTED_DID": "did:web:agents.example.com:kestrel",
+        },
+        secrets={
+            **prod.secrets,
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": primary_ref,
+        },
+    )
+
+    with pytest.raises(DeployManagerError, match="independent primary and evidence"):
+        validate_cloudrun_persistence(unsafe)
+
+
 def test_production_ceremony_provisions_only_the_cluster_probe_privilege():
     """Least-privilege runtime roles can read the Hold cluster identity."""
 
@@ -330,9 +358,10 @@ def test_prod_instance_cap_matches_provisioned_database(live_config):
 
     ``durable_sovereign`` *permits* horizontal scale, but permission is not
     capacity.  Each serving instance opens up to ``max_pool_size`` (10) pooled
-    plus ``_advisory_max_pool_size`` (4) runtime PostgreSQL connections and one
-    serialized Hold connection on the primary database. The provisioned Cloud
-    SQL instance is a ``db-f1-micro`` with a ~25 connection ceiling — so a
+    plus ``_advisory_max_pool_size`` (4) runtime PostgreSQL connections, then
+    Hold's one operational and one advisory connection on the primary database.
+    The provisioned Cloud SQL instance is a ``db-f1-micro`` with a ~25
+    connection ceiling — so a
     second instance exhausts it.
 
     The floor is the same argument read the other way: scaling to zero is safe

@@ -22,7 +22,7 @@ PORT="${PORT:-8080}"
 MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 PERSISTENCE_MODE="${KESTREL_DEPLOYMENT_PERSISTENCE:-}"
-HOST_CONTROL_DIR="$(dirname -- "${KESTREL_HOST_DB_PATH:-/app/agent_data/host-data/kestrel_host.db}")"
+HOST_CONTROL_DIR="$(dirname -- "${KESTREL_HOST_DB_PATH:-/app/agent_data/host-data/host-features.db}")"
 
 # Compare canonical paths below. A supported relative KESTREL_HOST_DB_PATH
 # otherwise cannot match the absolute agent-directory glob, and a restart can

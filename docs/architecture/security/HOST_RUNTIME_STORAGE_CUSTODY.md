@@ -35,8 +35,8 @@ database leaf and SQLite auxiliaries must be regular single-link files; symbolic
 links, hard links, and special files fail closed.
 
 The supported SQLite Docker images set this override beneath their persistent
-agent-data mount (`/app/agent_data/host-data/kestrel_host.db`, or
-`/data/host-data/kestrel_host.db` for the sovereign image). Recreating a
+agent-data mount (`/app/agent_data/host-data/host-features.db`, or
+`/data/host-data/host-features.db` for the sovereign image). Recreating a
 container therefore preserves the active Hold database and its adjacent
 history/pending-publication witnesses with the agent database. Custom images
 must provide an equivalent persistent mount; the process-home default is not a

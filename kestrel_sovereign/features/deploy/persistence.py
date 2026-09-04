@@ -134,6 +134,14 @@ def validate_cloudrun_persistence(profile: DeploymentProfile) -> None:
             "Secret Manager versions (never :latest): "
             + ", ".join(unpinned)
         )
+    if (
+        profile.secrets["KESTREL_DATABASE_URL"]
+        == profile.secrets["KESTREL_HOLD_EVIDENCE_DATABASE_URL"]
+    ):
+        raise DeployManagerError(
+            "durable_sovereign Hold custody requires independent primary and "
+            "evidence database secret references"
+        )
 
 
 __all__ = [
