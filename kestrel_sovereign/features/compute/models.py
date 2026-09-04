@@ -185,10 +185,59 @@ class ComputeScript:
 
 
 @dataclass
+class ComputeCommand:
+    """An argv vector to execute directly — not a script.
+
+    A script is *text handed to an interpreter*; a command is an
+    *argument vector handed to exec*. The difference is load-bearing,
+    not stylistic. In a script the first word is read by the shell's
+    grammar, so ``eval``, ``FOO=x`` and ``trap`` each dispatch a program
+    of their own choosing; in an argv vector, element zero is the
+    program and every other element is an argument to it. #3187 is what
+    happens when a caller is promised the second and given the first.
+
+    Deliberately a separate type rather than a mode flag on
+    :class:`ComputeScript`: a command has no ``language`` because
+    nothing interprets it, and no ``content`` because there is no text,
+    while a script has no argv. One type carrying both would let a
+    caller set the fields of one execution primitive and get the other.
+    """
+
+    id: str  # UUID
+    name: str  # Human-readable name
+    argv: List[str]  # argv[0] is the program; the rest are its arguments
+    purpose: str  # Why the agent created this
+
+    timeout_seconds: int = 300
+    environment: Dict[str, str] = field(default_factory=dict)  # Env vars
+
+    parent_task_id: Optional[str] = None  # A2A task that triggered this
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self) -> None:
+        # An empty vector is not "run nothing": ``docker run IMAGE`` with
+        # no command runs the image's own default CMD, which for the
+        # execution images is a shell. Refuse it at construction, where
+        # the caller is, rather than discovering it as a container that
+        # started something nobody asked for.
+        if not self.argv:
+            raise ValueError("ComputeCommand requires a non-empty argv")
+        for index, element in enumerate(self.argv):
+            if not isinstance(element, str):
+                raise TypeError(
+                    f"ComputeCommand argv[{index}] must be str, "
+                    f"got {type(element).__name__}"
+                )
+        if not self.argv[0]:
+            raise ValueError("ComputeCommand argv[0] must name a program")
+
+
+@dataclass
 class ExecutionRecord:
-    """Record of a script execution."""
+    """Record of one execution — of a :class:`ComputeScript` or a
+    :class:`ComputeCommand`."""
     id: str
-    script_id: str
+    script_id: str  # id of the executed script OR command
     
     # Execution details
     started_at: datetime = field(default_factory=datetime.now)

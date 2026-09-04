@@ -46,7 +46,7 @@ Two side effects of this order:
 
 Filesystem reads, writes, and listings always run on the host — the agent is editing your files; that is the point. The backend split governs *shell exec*:
 
-- **`docker`** (default) — wraps the existing `kestrel_sovereign/features/compute/executors/docker_executor.py`. Each shell command runs in a fresh container with `--read-only`, `--network=none`, `--security-opt=no-new-privileges`, memory and PID limits. Same blast radius as the long-running compute feature.
+- **`docker`** (default) — wraps the existing `kestrel_sovereign/features/compute/executors/docker_executor.py`. Each shell command runs in a fresh container with `--read-only`, `--network=none`, `--security-opt=no-new-privileges`, memory and PID limits. Same blast radius as the long-running compute feature. The argv vector is handed to `docker run` *after* the image, where Docker stops reading options and `execve` takes over, so `argv[0]` is the program that runs and no word of the vector is re-read as shell grammar. It used to be quoted into a bash script instead, and a bash script reads its first word with a shell's grammar — `eval 'printf HACKED'` ran `printf` having shown the policy only `eval`, which is not a program at all (#3187).
 - **`local`** — direct `asyncio.subprocess.exec` on the host. Refuses to construct unless Amendment IX grants both `shell_execution_sandboxed` *and* `shell_execution_host`. The two-grant model exists so a single permissive amendment cannot covertly widen sandboxed access into host access.
 
 The backend is selected once at feature init and cannot be swapped at runtime.
