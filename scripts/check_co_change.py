@@ -887,6 +887,15 @@ def collect(
     # hunks also edited is an ordinary edited symbol and keeps its in-file
     # sites; the old path is added to it for the import check alone.
     rename_only: dict[str, str] = {}
+    # Module identity is not symbol identity. ``symbols`` is keyed by bare
+    # name, so a renamed ``dispatcher.py`` whose stem is also a ``def
+    # dispatcher()`` the same diff edits elsewhere could not register as a
+    # module — and the surviving entry, of another kind, answered the import
+    # question about the OTHER file: the module's import bindings vanished
+    # and the stranded importer read clean (round 14 review). The names of
+    # every renamed or deleted module are kept here unconditionally, and the
+    # import check consults them whatever kind the symbol table holds.
+    module_names: set[str] = set()
     for moved_from, moved_to in sorted(_RENAMES.items()):
         if not moved_from.endswith(".py"):
             continue
@@ -922,6 +931,8 @@ def collect(
         # and a constants-only or side-effect module has no definition at
         # all. A package's ``__init__`` is reached by the package name.
         stem = _module_name(moved_from)
+        if stem:
+            module_names.add(stem)
         if stem and stem not in symbols:
             rename_only[stem] = moved_to
             symbols[stem] = ("module", {moved_from})
@@ -934,6 +945,8 @@ def collect(
         if not gone.endswith(".py"):
             continue
         stem = _module_name(gone)
+        if stem:
+            module_names.add(stem)
         if stem and stem not in symbols:
             symbols[stem] = ("module", {gone})
 
@@ -987,7 +1000,7 @@ def collect(
             old_tree = _parse(source, path)
             return old_tree is not None and name in _build_index(old_tree).module_definitions
 
-        imports_at_risk = kind == "module" or any(
+        imports_at_risk = kind == "module" or name in module_names or any(
             _module_level_at(path, old_sources[path])
             and (
                 (index := index_for(path)) is None

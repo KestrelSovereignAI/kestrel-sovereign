@@ -1886,3 +1886,50 @@ def test_deleting_only_an_empty_module_is_still_a_change(repo: Path) -> None:
     new_map, old_map = checker.changed_line_map(["HEAD"])
     assert new_map == {} and old_map == {} and checker._DELETED == {"pkg/__init__.py"}
     assert checker.main(["--strict"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Round 23: module identity is not symbol identity; the copy boundary flush.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change", ["rename", "delete"])
+def test_a_module_whose_stem_matches_an_edited_symbol_still_surfaces_its_importers(
+    repo: Path, change: str
+) -> None:
+    """`symbols` is keyed by bare name: a `def dispatcher()` edited in a test
+    module blocked `dispatcher.py`'s registration as a module, the surviving
+    entry answered the import question about the OTHER file, and the
+    consumer bound to the module path read clean. 24 module stems in this
+    repo are also a def/class name in another file."""
+    (repo / "dispatcher.py").write_text("DEFAULT_TIMEOUT = 30\n")
+    (repo / "consumer.py").write_text("from dispatcher import DEFAULT_TIMEOUT\n")
+    (repo / "test_x.py").write_text("def dispatcher():\n    return 1\n")
+    _commit(repo)
+    if change == "rename":
+        _run(repo, "mv", "dispatcher.py", "dispatch.py")
+    else:
+        _run(repo, "rm", "-q", "dispatcher.py")
+    (repo / "test_x.py").write_text("def dispatcher():\n    return 2\n")  # the colliding edit
+
+    finding = _named(_findings(repo), "dispatcher")
+    assert ("consumer.py", 1) in {(o.path, o.line) for o in finding.unchanged}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_pure_copy_is_seeded_when_a_later_entry_follows_it(repo: Path) -> None:
+    """Every earlier copy fixture put the copy target last, so the end-of-loop
+    flush answered for the entry-boundary one; without the boundary flush a
+    later entry's hunks leave `in_hunk` set and the copy is seeded nowhere."""
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')
+    (repo / "zz.py").write_text("Z = 1\n")
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_text('GAMMA = "gamma_marker"\nPAD = 1\n')  # byte copy of HEAD a.py
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_text('GAMMA = "gamma_marker"\nPAD = 9\n')
+    (repo / "zz.py").write_text("Z = 2\n")  # sorts after b.py: its hunk follows the copy entry
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert new_map.get("b.py") == {1, 2}, new_map
+    finding = _named(_findings(repo), "gamma_marker")
+    assert [(o.path, o.line) for o in finding.unchanged] == [("a.py", 1)]
