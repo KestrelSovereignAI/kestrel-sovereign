@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from pathlib import Path
+
+import pytest
 
 from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 
@@ -68,6 +71,7 @@ HTTP_SEGMENTS = {
     # or describe shared host state.
     "bridge",
     "host",
+    "auth",
 }
 HTTP_EXACT_ROUTES = {
     "/health",
@@ -100,27 +104,6 @@ CLI_SURFACE_ID = re.compile(
 )
 
 
-def _module_string_constants(tree: ast.Module) -> dict[str, str]:
-    """Resolve literal module strings used in decorator declarations."""
-
-    constants: dict[str, str] = {}
-    for node in tree.body:
-        targets: list[ast.expr] = []
-        value: ast.expr | None = None
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                constants[target.id] = value.value
-    return constants
-
-
 def _resolved_string(
     node: ast.expr,
     constants: dict[str, str] | None = None,
@@ -129,7 +112,97 @@ def _resolved_string(
         return node.value
     if isinstance(node, ast.Name):
         return (constants or {}).get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _resolved_string(node.left, constants)
+        right = _resolved_string(node.right, constants)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+                continue
+            if isinstance(value, ast.FormattedValue):
+                resolved = _resolved_string(value.value, constants)
+                if resolved is not None:
+                    parts.append(resolved)
+                    continue
+            return None
+        return "".join(parts)
     return None
+
+
+def _imported_module_path(node: ast.ImportFrom, source_path: Path) -> Path | None:
+    """Resolve a repository-local ``from ... import`` without importing code."""
+
+    if node.level:
+        base = source_path.parent
+        for _ in range(node.level - 1):
+            base = base.parent
+    else:
+        base = REPO_ROOT
+    candidate = base.joinpath(*(node.module or "").split("."))
+    module_file = candidate.with_suffix(".py")
+    if module_file.is_file():
+        return module_file
+    package_file = candidate / "__init__.py"
+    return package_file if package_file.is_file() else None
+
+
+def _module_string_constants(
+    tree: ast.Module,
+    source_path: Path | None = None,
+) -> dict[str, str]:
+    """Resolve static strings used in decorators, including local imports."""
+
+    constants: dict[str, str] = {}
+    if source_path is not None:
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            imported_path = _imported_module_path(node, source_path)
+            if imported_path is None:
+                continue
+            imported_constants = _cached_local_string_constants(imported_path)
+            for alias in node.names:
+                if alias.name in imported_constants:
+                    constants[alias.asname or alias.name] = imported_constants[
+                        alias.name
+                    ]
+
+    unresolved: list[tuple[list[ast.expr], ast.expr]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            unresolved.append((node.targets, node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            unresolved.append(([node.target], node.value))
+
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in unresolved:
+            resolved = _resolved_string(value, constants)
+            if resolved is None:
+                continue
+            for target in targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and constants.get(target.id) != resolved
+                ):
+                    constants[target.id] = resolved
+                    changed = True
+    return constants
+
+
+@lru_cache(maxsize=None)
+def _cached_local_string_constants(source_path: Path) -> dict[str, str]:
+    """Read one imported module's local constants without crawling its imports."""
+
+    tree = ast.parse(
+        source_path.read_text(encoding="utf-8"),
+        filename=str(source_path),
+    )
+    return _module_string_constants(tree)
 
 
 def _public_tool_name(
@@ -150,12 +223,21 @@ def _public_tool_name(
         return None
     if call is None:
         return fallback
-    if call.args and (name := _resolved_string(call.args[0], constants)) is not None:
+    if call.args:
+        name = _resolved_string(call.args[0], constants)
+        if name is None:
+            raise AssertionError(
+                f"Unresolved @tool name expression: {ast.unparse(call.args[0])}"
+            )
         return name
     for keyword in call.keywords:
-        if keyword.arg == "name" and (
-            name := _resolved_string(keyword.value, constants)
-        ) is not None:
+        if keyword.arg == "name":
+            name = _resolved_string(keyword.value, constants)
+            if name is None:
+                raise AssertionError(
+                    "Unresolved @tool name expression: "
+                    f"{ast.unparse(keyword.value)}"
+                )
             return name
     return fallback
 
@@ -210,7 +292,7 @@ def _discovered_tool_surfaces() -> set[str]:
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        string_constants = _module_string_constants(tree)
+        string_constants = _module_string_constants(tree, path)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -294,9 +376,13 @@ def _router_prefix(
         if not isinstance(node.value, ast.Call):
             continue
         for keyword in node.value.keywords:
-            if keyword.arg == "prefix" and (
-                prefix := _resolved_string(keyword.value, constants)
-            ) is not None:
+            if keyword.arg == "prefix":
+                prefix = _resolved_string(keyword.value, constants)
+                if prefix is None:
+                    raise AssertionError(
+                        "Unresolved APIRouter prefix expression: "
+                        f"{ast.unparse(keyword.value)}"
+                    )
                 return prefix
     return ""
 
@@ -307,17 +393,30 @@ def _route_path(
 ) -> str | None:
     """Resolve positional or keyword FastAPI route paths."""
 
-    if decorator.args and (
-        route := _resolved_string(decorator.args[0], constants)
-    ) is not None:
+    if decorator.args:
+        route = _resolved_string(decorator.args[0], constants)
+        if route is None:
+            raise AssertionError(
+                "Unresolved route path expression: "
+                f"{ast.unparse(decorator.args[0])}"
+            )
         return route
     for keyword in decorator.keywords:
         if keyword.arg == "path":
-            return _resolved_string(keyword.value, constants)
-    return None
+            route = _resolved_string(keyword.value, constants)
+            if route is None:
+                raise AssertionError(
+                    "Unresolved route path expression: "
+                    f"{ast.unparse(keyword.value)}"
+                )
+            return route
+    raise AssertionError(f"Route decorator has no path: {ast.unparse(decorator)}")
 
 
-def _module_string_collections(tree: ast.Module) -> dict[str, tuple[str, ...]]:
+def _module_string_collections(
+    tree: ast.Module,
+    string_constants: dict[str, str] | None = None,
+) -> dict[str, tuple[str, ...]]:
     """Resolve safe module constants used by ``methods=`` declarations."""
 
     collections: dict[str, tuple[str, ...]] = {}
@@ -326,13 +425,12 @@ def _module_string_collections(tree: ast.Module) -> dict[str, tuple[str, ...]]:
             node.value, (ast.List, ast.Tuple, ast.Set)
         ):
             continue
-        values = tuple(
-            str(element.value)
-            for element in node.value.elts
-            if isinstance(element, ast.Constant) and isinstance(element.value, str)
-        )
-        if len(values) != len(node.value.elts):
+        resolved_values = [
+            _resolved_string(element, string_constants) for element in node.value.elts
+        ]
+        if any(value is None for value in resolved_values):
             continue
+        values = tuple(value for value in resolved_values if value is not None)
         for target in node.targets:
             if isinstance(target, ast.Name):
                 collections[target.id] = values
@@ -363,19 +461,39 @@ def _route_methods(
         if keyword.arg != "methods":
             continue
         if isinstance(keyword.value, ast.Name):
-            return tuple(
-                value.upper()
-                for value in (constants or {}).get(keyword.value.id, ())
-            )
+            values = (constants or {}).get(keyword.value.id)
+            if values is None:
+                raise AssertionError(
+                    "Unresolved api_route methods expression: "
+                    f"{ast.unparse(keyword.value)}"
+                )
+            return tuple(value.upper() for value in values)
         if isinstance(keyword.value, (ast.List, ast.Tuple, ast.Set)):
-            methods = []
+            methods: list[str] = []
             for element in keyword.value.elts:
-                if isinstance(element, ast.Constant) and isinstance(
-                    element.value, str
-                ):
-                    methods.append(element.value.upper())
+                value = _resolved_string(element)
+                if value is None:
+                    raise AssertionError(
+                        "Unresolved api_route method expression: "
+                        f"{ast.unparse(element)}"
+                    )
+                methods.append(value.upper())
             return tuple(methods)
-    return ()
+        raise AssertionError(
+            "Unsupported api_route methods expression: "
+            f"{ast.unparse(keyword.value)}"
+        )
+    return ("GET",)
+
+
+def _deprecated_agent_alias(route: str) -> str | None:
+    """Return the live #871 compatibility spelling for a singular route."""
+
+    if route == "/api/agent":
+        return "/agent"
+    if route.startswith("/api/agent/"):
+        return route.removeprefix("/api")
+    return None
 
 
 def _discovered_http_surfaces() -> set[str]:
@@ -390,9 +508,9 @@ def _discovered_http_surfaces() -> set[str]:
     )
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        string_constants = _module_string_constants(tree)
+        string_constants = _module_string_constants(tree, path)
         prefix = _router_prefix(tree, string_constants)
-        method_constants = _module_string_collections(tree)
+        method_constants = _module_string_collections(tree, string_constants)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -417,6 +535,9 @@ def _discovered_http_surfaces() -> set[str]:
                 relative = path.relative_to(REPO_ROOT).as_posix()
                 for method in methods:
                     surfaces.add(f"{relative}::{method} {route}")
+                    deprecated_alias = _deprecated_agent_alias(route)
+                    if deprecated_alias is not None:
+                        surfaces.add(f"{relative}::{method} {deprecated_alias}")
     return surfaces
 
 
@@ -448,9 +569,9 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
     )
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        string_constants = _module_string_constants(tree)
+        string_constants = _module_string_constants(tree, path)
         prefix = _router_prefix(tree, string_constants)
-        method_constants = _module_string_collections(tree)
+        method_constants = _module_string_collections(tree, string_constants)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -521,7 +642,7 @@ def test_generic_indirect_dispatch_tools_are_classified() -> None:
             (REPO_ROOT / relative).read_text(encoding="utf-8"),
             filename=relative,
         )
-        string_constants = _module_string_constants(tree)
+        string_constants = _module_string_constants(tree, REPO_ROOT / relative)
         tool_nodes = [
             node
             for node in ast.walk(tree)
@@ -659,6 +780,36 @@ def test_app_level_host_authority_routes_are_discovered() -> None:
     assert "/api/auth/key" in auth_matrix
 
 
+def test_canonical_host_authentication_routes_are_discovered() -> None:
+    discovered = _discovered_http_surfaces()
+    for method, route in (
+        ("GET", "/auth/login"),
+        ("GET", "/auth/callback"),
+        ("GET", "/auth/logout"),
+        ("POST", "/auth/token"),
+        ("GET", "/auth/me"),
+        ("GET", "/auth/verify"),
+    ):
+        assert (
+            "kestrel_sovereign/endpoints/auth_oauth.py::"
+            f"{method} {route}"
+        ) in discovered
+
+
+def test_deprecated_agent_compatibility_routes_are_discovered() -> None:
+    discovered = _discovered_http_surfaces()
+    for surface in (
+        "kestrel_sovereign/endpoints/agent.py::POST /agent/invoke",
+        "kestrel_sovereign/endpoints/agent.py::POST /agent/stream",
+        "kestrel_sovereign/endpoints/agent.py::GET /agent/tasks",
+        "kestrel_sovereign/endpoints/agent.py::"
+        "POST /agent/tasks/{task_id:path}/cancel",
+        "kestrel_sovereign/endpoints/files.py::"
+        "GET /agent/channels/{channel_type}/link-qr.png",
+    ):
+        assert surface in discovered
+
+
 def test_api_route_declarations_expand_every_registered_method() -> None:
     decorator = ast.parse(
         '@router.api_route("/api/tasks", methods=["POST", "PUT"])\n'
@@ -684,9 +835,11 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
 
 def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
     tree = ast.parse(
-        '_ROUTE = "/api/agent/constant"\n'
-        '_PREFIX = "/api"\n'
-        '_TOOL_NAME = "neutral-control"\n'
+        '_BASE = "/api"\n'
+        '_ROUTE = _BASE + "/agent/constant"\n'
+        '_PREFIX = f"{_BASE}"\n'
+        '_TOOL_PREFIX = "neutral"\n'
+        '_TOOL_NAME = _TOOL_PREFIX + "-control"\n'
         "router = APIRouter(prefix=_PREFIX)\n"
         "@router.post(path=_ROUTE)\n"
         "def route():\n    pass\n\n"
@@ -694,14 +847,55 @@ def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
         "def tool_impl():\n    pass\n"
     )
     constants = _module_string_constants(tree)
-    route_decorator = tree.body[4].decorator_list[0]
-    tool_decorator = tree.body[5].decorator_list[0]
+    route_decorator = tree.body[6].decorator_list[0]
+    tool_decorator = tree.body[7].decorator_list[0]
     assert isinstance(route_decorator, ast.Call)
     assert _router_prefix(tree, constants) == "/api"
     assert _route_path(route_decorator, constants) == "/api/agent/constant"
     assert _public_tool_name(tool_decorator, "tool_impl", constants) == (
         "neutral-control"
     )
+
+
+def test_imported_tool_name_constant_is_resolved_without_importing_code() -> None:
+    path = REPO_ROOT / "kestrel_sovereign/features/security/feature.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    constants = _module_string_constants(tree, path)
+    assert constants["SEARCH_TOOL_NAME"] == "security_audit_search"
+
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "security_audit_search"
+    )
+    assert (
+        _public_tool_name(function.decorator_list[0], function.name, constants)
+        == "security_audit_search"
+    )
+
+
+def test_unresolved_decorator_declarations_fail_closed() -> None:
+    tool_decorator = ast.parse(
+        "@tool(name=make_name())\ndef tool_impl():\n    pass\n"
+    ).body[0].decorator_list[0]
+    route_decorator = ast.parse(
+        "@router.post(make_path())\ndef route():\n    pass\n"
+    ).body[0].decorator_list[0]
+    prefix_tree = ast.parse("router = APIRouter(prefix=make_prefix())\n")
+    methods_decorator = ast.parse(
+        '@router.api_route("/route", methods=make_methods())\n'
+        "def route():\n    pass\n"
+    ).body[0].decorator_list[0]
+
+    with pytest.raises(AssertionError, match="Unresolved @tool name"):
+        _public_tool_name(tool_decorator, "tool_impl")
+    with pytest.raises(AssertionError, match="Unresolved route path"):
+        _route_path(route_decorator)
+    with pytest.raises(AssertionError, match="Unresolved APIRouter prefix"):
+        _router_prefix(prefix_tree)
+    with pytest.raises(AssertionError, match="Unsupported api_route methods"):
+        _route_methods(methods_decorator)
 
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
@@ -748,6 +942,25 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
         )
         assert issue in row
         assert "Defect:" in row
+
+
+def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Deploy/teardown shared agent hosting |")
+    )
+    tool_row = next(
+        line
+        for line in audit.splitlines()
+        if "features/deploy/feature.py::deploy_agent`" in line
+    )
+    assert "Sovereign/delegated" in action_row
+    assert "[#3223]" in action_row
+    assert "Defect:" in action_row
+    assert "D-3223" in tool_row
+    assert "multi-agent" in tool_row
 
 
 def test_task_reads_remain_labeled_unscoped_until_3145_lands() -> None:
