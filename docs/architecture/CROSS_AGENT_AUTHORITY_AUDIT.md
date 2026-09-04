@@ -339,6 +339,37 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/features/wellness/feature.py::wellness_export` | Caller runtime wellness state; no co-hosted-agent target. |
 | `kestrel_sovereign/features/wellness/feature.py::wellness_history` | Caller runtime wellness state; no co-hosted-agent target. |
 
+## Machine-checked scheduled target inventory
+
+`CRON_TASKS` names are executable entry doors even when they have no `@tool`
+declaration. The contract discovers every name from the source table and every
+literal bespoke-handler mapping supplied to `build_cron_registrations`. A
+schedule and its resulting signal remain owned by the local agent; registration
+and causation metadata grant no authority over a peer or the host.
+
+| Surface ID | Classification |
+|---|---|
+| `kestrel_sovereign/features/scheduler/feature.py::_handle_backup_snapshot` | Bespoke self-owned backup handler for `cron.backup_snapshot`; no co-hosted-agent target. |
+| `kestrel_sovereign/features/scheduler/feature.py::_handle_sleep` | Bespoke caller-agent memory-maintenance handler for `cron.sleep`; no co-hosted-agent target. |
+| `kestrel_sovereign/features/scheduler/feature.py::_run_bootstrap_timeout_check` | Bespoke caller-agent bootstrap watchdog for `cron.bootstrap_timeout_check`; no peer authority. |
+| `kestrel_sovereign/features/scheduler/feature.py::_run_ecosystem_discovery_watch` | Bespoke caller-agent repository watcher for `cron.ecosystem_discovery_watch`; downstream provider policy remains enforcement. |
+| `kestrel_sovereign/features/scheduler/feature.py::_run_github_pr_watch` | Bespoke caller-agent repository watcher for `cron.github_pr_watch`; #3147 binds any resulting wake to the scheduler owner. |
+| `kestrel_sovereign/features/scheduler/feature.py::_run_trash_retention` | Bespoke caller-agent retention handler for `cron.trash_retention`; no co-hosted-agent target. |
+| `kestrel_sovereign/features/scheduler/feature.py::_run_wait_reconcile` | Bespoke caller-agent wait reconciliation for `cron.wait_reconcile`; resulting wakes remain locally targeted. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.backup_snapshot` | Self-owned backup action; schedule ownership and the local dispatcher bind the target agent. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.bootstrap_timeout_check` | Self-owned bootstrap watchdog; no peer or host target. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.ecosystem_discovery_watch` | Self-owned repository watch; its provider and downstream tool policies remain enforcement. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.github_pr_watch` | Self-owned repository watch; #3147 rejects caller-supplied peer wake identity and binds the owner. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.memory_consolidate` | Self-owned memory maintenance dispatched to the matching feature tool. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.morning_signal` | Self-owned strategic-memory artifact dispatched to the matching feature tool. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.reflect` | Self-owned reflection artifact dispatched to the matching feature tool. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.restart_coordinator` | Whole-host restart/update target; sovereign/delegated authority is required and the current ordinary-agent admission defect is tracked by #3148. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.signal_dispatch` | Generic local scheduled-tool dispatch; the selected downstream tool retains target-specific authority checks. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.sleep` | Self-owned memory-maintenance action with a bespoke local handler. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.training_cycle` | Caller-agent training/model workflow; shared-provider policy remains independently required. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.trash_retention` | Self-owned memory-retention action with a bespoke local handler. |
+| `kestrel_sovereign/signals/sources/scheduler.py::cron.wait_reconcile` | Self-owned wait reconciliation; resulting signals remain locally targeted. |
+
 ## Machine-checked dynamic router boundary inventory
 
 Runtime-installed agent and host features can return routers whose decorators

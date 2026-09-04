@@ -291,7 +291,8 @@
         "kestrel_sovereign/features/webhooks/receiver.py",
         "kestrel_sovereign/features/wellness/feature.py",
         "kestrel_sovereign/host_features/runtime.py",
-        "kestrel_sovereign/server.py"
+        "kestrel_sovereign/server.py",
+        "kestrel_sovereign/signals/sources/scheduler.py"
       ],
       "findings": [],
       "missing_code_refs": [],

@@ -110,7 +110,7 @@ INDIRECT_DISPATCH_CALLS = {
 }
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/"
-    r"(?:server\.py::[^`]+|(?:agent|features|host_features|endpoints)/[^`]+))`\s*\|"
+    r"(?:server\.py::[^`]+|(?:agent|features|host_features|endpoints|signals)/[^`]+))`\s*\|"
 )
 COMMAND_SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/command_handler\.py::![^`]+)`\s*\|"
@@ -340,6 +340,112 @@ def _discovered_tool_surfaces() -> set[str]:
                 relative = path.relative_to(REPO_ROOT).as_posix()
                 surfaces.add(f"{relative}::{public_name}")
     return surfaces | _discovered_runtime_generated_tool_surfaces()
+
+
+def _discovered_scheduler_surfaces() -> set[str]:
+    """Inventory every cron target and every bespoke handler wired to it."""
+
+    source_path = REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
+    source_tree = ast.parse(
+        source_path.read_text(encoding="utf-8"), filename=str(source_path)
+    )
+    source_constants = _module_string_constants(source_tree, source_path)
+    task_names: set[str] | None = None
+    for node in source_tree.body:
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            value = node.value
+        if not (
+            isinstance(target, ast.Name)
+            and target.id == "CRON_TASKS"
+            and isinstance(value, (ast.List, ast.Tuple))
+        ):
+            continue
+        resolved: set[str] = set()
+        for item in value.elts:
+            if not isinstance(item, (ast.List, ast.Tuple)) or not item.elts:
+                raise AssertionError("CRON_TASKS contains an unsupported entry")
+            name = _resolved_string(item.elts[0], source_constants)
+            if name is None:
+                raise AssertionError(
+                    "Unresolved CRON_TASKS name expression: "
+                    f"{ast.unparse(item.elts[0])}"
+                )
+            resolved.add(name)
+        task_names = resolved
+        break
+    if task_names is None:
+        raise AssertionError("Could not find the CRON_TASKS declaration")
+
+    feature_path = REPO_ROOT / "kestrel_sovereign/features/scheduler/feature.py"
+    feature_tree = ast.parse(
+        feature_path.read_text(encoding="utf-8"), filename=str(feature_path)
+    )
+    feature_constants = _module_string_constants(feature_tree, feature_path)
+    builtin_handlers: dict[str, str] | None = None
+    for node in ast.walk(feature_tree):
+        if not isinstance(node, ast.Call) or _call_name(node) != "build_cron_registrations":
+            continue
+        keyword = next(
+            (item for item in node.keywords if item.arg == "builtin_handlers"),
+            None,
+        )
+        if keyword is None or not isinstance(keyword.value, ast.Dict):
+            raise AssertionError(
+                "build_cron_registrations must expose a literal builtin_handlers map"
+            )
+        handlers: dict[str, str] = {}
+        for key, value in zip(keyword.value.keys, keyword.value.values):
+            if key is None:
+                raise AssertionError("builtin_handlers contains dictionary unpacking")
+            task_name = _resolved_string(key, feature_constants)
+            handler_name = (
+                value.attr
+                if isinstance(value, ast.Attribute)
+                else value.id
+                if isinstance(value, ast.Name)
+                else None
+            )
+            if task_name is None or handler_name is None:
+                raise AssertionError(
+                    "Unresolved builtin scheduler handler entry: "
+                    f"{ast.unparse(key)}: {ast.unparse(value)}"
+                )
+            handlers[task_name] = handler_name
+        builtin_handlers = handlers
+        break
+    if builtin_handlers is None:
+        raise AssertionError("Could not find the builtin scheduler handler map")
+    unknown_handlers = set(builtin_handlers) - task_names
+    if unknown_handlers:
+        raise AssertionError(
+            "Scheduler handlers lack CRON_TASKS entries: "
+            + ", ".join(sorted(unknown_handlers))
+        )
+    function_names = {
+        node.name
+        for node in ast.walk(feature_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing_functions = set(builtin_handlers.values()) - function_names
+    if missing_functions:
+        raise AssertionError(
+            "Missing builtin scheduler handler functions: "
+            + ", ".join(sorted(missing_functions))
+        )
+
+    return {
+        *(
+            f"kestrel_sovereign/signals/sources/scheduler.py::cron.{name}"
+            for name in task_names
+        ),
+        *(f"kestrel_sovereign/features/scheduler/feature.py::{name}" for name in builtin_handlers.values()),
+    }
 
 
 def _discovered_runtime_generated_tool_surfaces() -> set[str]:
@@ -835,19 +941,29 @@ def _module_string_collections(
 
     collections: dict[str, tuple[str, ...]] = {}
     for node in tree.body:
-        if not isinstance(node, ast.Assign) or not isinstance(
-            node.value, (ast.List, ast.Tuple, ast.Set)
-        ):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value: ast.expr | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        names = [target.id for target in targets if isinstance(target, ast.Name)]
+        if not isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            for name in names:
+                collections.pop(name, None)
             continue
         resolved_values = [
-            _resolved_string(element, string_constants) for element in node.value.elts
+            _resolved_string(element, string_constants) for element in value.elts
         ]
         if any(value is None for value in resolved_values):
+            for name in names:
+                collections.pop(name, None)
             continue
         values = tuple(value for value in resolved_values if value is not None)
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                collections[target.id] = values
+        for name in names:
+            collections[name] = values
     return collections
 
 
@@ -1125,6 +1241,22 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
         and _call_name(node) == "to_orchestrator_tool"
         for node in ast.walk(registry_tree)
     ), "The classified high-level Feature tool must remain wired into registration"
+
+
+def test_every_builtin_scheduler_target_and_handler_is_classified() -> None:
+    discovered = _discovered_scheduler_surfaces()
+    assert discovered == _documented_surfaces(
+        "## Machine-checked scheduled target inventory"
+    )
+    for surface in (
+        "kestrel_sovereign/signals/sources/scheduler.py::"
+        "cron.restart_coordinator",
+        "kestrel_sovereign/features/scheduler/feature.py::"
+        "_run_github_pr_watch",
+        "kestrel_sovereign/features/scheduler/feature.py::"
+        "_run_wait_reconcile",
+    ):
+        assert surface in discovered
 
 
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
@@ -1432,6 +1564,19 @@ def test_api_route_declarations_resolve_module_method_constants() -> None:
         "GET",
         "POST",
     )
+
+    reassigned = ast.parse(
+        '_METHODS = ["GET"]\n'
+        "_METHODS = runtime_methods()\n"
+        '@router.api_route("/phoenix", methods=_METHODS)\n'
+        "def route():\n    pass\n"
+    )
+    reassigned_decorator = reassigned.body[2].decorator_list[0]
+    assert isinstance(reassigned_decorator, ast.Call)
+    method_constants = _module_string_collections(reassigned)
+    assert "_METHODS" not in method_constants
+    with pytest.raises(AssertionError, match="Unresolved api_route methods"):
+        _route_methods(reassigned_decorator, method_constants)
 
 
 def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
@@ -1794,7 +1939,7 @@ def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
     if not statements:
         return False
     terminal = statements[-1]
-    if isinstance(terminal, (ast.Raise, ast.Return)):
+    if isinstance(terminal, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
         return True
     if isinstance(terminal, ast.If):
         return _block_guaranteed_exits(
@@ -2011,6 +2156,14 @@ def _provenance_aliases(
                 statement for case in node.cases for statement in case.body
             ]
             decision_expression = node.subject
+            for case in node.cases:
+                if (
+                    case.guard is not None
+                    and _contains_cross_agent_control_call(case.body)
+                ):
+                    authority_decision_names.update(
+                        _identifier_tokens(case.guard)
+                    )
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             guarded = [*node.body, *node.orelse]
             decision_expression = node.iter
@@ -2260,6 +2413,18 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     )
                 ):
                     lines.add(node.lineno)
+                for case in node.cases:
+                    if (
+                        case.guard is not None
+                        and _has_provenance_token(
+                            case.guard, provenance_aliases
+                        )
+                        and (
+                            function_is_permission_boundary
+                            or _contains_cross_agent_control_call(case.body)
+                        )
+                    ):
+                        lines.add(case.guard.lineno)
                 continue
             if isinstance(node, (ast.For, ast.AsyncFor)):
                 if _has_provenance_token(node.iter, provenance_aliases) and (
@@ -2616,6 +2781,29 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
         "    assert decision\n"
         "    stop_peer(request.target)\n"
     )
+    loop_guard_clauses = ast.parse(
+        "def dispatch(request, targets):\n"
+        "    for target in targets:\n"
+        "        if not request.causation_chain:\n"
+        "            continue\n"
+        "        terminate_child(target)\n\n"
+        "def adapter(request, targets):\n"
+        "    for target in targets:\n"
+        "        if request.orchestrator:\n"
+        "            break\n"
+        "        stop_peer(target)\n"
+    )
+    match_guards = ast.parse(
+        "def match_dispatch(request, target):\n"
+        "    match target:\n"
+        "        case _ if request.causation_chain:\n"
+        "            terminate_child(target)\n\n"
+        "def alias_dispatch(request, target):\n"
+        "    decision = compare_lineage(request.causation_chain, target)\n"
+        "    match target:\n"
+        "        case _ if decision:\n"
+        "            stop_peer(target)\n"
+    )
 
     assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
@@ -2628,6 +2816,8 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 14}
     assert _authority_provenance_lines(ownership_predicate) == {2}
     assert _authority_provenance_lines(guard_clauses) == {2, 7, 15}
+    assert _authority_provenance_lines(loop_guard_clauses) == {3, 9}
+    assert _authority_provenance_lines(match_guards) == {3, 9}
 
 
 def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
