@@ -9,7 +9,7 @@ import hashlib
 import logging
 import re
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from .db import (
     ConnectionError,
@@ -1007,6 +1007,9 @@ class AsyncDatabase:
         backend: DatabaseBackend,
         *,
         initialization_guard: Any = None,
+        schema_initializer: Optional[
+            Callable[["AsyncDatabase"], Awaitable[None]]
+        ] = None,
     ) -> "AsyncDatabase":
         """Take ownership of a connected backend and initialize its schema.
 
@@ -1014,16 +1017,24 @@ class AsyncDatabase:
         mutation use this boundary rather than discarding that pool and opening
         a second one through :meth:`postgres`. ``initialization_guard`` may be
         an async context manager that serializes the first schema publication;
-        it is exited before failure cleanup closes the owned backend.
+        it is exited before failure cleanup closes the owned backend. A narrow
+        subsystem may supply ``schema_initializer`` when the connected database
+        intentionally carries only that subsystem's schema; the default remains
+        the complete Kestrel core initializer.
         """
 
         db = cls(backend)
+        initialize_schema = (
+            db._init_schema
+            if schema_initializer is None
+            else lambda: schema_initializer(db)
+        )
         try:
             if initialization_guard is None:
-                await db._init_schema()
+                await initialize_schema()
             else:
                 async with initialization_guard:
-                    await db._init_schema()
+                    await initialize_schema()
         except BaseException:
             await _close_failed_database_initialization(db)
             raise

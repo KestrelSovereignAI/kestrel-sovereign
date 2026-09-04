@@ -134,13 +134,15 @@ def require_private_directory(path: Path, *, label: str = "storage") -> None:
         )
 
 
-def open_private_file(
+def _open_private_file(
     path: Path,
     flags: int,
     *,
-    label: str = "storage",
+    label: str,
+    harden: bool,
 ) -> int:
-    """Open a non-link, single-link regular file and enforce mode ``0600``."""
+    """Open one private file and either harden or validate its custody mode."""
+
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow and path_exists(path):  # pragma: no cover - Windows fallback
         try:
@@ -167,14 +169,45 @@ def open_private_file(
                 f"{label} custody file has {st.st_nlink} hard links; exclusive "
                 f"custody cannot be established: {path}"
             )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        else:  # pragma: no cover - Windows has no POSIX mode enforcement
-            path.chmod(PRIVATE_FILE_MODE)
+        if harden:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, PRIVATE_FILE_MODE)
+            else:  # pragma: no cover - Windows has no POSIX mode enforcement
+                path.chmod(PRIVATE_FILE_MODE)
+        elif os.name != "nt" and stat.S_IMODE(st.st_mode) != PRIVATE_FILE_MODE:
+            raise PrivateStorageError(
+                f"{label} custody file {path} must have mode 0600; found "
+                f"{stat.S_IMODE(st.st_mode):04o}"
+            )
         return fd
     except (OSError, PrivateStorageError):
         os.close(fd)
         raise
+
+
+def open_private_file(
+    path: Path,
+    flags: int,
+    *,
+    label: str = "storage",
+) -> int:
+    """Open a non-link, single-link regular file and enforce mode ``0600``."""
+
+    return _open_private_file(path, flags, label=label, harden=True)
+
+
+def open_private_file_for_validation(
+    path: Path,
+    flags: int = os.O_RDONLY,
+    *,
+    label: str = "storage",
+) -> int:
+    """Open an existing private file without changing its custody metadata."""
+
+    mutating_flags = os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_WRONLY
+    if flags & mutating_flags:
+        raise ValueError("validation-only private file open cannot mutate the file")
+    return _open_private_file(path, flags, label=label, harden=False)
 
 
 def ensure_private_file(path: Path, *, label: str = "storage") -> None:
@@ -191,6 +224,7 @@ __all__ = [
     "ensure_private_directory",
     "ensure_private_file",
     "open_private_file",
+    "open_private_file_for_validation",
     "path_exists",
     "require_private_directory",
 ]

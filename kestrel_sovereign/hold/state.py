@@ -13,6 +13,7 @@ import errno
 import hashlib
 import os
 import sqlite3
+import stat
 from contextlib import AsyncExitStack, asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,12 +32,15 @@ try:  # pragma: no cover - imported only on Windows
 except ImportError:  # pragma: no cover - POSIX has no Windows byte-range locks
     msvcrt = None  # type: ignore[assignment]
 
+from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.private_storage import (
     PrivateStorageError,
     absolute_without_following_leaf,
     ensure_private_directory,
     open_private_file,
+    open_private_file_for_validation,
     path_exists,
+    require_private_directory,
 )
 from kestrel_sovereign.storage.database_clock import database_now_sql
 
@@ -63,10 +67,9 @@ _POSTGRES_ROLLBACK_DOMAIN_PREFIX = "kestrel-hold-rollback-domain-v1:"
 _POSTGRES_PRIMARY_BINDING_KEY = "hold_primary_custody_binding_v1"
 _POSTGRES_EVIDENCE_BINDING_KEY = "hold_evidence_custody_binding_v1"
 _POSTGRES_CUSTODY_BINDING_PREFIX = "kestrel-hold-custody-binding-v1:"
-# Serialize the first core-schema publication independently on each PostgreSQL
-# database.  PostgreSQL's CREATE TABLE IF NOT EXISTS catalog probe can race a
-# peer cold start, so migration_lock() cannot be the first lock: its own table
-# does not exist yet.
+# Serialize the first Hold metadata publication independently on each
+# PostgreSQL database. PostgreSQL's CREATE TABLE IF NOT EXISTS catalogue probe
+# can race a peer cold start, so the lock must precede that first DDL statement.
 _POSTGRES_SCHEMA_BOOTSTRAP_LOCK = (0x004B4553, 0x5343484D)
 # Two signed int32 values spelling ``KES`` / ``HOLD``. The lock lives on the
 # independent evidence service and spans both primary commit and publication.
@@ -110,6 +113,29 @@ _HOLD_REQUIRED_UNIQUE_INDEXES = (
         "hold_schema_migrations",
         "name",
     ),
+)
+_POSTGRES_HOLD_METADATA_SCHEMA_SQL = (
+    "CREATE TABLE IF NOT EXISTS agent_metadata ("
+    "agent_id TEXT NOT NULL, "
+    "key TEXT NOT NULL, "
+    "value TEXT NOT NULL, "
+    "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+    "PRIMARY KEY (agent_id, key))"
+)
+_POSTGRES_HOLD_METADATA_TABLE_SQL = (
+    "SELECT to_regclass("
+    "format('%I.%I', current_schema(), 'agent_metadata')"
+    ")::text"
+)
+_POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL = (
+    "EXPLAIN INSERT INTO agent_metadata "
+    "(agent_id, key, value) VALUES ($1, $2, $3) "
+    "ON CONFLICT (agent_id, key) DO UPDATE SET value = excluded.value"
+)
+_POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS = (
+    "__kestrel_hold_schema_probe__",
+    "__kestrel_hold_schema_probe__",
+    "__kestrel_hold_schema_probe__",
 )
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
@@ -172,6 +198,30 @@ class HoldDatabaseSnapshot:
     content_witness_rows: tuple[Any, ...] = ()
     operation_witness_rows: tuple[Any, ...] = ()
     migration_rows: tuple[Any, ...] = ()
+    resolvable_conflict_keys: frozenset[tuple[str, frozenset[str]]] | None = None
+    occupied_schema_names: frozenset[str] | None = None
+    duplicate_conflict_keys: frozenset[tuple[str, frozenset[str]]] | None = None
+
+
+def _hold_duplicate_conflict_key_sql(table: str, columns: str) -> str:
+    """Build the read-only duplicate probe for one declared repair key."""
+
+    declaration = next(
+        (
+            (declared_table, declared_columns)
+            for _name, declared_table, declared_columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+            if declared_table == table and declared_columns == columns
+        ),
+        None,
+    )
+    if declaration is None:
+        raise ValueError("unknown Hold conflict key")
+    column_names = tuple(column.strip() for column in columns.split(","))
+    present = " AND ".join(f"{column} IS NOT NULL" for column in column_names)
+    return (
+        f"SELECT 1 FROM {table} WHERE {present} GROUP BY {columns} "
+        "HAVING COUNT(*) > 1 LIMIT 1"
+    )
 
 
 def validate_postgres_hold_readiness_snapshot(
@@ -452,14 +502,89 @@ async def _postgres_custody_locks(
         key=lambda item: item[0],
     )
     async with AsyncExitStack() as stack:
-        for _cluster, label, database in databases:
+        for cluster, label, database in databases:
             lock_owner = getattr(database, "backend", None) or database
             locks = getattr(lock_owner, "advisory_locks", None)
             if not callable(locks):
                 raise HoldStateError(
                     f"PostgreSQL Hold {label} database cannot provide advisory locks"
                 )
-            await stack.enter_async_context(locks((_POSTGRES_EVIDENCE_LOCK,)))
+            await stack.enter_async_context(
+                locks(
+                    (_POSTGRES_EVIDENCE_LOCK,),
+                    expected_cluster_identity=cluster,
+                )
+            )
+        yield
+
+
+@asynccontextmanager
+async def _postgres_operational_session(
+    database: Any,
+    *,
+    expected_cluster_identity: str | None = None,
+):
+    """Pin Hold I/O when the concrete PostgreSQL backend exposes the seam."""
+
+    owner = getattr(database, "backend", None) or database
+    session = getattr(owner, "operational_session", None)
+    if callable(session):
+        context = (
+            session()
+            if expected_cluster_identity is None
+            else session(expected_cluster_identity=expected_cluster_identity)
+        )
+        async with context:
+            yield
+        return
+    # Compatibility for narrow test/storage facades. Production PostgreSQL
+    # uses PostgresBackend, which always supplies operational_session.
+    yield
+
+
+@asynccontextmanager
+async def _postgres_operational_sessions(
+    primary_db: Any,
+    evidence_db: Any,
+    *,
+    primary_cluster: str,
+    evidence_cluster: str,
+):
+    """Pin both operational pools in the same immutable cluster order."""
+
+    databases = sorted(
+        (
+            (primary_cluster, primary_db),
+            (evidence_cluster, evidence_db),
+        ),
+        key=lambda item: item[0],
+    )
+    async with AsyncExitStack() as stack:
+        for cluster, database in databases:
+            await stack.enter_async_context(
+                _postgres_operational_session(
+                    database,
+                    expected_cluster_identity=cluster,
+                )
+            )
+        yield
+
+
+@asynccontextmanager
+async def _postgres_schema_initialization_guard(
+    backend: Any,
+    *,
+    expected_cluster_identity: str,
+):
+    """Keep identity verification, advisory exclusion, and DDL on one cluster."""
+
+    async with _postgres_operational_session(
+        backend,
+        expected_cluster_identity=expected_cluster_identity,
+    ), backend.advisory_locks(
+        (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,),
+        expected_cluster_identity=expected_cluster_identity,
+    ):
         yield
 
 
@@ -499,46 +624,45 @@ async def _read_postgres_hold_custody_snapshot(
 ) -> PostgresHoldCustodySnapshot:
     """Read custody evidence without creating or changing database objects."""
 
-    cluster_identity = await _read_raw_postgres_cluster_identity(
-        backend,
-        label=label,
-    )
-
-    try:
-        table_rows = await backend.fetch_all(
-            "SELECT to_regclass('agent_metadata')::text"
-        )
-    except Exception as exc:
-        raise HoldStateError(
-            f"could not inspect PostgreSQL Hold {label} custody metadata"
-        ) from exc
-    if len(table_rows) != 1 or len(table_rows[0]) != 1:
-        raise HoldStateError(
-            f"could not inspect PostgreSQL Hold {label} custody metadata"
-        )
-    table_name = table_rows[0][0]
-    if table_name is None:
-        return PostgresHoldCustodySnapshot(cluster_identity=cluster_identity)
-    if not isinstance(table_name, str) or not table_name.strip():
-        raise HoldStateError(
-            f"could not inspect PostgreSQL Hold {label} custody metadata"
+    async with _postgres_operational_session(backend):
+        cluster_identity = await _read_raw_postgres_cluster_identity(
+            backend,
+            label=label,
         )
 
-    try:
-        rows = await backend.fetch_all(
-            "SELECT key, value FROM agent_metadata "
-            "WHERE agent_id = ? AND key IN (?, ?, ?)",
-            (
-                _POSTGRES_WITNESS_AGENT_ID,
-                _POSTGRES_ROLLBACK_DOMAIN_KEY,
-                _POSTGRES_PRIMARY_BINDING_KEY,
-                _POSTGRES_EVIDENCE_BINDING_KEY,
-            ),
-        )
-    except Exception as exc:
-        raise HoldStateError(
-            f"could not inspect PostgreSQL Hold {label} custody metadata"
-        ) from exc
+        try:
+            table_rows = await backend.fetch_all(_POSTGRES_HOLD_METADATA_TABLE_SQL)
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            ) from exc
+        if len(table_rows) != 1 or len(table_rows[0]) != 1:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            )
+        table_name = table_rows[0][0]
+        if table_name is None:
+            return PostgresHoldCustodySnapshot(cluster_identity=cluster_identity)
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            )
+
+        try:
+            rows = await backend.fetch_all(
+                "SELECT key, value FROM agent_metadata "
+                "WHERE agent_id = ? AND key IN (?, ?, ?)",
+                (
+                    _POSTGRES_WITNESS_AGENT_ID,
+                    _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                ),
+            )
+        except Exception as exc:
+            raise HoldStateError(
+                f"could not inspect PostgreSQL Hold {label} custody metadata"
+            ) from exc
 
     return postgres_hold_custody_snapshot_from_rows(
         cluster_identity,
@@ -580,7 +704,7 @@ async def preflight_postgres_hold_custody(
 ) -> None:
     """Verify existing custody roles through raw, read-only PostgreSQL pools."""
 
-    primary_backend, evidence_backend = (
+    primary_backend, evidence_backend, _primary_cluster, _evidence_cluster = (
         await _connect_postgres_hold_custody_backends(
             primary_dsn,
             evidence_dsn,
@@ -599,7 +723,7 @@ async def preflight_postgres_hold_custody(
 async def _connect_postgres_hold_custody_backends(
     primary_dsn: str,
     evidence_dsn: str,
-) -> tuple[Any, Any]:
+) -> tuple[Any, Any, str, str]:
     """Return the exact connected pools whose custody roles were validated."""
 
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -673,18 +797,18 @@ async def _connect_postgres_hold_custody_backends(
                 f"{close_error!r}"
             )
         raise failure.with_traceback(failure.__traceback__)
-    return primary_backend, evidence_backend
+    return primary_backend, evidence_backend, primary_cluster, evidence_cluster
 
 
 async def initialize_postgres_hold_databases(
     primary_dsn: str,
     evidence_dsn: str,
 ) -> tuple[Any, Any]:
-    """Validate, then initialize schema on those same connected PG pools."""
+    """Validate, then initialize Hold prerequisites on those connected pools."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    primary_backend, evidence_backend = (
+    primary_backend, evidence_backend, primary_cluster, evidence_cluster = (
         await _connect_postgres_hold_custody_backends(
             primary_dsn,
             evidence_dsn,
@@ -692,32 +816,71 @@ async def initialize_postgres_hold_databases(
     )
     primary_db = None
     evidence_db = None
+    primary_backend_consumed = False
+    evidence_backend_consumed = False
     try:
+        # Hold's two custody services are deliberately narrower than Kestrel's
+        # agent database. Running the full core initializer here made a valid
+        # Hold deployment depend on write authority over every unrelated core
+        # table and made Doctor's Hold-specific readiness probe incapable of
+        # predicting boot. Only the metadata ledger used by the external
+        # custody protocol is required before HoldStore creates its own tables.
+        async def initialize_hold_metadata(db: Any) -> None:
+            await db.execute(_POSTGRES_HOLD_METADATA_SCHEMA_SQL)
+            try:
+                await db.fetchall(
+                    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL,
+                    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS,
+                )
+            except Exception as exc:
+                raise HoldCorruptStateError(
+                    "Hold agent_metadata schema cannot resolve its required "
+                    "agent/key conflict key"
+                ) from exc
+
         # Lock each database separately rather than holding both locks at once.
         # Besides bounding the critical section, this avoids a deadlock if two
         # still-unbound databases are accidentally presented in opposite roles
-        # by concurrent starts.  Custody-role validation below remains the
-        # authority that rejects that topology.
+        # by concurrent starts. Custody-role validation remains the authority
+        # that rejects that topology.
+        # from_connected_backend takes ownership at invocation and closes that
+        # backend itself if initialization fails. Track the transfer so outer
+        # pair cleanup never double-closes the failed half.
+        primary_backend_consumed = True
         primary_db = await AsyncDatabase.from_connected_backend(
             primary_backend,
-            initialization_guard=primary_backend.advisory_locks(
-                (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,)
+            initialization_guard=_postgres_schema_initialization_guard(
+                primary_backend,
+                expected_cluster_identity=primary_cluster,
             ),
+            schema_initializer=initialize_hold_metadata,
         )
+        evidence_backend_consumed = True
         evidence_db = await AsyncDatabase.from_connected_backend(
             evidence_backend,
-            initialization_guard=evidence_backend.advisory_locks(
-                (_POSTGRES_SCHEMA_BOOTSTRAP_LOCK,)
+            initialization_guard=_postgres_schema_initialization_guard(
+                evidence_backend,
+                expected_cluster_identity=evidence_cluster,
             ),
+            schema_initializer=initialize_hold_metadata,
         )
         return primary_db, evidence_db
     except BaseException as failure:
         close_errors: tuple[BaseException, ...] = ()
         try:
-            close_errors = await _close_postgres_preflight_backends(
-                primary_db or primary_backend,
-                evidence_db or evidence_backend,
-            )
+            remaining_owners = []
+            if primary_db is not None:
+                remaining_owners.append(primary_db)
+            elif not primary_backend_consumed:
+                remaining_owners.append(primary_backend)
+            if evidence_db is not None:
+                remaining_owners.append(evidence_db)
+            elif not evidence_backend_consumed:
+                remaining_owners.append(evidence_backend)
+            if remaining_owners:
+                close_errors = await _close_postgres_preflight_backends(
+                    *remaining_owners
+                )
         except asyncio.CancelledError as cancellation:
             failure = cancellation
         for close_error in close_errors:
@@ -816,17 +979,19 @@ def hold_sqlite_custody_marker_path(control_db_path: str | Path) -> Path:
     replacement tooling commonly treats ``<database>*`` as one replaceable
     SQLite family; keeping this witness in a private sibling directory leaves
     an independent fact that distinguishes a first boot from total family
-    loss.  The filename binds that fact to the absolute database identity.
+    loss. The filename binds that fact to the database name within the custody
+    root, rather than to an absolute mount path, so moving or restoring the
+    complete stopped root does not invalidate its authority evidence.
     """
 
     path = absolute_without_following_leaf(Path(control_db_path))
-    identity = hashlib.sha256(os.fsencode(str(path))).hexdigest()
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
     return path.parent / ".hold-custody" / f"{identity}.initialized-v1"
 
 
 def _sqlite_custody_marker_payload(control_db_path: str | Path) -> bytes:
     path = absolute_without_following_leaf(Path(control_db_path))
-    identity = hashlib.sha256(os.fsencode(str(path))).hexdigest().encode("ascii")
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest().encode("ascii")
     return _SQLITE_CUSTODY_MARKER_HEADER + identity + b"\n"
 
 
@@ -1421,6 +1586,9 @@ def _snapshot_after_witness_backfill(
             content_witness_rows=snapshot.content_witness_rows,
             operation_witness_rows=snapshot.operation_witness_rows,
             migration_rows=snapshot.migration_rows,
+            resolvable_conflict_keys=snapshot.resolvable_conflict_keys,
+            occupied_schema_names=snapshot.occupied_schema_names,
+            duplicate_conflict_keys=snapshot.duplicate_conflict_keys,
         )
 
     receipt_rows = tuple(snapshot.receipt_rows)
@@ -1487,7 +1655,54 @@ def _snapshot_after_witness_backfill(
         content_witness_rows=tuple(content_rows),
         operation_witness_rows=tuple(operation_rows),
         migration_rows=(*snapshot.migration_rows, (_WITNESS_BACKFILL,)),
+        resolvable_conflict_keys=frozenset(
+            (table, frozenset(column.strip() for column in columns.split(",")))
+            for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ),
+        occupied_schema_names=frozenset(
+            name for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ),
+        duplicate_conflict_keys=frozenset(),
     )
+
+
+def _validate_snapshot_conflict_keys(snapshot: HoldDatabaseSnapshot) -> None:
+    """Prove each existing table has or can build its required upsert key."""
+
+    resolved = snapshot.resolvable_conflict_keys
+    occupied = snapshot.occupied_schema_names
+    duplicates = snapshot.duplicate_conflict_keys
+    if resolved is None or occupied is None or duplicates is None:
+        # Synthetic snapshots used by pure state-machine callers predate schema
+        # catalogue evidence. Real SQLite/PostgreSQL readiness readers always
+        # populate all three fields before this validator is used as a boot
+        # oracle.
+        return
+    for name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+        if table not in snapshot.existing_tables:
+            continue
+        key = (
+            table,
+            frozenset(column.strip() for column in columns.split(",")),
+        )
+        if key in resolved:
+            # An existing arbiter is already usable.
+            continue
+        conflict_label = (
+            "scope/target"
+            if columns == "scope, target_id"
+            else "/".join(column.strip() for column in columns.split(","))
+        )
+        if name in occupied:
+            raise HoldCorruptStateError(
+                f"Hold {table} schema cannot resolve its required "
+                f"{conflict_label} conflict key"
+            )
+        if key in duplicates:
+            raise HoldCorruptStateError(
+                f"Hold {table} schema cannot enforce its required "
+                f"{conflict_label} unique key"
+            )
 
 
 def validate_hold_readiness_snapshot(
@@ -1520,6 +1735,7 @@ def validate_hold_readiness_snapshot(
             raise HoldCorruptStateError(
                 f"Hold state probe returned rows without {table}"
             )
+    _validate_snapshot_conflict_keys(snapshot)
 
     if (
         initialization_witness is not None
@@ -2081,7 +2297,12 @@ class HoldStore:
         primary_cluster, evidence_cluster = (
             await self._assert_postgres_clusters_independent()
         )
-        async with _postgres_custody_locks(
+        async with _postgres_operational_sessions(
+            self._db,
+            evidence_db,
+            primary_cluster=primary_cluster,
+            evidence_cluster=evidence_cluster,
+        ), _postgres_custody_locks(
             self._db,
             evidence_db,
             primary_cluster=primary_cluster,
@@ -2150,13 +2371,19 @@ class HoldStore:
         *,
         label: str,
         max_bytes: int,
+        harden_custody: bool = True,
     ) -> bytes | None:
         """Read one complete private evidence file without following links."""
 
         if not path_exists(path):
             return None
         try:
-            descriptor = open_private_file(path, os.O_RDONLY, label=label)
+            opener = (
+                open_private_file
+                if harden_custody
+                else open_private_file_for_validation
+            )
+            descriptor = opener(path, os.O_RDONLY, label=label)
             try:
                 return os.read(descriptor, max_bytes + 1)
             finally:
@@ -2670,8 +2897,28 @@ class HoldStore:
         async with self._db.transaction(immediate=True):
             try:
                 yield
-            except BaseException:
-                await self._remove_external_history_candidate()
+            except BaseException as mutation_failure:
+                # PostgreSQL candidate removal crosses into an independent
+                # database. Own that cleanup separately so a second cancel of
+                # the mutation caller cannot interrupt the delete and leave a
+                # known rollback looking like an ambiguous committed restore.
+                cleanup = asyncio.create_task(
+                    self._remove_external_history_candidate(),
+                    name="hold:rollback-history-candidate",
+                )
+                pending_cancellation = (
+                    mutation_failure
+                    if isinstance(mutation_failure, asyncio.CancelledError)
+                    else None
+                )
+                cleanup_outcome = await await_owned_task(
+                    cleanup,
+                    pending_cancellation,
+                )
+                raise_owned_outcome(
+                    cleanup_outcome,
+                    operation="Hold rollback history candidate cleanup",
+                )
                 raise
 
     def _finish_history_publication(self, payload: bytes | None) -> None:
@@ -3023,21 +3270,37 @@ class HoldStore:
                         f"Hold {table} schema cannot enforce its required "
                         "unique key"
                     ) from exc
-            try:
-                # Prove the conflict target itself, not just our index name. A
-                # pre-existing corrupt index may occupy that name while
-                # covering different columns; EXPLAIN asks the database to
-                # resolve the arbiter without inserting the probe row.
-                await self._db.fetchall(
-                    "EXPLAIN INSERT INTO hold_latches (scope, target_id) "
-                    "VALUES (?, ?) ON CONFLICT (scope, target_id) DO NOTHING",
-                    ("agent", "__kestrel_hold_schema_probe__"),
+            # Prove each conflict key itself, not just our index names. A
+            # pre-existing corrupt index may occupy an expected name while
+            # covering different columns. EXPLAIN asks the database to resolve
+            # every arbiter without inserting a probe row. Keep the proof
+            # derived from the complete unique-key declaration so a future
+            # upsert cannot be added behind a name-only readiness check.
+            for _index, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+                column_names = tuple(
+                    column.strip() for column in columns.split(",")
                 )
-            except Exception as exc:
-                raise HoldCorruptStateError(
-                    "Hold latch schema cannot resolve its required "
-                    "scope/target conflict key"
-                ) from exc
+                placeholders = ", ".join("?" for _column in column_names)
+                conflict_label = (
+                    "scope/target"
+                    if column_names == ("scope", "target_id")
+                    else "/".join(column_names)
+                )
+                try:
+                    await self._db.fetchall(
+                        f"EXPLAIN INSERT INTO {table} ({columns}) "
+                        f"VALUES ({placeholders}) "
+                        f"ON CONFLICT ({columns}) DO NOTHING",
+                        tuple(
+                            f"__kestrel_hold_schema_probe_{position}__"
+                            for position, _column in enumerate(column_names)
+                        ),
+                    )
+                except Exception as exc:
+                    raise HoldCorruptStateError(
+                        f"Hold {table} schema cannot resolve its required "
+                        f"{conflict_label} conflict key"
+                    ) from exc
             migration_complete = await self._db.fetchone(
                 "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
                 (_WITNESS_BACKFILL,),
@@ -4015,7 +4278,7 @@ def _sqlite_readiness_evidence_lock(path: Path):
         raise HoldStateError("durable SQLite Hold requires advisory file locks")
     flags = os.O_RDONLY if fcntl is not None else os.O_RDWR
     try:
-        descriptor = open_private_file(
+        descriptor = open_private_file_for_validation(
             path,
             flags,
             label="Hold evidence protocol lock",
@@ -4059,19 +4322,80 @@ def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapsho
 
     names = tuple(sorted(_HOLD_SCHEMA_TABLES))
     placeholders = ", ".join("?" for _ in names)
-    existing = frozenset(
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            f"AND name IN ({placeholders}) ORDER BY name",
+    catalog_rows = tuple(
+        connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            f"WHERE name IN ({placeholders}) ORDER BY name",
             names,
         ).fetchall()
+    )
+    non_table_collisions = sorted(
+        str(row[1])
+        for row in catalog_rows
+        if len(row) == 2 and row[0] != "table"
+    )
+    if non_table_collisions:
+        raise HoldCorruptStateError(
+            "Hold schema has non-table objects occupying required table names: "
+            + ", ".join(non_table_collisions)
+        )
+    existing = frozenset(
+        str(row[1])
+        for row in catalog_rows
+        if len(row) == 2 and row[0] == "table"
     )
 
     def rows(table: str, sql: str) -> tuple[Any, ...]:
         if table not in existing:
             return ()
         return tuple(connection.execute(sql).fetchall())
+
+    required_names = tuple(
+        name for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+    )
+    name_placeholders = ", ".join("?" for _name in required_names)
+    occupied_names = frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            f"WHERE name IN ({name_placeholders})",
+            required_names,
+        ).fetchall()
+    )
+    conflict_keys: set[tuple[str, frozenset[str]]] = set()
+    for table in existing:
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        for index_row in connection.execute(
+            f"PRAGMA index_list({quoted_table})"
+        ).fetchall():
+            if len(index_row) < 5 or index_row[2] != 1 or index_row[4] != 0:
+                continue
+            index_name = index_row[1]
+            if not isinstance(index_name, str):
+                continue
+            quoted_index = '"' + index_name.replace('"', '""') + '"'
+            index_columns = connection.execute(
+                f"PRAGMA index_info({quoted_index})"
+            ).fetchall()
+            names_for_key = tuple(row[2] for row in index_columns)
+            if names_for_key and all(
+                isinstance(column, str) for column in names_for_key
+            ) and len(set(names_for_key)) == len(names_for_key):
+                conflict_keys.add((table, frozenset(names_for_key)))
+
+    duplicate_keys: set[tuple[str, frozenset[str]]] = set()
+    for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+        key = (
+            table,
+            frozenset(column.strip() for column in columns.split(",")),
+        )
+        if table not in existing or key in conflict_keys:
+            continue
+        duplicate = connection.execute(
+            _hold_duplicate_conflict_key_sql(table, columns)
+        ).fetchone()
+        if duplicate is not None:
+            duplicate_keys.add(key)
 
     return HoldDatabaseSnapshot(
         existing_tables=existing,
@@ -4102,11 +4426,89 @@ def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapsho
             "hold_schema_migrations",
             "SELECT name FROM hold_schema_migrations ORDER BY name",
         ),
+        resolvable_conflict_keys=frozenset(conflict_keys),
+        occupied_schema_names=occupied_names,
+        duplicate_conflict_keys=frozenset(duplicate_keys),
     )
+
+
+def _validate_sqlite_creation_parent(
+    database: Path,
+    *,
+    runtime_hardens_parent: bool,
+) -> None:
+    """Predict whether runtime can create a fresh private control database."""
+
+    parent = database.parent
+    if path_exists(parent):
+        runtime_will_harden_parent = False
+        if not runtime_hardens_parent:
+            require_private_directory(parent, label="host database")
+        else:
+            try:
+                parent_stat = parent.lstat()
+            except OSError as exc:
+                raise HoldStateError(
+                    f"cannot inspect host database directory {parent}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise HoldStateError(
+                    "host database custody path must be a real directory, "
+                    f"not a link or special file: {parent}"
+                )
+            if os.name != "nt" and stat.S_IMODE(parent_stat.st_mode) != 0o700:
+                effective_uid = getattr(os, "geteuid", lambda: parent_stat.st_uid)()
+                if effective_uid not in (0, parent_stat.st_uid):
+                    raise HoldStateError(
+                        "host database directory cannot be restricted to mode "
+                        f"0700 by this runtime: {parent}"
+                    )
+                runtime_will_harden_parent = True
+        if (
+            not runtime_will_harden_parent
+            and not os.access(parent, os.W_OK | os.X_OK)
+        ):
+            raise HoldStateError(
+                f"host database directory is not writable by this runtime: {parent}"
+            )
+        return
+
+    # Runtime creates a missing suffix one private directory at a time. Doctor
+    # stays read-only, so prove that the nearest existing ancestor can admit
+    # that creation without touching it.
+    ancestor = parent
+    while not path_exists(ancestor):
+        next_ancestor = ancestor.parent
+        if next_ancestor == ancestor:
+            raise HoldStateError(
+                f"host database directory has no existing ancestor: {parent}"
+            )
+        ancestor = next_ancestor
+    try:
+        ancestor_stat = ancestor.lstat()
+    except OSError as exc:
+        raise HoldStateError(
+            f"cannot inspect host database parent {ancestor}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(ancestor_stat.st_mode) or not stat.S_ISDIR(
+        ancestor_stat.st_mode
+    ):
+        raise HoldStateError(
+            "host database parent must be a real directory, not a link or "
+            f"special file: {ancestor}"
+        )
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        raise HoldStateError(
+            f"host database parent is not writable by this runtime: {ancestor}"
+        )
 
 
 def validate_sqlite_hold_readiness(
     control_db_path: str | Path,
+    *,
+    runtime_hardens_parent: bool = False,
 ) -> tuple[HoldState, ...]:
     """Read and validate SQLite Hold state without creating or recovering it."""
 
@@ -4123,27 +4525,94 @@ def validate_sqlite_hold_readiness(
     lock_path = Path(f"{history_path}.lock")
     custody_path = hold_sqlite_custody_marker_path(database)
     custody_payload = _sqlite_custody_marker_payload(database)
-    evidence_paths = (
-        initialization_path,
-        history_path,
-        candidate_path,
-        bootstrap_path,
-        lock_path,
-        custody_path,
-    )
-    if not path_exists(database):
-        leftovers = tuple(
-            path
-            for path in (*sqlite_family(database)[1:], *evidence_paths)
-            if path_exists(path)
-        )
-        if leftovers:
-            raise HoldCorruptStateError(
-                "SQLite Hold database is missing while durable sidecars remain"
-            )
-        return ()
 
+    def evidence() -> tuple[bytes | None, ...]:
+        return (
+            HoldStore._read_file_evidence(
+                initialization_path,
+                label="Hold initialization witness",
+                max_bytes=len(_INITIALIZATION_WITNESS_PAYLOAD),
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                history_path,
+                label="Hold history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                candidate_path,
+                label="Hold staged history anchor",
+                max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                bootstrap_path,
+                label="Hold bootstrap intent",
+                max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
+                harden_custody=False,
+            ),
+            HoldStore._read_file_evidence(
+                custody_path,
+                label="SQLite Hold custody marker",
+                max_bytes=len(custody_payload),
+                harden_custody=False,
+            ),
+        )
+
+    if not path_exists(database):
+        _validate_sqlite_creation_parent(
+            database,
+            runtime_hardens_parent=runtime_hardens_parent,
+        )
+        if any(path_exists(path) for path in sqlite_family(database)[1:]):
+            raise HoldCorruptStateError(
+                "SQLite Hold database is missing while database sidecars remain"
+            )
+        with _sqlite_readiness_evidence_lock(lock_path):
+            evidence_before = evidence()
+            evidence_after = evidence()
+            if (
+                evidence_before != evidence_after
+                or path_exists(database)
+                or any(path_exists(path) for path in sqlite_family(database)[1:])
+            ):
+                raise HoldStateError(
+                    "SQLite Hold state changed during the diagnostic snapshot"
+                )
+            _validate_sqlite_custody_evidence(
+                marker_payload=evidence_after[4],
+                expected_payload=custody_payload,
+                initialized=evidence_after[0] is not None,
+                bootstrap_pending=evidence_after[3] is not None,
+            )
+            return validate_hold_readiness_snapshot(
+                snapshot=HoldDatabaseSnapshot(
+                    existing_tables=frozenset(),
+                    resolvable_conflict_keys=frozenset(),
+                    occupied_schema_names=frozenset(),
+                    duplicate_conflict_keys=frozenset(),
+                ),
+                initialization_witness=evidence_after[0],
+                history_anchor=evidence_after[1],
+                history_candidate=evidence_after[2],
+                bootstrap_intent=evidence_after[3],
+            )
+
+    _validate_sqlite_creation_parent(
+        database,
+        runtime_hardens_parent=runtime_hardens_parent,
+    )
     validate_sqlite_family_private(database, label="host database")
+    for family_member in sqlite_family(database):
+        if path_exists(family_member) and not os.access(
+            family_member,
+            os.R_OK | os.W_OK,
+        ):
+            raise HoldStateError(
+                "SQLite Hold database family is not readable and writable by "
+                f"this runtime: {family_member}"
+            )
     with _sqlite_readiness_evidence_lock(lock_path) as locked:
         wal_path = Path(f"{database}-wal")
         shm_path = Path(f"{database}-shm")
@@ -4176,35 +4645,6 @@ def validate_sqlite_hold_readiness(
             if lock_stat is None
             else (lock_stat.st_ino, lock_stat.st_mtime_ns, lock_stat.st_size)
         )
-
-        def evidence() -> tuple[bytes | None, ...]:
-            return (
-                HoldStore._read_file_evidence(
-                    initialization_path,
-                    label="Hold initialization witness",
-                    max_bytes=len(_INITIALIZATION_WITNESS_PAYLOAD),
-                ),
-                HoldStore._read_file_evidence(
-                    history_path,
-                    label="Hold history anchor",
-                    max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
-                ),
-                HoldStore._read_file_evidence(
-                    candidate_path,
-                    label="Hold staged history anchor",
-                    max_bytes=_HISTORY_ANCHOR_MAX_BYTES,
-                ),
-                HoldStore._read_file_evidence(
-                    bootstrap_path,
-                    label="Hold bootstrap intent",
-                    max_bytes=_BOOTSTRAP_INTENT_MAX_BYTES,
-                ),
-                HoldStore._read_file_evidence(
-                    custody_path,
-                    label="SQLite Hold custody marker",
-                    max_bytes=len(custody_payload),
-                ),
-            )
 
         evidence_before = evidence()
         flags = "mode=ro" if wal_sidecars else "mode=ro&immutable=1"

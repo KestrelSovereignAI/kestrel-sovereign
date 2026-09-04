@@ -17,15 +17,16 @@ state, not source-tree output.
 
 ## Shared private host-data root
 
-Implicit host services use one placement rule:
+The baseline private host-data resolver is:
 
 1. `<KESTREL_HOME>/host-data` when `KESTREL_HOME` is explicitly set;
 2. `~/.kestrel/host-data` otherwise.
 
 This resolver deliberately ignores source markers and the current working
 directory. Launching from a clone does not make that clone a runtime-data root.
-Phoenix uses `<host-data>/phoenix`; fleet/host features use
-`<host-data>/host-features.db`.
+Phoenix uses `<host-data>/phoenix`. Fleet/host features use
+`$KESTREL_DB_PATH/host-data/host-features.db` when an agent-data root is set,
+and otherwise use `<host-data>/host-features.db`.
 
 `KESTREL_HOST_DB_PATH` remains the explicit host-feature database override. Its
 parent is the custody boundary: Kestrel creates a missing parent as `0700`, but
@@ -34,21 +35,21 @@ will not chmod a shared operator directory such as `/data` or `/tmp`. The
 database leaf and SQLite auxiliaries must be regular single-link files; symbolic
 links, hard links, and special files fail closed.
 
-The supported SQLite Docker images set this override beneath their persistent
-agent-data mount (`/app/agent_data/host-data/host-features.db`, or
-`/data/host-data/host-features.db` for the sovereign image). Recreating a
+The supported SQLite Docker images derive this path beneath the effective
+`KESTREL_DB_PATH` (`<agent-data>/host-data/host-features.db`). Recreating a
 container therefore preserves the active Hold database and its adjacent
-history/pending-publication witnesses with the agent database. Custom images
-must provide an equivalent persistent mount; the process-home default is not a
-durability boundary inside a replaceable container.
+history/pending-publication witnesses with the agent database, including when
+an operator moves the mounted data root. Custom images must provide an
+equivalent persistent mount; the process-home default is not a durability
+boundary inside a replaceable container.
 
-SQLite Hold also writes a path-bound initialization marker under the private
-`<host-data>/.hold-custody/` directory. Its filename does not share the database
-basename: replacing `host-features.db*` therefore leaves a durable fact that the
-store existed, and a later boot refuses to reinterpret the missing family as a
-new empty installation. The marker is evidence, not a backup; operators must
-preserve it with the host-data directory and restore the database family rather
-than deleting the marker to make a failed custody check pass.
+SQLite Hold also writes a database-name-bound initialization marker under the
+private `<host-data>/.hold-custody/` directory. Its filename does not share the
+database basename: replacing `host-features.db*` therefore leaves a durable fact
+that the store existed, and a later boot refuses to reinterpret the missing
+family as a new empty installation. The marker is evidence, not a backup;
+operators must preserve it with the host-data directory and restore the database
+family rather than deleting the marker to make a failed custody check pass.
 
 ## Secure SQLite creation
 
@@ -76,7 +77,7 @@ The similarly named databases are intentionally distinct:
 
 | Database | Owner and purpose | Discovery contract |
 |---|---|---|
-| `<host-data>/host-features.db` | Multi-agent host; fleet-scoped host-feature entities and operational state | `build_host_context`; optional `KESTREL_HOST_DB_PATH` |
+| `<agent-data>/host-data/host-features.db` or `<host-data>/host-features.db` | Multi-agent host; fleet-scoped host-feature entities and operational state | `build_host_context`; follows `KESTREL_DB_PATH`, with optional `KESTREL_HOST_DB_PATH` override |
 | `<project>/agent_data/host.db` | Payment/key subsystem; deployment credential records agents must discover from their storage path | setup payment step and `open_host_db` |
 
 There is no fallback, merge, or automatic copying between these databases.

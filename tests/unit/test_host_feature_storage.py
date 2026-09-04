@@ -64,6 +64,7 @@ async def test_default_host_database_is_private_at_creation_under_umask_zero(
     monkeypatch.setenv("HOME", str(operator_home))
     monkeypatch.delenv("KESTREL_HOME", raising=False)
     monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
 
     previous_umask = os.umask(0)
     try:
@@ -231,6 +232,7 @@ async def test_default_migrates_and_hardens_stopped_legacy_database(
     legacy.chmod(0o644)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
 
     ctx = await build_host_context()
     destination = home / "host-data" / HOST_FEATURE_DB_FILENAME
@@ -253,6 +255,7 @@ def test_cross_filesystem_migration_uses_private_staging(tmp_path, monkeypatch):
     legacy.chmod(0o644)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
 
     from kestrel_sovereign.host_features import storage
 
@@ -290,6 +293,7 @@ def test_live_legacy_sidecars_are_contained_and_fail_closed(tmp_path, monkeypatc
         path.chmod(0o644)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
 
     with pytest.raises(HostStorageError, match="another Kestrel process"):
         prepare_host_database()
@@ -312,6 +316,7 @@ def test_dual_legacy_and_destination_stores_are_contained_and_rejected(
     destination.chmod(0o644)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
 
     with pytest.raises(HostStorageError, match="both legacy host database"):
         prepare_host_database()
@@ -325,3 +330,69 @@ def test_host_database_path_distinguishes_explicit_override(tmp_path, monkeypatc
     override = tmp_path / "private" / "custom.db"
     monkeypatch.setenv(HOST_DB_PATH_ENV, str(override))
     assert host_database_path() == (override.absolute(), False)
+
+
+def test_host_database_path_follows_agent_data_root_without_override(
+    tmp_path,
+    monkeypatch,
+):
+    """One Docker data-root override moves agent and Hold custody together."""
+
+    data_root = tmp_path / "mounted-data"
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.setenv("KESTREL_DB_PATH", str(data_root))
+
+    assert host_database_path() == (
+        data_root / "host-data" / HOST_FEATURE_DB_FILENAME,
+        False,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_agent_data_root_migrates_previous_default_host_database(
+    tmp_path,
+    monkeypatch,
+):
+    """Changing the implicit root must not hide the pre-upgrade host store."""
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    data_root = tmp_path / "mounted-data"
+    destination = data_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="pre-upgrade")
+    previous.chmod(0o644)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv("KESTREL_DB_PATH", str(data_root))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+
+    assert prepare_host_database() == destination
+    assert not previous.exists()
+    assert _mode(destination) == 0o600
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
+            "pre-upgrade",
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_agent_data_root_rejects_previous_and_destination_histories(
+    tmp_path,
+    monkeypatch,
+):
+    """An upgrade refuses two histories instead of selecting the blanker one."""
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    data_root = tmp_path / "mounted-data"
+    destination = data_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="pre-upgrade")
+    _create_legacy_sqlite(destination, value="new-root")
+    destination.parent.chmod(0o700)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv("KESTREL_DB_PATH", str(data_root))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+
+    with pytest.raises(HostStorageError, match="both previous default"):
+        prepare_host_database()
+
+    assert previous.exists() and destination.exists()

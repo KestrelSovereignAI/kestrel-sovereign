@@ -56,9 +56,19 @@ from kestrel_sovereign._doctor_postgres_probe import (
     ERROR_KIND_DIAGNOSTIC,
     ERROR_KIND_QUERY,
 )
+from kestrel_sovereign.hold.state import (
+    _HOLD_REQUIRED_UNIQUE_INDEXES,
+    _POSTGRES_HOLD_METADATA_TABLE_SQL,
+    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS,
+    _POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL,
+    _hold_duplicate_conflict_key_sql,
+)
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
     effective_identity_export_roots,
+)
+from kestrel_sovereign.lifecycle_checks import (
+    is_isolated_nonproduction_kite_environment,
 )
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.multi_agent.config import (
@@ -310,9 +320,6 @@ def _anchor_is_the_runtime_database(env: dict) -> bool:
 _POSTGRES_CLUSTER_ID_SQL = (
     "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
 )
-_POSTGRES_HOLD_METADATA_TABLE_SQL = (
-    "SELECT to_regclass('agent_metadata')::text"
-)
 _POSTGRES_HOLD_CUSTODY_SQL = (
     "SELECT key, value FROM agent_metadata "
     "WHERE agent_id = $1 AND key IN ($2, $3, $4)"
@@ -349,9 +356,85 @@ _POSTGRES_HOLD_OPERATION_WITNESSES_SQL = (
 _POSTGRES_HOLD_MIGRATIONS_SQL = (
     "SELECT name FROM hold_schema_migrations ORDER BY name"
 )
+_POSTGRES_HOLD_REQUIRED_INDEX_NAMES = ", ".join(
+    f"'{name}'" for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+)
+_POSTGRES_HOLD_REQUIRED_TABLE_NAMES = ", ".join(
+    f"'{table}'"
+    for table in sorted(
+        {table for _name, table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES}
+    )
+)
+_POSTGRES_HOLD_NAMED_SCHEMA_OBJECTS_SQL = (
+    "SELECT c.relname FROM pg_catalog.pg_class AS c "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = current_schema() AND c.relname IN ("
+    f"{_POSTGRES_HOLD_REQUIRED_INDEX_NAMES}) ORDER BY c.relname"
+)
+_POSTGRES_HOLD_UNIQUE_KEYS_SQL = (
+    "SELECT tbl.relname, "
+    "string_agg(att.attname, ',' ORDER BY indexed_column.ordinality) "
+    "FROM pg_catalog.pg_index AS idx "
+    "JOIN pg_catalog.pg_class AS tbl ON tbl.oid = idx.indrelid "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = tbl.relnamespace "
+    "CROSS JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY "
+    "AS indexed_column(attnum, ordinality) "
+    "JOIN pg_catalog.pg_attribute AS att "
+    "ON att.attrelid = tbl.oid AND att.attnum = indexed_column.attnum "
+    "WHERE n.nspname = current_schema() AND tbl.relname IN ("
+    f"{_POSTGRES_HOLD_REQUIRED_TABLE_NAMES}) "
+    "AND idx.indisunique AND idx.indisvalid AND idx.indisready "
+    "AND idx.indimmediate AND idx.indpred IS NULL AND idx.indexprs IS NULL "
+    "AND indexed_column.ordinality <= idx.indnkeyatts "
+    "GROUP BY tbl.relname, idx.indexrelid "
+    "ORDER BY tbl.relname, idx.indexrelid"
+)
 _POSTGRES_HOLD_PROTOCOL_SQL = (
     "SELECT key, value FROM agent_metadata "
     "WHERE agent_id = $1 AND key IN ($2, $3, $4, $5) ORDER BY key"
+)
+_POSTGRES_HOLD_WRITE_PRIVILEGES_SQL_PREFIX = (
+    "SELECT current_schema(), "
+    "has_schema_privilege(current_user, current_schema(), 'USAGE'), "
+    "has_schema_privilege(current_user, current_schema(), 'CREATE'), "
+    "NOT EXISTS ("
+    "SELECT 1 FROM pg_catalog.pg_class AS c "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = current_schema() AND c.relname IN ("
+    "'agent_metadata', 'hold_latches', 'hold_receipts', "
+    "'hold_receipt_witnesses', 'hold_receipt_content_witnesses', "
+    "'hold_operation_witnesses', 'hold_schema_migrations') AND ("
+    "c.relkind NOT IN ('r', 'p') OR "
+    "(c.relname <> 'agent_metadata' AND "
+    "NOT pg_has_role(current_user, c.relowner, 'USAGE')) OR "
+    "NOT has_table_privilege(current_user, c.oid, 'SELECT') OR "
+    "NOT has_table_privilege(current_user, c.oid, 'INSERT') OR "
+    "NOT has_table_privilege(current_user, c.oid, 'UPDATE') OR "
+)
+_POSTGRES_HOLD_WRITE_PRIVILEGES_SQL_SUFFIX = (
+    ")), "
+    "current_setting('transaction_read_only') = 'on'"
+)
+
+
+def _postgres_hold_write_privileges_sql(*, metadata_delete_required: bool) -> str:
+    """Build the privilege probe for one side of PostgreSQL Hold custody."""
+
+    delete_check = "NOT has_table_privilege(current_user, c.oid, 'DELETE')"
+    if not metadata_delete_required:
+        delete_check = f"(c.relname <> 'agent_metadata' AND {delete_check})"
+    return (
+        _POSTGRES_HOLD_WRITE_PRIVILEGES_SQL_PREFIX
+        + delete_check
+        + _POSTGRES_HOLD_WRITE_PRIVILEGES_SQL_SUFFIX
+    )
+
+
+_POSTGRES_HOLD_PRIMARY_WRITE_PRIVILEGES_SQL = _postgres_hold_write_privileges_sql(
+    metadata_delete_required=False
+)
+_POSTGRES_HOLD_EVIDENCE_WRITE_PRIVILEGES_SQL = _postgres_hold_write_privileges_sql(
+    metadata_delete_required=True
 )
 
 
@@ -443,6 +526,78 @@ def _runtime_postgres_connection_failed(readings: list[_AgentGovernance]) -> boo
     )
 
 
+def _check_postgres_hold_write_privileges(
+    dsn: str,
+    *,
+    label: str,
+    cluster_identity: str,
+    metadata_delete_required: bool,
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+) -> bool:
+    """Prove the connected role can perform Hold's boot-time DDL and writes."""
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    try:
+        rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _postgres_hold_write_privileges_sql(
+                metadata_delete_required=metadata_delete_required
+            ),
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+            expected_cluster_identity=cluster_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostic must fail closed
+        report.fail.append(
+            f"PostgreSQL Hold {label} write privileges NOT verified: "
+            f"{_safe(exc, source)}"
+        )
+        return False
+
+    if len(rows) != 1 or len(rows[0]) != 5:
+        report.fail.append(
+            f"PostgreSQL Hold {label} write privileges NOT verified: "
+            "privilege probe returned invalid data"
+        )
+        return False
+    (
+        schema,
+        has_usage,
+        has_create,
+        existing_tables_writable,
+        transaction_read_only,
+    ) = rows[0]
+    missing: list[str] = []
+    if not isinstance(schema, str) or not schema.strip():
+        missing.append("an active schema")
+    if has_usage is not True:
+        missing.append("USAGE on the active schema")
+    if has_create is not True:
+        missing.append("CREATE on the active schema")
+    if existing_tables_writable is not True:
+        metadata_privileges = "SELECT/INSERT/UPDATE"
+        if metadata_delete_required:
+            metadata_privileges += "/DELETE"
+        missing.append(
+            "ownership of existing Hold tables and "
+            "SELECT/INSERT/UPDATE/DELETE on existing Hold tables and "
+            f"{metadata_privileges} on metadata"
+        )
+    if transaction_read_only is not False:
+        missing.append("a read-write transaction")
+    if missing:
+        report.fail.append(
+            f"PostgreSQL Hold {label} write privileges NOT verified: "
+            "runtime role requires " + ", ".join(missing)
+        )
+        return False
+    return True
+
+
 def _read_postgres_hold_custody_snapshot(
     dsn: str,
     *,
@@ -471,6 +626,7 @@ def _read_postgres_hold_custody_snapshot(
             postgres_env=source.postgres_env,
             postgres_cwd=source.postgres_cwd,
             dsn_identity=source.dsn_identity,
+            expected_cluster_identity=cluster_identity,
         )
         if len(table_rows) != 1 or len(table_rows[0]) != 1:
             raise ValueError("metadata-table probe returned invalid data")
@@ -480,6 +636,16 @@ def _read_postgres_hold_custody_snapshot(
         else:
             if not isinstance(table_name, str) or not table_name.strip():
                 raise ValueError("metadata-table probe returned invalid data")
+            _fetch_postgres_rows_isolated(
+                dsn,
+                _POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL,
+                _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS,
+                postgres_home=source.postgres_home,
+                postgres_env=source.postgres_env,
+                postgres_cwd=source.postgres_cwd,
+                dsn_identity=source.dsn_identity,
+                expected_cluster_identity=cluster_identity,
+            )
             metadata_rows = _fetch_postgres_rows_isolated(
                 dsn,
                 _POSTGRES_HOLD_CUSTODY_SQL,
@@ -493,6 +659,7 @@ def _read_postgres_hold_custody_snapshot(
                 postgres_env=source.postgres_env,
                 postgres_cwd=source.postgres_cwd,
                 dsn_identity=source.dsn_identity,
+                expected_cluster_identity=cluster_identity,
             )
         return (
             postgres_hold_custody_snapshot_from_rows(
@@ -514,6 +681,7 @@ def _read_postgres_hold_protocol_rows(
     dsn: str,
     *,
     metadata_table_exists: bool,
+    cluster_identity: str,
     env: dict[str, str],
     project_dir: Path,
 ) -> list:
@@ -544,12 +712,14 @@ def _read_postgres_hold_protocol_rows(
         postgres_env=source.postgres_env,
         postgres_cwd=source.postgres_cwd,
         dsn_identity=source.dsn_identity,
+        expected_cluster_identity=cluster_identity,
     )
 
 
 def _read_postgres_hold_primary_state(
     dsn: str,
     *,
+    cluster_identity: str,
     env: dict[str, str],
     project_dir: Path,
 ) -> object:
@@ -568,6 +738,7 @@ def _read_postgres_hold_primary_state(
         postgres_env=source.postgres_env,
         postgres_cwd=source.postgres_cwd,
         dsn_identity=source.dsn_identity,
+        expected_cluster_identity=cluster_identity,
     )
     tables: set[str] = set()
     for row in table_rows:
@@ -579,6 +750,71 @@ def _read_postgres_hold_primary_state(
         ):
             raise ValueError("Hold schema probe returned invalid data")
         tables.add(row[0])
+
+    occupied_names: set[str] = set()
+    conflict_keys: set[tuple[str, frozenset[str]]] = set()
+    if tables:
+        for row in _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_HOLD_NAMED_SCHEMA_OBJECTS_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+            expected_cluster_identity=cluster_identity,
+        ):
+            if (
+                len(row) != 1
+                or not isinstance(row[0], str)
+                or row[0] in occupied_names
+            ):
+                raise ValueError("Hold schema-name probe returned invalid data")
+            occupied_names.add(row[0])
+        for row in _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_HOLD_UNIQUE_KEYS_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+            expected_cluster_identity=cluster_identity,
+        ):
+            if (
+                len(row) != 2
+                or not isinstance(row[0], str)
+                or row[0] not in tables
+                or not isinstance(row[1], str)
+                or not row[1]
+            ):
+                raise ValueError("Hold unique-key probe returned invalid data")
+            columns = tuple(row[1].split(","))
+            if any(not column for column in columns):
+                raise ValueError("Hold unique-key probe returned invalid data")
+            if len(set(columns)) == len(columns):
+                conflict_keys.add((row[0], frozenset(columns)))
+
+    duplicate_keys: set[tuple[str, frozenset[str]]] = set()
+    for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES:
+        key = (
+            table,
+            frozenset(column.strip() for column in columns.split(",")),
+        )
+        if table not in tables or key in conflict_keys:
+            continue
+        duplicate_rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _hold_duplicate_conflict_key_sql(table, columns),
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+            expected_cluster_identity=cluster_identity,
+        )
+        if duplicate_rows not in ([], [(1,)]):
+            raise ValueError("Hold duplicate-key probe returned invalid data")
+        if duplicate_rows:
+            duplicate_keys.add(key)
+
     def read_table(table: str, sql: str) -> tuple:
         if table not in tables:
             return ()
@@ -590,6 +826,7 @@ def _read_postgres_hold_primary_state(
                 postgres_env=source.postgres_env,
                 postgres_cwd=source.postgres_cwd,
                 dsn_identity=source.dsn_identity,
+                expected_cluster_identity=cluster_identity,
             )
         )
 
@@ -613,21 +850,29 @@ def _read_postgres_hold_primary_state(
             "hold_schema_migrations",
             _POSTGRES_HOLD_MIGRATIONS_SQL,
         ),
+        resolvable_conflict_keys=frozenset(conflict_keys),
+        occupied_schema_names=frozenset(occupied_names),
+        duplicate_conflict_keys=frozenset(duplicate_keys),
     )
 
 
-def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
-    """Resolve the host database exactly as its spawned runtime will."""
+def _expand_runtime_user(value: str, env: dict[str, str]) -> Path:
+    """Expand a path using the spawned runtime's home, not Doctor's home."""
 
-    explicit = env.get("KESTREL_HOST_DB_PATH")
-    if explicit:
-        candidate = Path(explicit).expanduser()
-        if not candidate.is_absolute():
-            candidate = project_dir / candidate
-        return Path(os.path.abspath(candidate))
+    runtime_home = env.get("HOME") or env.get("USERPROFILE")
+    if runtime_home and value == "~":
+        return Path(runtime_home)
+    if runtime_home and value.startswith(("~/", "~\\")):
+        return Path(runtime_home) / value[2:]
+    return Path(value).expanduser()
+
+
+def _sqlite_default_host_database_path(env: dict[str, str], project_dir: Path) -> Path:
+    """Resolve the pre-data-root default host database for this runtime."""
+
     configured_home = env.get("KESTREL_HOME")
     if configured_home:
-        base = Path(configured_home).expanduser()
+        base = _expand_runtime_user(configured_home, env)
         if not base.is_absolute():
             base = project_dir / base
     else:
@@ -640,6 +885,24 @@ def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
     return Path(os.path.abspath(base / "host-data" / "host-features.db"))
 
 
+def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
+    """Resolve the host database exactly as its spawned runtime will."""
+
+    explicit = env.get("KESTREL_HOST_DB_PATH")
+    if explicit:
+        candidate = _expand_runtime_user(explicit, env)
+        if not candidate.is_absolute():
+            candidate = project_dir / candidate
+        return Path(os.path.abspath(candidate))
+    agent_data_root = env.get("KESTREL_DB_PATH")
+    if agent_data_root:
+        base = _expand_runtime_user(agent_data_root, env)
+        if not base.is_absolute():
+            base = project_dir / base
+        return Path(os.path.abspath(base / "host-data" / "host-features.db"))
+    return _sqlite_default_host_database_path(env, project_dir)
+
+
 def _check_sqlite_hold_readiness(
     env: dict[str, str],
     project_dir: Path,
@@ -647,14 +910,30 @@ def _check_sqlite_hold_readiness(
 ) -> None:
     """Verify the mandatory local Hold database and external sidecars."""
 
-    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
-    if backend == "postgres" and env.get("KESTREL_DATABASE_URL"):
-        return
     from kestrel_sovereign.hold.state import validate_sqlite_hold_readiness
+    from kestrel_sovereign.host_features.storage import (
+        validate_host_database_migration_readiness,
+    )
 
     database = _sqlite_hold_database_path(env, project_dir)
     try:
-        validate_sqlite_hold_readiness(database)
+        if not env.get("KESTREL_HOST_DB_PATH"):
+            sources: list[tuple[str, Path]] = []
+            if env.get("KESTREL_DB_PATH"):
+                sources.append(
+                    (
+                        "previous default host database",
+                        _sqlite_default_host_database_path(env, project_dir),
+                    )
+                )
+            sources.append(("legacy host database", project_dir / "kestrel_host.db"))
+            validate_host_database_migration_readiness(database, tuple(sources))
+        validate_sqlite_hold_readiness(
+            database,
+            runtime_hardens_parent=not bool(
+                env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
+            ),
+        )
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
         report.fail.append(f"SQLite Hold readiness NOT verified: {exc}")
         return
@@ -671,7 +950,35 @@ def _check_postgres_hold_readiness(
 
     backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
     primary_dsn = env.get("KESTREL_DATABASE_URL")
-    if backend != "postgres" or not primary_dsn:
+    configured_hold_backend = env.get("KESTREL_HOLD_BACKEND")
+    if configured_hold_backend is None:
+        hold_backend = (
+            "postgres" if backend == "postgres" and primary_dsn else "sqlite"
+        )
+    else:
+        hold_backend = configured_hold_backend.lower()
+        if hold_backend not in {"postgres", "sqlite"}:
+            report.fail.append(
+                "KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'"
+            )
+            return
+        if (
+            hold_backend == "sqlite"
+            and backend == "postgres"
+            and not is_isolated_nonproduction_kite_environment(env)
+        ):
+            report.fail.append(
+                "PostgreSQL runtimes may select SQLite Hold only inside "
+                "isolated Kite release evidence from an isolated "
+                "non-production Kite demo"
+            )
+            return
+    if hold_backend != "postgres":
+        return
+    if not primary_dsn:
+        report.fail.append(
+            "KESTREL_DATABASE_URL is required for PostgreSQL Hold state"
+        )
         return
     try:
         _doctor_postgres_timeout_seconds(env)
@@ -725,6 +1032,28 @@ def _check_postgres_hold_readiness(
             "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
         )
         return
+    privilege_results = (
+        _check_postgres_hold_write_privileges(
+            primary_dsn,
+            label="primary",
+            cluster_identity=primary_identity,
+            metadata_delete_required=False,
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        ),
+        _check_postgres_hold_write_privileges(
+            evidence_dsn,
+            label="evidence",
+            cluster_identity=evidence_identity,
+            metadata_delete_required=True,
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        ),
+    )
+    if not all(privilege_results):
+        return
     primary_reading = _read_postgres_hold_custody_snapshot(
         primary_dsn,
         cluster_identity=primary_identity,
@@ -763,6 +1092,7 @@ def _check_postgres_hold_readiness(
         evidence_before = _read_postgres_hold_protocol_rows(
             evidence_dsn,
             metadata_table_exists=evidence_metadata_exists,
+            cluster_identity=evidence_identity,
             env=env,
             project_dir=project_dir,
         )
@@ -775,6 +1105,7 @@ def _check_postgres_hold_readiness(
     try:
         primary_state = _read_postgres_hold_primary_state(
             primary_dsn,
+            cluster_identity=primary_identity,
             env=env,
             project_dir=project_dir,
         )
@@ -788,6 +1119,7 @@ def _check_postgres_hold_readiness(
         evidence_after = _read_postgres_hold_protocol_rows(
             evidence_dsn,
             metadata_table_exists=evidence_metadata_exists,
+            cluster_identity=evidence_identity,
             env=env,
             project_dir=project_dir,
         )
@@ -1418,6 +1750,7 @@ def _postgres_fetch_rows_in_process(
     params: tuple | list,
     *,
     connect=None,
+    expected_cluster_identity: str | None = None,
 ) -> list:
     """Exercise the asyncpg worker seam in-process for focused tests."""
     from kestrel_sovereign._doctor_postgres_probe import (
@@ -1428,7 +1761,13 @@ def _postgres_fetch_rows_in_process(
     )
 
     try:
-        return fetch_rows_in_process(dsn, sql, params, connect=connect)
+        return fetch_rows_in_process(
+            dsn,
+            sql,
+            params,
+            connect=connect,
+            expected_cluster_identity=expected_cluster_identity,
+        )
     except ProbeConnectionError as exc:
         raise _PostgresProbeConnectionError(str(exc)) from exc
     except ProbeQueryError as exc:
@@ -1523,10 +1862,14 @@ def _fetch_postgres_rows_isolated(
     postgres_env: dict[str, str] | None = None,
     postgres_cwd: str | None = None,
     dsn_identity: tuple | None = None,
+    expected_cluster_identity: str | None = None,
 ) -> list:
     """Run asyncpg under the spawned agent's executable, environment, and cwd."""
     try:
-        payload = json.dumps({"dsn": dsn, "sql": sql, "params": params})
+        request = {"dsn": dsn, "sql": sql, "params": params}
+        if expected_cluster_identity is not None:
+            request["expected_cluster_identity"] = expected_cluster_identity
+        payload = json.dumps(request)
     except (TypeError, ValueError) as exc:
         raise _PostgresProbeError(
             "PostgreSQL diagnostic query parameters are not transportable"

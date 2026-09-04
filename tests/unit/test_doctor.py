@@ -1808,6 +1808,88 @@ def test_asyncpg_worker_uses_only_the_public_connection_surface():
     ]
 
 
+def test_asyncpg_worker_binds_query_to_expected_cluster_connection():
+    """Identity and state are read through the same asyncpg connection."""
+
+    from kestrel_sovereign.doctor import _postgres_fetch_rows_in_process
+
+    calls = []
+
+    class _Connection:
+        async def fetchval(self, sql):
+            calls.append(("identity", sql))
+            return "cluster-a"
+
+        async def fetch(self, sql, *params):
+            calls.append(("query", sql, params))
+            return [(42,)]
+
+        async def close(self):
+            calls.append(("close",))
+
+    connection = _Connection()
+
+    async def connect(_dsn):
+        calls.append(("connect",))
+        return connection
+
+    rows = _postgres_fetch_rows_in_process(
+        "postgresql://runtime/database",
+        "SELECT $1::int",
+        (42,),
+        connect=connect,
+        expected_cluster_identity="cluster-a",
+    )
+
+    assert rows == [[42]]
+    assert [call[0] for call in calls] == [
+        "connect",
+        "identity",
+        "query",
+        "close",
+    ]
+
+
+def test_asyncpg_worker_rejects_query_connection_on_another_cluster():
+    """A load-balancer reselection cannot be labelled with an earlier identity."""
+
+    from kestrel_sovereign.doctor import (
+        _postgres_fetch_rows_in_process,
+        _PostgresProbeQueryError,
+    )
+
+    queried = False
+    closed = False
+
+    class _Connection:
+        async def fetchval(self, _sql):
+            return "cluster-b"
+
+        async def fetch(self, _sql, *_params):
+            nonlocal queried
+            queried = True
+            return []
+
+        async def close(self):
+            nonlocal closed
+            closed = True
+
+    async def connect(_dsn):
+        return _Connection()
+
+    with pytest.raises(_PostgresProbeQueryError, match="expected PostgreSQL cluster"):
+        _postgres_fetch_rows_in_process(
+            "postgresql://runtime/database",
+            "SELECT 1",
+            (),
+            connect=connect,
+            expected_cluster_identity="cluster-a",
+        )
+
+    assert not queried
+    assert closed
+
+
 def test_asyncpg_cleanup_failure_is_diagnostic_not_a_query_integrity_failure():
     from kestrel_sovereign.doctor import (
         _postgres_fetch_rows_in_process,
@@ -2146,6 +2228,8 @@ def _postgres_host(monkeypatch, fake):
                 "primary-cluster" if dsn == runtime_dsn else "evidence-cluster"
             )
             return [(identity,)]
+        if "has_schema_privilege" in sql:
+            return [("public", True, True, True, False)]
         if sql == doctor_module._POSTGRES_HOLD_METADATA_TABLE_SQL:
             return [(None,)]
         return doctor_module._postgres_fetch_rows_in_process(
@@ -2160,6 +2244,29 @@ def _postgres_host(monkeypatch, fake):
         "_fetch_postgres_rows_isolated",
         _fetch,
     )
+
+
+def _permit_postgres_hold_write_privileges(monkeypatch, doctor):
+    monkeypatch.setattr(
+        doctor,
+        "_check_postgres_hold_write_privileges",
+        lambda *_args, **_kwargs: True,
+    )
+
+
+def _postgres_hold_schema_catalog_rows(doctor, sql):
+    from kestrel_sovereign.hold.state import _HOLD_REQUIRED_UNIQUE_INDEXES
+
+    if sql == doctor._POSTGRES_HOLD_NAMED_SCHEMA_OBJECTS_SQL:
+        return [
+            (name,) for name, _table, _columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ]
+    if sql == doctor._POSTGRES_HOLD_UNIQUE_KEYS_SQL:
+        return [
+            (table, columns.replace(" ", ""))
+            for _name, table, columns in _HOLD_REQUIRED_UNIQUE_INDEXES
+        ]
+    return None
 
 
 def test_postgres_doctor_requires_hold_evidence_database(tmp_path, monkeypatch):
@@ -2235,6 +2342,497 @@ def test_postgres_doctor_rejects_same_cluster_hold_evidence(tmp_path, monkeypatc
 
     assert not report.ready
     assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+@pytest.mark.parametrize(
+    ("restricted", "privileges", "required"),
+    (
+        ("evidence", ("public", True, False, True, False), "CREATE"),
+        (
+            "primary",
+            ("public", True, True, False, False),
+            "SELECT/INSERT/UPDATE/DELETE",
+        ),
+        ("evidence", ("public", True, True, True, True), "read-write"),
+    ),
+)
+def test_postgres_doctor_rejects_hold_role_without_write_privilege(
+    tmp_path,
+    monkeypatch,
+    restricted,
+    privileges,
+    required,
+):
+    """Read-only probes cannot bless a role that Hold boot cannot initialize."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    primary_dsn = "postgresql://primary.example/kestrel"
+    evidence_dsn = "postgresql://evidence.example/kestrel"
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+
+    def _privileges(dsn, sql, *_args, **_kwargs):
+        assert "has_schema_privilege" in sql
+        label = "primary" if dsn == primary_dsn else "evidence"
+        return [
+            privileges
+            if label == restricted
+            else ("public", True, True, True, False)
+        ]
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _privileges)
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "custody inspection ran after write privilege refusal"
+        ),
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": primary_dsn,
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": evidence_dsn,
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any(
+        restricted in item and required in item for item in report.fail
+    ), report.fail
+
+
+def test_postgres_hold_privilege_probe_does_not_require_metadata_ownership():
+    """Provisioned metadata needs DML grants, not membership in its owner role."""
+
+    from kestrel_sovereign import doctor
+
+    ownership_clause = "NOT pg_has_role(current_user, c.relowner, 'USAGE')"
+    assert (
+        "c.relname <> 'agent_metadata' AND " + ownership_clause
+        in doctor._POSTGRES_HOLD_PRIMARY_WRITE_PRIVILEGES_SQL
+    )
+
+
+def test_postgres_hold_privilege_probe_requires_metadata_delete_only_on_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    """Primary metadata is never deleted; rollback evidence candidates are."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    queries: dict[str, str] = {}
+
+    def _privileges(dsn, sql, *_args, **_kwargs):
+        queries[dsn] = sql
+        return [("public", True, True, True, False)]
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _privileges)
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda *_args, **_kwargs: None,
+    )
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        DoctorReport(),
+    )
+
+    metadata_delete_exception = (
+        "c.relname <> 'agent_metadata' AND "
+        "NOT has_table_privilege(current_user, c.oid, 'DELETE')"
+    )
+    assert metadata_delete_exception in queries[
+        "postgresql://primary.example/kestrel"
+    ]
+    assert metadata_delete_exception not in queries[
+        "postgresql://evidence.example/kestrel"
+    ]
+
+
+def test_sqlite_hold_path_expands_tilde_with_spawned_runtime_home(tmp_path):
+    """Doctor resolves an env-file tilde as the spawned server will."""
+
+    from kestrel_sovereign.doctor import _sqlite_hold_database_path
+
+    child_home = tmp_path / "child-home"
+    assert _sqlite_hold_database_path(
+        {
+            "HOME": str(child_home),
+            "KESTREL_HOST_DB_PATH": "~/custody/hold.db",
+        },
+        tmp_path,
+    ) == child_home / "custody" / "hold.db"
+
+
+def test_sqlite_hold_path_follows_spawned_agent_data_root(tmp_path):
+    """Doctor mirrors the runtime's coupled Docker custody default."""
+
+    from kestrel_sovereign.doctor import _sqlite_hold_database_path
+
+    assert _sqlite_hold_database_path(
+        {"KESTREL_DB_PATH": "mounted-agent-data"},
+        tmp_path,
+    ) == tmp_path / "mounted-agent-data" / "host-data" / "host-features.db"
+
+
+def test_postgres_doctor_still_validates_mandatory_host_sqlite(
+    tmp_path,
+    monkeypatch,
+):
+    """PostgreSQL carries Hold, but host features still require SQLite."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold import state
+
+    database = tmp_path / "host-data" / "host-features.db"
+    calls = []
+
+    def reject_host_sqlite(path, **kwargs):
+        calls.append((path, kwargs))
+        raise RuntimeError("host SQLite rejected")
+
+    monkeypatch.setattr(state, "validate_sqlite_hold_readiness", reject_host_sqlite)
+    report = doctor.DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+
+    assert calls == [(database, {"runtime_hardens_parent": False})]
+    assert not report.ready
+    assert any("host SQLite rejected" in item for item in report.fail)
+
+
+def test_postgres_doctor_skips_external_evidence_for_sqlite_hold(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor follows the same explicit local Hold backend as startup."""
+
+    from kestrel_sovereign import doctor
+
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda *_args, **_kwargs: pytest.fail("PostgreSQL Hold probe was used"),
+    )
+    report = doctor.DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_BACKEND": "sqlite",
+            "KESTREL_KITE_RELEASE_EVIDENCE": "1",
+            "KESTREL_DEMO_SERVER": "1",
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert report.ready
+
+
+@pytest.mark.parametrize(
+    "unsafe_environment",
+    (
+        {"KESTREL_ENV": "production", "KESTREL_DEMO_SERVER": "1"},
+        {
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+            "KESTREL_DEMO_SERVER": "1",
+        },
+        {},
+    ),
+)
+def test_postgres_doctor_rejects_stale_kite_sqlite_override(
+    tmp_path,
+    unsafe_environment,
+):
+    """A provenance marker alone cannot downgrade Doctor's Hold contract."""
+
+    from kestrel_sovereign import doctor
+
+    report = doctor.DoctorReport()
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_BACKEND": "sqlite",
+            "KESTREL_KITE_RELEASE_EVIDENCE": "1",
+            **unsafe_environment,
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert "isolated non-production Kite" in report.fail[0]
+
+
+def test_postgres_doctor_rejects_sqlite_hold_outside_kite(tmp_path):
+    """Doctor does not certify a local Hold downgrade in production."""
+
+    from kestrel_sovereign import doctor
+
+    report = doctor.DoctorReport()
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_BACKEND": "sqlite",
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert "only inside isolated Kite" in report.fail[0]
+
+
+def test_postgres_doctor_rejects_unknown_hold_backend(tmp_path):
+    """An invalid explicit control-plane selector cannot silently downgrade."""
+
+    from kestrel_sovereign import doctor
+
+    report = doctor.DoctorReport()
+    doctor._check_postgres_hold_readiness(
+        {"KESTREL_HOLD_BACKEND": "memory"},
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert report.fail == ["KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'"]
+
+
+def test_postgres_metadata_probe_matches_runtime_current_schema_lookup():
+    """Doctor and Hold startup must inspect the same metadata relation."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold import state
+
+    assert (
+        doctor._POSTGRES_HOLD_METADATA_TABLE_SQL
+        == state._POSTGRES_HOLD_METADATA_TABLE_SQL
+    )
+    assert (
+        doctor._POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL
+        == state._POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL
+    )
+    assert (
+        doctor._POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS
+        == state._POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS
+    )
+    assert "$1" in doctor._POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL
+    assert "?" not in doctor._POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL
+    assert "current_schema()" in doctor._POSTGRES_HOLD_METADATA_TABLE_SQL
+
+
+def test_postgres_unique_key_probe_ignores_unusable_indexes():
+    """Doctor recognizes only indexes PostgreSQL can use as arbiters."""
+
+    from kestrel_sovereign import doctor
+
+    for predicate in ("idx.indisvalid", "idx.indisready", "idx.indimmediate"):
+        assert predicate in doctor._POSTGRES_HOLD_UNIQUE_KEYS_SQL
+
+
+def test_postgres_doctor_rejects_metadata_without_upsert_arbiter(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor must run the same metadata planner proof as Hold startup."""
+
+    from kestrel_sovereign import doctor
+
+    planner_probes = []
+
+    def fetch(_dsn, sql, _params=(), **_kwargs):
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [("agent_metadata",)]
+        if sql.startswith("EXPLAIN INSERT INTO agent_metadata"):
+            planner_probes.append(sql)
+            raise RuntimeError("metadata has no upsert arbiter")
+        if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
+            return []
+        raise AssertionError(f"unexpected query: {sql}")
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", fetch)
+    report = doctor.DoctorReport()
+
+    snapshot = doctor._read_postgres_hold_custody_snapshot(
+        "postgresql://primary.example/kestrel",
+        cluster_identity="primary-cluster",
+        label="primary",
+        env={},
+        project_dir=tmp_path,
+        report=report,
+    )
+
+    assert planner_probes
+    assert snapshot is None
+    assert any("metadata has no upsert arbiter" in item for item in report.fail)
+
+
+def test_postgres_doctor_custody_queries_bind_expected_cluster(
+    tmp_path,
+    monkeypatch,
+):
+    """Each worker verifies identity on the connection returning custody rows."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import PostgresHoldCustodySnapshot
+
+    def fetch(_dsn, sql, _params=(), **kwargs):
+        assert kwargs["expected_cluster_identity"] == "cluster-a"
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [(None,)]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", fetch)
+    report = doctor.DoctorReport()
+
+    result = doctor._read_postgres_hold_custody_snapshot(
+        "postgresql://primary.example/kestrel",
+        cluster_identity="cluster-a",
+        label="primary",
+        env={},
+        project_dir=tmp_path,
+        report=report,
+    )
+
+    assert result == (
+        PostgresHoldCustodySnapshot(cluster_identity="cluster-a"),
+        False,
+    )
+    assert report.ready
+
+
+def test_postgres_hold_snapshot_records_duplicate_unindexed_repair_key(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor asks PostgreSQL whether a missing unique arbiter can be built."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import (
+        _WITNESS_BACKFILL,
+        validate_hold_readiness_snapshot,
+    )
+
+    duplicate_probe_seen = False
+
+    def fetch(_dsn, sql, _params=(), **_kwargs):
+        nonlocal duplicate_probe_seen
+        if sql == doctor._POSTGRES_HOLD_SCHEMA_SQL:
+            return [("hold_schema_migrations",)]
+        if sql == doctor._POSTGRES_HOLD_NAMED_SCHEMA_OBJECTS_SQL:
+            return []
+        if sql == doctor._POSTGRES_HOLD_UNIQUE_KEYS_SQL:
+            return []
+        if sql.startswith("SELECT 1 FROM hold_schema_migrations"):
+            duplicate_probe_seen = True
+            return [(1,)]
+        if sql == doctor._POSTGRES_HOLD_MIGRATIONS_SQL:
+            return [(_WITNESS_BACKFILL,), (_WITNESS_BACKFILL,)]
+        raise AssertionError(f"unexpected query: {sql}")
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", fetch)
+    snapshot = doctor._read_postgres_hold_primary_state(
+        "postgresql://primary.example/kestrel",
+        cluster_identity="primary-cluster",
+        env={},
+        project_dir=tmp_path,
+    )
+
+    assert duplicate_probe_seen
+    with pytest.raises(
+        RuntimeError,
+        match="cannot enforce its required name unique key",
+    ):
+        validate_hold_readiness_snapshot(
+            snapshot=snapshot,
+            initialization_witness=None,
+            history_anchor=None,
+            history_candidate=None,
+            bootstrap_intent=None,
+        )
+
+
+def test_postgres_doctor_preserves_unique_index_column_arity(
+    tmp_path,
+    monkeypatch,
+):
+    """A repeated index column cannot impersonate the runtime upsert arbiter."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import validate_hold_readiness_snapshot
+
+    def fetch(_dsn, sql, _params=(), **_kwargs):
+        if sql == doctor._POSTGRES_HOLD_SCHEMA_SQL:
+            return [("hold_latches",)]
+        if sql == doctor._POSTGRES_HOLD_NAMED_SCHEMA_OBJECTS_SQL:
+            return [("idx_hold_latches_scope_target_unique",)]
+        if sql == doctor._POSTGRES_HOLD_UNIQUE_KEYS_SQL:
+            return [("hold_latches", "scope,target_id,target_id")]
+        if sql.startswith("SELECT 1 FROM hold_latches"):
+            return []
+        if sql == doctor._POSTGRES_HOLD_LATCHES_SQL:
+            return []
+        raise AssertionError(f"unexpected query: {sql}")
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", fetch)
+    snapshot = doctor._read_postgres_hold_primary_state(
+        "postgresql://primary.example/kestrel",
+        cluster_identity="primary-cluster",
+        env={},
+        project_dir=tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="scope/target conflict key"):
+        validate_hold_readiness_snapshot(
+            snapshot=snapshot,
+            initialization_witness=None,
+            history_anchor=None,
+            history_candidate=None,
+            bootstrap_intent=None,
+        )
 
 
 def test_postgres_doctor_rejects_swapped_persisted_custody_roles(
@@ -2345,6 +2943,9 @@ def test_postgres_doctor_rejects_primary_receipt_history_rollback(
     ).decode("ascii")
 
     def _rolled_back_primary(dsn, sql, params=(), **kwargs):
+        catalog_rows = _postgres_hold_schema_catalog_rows(doctor, sql)
+        if catalog_rows is not None:
+            return catalog_rows
         if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
             return [("agent_metadata",)]
         if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
@@ -2409,6 +3010,7 @@ def test_postgres_doctor_rejects_protocol_changed_during_snapshot(
         "_read_postgres_cluster_identity",
         lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
     )
+    _permit_postgres_hold_write_privileges(monkeypatch, doctor)
     monkeypatch.setattr(
         doctor,
         "_read_postgres_hold_custody_snapshot",
@@ -2499,6 +3101,7 @@ def test_postgres_doctor_rejects_missing_hold_content_witness(
         "_read_postgres_cluster_identity",
         lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
     )
+    _permit_postgres_hold_write_privileges(monkeypatch, doctor)
     monkeypatch.setattr(
         doctor,
         "_read_postgres_hold_custody_snapshot",
@@ -2521,6 +3124,9 @@ def test_postgres_doctor_rejects_missing_hold_content_witness(
 
     def _primary_rows(_dsn, sql, *_args, **_kwargs):
         queried.append(sql)
+        catalog_rows = _postgres_hold_schema_catalog_rows(doctor, sql)
+        if catalog_rows is not None:
+            return catalog_rows
         if sql == doctor._POSTGRES_HOLD_SCHEMA_SQL:
             return [(table,) for table in sorted(_HOLD_SCHEMA_TABLES)]
         return {
@@ -2588,6 +3194,7 @@ def test_postgres_doctor_rejects_custody_roles_changed_during_snapshot(
         "_read_postgres_cluster_identity",
         lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
     )
+    _permit_postgres_hold_write_privileges(monkeypatch, doctor)
     custody_reads = iter(
         (
             (PostgresHoldCustodySnapshot(cluster_identity="primary-cluster"), False),
@@ -2668,6 +3275,7 @@ def test_postgres_doctor_rejects_cluster_targets_changed_during_snapshot(
         "_read_postgres_cluster_identity",
         lambda *_args, **_kwargs: next(identity_reads),
     )
+    _permit_postgres_hold_write_privileges(monkeypatch, doctor)
     monkeypatch.setattr(
         doctor,
         "_read_postgres_hold_custody_snapshot",
@@ -2754,6 +3362,288 @@ async def test_sqlite_doctor_rejects_missing_hold_history_anchor(
 
     assert not report.ready
     assert any("Hold history anchor" in item for item in report.fail), report.fail
+
+
+def test_sqlite_doctor_rejects_fresh_explicit_target_in_nonprivate_parent(
+    tmp_path,
+):
+    """Doctor must predict runtime custody refusal before the first boot."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.host_features.storage import (
+        HostStorageError,
+        prepare_host_database,
+    )
+
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    if os.name != "nt":
+        parent.chmod(0o755)
+    database = parent / "host-features.db"
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+
+    if os.name == "nt":
+        assert report.ready
+    else:
+        assert not report.ready
+        assert any("mode 0700" in item for item in report.fail), report.fail
+        with pytest.raises(HostStorageError, match="must have mode 0700"):
+            prepare_host_database(str(database))
+    assert not database.exists()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_doctor_rejects_existing_store_in_nonprivate_parent(
+    tmp_path,
+):
+    """Existing Hold state still passes through runtime parent custody."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.host_features.context import (
+        build_host_context,
+        close_host_context_resources,
+    )
+    from kestrel_sovereign.host_features.storage import (
+        HostStorageError,
+        prepare_host_database,
+    )
+
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    context = await build_host_context(db_path=str(database))
+    assert context.hold_store is not None, context.backend_error
+    await close_host_context_resources(context)
+    if os.name != "nt":
+        parent.chmod(0o755)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+
+    if os.name == "nt":
+        assert report.ready
+    else:
+        assert not report.ready
+        assert any("mode 0700" in item for item in report.fail), report.fail
+        with pytest.raises(HostStorageError, match="must have mode 0700"):
+            prepare_host_database(str(database))
+
+
+def test_sqlite_doctor_rejects_legacy_and_destination_histories(tmp_path):
+    """Readiness must fail when runtime would refuse to choose a migration source."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    home = tmp_path / "runtime-home"
+    destination = home / "host-data" / "host-features.db"
+    legacy = tmp_path / "kestrel_host.db"
+    destination.parent.mkdir(parents=True, mode=0o700)
+    for path in (legacy, destination):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE existing_state (value TEXT)")
+        if os.name != "nt":
+            path.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {"KESTREL_HOME": str(home), "HOME": str(tmp_path)},
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any("both legacy host database" in item for item in report.fail)
+
+
+def test_sqlite_doctor_rejects_live_legacy_migration_source(tmp_path):
+    """Readiness observes the same stopped-database migration guard as boot."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    home = tmp_path / "runtime-home"
+    legacy = tmp_path / "kestrel_host.db"
+    with sqlite3.connect(legacy) as connection:
+        connection.execute("CREATE TABLE existing_state (value TEXT)")
+    sidecar = Path(f"{legacy}-wal")
+    sidecar.write_bytes(b"possibly live")
+    if os.name != "nt":
+        legacy.chmod(0o600)
+        sidecar.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {"KESTREL_HOME": str(home), "HOME": str(tmp_path)},
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any("another Kestrel process" in item for item in report.fail)
+
+
+def test_sqlite_doctor_rejects_previous_default_and_agent_root_histories(
+    tmp_path,
+):
+    """Data-root upgrades cannot be certified while two stores exist."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    home = tmp_path / "runtime-home"
+    previous = home / "host-data" / "host-features.db"
+    data_root = tmp_path / "mounted-data"
+    destination = data_root / "host-data" / "host-features.db"
+    previous.parent.mkdir(parents=True, mode=0o700)
+    destination.parent.mkdir(parents=True, mode=0o700)
+    for path in (previous, destination):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE existing_state (value TEXT)")
+        if os.name != "nt":
+            path.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_HOME": str(home),
+            "KESTREL_DB_PATH": str(data_root),
+            "HOME": str(tmp_path),
+        },
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any("both previous default" in item for item in report.fail)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_doctor_rejects_named_index_with_wrong_conflict_key(
+    tmp_path,
+):
+    """Doctor cannot approve a schema whose first runtime upsert will reject."""
+
+    import sqlite3
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.host_features.context import (
+        build_host_context,
+        close_host_context_resources,
+    )
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    context = await build_host_context(db_path=str(database))
+    assert context.hold_store is not None, context.backend_error
+    await close_host_context_resources(context)
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            "DROP INDEX idx_hold_latches_scope_target_unique; "
+            "DROP TABLE hold_latches; "
+            "CREATE TABLE hold_latches ("
+            "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+            "active INTEGER NOT NULL DEFAULT 0, "
+            "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+            "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+            "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0); "
+            "CREATE UNIQUE INDEX idx_hold_latches_scope_target_unique "
+            "ON hold_latches(scope);"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = DoctorReport()
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+    runtime = await build_host_context(db_path=str(database))
+
+    assert runtime.hold_store is None
+    assert "scope/target conflict key" in runtime.backend_error
+    assert not report.ready
+    assert any("scope/target conflict key" in item for item in report.fail)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lock_present", [True, False])
+async def test_sqlite_doctor_accepts_recoverable_absent_database_bootstrap(
+    tmp_path,
+    lock_present,
+):
+    """A durable pre-DDL intent remains the same recovery authority at check time."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        _BOOTSTRAP_INTENT_PAYLOAD,
+        HoldStore,
+        hold_history_anchor_path,
+    )
+    from kestrel_sovereign.host_features.context import (
+        build_host_context,
+        close_host_context_resources,
+    )
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    history = hold_history_anchor_path(database)
+    bootstrap = Path(f"{history}.bootstrap")
+    lock = Path(f"{history}.lock")
+    bootstrap.write_bytes(
+        _BOOTSTRAP_INTENT_PAYLOAD
+        + HoldStore._history_anchor_payload_from_rows(())
+    )
+    if lock_present:
+        lock.write_bytes(b"\0")
+    if os.name != "nt":
+        bootstrap.chmod(0o600)
+        if lock_present:
+            lock.chmod(0o600)
+
+    report = DoctorReport()
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+
+    assert report.ready, report.fail
+    runtime = await build_host_context(db_path=str(database))
+    assert runtime.hold_store is not None, runtime.backend_error
+    await close_host_context_resources(runtime)
 
 
 def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(

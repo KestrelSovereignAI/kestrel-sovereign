@@ -176,13 +176,13 @@ Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
 `roles/secretmanager.secretAccessor` only on those required secrets. Secret
 Manager access is visible in Cloud Audit Logs; never print the bundle/data key
-or bake either into an image. The three custody references in
+or bake either into an image. The four custody references in
 `deploy_config.toml` must use immutable numeric versions such as `:7`, never
 `:latest`: two instances in one revision must not resolve different keys or
 bundles. Cloud Run environment values have a 32 KiB limit, which the bundle
 export enforces.
 
-After adding a new secret version, update all three numeric references and
+After adding a new secret version, update all four numeric references and
 deploy a new immutable image tag. A revision whose database, data key, bundle,
 or expected DID is missing/mismatched fails startup and never re-incepts.
 

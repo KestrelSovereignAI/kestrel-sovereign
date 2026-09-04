@@ -3,13 +3,13 @@
 Many tests here build ``TestClient(server.app)`` without overriding the
 lifespan. That lifespan calls ``build_host_context()`` with no ``db_path``,
 so the host-feature database resolves through the *production* precedence:
-``$KESTREL_HOST_DB_PATH``, else ``$KESTREL_HOME/host-data``, else
-``~/.kestrel/host-data``. On a developer machine that last branch is the
-live fleet database — running the unit suite migrated its schema as a side
-effect of ``pytest``, and the real host features named by the project's
-``.kestrel-host-features.toml`` started (and recorded their start failures)
-against it. CI never notices: the runner's ``HOME`` is fresh, so the same
-code writes a throwaway file.
+``$KESTREL_HOST_DB_PATH``, else ``$KESTREL_DB_PATH/host-data``, else
+``$KESTREL_HOME/host-data``, else ``~/.kestrel/host-data``. On a developer
+machine that last branch is the live fleet database — running the unit suite
+migrated its schema as a side effect of ``pytest``, and the real host features
+named by the project's ``.kestrel-host-features.toml`` started (and recorded
+their start failures) against it. CI never notices: the runner's ``HOME`` is
+fresh, so the same code writes a throwaway file.
 
 The autouse fixture below moves those roots into a temporary directory of its
 own, and seeds that directory with a host manifest that starts no host features
@@ -85,8 +85,9 @@ def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
 
     ``KESTREL_HOST_DB_PATH`` is the authoritative override for the
     host-feature database. ``HOME`` and ``KESTREL_HOME`` close the two
-    default branches behind it, so a code path that ignores the override —
-    or resolves some *other* implicit host-runtime root, such as the Phoenix
+    default branches behind it; ``KESTREL_DB_PATH`` is unnecessary while the
+    explicit host override is set. Thus a code path that ignores the override
+    — or resolves some *other* implicit host-runtime root, such as the Phoenix
     trace store, the host-feature manifest, or the ``~/.kestrel`` project
     fallback — still lands in the temporary directory rather than on the
     operator's disk.

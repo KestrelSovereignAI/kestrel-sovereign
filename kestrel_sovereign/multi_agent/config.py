@@ -11,13 +11,13 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from kestrel_sovereign.host_features.storage import host_database_path
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did_sync,
@@ -69,6 +69,17 @@ def spawn_retirement_denies_startup(data_dir: Path) -> bool:
     )
     return False
 
+def _host_control_directory() -> Path:
+    """Resolve the host custody root using the runtime's path precedence."""
+
+    database_path, _uses_default = host_database_path()
+    return database_path.parent.resolve(strict=False)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either resolved custody root contains the other."""
+
+    return first == second or first in second.parents or second in first.parents
 
 # Canonical modules for the features that form every agent's sovereignty
 # foundation. Discovery imports these modules explicitly and fails closed, so
@@ -367,7 +378,24 @@ class MultiAgentConfig(BaseModel):
                     f"'data_dir' + 'port' (local)"
                 )
 
-        return cls(host=host, agents=agents)
+        config = cls(host=host, agents=agents)
+        config.validate_host_custody_paths(base_dir=path.parent)
+        return config
+
+    def validate_host_custody_paths(self, *, base_dir: Path) -> None:
+        """Reject explicit local agent roots overlapping host-owned Hold state."""
+
+        host_control_dir = _host_control_directory()
+        for name, agent in self.agents.items():
+            if not isinstance(agent, LocalAgentConfig):
+                continue
+            agent_dir = agent.resolve_data_dir(base_dir)
+            if _paths_overlap(agent_dir, host_control_dir):
+                raise ValueError(
+                    f"Agent '{name}' data directory {agent_dir} overlaps host "
+                    f"Hold custody at {host_control_dir}. Move the agent or set "
+                    "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
+                )
 
     @classmethod
     def auto_discover(
@@ -390,28 +418,7 @@ class MultiAgentConfig(BaseModel):
             MultiAgentConfig with auto-discovered agents
         """
         base_path = Path(base_dir)
-        resolved_base_path = base_path.resolve(strict=False)
-        host_db_path = os.environ.get("KESTREL_HOST_DB_PATH")
-        host_control_dir = (
-            Path(host_db_path).expanduser().resolve(strict=False).parent
-            if host_db_path
-            else None
-        )
-        host_control_root = None
-        if host_control_dir is not None:
-            try:
-                relative_control_dir = host_control_dir.relative_to(
-                    resolved_base_path
-                )
-            except ValueError:
-                # A host database outside agent_data cannot collide with a
-                # direct child discovered as an agent.
-                pass
-            else:
-                if relative_control_dir.parts:
-                    host_control_root = (
-                        resolved_base_path / relative_control_dir.parts[0]
-                    )
+        host_control_dir = _host_control_directory()
         agents: dict[str, LocalAgentConfig] = {}
         next_port = DEFAULT_AGENT_START_PORT
 
@@ -428,16 +435,25 @@ class MultiAgentConfig(BaseModel):
         for subdir in sorted(base_path.iterdir()):
             if not subdir.is_dir():
                 continue
+            db_path = subdir / "kestrel_prime.db"
             # The supported multi-agent image keeps the host-owned Hold store
             # below the persistent agent-data volume. That directory is host
             # infrastructure, never an agent, even when include_empty=True is
             # selecting freshly provisioned agent directories.
-            if (
-                host_control_root is not None
-                and subdir.resolve(strict=False) == host_control_root
-            ):
+            resolved_subdir = subdir.resolve(strict=False)
+            collides_with_host_control = _paths_overlap(
+                resolved_subdir,
+                host_control_dir,
+            )
+            if collides_with_host_control:
+                if db_path.exists():
+                    raise ValueError(
+                        f"Host control directory {subdir} collides with an "
+                        f"existing agent database at {db_path}. Move that "
+                        "agent directory or set KESTREL_HOST_DB_PATH to a "
+                        "dedicated path outside agent_data before restarting"
+                    )
                 continue
-            db_path = subdir / "kestrel_prime.db"
             if not db_path.exists() and not include_empty:
                 continue
             candidate = LocalAgentConfig(

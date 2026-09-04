@@ -14,9 +14,9 @@ import toml
 from pydantic import ValidationError
 
 from kestrel_sovereign.multi_agent import (
-    MultiAgentConfig,
     HostConfig,
     LocalAgentConfig,
+    MultiAgentConfig,
     RemoteAgentConfig,
 )
 
@@ -472,6 +472,39 @@ class TestMultiAgentConfigLoading:
             MultiAgentConfig.from_file(config_path)
         assert "must have either 'url'" in str(exc_info.value)
 
+    @pytest.mark.parametrize("relation", ("same", "host-child", "agent-child"))
+    def test_explicit_local_agent_cannot_overlap_host_custody(
+        self,
+        tmp_path,
+        monkeypatch,
+        relation,
+    ):
+        """Existing multi_agent.toml gets the same custody guard as discovery."""
+
+        root = tmp_path / "roots"
+        if relation == "same":
+            agent_dir = host_dir = root
+        elif relation == "host-child":
+            agent_dir = root
+            host_dir = root / "host-control"
+        else:
+            host_dir = root
+            agent_dir = root / "alice"
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(host_dir / "host-features.db"),
+        )
+        config_path = tmp_path / "multi_agent.toml"
+        config_path.write_text(
+            "[agents.alice]\n"
+            f'data_dir = "{agent_dir}"\n'
+            "port = 8801\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="overlaps host Hold custody"):
+            MultiAgentConfig.from_file(config_path)
+
 
 class TestAutoDiscovery:
     """Tests for auto-discovery of agents."""
@@ -653,6 +686,45 @@ os._exit(0)
         config = MultiAgentConfig.auto_discover(agent_data, include_empty=True)
 
         assert list(config.agents) == ["real-agent"]
+
+    def test_auto_discover_refuses_existing_agent_at_host_control_root(
+        self, tmp_path, monkeypatch
+    ):
+        """An upgrade may not silently reclassify a valid agent as host state."""
+
+        agent_data = tmp_path / "agent_data"
+        host_named_agent = agent_data / "host-data"
+        host_named_agent.mkdir(parents=True)
+        (host_named_agent / "kestrel_prime.db").touch()
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(host_named_agent / "host-features.db"),
+        )
+
+        with pytest.raises(ValueError, match="collides with an existing agent"):
+            MultiAgentConfig.auto_discover(agent_data, include_empty=True)
+
+    def test_auto_discover_excludes_symlink_alias_to_external_host_custody(
+        self, tmp_path, monkeypatch
+    ):
+        """A direct child symlink cannot disguise the host-control directory."""
+
+        agent_data = tmp_path / "agent_data"
+        host_dir = tmp_path / "external-host-data"
+        agent_data.mkdir()
+        host_dir.mkdir()
+        (agent_data / "custody-alias").symlink_to(
+            host_dir,
+            target_is_directory=True,
+        )
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(host_dir / "host-features.db"),
+        )
+
+        config = MultiAgentConfig.auto_discover(agent_data, include_empty=True)
+
+        assert config.agents == {}
 
     def test_auto_discover_skips_invalid_dirs(self, tmp_path):
         """Test that auto-discovery skips directories without kestrel_prime.db."""

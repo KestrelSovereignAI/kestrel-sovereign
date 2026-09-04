@@ -469,9 +469,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-start",
             "host-context-validate",
             "host-stop",
+            "host-unmount",
             "session-close",
             "db-close",
-            "host-unmount",
             "agents-stop",
         ]
         assert not fake_manager.host_context_publication_gate.is_set()
@@ -484,8 +484,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert test_app.state.host_context is ctx
         assert fake_manager.host_context_publication_gate.is_set()
         assert events == [
-            "agents-load",
             "context-build",
+            "agents-load",
             "host-start",
             "host-context-validate",
             "host-router-mount",
@@ -651,6 +651,107 @@ async def test_build_host_context_provides_fleet_session_factory(tmp_path: Path)
             await ctx.session_factory.close()
         if ctx.db is not None and hasattr(ctx.db, "close"):
             await ctx.db.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_kite_context_can_select_isolated_sqlite_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A one-cluster test lane may keep Hold in its owned local database."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://isolated.example/kite",
+    )
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.backend_error == ""
+        assert ctx.hold_store is not None
+        assert ctx.hold_db is ctx.db
+        assert ctx.hold_evidence_db is None
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    (
+        ("KESTREL_ENV", "production"),
+        ("KESTREL_ENV", "prod"),
+        ("KESTREL_DEPLOYMENT_PERSISTENCE", "durable_sovereign"),
+    ),
+)
+async def test_production_rejects_stale_kite_sqlite_hold_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    value: str,
+):
+    """A stale test flag cannot move production Hold onto ephemeral SQLite."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://production/kestrel")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+    monkeypatch.setenv(setting, value)
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "isolated non-production Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+async def test_kite_flag_without_demo_mode_cannot_select_sqlite_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The broad Kite seam alone is not authority to change Hold custody."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://production/kestrel")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.delenv("KESTREL_DEMO_SERVER", raising=False)
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "isolated non-production Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+async def test_postgres_runtime_cannot_downgrade_hold_to_local_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The Kite exception cannot become a production control-plane escape."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://production.example/kestrel",
+    )
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "only inside isolated Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
 
 
 @pytest.mark.asyncio

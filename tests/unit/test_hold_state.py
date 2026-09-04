@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -21,19 +24,29 @@ from kestrel_sovereign.hold import (
     HoldStore,
 )
 from kestrel_sovereign.hold.state import (
+    _POSTGRES_EVIDENCE_LOCK,
+    _WITNESS_BACKFILL,
     HoldCorruptStateError,
     PostgresHoldCustodySnapshot,
     _latch_from_row,
+    _postgres_custody_locks,
+    _read_postgres_hold_custody_snapshot,
     _receipt_from_row,
+    _sqlite_hold_snapshot,
     _terminal_authority_ids,
     hold_history_anchor_path,
     hold_initialization_witness_path,
     initialize_postgres_hold_databases,
     postgres_hold_custody_binding_payload,
     preflight_postgres_hold_custody,
+    validate_hold_readiness_snapshot,
     validate_postgres_hold_custody,
+    validate_sqlite_hold_readiness,
 )
-from kestrel_sovereign.host_features.context import build_host_context
+from kestrel_sovereign.host_features.context import (
+    build_host_context,
+    close_host_context_resources,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 
@@ -85,7 +98,7 @@ class _PostgresCustodyFacade:
         self.backend = backend if backend is not None else self
 
     @asynccontextmanager
-    async def advisory_locks(self, _keys):
+    async def advisory_locks(self, _keys, **_kwargs):
         yield
 
     async def fetchall(self, query, params=()):
@@ -99,6 +112,309 @@ class _PostgresCustodyFacade:
             self.metadata.setdefault(params[1], params[2])
         elif query.startswith("DELETE"):
             self.metadata.pop(params[1], None)
+
+
+@pytest.mark.asyncio
+async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(
+    monkeypatch,
+):
+    """The connection owning a custody lock must be on the probed cluster."""
+
+    from kestrel_sovereign.storage.db.interface import QueryError
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    class _Connection:
+        def __init__(self):
+            self.executed = []
+            self.terminated = False
+
+        async def fetchval(self, query, *_params):
+            assert "pg_control_system" in query
+            return "cluster-selected-by-load-balancer"
+
+        async def execute(self, query, *params):
+            self.executed.append((query, params))
+
+        def terminate(self):
+            self.terminated = True
+
+    connection = _Connection()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    backend = object.__new__(PostgresBackend)
+    monkeypatch.setattr(
+        backend,
+        "_ensure_advisory_pool",
+        AsyncMock(return_value=_Pool()),
+    )
+
+    with pytest.raises(QueryError, match="validated PostgreSQL cluster"):
+        async with backend.advisory_locks(
+            (_POSTGRES_EVIDENCE_LOCK,),
+            expected_cluster_identity="cluster-validated-by-operational-pool",
+        ):
+            pytest.fail("a lock on the wrong cluster was admitted")
+
+    assert connection.executed == []
+    assert connection.terminated
+
+
+@pytest.mark.asyncio
+async def test_postgres_operational_session_routes_queries_on_checked_connection():
+    """The checked connection, not a second pool selection, serves Hold I/O."""
+
+    import contextvars
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    calls = []
+
+    class _Connection:
+        async def fetchval(self, query, *_params):
+            calls.append(("identity", query))
+            return "cluster-a"
+
+        async def fetch(self, query, *params):
+            calls.append(("query", query, params))
+            return [{"value": 42}]
+
+    connection = _Connection()
+
+    class _Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+        async def fetch(self, *_args):
+            pytest.fail("query escaped the checked operational connection")
+
+    backend = object.__new__(PostgresBackend)
+    backend._pool = _Pool()
+    backend._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+    backend._operational_conn_var = contextvars.ContextVar(
+        "pg_operational_conn", default=None
+    )
+
+    async with backend.operational_session(
+        expected_cluster_identity="cluster-a",
+    ):
+        assert await backend.fetch_all("SELECT ?", (42,)) == [(42,)]
+
+    assert calls[0][0] == "identity"
+    assert calls[1] == ("query", "SELECT $1", (42,))
+
+
+@pytest.mark.asyncio
+async def test_postgres_operational_session_owned_child_reuses_checked_connection():
+    """Cancellation cleanup cannot deadlock behind its parent's one-slot pool."""
+
+    import contextvars
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    calls = []
+
+    class _Connection:
+        async def fetchval(self, query, *_params):
+            calls.append(("identity", query))
+            return "cluster-a"
+
+        async def fetch(self, query, *params):
+            calls.append(("query", query, params, asyncio.current_task()))
+            return [{"value": 42}]
+
+    connection = _Connection()
+
+    class _Acquire:
+        async def __aenter__(self):
+            calls.append(("acquire",))
+            return connection
+
+        async def __aexit__(self, *_args):
+            calls.append(("release",))
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+        async def fetch(self, *_args):
+            pytest.fail("owned child escaped the checked connection")
+
+    backend = object.__new__(PostgresBackend)
+    backend._pool = _Pool()
+    backend._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+    backend._operational_conn_var = contextvars.ContextVar(
+        "pg_operational_conn", default=None
+    )
+
+    async with backend.operational_session(
+        expected_cluster_identity="cluster-a",
+    ):
+        rows = await asyncio.create_task(backend.fetch_all("SELECT ?", (42,)))
+
+    assert rows == [(42,)]
+    assert [call[0] for call in calls] == [
+        "acquire",
+        "identity",
+        "query",
+        "release",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_locks_bind_each_session_to_probed_cluster():
+    """Hold passes each sorted custody identity to the exact lock session."""
+
+    calls = []
+
+    class _Backend:
+        def __init__(self, label):
+            self.label = label
+
+        @asynccontextmanager
+        async def advisory_locks(
+            self,
+            keys,
+            *,
+            expected_cluster_identity=None,
+        ):
+            calls.append((self.label, keys, expected_cluster_identity))
+            yield
+
+    async with _postgres_custody_locks(
+        _Backend("primary"),
+        _Backend("evidence"),
+        primary_cluster="cluster-z",
+        evidence_cluster="cluster-a",
+    ):
+        pass
+
+    assert calls == [
+        ("evidence", (_POSTGRES_EVIDENCE_LOCK,), "cluster-a"),
+        ("primary", (_POSTGRES_EVIDENCE_LOCK,), "cluster-z"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_metadata_probe_is_bound_to_current_schema():
+    """A public metadata table cannot impersonate a fresh tenant schema."""
+
+    queries = []
+
+    class _Backend:
+        async def fetch_all(self, query, _params=()):
+            queries.append(query)
+            if "pg_control_system" in query:
+                return [("cluster-a",)]
+            if "to_regclass" in query:
+                assert "current_schema()" in query
+                return [(None,)]
+            raise AssertionError(f"unexpected query: {query}")
+
+    snapshot = await _read_postgres_hold_custody_snapshot(
+        _Backend(),
+        label="primary",
+    )
+
+    assert snapshot == PostgresHoldCustodySnapshot(cluster_identity="cluster-a")
+    assert any("current_schema()" in query for query in queries)
+
+
+@pytest.mark.asyncio
+async def test_postgres_custody_snapshot_pins_one_operational_session():
+    """Cluster identity and custody rows come from one physical connection."""
+
+    class _Backend:
+        def __init__(self):
+            self.session_depth = 0
+
+        @asynccontextmanager
+        async def operational_session(self):
+            self.session_depth += 1
+            try:
+                yield
+            finally:
+                self.session_depth -= 1
+
+        async def fetch_all(self, query, _params=()):
+            assert self.session_depth == 1
+            if "pg_control_system" in query:
+                return [("cluster-a",)]
+            if "to_regclass" in query:
+                return [(None,)]
+            raise AssertionError(f"unexpected query: {query}")
+
+    snapshot = await _read_postgres_hold_custody_snapshot(
+        _Backend(),
+        label="primary",
+    )
+
+    assert snapshot == PostgresHoldCustodySnapshot(cluster_identity="cluster-a")
+
+
+def test_readiness_rejects_duplicate_rows_before_predicting_index_repair(tmp_path):
+    """A free index name is not proof that legacy duplicates are repairable."""
+
+    connection = sqlite3.connect(tmp_path / "duplicate-migration.db")
+    try:
+        connection.execute("CREATE TABLE hold_schema_migrations (name TEXT)")
+        connection.execute(
+            "INSERT INTO hold_schema_migrations VALUES (?)",
+            (_WITNESS_BACKFILL,),
+        )
+        connection.execute(
+            "INSERT INTO hold_schema_migrations VALUES (?)",
+            (_WITNESS_BACKFILL,),
+        )
+        snapshot = _sqlite_hold_snapshot(connection)
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="cannot enforce its required name unique key",
+    ):
+        validate_hold_readiness_snapshot(
+            snapshot=snapshot,
+            initialization_witness=None,
+            history_anchor=None,
+            history_candidate=None,
+            bootstrap_intent=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_absent_hold_table_accepts_occupied_repair_index_name(tmp_path):
+    """Fresh inline PKs remain bootable when a planned repair name is occupied."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "occupied-repair-name.db"))
+    await db.execute("CREATE TABLE unrelated (scope TEXT, target_id TEXT)")
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_hold_latches_scope_target_unique "
+        "ON unrelated(scope, target_id)"
+    )
+    try:
+        store = HoldStore(db)
+        await store.ensure_schema()
+        assert await store.read_boot_state() == ()
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -192,6 +508,98 @@ async def test_state_and_receipts_survive_database_restart(tmp_path):
         assert datetime.fromisoformat(receipt.occurred_at).tzinfo is not None
     finally:
         await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_custody_survives_complete_data_root_relocation(tmp_path):
+    """Mount-point changes preserve a stopped database and all its witnesses."""
+
+    original_root = tmp_path / "original-root"
+    original_root.mkdir(mode=0o700)
+    original_db = original_root / "host-features.db"
+    context = await build_host_context(db_path=str(original_db))
+    assert context.hold_store is not None, context.backend_error
+    mutation = await context.hold_store.set_hold(
+        scope="agent",
+        target_id="did:agent:relocated",
+        actor_id="did:operator:sovereign",
+        reason="preserve root-relative custody",
+        operation_id="relocation-hold",
+    )
+    await close_host_context_resources(context)
+
+    relocated_root = tmp_path / "relocated-root"
+    original_root.rename(relocated_root)
+    reopened = await build_host_context(
+        db_path=str(relocated_root / "host-features.db")
+    )
+    try:
+        assert reopened.hold_store is not None, reopened.backend_error
+        state = await reopened.hold_store.get_effective("did:agent:relocated")
+        assert state.agent is not None
+        assert state.agent.hold_receipt_id == mutation.receipt.receipt_id
+    finally:
+        await close_host_context_resources(reopened)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX custody modes only")
+@pytest.mark.parametrize("artifact", ["history", "lock"])
+@pytest.mark.asyncio
+async def test_sqlite_readiness_refuses_insecure_evidence_without_hardening_it(
+    tmp_path,
+    artifact,
+):
+    """Doctor may observe insecure custody, but must never repair it."""
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    context = await build_host_context(db_path=str(database))
+    assert context.hold_store is not None, context.backend_error
+    await close_host_context_resources(context)
+
+    history = hold_history_anchor_path(database)
+    target = history if artifact == "history" else Path(f"{history}.lock")
+    assert target.exists()
+    target.chmod(0o644)
+
+    with pytest.raises(HoldStateError, match="mode 0600"):
+        validate_sqlite_hold_readiness(database)
+
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX custody modes only")
+def test_sqlite_readiness_accounts_for_default_parent_runtime_hardening(tmp_path):
+    """Doctor accepts a runtime-owned default directory that boot will chmod."""
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o500)
+
+    assert validate_sqlite_hold_readiness(
+        parent / "host-features.db",
+        runtime_hardens_parent=True,
+    ) == ()
+    assert parent.stat().st_mode & 0o777 == 0o500
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX custody modes only")
+def test_sqlite_readiness_rejects_view_colliding_with_hold_table(tmp_path):
+    """A schema object cannot hide the Hold table runtime must create."""
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE VIEW hold_latches AS SELECT 1 AS active")
+        connection.commit()
+    finally:
+        connection.close()
+    database.chmod(0o600)
+
+    with pytest.raises(HoldCorruptStateError, match="non-table.*hold_latches"):
+        validate_sqlite_hold_readiness(database)
 
 
 @pytest.mark.asyncio
@@ -1044,7 +1452,6 @@ async def test_postgres_factory_closes_pool_when_core_schema_init_fails(
     """A factory failure cannot hide its newly connected pool from cleanup."""
 
     from kestrel_sovereign.storage import async_database as database_module
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import postgres as postgres_module
 
     events: list[str] = []
@@ -1116,7 +1523,6 @@ async def test_connected_backend_exits_schema_guard_before_failure_close(
 async def test_postgres_factory_forwards_explicit_pool_budget(monkeypatch):
     """Special-purpose stores can reserve only their justified connections."""
 
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import postgres as postgres_module
 
     constructor_args: dict[str, object] = {}
@@ -2482,6 +2888,113 @@ async def test_postgres_external_candidate_recovers_committed_mutation(
 
 
 @pytest.mark.asyncio
+async def test_postgres_rollback_candidate_cleanup_survives_repeated_cancellation(
+    tmp_path,
+    monkeypatch,
+):
+    """Caller cancellation cannot strand evidence for a rolled-back mutation."""
+
+    primary = await AsyncDatabase.sqlite(str(tmp_path / "pg-cancel-primary.db"))
+    evidence = await AsyncDatabase.sqlite(str(tmp_path / "pg-cancel-evidence.db"))
+    store = HoldStore(primary)
+    await store.ensure_schema()
+
+    class _EvidenceFacade:
+        backend_type = "postgres"
+
+        async def fetchall(self, query, params=()):
+            return await evidence.fetchall(query, params)
+
+        async def execute(self, query, params=()):
+            return await evidence.execute(query, params)
+
+    @asynccontextmanager
+    async def evidence_lock():
+        yield
+
+    store._history_anchor_path = None
+    store._history_candidate_path = None
+    store._bootstrap_intent_path = None
+    store._evidence_lock_path = None
+    store._evidence_db = _EvidenceFacade()
+    monkeypatch.setattr(store, "_postgres_evidence_lock", evidence_lock)
+
+    async def read_external_anchor():
+        payload = await store._read_postgres_evidence(
+            "hold_history_anchor_v1",
+            label="history anchor",
+        )
+        if payload is None:
+            return None
+        return store._validate_history_anchor_payload(payload)
+
+    monkeypatch.setattr(store, "_read_history_anchor", read_external_anchor)
+    await store._write_postgres_evidence(
+        "hold_history_anchor_v1",
+        await store._current_history_anchor_payload(),
+    )
+
+    staged = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    prepare = store._prepare_history_publication
+    remove = store._remove_external_history_candidate
+
+    async def pause_after_staging():
+        payload = await prepare()
+        staged.set()
+        await asyncio.Future()
+        return payload
+
+    async def pause_before_cleanup():
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await remove()
+
+    monkeypatch.setattr(store, "_prepare_history_publication", pause_after_staging)
+    monkeypatch.setattr(
+        store,
+        "_remove_external_history_candidate",
+        pause_before_cleanup,
+    )
+    mutation = asyncio.create_task(
+        store.set_hold(
+            scope="agent",
+            target_id="did:agent:cancelled-publication",
+            actor_id="did:sovereign:operator",
+            reason="rollback must retire its candidate",
+            operation_id="cancelled-publication",
+        )
+    )
+    try:
+        await asyncio.wait_for(staged.wait(), timeout=1)
+        mutation.cancel("first cancellation")
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        mutation.cancel("repeated cancellation")
+        await asyncio.sleep(0)
+        assert not mutation.done()
+
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await mutation
+        assert cancelled.value.args == ("first cancellation",)
+
+        monkeypatch.setattr(store, "_prepare_history_publication", prepare)
+        monkeypatch.setattr(store, "_remove_external_history_candidate", remove)
+        assert await store._read_external_history_candidate() is None
+        assert await store.get_hold("agent", "did:agent:cancelled-publication") is None
+        assert await store.get_receipt("cancelled-publication") is None
+    finally:
+        release_cleanup.set()
+        if not mutation.done():
+            mutation.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await mutation
+        await primary.close()
+        await evidence.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_reader_waits_for_database_and_anchor_publication(
     tmp_path,
     monkeypatch,
@@ -2736,7 +3249,7 @@ async def test_postgres_evidence_lock_rejects_same_database_identity():
     """Two pools do not become independent merely by being distinct objects."""
 
     @asynccontextmanager
-    async def advisory_locks(_keys):
+    async def advisory_locks(_keys, **_kwargs):
         yield
 
     identity = (
@@ -2767,7 +3280,7 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
 
     def lock_backend(label):
         @asynccontextmanager
-        async def advisory_locks(keys):
+        async def advisory_locks(keys, **_kwargs):
             events.append(("lock", label, keys))
             try:
                 yield
@@ -2807,11 +3320,49 @@ async def test_postgres_evidence_lock_uses_independent_service_session():
 
 
 @pytest.mark.asyncio
+async def test_postgres_evidence_lock_pins_validated_operational_pair():
+    """Role validation and the protected body cannot reselect either cluster."""
+
+    class _PinnedFacade(_PostgresCustodyFacade):
+        def __init__(self, cluster):
+            super().__init__(cluster)
+            self.session_depth = 0
+
+        @asynccontextmanager
+        async def operational_session(self, *, expected_cluster_identity=None):
+            assert expected_cluster_identity == self.cluster
+            self.session_depth += 1
+            try:
+                yield
+            finally:
+                self.session_depth -= 1
+
+        async def fetchall(self, query, params=()):
+            if "pg_control_system" not in query:
+                assert self.session_depth == 1
+            return await super().fetchall(query, params)
+
+        async def execute(self, query, params=()):
+            assert self.session_depth == 1
+            return await super().execute(query, params)
+
+    primary = _PinnedFacade("cluster-z-primary")
+    evidence = _PinnedFacade("cluster-a-evidence")
+
+    async with HoldStore(primary, evidence_db=evidence)._postgres_evidence_lock():
+        assert primary.session_depth == 1
+        assert evidence.session_depth == 1
+
+    assert primary.session_depth == 0
+    assert evidence.session_depth == 0
+
+
+@pytest.mark.asyncio
 async def test_postgres_evidence_lock_founds_distinct_domain_markers():
     """Fresh databases get durable identities before their first protocol lock."""
 
     @asynccontextmanager
-    async def advisory_locks(_keys):
+    async def advisory_locks(_keys, **_kwargs):
         yield
 
     primary = _PostgresCustodyFacade("cluster-primary")
@@ -2834,7 +3385,7 @@ async def test_postgres_evidence_lock_rejects_two_databases_in_one_cluster():
     """Different database markers do not prove an independent restore domain."""
 
     @asynccontextmanager
-    async def advisory_locks(_keys):
+    async def advisory_locks(_keys, **_kwargs):
         yield
 
     primary = _PostgresCustodyFacade("cluster-one")
@@ -2853,7 +3404,7 @@ async def test_postgres_evidence_lock_rejects_swapped_custody_roles():
     """A configured evidence service can never become the protected primary."""
 
     @asynccontextmanager
-    async def advisory_locks(_keys):
+    async def advisory_locks(_keys, **_kwargs):
         yield
 
     backend = SimpleNamespace(advisory_locks=advisory_locks)
@@ -2881,7 +3432,7 @@ async def test_reversed_concurrent_custody_boots_cannot_poison_role_metadata():
             self.cluster = cluster
 
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **_kwargs):
             assert keys == ((0x004B4553, 0x484F4C44),)
             async with cluster_locks[self.cluster]:
                 yield
@@ -3076,7 +3627,7 @@ async def test_postgres_custody_preflight_is_read_only_and_closes_raw_pools(
             raise AssertionError(f"unexpected preflight query: {query}")
 
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **_kwargs):
             assert keys == ((0x004B4553, 0x484F4C44),)
             yield
 
@@ -3148,7 +3699,7 @@ async def test_postgres_custody_preflight_waits_out_partial_role_publication(
             raise AssertionError(f"unexpected custody query: {query}")
 
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **_kwargs):
             nonlocal preflight_lock_depth
             assert keys == ((0x004B4553, 0x484F4C44),)
             async with locks[self.dsn]:
@@ -3220,11 +3771,12 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
             raise AssertionError(f"unexpected custody query: {query}")
 
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **kwargs):
             label = {
                 ((0x004B4553, 0x484F4C44),): "custody-lock",
                 ((0x004B4553, 0x5343484D),): "schema-lock",
             }[keys]
+            assert kwargs == {"expected_cluster_identity": self.dsn}
             events.append((label, self))
             yield
 
@@ -3238,9 +3790,16 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
         async def close(self):
             await self.backend.close()
 
-    async def _from_connected(_cls, backend, *, initialization_guard=None):
+    async def _from_connected(
+        _cls,
+        backend,
+        *,
+        initialization_guard=None,
+        schema_initializer=None,
+    ):
         assert backend.validated
         assert initialization_guard is not None
+        assert schema_initializer is not None
         async with initialization_guard:
             events.append(("schema", backend))
         return _DB(backend)
@@ -3280,6 +3839,76 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
 
 
 @pytest.mark.asyncio
+async def test_postgres_hold_pair_initializer_does_not_create_unrelated_core_schema(
+    monkeypatch,
+):
+    """The Hold-only databases need no authority over unrelated core tables."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db import postgres as postgres_module
+
+    backends = []
+
+    class _Backend:
+        backend_type = "postgres"
+
+        def __init__(self, *, dsn, min_pool_size, max_pool_size):
+            self.dsn = dsn
+            self.statements = []
+            self.closed = False
+            assert (min_pool_size, max_pool_size) == (1, 1)
+            backends.append(self)
+
+        async def connect(self):
+            return None
+
+        async def fetch_all(self, query, params=()):
+            if "pg_control_system" in query:
+                return [(self.dsn,)]
+            if "to_regclass" in query:
+                return [(None,)]
+            if query.startswith("EXPLAIN INSERT INTO agent_metadata"):
+                return []
+            raise AssertionError(f"unexpected custody query: {query}")
+
+        async def execute(self, query, params=()):
+            self.statements.append(query)
+
+        @asynccontextmanager
+        async def advisory_locks(self, keys, **_kwargs):
+            assert keys in {
+                ((0x004B4553, 0x484F4C44),),
+                ((0x004B4553, 0x5343484D),),
+            }
+            yield
+
+        async def close(self):
+            self.closed = True
+
+    async def _full_core_initializer(*_args, **_kwargs):
+        pytest.fail("Hold startup invoked the unrelated full core initializer")
+
+    monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
+    monkeypatch.setattr(AsyncDatabase, "_init_schema", _full_core_initializer)
+
+    primary, evidence = await initialize_postgres_hold_databases(
+        "postgresql://primary/db",
+        "postgresql://evidence/db",
+    )
+    try:
+        assert len(backends) == 2
+        assert all(backend.statements for backend in backends)
+        assert all(
+            "agent_metadata" in statement
+            for backend in backends
+            for statement in backend.statements
+        )
+    finally:
+        await primary.close()
+        await evidence.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
     monkeypatch,
 ):
@@ -3312,7 +3941,7 @@ async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
             raise AssertionError(f"unexpected custody query: {query}")
 
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **_kwargs):
             assert keys in {
                 ((0x004B4553, 0x484F4C44),),
                 ((0x004B4553, 0x5343484D),),
@@ -3330,8 +3959,15 @@ async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
         async def close(self):
             await self.backend.close()
 
-    async def _from_connected(_cls, backend, *, initialization_guard=None):
+    async def _from_connected(
+        _cls,
+        backend,
+        *,
+        initialization_guard=None,
+        schema_initializer=None,
+    ):
         assert initialization_guard is not None
+        assert schema_initializer is not None
         async with initialization_guard:
             active[backend.dsn] += 1
             max_active[backend.dsn] = max(
@@ -3378,12 +4014,13 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
 ):
     """A failed second schema cannot strand either validated backend."""
 
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db import postgres as postgres_module
 
     backends = []
 
     class _Backend:
+        backend_type = "postgres"
+
         def __init__(self, *, dsn, min_pool_size, max_pool_size):
             self.dsn = dsn
             self.close_count = 0
@@ -3398,10 +4035,17 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
                 return [(self.dsn,)]
             if "to_regclass" in query:
                 return [(None,)]
+            if query.startswith("EXPLAIN INSERT INTO agent_metadata"):
+                if "evidence" in self.dsn:
+                    raise RuntimeError("injected evidence schema failure")
+                return []
             raise AssertionError(f"unexpected custody query: {query}")
 
+        async def execute(self, _query, _params=()):
+            return None
+
         @asynccontextmanager
-        async def advisory_locks(self, keys):
+        async def advisory_locks(self, keys, **_kwargs):
             assert keys in {
                 ((0x004B4553, 0x484F4C44),),
                 ((0x004B4553, 0x5343484D),),
@@ -3411,28 +4055,9 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
         async def close(self):
             self.close_count += 1
 
-    class _DB:
-        def __init__(self, backend):
-            self.backend = backend
-
-        async def close(self):
-            await self.backend.close()
-
-    async def _from_connected(_cls, backend, *, initialization_guard=None):
-        assert initialization_guard is not None
-        async with initialization_guard:
-            if "evidence" in backend.dsn:
-                raise RuntimeError("injected evidence schema failure")
-            return _DB(backend)
-
     monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
-    monkeypatch.setattr(
-        AsyncDatabase,
-        "from_connected_backend",
-        classmethod(_from_connected),
-    )
 
-    with pytest.raises(RuntimeError, match="evidence schema failure"):
+    with pytest.raises(HoldCorruptStateError, match="agent/key conflict key"):
         await initialize_postgres_hold_databases(
             "postgresql://primary/db",
             "postgresql://evidence/db",
@@ -3447,7 +4072,7 @@ async def test_postgres_evidence_lock_recovers_partial_pair_binding(monkeypatch)
     """A crash between role writes resumes only the already-declared pair."""
 
     @asynccontextmanager
-    async def advisory_locks(_keys):
+    async def advisory_locks(_keys, **_kwargs):
         yield
 
     backend = SimpleNamespace(advisory_locks=advisory_locks)
@@ -4251,6 +4876,79 @@ async def test_legacy_latch_rejects_wrong_index_occupying_migration_name(tmp_pat
             match="cannot resolve its required scope/target conflict key",
         ):
             await HoldStore(db).ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_latch_rejects_repeated_column_conflict_index(tmp_path):
+    """Column-set equality cannot hide an unusable extra index position."""
+
+    path = tmp_path / "repeated-latch-index.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    await db.execute(
+        "CREATE TABLE hold_latches ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0, "
+        "hold_receipt_id TEXT NOT NULL DEFAULT '', "
+        "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+        "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0)"
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_hold_latches_scope_target_unique "
+        "ON hold_latches(scope, target_id, target_id)"
+    )
+    try:
+        with sqlite3.connect(path) as connection:
+            snapshot = _sqlite_hold_snapshot(connection)
+        assert (
+            "hold_latches",
+            frozenset(("scope", "target_id")),
+        ) not in (snapshot.resolvable_conflict_keys or frozenset())
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="cannot resolve its required scope/target conflict key",
+        ):
+            await HoldStore(db).ensure_schema()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipt_witness_rejects_wrong_named_conflict_index(tmp_path):
+    """Every upsert arbiter is proven before the Hold store becomes ready."""
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "wrong-witness-index.db"))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await store.read_boot_state()
+    await db.execute(
+        "DROP INDEX idx_hold_receipt_witnesses_scope_target_unique"
+    )
+    await db.execute(
+        "ALTER TABLE hold_receipt_witnesses "
+        "RENAME TO hold_receipt_witnesses_valid"
+    )
+    await db.execute(
+        "CREATE TABLE hold_receipt_witnesses ("
+        "scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+        "receipt_count INTEGER NOT NULL)"
+    )
+    await db.execute(
+        "INSERT INTO hold_receipt_witnesses "
+        "SELECT * FROM hold_receipt_witnesses_valid"
+    )
+    await db.execute("DROP TABLE hold_receipt_witnesses_valid")
+    await db.execute(
+        "CREATE UNIQUE INDEX idx_hold_receipt_witnesses_scope_target_unique "
+        "ON hold_receipt_witnesses(receipt_count)"
+    )
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="cannot resolve its required scope/target conflict key",
+        ):
+            await store.ensure_schema()
     finally:
         await db.close()
 

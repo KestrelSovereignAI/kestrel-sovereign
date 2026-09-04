@@ -24,6 +24,10 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+from kestrel_sovereign.lifecycle_checks import (
+    is_isolated_nonproduction_kite_environment,
+)
+
 logger = logging.getLogger(__name__)
 
 #: Reserved tenant id for fleet/host-scoped stores. Distinct from any agent's
@@ -310,8 +314,11 @@ async def build_host_context(
     an upgrade cannot make existing workflow/feature rows disappear. Hold is
     the cross-worker control plane exception: PostgreSQL deployments give it a
     separate ``KESTREL_DATABASE_URL`` backend plus an independently restored
-    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL``. ``db_path`` overrides the host
-    SQLite location (``$KESTREL_HOST_DB_PATH`` or the private host-data root).
+    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL``. An explicitly isolated single-host
+    workload may select the already-owned SQLite control plane with
+    ``KESTREL_HOLD_BACKEND=sqlite``. ``db_path`` overrides the host SQLite
+    location (``$KESTREL_HOST_DB_PATH``, otherwise
+    ``$KESTREL_DB_PATH/host-data``, otherwise the private host-data root).
     Failure to secure or open either backend degrades gracefully to a context
     with no store; production Hold enforcement then fails closed at boot.
     """
@@ -344,7 +351,32 @@ async def build_host_context(
 
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
         dsn = os.environ.get("KESTREL_DATABASE_URL")
-        if backend == "postgres" and dsn:
+        configured_hold_backend = os.environ.get("KESTREL_HOLD_BACKEND")
+        if configured_hold_backend is None:
+            hold_backend = (
+                "postgres" if backend == "postgres" and dsn else "sqlite"
+            )
+        else:
+            hold_backend = configured_hold_backend.lower()
+            if hold_backend not in {"postgres", "sqlite"}:
+                raise RuntimeError(
+                    "KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'"
+                )
+            if (
+                hold_backend == "sqlite"
+                and backend == "postgres"
+                and not is_isolated_nonproduction_kite_environment(os.environ)
+            ):
+                raise RuntimeError(
+                    "PostgreSQL runtimes may select SQLite Hold only inside "
+                    "isolated Kite release evidence from an isolated "
+                    "non-production Kite demo"
+                )
+        if hold_backend == "postgres":
+            if not dsn:
+                raise RuntimeError(
+                    "KESTREL_DATABASE_URL is required for PostgreSQL Hold state"
+                )
             evidence_dsn = os.environ.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
             if not evidence_dsn:
                 raise RuntimeError(
@@ -434,21 +466,9 @@ async def build_host_context(
 
 
 async def close_host_context(ctx: Any) -> None:
-    """Best-effort close of every resource owned by one host context."""
+    """Compatibility name for cancellation-safe host resource cleanup."""
 
-    session_factory = getattr(ctx, "session_factory", None)
-    try:
-        if session_factory is not None:
-            await session_factory.close()
-    except Exception as exc:  # noqa: BLE001 - the database must still close
-        logger.warning("Host feature session-factory shutdown failed: %s", exc)
-    finally:
-        db = getattr(ctx, "db", None)
-        if db is not None and hasattr(db, "close"):
-            try:
-                await db.close()
-            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                logger.warning("Host feature database shutdown failed: %s", exc)
+    await close_host_context_resources(ctx)
 
 
 __all__ = [

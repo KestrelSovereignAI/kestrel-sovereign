@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -42,14 +41,29 @@ def test_multi_agent_entrypoint_never_bootstraps_host_control_directory():
 
     control_dir = script.index('HOST_CONTROL_DIR="$(dirname -- ')
     agent_loop = script.index('for dir in "$AGENT_DATA_DIR"/*/')
-    exclusion = script.index(
-        'case "${HOST_CONTROL_DIR%/}/" in',
+    resolver = script.index(
+        'resolved_dir="$(canonicalize_path "$dir")"',
         agent_loop,
     )
-    subtree = script.index('"${dir%/}/"*) continue ;;', exclusion)
+    exclusion = script.index(
+        'if paths_overlap "$HOST_CONTROL_DIR" "$resolved_dir"; then',
+        resolver,
+    )
+    collision = script.index('[ -f "$dir/kestrel_prime.db" ]', exclusion)
+    refusal = script.index("collides with existing agent directory", collision)
+    skip = script.index("continue", refusal)
     inception = script.index("create_kestrel_identity", agent_loop)
 
-    assert control_dir < agent_loop < exclusion < subtree < inception
+    assert (
+        control_dir
+        < agent_loop
+        < resolver
+        < exclusion
+        < collision
+        < refusal
+        < skip
+        < inception
+    )
 
 
 def test_multi_agent_entrypoint_canonicalizes_relative_host_control_directory(
@@ -92,3 +106,130 @@ printf '%s\0%s\0%s\0' "$AGENT_DATA_DIR" "$HOST_CONTROL_DIR" "$decision"
     assert agent_root.decode() == str(agent_data_dir.resolve())
     assert control_root.decode() == str((agent_data_dir / "host-data").resolve())
     assert decision == b"excluded"
+
+
+def test_multi_agent_entrypoint_refuses_existing_agent_at_host_control_root(
+    tmp_path,
+):
+    """An existing config cannot bypass the upgrade collision refusal."""
+
+    script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
+    setup = script.split(
+        'if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]',
+        1,
+    )[0]
+    agent_loop = script.split(
+        "# Bootstrap identity and initialize DB for each agent data dir",
+        1,
+    )[1].split('echo "Starting Kestrel MultiAgent Host', 1)[0]
+    probe = setup + agent_loop
+    probe = probe.replace("/app/.venv/bin/python", shlex.quote(sys.executable))
+    agent_data_dir = tmp_path / "agent_data"
+    host_named_agent = agent_data_dir / "host-data"
+    host_named_agent.mkdir(parents=True)
+    (host_named_agent / "kestrel_prime.db").touch()
+    env = os.environ.copy()
+    env.update(
+        {
+            "KESTREL_AGENT_DATA_DIR": str(agent_data_dir),
+            "KESTREL_HOST_DB_PATH": str(host_named_agent / "host-features.db"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "collides with existing agent directory" in result.stderr
+    assert "set KESTREL_HOST_DB_PATH outside agent_data" in result.stderr
+
+
+def test_multi_agent_entrypoint_refuses_requested_host_control_collision(
+    tmp_path,
+):
+    """KESTREL_AGENTS cannot request a name reserved by host custody."""
+
+    script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
+    probe = script.split("# Generate multi_agent.toml", 1)[0]
+    probe = probe.replace("/app/.venv/bin/python", shlex.quote(sys.executable))
+    agent_data_dir = tmp_path / "agent_data"
+    env = os.environ.copy()
+    env.update(
+        {
+            "KESTREL_AGENT_DATA_DIR": str(agent_data_dir),
+            "KESTREL_HOST_DB_PATH": str(
+                agent_data_dir / "host-data" / "host-features.db"
+            ),
+            "KESTREL_MULTI_AGENT_CONFIG": str(tmp_path / "multi_agent.toml"),
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "ephemeral_demo",
+            "KESTREL_ENV": "development",
+            "KESTREL_AGENTS": "kite,host-data",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "requested agent 'host-data' collides with host control path" in (
+        result.stderr
+    )
+
+
+def test_multi_agent_entrypoint_refuses_symlink_alias_to_external_host_custody(
+    tmp_path,
+):
+    """The bootstrap loop compares resolved paths before touching an agent."""
+
+    script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
+    setup = script.split(
+        'if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]',
+        1,
+    )[0]
+    agent_loop = script.split(
+        "# Bootstrap identity and initialize DB for each agent data dir",
+        1,
+    )[1].split('echo "Starting Kestrel MultiAgent Host', 1)[0]
+    probe = setup + agent_loop
+    probe = probe.replace("/app/.venv/bin/python", shlex.quote(sys.executable))
+    agent_data_dir = tmp_path / "agent_data"
+    host_dir = tmp_path / "external-host-data"
+    agent_data_dir.mkdir()
+    host_dir.mkdir()
+    (host_dir / "kestrel_existing.json").write_text("{}", encoding="utf-8")
+    (host_dir / "kestrel_prime.db").touch()
+    (agent_data_dir / "custody-alias").symlink_to(
+        host_dir,
+        target_is_directory=True,
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "KESTREL_AGENT_DATA_DIR": str(agent_data_dir),
+            "KESTREL_HOST_DB_PATH": str(host_dir / "host-features.db"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        cwd=tmp_path,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "collides with existing agent directory" in result.stderr
