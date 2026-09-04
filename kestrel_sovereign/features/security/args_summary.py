@@ -278,7 +278,10 @@ def remask_summary(summary: Optional[str]) -> Optional[str]:
     if not isinstance(parsed, (dict, list)):
         return summary
     try:
-        return json.dumps(mask_sensitive(parsed), default=str)
+        # READ path: a nested JSON-encoded payload can be cut inside a row
+        # whose outer JSON parses, so the string branch gets the repair slack
+        # here exactly as it does under repair_unparseable_summary.
+        return json.dumps(mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM), default=str)
     except (TypeError, ValueError):
         return "(summary could not be re-masked; not shown)"
 

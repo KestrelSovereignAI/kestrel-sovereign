@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.features.security.args_summary import (
+    _MAX_REPAIR_TRIM,
     mask_sensitive,
     remask_summary,
     repair_unparseable_summary,
@@ -109,7 +110,10 @@ def fold_stored_summary(text):
         # hit/no-hit, while every returned row dutifully showed ***MASKED***
         # (#3107 review round 7). The searchable projection has to be the
         # masked one, so matching and display are the same text.
-        parsed = mask_sensitive(parsed)
+        # READ path: a nested payload cut inside a row that parses needs the
+        # repair slack the unparseable branch already has, or its secret
+        # stays in the searchable projection (round 20 review).
+        parsed = mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
         # Walk the VALUES rather than re-serializing: json.dumps would put back
         # the standard escapes (\", \n, doubled backslashes) that summarize_args
         # introduced, so `say "hello"`, multiline text and Windows paths would

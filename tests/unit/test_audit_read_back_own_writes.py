@@ -2201,3 +2201,31 @@ def test_the_read_path_still_repairs_a_cut_nested_payload_with_slack():
     row = '{"payload": "{\\"password\\": \\"sk-live-LEAK\\", \\"n\\": tr", "b": 1'
     assert "LEAK" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
     assert "leak" not in fold_stored_summary(row)
+
+
+@pytest.mark.asyncio
+async def test_a_cut_nested_payload_inside_a_parseable_row_is_masked_in_both_projections(tmp_path):
+    """The outer row parses, so both read paths took the json.loads branch and
+    called mask_sensitive with no repair slack; the nested payload's cut
+    string never parsed and its secret stayed raw — shown, and walkable
+    from hit/no-hit (round 20 review)."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.feature import SecurityFeature
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = json.dumps({"payload": '{"api_key": "sk-live-NESTEDCUT', "memo": "orphans the worker"})
+    assert "NESTEDCUT" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
+    assert "nestedcut" not in fold_stored_summary(row) and "orphans the worker" in fold_stored_summary(row)
+
+    store = PermissionStore(str(tmp_path / "nested-cut.db"))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="Legacy", tool_name="t", action="tool_execution",
+        decision="auto_mode_allowed", args_summary=row,
+    )
+    feature = SecurityFeature.__new__(SecurityFeature)
+    feature.permission_store = store
+    shown = await feature.security_audit_search(query="orphans the worker")
+    assert shown.data["count"] == 1 and "NESTEDCUT" not in str(shown.data)
+    for probe in ("sk-live-N", "sk-live-NESTEDCUT"):
+        assert (await feature.security_audit_search(query=probe)).data["count"] == 0, probe
