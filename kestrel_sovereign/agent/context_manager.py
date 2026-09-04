@@ -1584,7 +1584,16 @@ class ContextManager:
                     f"the {system_prompt_budget_bytes}-byte system prompt cap"
                 )
                 return False
-        guidance_tokens = self.counter.count(guidance_text)
+        # Charge the exact tokenizer delta of the bytes we append, including
+        # the ``\n\n`` boundary. Tokenizers may merge across that boundary, so
+        # summing the body and a separately-counted joiner is not exact either.
+        guidance_tokens = max(
+            0,
+            self.counter.count(
+                f"{assembly.system_prompt}\n\n{guidance_text}"
+            )
+            - self.counter.count(assembly.system_prompt),
+        )
         # Reflection is optional.  It must not consume bytes when the system
         # slice plus released elastic slack cannot accept the whole block.
         # Check first because the legacy TokenBudget.use mutates on rejection;

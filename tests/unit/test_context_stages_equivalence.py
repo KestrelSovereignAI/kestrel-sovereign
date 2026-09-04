@@ -1280,6 +1280,46 @@ async def test_reflection_guidance_rejected_by_token_budget_is_not_appended():
 
 
 @pytest.mark.asyncio
+async def test_reflection_guidance_charges_joiner_token_before_append():
+    """Optional guidance is skipped when only its body, not its joiner, fits."""
+
+    from kestrel_sovereign.agent.context_stages import (
+        ContextAssembly,
+        build_reflection_guidance_block,
+    )
+    from kestrel_sovereign.agent.token_budget import ElasticTokenBudget
+
+    cm = _make_cm()
+    assembly = ContextAssembly(system_prompt="BASE-PROMPT")
+    guidance = ["OPTIONAL-GUIDANCE-CANARY"]
+    guidance_text = build_reflection_guidance_block(guidance)
+    guidance_tokens = cm.counter.count(guidance_text)
+    marginal_tokens = (
+        cm.counter.count(f"{assembly.system_prompt}\n\n{guidance_text}")
+        - cm.counter.count(assembly.system_prompt)
+    )
+    assert marginal_tokens > guidance_tokens
+
+    budget = ElasticTokenBudget(
+        "test-model", message_count=0, mandatory_system_tokens=0
+    )
+    system = budget.allocations["system"]
+    system.used = system.budget - guidance_tokens
+    before = budget.total_used
+
+    included = cm._apply_reflection_guidance(
+        assembly,
+        budget,
+        guidance,
+        system_prompt_budget_bytes=None,
+    )
+
+    assert included is False
+    assert assembly.system_prompt == "BASE-PROMPT"
+    assert budget.total_used == before
+
+
+@pytest.mark.asyncio
 async def test_live_dry_plan_equivalence_under_lumpy_microcompact_pressure():
     history = [
         {

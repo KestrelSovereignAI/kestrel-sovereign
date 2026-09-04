@@ -4431,6 +4431,22 @@ class SignalDispatcher:
                     )
 
                     if isinstance(exc, SystemPromptNamespaceError):
+                        # Receipt registration and causation binding happen
+                        # before doctrine resolution. This validation error is
+                        # intentionally loud, but it must not leave either
+                        # ephemeral capability visible to a later turn.
+                        try:
+                            if receipt_tool_registered:
+                                clear_receipt = getattr(
+                                    self._agent,
+                                    "clear_constitution_receipt_tool",
+                                    None,
+                                )
+                                if callable(clear_receipt):
+                                    clear_receipt()
+                        finally:
+                            if clear_chain is not None:
+                                clear_chain(token)
                         raise
                     logger.exception(
                         "agent.get_anchored_doctrine_files raised for "

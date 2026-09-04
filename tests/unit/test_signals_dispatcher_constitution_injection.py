@@ -1698,6 +1698,65 @@ async def test_constitution_mixin_rejects_reserved_anchored_audit_name(
 
 
 @pytest.mark.asyncio
+async def test_reserved_doctrine_failure_unwinds_receipt_tool_and_chain(
+    tmp_path, template_path
+):
+    """Validation after ephemeral setup cannot leak state into a later turn."""
+
+    from kestrel_sovereign.agent.system_prompt_assembler import (
+        SystemPromptNamespaceError,
+    )
+
+    class _StateTrackingAgent(_AuditingAgent):
+        def __init__(self):
+            super().__init__(
+                constitution_hash="constitution-hash",
+                anchored_bundle_hash="bundle-hash",
+                live_bundle_hash="bundle-hash",
+            )
+            self.receipt_tool_registered = False
+            self.chain = None
+
+        def register_constitution_receipt_tool(self, *, canary, signal_id):
+            self.receipt_tool_registered = True
+
+        def clear_constitution_receipt_tool(self):
+            self.receipt_tool_registered = False
+
+        def _set_current_chain(self, chain):
+            prior = self.chain
+            self.chain = list(chain)
+            return prior
+
+        def _clear_current_chain(self, token=None):
+            self.chain = token
+
+        async def get_anchored_doctrine_files(self):
+            raise SystemPromptNamespaceError("reserved doctrine collision")
+
+    agent = _StateTrackingAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="reserved_doctrine",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="claude_code",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("reserved_doctrine"))
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert agent.receipt_tool_registered is False
+    assert agent.chain is None
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_skips_constitution_in_anchored_doctrine(
     tmp_path, monkeypatch,
 ):
