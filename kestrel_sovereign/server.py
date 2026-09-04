@@ -4589,7 +4589,10 @@ async def host_csrf_token(request: Request):
 # Phoenix trace backend: embed-session mint + same-origin reverse proxy (#2570)
 # ---------------------------------------------------------------------------
 
-_PHOENIX_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+# CORS middleware answers real preflights before this route.  Do not register a
+# bare OPTIONS proxy: global auth deliberately bypasses OPTIONS, so registering
+# it here would expose an unauthenticated fleet-scoped Phoenix operation.
+_PHOENIX_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
 
 
 def _phoenix_supervisor(request: Request):

@@ -1211,6 +1211,34 @@ def test_phoenix_route_requires_auth(monkeypatch):
     assert r.status_code == 401
 
 
+def test_bare_phoenix_options_is_not_a_proxy_operation(monkeypatch):
+    """OPTIONS auth bypass must never reach the fleet-scoped proxy."""
+
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+    app = _client_with_state(None, monkeypatch)
+    with TestClient(app) as client:
+        # No Origin/Access-Control-Request-Method: this is not a CORS preflight.
+        r = client.options("/phoenix/")
+    assert r.status_code == 405
+
+
+def test_phoenix_cors_preflight_remains_available(monkeypatch):
+    """Removing bare OPTIONS must not remove browser CORS preflights."""
+
+    monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
+    app = _client_with_state(None, monkeypatch)
+    with TestClient(app) as client:
+        r = client.options(
+            "/phoenix/",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
 def test_phoenix_route_503_when_disabled(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
     app = _client_with_state(None, monkeypatch)

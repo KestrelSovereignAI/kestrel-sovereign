@@ -67,6 +67,13 @@ HTTP_EXACT_ROUTES = {
     "/api/auth/key",
     "/v1/chat/completions",
 }
+INDIRECT_DISPATCH_CALLS = {
+    # Generic tool dispatchers need inventory even when their public name has
+    # no agent-shaped word.  These are execution boundaries, not authority:
+    # the selected downstream tool must still enforce its own policy.
+    "execute_skill",
+    "_create_schedule",
+}
 SURFACE_ID = re.compile(
     r"\|\s*`(kestrel_sovereign/"
     r"(?:server\.py::[^`]+|(?:features|endpoints)/[^`]+))`\s*\|"
@@ -105,6 +112,33 @@ def _is_cross_agent_control_name(name: str) -> bool:
     return any(term in name.casefold() for term in CONTROL_NAME_TERMS)
 
 
+def _call_name(call: ast.Call) -> str:
+    function = call.func
+    if isinstance(function, ast.Name):
+        return function.id
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    return ""
+
+
+def _is_indirect_tool_dispatcher(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Detect public tools that can select another tool at runtime.
+
+    ``run_workflow`` delegates directly through ``TaskManager.execute_skill``.
+    Scheduler creation tools delegate indirectly through ``_create_schedule``;
+    the persisted name is later resolved to any loaded feature tool.  Detect
+    the wiring rather than freezing only today's public names, so renaming one
+    of these entry doors cannot make it disappear from the authority audit.
+    """
+
+    return any(
+        isinstance(node, ast.Call) and _call_name(node) in INDIRECT_DISPATCH_CALLS
+        for node in ast.walk(function)
+    )
+
+
 def _discovered_tool_surfaces() -> set[str]:
     surfaces: set[str] = set()
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
@@ -117,7 +151,9 @@ def _discovered_tool_surfaces() -> set[str]:
                 public_name = _public_tool_name(decorator, node.name)
                 if public_name is None:
                     continue
-                if _is_cross_agent_control_name(public_name):
+                if _is_cross_agent_control_name(
+                    public_name
+                ) or _is_indirect_tool_dispatcher(node):
                     relative = path.relative_to(REPO_ROOT).as_posix()
                     surfaces.add(f"{relative}::{public_name}")
     return surfaces
@@ -293,6 +329,62 @@ def _discovered_http_surfaces() -> set[str]:
     return surfaces
 
 
+def _agent_alias(route: str) -> str:
+    """Return the concrete multi-agent spelling after target selection."""
+
+    return f"/api/agents/{{selected_agent_name}}/{route.lstrip('/')}"
+
+
+def _discovered_request_routed_alias_surfaces() -> set[str]:
+    """Synthesize the host alias for every decorated core HTTP route.
+
+    The routing middleware accepts ``/api/agents/{name}/{remaining_path}`` and
+    rewrites the remainder before FastAPI dispatch.  Consequently every
+    canonical route is an agent-addressable door, even when its handler
+    does not consume ``Request`` and its path says only ``security``,
+    ``identity``, or ``conversations``.  This complete inventory complements
+    the narrower set of intrinsically cross-agent/host routes above.
+    """
+
+    surfaces: set[str] = set()
+    roots = (
+        REPO_ROOT / "kestrel_sovereign/endpoints",
+        REPO_ROOT / "kestrel_sovereign/features",
+    )
+    paths = sorted(
+        {path for root in roots for path in root.rglob("*.py")}
+        | {REPO_ROOT / "kestrel_sovereign/server.py"}
+    )
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        prefix = _router_prefix(tree)
+        method_constants = _module_string_collections(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                methods = _route_methods(decorator, method_constants)
+                if not methods:
+                    continue
+                if not decorator.args or not isinstance(
+                    decorator.args[0], ast.Constant
+                ):
+                    continue
+                canonical_route = prefix + str(decorator.args[0].value)
+                # The host regex requires a non-empty remaining path, so the
+                # canonical root has no multi-agent alias.
+                if canonical_route == "/":
+                    continue
+                relative = path.relative_to(REPO_ROOT).as_posix()
+                for method in methods:
+                    surfaces.add(
+                        f"{relative}::{method} {_agent_alias(canonical_route)}"
+                    )
+    return surfaces
+
+
 def _documented_surfaces(section: str) -> set[str]:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     start = audit.index(section)
@@ -321,6 +413,31 @@ def test_every_cross_agent_named_tool_is_classified() -> None:
     assert _discovered_tool_surfaces() == _documented_surfaces(
         "## Machine-checked tool inventory"
     )
+
+
+def test_generic_indirect_dispatch_tools_are_classified() -> None:
+    discovered = _discovered_tool_surfaces()
+    for surface in (
+        "kestrel_sovereign/features/tasks/feature.py::run_workflow",
+        "kestrel_sovereign/features/scheduler/feature.py::schedule_add",
+        "kestrel_sovereign/features/scheduler/feature.py::schedule_add_deadline",
+    ):
+        assert surface in discovered
+
+
+def test_indirect_dispatch_discovery_follows_execution_wiring() -> None:
+    direct = ast.parse(
+        "async def renamed_meta_tool(manager):\n"
+        "    return await manager.execute_skill('feature', 'skill', {})\n"
+    ).body[0]
+    scheduled = ast.parse(
+        "async def later(self):\n"
+        "    return await self._create_schedule(task_name='anything')\n"
+    ).body[0]
+    assert isinstance(direct, ast.AsyncFunctionDef)
+    assert isinstance(scheduled, ast.AsyncFunctionDef)
+    assert _is_indirect_tool_dispatcher(direct)
+    assert _is_indirect_tool_dispatcher(scheduled)
 
 
 def test_relation_free_control_names_are_still_discovered() -> None:
@@ -366,6 +483,29 @@ def test_every_cross_agent_http_route_is_classified() -> None:
     assert _discovered_http_surfaces() == _documented_surfaces(
         "## Machine-checked HTTP inventory"
     )
+
+
+def test_every_request_routed_agent_alias_is_classified() -> None:
+    assert _discovered_request_routed_alias_surfaces() == _documented_surfaces(
+        "## Machine-checked request-routed alias inventory"
+    )
+
+
+def test_sensitive_unprefixed_routes_have_synthesized_agent_aliases() -> None:
+    discovered = _discovered_request_routed_alias_surfaces()
+    for surface in (
+        "kestrel_sovereign/endpoints/security.py::"
+        "POST /api/agents/{selected_agent_name}/api/security/approve",
+        "kestrel_sovereign/endpoints/security.py::"
+        "POST /api/agents/{selected_agent_name}/api/security/auto-mode",
+        "kestrel_sovereign/endpoints/models.py::"
+        "PATCH /api/agents/{selected_agent_name}/api/identity",
+        "kestrel_sovereign/endpoints/conversations.py::"
+        "DELETE /api/agents/{selected_agent_name}/api/conversations/{session_id}",
+        "kestrel_sovereign/endpoints/memories.py::"
+        "DELETE /api/agents/{selected_agent_name}/api/memories/{node_id}",
+    ):
+        assert surface in discovered
 
 
 def test_feature_contributed_nested_webhook_router_is_discovered() -> None:
@@ -542,6 +682,76 @@ def _identifier_tokens(node: ast.AST) -> set[str]:
     return tokens
 
 
+def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
+    tokens = _identifier_tokens(node)
+    provenance_tokens = {
+        "causation",
+        "causation_chain",
+        "orchestrator",
+        "kestrel.orchestrator",
+    }
+    return bool(tokens.intersection(provenance_tokens | (aliases or set())))
+
+
+def _provenance_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Resolve simple local aliases of provenance metadata to a fixed point."""
+
+    def is_value_preserving_alias(value: ast.AST, aliases: set[str]) -> bool:
+        # Awaiting a helper that merely *receives* causation metadata does not
+        # make its result provenance (for example ``fired = await
+        # emit(..., causation_chain=chain)``).  Follow only direct accessors and
+        # boolean wrappers whose result still represents the metadata itself.
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+            return _has_provenance_token(value, aliases)
+        if isinstance(value, ast.Call) and _call_name(value) in {
+            "bool",
+            "get",
+            "getattr",
+        }:
+            return _has_provenance_token(value, aliases)
+        return False
+
+    aliases: set[str] = set()
+    assignments: list[tuple[set[str], ast.AST]] = []
+    for node in ast.walk(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        names = {
+            child.id.casefold()
+            for target in targets
+            for child in ast.walk(target)
+            if isinstance(child, ast.Name)
+        }
+        if names:
+            assignments.append((names, value))
+
+    changed = True
+    while changed:
+        changed = False
+        for names, value in assignments:
+            if is_value_preserving_alias(value, aliases) and not names.issubset(
+                aliases
+            ):
+                aliases.update(names)
+                changed = True
+    return aliases
+
+
 def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     lines: set[int] = set()
     functions = [
@@ -551,6 +761,7 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     ]
     for function in functions:
         function_name = function.name.casefold()
+        provenance_aliases = _provenance_aliases(function)
         function_is_permission_boundary = (
             any(
                 term in function_name
@@ -565,25 +776,22 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 )
             )
             or function_name.startswith(("can_", "may_"))
+            or _is_cross_agent_control_name(function_name)
         )
         for node in ast.walk(function):
             if isinstance(node, ast.Return):
                 if (
                     function_is_permission_boundary
                     and node.value is not None
-                    and any(
-                        "causation" in token or "orchestrator" in token
-                        for token in _identifier_tokens(node.value)
-                    )
+                    and _has_provenance_token(node.value, provenance_aliases)
                 ):
                     lines.add(node.lineno)
                 continue
             if not isinstance(node, (ast.If, ast.IfExp, ast.Assert)):
                 continue
             tokens = _identifier_tokens(node.test)
-            has_provenance = any(
-                "causation" in token or "orchestrator" in token
-                for token in tokens
+            has_provenance = _has_provenance_token(
+                node.test, provenance_aliases
             )
             has_permission = any(
                 "authoriz" in token or "permission" in token
@@ -634,10 +842,23 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "def is_allowed(request):\n"
         "    return bool(request.orchestrator)\n"
     )
+    control_handlers = ast.parse(
+        "def terminate_child(request):\n"
+        "    if request.causation_chain:\n"
+        "        return True\n\n"
+        "def delegate_task(request):\n"
+        "    chain = request.causation_chain\n"
+        "    return bool(chain)\n\n"
+        "def cancel_task(request):\n"
+        "    chain = request.metadata.get('kestrel.orchestrator')\n"
+        "    if chain:\n"
+        "        return True\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
     assert _authority_provenance_lines(ordinary_helpers) == {2, 5}
+    assert _authority_provenance_lines(control_handlers) == {2, 7, 11}
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

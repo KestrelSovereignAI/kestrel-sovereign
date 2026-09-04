@@ -99,6 +99,9 @@ object (`task`), a control verb (`cancel`, `interrupt`, `stop`, `hold`,
 `terminate`, `offboard`, or `withdraw`), or host/fleet/restart scope. Every
 match must remain classified here, including false positives, so a newly named
 cross-agent door cannot silently appear merely because it omits `agent`.
+The scanner also follows the generic `execute_skill` and `_create_schedule`
+dispatch calls, because a meta-tool can reach an authority-bearing target even
+when its own public name contains none of those words.
 
 | Surface ID | Classification |
 |---|---|
@@ -118,6 +121,8 @@ cross-agent door cannot silently appear merely because it omits `agent`.
 | `kestrel_sovereign/features/restart_coordinator/feature.py::list_restart_status_events` | Requester/explicit host-coordination read; #3146. |
 | `kestrel_sovereign/features/restart_coordinator/feature.py::request_restart` | Sovereign or narrow signed delegation; #3148. |
 | `kestrel_sovereign/features/restart_coordinator/feature.py::restart_coordinator` | Sovereign executor/registered cron action; #3148. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_add` | Self-owned indirect dispatcher: it persists only a registered tool name, and the scheduled execution re-enters the downstream tool's runtime permission gate; scheduling conveys no relation authority. |
+| `kestrel_sovereign/features/scheduler/feature.py::schedule_add_deadline` | Self-owned one-shot indirect dispatcher with the same registered-name and downstream runtime permission gates; scheduling conveys no relation authority. |
 | `kestrel_sovereign/features/spawn/feature.py::delegate_task` | Unverified process-local child map; defect #3142. |
 | `kestrel_sovereign/features/spawn/feature.py::get_child_result` | Self-owned result state keyed by the caller's prior delegated task. |
 | `kestrel_sovereign/features/spawn/feature.py::list_children` | Unverified process-local child map; defects #3133/#3142. |
@@ -129,6 +134,7 @@ cross-agent door cannot silently appear merely because it omits `agent`.
 | `kestrel_sovereign/features/tasks/feature.py::get_task_result` | Unscoped task-ID read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | `kestrel_sovereign/features/tasks/feature.py::list_my_tasks` | Unscoped shared-store inbox read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | `kestrel_sovereign/features/tasks/feature.py::respond_to_a2a_task` | Recipient-owned mutation; #3144. |
+| `kestrel_sovereign/features/tasks/feature.py::run_workflow` | Self-owned indirect dispatcher through `TaskManager.execute_skill`; each selected feature tool retains its PRE_TOOL_USE and target-specific authority checks, so the workflow supplies sequence, not relation authority. |
 | `kestrel_sovereign/features/todo/feature.py::todo_link_task` | Self-owned todo metadata link; not an A2A task control. |
 
 ## Machine-checked built-in command inventory
@@ -261,8 +267,203 @@ outside core and must define their own operator policy.
 | `kestrel_sovereign/server.py::DELETE /phoenix/{path:path}` | Host-authenticated proxy mutation of the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::HEAD /phoenix` | Host-authenticated proxy metadata read from the fleet-scoped Phoenix trace store. |
 | `kestrel_sovereign/server.py::HEAD /phoenix/{path:path}` | Host-authenticated proxy metadata read from the fleet-scoped Phoenix trace store. |
-| `kestrel_sovereign/server.py::OPTIONS /phoenix` | Host-authenticated Phoenix proxy capability response. |
-| `kestrel_sovereign/server.py::OPTIONS /phoenix/{path:path}` | Host-authenticated Phoenix proxy capability response. |
+
+## Machine-checked request-routed alias inventory
+
+The host routing middleware accepts
+`/api/agents/{selected_agent_name}/{remaining_path}` and rewrites the remainder before
+FastAPI dispatch. The table therefore spells the synthesized alias for every
+decorated core HTTP route, including handlers that do not consume `Request`
+and routes whose canonical spelling contains no agent-shaped word. The
+canonical root is excluded because the router regex requires a non-empty
+remainder. Authentication sees the
+prefixed path before routing: every alias below requires host authentication
+except the deliberately self-authenticating webhook family. The repeated
+agent-local classifications are intentional false-positive dispositions; an
+exact-set contract makes any new request-bound route fail until it is added.
+
+Classification codes: **A** = sovereign/operator-authenticated,
+target-agent-local read or mutation, with routing selecting the target but
+granting no hierarchy authority;
+**H** = host/fleet handler whose explicit operator policy ignores agent
+selection as authority; **W** = webhook-self-authenticated ingress; **D-n** =
+known focused defect n.
+
+| Surface ID | Classification |
+|---|---|
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/context-status` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/health/status` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/heartbeat/status` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/info` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/notifications` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/notifications/sse` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/privacy-mode` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/reflection/status` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks` | D-3145 — shared-task read lacks principal scoping. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}` | D-3145 — shared-task read lacks principal scoping. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}/subscribe` | D-3145 — shared-task read lacks principal scoping. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/attachments` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/health/trigger` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/heartbeat/trigger` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/invoke` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/privacy-mode` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/privacy-mode/cancel` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/privacy-mode/confirm` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/stop` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/stream` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/send` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/{task_id:path}/cancel` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/callback` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/login` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/logout` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/me` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/verify` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/auth_oauth.py::POST /api/agents/{selected_agent_name}/auth/token` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/commands.py::GET /api/agents/{selected_agent_name}/api/commands` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::DELETE /api/agents/{selected_agent_name}/api/conversations/messages/{message_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::DELETE /api/agents/{selected_agent_name}/api/conversations/{session_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::GET /api/agents/{selected_agent_name}/api/conversations` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::GET /api/agents/{selected_agent_name}/api/conversations/{session_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::GET /api/agents/{selected_agent_name}/api/conversations/{session_id}/transcript` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::GET /api/agents/{selected_agent_name}/api/sessions` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::GET /api/agents/{selected_agent_name}/api/trash` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::PATCH /api/agents/{selected_agent_name}/api/conversations/{session_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/messages/{message_id}/purge` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/messages/{message_id}/restore` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/new` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/{session_id}/archive` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/{session_id}/purge` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/{session_id}/restore` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/conversations.py::POST /api/agents/{selected_agent_name}/api/conversations/{session_id}/unarchive` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/database.py::GET /api/agents/{selected_agent_name}/api/db/tables` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/database.py::GET /api/agents/{selected_agent_name}/api/db/tables/{table_name}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/features` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/features/installed` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/features/{name}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/features/{name}/config` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/features/{name}/skills` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/skills` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/skills/{skill_id}/schema` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/ui/capabilities` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::GET /api/agents/{selected_agent_name}/api/ui/contributions` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::PATCH /api/agents/{selected_agent_name}/api/features/{name}/config` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/agents/{selected_agent_name}/api/features/{name}/disable` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/agents/{selected_agent_name}/api/features/{name}/enable` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/agents/{selected_agent_name}/api/features/{name}/install` | D-3214 — shared-host package mutation lacks sovereign/delegated enforcement. |
+| `kestrel_sovereign/endpoints/features.py::POST /api/agents/{selected_agent_name}/api/features/{name}/remove` | D-3214 — shared-host package mutation lacks sovereign/delegated enforcement. |
+| `kestrel_sovereign/endpoints/files.py::GET /api/agents/{selected_agent_name}/api/agent/channels/{channel_type}/link-qr.png` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/files.py::GET /api/agents/{selected_agent_name}/api/files/{content_hash}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/files.py::HEAD /api/agents/{selected_agent_name}/api/files/{content_hash}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/repos` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/github.py::GET /api/agents/{selected_agent_name}/api/github/{path:path}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/memories.py::DELETE /api/agents/{selected_agent_name}/api/memories/{node_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/identity-chain` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/memories` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/memories.py::GET /api/agents/{selected_agent_name}/api/memories/{node_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/metrics.py::GET /api/agents/{selected_agent_name}/metrics` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/agents/{agent_name}` | H — host/fleet discovery or lifecycle; #3149 policy enforces mutations. |
+| `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/keys/user/{provider}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{selected_agent_name}/api/keys/{provider}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/agents` | H — host/fleet discovery or lifecycle; #3149 policy enforces mutations. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/constitution` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/embedding/models` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/embedding/reindex/{job_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/embedding/settings` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/identity` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/ipfs/status` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/available-sources` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/platform` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/user` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/keys/{provider}/usage` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/model/current` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/models` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/api/wallet` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/agents/{selected_agent_name}/v1/models` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::PATCH /api/agents/{selected_agent_name}/api/identity` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::PATCH /api/agents/{selected_agent_name}/api/keys/{provider}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/agents` | H — host/fleet discovery or lifecycle; #3149 policy enforces mutations. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/embedding/reindex` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/embedding/route-model` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/embedding/settings` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/embedding/space/verify` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/identity/avatar` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/identity/avatar/generate` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/keys/user/verify` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/api/model/set` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::POST /api/agents/{selected_agent_name}/v1/chat/completions` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::PUT /api/agents/{selected_agent_name}/api/embedding/route-model` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/models.py::PUT /api/agents/{selected_agent_name}/api/embedding/settings` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/observability.py::GET /api/agents/{selected_agent_name}/api/observability/metrics/{metric_name}` | D-3215 — shared PostgreSQL read lacks a trusted selected-agent predicate. |
+| `kestrel_sovereign/endpoints/observability.py::GET /api/agents/{selected_agent_name}/api/observability/summary` | D-3215 — shared PostgreSQL read lacks a trusted selected-agent predicate. |
+| `kestrel_sovereign/endpoints/rasa_shim.py::POST /api/agents/{selected_agent_name}/webhooks/rest/webhook` | W — target-selected ingress; source auth/rate limit enforce; no hierarchy grant. |
+| `kestrel_sovereign/endpoints/restart_events.py::GET /api/agents/{selected_agent_name}/api/restart/status-events` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::DELETE /api/agents/{selected_agent_name}/api/saved-items/{item_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/by-schema/{schema_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/by-tag/{tag}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/schemas` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/stats` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/tags` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::GET /api/agents/{selected_agent_name}/api/saved-items/{item_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::PATCH /api/agents/{selected_agent_name}/api/saved-items/{item_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::POST /api/agents/{selected_agent_name}/api/saved-items` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::POST /api/agents/{selected_agent_name}/api/saved-items/search` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::POST /api/agents/{selected_agent_name}/api/saved-items/structured` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/saved_items.py::POST /api/agents/{selected_agent_name}/api/saved-items/{item_id}/pin` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::DELETE /api/agents/{selected_agent_name}/api/security/auto-approve/rules/{rule_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/audit` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/auto-approve/audit` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/auto-approve/rules` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/auto-mode` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/pending` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::GET /api/agents/{selected_agent_name}/api/security/permissions/tree` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/approve` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/auto-mode` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/cancel-all` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/cancel/{request_id}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/permissions` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/permissions/feature` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/security.py::POST /api/agents/{selected_agent_name}/api/security/reset-session` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/sovereignty/exports` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/sovereignty/files` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/sovereignty/files/{filename}` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/sovereignty/files/{filename}/preview` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/storage/stats` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::POST /api/agents/{selected_agent_name}/api/sovereignty/export` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/sovereignty.py::POST /api/agents/{selected_agent_name}/api/sovereignty/import` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/spawn.py::GET /api/agents/{selected_agent_name}/api/spawn/children` | D-3142 — unverified process-local child relation. |
+| `kestrel_sovereign/endpoints/ui.py::GET /api/agents/{selected_agent_name}/api/ui/theme` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/ui.py::GET /api/agents/{selected_agent_name}/api/ui/themes` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/bridge/router.py::GET /api/agents/{selected_agent_name}/api/bridge/capabilities` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/bridge/router.py::GET /api/agents/{selected_agent_name}/api/bridge/health` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/invoke` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/session` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/bridge/router.py::POST /api/agents/{selected_agent_name}/api/bridge/stream` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/web_search/feature.py::GET /api/agents/{selected_agent_name}/api/features/web_search/test` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/features/webhooks/receiver.py::POST /api/agents/{selected_agent_name}/webhooks/{webhook_name}` | W — target-selected ingress; source auth/rate limit enforce; no hierarchy grant. |
+| `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::DELETE /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/auth/key` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/host/csrf` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/api/host/ui/contributions` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/assets/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/health` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/health/detailed` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::GET /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/assets/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::HEAD /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::PATCH /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::PATCH /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::POST /api/agents/{selected_agent_name}/api/host/phoenix/session` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::POST /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::POST /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::PUT /api/agents/{selected_agent_name}/phoenix` | H — explicit operator/public policy; selected-agent context is not authority. |
+| `kestrel_sovereign/server.py::PUT /api/agents/{selected_agent_name}/phoenix/{path:path}` | H — explicit operator/public policy; selected-agent context is not authority. |
 
 ## Review rule
 
