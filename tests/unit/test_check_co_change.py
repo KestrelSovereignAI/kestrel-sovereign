@@ -1434,9 +1434,9 @@ def test_a_pure_rename_is_analysed_not_invisible(repo: Path) -> None:
 
 
 def test_a_renamed_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
-    # A PURE rename (identical bytes, so no hunks): only the rename seeding
-    # ever looks at the new path, and it must record what it could not read
-    # under that path — collect's own guard sees the old path alone.
+    # A PURE rename (identical bytes, so no hunks): collect's rename loop
+    # reads the OLD blob, and when that will not parse it must record the
+    # NEW path as NOT ANALYSED — the path the reader would look for.
     (repo / "mod.py").write_bytes(b'# caf\xe9\nA = "tool_execution"\n')  # latin-1
     _commit(repo)
     _run(repo, "mv", "mod.py", "moved.py")
@@ -1620,6 +1620,7 @@ def test_a_copy_with_edits_records_no_removals_from_its_source(repo: Path) -> No
     (repo / "a.py").write_text(
         'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 1\n'
     )
+    (repo / "zz.py").write_text('Z = "tool_execution"\n')
     _commit(repo)
     _run(repo, "config", "diff.renames", "copies")
     (repo / "b.py").write_text(
@@ -1630,11 +1631,15 @@ def test_a_copy_with_edits_records_no_removals_from_its_source(repo: Path) -> No
         'A = "tool_execution"\nB = "tool_execution"\nC = "tool_execution"\nPAD = 9\n'
     )
 
+    # A file sorting AFTER the copy target in git's entry order: the per-entry
+    # `is_copy` reset is what lets its `---` header key the old map again.
+    (repo / "zz.py").write_text('Z = "subagent_dispatch"\n')
+
     new_map, old_map = changed = checker.changed_line_map(["HEAD"])
-    assert old_map == {"a.py": {4}}, changed
+    assert old_map == {"a.py": {4}, "zz.py": {1}}, changed
     assert new_map.get("b.py") == {1} and new_map.get("a.py") == {4}, changed
-    # Nothing removed "tool_execution" anywhere, so nothing is surfaced for it.
-    assert [f.name for f in _findings(repo) if f.name == "tool_execution"] == []
+    finding = _named(_findings(repo), "tool_execution")
+    assert [(o.path, o.line) for o in finding.changed] == [("zz.py", 1)], finding
 
 
 # --------------------------------------------------------------------------
@@ -1700,3 +1705,74 @@ def test_counts_across_a_rename_reconcile_through_it(repo: Path) -> None:
     finding = _named(_findings(repo), "shared")
     assert len(finding.changed) == 1 and len(finding.unchanged) == 2, finding
     assert "modified 1 of 3 call sites" in checker.render([finding])
+
+
+# --------------------------------------------------------------------------
+# Round 20: the module's own name is a stranded reference too; the literal
+# reconciliation, the copy target's read guard and the method filter get the
+# tests that discriminate them.
+# --------------------------------------------------------------------------
+
+def test_a_pure_rename_surfaces_bare_imports_of_the_module(repo: Path) -> None:
+    """``import mod`` and ``mod.TIMEOUT`` are bound to the module PATH, not to
+    any definition in it; a constants-only module has no definition at all.
+    Both read clean while user.py raised ModuleNotFoundError."""
+    (repo / "mod.py").write_text("TIMEOUT = 30\n")
+    (repo / "user.py").write_text("import mod\n\n\ndef f():\n    return mod.TIMEOUT\n")
+    (repo / "pkguser.py").write_text("from pkg import mod\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    finding = _named(_findings(repo), "mod")
+    assert {(o.path, o.line) for o in finding.unchanged} >= {("user.py", 1), ("user.py", 5), ("pkguser.py", 1)}, finding
+    assert checker.main(["--strict"]) == 1
+
+
+def test_a_pure_rename_of_a_class_only_module_surfaces_no_method(repo: Path) -> None:
+    """A method moves with its class, and attribute access does not depend on
+    the module path — reporting ``q.dispatch(1)`` for it is the noise the
+    docstring says trains suppression."""
+    (repo / "mod.py").write_text("class Queue:\n    def dispatch(self, x):\n        return x\n")
+    (repo / "user.py").write_text("from mod import Queue\n\nq = Queue()\nq.dispatch(1)\n")
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+
+    findings = _findings(repo)
+    assert "dispatch" not in {f.name for f in findings}, findings
+    assert {(o.path, o.line) for o in _named(findings, "Queue").unchanged} == {("user.py", 1), ("user.py", 3)}
+
+
+def test_literal_counts_across_a_rename_reconcile_through_it(repo: Path) -> None:
+    """The literal twin of the symbol reconciliation: reverting it to a path
+    match counted the old blob's sites a second time — 'modified 3 of 4' for
+    three occurrences with two edited."""
+    (repo / "mod.py").write_text(
+        'A = "tool_execution"\nB = ["tool_execution", 1]\n' + "".join(f"PAD{i} = {i}\n" for i in range(6))
+    )
+    (repo / "far.py").write_text('D = "tool_execution"\n')
+    _commit(repo)
+    _run(repo, "mv", "mod.py", "newmod.py")
+    (repo / "newmod.py").write_text(
+        'A = "subagent_dispatch"\nB = ["tool_execution", 2]\n' + "".join(f"PAD{i} = {i}\n" for i in range(6))
+    )
+
+    finding = _named(_findings(repo), "tool_execution")
+    assert len(finding.changed) == 2 and [(o.path, o.line) for o in finding.unchanged] == [("far.py", 1)], finding
+    assert "modified 2 of 3 occurrences" in checker.render([finding])
+
+
+def test_a_copied_file_that_cannot_be_read_is_not_analysed(repo: Path) -> None:
+    """The copy target is the one remaining whole-file seed; a target the gate
+    cannot read must land in NOT ANALYSED under its own path."""
+    latin1 = b'# caf\xe9\nA = "tool_execution"\nPAD = 1\n'
+    (repo / "a.py").write_bytes(latin1)
+    _commit(repo)
+    _run(repo, "config", "diff.renames", "copies")
+    (repo / "b.py").write_bytes(latin1)  # a byte copy: no hunks, so the seed is the only reader
+    _run(repo, "add", "b.py")
+    (repo / "a.py").write_bytes(latin1.replace(b"PAD = 1", b"PAD = 9"))
+
+    new_map, _ = checker.changed_line_map(["HEAD"])
+    assert "b.py" not in new_map and "b.py" in checker._UNANALYSED
+    assert "b.py" in _unparseable(repo)
+    assert checker.main(["--strict"]) == 1

@@ -188,8 +188,9 @@ def changed_line_map(
     # untouched sites inside a renamed-and-edited file as touched (a false
     # clean); seeding the source's lines double-counted them. What a rename
     # actually changes is the module path: every reference bound to the old
-    # one is stranded, edits or not — ``collect`` raises exactly those from
-    # the old file's module-level definitions. The entry's hunks, if any,
+    # one is stranded, edits or not — ``collect`` raises the old file's
+    # module-level definitions AND the module's own name (``import mod``,
+    # ``from pkg import mod``, ``mod.attr``). The entry's hunks, if any,
     # key the maps like a plain edit. A COPY target is a new file (its lines
     # all new, like an untracked file) only when the entry has no hunks, so
     # that seed is buffered and applied when the entry ends.
@@ -481,6 +482,13 @@ def _build_index(tree: ast.AST) -> FileIndex:
             for entry in node.names:
                 index.imported_modules.add(entry.name)
                 index.imported_modules.add(entry.name.rsplit(".", 1)[-1])
+                # ``import mod`` binds the MODULE name: a rename of mod.py
+                # strands this line whether or not anything below uses it.
+                start = getattr(entry, "lineno", node.lineno) or node.lineno
+                end = getattr(entry, "end_lineno", start) or start
+                index.import_bindings.setdefault(
+                    entry.name.rsplit(".", 1)[-1], []
+                ).append((start, end))
 
     # Bare references, excluding the callee nodes already recorded as calls, so
     # ``Worker()`` is one use rather than two.
@@ -867,6 +875,8 @@ def collect(
         every_line = set(range(1, len(source.splitlines()) + 1))
         for name, kind in modified_symbols(source, moved_from, every_line).items():
             if name not in module_level:
+                # A method moves with its class; attribute access does not
+                # depend on the module path.
                 continue
             if name not in symbols:
                 rename_only[name] = moved_to
@@ -875,6 +885,16 @@ def collect(
                 "method" if "method" in (existing_kind, kind) else kind,
                 paths | {moved_from},
             )
+        # The module's OWN name: ``import mod``, ``from pkg import mod`` and
+        # ``mod.TIMEOUT`` are bound to the path, not to any definition in it,
+        # and a constants-only or side-effect module has no definition at
+        # all. A package's ``__init__`` is reached by the package name.
+        stem = moved_from[:-3].rsplit("/", 1)[-1]
+        if stem == "__init__" and "/" in moved_from:
+            stem = moved_from[:-3].rsplit("/", 2)[-2]
+        if stem and stem not in symbols:
+            rename_only[stem] = moved_to
+            symbols[stem] = ("module", {moved_from})
 
     findings: list[Finding] = []
     structural: list[tuple[str, int]] = []
@@ -926,7 +946,7 @@ def collect(
             old_tree = _parse(source, path)
             return old_tree is not None and name in _build_index(old_tree).module_definitions
 
-        imports_at_risk = any(
+        imports_at_risk = kind == "module" or any(
             _module_level_at(path, old_sources[path])
             and (
                 (index := index_for(path)) is None
@@ -935,11 +955,13 @@ def collect(
             for path in defining_paths
             if path in old_sources
         )
-        defined_before = any(
+        defined_before = kind == "module" or any(
             (tree := _parse(source, path)) is not None
             and defines(_build_index(tree), name)
             for path, source in old_sources.items()
         )
+        # A module symbol is "defined" by the old path existing; no AST node
+        # defines it, so the positive control does not apply.
         if not (defined_now or defined_before):
             raise DetectorBroken(
                 f"the definition of {name!r} was parsed from the diff but cannot "
