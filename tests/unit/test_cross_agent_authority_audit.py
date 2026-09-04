@@ -1389,6 +1389,51 @@ def _provenance_aliases(
     return aliases
 
 
+def _contains_cross_agent_control_call(nodes: ast.AST | list[ast.AST]) -> bool:
+    """Return whether a guarded expression/body invokes an agent control.
+
+    Authority checks are often wrapped by generic adapters named ``execute``
+    or ``dispatch``.  In those cases the enclosing function and condition can
+    both be neutrally named even though the branch controls another agent.
+    Inspect the guarded operation itself, while stopping at nested lexical
+    scopes whose calls are not executed merely because the outer branch ran.
+    """
+
+    roots = nodes if isinstance(nodes, list) else [nodes]
+
+    class ControlCallVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast API
+            if _is_cross_agent_control_name(_call_name(node)):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_FunctionDef(  # noqa: N802 - ast API
+            self, node: ast.FunctionDef
+        ) -> None:
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802 - ast API
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = ControlCallVisitor()
+    for root in roots:
+        visitor.visit(root)
+        if visitor.found:
+            return True
+    return False
+
+
 def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     lines: set[int] = set()
     functions = [
@@ -1455,20 +1500,30 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     lines.add(node.lineno)
                 continue
             if isinstance(node, ast.Match):
-                if function_is_permission_boundary and _has_provenance_token(
-                    node.subject, provenance_aliases
+                if _has_provenance_token(node.subject, provenance_aliases) and (
+                    function_is_permission_boundary
+                    or _contains_cross_agent_control_call(
+                        [statement for case in node.cases for statement in case.body]
+                    )
                 ):
                     lines.add(node.lineno)
                 continue
-            if not isinstance(node, (ast.If, ast.IfExp, ast.Assert)):
+            if not isinstance(node, (ast.If, ast.IfExp, ast.Assert, ast.While)):
                 continue
             tokens = _identifier_tokens(node.test)
             has_provenance = _has_provenance_token(
                 node.test, provenance_aliases
             )
             has_permission = any(_is_permission_name(token) for token in tokens)
+            guarded_nodes: list[ast.AST] = [node.test]
+            if isinstance(node, (ast.If, ast.While)):
+                guarded_nodes.extend([*node.body, *node.orelse])
+            elif isinstance(node, ast.IfExp):
+                guarded_nodes.extend([node.body, node.orelse])
             if has_provenance and (
-                has_permission or function_is_permission_boundary
+                has_permission
+                or function_is_permission_boundary
+                or _contains_cross_agent_control_call(guarded_nodes)
             ):
                 lines.add(node.lineno)
     return lines
@@ -1596,6 +1651,24 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    request.state.snapshot = request.causation_chain\n"
         "    return request\n"
     )
+    neutral_guarded_control = ast.parse(
+        "async def execute(request):\n"
+        "    if request.causation_chain:\n"
+        "        await terminate_child(request.target)\n\n"
+        "def dispatch(request):\n"
+        "    return cancel_task(request.target) if request.causation_chain else None\n\n"
+        "def adapter(request):\n"
+        "    match request.causation_chain:\n"
+        "        case []:\n"
+        "            return None\n"
+        "        case _:\n"
+        "            return stop_peer(request.target)\n"
+    )
+    propagation_only_guard = ast.parse(
+        "def dispatch(request, metadata):\n"
+        "    if request.causation_chain:\n"
+        "        metadata['causation_chain'] = request.causation_chain\n"
+    )
     assert _authority_provenance_lines(enclosing) == {2}
     assert _authority_provenance_lines(metadata_key) == {2}
     assert _authority_provenance_lines(direct_return) == {2}
@@ -1616,6 +1689,8 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(permission_mapping) == {2}
     assert _authority_provenance_lines(permission_match) == {2}
     assert _authority_provenance_lines(unrelated_attribute_assignment) == set()
+    assert _authority_provenance_lines(neutral_guarded_control) == {2, 6, 9}
+    assert _authority_provenance_lines(propagation_only_guard) == set()
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
