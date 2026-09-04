@@ -1802,6 +1802,49 @@ async def test_every_global_read_rejects_receipt_missing_operation_witness(hold_
 
 
 @pytest.mark.asyncio
+async def test_every_global_read_rejects_duplicate_operation_witness(hold_db):
+    """A damaged legacy key cannot make boot accept ambiguous evidence."""
+
+    db, store = hold_db
+    held = await store.set_hold(
+        scope="agent",
+        target_id="did:agent:duplicate-operation-witness",
+        actor_id="did:sovereign:operator",
+        reason="witness identity must remain unique",
+        operation_id="operation-with-duplicate-witness",
+    )
+    await db.execute(
+        "ALTER TABLE hold_operation_witnesses "
+        "RENAME TO hold_operation_witnesses_valid"
+    )
+    await db.execute(
+        "CREATE TABLE hold_operation_witnesses ("
+        "operation_id TEXT NOT NULL, receipt_id TEXT NOT NULL)"
+    )
+    await db.execute(
+        "INSERT INTO hold_operation_witnesses "
+        "SELECT operation_id, receipt_id FROM hold_operation_witnesses_valid"
+    )
+    await db.execute(
+        "INSERT INTO hold_operation_witnesses "
+        "SELECT operation_id, receipt_id FROM hold_operation_witnesses_valid"
+    )
+    await db.execute("DROP TABLE hold_operation_witnesses_valid")
+
+    readers = (
+        store.ensure_schema,
+        store.read_boot_state,
+        lambda: store.get_hold(held.receipt.scope, held.receipt.target_id),
+    )
+    for reader in readers:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="duplicate operation identity",
+        ):
+            await reader()
+
+
+@pytest.mark.asyncio
 async def test_boot_discovers_target_retained_only_by_content_and_count_witnesses(
     hold_db,
 ):

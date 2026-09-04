@@ -2172,6 +2172,7 @@ class HoldStore:
         await self._assert_no_missing_operation_witnesses(
             context="completed Hold witness migration",
         )
+        await self._assert_no_duplicate_operation_witnesses()
         await self._assert_no_orphaned_operation_witnesses()
 
         missing_count = await self._db.fetchone(
@@ -2203,6 +2204,18 @@ class HoldStore:
         if missing_operation is not None:
             raise HoldCorruptStateError(f"{context} is missing an operation witness")
 
+    async def _assert_no_duplicate_operation_witnesses(self) -> None:
+        """Reject imported operation evidence whose nominal key is ambiguous."""
+
+        duplicate = await self._db.fetchone(
+            "SELECT operation_id FROM hold_operation_witnesses "
+            "GROUP BY operation_id HAVING COUNT(*) > 1 LIMIT 1"
+        )
+        if duplicate is not None:
+            raise HoldCorruptStateError(
+                "Hold operation witness has a duplicate operation identity"
+            )
+
     async def _assert_no_orphaned_operation_witnesses(self) -> None:
         """Reject append-only operation evidence without its immutable receipt."""
 
@@ -2220,6 +2233,7 @@ class HoldStore:
     async def _assert_global_history_intact(self) -> None:
         """Validate database-wide receipt evidence once per stable snapshot."""
 
+        await self._assert_no_duplicate_operation_witnesses()
         await self._assert_no_missing_operation_witnesses()
         await self._assert_no_orphaned_operation_witnesses()
         await self._assert_history_anchor_intact()
