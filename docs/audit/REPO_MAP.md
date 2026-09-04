@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-03
-**Scope:** 2377 tracked files (1609 `.py`, 346 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-09-04
+**Scope:** 2382 tracked files (1614 `.py`, 346 `.md`, 422 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -506,7 +506,7 @@ Repo entry points and standard project files.
   - `def normalize_choice(value, aliases)`; `def coerce_enum(value, valid)`
 - **kestrel_sovereign/features/health/__init__.py** — Health Feature - periodic liveness probes for the agent.
 - **kestrel_sovereign/features/health/checks.py** — Individual health check functions for the Heartbeat Feature.
-  - `def derive_overall_status(checks)`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_scheduler_liveness(agent, db)`; `async def check_bootstrap_state(agent, threshold_seconds)`; `…`
+  - `def derive_overall_status(checks)`; `def worst_status()`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_scheduler_liveness(agent, db)`; `…`
 - **kestrel_sovereign/features/health/feature.py** — Health Feature - periodic liveness probes.
   - `class HealthFeature`
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
@@ -1447,6 +1447,8 @@ Repo entry points and standard project files.
   - `class QualityMetrics`; `def cosine(a, b)`; `def rank_query()`; `def summarize(query_results)`; `async def evaluate(args)`; `def build_parser()`; `def main()`
 - **scripts/build_docs_site.py** — Project the OKF docs corpus into a published documentation site.
   - `def select_pages(docs_root)`; `def rewrite_local_images(body, src_dir, url_prefix)`; `def rewrite_local_links(body, src_dir)`; `class StarlightEmitter`; `class MintlifyEmitter`; `def build_site()`; `def main()`
+- **scripts/check_co_change.py** — Surface the sites a diff did **not** touch that share a symbol or literal with it.
+  - `class DetectorBroken`; `class Occurrence`; `class Finding`; `def changed_line_map(diff_spec)`; `class FileIndex`; `def index_for(path, ref)`; `def untracked_python_files()`; `def alias_closure(name)`; `…`
 - **scripts/check_docs_links.py** — Check repository-local relative Markdown links for broken targets.
   - `class Link`; `class BrokenLink`; `def github_slug(text)`; `class GithubSlugger`; `def anchors_for(text)`; `def extract_links(text)`; `def resolve_link(source, raw_target)`; `def check_text(source, text)`; `…`
 - **scripts/ci/__init__.py** — —
@@ -2608,6 +2610,8 @@ Repo entry points and standard project files.
   - `class StubAdapter`; `class FailingAdapter`; `class TestChannelMessage`; `class TestDeliveryReceipt`; `class TestChannelConfig`; `class TestChannelAdapterContract`; `class TestChannelRegistry`; `class TestChannelFeature`; `…`
 - **tests/unit/test_cheap_model_scoping_contracts.py** — Contract tests for vendor-scoped cheap-model selection.
   - `def test_no_config_no_hints_returns_none()`; `def test_hints_match_returns_vendor_scoped_selector()`; `def test_no_matching_hint_returns_none()`; `def test_explicit_cheap_model_selector_honored()`; `def test_cheap_model_auto_falls_through_to_hints()`; `def test_get_cheap_model_backcompat_returns_bare_model()`
+- **tests/unit/test_check_co_change.py** — Tests for the co-change surfacing gate (``scripts/check_co_change.py``, #3124).
+  - `def repo(tmp_path, monkeypatch)`; `def test_candidate_prefilter_finds_the_file_under_real_git_grep(repo)`; `def test_detector_broken_raises_when_a_known_symbol_finds_nothing(repo, monkeypatch)`; `def test_modified_function_surfaces_untouched_call_sites(repo)`; `def test_removed_literal_surfaces_siblings_under_the_old_name(repo)`; `def test_clean_when_the_diff_touches_every_sharing_site(repo)`; `def test_short_and_noise_literals_are_not_surfaced(repo)`; `def test_changed_definition_line_is_not_counted_as_a_touched_call_site(repo)`; `…`
 - **tests/unit/test_check_policy_guard.py** — Reflection test for the LLMService._check_policy() guard.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
@@ -2868,6 +2872,8 @@ Repo entry points and standard project files.
   - `class TestIterationTrackerRecord`; `class TestIterationTrackerShouldStop`; `class TestIterationTrackerIntegration`; `class TestDiminishingReturnsConstants`
 - **tests/unit/test_direct_tool_security_feature_name.py** — Direct-tool dispatch must use the PascalCase feature name for security lookups (#1427).
   - `class TestSecurityFeatureNameForTool`; `class TestDirectToolDispatchUsesPascalcaseFeatureName`
+- **tests/unit/test_discovery_failure_does_not_veto_mandate.py** — A persisted model pin must survive a discovery outage (#3186 / #3190).
+  - `class TestReplayedPinIsNotRevalidated`; `class TestUnrelatedGuardsAreUnchanged`; `class TestDiscoveryFailuresAreRecorded`; `class TestRecordDiscoverySeam`; `class TestHelpersRaiseRatherThanSwallow`; `class TestVendorAttributionInGather`; `class TestMandateLoadErrorLifecycle`; `class TestSkippedDiscoveryDoesNotClearAFailure`; `…`
 - **tests/unit/test_discovery_hang_regression.py** — Regression tests for the post-#1110 discovery wedge.
   - `async def test_generate_with_messages_lazy_resolves_auto_models()`; `async def test_streaming_path_lazy_resolves_auto_models()`; `async def test_ensure_models_discovered_skips_when_already_resolved()`; `async def test_ensure_models_discovered_never_runs_global_discovery_when_local_only()`; `async def test_ensure_models_discovered_resolves_local_auto_when_local_only()`; `async def test_resolve_local_auto_routes_contacts_local_routes_only()`; `async def test_resolve_local_auto_routes_does_not_mutate_cloud_sharing_vendor()`; `async def test_process_discovery_message_times_out_on_llm_hang()`; `…`
 - **tests/unit/test_docker_db_path_reconciliation.py** — Drift guards for Docker ``KESTREL_DB_PATH`` directory semantics.
@@ -3230,6 +3236,8 @@ Repo entry points and standard project files.
   - `def test_pqcrypto_installed_and_importable()`; `def test_mldsa65_suite_self_registers()`; `def test_mldsa65_classified_as_post_quantum()`; `def test_mldsa65_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_204_cat_3()`; `def suite()`; `def keypair(suite)`; `def test_keypair_carries_correct_suite_id(keypair)`; `…`
 - **tests/unit/test_model_catalog.py** — Unit tests for ModelCatalogService in model_catalog.py
   - `class TestModelCatalogServiceInit`; `class TestModelCatalogServiceLoad`; `class TestModelCatalogServiceEnrich`; `class TestModelCatalogServiceHelpers`; `class TestCatalogServiceSingleton`; `class TestCatalogWithRealConfig`; `class TestContextLimits`; `class TestTokenCounterCatalogIntegration`; `…`
+- **tests/unit/test_model_discovery_health_surface.py** — A dead model-discovery credential must be visible on the health surface (#3190).
+  - `class TestModelDiscoveryCheck`; `class TestLlmServiceSurfacesDroppedMandate`; `class TestRegisteredInTheSharedList`; `class TestWorstStatus`
 - **tests/unit/test_model_discovery_stale_while_revalidate.py** — Latency contract for stale-while-revalidate model catalog reads.
   - `async def test_stale_catalog_returns_without_awaiting_provider_refresh(monkeypatch)`; `async def test_fresh_caller_joins_inflight_background_refresh(monkeypatch)`
 - **tests/unit/test_model_metadata.py** — Unit tests for ModelInfo and ModelCategory in model_metadata.py
@@ -3466,6 +3474,8 @@ Repo entry points and standard project files.
   - `async def test_current_writer_persists_saved_item_content_as_plaintext(tmp_path)`
 - **tests/unit/test_scheduler_durability.py** — Durability contracts for scheduler claims, leases, deadlines, and zones.
   - `async def test_two_database_runners_claim_one_occurrence(tmp_path)`; `async def test_file_sqlite_concurrent_bootstrap_serializes_schema_and_all_did_seeding(tmp_path)`; `async def test_file_sqlite_concurrent_builtin_seeders_insert_each_default_once(tmp_path)`; `async def test_dynamic_registration_rollback_preserves_other_replica_rows(tmp_path)`; `async def test_dynamic_registration_rollback_preserves_schedule_adopted_by_claim_or_mutation(tmp_path, shared_action)`; `async def test_mutators_reject_future_target_schedule_without_overwriting_it(tmp_path, operation)`; `async def test_schedule_mutators_preserve_legacy_target_for_rollout_fencing(tmp_path, operation, legacy_marker)`; `async def test_record_outcome_rejects_claimed_execution_but_accepts_terminal_log(tmp_path)`; `…`
+- **tests/unit/test_scheduler_failure_reason_code.py** — The bounded failure reason a scheduled tool hands back (#3184).
+  - `def test_reason_code_is_read_from_a_toolresult()`; `def test_reason_code_is_read_from_a_dict_result()`; `def test_absent_reason_code_yields_empty_so_the_message_is_unchanged(caplog)`; `def test_undeclared_values_never_cross_the_boundary(value)`; `def test_an_undeclared_value_is_logged_by_tool_name_never_by_value(caplog)`; `def test_a_non_string_reason_code_is_ignored()`; `def test_a_declared_code_is_admitted_whatever_its_spelling()`; `def test_a_declared_code_that_is_prose_still_cannot_cross(caplog)`; `…`
 - **tests/unit/test_scheduler_feature.py** — Unit tests for the SchedulerFeature and SchedulerRunner.
   - `async def feature()`; `async def feature_no_db()`; `class TestSchedulerTools`; `class TestScheduleList`; `class TestRetiredCronCleanup`; `class TestSleepCronHandler`; `class TestSleepActivityGateSoftDelete`; `class TestScheduleAdd`; `…`
 - **tests/unit/test_scheduler_timezone_dependencies.py** — Base-install contracts for scheduler time-zone evaluation.
@@ -3617,7 +3627,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sleep_hook_phases.py** — Focused post-consolidation phase and dependency coverage (#2749).
   - `async def test_artifact_sweep_failure_reports_failure_but_runs_other_sleep_phases()`; `async def test_storage_without_artifact_sweep_capability_skips_it_as_unconfigured()`; `async def test_annotated_hooks_are_ordered_by_phase_and_identity_not_registration()`; `async def test_before_dependency_reorders_hooks_within_one_phase()`; `async def test_legacy_post_hooks_keep_registration_order_and_continue_after_failure()`; `async def test_legacy_registration_does_not_constrain_annotated_phase_order()`; `async def test_mixed_legacy_registration_cannot_create_a_phase_cycle()`; `async def test_invalid_post_hook_result_does_not_abort_later_hooks(caplog)`; `…`
 - **tests/unit/test_sleep_observability.py** — Contracts for privacy-safe semantic maintenance sleep observability.
-  - `def test_sleep_report_renders_distinct_bounded_maintenance_statuses(status, success, reason, expected_heading)`; `def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors()`; `def test_sleep_diagnostics_expose_verified_capabilities_and_repair_guidance()`; `def test_sleep_diagnostics_reject_version_shaped_unregistered_capability_labels()`; `def test_sleep_diagnostics_marks_absent_producer_profile_and_ontology_as_omitted()`; `async def test_consolidate_only_command_includes_safe_maintenance_summary()`; `def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary()`
+  - `def test_sleep_report_renders_distinct_bounded_maintenance_statuses(status, success, reason, expected_heading)`; `def test_sleep_report_maintenance_renderer_redacts_content_ids_and_raw_errors()`; `def test_sleep_diagnostics_expose_verified_capabilities_and_repair_guidance()`; `def test_sleep_diagnostics_reject_version_shaped_unregistered_capability_labels()`; `def test_sleep_diagnostics_marks_absent_producer_profile_and_ontology_as_omitted()`; `async def test_consolidate_only_command_includes_safe_maintenance_summary()`; `def test_authenticated_invoke_preserves_consolidate_only_maintenance_summary()`; `def test_the_report_names_its_first_terminal_failure_not_the_skip()`; `…`
 - **tests/unit/test_sleep_wake_resilience.py** — Unit tests for host sleep/wake (suspend/resume) resilience (#1545).
   - `class TestSuspendGap`; `class TestResumeMonitor`; `class TestResumeMonitorConfig`; `class TestDispatcherReanchor`; `class TestSchedulerMisfireGrace`; `class TestHeartbeatGapAwareness`
 - **tests/unit/test_slhdsa_suite.py** — SLHDSASHA2128sSuite tests — Wave 3 sub-PR 1 (#918).
