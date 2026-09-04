@@ -427,28 +427,125 @@ def _router_prefix(
     tree: ast.Module,
     constants: dict[str, str] | None = None,
 ) -> str:
-    # Feature routers are commonly built inside ``get_router`` factories, so
-    # the APIRouter assignment is not necessarily at module scope.
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "router"
-            for target in node.targets
-        ):
-            continue
-        if not isinstance(node.value, ast.Call):
-            continue
-        for keyword in node.value.keywords:
-            if keyword.arg == "prefix":
-                prefix = _resolved_string(keyword.value, constants)
-                if prefix is None:
+    """Compatibility helper for tests with one module-level ``router``."""
+
+    return _scope_router_prefixes(tree.body, constants).get("router", "")
+
+
+def _scope_router_prefixes(
+    statements: list[ast.stmt],
+    constants: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve every APIRouter variable in one Python lexical scope."""
+
+    prefixes: dict[str, str] = {}
+
+    def collect(node: ast.AST) -> None:
+        # A nested function/class has its own names. Its routers are collected
+        # when route discovery descends into that lexical scope.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return
+
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+
+        if isinstance(value, ast.Call) and _call_name(value) == "APIRouter":
+            prefix = ""
+            for keyword in value.keywords:
+                if keyword.arg != "prefix":
+                    continue
+                resolved = _resolved_string(keyword.value, constants)
+                if resolved is None:
                     raise AssertionError(
                         "Unresolved APIRouter prefix expression: "
                         f"{ast.unparse(keyword.value)}"
                     )
-                return prefix
-    return ""
+                prefix = resolved
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    raise AssertionError(
+                        "APIRouter assignment target is not a simple name: "
+                        f"{ast.unparse(target)}"
+                    )
+                previous = prefixes.get(target.id)
+                if previous is not None and previous != prefix:
+                    raise AssertionError(
+                        f"Ambiguous APIRouter prefix for {target.id!r}: "
+                        f"{previous!r} and {prefix!r}"
+                    )
+                prefixes[target.id] = prefix
+
+        for child in ast.iter_child_nodes(node):
+            collect(child)
+
+    for statement in statements:
+        collect(statement)
+    return prefixes
+
+
+def _route_receiver_name(decorator: ast.Call) -> str | None:
+    if not isinstance(decorator.func, ast.Attribute):
+        return None
+    receiver = decorator.func.value
+    return receiver.id if isinstance(receiver, ast.Name) else None
+
+
+def _route_declarations(
+    tree: ast.Module,
+    string_constants: dict[str, str],
+    method_constants: dict[str, tuple[str, ...]],
+) -> list[tuple[tuple[str, ...], str]]:
+    """Return methods and canonical paths with receiver/scoped prefixes."""
+
+    declarations: list[tuple[tuple[str, ...], str]] = []
+
+    def walk_scope(
+        statements: list[ast.stmt],
+        inherited_prefixes: dict[str, str],
+    ) -> None:
+        prefixes = dict(inherited_prefixes)
+        prefixes.update(_scope_router_prefixes(statements, string_constants))
+
+        def visit(node: ast.AST) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for decorator in node.decorator_list:
+                    if not isinstance(decorator, ast.Call):
+                        continue
+                    methods = _route_methods(decorator, method_constants)
+                    if not methods:
+                        continue
+                    receiver = _route_receiver_name(decorator)
+                    if receiver == "app":
+                        prefix = ""
+                    elif receiver is not None and receiver in prefixes:
+                        prefix = prefixes[receiver]
+                    else:
+                        raise AssertionError(
+                            "Unresolved route decorator receiver: "
+                            f"{ast.unparse(decorator.func)}"
+                        )
+                    declarations.append(
+                        (methods, prefix + _route_path(decorator, string_constants))
+                    )
+                walk_scope(node.body, prefixes)
+                return
+            if isinstance(node, ast.ClassDef):
+                walk_scope(node.body, prefixes)
+                return
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+
+        for statement in statements:
+            visit(statement)
+
+    walk_scope(tree.body, {})
+    return declarations
 
 
 def _route_path(
@@ -573,35 +670,22 @@ def _discovered_http_surfaces() -> set[str]:
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         string_constants = _module_string_constants(tree, path)
-        prefix = _router_prefix(tree, string_constants)
         method_constants = _module_string_collections(tree, string_constants)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for methods, route in _route_declarations(
+            tree, string_constants, method_constants
+        ):
+            segments = {part for part in route.casefold().split("/") if part}
+            if (
+                route.casefold() not in HTTP_EXACT_ROUTES
+                and not segments.intersection(HTTP_SEGMENTS)
+            ):
                 continue
-            for decorator in node.decorator_list:
-                if not isinstance(decorator, ast.Call) or not isinstance(
-                    decorator.func, ast.Attribute
-                ):
-                    continue
-                methods = _route_methods(decorator, method_constants)
-                if not methods:
-                    continue
-                route_path = _route_path(decorator, string_constants)
-                if route_path is None:
-                    continue
-                route = prefix + route_path
-                segments = {part for part in route.casefold().split("/") if part}
-                if (
-                    route.casefold() not in HTTP_EXACT_ROUTES
-                    and not segments.intersection(HTTP_SEGMENTS)
-                ):
-                    continue
-                relative = path.relative_to(REPO_ROOT).as_posix()
-                for method in methods:
-                    surfaces.add(f"{relative}::{method} {route}")
-                    deprecated_alias = _deprecated_agent_alias(route)
-                    if deprecated_alias is not None:
-                        surfaces.add(f"{relative}::{method} {deprecated_alias}")
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            for method in methods:
+                surfaces.add(f"{relative}::{method} {route}")
+                deprecated_alias = _deprecated_agent_alias(route)
+                if deprecated_alias is not None:
+                    surfaces.add(f"{relative}::{method} {deprecated_alias}")
     return surfaces
 
 
@@ -634,30 +718,19 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
     for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         string_constants = _module_string_constants(tree, path)
-        prefix = _router_prefix(tree, string_constants)
         method_constants = _module_string_collections(tree, string_constants)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for methods, canonical_route in _route_declarations(
+            tree, string_constants, method_constants
+        ):
+            # The host regex requires a non-empty remaining path, so the
+            # canonical root has no multi-agent alias.
+            if canonical_route == "/":
                 continue
-            for decorator in node.decorator_list:
-                if not isinstance(decorator, ast.Call):
-                    continue
-                methods = _route_methods(decorator, method_constants)
-                if not methods:
-                    continue
-                route_path = _route_path(decorator, string_constants)
-                if route_path is None:
-                    continue
-                canonical_route = prefix + route_path
-                # The host regex requires a non-empty remaining path, so the
-                # canonical root has no multi-agent alias.
-                if canonical_route == "/":
-                    continue
-                relative = path.relative_to(REPO_ROOT).as_posix()
-                for method in methods:
-                    surfaces.add(
-                        f"{relative}::{method} {_agent_alias(canonical_route)}"
-                    )
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            for method in methods:
+                surfaces.add(
+                    f"{relative}::{method} {_agent_alias(canonical_route)}"
+                )
     return surfaces
 
 
@@ -965,6 +1038,24 @@ def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
     )
 
 
+def test_route_prefix_is_bound_to_receiver_and_lexical_scope() -> None:
+    tree = ast.parse(
+        'read_router = APIRouter(prefix="/api/read")\n'
+        'admin_router = APIRouter(prefix="/api/admin")\n'
+        '@admin_router.post("/agents")\n'
+        "def mutate():\n    pass\n\n"
+        "def get_router():\n"
+        '    router = APIRouter(prefix="/api/nested")\n'
+        '    @router.get("/children")\n'
+        "    def children():\n        pass\n"
+        "    return router\n"
+    )
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST",), "/api/admin/agents"),
+        (("GET",), "/api/nested/children"),
+    ]
+
+
 def test_imported_tool_name_constant_is_resolved_without_importing_code() -> None:
     path = REPO_ROOT / "kestrel_sovereign/features/security/feature.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -1185,7 +1276,11 @@ def _provenance_aliases(
         # Awaiting a helper that merely *receives* causation metadata does not
         # make its result provenance (for example ``fired = await
         # emit(..., causation_chain=chain)``).  Follow only direct accessors and
-        # boolean wrappers whose result still represents the metadata itself.
+        # transformations whose result still represents or measures the
+        # metadata itself. Predicate-shaped helpers are included because a
+        # value such as ``has_valid_causation(chain)`` is plainly intended for
+        # a later authority decision; arbitrary side-effect call results are
+        # not, even when the call carries lineage for propagation.
         while isinstance(value, (ast.Await, ast.Expr)):
             value = value.value
         if isinstance(
@@ -1207,18 +1302,47 @@ def _provenance_aliases(
             "copy",
             "deepcopy",
             "dict",
+            "enumerate",
+            "filter",
             "frozenset",
             "get",
             "getattr",
+            "len",
             "list",
+            "map",
+            "max",
+            "min",
+            "reversed",
             "set",
+            "sorted",
+            "sum",
             "tuple",
         }:
             return _has_provenance_token(value, aliases)
-        # Boolean normalization does not erase the authority input. Common
-        # forms such as ``allowed = chain is not None`` and ``has_chain = not
-        # not chain`` remain provenance-derived when used by a later gate.
-        if isinstance(value, (ast.Compare, ast.BoolOp, ast.UnaryOp, ast.IfExp)):
+        if isinstance(value, ast.Call):
+            call_name = _call_name(value).casefold()
+            if call_name.startswith(("can_", "has_", "is_", "may_")) or (
+                _is_permission_name(call_name)
+                and _has_provenance_token(value, aliases)
+            ):
+                return _has_provenance_token(value, aliases)
+        # Normalization does not erase the authority input. Comparisons,
+        # arithmetic, comprehensions, and conditional expressions remain
+        # provenance-derived when a later gate consumes their result.
+        if isinstance(
+            value,
+            (
+                ast.BinOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.DictComp,
+                ast.GeneratorExp,
+                ast.IfExp,
+                ast.ListComp,
+                ast.SetComp,
+                ast.UnaryOp,
+            ),
+        ):
             return _has_provenance_token(value, aliases)
         return False
 
@@ -1410,6 +1534,19 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    chain = [*request.causation_chain]\n"
         "    return bool(chain)\n"
     )
+    derived_values = ast.parse(
+        "def authorize_length(request):\n"
+        "    chain_len = len(request.causation_chain)\n"
+        "    if chain_len:\n"
+        "        return True\n\n"
+        "def authorize_comprehension(request):\n"
+        "    chain = [frame for frame in request.causation_chain]\n"
+        "    return bool(chain)\n\n"
+        "def authorize_predicate(request):\n"
+        "    trusted = has_valid_causation(request.causation_chain)\n"
+        "    if trusted:\n"
+        "        return True\n"
+    )
     authority_helper = ast.parse(
         "def scheduler_authority_for(request):\n"
         "    return bool(request.causation_chain)\n"
@@ -1468,6 +1605,7 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(compared_alias) == {2, 3}
     assert _authority_provenance_lines(permission_call_alias) == {3}
     assert _authority_provenance_lines(collection_wrappers) == {3, 8, 12}
+    assert _authority_provenance_lines(derived_values) == {3, 8, 12}
     assert _authority_provenance_lines(authority_helper) == {2}
     assert _authority_provenance_lines(access_helper) == {2}
     assert _authority_provenance_lines(require_call) == {3}

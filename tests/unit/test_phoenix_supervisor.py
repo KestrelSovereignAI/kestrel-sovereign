@@ -1225,18 +1225,22 @@ def test_bare_phoenix_options_is_not_a_proxy_operation(monkeypatch):
 def test_phoenix_cors_preflight_remains_available(monkeypatch):
     """Removing bare OPTIONS must not remove browser CORS preflights."""
 
+    from server import CORS_ORIGINS
+
+    assert CORS_ORIGINS
+    configured_origin = CORS_ORIGINS[0]
     monkeypatch.setenv("KESTREL_API_KEY", "test-key-123")
     app = _client_with_state(None, monkeypatch)
     with TestClient(app) as client:
         r = client.options(
             "/phoenix/",
             headers={
-                "Origin": "http://localhost:3000",
+                "Origin": configured_origin,
                 "Access-Control-Request-Method": "GET",
             },
         )
     assert r.status_code == 200
-    assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert r.headers["access-control-allow-origin"] == configured_origin
 
 
 def test_phoenix_route_503_when_disabled(monkeypatch):
