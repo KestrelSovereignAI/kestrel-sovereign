@@ -41,15 +41,15 @@ import toml
 from cryptography.fernet import Fernet
 
 from kestrel_sovereign.doctor import diagnose
-from kestrel_sovereign.storage.async_database import core_schema_sql
 from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
     LocalAgentConfig,
-    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import write_env
 from kestrel_sovereign.setup.toml_file import write_toml
+from kestrel_sovereign.storage.async_database import core_schema_sql
 
 pytestmark = [pytest.mark.integration]
 

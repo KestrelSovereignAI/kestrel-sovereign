@@ -679,7 +679,7 @@ async def initialize_postgres_hold_databases(
             ),
         )
         return primary_db, evidence_db
-    except BaseException:
+    except BaseException as failure:
         close_errors: tuple[BaseException, ...] = ()
         try:
             close_errors = await _close_postgres_preflight_backends(
