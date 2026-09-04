@@ -455,14 +455,14 @@ def issue_restart_authority(
         actor = require_restart_request_authority()
         delegation_binding = None
     else:
-        parsed, reason = verify_restart_delegation(
+        parsed, _verification_reason = verify_restart_delegation(
             delegation.evidence, delegation.signature
         )
         if parsed != delegation:
             raise RestartAuthorityError(
                 "restart delegation object does not match its signed evidence"
             )
-        allowed, reason = restart_delegation_allows(
+        allowed, delegation_reason = restart_delegation_allows(
             delegation,
             subject_agent_did=requested_by_agent,
             operation=operation,
@@ -472,7 +472,7 @@ def issue_restart_authority(
             update_allow_migrations=update_allow_migrations,
         )
         if not allowed:
-            raise RestartAuthorityError(reason)
+            raise RestartAuthorityError(delegation_reason)
         actor = delegation.subject_agent_did
         delegation_binding = {
             "delegation_id": delegation.delegation_id,

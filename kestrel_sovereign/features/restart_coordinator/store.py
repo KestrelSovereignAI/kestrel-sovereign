@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.storage.database_clock import database_clock
@@ -757,7 +757,7 @@ async def insert_request(
     async with db.transaction(immediate=True):
         delegation = None
         if delegation_id:
-            delegation, reason = await resolve_restart_delegation(
+            delegation, delegation_reason = await resolve_restart_delegation(
                 db,
                 delegation_id,
                 subject_agent_did=requested_by_agent,
@@ -768,7 +768,7 @@ async def insert_request(
                 update_allow_migrations=update_allow_migrations,
             )
             if delegation is None:
-                raise RestartAuthorityError(reason)
+                raise RestartAuthorityError(delegation_reason)
         authority_evidence, authority_signature = issue_restart_authority(
             request_id=req_id,
             requested_by_agent=requested_by_agent,

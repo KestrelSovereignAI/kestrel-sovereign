@@ -719,6 +719,10 @@ async def test_sovereign_grants_did_bound_delegation_for_autonomous_restart(
 
     assert requested.status is ToolResultStatus.OK
     row = await get_request(backend, requested.data["request"]["id"])
+    assert row.reason == "delegated unattended recovery"
+    assert json.loads(row.authority_evidence)["request"]["reason"] == (
+        "delegated unattended recovery"
+    )
     assert await verify_restart_authority_at_use(backend, row) == (
         True,
         "restart request is within delegated bounds",
