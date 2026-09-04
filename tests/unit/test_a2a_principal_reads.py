@@ -398,7 +398,10 @@ def test_process_resolver_verifies_signed_http_result_read(
     import json
     from datetime import datetime, timezone
 
-    from kestrel_sovereign.a2a.did_registry import ProcessA2ADidResolver
+    from kestrel_sovereign.a2a.did_registry import (
+        A2A_PEER_STABLE_AGENT_ID_FIELD,
+        ProcessA2ADidResolver,
+    )
     from kestrel_sovereign.a2a.envelope_signing import (
         bound_envelope_fields,
         canonical_message,
@@ -406,8 +409,12 @@ def test_process_resolver_verifies_signed_http_result_read(
     )
     from kestrel_sovereign.identity.did_web import build_verification_methods
     from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+    from kestrel_sovereign.a2a.inbound_authorization import (
+        install_a2a_inbound_sender_authorizer,
+    )
 
     sender_did = "did:web:example.com:process-sender"
+    stable_sender_id = "did:pkh:eip155:1:0xprocess-sender"
     sender_keypair = generate_hybrid_keypair()
     sender_document = {
         "id": sender_did,
@@ -415,6 +422,7 @@ def test_process_resolver_verifies_signed_http_result_read(
             sender_did,
             sender_keypair.public_keys(),
         ),
+        A2A_PEER_STABLE_AGENT_ID_FIELD: stable_sender_id,
     }
     task = SimpleNamespace(
         id="process-read",
@@ -426,11 +434,23 @@ def test_process_resolver_verifies_signed_http_result_read(
         get_task_for_creator=AsyncMock(return_value=task),
     )
     resolver = ProcessA2ADidResolver((sender_document,))
+    directory = SimpleNamespace(
+        authorize_inbound_sender=AsyncMock(return_value=True),
+    )
+    requester = PeerRequester(RECIPIENT_A, object())
     agent = SimpleNamespace(
         agent_id=RECIPIENT_A,
         did=RECIPIENT_A,
         task_manager=manager,
         a2a_did_resolver=resolver.resolve,
+        peer_directory_router=directory,
+        peer_requester=requester,
+        a2a_inbound_sender_authorizer=None,
+    )
+    install_a2a_inbound_sender_authorizer(
+        None,
+        recipient=agent,
+        sender_id_resolver=resolver.directory_agent_id,
     )
     app = _principal_endpoint_app(monkeypatch, agent)
     body = _principal_action_body("process-read", "read_task")
@@ -452,9 +472,13 @@ def test_process_resolver_verifies_signed_http_result_read(
         )
 
     assert response.status_code == 200
+    directory.authorize_inbound_sender.assert_awaited_once_with(
+        requester,
+        stable_sender_id,
+    )
     manager.get_task_for_creator.assert_awaited_once_with(
         "process-read",
-        sender_did,
+        stable_sender_id,
         recipient_agent_id=RECIPIENT_A,
     )
 

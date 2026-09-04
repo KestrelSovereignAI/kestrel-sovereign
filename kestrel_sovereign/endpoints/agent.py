@@ -2558,28 +2558,49 @@ async def _authorize_verified_a2a_sender(
     authorizer,
     sender_did: str,
     hosted_policy=None,
-) -> bool:
-    """Invoke the explicit inbound seam, requiring a literal True verdict."""
+) -> Optional[str]:
+    """Authorize a verified DID and return its durable principal identity."""
     if authorizer is None or not callable(
         getattr(authorizer, "authorize", None)
     ):
-        return False
+        return None
     try:
         if hosted_policy is not None:
-            policy_authorize = getattr(
+            policy_authorize_principal = getattr(
                 authorizer,
-                "authorize_with_policy",
+                "authorize_principal_with_policy",
                 None,
             )
-            if not callable(policy_authorize):
-                return False
-            result = policy_authorize(
-                sender_did,
-                router=hosted_policy.router,
-                requester=hosted_policy.requester,
-            )
+            if callable(policy_authorize_principal):
+                result = policy_authorize_principal(
+                    sender_did,
+                    router=hosted_policy.router,
+                    requester=hosted_policy.requester,
+                )
+            else:
+                policy_authorize = getattr(
+                    authorizer,
+                    "authorize_with_policy",
+                    None,
+                )
+                if not callable(policy_authorize):
+                    return None
+                result = policy_authorize(
+                    sender_did,
+                    router=hosted_policy.router,
+                    requester=hosted_policy.requester,
+                )
         else:
-            result = authorizer.authorize(sender_did)
+            authorize_principal = getattr(
+                authorizer,
+                "authorize_principal",
+                None,
+            )
+            result = (
+                authorize_principal(sender_did)
+                if callable(authorize_principal)
+                else authorizer.authorize(sender_did)
+            )
         if inspect.isawaitable(result):
             result = await result
     except Exception:  # noqa: BLE001 - injected host policy boundary
@@ -2587,8 +2608,11 @@ async def _authorize_verified_a2a_sender(
             "Inbound A2A sender authorization provider failed",
             exc_info=True,
         )
-        return False
-    return result is True
+        return None
+    if isinstance(result, str) and result:
+        return result
+    # Preserve third-party authorizers' pre-existing literal-bool contract.
+    return sender_did if result is True else None
 
 
 def _a2a_replay_store(agent):
@@ -2733,6 +2757,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             inbound_authorizer,
         )
     authorized_legacy_sender_id = None
+    authorized_verified_sender_id = None
     if sender_verdict.verified:
         if inbound_authorizer is not None:
             if (
@@ -2746,12 +2771,12 @@ async def _create_a2a_task_under_lifecycle_lease(
                     status_code=403,
                     detail="A2A sender authorization context is invalid",
                 )
-            authorized = await _authorize_verified_a2a_sender(
+            authorized_verified_sender_id = await _authorize_verified_a2a_sender(
                 inbound_authorizer,
                 sender_verdict.sender,
                 hosted_policy,
             )
-            if not authorized:
+            if authorized_verified_sender_id is None:
                 raise HTTPException(
                     status_code=403,
                     detail="A2A sender authorization failed",
@@ -2850,7 +2875,7 @@ async def _create_a2a_task_under_lifecycle_lease(
 
     params.metadata["sender_verified"] = sender_verdict.verified
     authorized_sender_id = (
-        sender_verdict.sender
+        authorized_verified_sender_id or sender_verdict.sender
         if sender_verdict.verified
         else authorized_legacy_sender_id
     )

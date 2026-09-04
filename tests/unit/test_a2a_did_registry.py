@@ -296,6 +296,33 @@ def test_process_registry_maps_signing_did_to_attested_stable_agent_id():
     assert A2A_PEER_STABLE_AGENT_ID_FIELD not in resolver.resolve(DID_A)
 
 
+def test_process_registry_rejects_two_signing_dids_for_one_stable_agent_id():
+    """A stale rotation fork cannot inherit the live peer's directory authority."""
+
+    sender_a, _ = _hybrid_agent(DID_A)
+    sender_b, _ = _hybrid_agent(DID_B)
+    stable_agent_id = "did:pkh:eip155:1:0xstable"
+
+    with pytest.raises(
+        ProcessA2ADidResolverConfigurationError,
+        match="duplicate stable agent id",
+    ):
+        ProcessA2ADidResolver(
+            (
+                {
+                    "id": DID_A,
+                    "verificationMethod": sender_a.identity.new_verification_methods,
+                    A2A_PEER_STABLE_AGENT_ID_FIELD: stable_agent_id,
+                },
+                {
+                    "id": DID_B,
+                    "verificationMethod": sender_b.identity.new_verification_methods,
+                    A2A_PEER_STABLE_AGENT_ID_FIELD: stable_agent_id,
+                },
+            )
+        )
+
+
 def test_process_registry_file_handoff_is_authenticated_and_one_shot(
     tmp_path,
     monkeypatch,

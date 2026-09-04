@@ -299,6 +299,25 @@ def _start_inprocess_mode(
         if not cfg.autostart
     }
 
+    # Credential material below governs only a future launch. A verified live
+    # PID already identifies the serving process; reinterpreting it through a
+    # rotated or removed project key would make idempotent ``start`` fail or
+    # print a credential that the running host cannot accept.
+    host_pid_file = _host_pid_file(project_dir)
+    existing = pm.read_pid_record(host_pid_file)
+    if existing.is_running:
+        print(f"   Server already running (PID: {existing.pid})")
+        return 0
+
+    # Keyed on the status, not on whether a PID came back. ``read_pid``
+    # withholds a stale number by design, so testing its result for
+    # truthiness silently stopped clearing exactly the records that most need
+    # clearing — and a leftover legacy file flips from stale to undecidable
+    # the moment its number is reused, after which stop would signal the
+    # replacement (#2995).
+    if existing.needs_cleanup:
+        pm.clear_pid(host_pid_file)
+
     # An API-key fleet cannot mint a sovereign credential at runtime: every
     # managed child can reach the same loopback bootstrap route as a browser.
     # Setup normally provisions this value in the project .env. OAuth-required
@@ -349,21 +368,6 @@ def _start_inprocess_mode(
             resolved = (project_dir / cfg.data_dir).resolve()
             print(f"     {name:12} {resolved}/       manual")
     print()
-
-    host_pid_file = _host_pid_file(project_dir)
-    existing = pm.read_pid_record(host_pid_file)
-    if existing.is_running:
-        print(f"   Server already running (PID: {existing.pid})")
-        return 0
-
-    # Keyed on the status, not on whether a PID came back. ``read_pid``
-    # withholds a stale number by design, so testing its result for
-    # truthiness silently stopped clearing exactly the records that most need
-    # clearing — and a leftover legacy file flips from stale to undecidable
-    # the moment its number is reused, after which stop would signal the
-    # replacement (#2995).
-    if existing.needs_cleanup:
-        pm.clear_pid(host_pid_file)
 
     if pm.is_port_in_use(multi_agent.host.port, multi_agent.host.bind):
         orphans = pm.find_pids_on_port(multi_agent.host.port)

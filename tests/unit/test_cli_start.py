@@ -61,6 +61,9 @@ def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
 def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):
     config = _quickstart_config(tmp_path)
     process_manager = MagicMock(spec=ProcessManager)
+    process_manager.read_pid_record.return_value = PidRecord(
+        PidStatus.ABSENT, None, None, None, "no PID file"
+    )
     process_manager._load_env.return_value = {}
 
     result = _start_inprocess_mode(tmp_path, config, process_manager)
@@ -105,6 +108,9 @@ def test_oauth_flag_without_credentials_does_not_start_keyless_host(
 ):
     config = _quickstart_config(tmp_path)
     process_manager = MagicMock(spec=ProcessManager)
+    process_manager.read_pid_record.return_value = PidRecord(
+        PidStatus.ABSENT, None, None, None, "no PID file"
+    )
     process_manager._load_env.return_value = {"KESTREL_REQUIRE_OAUTH": "true"}
 
     result = _start_inprocess_mode(tmp_path, config, process_manager)
@@ -113,6 +119,33 @@ def test_oauth_flag_without_credentials_does_not_start_keyless_host(
     process_manager._spawn_detached.assert_not_called()
     output = capsys.readouterr().out
     assert "Google OAuth credentials" in output
+
+
+def test_already_running_host_ignores_credentials_for_a_future_launch(
+    tmp_path, capsys
+):
+    """An idempotent start reports the live PID even after project-key rotation."""
+
+    config = _quickstart_config(tmp_path)
+    process_manager = MagicMock(spec=ProcessManager)
+    process_manager.read_pid_record.return_value = PidRecord(
+        PidStatus.LIVE,
+        4242,
+        str(tmp_path),
+        DEFAULT_HOST_PORT,
+        "verified live host",
+        123.0,
+    )
+    # Empty configuration would reject a new API-key fleet launch. It must not
+    # reinterpret the authority of the already-running process.
+    process_manager._load_env.return_value = {}
+
+    result = _start_inprocess_mode(tmp_path, config, process_manager)
+
+    assert result == 0
+    process_manager._load_env.assert_not_called()
+    process_manager._spawn_detached.assert_not_called()
+    assert "Server already running (PID: 4242)" in capsys.readouterr().out
 
 
 def test_named_start_output_uses_assigned_agent_port(tmp_path, capsys):

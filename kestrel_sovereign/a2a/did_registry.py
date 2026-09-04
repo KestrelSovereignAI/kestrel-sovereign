@@ -323,6 +323,7 @@ class ProcessA2ADidResolver:
         self._federated_fallback = federated_fallback
         verified: dict[str, Mapping[str, Any]] = {}
         stable_agent_ids: dict[str, str] = {}
+        claimed_stable_agent_ids: set[str] = set()
         for material in documents:
             document = _validated_verification_document(material)
             did = str(document["id"])
@@ -332,6 +333,11 @@ class ProcessA2ADidResolver:
                 )
             stable_agent_id = document.get(A2A_PEER_STABLE_AGENT_ID_FIELD)
             if isinstance(stable_agent_id, str):
+                if stable_agent_id in claimed_stable_agent_ids:
+                    raise ProcessA2ADidResolverConfigurationError(
+                        "A2A peer identity registry contains a duplicate stable agent id"
+                    )
+                claimed_stable_agent_ids.add(stable_agent_id)
                 stable_agent_ids[did] = stable_agent_id
             verified[did] = {
                 "id": did,
