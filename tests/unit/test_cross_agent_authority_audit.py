@@ -10,7 +10,25 @@ from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
-TOOL_KEYWORDS = ("agent", "peer", "a2a", "child", "restart", "task")
+CONTROL_NAME_TERMS = (
+    "agent",
+    "peer",
+    "a2a",
+    "child",
+    "descendant",
+    "delegate",
+    "task",
+    "cancel",
+    "interrupt",
+    "stop",
+    "hold",
+    "terminate",
+    "offboard",
+    "withdraw",
+    "restart",
+    "host",
+    "fleet",
+)
 HTTP_SEGMENTS = {
     "agents",
     "tasks",
@@ -52,6 +70,10 @@ def _public_tool_name(decorator: ast.expr, fallback: str) -> str | None:
     return fallback
 
 
+def _is_cross_agent_control_name(name: str) -> bool:
+    return any(term in name.casefold() for term in CONTROL_NAME_TERMS)
+
+
 def _discovered_tool_surfaces() -> set[str]:
     surfaces: set[str] = set()
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
@@ -64,7 +86,7 @@ def _discovered_tool_surfaces() -> set[str]:
                 public_name = _public_tool_name(decorator, node.name)
                 if public_name is None:
                     continue
-                if any(term in public_name.casefold() for term in TOOL_KEYWORDS):
+                if _is_cross_agent_control_name(public_name):
                     relative = path.relative_to(REPO_ROOT).as_posix()
                     surfaces.add(f"{relative}::{public_name}")
     return surfaces
@@ -83,7 +105,7 @@ def _discovered_builtin_command_surfaces() -> set[str]:
         command = spec.get("cmd")
         if not isinstance(command, str):
             continue
-        if any(term in command.casefold() for term in TOOL_KEYWORDS):
+        if _is_cross_agent_control_name(command):
             surfaces.add(f"kestrel_sovereign/command_handler.py::{command}")
     return surfaces
 
@@ -185,6 +207,20 @@ def test_every_cross_agent_named_tool_is_classified() -> None:
     )
 
 
+def test_relation_free_control_names_are_still_discovered() -> None:
+    """A control door need not say ``agent`` or ``task`` to cross a boundary."""
+
+    for name in (
+        "hold",
+        "interrupt",
+        "offboard",
+        "terminate",
+        "withdraw",
+        "stop",
+    ):
+        assert _is_cross_agent_control_name(name)
+
+
 def test_every_cross_agent_named_builtin_command_is_classified() -> None:
     assert _discovered_builtin_command_surfaces() == _documented_command_surfaces(
         "## Machine-checked built-in command inventory"
@@ -222,10 +258,19 @@ def test_api_route_declarations_expand_every_registered_method() -> None:
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
-    for issue in (3146, 3147, 3149):
+    for issue in (3134, 3144, 3146, 3147, 3149):
         row = next(line for line in audit.splitlines() if f"[#{issue}]" in line)
         assert "Enforced by" in row
         assert "Defect:" not in row
+
+
+def test_a2a_cancellation_delegates_to_issue_3134() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    row = next(
+        line for line in audit.splitlines() if line.startswith("| Cancel A2A task |")
+    )
+    assert "[#3134]" in row
+    assert "Defect:" not in row
 
 
 def _identifier_tokens(node: ast.AST) -> set[str]:

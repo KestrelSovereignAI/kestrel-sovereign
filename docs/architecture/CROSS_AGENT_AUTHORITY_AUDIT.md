@@ -60,8 +60,8 @@ narrow, revocable, signed delegation.
 | External webhook ingress | `POST /webhooks/{webhook_name}`; Rasa `POST /webhooks/rest/webhook` | The request-bound agent or uniquely configured receiver | Universal policy (bounded ingress) | The route binds the target from trusted request state/receiver registration and the configured receiver authenticates and rate-limits the payload. Rasa uses its sovereign-configured shared secret and the host-bound agent; payload sender fields create no agent authority. |
 | Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Outbound records retain creator/recipient binding. Shared-store reads and HTTP/SSE still need durable principal predicates: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
 | Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`; task GET/list/SSE endpoints | Recipient inbox or creator-owned result | Self (recipient or creator, according to operation) | Current task-ID/full-table reads are not consistently principal-scoped on shared PostgreSQL. Defect: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Current mutations use task ID without an atomic recipient predicate. Defect: [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144). |
-| Cancel A2A task | `cancel_task` | A non-terminal task | Self (creator or recipient) | Durable creator/recipient authorization and an atomic cancellation predicate are implemented by [#3134](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3134). Causation/sender display metadata is not consulted. |
+| Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Enforced by [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144): each mutation binds the trusted caller DID and includes the recipient in the durable atomic predicate. |
+| Cancel A2A task | `cancel_task`; `POST /api/agent/tasks/{task_id:path}/cancel` | A non-terminal task | Self (creator or recipient) | Enforced by [#3134](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3134): durable creator/recipient authorization and an atomic cancellation predicate are shared by the tool and signed peer route. Causation/sender display metadata is not consulted. |
 | Create child | `spawn_agent` | A new child | Spawn mandate | The parent constructs/signs the mandate; the host binds and re-signs it to the final child DID. A created child does not grant the child reciprocal authority. |
 | List/read child work | `list_children`, `get_child_result`; `GET /api/spawn/children` | The caller's children | Spawn mandate or self-owned feature state | Child enumeration must derive from verified receipts ([#3133](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3133), [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142)); results are held by the calling feature instance. |
 | Delegate work to child | `delegate_task` | A direct child | Spawn mandate | The caller DID must be the verified mandate parent at dispatch time. `_parent_children` is only a lookup cache. |
@@ -80,10 +80,12 @@ machine-checked inventory below before shipping.
 
 ## Machine-checked tool inventory
 
-The contract test discovers every `@tool` whose public name contains
-`agent`, `peer`, `a2a`, `child`, `restart`, or `task`. Every match must remain
-classified here, including false positives, so a newly named cross-agent door
-cannot silently appear.
+The contract test discovers every `@tool` whose public name names an agent
+relation (`agent`, `peer`, `a2a`, `child`, `descendant`, or `delegate`), a work
+object (`task`), a control verb (`cancel`, `interrupt`, `stop`, `hold`,
+`terminate`, `offboard`, or `withdraw`), or host/fleet/restart scope. Every
+match must remain classified here, including false positives, so a newly named
+cross-agent door cannot silently appear merely because it omits `agent`.
 
 | Surface ID | Classification |
 |---|---|
@@ -136,6 +138,7 @@ a host-control door behind the feature-tool inventory.
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks` | Recipient inbox read; #3145. |
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}` | Principal-scoped read; #3145. |
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}/subscribe` | Principal-scoped subscription; #3145. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/cancel` | Creator/recipient-owned mutation; the signed peer envelope authenticates the actor, live recipient scope is rechecked, and the durable transition uses the atomic #3134 authority predicate. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/stop` | Current routed-agent/self Stop; peer Stop must use the typed authority rail. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/send` | Scoped, authenticated A2A delivery. |
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/agents/{agent_name}` | Sovereign/delegated host lifecycle; #3149. |
