@@ -42,6 +42,7 @@ PERMISSION_NAME_TERMS = (
     "authoriz",
     "authority",
     "mandate",
+    "owner",
     "permission",
     "allowed",
     "permitted",
@@ -168,13 +169,18 @@ def _module_string_constants(
     tree: ast.Module,
     source_path: Path | None = None,
 ) -> dict[str, str]:
-    """Resolve static strings used in decorators, including local imports."""
+    """Resolve static strings in module execution order, including imports.
+
+    Replaying assignments once in source order both matches Python's runtime
+    semantics and prevents two assignments to the same name from oscillating
+    forever in a fixed-point loop.  An unresolved reassignment invalidates an
+    earlier value so later route discovery fails closed rather than using a
+    stale string.
+    """
 
     constants: dict[str, str] = {}
-    if source_path is not None:
-        for node in tree.body:
-            if not isinstance(node, ast.ImportFrom):
-                continue
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and source_path is not None:
             imported_path = _imported_module_path(node, source_path)
             if imported_path is None:
                 continue
@@ -184,28 +190,23 @@ def _module_string_constants(
                     constants[alias.asname or alias.name] = imported_constants[
                         alias.name
                     ]
-
-    unresolved: list[tuple[list[ast.expr], ast.expr]] = []
-    for node in tree.body:
+            continue
         if isinstance(node, ast.Assign):
-            unresolved.append((node.targets, node.value))
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            unresolved.append(([node.target], node.value))
-
-    changed = True
-    while changed:
-        changed = False
-        for targets, value in unresolved:
-            resolved = _resolved_string(value, constants)
-            if resolved is None:
+            targets = node.targets
+            value: ast.expr | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        resolved = _resolved_string(value, constants) if value is not None else None
+        for target in targets:
+            if not isinstance(target, ast.Name):
                 continue
-            for target in targets:
-                if (
-                    isinstance(target, ast.Name)
-                    and constants.get(target.id) != resolved
-                ):
-                    constants[target.id] = resolved
-                    changed = True
+            if resolved is None:
+                constants.pop(target.id, None)
+            else:
+                constants[target.id] = resolved
     return constants
 
 
@@ -218,6 +219,25 @@ def _cached_local_string_constants(source_path: Path) -> dict[str, str]:
         filename=str(source_path),
     )
     return _module_string_constants(tree)
+
+
+def test_module_string_constants_follow_source_order_on_reassignment() -> None:
+    reassigned = ast.parse(
+        'BASE = "/first"\n'
+        'PATH = BASE + "/route"\n'
+        'BASE = "/second"\n'
+        'PATH = BASE + "/route"\n'
+    )
+    assert _module_string_constants(reassigned) == {
+        "BASE": "/second",
+        "PATH": "/second/route",
+    }
+
+    invalidated = ast.parse(
+        'PATH = "/known"\n'
+        "PATH = runtime_path()\n"
+    )
+    assert "PATH" not in _module_string_constants(invalidated)
 
 
 def _public_tool_name(
@@ -1768,8 +1788,73 @@ def _walk_lexical_scope(
     return nodes
 
 
+def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
+    """Whether a simple statement block cannot reach its following sibling."""
+
+    if not statements:
+        return False
+    terminal = statements[-1]
+    if isinstance(terminal, (ast.Raise, ast.Return)):
+        return True
+    if isinstance(terminal, ast.If):
+        return _block_guaranteed_exits(
+            terminal.body
+        ) and _block_guaranteed_exits(terminal.orelse)
+    return False
+
+
+def _child_statement_blocks(statement: ast.stmt) -> list[list[ast.stmt]]:
+    """Return same-scope child blocks while excluding nested definitions."""
+
+    if isinstance(statement, (ast.For, ast.AsyncFor, ast.If, ast.While)):
+        return [statement.body, statement.orelse]
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return [statement.body]
+    if isinstance(statement, (ast.Try, ast.TryStar)):
+        return [
+            statement.body,
+            statement.orelse,
+            statement.finalbody,
+            *(handler.body for handler in statement.handlers),
+        ]
+    if isinstance(statement, ast.Match):
+        return [case.body for case in statement.cases]
+    return []
+
+
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
     tokens = _identifier_tokens(node)
+    # The bare string ``"ORCHESTRATOR"`` is also a provider role label in
+    # prompts and logs. Treat it as metadata only when it is used as a lookup
+    # key; names/attributes called ``orchestrator`` remain provenance-bearing.
+    if "orchestrator" in tokens:
+        semantic_orchestrator = any(
+            (
+                isinstance(child, ast.Name)
+                and child.id.casefold() == "orchestrator"
+            )
+            or (
+                isinstance(child, ast.Attribute)
+                and child.attr.casefold() == "orchestrator"
+            )
+            or (
+                isinstance(child, ast.Subscript)
+                and isinstance(child.slice, ast.Constant)
+                and isinstance(child.slice.value, str)
+                and child.slice.value.casefold() == "orchestrator"
+            )
+            or (
+                isinstance(child, ast.Call)
+                and _call_name(child) == "get"
+                and bool(child.args)
+                and isinstance(child.args[0], ast.Constant)
+                and isinstance(child.args[0].value, str)
+                and child.args[0].value.casefold() == "orchestrator"
+            )
+            for child in ast.walk(node)
+        )
+        if not semantic_orchestrator:
+            tokens.discard("orchestrator")
     provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
     return any(
         token in provenance_tokens
@@ -1952,6 +2037,29 @@ def _provenance_aliases(
                 _identifier_tokens(decision_expression)
             )
 
+    # Guard clauses and assertions govern the statements that follow them,
+    # rather than a syntactically nested branch. Mark their conditions as
+    # authority decisions before walking assignment dependencies backwards.
+    def collect_guard_decisions(statements: list[ast.stmt]) -> None:
+        for index, statement in enumerate(statements):
+            continuation = statements[index + 1 :]
+            if continuation and _contains_cross_agent_control_call(continuation):
+                if isinstance(statement, ast.Assert):
+                    authority_decision_names.update(
+                        _identifier_tokens(statement.test)
+                    )
+                elif isinstance(statement, ast.If) and (
+                    _block_guaranteed_exits(statement.body)
+                    != _block_guaranteed_exits(statement.orelse)
+                ):
+                    authority_decision_names.update(
+                        _identifier_tokens(statement.test)
+                    )
+            for block in _child_statement_blocks(statement):
+                collect_guard_decisions(block)
+
+    collect_guard_decisions(function.body)
+
     assignment_names = {
         name for names, _value in assignments for name in names
     }
@@ -2042,6 +2150,40 @@ def _is_cross_agent_control_reference(node: ast.AST) -> bool:
     return False
 
 
+def _guard_clause_provenance_lines(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    provenance_aliases: set[str],
+) -> set[int]:
+    """Find provenance conditions that gate a later control by exiting early."""
+
+    lines: set[int] = set()
+
+    def scan_block(statements: list[ast.stmt]) -> None:
+        for index, statement in enumerate(statements):
+            continuation = statements[index + 1 :]
+            controls_continuation = bool(continuation) and (
+                _contains_cross_agent_control_call(continuation)
+            )
+            if controls_continuation and isinstance(statement, ast.Assert):
+                if _has_provenance_token(statement.test, provenance_aliases):
+                    lines.add(statement.lineno)
+            elif controls_continuation and isinstance(statement, ast.If):
+                body_exits = _block_guaranteed_exits(statement.body)
+                orelse_exits = _block_guaranteed_exits(statement.orelse)
+                if (
+                    body_exits != orelse_exits
+                    and _has_provenance_token(
+                        statement.test, provenance_aliases
+                    )
+                ):
+                    lines.add(statement.lineno)
+            for block in _child_statement_blocks(statement):
+                scan_block(block)
+
+    scan_block(function.body)
+    return lines
+
+
 def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     lines: set[int] = set()
     functions = [
@@ -2052,6 +2194,9 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
     for function in functions:
         function_name = function.name.casefold()
         provenance_aliases = _provenance_aliases(function)
+        lines.update(
+            _guard_clause_provenance_lines(function, provenance_aliases)
+        )
         function_is_permission_boundary = (
             _is_permission_name(function_name)
             or function_name.startswith(("can_", "may_"))
@@ -2448,6 +2593,29 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
         "        if decision\n"
         "    ]\n"
     )
+    ownership_predicate = ast.parse(
+        "def is_owner(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def dispatch(request, target):\n"
+        "    if is_owner(request):\n"
+        "        terminate_child(target)\n"
+    )
+    guard_clauses = ast.parse(
+        "def execute(request):\n"
+        "    if not request.causation_chain:\n"
+        "        return None\n"
+        "    terminate_child(request.target)\n\n"
+        "def adapter(request):\n"
+        "    if request.orchestrator:\n"
+        "        raise PermissionError\n"
+        "    manager.remove_agent(request.target)\n\n"
+        "def asserted(request):\n"
+        "    decision = compare_lineage(\n"
+        "        request.causation_chain, request.target\n"
+        "    )\n"
+        "    assert decision\n"
+        "    stop_peer(request.target)\n"
+    )
 
     assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
@@ -2458,6 +2626,8 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(comprehension_control) == {2}
     assert _authority_provenance_lines(propagation_only_helper) == set()
     assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 14}
+    assert _authority_provenance_lines(ownership_predicate) == {2}
+    assert _authority_provenance_lines(guard_clauses) == {2, 7, 15}
 
 
 def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
