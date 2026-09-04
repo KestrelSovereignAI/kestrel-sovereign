@@ -2701,3 +2701,32 @@ async def test_a_lone_surrogate_in_the_query_or_tool_name_does_not_error_the_sea
     assert len(rows) == 1
     rows, _ = await store.search_audit_log("build", tool_name="create_github_issue\ud83d")
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_an_undated_row_stays_in_the_corpus_under_a_days_window(tmp_path):
+    """`NULL >= ?` is NULL and '' loses a string comparison, so a row with no
+    created_at silently left the corpus whenever days was passed, and the
+    no-match text blamed the writer's truncation. Its siblings COALESCE."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    db_path = tmp_path / "undated.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+    raw = sqlite3.connect(db_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    for stamp in (None, "", old):
+        raw.execute(
+            "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary, created_at)"
+            " VALUES (?,?,?,?,?,?)", ("GitHub", "create_github_issue", "tool_execution", "auto_mode_allowed",
+                                    '{"title": "orphans the worker"}', stamp),
+        )
+    raw.commit(); raw.close()
+
+    rows, _ = await store.search_audit_log("orphans the worker")
+    assert len(rows) == 3
+    rows, _ = await store.search_audit_log("orphans the worker", days=7)
+    # The undated rows stay; the dated row outside the window is excluded
+    # (the positive control that the window still does its job).
+    assert len(rows) == 2 and all(not r["timestamp"] for r in rows), rows

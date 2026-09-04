@@ -1368,7 +1368,14 @@ class PermissionStore:
             # below "T" (84), so EVERY legacy row on the cutoff's own date
             # compares below an ISO cutoff regardless of the time it carries.
             # Normalize both to "YYYY-MM-DD HH:MM:SS" first.
-            clauses.append("substr(replace(created_at, 'T', ' '), 1, 19) >= ?")
+            # An undated row (NULL or '' created_at — a documented real shape,
+            # #2146/P9) cannot be proven out of the window; it stays in the
+            # corpus like the two COALESCE'd exclusions above, rather than
+            # silently leaving it (round 30 review).
+            clauses.append(
+                "(created_at IS NULL OR created_at = '' "
+                "OR substr(replace(created_at, 'T', ' '), 1, 19) >= ?)"
+            )
             params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
 
         return " AND ".join(clauses), params
