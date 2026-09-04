@@ -619,33 +619,57 @@ jobs:
         # thresholds are the least trustworthy thing to assert on a shared
         # runner. It still runs weekly via weekly-analysis.yml, which
         # invokes run_tests.py with no marker filter.
-        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 -m "not docker_mcp and not cloud_resource and not bench"
-        # 20 was too tight, for the same reason 10 was too tight on the unit
-        # tier above: it started killing PASSING runs. This tier is far closer
-        # to its ceiling than that one ever was. Over the last 17 successful
-        # runs it took 14.3-16.4 min (median 15.9) against a 20 min budget —
-        # ~80% utilization, i.e. ~4 min of headroom. Unit sits at ~6 min
-        # against 20.
+        run: uv run pytest tests/integration/ -v --tb=short -x --timeout=120 --session-timeout=2700 -m "not docker_mcp and not cloud_resource and not bench"
+        # 20 was too tight, then 30 was too tight, each for the same reason
+        # 10 was too tight on the unit tier above: they started killing
+        # PASSING runs. #3212 is the third instance, and the repetition is
+        # the point — each budget was sized to the worst runner ratio seen
+        # SO FAR, which guarantees the next worse one re-teaches the lesson
+        # by discarding a green suite.
         #
-        # A runner ~1.3x slower than median is therefore enough to discard a
-        # green suite, and one turned up: #3099's push stalled at 91% on the
-        # wall clock. It was measured against the immediately preceding run on
-        # the same tree — median per-test ratio 1.32 across the 256 tests
-        # common to both. The tell that it was the machine and not the code:
-        # the wall-clock-bound tests were untouched (53.1s -> 55.9s, 33.3s ->
-        # 33.4s, 10.3s -> 10.2s) while CPU-bound ones moved as a block. A
-        # regression does not spare sleeps and inflate everything else.
+        # What a slow runner costs, measured on ONE tree rather than
+        # inferred (PR #3208, run 33843748702): attempt 1 was killed at
+        # exactly 30:00 with every test already passed — pytest printed
+        # `1472 passed ... in 1789.82s (0:29:49)` and the step died 11s
+        # later. The rerun of the same commit finished the step in 16:11.
+        # That is a 1.85x runner-speed swing on identical code, and the
+        # 30 min budget was 1.81x the median: the ceiling sat BELOW the
+        # variance already demonstrated.
         #
-        # 30 absorbs ~1.9x on the median and ~1.55x on the slowest observed
-        # pass, which brackets the 1.32 actually seen.
+        # The distribution is not the problem; the suite has not drifted.
+        # Across the last 19 successful runs the step took 15.7-20.6 min,
+        # median 16.5, p90 17.5 — tight. So the budget is sized against
+        # runner speed, not growth: the slowest pass ever observed (20.6),
+        # on the slowest runner ever observed (1.85x), is 38.1 min. The
+        # `--session-timeout=2700` above (45 min) clears that by ~18%, and
+        # `budget-basis` below states those inputs where a test can check
+        # them — because the previous version of this comment made the same
+        # argument in prose and was falsified without anything noticing.
         #
-        # This does not mask a hang, and the ceiling is not a cost. Per-test
-        # `--timeout=120` catches a stuck test in 2 min, and `-x` exits on the
-        # first real failure; a healthy run still finishes and exits at ~16
-        # min. The wall clock only decides how much passing work gets thrown
-        # away. Parallelizing this tier (#2794) is the fix that would actually
+        # Two numbers, and the order between them is the point. pytest owns
+        # the deadline, the runner owns the backstop: when a run really is
+        # too slow, `--session-timeout` stops it and prints
+        # `session-timeout: 2700.0 sec exceeded` with exit 1, which is a
+        # greppable failure. The runner's own kill prints
+        # `##[error]The action ... has timed out` with no `FAILED tests/`
+        # line anywhere, which is why #3212's red read as a test failure
+        # until someone tailed the log.
+        #
+        # 50 rather than 46 because the session deadline is checked BETWEEN
+        # tests, not during one: a run that crosses it inside a test keeps
+        # going until that test ends, up to the per-test `--timeout=120`.
+        # So the runner budget has to clear 45 + 2, and 50 leaves 3 min for
+        # teardown and reporting on top.
+        #
+        # This does not mask a hang. Per-test `--timeout=120` catches a
+        # stuck test in 2 min, and `-x` exits on the first real failure; a
+        # healthy run still finishes and exits at ~16 min. The wall clock
+        # only decides how much passing work gets thrown away.
+        # Parallelizing this tier (#2794) is the fix that would actually
         # lower the number; runner sizing is #2795.
-        timeout-minutes: 30
+        #
+        # budget-basis: slowest-pass=20.6 worst-runner-ratio=1.85 samples=19
+        timeout-minutes: 50
         env:
           KESTREL_AUDIT_MODE: skip
           KESTREL_SKIP_REACHABILITY_PROBE: "1"
