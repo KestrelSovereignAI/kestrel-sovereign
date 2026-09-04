@@ -117,6 +117,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_constitution_drift(readings, report)
     _check_anchor_consistency(readings, report)
+    _check_sqlite_hold_readiness(resolved, project_dir, report)
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
     _check_semantic_registry(report)
@@ -329,6 +330,25 @@ _POSTGRES_HOLD_RECEIPTS_SQL = (
     "prior_hold_receipt_id, resulting_hold_receipt_id "
     "FROM hold_receipts ORDER BY receipt_id"
 )
+_POSTGRES_HOLD_LATCHES_SQL = (
+    "SELECT scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, "
+    "revision FROM hold_latches ORDER BY scope, target_id"
+)
+_POSTGRES_HOLD_RECEIPT_COUNTS_SQL = (
+    "SELECT scope, target_id, receipt_count FROM hold_receipt_witnesses "
+    "ORDER BY scope, target_id"
+)
+_POSTGRES_HOLD_CONTENT_WITNESSES_SQL = (
+    "SELECT receipt_id, scope, target_id, receipt_digest "
+    "FROM hold_receipt_content_witnesses ORDER BY receipt_id"
+)
+_POSTGRES_HOLD_OPERATION_WITNESSES_SQL = (
+    "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
+    "ORDER BY operation_id"
+)
+_POSTGRES_HOLD_MIGRATIONS_SQL = (
+    "SELECT name FROM hold_schema_migrations ORDER BY name"
+)
 _POSTGRES_HOLD_PROTOCOL_SQL = (
     "SELECT key, value FROM agent_metadata "
     "WHERE agent_id = $1 AND key IN ($2, $3, $4, $5) ORDER BY key"
@@ -532,10 +552,13 @@ def _read_postgres_hold_primary_state(
     *,
     env: dict[str, str],
     project_dir: Path,
-) -> tuple[set[str], list]:
-    """Read the primary schema and complete receipt set without mutation."""
+) -> object:
+    """Read the complete primary Hold state without mutation."""
 
-    from kestrel_sovereign.hold.state import _HOLD_SCHEMA_TABLES
+    from kestrel_sovereign.hold.state import (
+        _HOLD_SCHEMA_TABLES,
+        HoldDatabaseSnapshot,
+    )
 
     source = _postgres_cluster_probe_source(dsn, env, project_dir)
     table_rows = _fetch_postgres_rows_isolated(
@@ -556,17 +579,86 @@ def _read_postgres_hold_primary_state(
         ):
             raise ValueError("Hold schema probe returned invalid data")
         tables.add(row[0])
-    if "hold_receipts" not in tables:
-        return tables, []
-    receipt_rows = _fetch_postgres_rows_isolated(
-        dsn,
-        _POSTGRES_HOLD_RECEIPTS_SQL,
-        postgres_home=source.postgres_home,
-        postgres_env=source.postgres_env,
-        postgres_cwd=source.postgres_cwd,
-        dsn_identity=source.dsn_identity,
+    def read_table(table: str, sql: str) -> tuple:
+        if table not in tables:
+            return ()
+        return tuple(
+            _fetch_postgres_rows_isolated(
+                dsn,
+                sql,
+                postgres_home=source.postgres_home,
+                postgres_env=source.postgres_env,
+                postgres_cwd=source.postgres_cwd,
+                dsn_identity=source.dsn_identity,
+            )
+        )
+
+    return HoldDatabaseSnapshot(
+        existing_tables=frozenset(tables),
+        latch_rows=read_table("hold_latches", _POSTGRES_HOLD_LATCHES_SQL),
+        receipt_rows=read_table("hold_receipts", _POSTGRES_HOLD_RECEIPTS_SQL),
+        receipt_count_witness_rows=read_table(
+            "hold_receipt_witnesses",
+            _POSTGRES_HOLD_RECEIPT_COUNTS_SQL,
+        ),
+        content_witness_rows=read_table(
+            "hold_receipt_content_witnesses",
+            _POSTGRES_HOLD_CONTENT_WITNESSES_SQL,
+        ),
+        operation_witness_rows=read_table(
+            "hold_operation_witnesses",
+            _POSTGRES_HOLD_OPERATION_WITNESSES_SQL,
+        ),
+        migration_rows=read_table(
+            "hold_schema_migrations",
+            _POSTGRES_HOLD_MIGRATIONS_SQL,
+        ),
     )
-    return tables, receipt_rows
+
+
+def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
+    """Resolve the host database exactly as its spawned runtime will."""
+
+    explicit = env.get("KESTREL_HOST_DB_PATH")
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_dir / candidate
+        return Path(os.path.abspath(candidate))
+    configured_home = env.get("KESTREL_HOME")
+    if configured_home:
+        base = Path(configured_home).expanduser()
+        if not base.is_absolute():
+            base = project_dir / base
+    else:
+        runtime_home = env.get("HOME") or env.get("USERPROFILE")
+        base = (
+            Path(runtime_home).expanduser() / ".kestrel"
+            if runtime_home
+            else Path.home() / ".kestrel"
+        )
+    return Path(os.path.abspath(base / "host-data" / "host-features.db"))
+
+
+def _check_sqlite_hold_readiness(
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+) -> None:
+    """Verify the mandatory local Hold database and external sidecars."""
+
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    if backend == "postgres" and env.get("KESTREL_DATABASE_URL"):
+        return
+    from kestrel_sovereign.hold.state import validate_sqlite_hold_readiness
+
+    database = _sqlite_hold_database_path(env, project_dir)
+    try:
+        validate_sqlite_hold_readiness(database)
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(f"SQLite Hold readiness NOT verified: {exc}")
+        return
+    report.ok.append(f"SQLite Hold state verified at {database}")
 
 
 def _check_postgres_hold_readiness(
@@ -681,7 +773,7 @@ def _check_postgres_hold_readiness(
         )
         return
     try:
-        existing_tables, receipt_rows = _read_postgres_hold_primary_state(
+        primary_state = _read_postgres_hold_primary_state(
             primary_dsn,
             env=env,
             project_dir=project_dir,
@@ -703,9 +795,34 @@ def _check_postgres_hold_readiness(
             raise RuntimeError(
                 "Hold protocol evidence changed during the diagnostic snapshot"
             )
+        primary_after = _read_postgres_hold_custody_snapshot(
+            primary_dsn,
+            cluster_identity=primary_identity,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        evidence_custody_after = _read_postgres_hold_custody_snapshot(
+            evidence_dsn,
+            cluster_identity=evidence_identity,
+            label="evidence",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        if primary_after is None or evidence_custody_after is None:
+            return
+        if (
+            primary_after != primary_reading
+            or evidence_custody_after != evidence_reading
+        ):
+            raise RuntimeError(
+                "Hold custody roles changed during the diagnostic snapshot"
+            )
+        validate_postgres_hold_custody(primary_after[0], evidence_custody_after[0])
         validate_postgres_hold_readiness_snapshot(
-            existing_tables=existing_tables,
-            receipt_rows=receipt_rows,
+            snapshot=primary_state,
             evidence_rows=evidence_after,
         )
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness

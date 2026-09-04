@@ -29,8 +29,8 @@ from kestrel_sovereign.hold.state import (
     hold_history_anchor_path,
     hold_initialization_witness_path,
     initialize_postgres_hold_databases,
-    preflight_postgres_hold_custody,
     postgres_hold_custody_binding_payload,
+    preflight_postgres_hold_custody,
     validate_postgres_hold_custody,
 )
 from kestrel_sovereign.host_features.context import build_host_context
@@ -617,6 +617,23 @@ async def test_boot_validates_global_history_once_for_all_targets(
     assert len(states) == 3
     assert validate_anchor.await_count == 1
     assert validate_operations.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_boot_invokes_complete_snapshot_validator(hold_db, monkeypatch):
+    """The Doctor-shared validator remains a load-bearing boot gate."""
+
+    from kestrel_sovereign.hold import state as state_module
+
+    _db, store = hold_db
+
+    def _reject(_snapshot):
+        raise HoldCorruptStateError("complete snapshot validator reached")
+
+    monkeypatch.setattr(state_module, "validate_hold_database_snapshot", _reject)
+
+    with pytest.raises(HoldCorruptStateError, match="validator reached"):
+        await store.read_boot_state()
 
 
 @pytest.mark.asyncio
