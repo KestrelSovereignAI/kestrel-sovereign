@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
 
 from .system_prompt_assembler import (
-    HOST_OWNED_AUDIT_NAMES,
     LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
     legacy_bootstrap_audit_name,
 )
@@ -218,20 +217,12 @@ class ContextBuilder:
         """Preflight bootstrap names against host and feature audit owners."""
 
         from kestrel_sovereign.features.contribution_runtime import (
-            FeatureContributionRuntimeError,
+            validate_bootstrap_audit_namespace,
         )
 
-        values = tuple(
+        values, _prospective_audit_names = validate_bootstrap_audit_namespace(
             self._bootstrap_loader.file_order if names is None else names
         )
-        conflict = next(
-            (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
-            None,
-        )
-        if conflict is not None:
-            raise FeatureContributionRuntimeError(
-                f"bootstrap name {conflict!r} is a reserved host audit name"
-            )
 
         registry = getattr(self, "_context_clause_registry", None)
         validator = getattr(registry, "validate_reserved_audit_names", None)

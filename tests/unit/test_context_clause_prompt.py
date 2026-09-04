@@ -280,6 +280,43 @@ def test_bootstrap_add_rejects_legacy_host_audit_name_without_registry():
     assert builder._bootstrap_loader.file_order == before
 
 
+def test_core_registry_rejects_duplicate_derived_bootstrap_audit_names():
+    registry = ContextClauseRegistry()
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="duplicate bootstrap audit identity",
+    ):
+        registry.validate_reserved_audit_names(("NOTES.md", "notes.md"))
+
+
+def test_composite_registry_rejects_duplicate_derived_bootstrap_audit_names():
+    composite = CompositeContextClauseRegistry(
+        ContextClauseRegistry(),
+        ContextClauseRegistry(),
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="duplicate bootstrap audit identity",
+    ):
+        composite.validate_reserved_audit_names(("NOTES.md", "notes.md"))
+
+
+def test_bootstrap_add_rejects_duplicate_derived_alias_without_registry():
+    builder = ContextBuilder(MagicMock(), context_clause_registry=None)
+    builder._bootstrap_loader.add_file("NOTES.md")
+    before = builder._bootstrap_loader.file_order
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="duplicate bootstrap audit identity",
+    ):
+        builder._bootstrap_loader.add_file("notes.md")
+
+    assert builder._bootstrap_loader.file_order == before
+
+
 @pytest.mark.parametrize(
     "synthetic_name",
     [
