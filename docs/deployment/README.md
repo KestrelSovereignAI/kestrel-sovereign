@@ -76,10 +76,11 @@ to every hosted agent.
 The checked-in `prod` profile nonetheless caps `max_instances` at 1, because the
 contract permitting horizontal scale is not the same thing as a substrate able
 to serve it. Each instance opens up to 10 pooled plus 4 advisory runtime
-PostgreSQL connections and one serialized Hold connection on the primary
-database. Hold's independent evidence database has its own one-connection
-operational pool and separately bounded one-connection advisory pool. The cap
-must therefore be raised together with the database tier (or a connection
+PostgreSQL connections plus Hold's one-connection operational pool and
+separately bounded one-connection advisory pool on the primary database.
+Hold's independent evidence database has the same operational-plus-advisory
+pair. The cap must therefore be raised together with the database tier (or a
+connection
 pooler added) rather than on its own — see the comment above `[profiles.prod]`
 in `deploy_config.toml`. A profile that advertises capacity its database cannot
 supply is a declaration nothing has provisioned.

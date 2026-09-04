@@ -68,7 +68,7 @@ def test_multi_agent_entrypoint_canonicalizes_relative_host_control_directory(
     env.update(
         {
             "KESTREL_AGENT_DATA_DIR": str(agent_data_dir),
-            "KESTREL_HOST_DB_PATH": "agent_data/host-data/kestrel_host.db",
+            "KESTREL_HOST_DB_PATH": "agent_data/host-data/host-features.db",
         }
     )
     probe = setup + r'''

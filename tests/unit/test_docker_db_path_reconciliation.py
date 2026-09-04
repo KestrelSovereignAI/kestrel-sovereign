@@ -10,7 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CANONICAL_AGENT_DATA_DIR = "/app/agent_data"
-CANONICAL_HOST_DB_PATH = "/app/agent_data/host-data/kestrel_host.db"
+CANONICAL_HOST_DB_PATH = "/app/agent_data/host-data/host-features.db"
 
 
 def _read(relative_path: str) -> str:
@@ -54,7 +54,7 @@ def test_sovereign_image_keeps_host_control_state_on_its_data_volume():
     text = _read("docker/Dockerfile.sovereign")
 
     assert "ENV KESTREL_DB_PATH=/data" in text
-    assert "ENV KESTREL_HOST_DB_PATH=/data/host-data/kestrel_host.db" in text
+    assert "ENV KESTREL_HOST_DB_PATH=/data/host-data/host-features.db" in text
 
 
 def test_container_entrypoint_initializes_db_inside_agent_data_dir():
