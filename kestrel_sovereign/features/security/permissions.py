@@ -76,6 +76,13 @@ def fold_stored_summary(text):
     caller believes it searched — only a row whose JSON cannot be repaired is
     withheld, because it cannot be masked.
     """
+    if not isinstance(text, str):
+        # A BLOB (the column has TEXT affinity, but bytes are stored as
+        # bytes) would raise inside the registered scalar function, and a
+        # raised scalar fails the WHOLE query — one such row and every search
+        # errors permanently, the same hazard round 5 closed for a lone
+        # surrogate. Nothing here can read it, so it matches nothing.
+        return ""
     if not text:
         return text
     try:

@@ -1438,17 +1438,24 @@ async def test_a_completion_row_is_never_reported_as_work_that_may_not_have_happ
     assert result.data["refused"] == 1 and result.data["outcomes"] == 0
     assert "may never have happened" in result.confirmation
 
-    # An outcome row that records the work did NOT happen (live: 6 such rows)
-    # is not a completion: no ✓, and the warning fires.
-    await store.log_decision(
-        feature_name="talon_feature", tool_name="talon_file_and_claim.outcome",
-        action="tool_outcome", decision="filing_failed",
-        args_summary='{"reason_code": "UNKNOWN_FAILURE", "filed": false, "issue_number": 1481}',
-    )
+    # An outcome row whose decision this tool does not classify — a failure
+    # (live: 6 `filing_failed` rows) or a success value the allowlist has
+    # not learned — is neither a completion (no ✓) nor a refusal: it is an
+    # outcome record to READ. Calling it "work that may never have happened"
+    # turned a completion record into the false absence this tool exists to
+    # prevent (round 19 review).
+    for decision in ("filing_failed", "issue_created"):
+        await store.log_decision(
+            feature_name="talon_feature", tool_name="talon_file_and_claim.outcome",
+            action="tool_outcome", decision=decision,
+            args_summary=f'{{"decision": "{decision}", "issue_number": 1481}}',
+        )
     result = await feature.security_audit_search(query="1481")
-    assert result.data["outcomes"] == 0 and result.data["refused"] == 1
-    assert "✓" not in result.confirmation
-    assert "may never have happened" in result.confirmation
+    assert result.data["outcomes"] == 0 and result.data["refused"] == 0
+    assert result.data["unclassified_outcomes"] == 2
+    assert "✓" not in result.confirmation and "?" in result.confirmation
+    assert "may never have happened" not in result.confirmation
+    assert "does not classify" in result.confirmation and "read them" in result.confirmation
 
 
 @pytest.mark.asyncio
@@ -2140,3 +2147,57 @@ async def test_an_unrepairable_region_before_a_repairable_one_is_withheld(tmp_pa
     ):
         assert remask_summary(shape) == "(summary truncated past repair; not shown)", shape
         assert fold_stored_summary(shape) == "", shape
+
+
+# --------------------------------------------------------------------------
+# Round 20: a BLOB row cannot poison every search; repair slack belongs to
+# the read path; a JSON prefix keeps its prose tail.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_blob_args_summary_row_does_not_kill_every_search(tmp_path):
+    """The column has TEXT affinity but stores bytes as bytes; a BLOB reached
+    the registered scalar function, raised, and a raised scalar fails the
+    WHOLE query — every search errored, permanently."""
+    import sqlite3
+
+    db_path = tmp_path / "blob.db"
+    store = PermissionStore(str(db_path))
+    await store.initialize()
+    await store.log_decision(
+        feature_name="GitHub", tool_name="create_github_issue", action="tool_execution",
+        decision="auto_mode_allowed", args_summary='{"title": "orphans the worker"}',
+    )
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "INSERT INTO security_audit_log (feature_name, tool_name, action, decision, args_summary)"
+        " VALUES (?,?,?,?,?)", ("Foreign", "t", "tool_execution", "auto_mode_allowed", b"\x00orphans the worker"),
+    )
+    raw.commit(); raw.close()
+
+    matches, _ = await store.search_audit_log("orphans the worker")
+    assert [m["tool"] for m in matches] == ["create_github_issue"]
+
+
+def test_the_write_path_keeps_prose_after_a_json_prefix_and_never_trims():
+    from kestrel_sovereign.features.security.args_summary import mask_sensitive, summarize_args
+
+    assert mask_sensitive('{"api_key": "x"} yes') == '{"api_key": "***MASKED***"} yes'
+    assert mask_sensitive('{"token": 1} FAILED') == '{"token": "***MASKED***"} FAILED'
+    assert mask_sensitive('  {"token": 1}...') == '  {"token": "***MASKED***"}...'
+    assert json.loads(summarize_args({"body": '{"api_key": "x"} yes'}))["body"] == '{"api_key": "***MASKED***"} yes'
+    # A cut nested payload is NOT repaired on the write path (nothing was cut
+    # there): it is prose and passes through unchanged rather than trimmed.
+    cut = '{"api_key": "x", "n": tr'
+    assert mask_sensitive(cut) == cut
+
+
+def test_the_read_path_still_repairs_a_cut_nested_payload_with_slack():
+    """A nested payload cut inside a bare literal needs the trim slack to
+    parse; the read path passes it, so the secret inside is still masked."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary
+    from kestrel_sovereign.features.security.permissions import fold_stored_summary
+
+    row = '{"payload": "{\\"password\\": \\"sk-live-LEAK\\", \\"n\\": tr", "b": 1'
+    assert "LEAK" not in remask_summary(row) and "***MASKED***" in remask_summary(row)
+    assert "leak" not in fold_stored_summary(row)

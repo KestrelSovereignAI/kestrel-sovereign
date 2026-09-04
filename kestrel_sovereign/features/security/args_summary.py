@@ -107,21 +107,22 @@ def _close_open_structures(text: str) -> Optional[str]:
     return tail + "".join(reversed(closers))
 
 
-def complete_truncated_json(text: Any) -> Any:
+def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> Any:
     """Parse JSON text that a truncation cut, or return None.
 
     Tries the text as it is, then with its open string and containers
-    closed, dropping up to ``_MAX_REPAIR_TRIM`` trailing characters so a cut
-    that landed inside an escape sequence, a number or a bare literal still
+    closed, dropping up to ``max_trim`` trailing characters so a cut that
+    landed inside an escape sequence, a number or a bare literal still
     reaches a parseable point. Only a dict or list counts: the shape is what
-    :func:`mask_sensitive` walks.
+    :func:`mask_sensitive` walks. ``max_trim`` is the READ path's slack for a
+    real cut; the write path, where nothing has been cut, passes 0.
     """
     if not isinstance(text, str):
         return None
     body = text.rstrip()
     if body.endswith(_TRUNCATION_MARK):
         body = body[: -len(_TRUNCATION_MARK)]
-    for trim in range(_MAX_REPAIR_TRIM + 1):
+    for trim in range(max_trim + 1):
         candidate = body[: len(body) - trim] if trim else body
         if not candidate:
             return None
@@ -165,7 +166,7 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
             return None
         parsed = complete_truncated_json(text[start:])
         if parsed is not None:
-            return prefix, mask_sensitive(parsed)
+            return prefix, mask_sensitive(parsed, repair_slack=_MAX_REPAIR_TRIM)
     return None
 
 
@@ -173,7 +174,7 @@ def repair_unparseable_summary(text: str) -> Optional[tuple[str, Any]]:
 MASK = "***MASKED***"
 
 
-def mask_sensitive(data: Any) -> Any:
+def mask_sensitive(data: Any, *, repair_slack: int = 0) -> Any:
     """Recursively mask values whose key looks sensitive.
 
     Dicts and lists are walked recursively; a key matching any
@@ -182,32 +183,48 @@ def mask_sensitive(data: Any) -> Any:
     masked wholesale rather than descended into). A string value that IS
     JSON — a JSON-encoded payload carried as a string
     (``{"payload": "{\\"api_key\\": ...}"}``) has no dict key for this walk
-    to see — is parsed (repaired first if a cut left it open), masked the
-    same way and re-serialized, and only when masking changed something.
-    Every other string is prose and passes through byte-for-byte: this runs
-    on the WRITE path for every tool call, and a text scanner applied to an
-    issue body that merely quoted ``"api_key":`` — or that began with a
-    markdown ``[link]`` — ate the rest of the body from the audit row,
-    permanently (rounds 15 and 16). Whether a string is JSON is decided by
-    parsing it, never by its first character.
+    to see — is parsed, masked the same way and re-serialized, and only when
+    masking changed something; text after the JSON (``{...} yes``) is kept.
+    ``repair_slack`` is the READ path's allowance for a cut nested payload
+    (``repair_unparseable_summary`` passes it); on the WRITE path nothing has
+    been cut, so it stays 0 and a prose tail is never trimmed away (round 19
+    review). Every other string is prose and passes through byte-for-byte:
+    a text scanner applied to an issue body that merely quoted
+    ``"api_key":`` — or that began with a markdown ``[link]`` — ate the rest
+    of the body from the audit row, permanently (rounds 15 and 16). Whether
+    a string is JSON is decided by parsing it, never by its first character.
     """
     if isinstance(data, str):
-        nested = complete_truncated_json(data.lstrip())
-        if nested is None:
+        stripped = data.lstrip()
+        if stripped[:1] not in "{[":
             return data
-        masked = mask_sensitive(nested)
-        return data if masked == nested else json.dumps(masked, default=str)
+        try:
+            nested, end = _JSON_PREFIX.raw_decode(stripped)
+        except ValueError:
+            nested = complete_truncated_json(stripped, max_trim=repair_slack) if repair_slack else None
+            end = len(stripped)
+        if not isinstance(nested, (dict, list)):
+            return data
+        masked = mask_sensitive(nested, repair_slack=repair_slack)
+        if masked == nested:
+            return data
+        return data[: len(data) - len(stripped)] + json.dumps(masked, default=str) + stripped[end:]
     if isinstance(data, dict):
         result: dict = {}
         for key, value in data.items():
             if any(s in str(key).lower() for s in SENSITIVE_KEY_SUBSTRINGS):
                 result[key] = MASK
             else:
-                result[key] = mask_sensitive(value)
+                result[key] = mask_sensitive(value, repair_slack=repair_slack)
         return result
     if isinstance(data, list):
-        return [mask_sensitive(item) for item in data]
+        return [mask_sensitive(item, repair_slack=repair_slack) for item in data]
     return data
+
+
+#: Parses a JSON value at the START of a string and reports where it ends,
+#: so prose after it is kept rather than trimmed away.
+_JSON_PREFIX = json.JSONDecoder()
 
 
 def remask_summary(summary: Optional[str]) -> Optional[str]:

@@ -38,8 +38,12 @@ _AUTHORIZED_DECISIONS = frozenset({
 #: DONE". The same allowlist discipline as above, for the same reason: an
 #: outcome row can just as well record that the work did NOT happen
 #: (``filing_failed`` is live in the log), and keying the completion bucket on
-#: the action alone reported such a row with a ✓ and suppressed the "may never
-#: have happened" warning. Anything not here falls through to "not authorized".
+#: the action alone reported such a row with a ✓. An outcome row whose
+#: decision is not here is neither a completion nor a refusal: it is reported
+#: as an outcome record this tool does not classify, to be read — never as
+#: "this work may never have happened", which a completion record with a
+#: value this list has not learned (``issue_created``) turned into the exact
+#: false absence the tool exists to prevent (round 19 review).
 _COMPLETED_OUTCOME_DECISIONS = frozenset({
     "filed_and_dispatched",
     "github_write_ok",
@@ -1346,6 +1350,14 @@ class SecurityFeature(Feature):
             if e.get("action") == "tool_outcome"
             and e["decision"] in _COMPLETED_OUTCOME_DECISIONS
         )
+        # An outcome row with a decision this tool does not classify: not a
+        # completion (no ✓), not a refusal (a completion record must never be
+        # described as work that may not have happened) — a record to read.
+        bounded_unclassified = sum(
+            1 for e in matches
+            if e.get("action") == "tool_outcome"
+            and e["decision"] not in _COMPLETED_OUTCOME_DECISIONS
+        )
         matches = matches[:limit_val]
         omitted = bounded_total - len(matches)
 
@@ -1416,7 +1428,8 @@ class SecurityFeature(Feature):
         # decision is reported as not-an-authorization, which is the safe read.
         allowed = bounded_authorized
         outcomes = bounded_outcomes
-        refused = bounded_total - allowed - outcomes
+        unclassified = bounded_unclassified
+        refused = bounded_total - allowed - outcomes - unclassified
         headline = f"{bounded_total} prior attempt(s) matched ({scope_text})"
         if omitted:
             headline += f" (showing {len(matches)}, {omitted} older not shown)"
@@ -1425,9 +1438,14 @@ class SecurityFeature(Feature):
             parts.append(f"{allowed} authorized to run")
         if outcomes:
             parts.append(f"{outcomes} completion(s) recorded")
+        if unclassified:
+            parts.append(
+                f"{unclassified} outcome record(s) with a decision this tool "
+                "does not classify — read them"
+            )
         if refused:
             parts.append(f"{refused} NOT authorized (refused or blocked)")
-        if refused and not allowed and not outcomes:
+        if refused and not allowed and not outcomes and not unclassified:
             headline += (
                 f" — none of the {refused} was an authorization to run, "
                 "so this work may never have happened"
@@ -1441,11 +1459,8 @@ class SecurityFeature(Feature):
             authorized = entry["decision"] in _AUTHORIZED_DECISIONS
             if authorized:
                 marker = "→"
-            elif (
-                entry.get("action") == "tool_outcome"
-                and entry["decision"] in _COMPLETED_OUTCOME_DECISIONS
-            ):
-                marker = "✓"
+            elif entry.get("action") == "tool_outcome":
+                marker = "✓" if entry["decision"] in _COMPLETED_OUTCOME_DECISIONS else "?"
             else:
                 marker = "✗"
             lines.append(
@@ -1462,6 +1477,7 @@ class SecurityFeature(Feature):
                 "shown": len(matches),
                 "authorized": allowed,
                 "outcomes": outcomes,
+                "unclassified_outcomes": unclassified,
                 "refused": refused,
                 "omitted": omitted,
                 "too_broad": False,
