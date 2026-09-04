@@ -491,14 +491,15 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
             raise RuntimeError(
                 "external payload tokens must be reserved before section use"
             )
-        if self._mandatory_system_tokens + tokens > self.total_budget:
+        total_reserved = self._external_reserved_tokens + tokens
+        if self._mandatory_system_tokens + total_reserved > self.total_budget:
             raise DegradedModeError(
                 self._mandatory_system_tokens,
                 self.total_budget,
                 self.model,
                 detail=(
                     "mandatory floor plus external payload reserve "
-                    f"({tokens} tokens) exceeds the post-response budget"
+                    f"({total_reserved} tokens) exceeds the post-response budget"
                 ),
             )
 
@@ -507,7 +508,7 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         reduction = max(
             0,
             sum(allocation.budget for allocation in self.allocations.values())
-            + tokens
+            + total_reserved
             - self.total_budget,
         )
         for source in reversed(self._priority):
@@ -534,7 +535,7 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
                 self.model,
                 detail=f"external payload reservation remains {reduction} tokens short",
             )
-        self._external_reserved_tokens += tokens
+        self._external_reserved_tokens = total_reserved
 
     def can_fit(self, source: str, tokens: int) -> bool:
         """Allow borrowing from the elastic pool when the source's own
