@@ -54,7 +54,6 @@ class HostFeatureConfigError(RuntimeError):
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
-    SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
@@ -73,7 +72,11 @@ from kestrel_sovereign.agent.boot import (
     run_boot_sequence,
 )
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
-from kestrel_sovereign.agent.constitution import ConstitutionMixin
+from kestrel_sovereign.agent.constitution import (
+    ConstitutionMixin,
+    SafeModeCause,
+    safe_mode_cognition_block,
+)
 from kestrel_sovereign.agent.streaming import (
     StreamingMixin,
     resolve_turn_invocation_context,
@@ -580,6 +583,7 @@ class KestrelAgent(
         sync_enabled: Optional[bool] = None,
         payer_policy=None,
         host_db=None,
+        host_context_clause_registry=None,
         hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
@@ -640,6 +644,10 @@ class KestrelAgent(
                        a host on Postgres supply the host db directly (e.g.
                        ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
                        lifecycle; the agent does not close it.
+            host_context_clause_registry: Optional host-feature context registry.
+                       Its immutable clauses are combined with this agent's own
+                       contribution registry without sharing agent-local clauses
+                       with any peer.
             hosted_telegram_route_attestation_resolver: Optional host-owned
                        pre-initialize resolver for a Telegram route already
                        provisioned outside Core. It supplies typed ledger
@@ -1359,6 +1367,8 @@ class KestrelAgent(
         self.feature_contribution_runtime = None
         self.permission_defaults_registry = None
         self.setup_step_registry = None
+        self.context_clause_registry = None
+        self._host_context_clause_registry = host_context_clause_registry
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)
@@ -1383,6 +1393,10 @@ class KestrelAgent(
         # detached task from reading a concurrent turn's `_active_session_id`
         # (#2877). Read via `get_turn_bound_session_id`, not directly.
         self._live_turn_id: Optional[str] = None
+        # Concrete owner of the live CONVERSATION span.  ContextVars are copied
+        # into detached children, so task identity is required when deciding
+        # whether a privacy transition may re-enter from inside the turn.
+        self._live_turn_task: Optional[asyncio.Task] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -1410,6 +1424,14 @@ class KestrelAgent(
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()
+        # Server-owned agents transfer the ready-phase publication boundary to
+        # their host before ``initialize()``.  This is deliberately separate
+        # from the host-context gate: a dynamically loaded agent can begin
+        # initialization after that one-time startup gate is already open, but
+        # must still wait until the manager publishes and onboards it.
+        self._agent_readiness_host_owned = False
+        self._agent_ready_hooks_deferred = False
+        self._agent_ready_hooks_completed = False
         # If the bounded durable tail cannot wait for dispatcher release, this
         # task owns the only safe successor: dispatcher drain followed by the
         # matching storage close.  It deliberately does not live in
@@ -3279,7 +3301,14 @@ class KestrelAgent(
             semantic_inference_limits=self.semantic_inference_limits,
             semantic_maintenance_limits=self.semantic_maintenance_limits,
             semantic_answerability_gate=self.memory_system.retriever.answerability_gate,
+            context_clause_registry=(
+                self._ensure_feature_contribution_runtime().context_clause_registry
+            ),
         )
+        if self._host_context_clause_registry is not None:
+            self.bind_host_context_clause_registry(
+                self._host_context_clause_registry
+            )
         # Merge DB-backed bootstrap config (bootstrap_add / bootstrap_remove
         # persistence) into the loader before the first system-prompt
         # assembly (#2135, F099). Storage is up here and no prompt has been
@@ -3373,7 +3402,11 @@ class KestrelAgent(
 
 
     async def _boot_phase_periodic_services_readiness(self, ctx: BootContext) -> None:
-        """Phase 6 — periodic services (heartbeat, resume monitor, salvage worker), spawn-mandate reattach, provider-reachability readiness, and the on_agent_ready hooks. Readiness fires only after every prior phase committed."""
+        """Start periodic services and schedule ready hooks after validation.
+
+        Server-owned agents may defer the hooks until host context publication;
+        direct-agent boots run them before this phase returns.
+        """
         # Initialize heartbeat system (periodic agent self-checks).
         # Registers the heartbeat source with the dispatcher so its
         # ticks route through the signal pipeline (Phase 3 of #889).
@@ -3511,24 +3544,100 @@ class KestrelAgent(
         await verify_llm_providers_reachable(self.llm_service)
 
         # All subsystems are now up (memory system, context manager, dispatcher,
-        # LLM). Notify features that the agent is fully ready, so any that must
-        # run a COGNITION turn at boot — notably RestartCoordinator's
-        # post-restart wake — fire NOW, after the context manager exists. This
-        # is deliberately distinct from post_all_features_loaded, which runs
-        # during the feature-load phase BEFORE memory/context are built; a wake
-        # dispatched there could not run a turn and would defer for a full cron
-        # interval (#1809). Best-effort per feature; the hook is optional.
+        # LLM). On direct-agent boots, notify features now. Server-owned agents
+        # defer while the host owns the publication boundary or its host policy
+        # gate is closed: an on_agent_ready hook is allowed to await cognition,
+        # and awaiting that turn here while the server awaits initialize() is a
+        # circular gate wait. The server binds host context, publishes/onboards
+        # the agent, opens the gate, then completes this same hook pass.
+        await self._run_or_defer_agent_ready_hooks()
+
+    async def _notify_agent_ready_hooks(self) -> None:
+        """Run the best-effort ready-phase hook once services are usable."""
+
         for feature in list(self.features.values()):
             ready_hook = getattr(feature, "on_agent_ready", None)
             if ready_hook is None:
                 continue
             try:
                 await ready_hook(self)
-            except Exception as e:
+            except (Exception, asyncio.CancelledError) as e:
+                # Ready hooks are explicitly best-effort.  A hook can await a
+                # child task that was independently cancelled; on modern
+                # Python that outcome is a BaseException and used to cancel
+                # the entire deferred-readiness task after host publication.
+                # That case leaves this task's cancellation count at zero.
+                # Cancellation of the readiness task itself must still
+                # propagate so direct-agent initialization remains cancellable.
+                readiness_task = asyncio.current_task()
+                if (
+                    isinstance(e, asyncio.CancelledError)
+                    and readiness_task is not None
+                    and readiness_task.cancelling()
+                ):
+                    raise
                 logging.warning(
                     "on_agent_ready failed for %s: %s",
                     getattr(feature, "name", type(feature).__name__), e,
                 )
+
+    async def _run_or_defer_agent_ready_hooks(self) -> None:
+        """Run ready hooks now, or defer them behind host policy publication."""
+
+        async with self._agent_readiness_lock():
+            if self._agent_ready_hooks_completed:
+                return
+            gate = getattr(self, "_host_context_publication_gate", None)
+            if self._agent_readiness_host_owned or (
+                gate is not None and not gate.is_set()
+            ):
+                self._agent_ready_hooks_deferred = True
+                return
+            await self._notify_agent_ready_hooks()
+            self._agent_ready_hooks_deferred = False
+            self._agent_ready_hooks_completed = True
+
+    def defer_agent_readiness_to_host(self) -> None:
+        """Transfer the initial ready-hook pass to a publishing host.
+
+        The host must claim this boundary before :meth:`initialize`.  Its
+        post-onboarding path later calls
+        :meth:`complete_deferred_agent_readiness`; an already-open context gate
+        does not weaken that registration boundary.
+        """
+
+        if self._agent_ready_hooks_completed:
+            raise RuntimeError(
+                "cannot transfer agent readiness after ready hooks completed"
+            )
+        self._agent_readiness_host_owned = True
+
+    async def complete_deferred_agent_readiness(self) -> None:
+        """Complete the server-deferred ready hooks after host publication."""
+
+        async with self._agent_readiness_lock():
+            if not bool(getattr(self, "_agent_ready_hooks_deferred", False)):
+                return
+            gate = getattr(self, "_host_context_publication_gate", None)
+            if gate is not None and not gate.is_set():
+                raise RuntimeError(
+                    "cannot complete agent readiness before host context publication"
+                )
+            await self._notify_agent_ready_hooks()
+            self._agent_ready_hooks_deferred = False
+            self._agent_ready_hooks_completed = True
+            self._agent_readiness_host_owned = False
+
+    def _agent_readiness_lock(self) -> asyncio.Lock:
+        """Return the per-agent exactly-once ready-hook completion mutex."""
+
+        lock = getattr(self, "_deferred_agent_readiness_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._deferred_agent_readiness_lock = lock
+        if not isinstance(lock, asyncio.Lock):
+            raise TypeError("deferred agent readiness lock has an invalid type")
+        return lock
 
     # ------------------------------------------------------------------
     # Boot rollback teardown helpers (#2522)
@@ -3726,7 +3835,7 @@ class KestrelAgent(
         This updates both the storage wrapper and the privacy agent.
         Note: Changing to a more restrictive mode does NOT delete existing data.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             return await self._set_privacy_mode_with_effects_locked(mode)
 
     async def confirm_privacy_transition(self) -> PrivacyTransitionResult:
@@ -3739,7 +3848,7 @@ class KestrelAgent(
         across all three state holders. A no-op (with an explanatory message) if
         nothing is pending.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             mode = getattr(self, "_pending_privacy_transition", None)
             if mode is None:
                 return PrivacyTransitionResult(
@@ -3765,7 +3874,7 @@ class KestrelAgent(
         declined. A no-op (with an explanatory message) if nothing is pending.
         Nothing else is mutated; the agent stays in its current mode.
         """
-        async with self._get_privacy_transition_lock():
+        async with self.privacy_transition():
             had_pending = getattr(self, "_pending_privacy_transition", None) is not None
             self._pending_privacy_transition = None
             return PrivacyTransitionResult(
@@ -3875,6 +3984,41 @@ class KestrelAgent(
             )
         self._privacy_mode = mode
         status_message = self.privacy_agent.set_mode(mode)
+
+        # Context clauses are immutable between deliberate transitions. A
+        # privacy change can make a feature's cached user-authored context
+        # ineligible even though no feature tool runs, so republish while the
+        # privacy-transition lock is still held. Renderer failure must never
+        # preserve pre-transition bytes: suppress every optional feature clause
+        # without executing feature code and continue in the safer mode.
+        try:
+            self.refresh_all_feature_context_clauses(fail_closed=True)
+        except (Exception, asyncio.CancelledError) as suppression_exc:
+            logging.critical(
+                "Feature context suppression during privacy transition "
+                "reported %s; entering Safe Mode",
+                type(suppression_exc).__name__,
+            )
+            safe_mode_reason = (
+                "Feature context suppression failed during a privacy transition; "
+                "cognition is blocked until lifecycle integrity is restored"
+            )
+            self._feature_lifecycle_integrity_uncertain = True
+            self._feature_lifecycle_repair_verified = False
+            try:
+                await self.enter_safe_mode(
+                    safe_mode_reason,
+                    cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+                )
+            except (Exception, asyncio.CancelledError):
+                self._safe_mode = True
+                self._safe_mode_reason = safe_mode_reason
+                self._safe_mode_cause = (
+                    SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                )
+            raise RuntimeError(
+                "feature context could not be suppressed during privacy transition"
+            ) from None
 
         config = privacy_mode_to_config(mode)
         model_switched = self._apply_privacy_model_transition(config)
@@ -4331,6 +4475,7 @@ class KestrelAgent(
         Laziness supports both without creating a competing registry.
         """
         from kestrel_sovereign.features.contribution_runtime import (
+            CompositeContextClauseRegistry,
             FeatureContributionRuntime,
         )
         from kestrel_sovereign.signals import SourceRegistry
@@ -4365,7 +4510,110 @@ class KestrelAgent(
         self.feature_contribution_runtime = runtime
         self.permission_defaults_registry = runtime.permission_defaults_registry
         self.setup_step_registry = runtime.setup_step_registry
+        self.context_clause_registry = runtime.context_clause_registry
+        host_registry = getattr(self, "_host_context_clause_registry", None)
+        runtime.context_clause_registry.bind_external_registries(
+            () if host_registry is None else (host_registry,)
+        )
+        context_builder = getattr(self, "context_builder", None)
+        if context_builder is not None:
+            context_builder._context_clause_registry = (
+                runtime.context_clause_registry
+                if host_registry is None
+                else CompositeContextClauseRegistry(
+                    host_registry,
+                    runtime.context_clause_registry,
+                )
+            )
         return runtime
+
+    def validate_host_context_clause_registry(self, registry) -> None:
+        """Preflight a host registry against this agent's active audit names."""
+
+        runtime = self._ensure_feature_contribution_runtime()
+        runtime.context_clause_registry.validate_external_registries(
+            () if registry is None else (registry,)
+        )
+
+    def bind_host_context_clause_registry(self, registry) -> None:
+        """Publish one validated host registry to this agent's prompt builder."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            CompositeContextClauseRegistry,
+        )
+
+        runtime = self._ensure_feature_contribution_runtime()
+        runtime.context_clause_registry.bind_external_registries(
+            () if registry is None else (registry,)
+        )
+        self._host_context_clause_registry = registry
+        context_builder = getattr(self, "context_builder", None)
+        if context_builder is not None:
+            context_builder._context_clause_registry = (
+                runtime.context_clause_registry
+                if registry is None
+                else CompositeContextClauseRegistry(
+                    registry,
+                    runtime.context_clause_registry,
+                )
+            )
+
+    def refresh_feature_context_clauses(self, feature: object):
+        """Commit fresh feature context bytes after an explicit config change."""
+
+        return self._ensure_feature_contribution_runtime().refresh_context_clauses(
+            feature
+        )
+
+    def _quarantine_feature_contributions(self, feature: object) -> bool:
+        """Withdraw exact surviving contributions after a drifted teardown."""
+
+        return self._ensure_feature_contribution_runtime().quarantine(feature)
+
+    def verify_feature_lifecycle_integrity(self) -> bool:
+        """Verify a clean, fully booted contribution generation after restart.
+
+        A process that observed incomplete quarantine cannot certify itself;
+        restart reconstructs the registries from feature declarations. Only a
+        READY boot with an exact, side-effect-free registry validation is a
+        repair proof accepted by the Safe Mode exit path.
+        """
+
+        if getattr(self, "_feature_lifecycle_integrity_uncertain", False):
+            return False
+        if self._boot_state is not BootPhaseState.READY:
+            return False
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return False
+        try:
+            return runtime.validate_active_integrity() is True
+        except Exception as exc:  # noqa: BLE001 - report type, remain restricted
+            logging.error(
+                "Feature lifecycle integrity validation reported %s",
+                type(exc).__name__,
+            )
+            return False
+
+    def refresh_all_feature_context_clauses(self, *, fail_closed: bool = False):
+        """Republish clauses after a host-owned configuration transition."""
+
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return ()
+        try:
+            return runtime.refresh_all_context_clauses()
+        except Exception as exc:
+            if not fail_closed:
+                raise
+            # Do not log the exception or its chained renderer cause: an
+            # out-of-tree renderer may have included private bytes in either.
+            logging.error(
+                "Feature context refresh failed during a host transition; "
+                "suppressing contributed context (%s)",
+                type(exc).__name__,
+            )
+            return runtime.suppress_all_context_clauses()
 
     def _record_contribution_rejections(self, transition) -> None:
         """Log and RETAIN the features refused activation.
@@ -4913,6 +5161,7 @@ class KestrelAgent(
         feature: "Feature",
         *,
         prepared_contributions=None,
+        notify_ready: bool = True,
     ) -> None:
         """Bring an already-loaded feature fully live — the inverse of
         :meth:`_unregister_feature_runtime` (kestrel-sovereign#2522 P1).
@@ -4921,6 +5170,9 @@ class KestrelAgent(
         performed, on the SAME feature instance, so a soft-disabled feature is
         restored end to end:
 
+        * operator-declared config before ``initialize()`` for isolated
+          runtimes, so their child opens ingress only after it has the declared
+          generation;
         * ``initialize()`` — re-registers the feature's owned **signal sources**;
         * contributed permission defaults through SecurityFeature, before any
           callable surface is exposed;
@@ -4931,10 +5183,11 @@ class KestrelAgent(
           :meth:`_promote_startup_feature_tools`);
         * ``post_all_features_loaded()`` — re-registers the feature's owned
           **wait providers**;
-        * ``on_agent_ready()`` — the ready-phase hook boot fires only after all
-          services are live (RestartCoordinator's post-restart wake sweep runs
-          here, #1809). Runtime re-enable must fire it too or a re-enabled
-          feature silently skips its ready work.
+        * ``on_agent_ready()`` — by default, the ready-phase hook boot fires only
+          after all services are live (RestartCoordinator's post-restart wake
+          sweep runs here, #1809). Package transactions pass
+          ``notify_ready=False`` and notify the complete committed generation in
+          one later phase, so a hook can never enter cognition between members.
 
         Precondition: ``feature.initialize()`` must be idempotent — it is re-run
         to restore signal sources a disable detached. Atomic: on any failure
@@ -4953,11 +5206,30 @@ class KestrelAgent(
                 (feature,)
             ).only()
         try:
+            # An isolated re-enable starts from a terminal proxy with no live
+            # ingress. Persist its declared config first so initialize forwards
+            # that exact generation to the child and opens the traffic gate only
+            # after settlement. If we initialized first, a child callback could
+            # enter the gate, queue on the CONVERSATION boundary held by this
+            # activation, and then be drained by the post-initialize setter: a
+            # lock cycle. In-process features retain their established ordering
+            # because initialize may intentionally reset volatile config.
+            config_precedes_initialize = (
+                inspect.getattr_static(
+                    feature,
+                    "_apply_host_config_before_initialize",
+                    False,
+                )
+                is True
+            )
+            if config_precedes_initialize:
+                await self._apply_host_feature_config(feature)
             await feature.initialize()
-            # initialize() can reset config a feature does not persist (a
-            # volatile-privacy host key, for example), so a disable/enable
-            # cycle would otherwise lose the declared value until restart.
-            await self._apply_host_feature_config(feature)
+            if not config_precedes_initialize:
+                # initialize() can reset config a feature does not persist (a
+                # volatile-privacy host key, for example), so a disable/enable
+                # cycle would otherwise lose the declared value until restart.
+                await self._apply_host_feature_config(feature)
             self._ensure_feature_contribution_runtime().activate(
                 prepared_contributions
             )
@@ -4972,31 +5244,89 @@ class KestrelAgent(
             self.features[feature.name] = feature
             feature.enabled = True
             self._cached_features_prompt = self._build_features_prompt_section()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Atomic activation: undo whatever partially registered so a failed
             # enable can't strand hooks / sources / tools. Soft teardown keeps
-            # the instance loaded (re-enable-able); its own errors are logged so
-            # the ORIGINAL activation error is what surfaces.
+            # the instance loaded (re-enable-able). If exact-inverse drift makes
+            # that teardown fail, quarantine every exact survivor before the
+            # ORIGINAL activation error is allowed to surface; otherwise a
+            # disabled feature can keep contributing prompt bytes.
+            quarantine_error = None
             try:
                 await self._unregister_feature_runtime(feature, unload=False)
-            except Exception as cleanup_exc:  # noqa: BLE001 - best-effort undo
+            except (Exception, asyncio.CancelledError) as cleanup_exc:
                 logging.warning(
-                    "Cleanup after failed activation of feature '%s' failed: %s",
+                    "Cleanup after failed activation of feature '%s' reported %s; "
+                    "quarantining surviving contributions",
                     getattr(feature, "name", type(feature).__name__),
-                    cleanup_exc,
+                    type(cleanup_exc).__name__,
                 )
+                try:
+                    self._quarantine_feature_contributions(feature)
+                except (Exception, asyncio.CancelledError):
+                    quarantine_error = RuntimeError(
+                        "failed activation contributions could not be quarantined"
+                    )
+            if quarantine_error is not None:
+                safe_mode_reason = (
+                    "Feature activation contribution quarantine failed; "
+                    "cognition is blocked until lifecycle integrity is restored"
+                )
+                self._feature_lifecycle_integrity_uncertain = True
+                self._feature_lifecycle_repair_verified = False
+                try:
+                    await self.enter_safe_mode(
+                        safe_mode_reason,
+                        cause=SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    # Safe Mode persistence is best-effort here, but the
+                    # in-memory cognition latch is not. A second failure must
+                    # not reopen prompts over an untrusted feature generation.
+                    self._safe_mode = True
+                    self._safe_mode_reason = safe_mode_reason
+                    self._safe_mode_cause = (
+                        SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+                    )
+                # Do not retain a third-party cleanup/quarantine exception as a
+                # printable cause; either may contain feature configuration.
+                raise quarantine_error from None
             raise
 
-        # Ready-phase lifecycle — fire ONLY after activation committed, so a
-        # re-enabled feature gets the same ``on_agent_ready`` signal boot gives
-        # it once services are live (#1809). Best-effort per the boot policy: an
-        # optional hook, and a failure here logs but never rolls back the
-        # now-live feature (kestrel-sovereign#2522 P2).
+        if notify_ready:
+            await self._notify_feature_runtime_ready(feature)
+
+    async def _notify_feature_runtime_ready(self, feature: "Feature") -> None:
+        """Notify one already-committed runtime feature that the agent is ready.
+
+        Kept separate from activation so a package transaction can commit every
+        member before any ready hook is permitted to enter cognition. The hook
+        remains best-effort, matching boot: failure never tears down the live
+        feature generation.
+        """
+
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:
-                await ready_hook(self)
-            except Exception as exc:  # noqa: BLE001 - readiness is non-fatal
+                # Runtime enable is still inside the endpoint's conversation
+                # transaction, but every contribution/tool/config surface is
+                # committed at this point. Admit cognition only across this
+                # explicit post-commit seam; earlier lifecycle hooks must fail
+                # closed instead of observing a half-published generation.
+                with self.committed_feature_transition_cognition():
+                    await ready_hook(self)
+            except (Exception, asyncio.CancelledError) as exc:
+                # A hook may await a child task that was cancelled on its own;
+                # ready hooks remain best-effort in that case.  Cancellation of
+                # this transition task itself is different: swallowing it would
+                # let the enable endpoint report success after its caller left.
+                transition_task = asyncio.current_task()
+                if (
+                    isinstance(exc, asyncio.CancelledError)
+                    and transition_task is not None
+                    and transition_task.cancelling()
+                ):
+                    raise
                 logging.warning(
                     "on_agent_ready failed for %s during re-enable: %s",
                     getattr(feature, "name", type(feature).__name__),
@@ -5044,14 +5374,14 @@ class KestrelAgent(
             getattr(feature, "name", None),
         )
         feature_tool_name = getattr(feature, "tool_name", feature_key)
-        errors: List[Exception] = []
+        errors: List[BaseException] = []
 
         # Declarative contributions are exact lifecycle capabilities. Remove
         # them independently even when the feature's imperative hooks fail.
         try:
             runtime = self._ensure_feature_contribution_runtime()
             runtime.deactivate(feature)
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' SDK contribution teardown failed; "
@@ -5063,7 +5393,7 @@ class KestrelAgent(
         # every teardown step below, so its failure must not skip them.
         try:
             await feature.on_disable()
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' on_disable() failed during teardown; "
@@ -5074,7 +5404,7 @@ class KestrelAgent(
         # The feature's own resource teardown (signal sources + wait providers).
         try:
             await feature.shutdown()
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' shutdown() failed during teardown; "
@@ -5091,7 +5421,7 @@ class KestrelAgent(
                         f"Auto-unregistered hook '{hook.name}' from feature "
                         f"'{feature_key}'"
                     )
-            except Exception as exc:  # noqa: BLE001 - cleanup continues below
+            except (Exception, asyncio.CancelledError) as exc:
                 errors.append(exc)
                 logging.exception(
                     "Feature '%s' hook unregistration failed during teardown; "
@@ -5102,7 +5432,7 @@ class KestrelAgent(
         if self.task_manager:
             try:
                 self.task_manager.unregister_agent(feature.get_agent_card().name)
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
                     feature_key,
@@ -5124,7 +5454,7 @@ class KestrelAgent(
                 self._tool_context_hidden_features.discard(feature.__class__.__name__)
             if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
                 self._tool_context_hidden_tools.difference_update(to_remove)
-        except Exception as exc:  # noqa: BLE001 - cleanup continues below
+        except (Exception, asyncio.CancelledError) as exc:
             errors.append(exc)
             logging.exception(
                 "Feature '%s' dynamic-tool teardown failed; "
@@ -5133,11 +5463,10 @@ class KestrelAgent(
             )
 
         # Full unload drops the instance; soft-toggle keeps it re-enable-able.
+        feature.enabled = False
         if unload:
             if feature_key is not None:
                 self.features.pop(feature_key, None)
-        else:
-            feature.enabled = False
         self._cached_features_prompt = self._build_features_prompt_section()
 
         # Surface the failure only AFTER every independent cleanup step ran.
@@ -5547,47 +5876,10 @@ Expected Duration: {expected_duration}
         # CONSTITUTION AUDIT CHECK: Trigger periodic integrity audits
         await self._maybe_audit()
 
-        # SAFE MODE CHECK: If in safe mode, only allow diagnostic commands.
-        # ``process_input`` can receive a restart signal while initialize() is
-        # still constructing the agent, so absent flags are not restrictions.
-        safe_mode = getattr(self, "_safe_mode", False) is True
-        audit_pending = (
-            getattr(self, "_constitution_audit_pending", False) is True
-        )
-        if safe_mode or audit_pending:
-            command = prefixed_command_token(user_input)
-            if command is not None:
-                if command not in SAFE_MODE_COMMANDS:
-                    from kestrel_sovereign.agent.constitution import (
-                        describe_safe_mode_restriction,
-                    )
-
-                    # A blocked COMMAND was told "integrity issue" whatever
-                    # the cause, so the branch an operator hits while trying
-                    # to diagnose was the one still misreporting it.
-                    blocked_by = describe_safe_mode_restriction(
-                        self, audit_pending=audit_pending
-                    )
-                    return (
-                        "🚨 SAFE MODE ACTIVE\\n\\n"
-                        f"The agent is operating in restricted mode due to {blocked_by}.\\n"
-                        "Only diagnostic commands are available: !safe-mode, !verify-constitution, !reanchor-constitution, !status, !help\\n\\n"
-                        "Please contact your administrator to resolve it."
-                    )
-            else:
-                from kestrel_sovereign.agent.constitution import (
-                    describe_safe_mode_restriction,
-                )
-
-                restriction = describe_safe_mode_restriction(
-                    self, audit_pending=audit_pending
-                )
-                return (
-                    "🚨 SAFE MODE ACTIVE\\n\\n"
-                    f"The agent cannot process queries due to {restriction}.\\n"
-                    "Use !safe-mode to check status or !verify-constitution to re-verify.\\n\\n"
-                    "Normal operation will resume once the restriction is cleared."
-                )
+        # Check before queueing so an already-restricted turn returns promptly.
+        safe_mode_block = safe_mode_cognition_block(self, user_input)
+        if safe_mode_block is not None:
+            return safe_mode_block
 
         # Everything below this point CAN touch conversation history
         # (bootstrap writes, command handlers may persist state, the LLM
@@ -5595,6 +5887,14 @@ Expected Duration: {expected_duration}
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
         async with self._turn_lifecycle():
+            # A feature/privacy transition can latch Safe Mode while this turn
+            # is queued for the same boundary. Recheck after acquisition so a
+            # request admitted under the prior generation cannot execute over
+            # prompt authority that failed quarantine.
+            safe_mode_block = safe_mode_cognition_block(self, user_input)
+            if safe_mode_block is not None:
+                return safe_mode_block
+
             # Record THIS turn's session as soon as the turn lock is held —
             # before command handling — so tools invoked via an explicit
             # ``!command`` (e.g. request_restart's origin-session capture) see

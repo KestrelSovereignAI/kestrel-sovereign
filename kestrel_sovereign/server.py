@@ -461,6 +461,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "state_not_persisted": "restricted_by_unsaved_state",
         "identity_missing": "identity_missing",
         "memory_unreadable": "memory_unreadable",
+        "feature_lifecycle_uncertain": "feature_lifecycle_uncertain",
         "unrecorded": "cause_unrecorded",
     }
     cause = getattr(agent, "_safe_mode_cause", None)
@@ -482,6 +483,7 @@ def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
         "identity_missing",
         "bootstrap_incomplete",
         "memory_unreadable",
+        "feature_lifecycle_uncertain",
         "restricted_by_unsaved_state",
         "cause_unrecorded",
         "state_unavailable",
@@ -1679,11 +1681,6 @@ async def _shutdown_host_features(app: FastAPI) -> None:
         # Router/UI state must not outlive a failed feature shutdown.  Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
         # the host session factory or database live.
-        session_factory = (
-            getattr(host_context, "session_factory", None)
-            if host_context is not None
-            else None
-        )
         try:
             _hf.unmount_host_features(app)
         finally:
@@ -1693,26 +1690,8 @@ async def _shutdown_host_features(app: FastAPI) -> None:
                 try:
                     _unmount_feature_ui_assets(app)
                 finally:
-                    try:
-                        if session_factory is not None:
-                            await session_factory.close()
-                    except Exception as exc:  # noqa: BLE001 - close host DB too
-                        logger.warning(
-                            "Host feature session-factory shutdown failed: %s", exc
-                        )
-                    finally:
-                        host_db = (
-                            getattr(host_context, "db", None)
-                            if host_context is not None
-                            else None
-                        )
-                        if host_db is not None and hasattr(host_db, "close"):
-                            try:
-                                await host_db.close()
-                            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                                logger.warning(
-                                    "Host feature database shutdown failed: %s", exc
-                                )
+                    if host_context is not None:
+                        await _hf.close_host_context(host_context)
 
 
 _SHARED_AGENT_POSTGRES_MAX_POOL_SIZE_ENV = (
@@ -2438,6 +2417,13 @@ async def _lifespan_startup(app: FastAPI):
                 shared_postgres_backend=shared_postgres_backend,
             )
             app.state.agent_manager = manager
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            set_host_context_gate = getattr(
+                manager, "set_host_context_publication_gate", None
+            )
+            if callable(set_host_context_gate):
+                set_host_context_gate(host_context_publication_gate)
             # Persistence context for runtime agent creation (#2358): when the
             # deployment is DRIVEN BY a multi_agent.toml, a UI-created agent
             # must be appended there or it vanishes on restart (startup loads
@@ -2590,6 +2576,13 @@ async def _lifespan_startup(app: FastAPI):
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
 
+            host_context_publication_gate = asyncio.Event()
+            app.state.host_context_publication_gate = host_context_publication_gate
+            app.state.agent._host_context_publication_gate = (
+                host_context_publication_gate
+            )
+            app.state.agent.defer_agent_readiness_to_host()
+
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including
             # the multi-agent AgentManager path above — gets the same check.
@@ -2701,13 +2694,26 @@ async def _lifespan_startup(app: FastAPI):
             if started_features is None:
                 started_features = features
             candidate_started = list(started_features)
+            runtime = getattr(ctx, "feature_contribution_runtime", None)
+            host_context_registry = (
+                None if runtime is None else runtime.context_clause_registry
+            )
+            manager = getattr(app.state, "agent_manager", None)
+            default_agent = getattr(app.state, "agent", None)
+            if manager is not None:
+                manager.validate_host_context_clause_registry(
+                    host_context_registry
+                )
+            elif default_agent is not None:
+                default_agent.validate_host_context_clause_registry(
+                    host_context_registry
+                )
             if replacing_host_state:
                 _hf.unmount_host_features(app)
             _hf.mount_host_feature_routers(app, candidate_started)
             _hf.mount_host_feature_ui(app, candidate_started)
             app.state.host_features = list(started_features)
             app.state.host_context = ctx
-            runtime = getattr(ctx, "feature_contribution_runtime", None)
             if runtime is not None:
                 app.state.host_operator_registry = runtime.operator_registry
                 app.state.host_wait_registry = runtime.wait_registry
@@ -2716,21 +2722,82 @@ async def _lifespan_startup(app: FastAPI):
                     runtime.permission_defaults_registry
                 )
                 app.state.host_setup_step_registry = runtime.setup_step_registry
+                app.state.host_context_clause_registry = host_context_registry
+                if manager is not None:
+                    manager.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
+                elif default_agent is not None:
+                    default_agent.bind_host_context_clause_registry(
+                        host_context_registry
+                    )
             logger.info("Host features initialized: %d", len(started_features))
     except (ContributionContractError, FeatureContributionRuntimeError):
         # Complete prospective-set rejection is a startup failure, not an
         # optional-feature warning. No candidate was mounted and prior valid
         # state remains visible.
+        if candidate_ctx is not None:
+            try:
+                if candidate_started:
+                    await _hf.stop_host_features(candidate_started, candidate_ctx)
+            finally:
+                await _hf.close_host_context(candidate_ctx)
         raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None and candidate_started:
-            await _hf.stop_host_features(candidate_started, candidate_ctx)
+        if candidate_ctx is not None:
+            try:
+                if candidate_started:
+                    await _hf.stop_host_features(candidate_started, candidate_ctx)
+            finally:
+                await _hf.close_host_context(candidate_ctx)
+
+    # No cognition turn may cross startup with the agent-only clause view.
+    # This includes overdue standalone schedules armed from on_agent_ready and
+    # the shared PostgreSQL runner, which may already have claimed work.  Host
+    # contribution validation/binding above is the publication boundary.
+    host_context_publication_gate = getattr(
+        app.state, "host_context_publication_gate", None
+    )
+    if host_context_publication_gate is not None:
+        host_context_publication_gate.set()
+    await _complete_deferred_agent_readiness(app)
 
     # Initialize OpenTelemetry tracing (no-op if packages not installed)
     setup_tracing(app)
 
     yield
+
+
+async def _complete_deferred_agent_readiness(app: FastAPI) -> None:
+    """Run ready hooks postponed until host prompt policy was published."""
+
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        complete_manager_readiness = getattr(
+            manager,
+            "complete_deferred_agent_readiness",
+            None,
+        )
+        if callable(complete_manager_readiness):
+            await complete_manager_readiness()
+            return
+        agents = [
+            manager.get_agent(name)
+            for name in manager.list_agents()
+        ]
+    else:
+        agent = getattr(app.state, "agent", None)
+        agents = [] if agent is None else [agent]
+
+    seen: set[int] = set()
+    for agent in agents:
+        if agent is None or id(agent) in seen:
+            continue
+        seen.add(id(agent))
+        complete = getattr(agent, "complete_deferred_agent_readiness", None)
+        if callable(complete):
+            await complete()
 
 
 @asynccontextmanager

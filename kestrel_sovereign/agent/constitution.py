@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from kestrel_sovereign.command_policy import (
     GENESIS_AUDIT_BYPASS_COMMANDS,
+    SAFE_MODE_COMMANDS,
     prefixed_command_token,
 )
 
@@ -62,6 +63,10 @@ class SafeModeCause(str, Enum):
     #: constitution — saying "governance state could not be read" would
     #: misdirect the operator to a store that is answering fine.
     MEMORY_UNREADABLE = "memory_unreadable"
+    #: A feature contribution transition could not prove that every prompt,
+    #: tool, signal, permission, and setup capability was withdrawn. A normal
+    #: constitution audit cannot repair that lifecycle generation.
+    FEATURE_LIFECYCLE_UNCERTAIN = "feature_lifecycle_uncertain"
     #: Restored from a durable record written before causes were recorded.
     #: Deliberately not INTEGRITY: an unrecorded cause is not evidence of one.
     UNRECORDED = "unrecorded"
@@ -82,6 +87,9 @@ _RESTRICTION_PHRASES = {
     SafeModeCause.IDENTITY_MISSING.value: "a missing agent identity record",
     SafeModeCause.MEMORY_UNREADABLE.value: (
         "stored memory that could not be decrypted"
+    ),
+    SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value: (
+        "feature lifecycle state whose integrity could not be verified"
     ),
     SafeModeCause.UNRECORDED.value: "a restriction whose cause was not recorded",
 }
@@ -110,6 +118,42 @@ def describe_safe_mode_restriction(agent, *, audit_pending: bool = False) -> str
     ):
         phrase += " (this restriction could not be saved and will not survive a restart)"
     return phrase
+
+
+def safe_mode_cognition_block(agent, user_input: str) -> str | None:
+    """Return the shared Safe Mode block, or allow one diagnostic command."""
+
+    safe_mode = getattr(agent, "_safe_mode", False) is True
+    audit_pending = (
+        getattr(agent, "_constitution_audit_pending", False) is True
+    )
+    if not (safe_mode or audit_pending):
+        return None
+
+    command = prefixed_command_token(user_input)
+    if command is not None:
+        if command in SAFE_MODE_COMMANDS:
+            return None
+        blocked_by = describe_safe_mode_restriction(
+            agent, audit_pending=audit_pending
+        )
+        return (
+            "🚨 SAFE MODE ACTIVE\n\n"
+            f"The agent is operating in restricted mode due to {blocked_by}.\n"
+            "Only diagnostic commands are available: !safe-mode, "
+            "!verify-constitution, !reanchor-constitution, !status, !help\n\n"
+            "Please contact your administrator to resolve it."
+        )
+
+    restriction = describe_safe_mode_restriction(
+        agent, audit_pending=audit_pending
+    )
+    return (
+        "🚨 SAFE MODE ACTIVE\n\n"
+        f"The agent cannot process queries due to {restriction}.\n"
+        "Use !safe-mode to check status or !verify-constitution to re-verify.\n\n"
+        "Normal operation will resume once the restriction is cleared."
+    )
 
 
 class ConstitutionMixin:
@@ -385,6 +429,14 @@ class ConstitutionMixin:
         # only the prompt-injection set excludes it.
         skip_names = {"KESTREL_CONSTITUTION.md"}
 
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            validate_anchored_doctrine_names,
+        )
+
+        validate_anchored_doctrine_names(
+            path.name for path in anchored_paths if path.name not in skip_names
+        )
+
         # Codex round-23 P2: keys are basenames so the assembler's
         # section labels match. Operators who declare two anchored
         # paths with the same basename get a logged warning and only
@@ -530,6 +582,11 @@ class ConstitutionMixin:
         self._constitution_audit_pending = False
         self._constitution_state_persistence_pending = False
         self._safe_mode_cause: Optional[str] = None
+        # Volatile evidence about this process generation. A clean restart can
+        # rebuild every feature registry from declarations, but the process in
+        # which quarantine failed must never certify its own uncertain state.
+        self._feature_lifecycle_integrity_uncertain = False
+        self._feature_lifecycle_repair_verified = False
 
     def _constitution_now(self) -> datetime:
         """Return an aware UTC time, using the injected test clock if present."""
@@ -1382,6 +1439,21 @@ class ConstitutionMixin:
         self, reason: str, *, cause: str = SafeModeCause.INTEGRITY.value
     ) -> bool:
         """Locked implementation of :meth:`enter_safe_mode`."""
+        existing_lifecycle_cause = (
+            getattr(self, "_safe_mode", False) is True
+            and getattr(self, "_safe_mode_cause", None)
+            == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+            and not getattr(self, "_feature_lifecycle_repair_verified", False)
+        )
+        if existing_lifecycle_cause:
+            # Diagnostic constitution checks remain available in Safe Mode, but
+            # a later integrity result must not overwrite the durable lifecycle
+            # cause before the separate registry repair proof has succeeded.
+            cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+        if cause == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value:
+            self._feature_lifecycle_integrity_uncertain = True
+            self._feature_lifecycle_repair_verified = False
+
         # Record agent consent before entering safe mode
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:
@@ -1446,6 +1518,31 @@ class ConstitutionMixin:
         if not authorization:
             return "Safe Mode remains active: explicit Sovereign authorization is required."
 
+        lifecycle_uncertain = (
+            self._safe_mode_cause
+            == SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+            or getattr(self, "_feature_lifecycle_integrity_uncertain", False)
+            is True
+        )
+        if lifecycle_uncertain:
+            verifier = getattr(self, "verify_feature_lifecycle_integrity", None)
+            repaired = False
+            if callable(verifier):
+                try:
+                    repaired = verifier() is True
+                except Exception as exc:  # noqa: BLE001 - never trust partial repair
+                    logging.error(
+                        "Feature lifecycle repair verification reported %s",
+                        type(exc).__name__,
+                    )
+            if not repaired:
+                return (
+                    "Safe Mode remains active: feature lifecycle repair "
+                    "verification failed; restart the agent after repairing the "
+                    "feature package or registry state."
+                )
+            self._feature_lifecycle_repair_verified = True
+
         is_valid, message = await self._verify_constitution_integrity()
         if not is_valid:
             await self.enter_safe_mode(f"Safe Mode exit verification failed: {message}")
@@ -1478,6 +1575,8 @@ class ConstitutionMixin:
         self._constitution_state_migration_pending = False
         self._constitution_bootstrap_pending = False
         self._constitution_audit_pending = False
+        self._feature_lifecycle_integrity_uncertain = False
+        self._feature_lifecycle_repair_verified = False
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
         privacy_agent = getattr(self, "privacy_agent", None)
         if privacy_agent is not None:

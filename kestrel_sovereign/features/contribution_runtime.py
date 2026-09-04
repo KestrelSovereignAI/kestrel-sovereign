@@ -7,11 +7,14 @@ enable (or host-feature start) transition until its matching teardown.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Iterable
+import asyncio
+import weakref
+from dataclasses import dataclass, field, replace
+from typing import Callable, Iterable
 
 from kestrel_sdk.features import (
     ContributionContractError,
+    ContextClauseRegistration,
     FeatureContributionSet,
     FeaturePermissionDefaults,
     SetupStepClassification,
@@ -23,6 +26,13 @@ from kestrel_sdk.features import (
 )
 from kestrel_sdk.operator import ServiceScope
 
+from kestrel_sovereign.agent.system_prompt_assembler import (
+    AGENTS_FILENAME,
+    HOST_OWNED_AUDIT_NAMES,
+    TORTOISE_DOCTRINE_FILENAME,
+    legacy_bootstrap_audit_name,
+)
+from kestrel_sovereign.features.bootstrap.loader import DEFAULT_BOOTSTRAP_FILES
 from kestrel_sovereign.operator import (
     ExecutionTargetRegistration,
     OperatorRegistrationSet,
@@ -41,12 +51,49 @@ class FeatureContributionRuntimeError(RuntimeError):
     """A contribution transition cannot be committed or exactly reversed."""
 
 
+def validate_bootstrap_audit_namespace(
+    names: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return raw and compatibility audit names after global validation."""
+
+    values = tuple(names)
+    if len(set(values)) != len(values):
+        raise FeatureContributionRuntimeError("duplicate bootstrap audit name")
+    host_conflict = next(
+        (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
+        None,
+    )
+    if host_conflict is not None:
+        raise FeatureContributionRuntimeError(
+            f"bootstrap name {host_conflict!r} is a reserved host audit name"
+        )
+    derived_audit_names = tuple(
+        audit_name
+        for filename in values
+        if (audit_name := legacy_bootstrap_audit_name(filename)) is not None
+    )
+    prospective_audit_names = (*values, *derived_audit_names)
+    if len(set(prospective_audit_names)) != len(prospective_audit_names):
+        seen: set[str] = set()
+        conflict = ""
+        for name in prospective_audit_names:
+            if name in seen:
+                conflict = name
+                break
+            seen.add(name)
+        raise FeatureContributionRuntimeError(
+            f"duplicate bootstrap audit identity: {conflict!r}"
+        )
+    return values, prospective_audit_names
+
+
 class FeatureContributionCollectionError(FeatureContributionRuntimeError):
     """A sanitized failure from one declarative collection boundary.
 
     The exact feature and fixed boundary remain inspectable, while the public
     message omits both the feature representation and original exception text.
-    The original failure is retained as ``__cause__``.
+    The original failure is deliberately discarded rather than retained as an
+    exception cause that production traceback logging could reveal.
     """
 
     _STAGES_BY_GETTER = {
@@ -57,6 +104,8 @@ class FeatureContributionCollectionError(FeatureContributionRuntimeError):
         "get_workflow_registrations": "workflow collection",
         "get_feature_permission_defaults": "permission-default collection",
         "get_setup_step_registrations": "setup-step collection",
+        "get_context_clause_registrations": "context-clause collection",
+        "render_context_clauses": "context-clause rendering",
         "validate_feature_contributions": "contribution validation",
         "validate_contribution_owner_uniqueness": "contribution validation",
     }
@@ -83,6 +132,353 @@ class PermissionDefaultRegistration:
     owner: str
     feature_name: str
     defaults: FeaturePermissionDefaults
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedContextClause:
+    """Immutable prompt bytes resolved at one feature lifecycle transition."""
+
+    owner: str
+    name: str
+    priority: int
+    body: str
+    registration: ContextClauseRegistration
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return (self.owner, self.name)
+
+
+class ContextClauseRegistry:
+    """Lifecycle-owned cache of already-rendered feature context clauses."""
+
+    def __init__(self) -> None:
+        self._clauses: dict[tuple[str, str], ResolvedContextClause] = {}
+        self._external_registries: tuple[ContextClauseRegistry, ...] = ()
+        # An agent registry depends on the host registry for prompt assembly.
+        # The reverse weak edge lets a later host-feature start preflight
+        # against already-bound agents without retaining stopped agents or
+        # making independent agents conflict with one another.
+        self._dependent_registries: weakref.WeakSet[ContextClauseRegistry] = (
+            weakref.WeakSet()
+        )
+        self._reserved_audit_name_provider: (
+            Callable[[], Iterable[str]] | None
+        ) = None
+
+    _HOST_OWNED_AUDIT_NAMES = HOST_OWNED_AUDIT_NAMES
+    _RESERVED_AUDIT_NAMES = frozenset(
+        set(DEFAULT_BOOTSTRAP_FILES)
+        | {AGENTS_FILENAME, TORTOISE_DOCTRINE_FILENAME}
+        | _HOST_OWNED_AUDIT_NAMES
+    )
+
+    def _local_reserved_audit_names(self) -> frozenset[str]:
+        names = set(self._RESERVED_AUDIT_NAMES)
+        bootstrap_names = set(DEFAULT_BOOTSTRAP_FILES)
+        if self._reserved_audit_name_provider is not None:
+            provided_names = tuple(self._reserved_audit_name_provider())
+            names.update(provided_names)
+            bootstrap_names.update(provided_names)
+        names.update(
+            audit_name
+            for filename in bootstrap_names
+            if (audit_name := legacy_bootstrap_audit_name(filename)) is not None
+        )
+        return frozenset(names)
+
+    def _visible_reserved_audit_names(self) -> frozenset[str]:
+        names = set(self._local_reserved_audit_names())
+        for registry in self._external_registries:
+            names.update(registry._local_reserved_audit_names())
+        for registry in self._dependent_registries:
+            names.update(registry._local_reserved_audit_names())
+        return frozenset(names)
+
+    def validate_declared_names(self, names: Iterable[str]) -> tuple[str, ...]:
+        """Validate host-visible audit names without invoking renderers."""
+
+        values = tuple(names)
+        if len(set(values)) != len(values):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause name in one registration batch"
+            )
+        reserved = next(
+            (
+                name
+                for name in values
+                if name in self._visible_reserved_audit_names()
+                or name.casefold().endswith(".md")
+            ),
+            None,
+        )
+        if reserved is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name {reserved!r} is a reserved host audit name"
+            )
+        return values
+
+    def _validate_names(
+        self,
+        values: tuple[ResolvedContextClause, ...],
+        *,
+        resident: Iterable[ResolvedContextClause],
+    ) -> None:
+        names = self.validate_declared_names(clause.name for clause in values)
+        resident_names = {clause.name for clause in resident}
+        conflict = next((name for name in names if name in resident_names), None)
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+
+    def _external_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        return tuple(
+            clause
+            for registry in self._external_registries
+            for clause in registry.snapshot()
+        )
+
+    def _dependent_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        return tuple(
+            clause
+            for registry in self._dependent_registries
+            for clause in registry.snapshot()
+        )
+
+    def validate_reserved_audit_names(
+        self, names: Iterable[str]
+    ) -> tuple[str, ...]:
+        """Ensure prospective bootstrap audit names do not shadow clauses."""
+
+        values, prospective_audit_names = validate_bootstrap_audit_namespace(
+            names
+        )
+        resident_names = {
+            clause.name
+            for clause in (
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            )
+        }
+        conflict = next(
+            (name for name in prospective_audit_names if name in resident_names),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+        return values
+
+    def bind_reserved_audit_name_provider(
+        self, provider: Callable[[], Iterable[str]]
+    ) -> None:
+        """Bind one live bootstrap namespace after an atomic conflict check."""
+
+        self.validate_reserved_audit_names(provider())
+        self._reserved_audit_name_provider = provider
+
+    def has_audit_name(self, name: str) -> bool:
+        """Whether visible clause or bootstrap state owns one audit name."""
+
+        return name in self._visible_reserved_audit_names() or any(
+            clause.name == name
+            for clause in (
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            )
+        )
+
+    def validate_external_registries(
+        self, registries: Iterable[ContextClauseRegistry]
+    ) -> tuple[ContextClauseRegistry, ...]:
+        values = tuple(registries)
+        if any(registry is self for registry in values):
+            raise FeatureContributionRuntimeError(
+                "context-clause registry cannot depend on itself"
+            )
+        external = tuple(
+            clause for registry in values for clause in registry.snapshot()
+        )
+        self._validate_names(external, resident=self._clauses.values())
+        external_reserved = {
+            name
+            for registry in values
+            for name in registry._local_reserved_audit_names()
+        }
+        conflict = next(
+            (
+                clause.name
+                for clause in self._clauses.values()
+                if clause.name in external_reserved
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name {conflict!r} is a reserved host audit name"
+            )
+        return values
+
+    def bind_external_registries(
+        self, registries: Iterable[ContextClauseRegistry]
+    ) -> None:
+        """Atomically bind host registries after validating bare audit names."""
+
+        values = self.validate_external_registries(registries)
+        for registry in self._external_registries:
+            if registry not in values:
+                registry._dependent_registries.discard(self)
+        for registry in values:
+            registry._dependent_registries.add(self)
+        self._external_registries = values
+
+    def validate_register_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = tuple(clauses)
+        identities = [clause.identity for clause in values]
+        if len(set(identities)) != len(identities):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause registration identity"
+            )
+        self._validate_names(
+            values,
+            resident=(
+                *self._clauses.values(),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            ),
+        )
+        conflict = next(
+            (identity for identity in identities if identity in self._clauses),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context clause is already registered for {conflict!r}"
+            )
+        return values
+
+    def register_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = self.validate_register_batch(clauses)
+        self._clauses.update((clause.identity, clause) for clause in values)
+        return values
+
+    def validate_unregister_batch(
+        self, clauses: Iterable[ResolvedContextClause]
+    ) -> tuple[ResolvedContextClause, ...]:
+        values = tuple(clauses)
+        if any(self._clauses.get(clause.identity) is not clause for clause in values):
+            raise FeatureContributionRuntimeError(
+                "active context-clause registration identity does not match"
+            )
+        return values
+
+    def unregister_batch(self, clauses: Iterable[ResolvedContextClause]) -> None:
+        values = self.validate_unregister_batch(clauses)
+        for clause in values:
+            del self._clauses[clause.identity]
+
+    def replace_batch(
+        self,
+        current: Iterable[ResolvedContextClause],
+        replacement: Iterable[ResolvedContextClause],
+    ) -> tuple[ResolvedContextClause, ...]:
+        old_values = self.validate_unregister_batch(current)
+        new_values = tuple(replacement)
+        old_identities = {clause.identity for clause in old_values}
+        new_identities = [clause.identity for clause in new_values]
+        if len(set(new_identities)) != len(new_identities):
+            raise FeatureContributionRuntimeError(
+                "duplicate context-clause registration identity"
+            )
+        self._validate_names(
+            new_values,
+            resident=(
+                *(
+                    clause
+                    for clause in self._clauses.values()
+                    if clause.identity not in old_identities
+                ),
+                *self._external_clauses(),
+                *self._dependent_clauses(),
+            ),
+        )
+        if any(
+            identity in self._clauses and identity not in old_identities
+            for identity in new_identities
+        ):
+            raise FeatureContributionRuntimeError(
+                "replacement context clause conflicts with an active registration"
+            )
+        for clause in old_values:
+            del self._clauses[clause.identity]
+        self._clauses.update((clause.identity, clause) for clause in new_values)
+        return new_values
+
+    def snapshot(self) -> tuple[ResolvedContextClause, ...]:
+        """Return a load-order-independent immutable prompt snapshot."""
+
+        return tuple(
+            sorted(
+                self._clauses.values(),
+                key=lambda clause: (clause.priority, clause.name, clause.owner),
+            )
+        )
+
+
+class CompositeContextClauseRegistry:
+    """Read-only deterministic union of host and agent lifecycle registries."""
+
+    def __init__(self, *registries: ContextClauseRegistry) -> None:
+        self._registries = tuple(registry for registry in registries if registry)
+
+    def snapshot(self) -> tuple[ResolvedContextClause, ...]:
+        clauses = tuple(
+            clause
+            for registry in self._registries
+            for clause in registry.snapshot()
+        )
+        names = [clause.name for clause in clauses]
+        if len(set(names)) != len(names):
+            raise FeatureContributionRuntimeError(
+                "composite context-clause audit names are not globally unique"
+            )
+        return tuple(
+            sorted(
+                clauses,
+                key=lambda clause: (clause.priority, clause.name, clause.owner),
+            )
+        )
+
+    def validate_reserved_audit_names(
+        self, names: Iterable[str]
+    ) -> tuple[str, ...]:
+        """Ensure bootstrap audit names do not shadow host or union members."""
+
+        values, prospective_audit_names = validate_bootstrap_audit_namespace(
+            names
+        )
+        resident_names = {clause.name for clause in self.snapshot()}
+        conflict = next(
+            (
+                name
+                for name in prospective_audit_names
+                if name in resident_names
+            ),
+            None,
+        )
+        if conflict is not None:
+            raise FeatureContributionRuntimeError(
+                f"context-clause name is already registered: {conflict!r}"
+            )
+        return values
 
 
 class PermissionDefaultsRegistry:
@@ -286,7 +682,18 @@ class ActiveFeatureContributions:
     prepared: PreparedFeatureContributions
     operator_registrations: OperatorRegistrationSet
     permission_registration: PermissionDefaultRegistration | None
+    context_clauses: tuple[ResolvedContextClause, ...] = ()
     execution_target_registrations: tuple[OperatorRegistrationSet, ...] = ()
+    # Quarantine is deliberately best-effort across independent registries.
+    # Operator registration sets are the exception: their authenticated
+    # withdrawal consumes a one-shot issuance seal. If a later registry fails,
+    # retain which exact capabilities already completed so a retry can finish
+    # instead of presenting a consumed seal again and becoming unrecoverable.
+    quarantined_operator_set_ids: set[int] = field(
+        default_factory=set,
+        repr=False,
+        compare=False,
+    )
 
 
 class FeatureContributionRuntime:
@@ -307,6 +714,7 @@ class FeatureContributionRuntime:
         source_registry: SourceRegistry,
         permission_defaults_registry: PermissionDefaultsRegistry | None = None,
         setup_step_registry: SetupStepRegistry | None = None,
+        context_clause_registry: ContextClauseRegistry | None = None,
     ) -> None:
         self.operator_registry = operator_registry
         self.wait_registry = wait_registry
@@ -320,6 +728,11 @@ class FeatureContributionRuntime:
             setup_step_registry
             if setup_step_registry is not None
             else SetupStepRegistry()
+        )
+        self.context_clause_registry = (
+            context_clause_registry
+            if context_clause_registry is not None
+            else ContextClauseRegistry()
         )
         self._active: dict[int, ActiveFeatureContributions] = {}
 
@@ -389,11 +802,16 @@ class FeatureContributionRuntime:
             raise FeatureContributionRuntimeError(rejections[0].reason)
 
         values = prepared.contributions
+        resolved_context_clauses = self._resolve_context_clauses(prepared)
+        self.context_clause_registry.validate_register_batch(
+            resolved_context_clauses
+        )
         operator_set: OperatorRegistrationSet | None = None
         registered_waits = []
         registered_sources = []
         permission_registration: PermissionDefaultRegistration | None = None
         setup_registered = False
+        context_registered = False
         try:
             operator_set = self.operator_registry.register(
                 prepared.owner,
@@ -443,7 +861,13 @@ class FeatureContributionRuntime:
                 values.setup_steps, prevalidated=True
             )
             setup_registered = True
+            self.context_clause_registry.register_batch(resolved_context_clauses)
+            context_registered = True
         except Exception:
+            if context_registered:
+                self.context_clause_registry.unregister_batch(
+                    resolved_context_clauses
+                )
             if setup_registered:
                 self.setup_step_registry.unregister_batch(values.setup_steps)
             if permission_registration is not None:
@@ -466,6 +890,7 @@ class FeatureContributionRuntime:
             prepared=prepared,
             operator_registrations=operator_set,
             permission_registration=permission_registration,
+            context_clauses=resolved_context_clauses,
         )
         self._active[id(prepared.feature)] = active
         return active
@@ -515,6 +940,34 @@ class FeatureContributionRuntime:
             raise FeatureContributionRuntimeError(
                 "active feature contribution identity does not match"
             )
+        values = active.prepared.contributions
+        self._validate_active_contributions(feature, active)
+
+        for registration_set in reversed(active.execution_target_registrations):
+            self.operator_registry.unregister(registration_set)
+        self.operator_registry.unregister(active.operator_registrations)
+        for registration in values.wait_providers:
+            self.wait_registry.deregister(registration.name, registration.provider)
+        if active.permission_registration is not None:
+            self.permission_defaults_registry.unregister(
+                active.permission_registration
+            )
+        self.setup_step_registry.unregister_batch(values.setup_steps)
+        self.context_clause_registry.unregister_batch(active.context_clauses)
+        # Past every validation, in the same mutating stretch as the other
+        # unregistrations: drop this feature's claims. The registry removes each
+        # source only when its last holder lets go.
+        self.source_registry.release_all(feature)
+        del self._active[id(feature)]
+        return True
+
+    def _validate_active_contributions(
+        self,
+        feature: object,
+        active: ActiveFeatureContributions,
+    ) -> None:
+        """Validate one exact inverse without mutating any registry."""
+
         values = active.prepared.contributions
         # No per-lifecycle source list any more: the registry holds the claims,
         # so teardown just lets go of what this feature held. A source another
@@ -573,26 +1026,169 @@ class FeatureContributionRuntime:
                 raise FeatureContributionRuntimeError(
                     "active setup-step registration identity does not match"
                 )
+        self.context_clause_registry.validate_unregister_batch(
+            active.context_clauses
+        )
         self.operator_registry.validate_registration_set(
             active.operator_registrations
         )
         for registration_set in active.execution_target_registrations:
             self.operator_registry.validate_registration_set(registration_set)
 
-        for registration_set in reversed(active.execution_target_registrations):
-            self.operator_registry.unregister(registration_set)
-        self.operator_registry.unregister(active.operator_registrations)
-        for registration in values.wait_providers:
-            self.wait_registry.deregister(registration.name, registration.provider)
-        if active.permission_registration is not None:
-            self.permission_defaults_registry.unregister(
-                active.permission_registration
+    def validate_active_integrity(self) -> bool:
+        """Prove that retained capabilities match the live registry generation.
+
+        This is the restart-time repair proof for a durable lifecycle Safe Mode
+        cause. It executes no feature code and mutates no registry.
+        """
+
+        try:
+            for key, active in tuple(self._active.items()):
+                feature = active.prepared.feature
+                if key != id(feature):
+                    raise FeatureContributionRuntimeError(
+                        "active feature contribution identity does not match"
+                    )
+                self._validate_active_contributions(feature, active)
+
+            expected_context = tuple(
+                clause
+                for active in self._active.values()
+                for clause in active.context_clauses
             )
-        self.setup_step_registry.unregister_batch(values.setup_steps)
-        # Past every validation, in the same mutating stretch as the other
-        # unregistrations: drop this feature's claims. The registry removes each
-        # source only when its last holder lets go.
-        self.source_registry.release_all(feature)
+            resident_context = self.context_clause_registry.snapshot()
+            if len(expected_context) != len(resident_context) or any(
+                self.context_clause_registry._clauses.get(clause.identity)
+                is not clause
+                for clause in expected_context
+            ):
+                raise FeatureContributionRuntimeError(
+                    "active context-clause registry identity does not match"
+                )
+        except FeatureContributionRuntimeError:
+            raise FeatureContributionRuntimeError(
+                "active feature contribution integrity does not match"
+            ) from None
+        return True
+
+    def quarantine(self, feature: object) -> bool:
+        """Fail closed after drift prevents the ordinary exact inverse.
+
+        ``deactivate`` deliberately validates the complete inverse before it
+        mutates anything. If an operator or external component has already
+        removed one retained capability, that atomic inverse refuses to run.
+        Runtime rollback still needs a repair seam: remove every surviving
+        capability only when its exact retained identity is present, tolerate
+        capabilities that are already absent, and never remove a replacement
+        object. Context clauses are checked and withdrawn first so a failed
+        quarantine cannot leave feature-owned prompt bytes published while a
+        caller reports the feature disabled.
+        """
+
+        active = self._active.get(id(feature))
+        if active is None:
+            return False
+        if active.prepared.feature is not feature:
+            raise FeatureContributionRuntimeError(
+                "active feature contribution identity does not match"
+            )
+
+        # A different object at the same context identity is not ours to erase.
+        # Refuse before any quarantine mutation rather than risk deleting a
+        # replacement clause published by another lifecycle generation.
+        for clause in active.context_clauses:
+            resident = self.context_clause_registry._clauses.get(clause.identity)
+            if resident is not None and resident is not clause:
+                raise FeatureContributionRuntimeError(
+                    "feature context clauses could not be quarantined"
+                )
+        exact_context = tuple(
+            clause
+            for clause in active.context_clauses
+            if self.context_clause_registry._clauses.get(clause.identity) is clause
+        )
+        if exact_context:
+            self.context_clause_registry.unregister_batch(exact_context)
+
+        failed = False
+
+        def attempt(operation) -> None:
+            nonlocal failed
+            try:
+                operation()
+            except Exception:
+                # The public error below is deliberately fixed text. Registry
+                # exceptions can include third-party names or representations.
+                failed = True
+
+        def quarantine_operator_set(registration_set: OperatorRegistrationSet) -> None:
+            nonlocal failed
+            capability_id = id(registration_set)
+            if capability_id in active.quarantined_operator_set_ids:
+                return
+            try:
+                withdrawn = self.operator_registry.quarantine_registration_set(
+                    registration_set
+                )
+            except Exception:
+                # Keep the retained capability unmarked so a later repair can
+                # retry its authenticated withdrawal.
+                failed = True
+                return
+            if withdrawn is not True:
+                failed = True
+                return
+            active.quarantined_operator_set_ids.add(capability_id)
+
+        for registration_set in reversed(active.execution_target_registrations):
+            quarantine_operator_set(registration_set)
+        quarantine_operator_set(active.operator_registrations)
+
+        for registration in active.prepared.contributions.wait_providers:
+            if self.wait_registry.contains(registration.name, registration.provider):
+                attempt(
+                    lambda item=registration: self.wait_registry.deregister(
+                        item.name, item.provider
+                    )
+                )
+
+        permission = active.permission_registration
+        if permission is not None:
+            resident_permission = self.permission_defaults_registry.registration(
+                permission.feature_name
+            )
+            if resident_permission is permission:
+                attempt(
+                    lambda: self.permission_defaults_registry.unregister(permission)
+                )
+            elif resident_permission is not None:
+                failed = True
+
+        exact_setup = tuple(
+            registration
+            for registration in active.prepared.contributions.setup_steps
+            if self.setup_step_registry.get(registration.name) is registration
+        )
+        if exact_setup:
+            attempt(lambda: self.setup_step_registry.unregister_batch(exact_setup))
+        if any(
+            (resident := self.setup_step_registry.get(registration.name)) is not None
+            and resident is not registration
+            for registration in active.prepared.contributions.setup_steps
+        ):
+            failed = True
+
+        sources = tuple(
+            source
+            for workflow in active.prepared.contributions.workflows
+            for source in workflow.sources
+        )
+        attempt(lambda: self.source_registry.quarantine_claims(feature, sources))
+        if failed:
+            raise FeatureContributionRuntimeError(
+                "feature contributions could not be quarantined"
+            ) from None
+
         del self._active[id(feature)]
         return True
 
@@ -602,6 +1198,132 @@ class FeatureContributionRuntime:
 
     def active_owners(self) -> tuple[str, ...]:
         return tuple(item.prepared.owner for item in self._active.values())
+
+    def active_context_clauses(self) -> tuple[ResolvedContextClause, ...]:
+        """Return only core-owned rendered bytes; no feature code runs here."""
+
+        return self.context_clause_registry.snapshot()
+
+    def refresh_context_clauses(
+        self, feature: object
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Resolve a deliberate configuration transition, never a turn read."""
+
+        active = self._active.get(id(feature))
+        if active is None or active.prepared.feature is not feature:
+            raise FeatureContributionRuntimeError(
+                "context-clause refresh requires an active owning feature"
+            )
+        replacement = self._resolve_context_clauses(active.prepared)
+        committed = self.context_clause_registry.replace_batch(
+            active.context_clauses, replacement
+        )
+        self._active[id(feature)] = replace(active, context_clauses=committed)
+        return committed
+
+    def refresh_all_context_clauses(
+        self,
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Atomically republish every active clause after a host transition.
+
+        Privacy and other host-owned configuration can change what an
+        out-of-tree renderer is allowed to disclose without invoking a feature
+        tool. Resolve every renderer before touching the registry, then replace
+        the complete agent-owned set in one validated mutation so prompts never
+        observe a mixture of pre- and post-transition bytes.
+        """
+
+        active_items = tuple(self._active.items())
+        replacements = tuple(
+            (
+                key,
+                active,
+                self._resolve_context_clauses(active.prepared),
+            )
+            for key, active in active_items
+        )
+        return self._commit_all_context_clause_replacements(replacements)
+
+    def suppress_all_context_clauses(
+        self,
+    ) -> tuple[ResolvedContextClause, ...]:
+        """Fail closed to empty bodies without executing feature code."""
+
+        replacements = tuple(
+            (
+                key,
+                active,
+                tuple(replace(clause, body="") for clause in active.context_clauses),
+            )
+            for key, active in tuple(self._active.items())
+        )
+        return self._commit_all_context_clause_replacements(replacements)
+
+    def _commit_all_context_clause_replacements(
+        self,
+        replacements: tuple[
+            tuple[
+                int,
+                ActiveFeatureContributions,
+                tuple[ResolvedContextClause, ...],
+            ],
+            ...,
+        ],
+    ) -> tuple[ResolvedContextClause, ...]:
+        current = tuple(
+            clause
+            for _key, active, _replacement in replacements
+            for clause in active.context_clauses
+        )
+        requested = tuple(
+            clause
+            for _key, _active, replacement in replacements
+            for clause in replacement
+        )
+        committed = self.context_clause_registry.replace_batch(current, requested)
+        offset = 0
+        for key, active, replacement in replacements:
+            end = offset + len(replacement)
+            self._active[key] = replace(
+                active,
+                context_clauses=committed[offset:end],
+            )
+            offset = end
+        return committed
+
+    @staticmethod
+    def _resolve_context_clauses(
+        prepared: PreparedFeatureContributions,
+    ) -> tuple[ResolvedContextClause, ...]:
+        sanitized_error: FeatureContributionCollectionError | None = None
+        try:
+            resolved = []
+            for registration in prepared.contributions.context_clauses:
+                body = registration.renderer()
+                if not isinstance(body, str):
+                    raise TypeError("context clause renderer must return str")
+                resolved.append(
+                    ResolvedContextClause(
+                        owner=registration.owner,
+                        name=registration.name,
+                        priority=registration.priority,
+                        body=body,
+                        registration=registration,
+                    )
+                )
+            return tuple(resolved)
+        except (Exception, asyncio.CancelledError):
+            # Renderer exceptions are arbitrary out-of-tree objects and may
+            # carry user-authored text or credentials in their message.  Do
+            # not retain them as a cause: API/startup error boundaries format
+            # complete exception chains into production logs.
+            sanitized_error = FeatureContributionCollectionError(
+                prepared.feature, "render_context_clauses"
+            )
+        # Raising outside the active handler is load-bearing: ``from None``
+        # hides an exception context from formatting but still retains the raw
+        # object (and any secret text) on ``__context__``.
+        raise sanitized_error
 
     @staticmethod
     def _collect(feature: object) -> PreparedFeatureContributions:
@@ -623,6 +1345,7 @@ class FeatureContributionRuntime:
                 workflows=(),
                 permission_defaults=None,
                 setup_steps=(),
+                context_clauses=(),
             )
             return PreparedFeatureContributions(
                 feature=feature,
@@ -664,6 +1387,13 @@ class FeatureContributionRuntime:
         setup_steps = FeatureContributionRuntime._call_collection_getter(
             feature, "get_setup_step_registrations", materialize=True
         )
+        context_clauses = FeatureContributionRuntime._call_collection_getter(
+            feature,
+            "get_context_clause_registrations",
+            materialize=True,
+            optional=True,
+            discard_cause=True,
+        )
         try:
             contributions = validate_feature_contributions(
                 owner,
@@ -673,6 +1403,7 @@ class FeatureContributionRuntime:
                 workflows=workflows,
                 permission_defaults=permissions,
                 setup_steps=setup_steps,
+                context_clauses=context_clauses,
             )
             if isinstance(feature, Feature):
                 agent_id = getattr(feature.agent, "agent_id", None) or getattr(
@@ -711,17 +1442,32 @@ class FeatureContributionRuntime:
         *,
         materialize: bool,
         optional: bool = False,
+        discard_cause: bool = False,
     ) -> object:
         """Read one SDK getter once and keep all failures at one typed edge."""
 
+        sanitized_error: FeatureContributionCollectionError | None = None
         try:
             method = getattr(feature, getter, None)
             if method is None and optional:
                 return ()
             value = method()
             return tuple(value) if materialize else value
-        except Exception as exc:
-            raise FeatureContributionCollectionError(feature, getter) from exc
+        except (Exception, asyncio.CancelledError) as exc:
+            if discard_cause:
+                # Context clauses are user-authored prompt material and their
+                # getters commonly read secret-bearing feature configuration.
+                # Startup/API logging formats complete exception chains, so the
+                # fixed boundary must not retain arbitrary out-of-tree text.
+                sanitized_error = FeatureContributionCollectionError(feature, getter)
+            if isinstance(exc, asyncio.CancelledError):
+                if sanitized_error is None:
+                    raise
+            elif sanitized_error is None:
+                raise FeatureContributionCollectionError(feature, getter) from exc
+        # Do not raise this while the untrusted exception is being handled:
+        # Python would retain it through ``__context__`` even with ``from None``.
+        raise sanitized_error
 
     @staticmethod
     def _first_owner_conflict(
@@ -763,6 +1509,7 @@ class FeatureContributionRuntime:
         source_names = []
         permission_names = []
         setup_steps = []
+        context_names = []
         for item in prepared:
             values = item.contributions
             service_refs.extend(registration.reference for registration in values.services)
@@ -776,6 +1523,9 @@ class FeatureContributionRuntime:
             if values.permission_defaults is not None:
                 permission_names.append(item.feature_name)
             setup_steps.extend(values.setup_steps)
+            context_names.extend(
+                registration.name for registration in values.context_clauses
+            )
 
         self._require_unique(service_refs, "service reference")
         self._require_unique(workflow_names, "workflow name")
@@ -785,6 +1535,8 @@ class FeatureContributionRuntime:
         self._require_unique(
             [registration.name for registration in setup_steps], "setup step name"
         )
+        self._require_unique(context_names, "context-clause name")
+        self.context_clause_registry.validate_declared_names(context_names)
 
         rejections = tuple(
             ContributionRejection(item.feature, item.feature_name, reason)
@@ -856,6 +1608,12 @@ class FeatureContributionRuntime:
         for registration in values.setup_steps:
             if self.setup_step_registry.get(registration.name) is not None:
                 return f"setup step already registered: {registration.name}"
+        for registration in values.context_clauses:
+            if self.context_clause_registry.has_audit_name(registration.name):
+                return (
+                    "context clause already registered: "
+                    f"{registration.name}"
+                )
         return None
 
     @staticmethod

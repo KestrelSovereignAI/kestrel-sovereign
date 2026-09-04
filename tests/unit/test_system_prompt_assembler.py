@@ -25,6 +25,7 @@ from kestrel_sovereign.agent.system_prompt_assembler import (
     CLAUSE_STYLE_REMINDER,
     PRIORITY_ANCHORED_DOCTRINE,
     PRIORITY_CONSTITUTION,
+    PRIORITY_CONTRIBUTED_CONTEXT,
     PRIORITY_OTHER_BOOTSTRAP,
     PRIORITY_SOUL,
     PRIORITY_STATE_OF_MIND,
@@ -139,6 +140,31 @@ def test_assemble_skips_agents_when_anchored_supplies_it():
     assert "from anchor" in result.prompt
 
 
+def test_anchored_doctrine_takes_precedence_for_every_bootstrap_name():
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(
+            [
+                ("TOOLS.md", "bootstrap tools"),
+                ("STRATEGY.yaml", "bootstrap strategy"),
+            ]
+        ),
+        anchored_doctrine=OrderedDict(
+            [
+                ("TOOLS.md", "anchored tools"),
+                ("STRATEGY.yaml", "anchored strategy"),
+            ]
+        ),
+    )
+
+    assert result.injected_clauses.count("TOOLS.md") == 1
+    assert result.injected_clauses.count("STRATEGY.yaml") == 1
+    assert "bootstrap tools" not in result.prompt
+    assert "bootstrap strategy" not in result.prompt
+    assert "anchored tools" in result.prompt
+    assert "anchored strategy" in result.prompt
+
+
 def test_assemble_includes_agents_from_bootstrap_when_no_anchor():
     """Backwards-compat: if no anchored doctrine is supplied,
     AGENTS.md from bootstrap iteration is still emitted."""
@@ -228,6 +254,125 @@ def test_truncation_drops_highest_priority_number_first():
     assert len(result.prompt.encode("utf-8")) <= 400
 
 
+def test_contributed_context_is_deterministic_audited_and_drops_first():
+    clauses = (
+        ("tests:z", "z-low", 30, "low-priority body"),
+        ("tests:a", "a-high", 10, "high-priority body"),
+        ("tests:b", "b-high", 10, "second high-priority body"),
+    )
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        style_reminder="style",
+        context_clauses=reversed(clauses),
+    )
+
+    assert result.injected_clauses == [
+        CLAUSE_KESTREL_CONSTITUTION,
+        CLAUSE_STYLE_REMINDER,
+        "a-high",
+        "b-high",
+        "z-low",
+    ]
+    assert result.prompt.endswith(
+        "high-priority body\n\nsecond high-priority body\n\nlow-priority body"
+    )
+    assert [name for name, _body in result.subsections[-3:]] == [
+        "a-high",
+        "b-high",
+        "z-low",
+    ]
+
+    squeezed = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        style_reminder="style",
+        context_clauses=clauses,
+        budget_bytes=len(result.prompt.encode("utf-8")) - 1,
+    )
+    assert squeezed.dropped_clauses[0] == "z-low"
+    assert CLAUSE_STYLE_REMINDER in squeezed.injected_clauses
+
+
+def test_contributed_context_alone_over_budget_never_drops_constitution():
+    result = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(),
+        context_clauses=(("tests:huge", "huge", 0, "x" * 2_000),),
+        budget_bytes=200,
+    )
+
+    assert result.injected_clauses == [CLAUSE_KESTREL_CONSTITUTION]
+    assert result.dropped_clauses == ["huge"]
+
+
+def test_budget_never_drops_mandatory_identity_or_operator_policy():
+    unbounded = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(
+            [
+                ("SOUL.md", "identity"),
+                ("AGENTS.md", "operator policy"),
+                ("TOOLS.md", "optional tools"),
+            ]
+        ),
+    )
+    optional_body = next(
+        body for name, body in unbounded.subsections if name == "TOOLS.md"
+    )
+    optional_bytes = len(optional_body.encode("utf-8"))
+    result = assemble_system_prompt(
+        constitution="governance",
+        bootstrap_files=OrderedDict(
+            [
+                ("SOUL.md", "identity"),
+                ("AGENTS.md", "operator policy"),
+                ("TOOLS.md", "optional tools"),
+            ]
+        ),
+        budget_bytes=len(unbounded.prompt.encode("utf-8")) - optional_bytes,
+    )
+
+    assert result.injected_clauses == [
+        "SOUL.md",
+        "AGENTS.md",
+        CLAUSE_KESTREL_CONSTITUTION,
+    ]
+    assert result.dropped_clauses == ["TOOLS.md"]
+    assert "identity" in result.prompt
+    assert "operator policy" in result.prompt
+
+
+def test_anchored_doctrine_shadows_same_name_contributed_context_with_audit():
+    result = assemble_system_prompt(
+        constitution="C",
+        bootstrap_files=OrderedDict(),
+        anchored_doctrine=OrderedDict(
+            [("POLICY.yaml", "authoritative per-turn policy")]
+        ),
+        context_clauses=(
+            ("tests:feature", "POLICY.yaml", 10, "feature policy"),
+        ),
+    )
+
+    assert result.injected_clauses.count("POLICY.yaml") == 1
+    assert "POLICY.yaml" in result.dropped_clauses
+    assert "authoritative per-turn policy" in result.prompt
+    assert "feature policy" not in result.prompt
+
+
+def test_zero_contributed_context_is_byte_identical_to_omitted_parameter():
+    kwargs = {
+        "constitution": "C",
+        "bootstrap_files": OrderedDict([("SOUL.md", "soul")]),
+        "style_reminder": "style",
+    }
+
+    assert assemble_system_prompt(**kwargs).prompt.encode() == assemble_system_prompt(
+        **kwargs, context_clauses=()
+    ).prompt.encode()
+
+
 def test_truncation_within_priority_drops_latest_emit_first():
     """Two entries at the same priority (other bootstrap): the later-
     emitted one drops first. Pin the deterministic order."""
@@ -247,18 +392,29 @@ def test_truncation_within_priority_drops_latest_emit_first():
     assert "TOOLS.md" in result.injected_clauses
 
 
-def test_constitution_never_dropped_even_when_oversized():
-    """If the constitution alone exceeds budget, keep it. The design
-    treats integrity as load-bearing; an oversized constitution is
-    an operator-config problem, not something to silently truncate."""
-    result = assemble_system_prompt(
-        constitution="C" * 10_000,
-        bootstrap_files=OrderedDict([("TOOLS.md", "x" * 100)]),
-        budget_bytes=1000,
-    )
-    assert CLAUSE_KESTREL_CONSTITUTION in result.injected_clauses
-    assert "TOOLS.md" in result.dropped_clauses
-    assert len(result.prompt.encode("utf-8")) > 1000
+def test_oversized_mandatory_floor_is_explicit_not_silently_returned():
+    """The assembler surfaces an irreducible floor for caller fail-closed."""
+
+    with pytest.raises(ValueError, match="mandatory.*byte.*budget"):
+        assemble_system_prompt(
+            constitution="C" * 10_000,
+            bootstrap_files=OrderedDict([("TOOLS.md", "x" * 100)]),
+            budget_bytes=1000,
+        )
+
+
+def test_anchored_doctrine_rejects_synthetic_host_audit_names_before_emission():
+    with pytest.raises(
+        ValueError,
+        match="anchored doctrine.*reserved host audit name",
+    ):
+        assemble_system_prompt(
+            constitution="C",
+            bootstrap_files=OrderedDict(),
+            anchored_doctrine=OrderedDict(
+                [(CLAUSE_KESTREL_CONSTITUTION, "operator text")]
+            ),
+        )
 
 
 def test_drop_order_in_dropped_clauses_is_drop_time_order():
@@ -317,6 +473,7 @@ def test_priority_ladder_is_strictly_increasing():
         < PRIORITY_STATE_OF_MIND
         < PRIORITY_OTHER_BOOTSTRAP
         < PRIORITY_STYLE_REMINDER
+        < PRIORITY_CONTRIBUTED_CONTEXT
     )
     # Constitution is canonically priority 1 — never dropped.
     assert PRIORITY_CONSTITUTION == 1

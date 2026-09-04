@@ -53,6 +53,7 @@ def _stub_builder(bootstrap: dict) -> ContextBuilder:
     cb._llm_service = None
     cb._model_fallback = "test-model"
     cb._counter = MagicMock()
+    cb._counter.count.side_effect = lambda text: len(text.split())
     cb._counter_model = "test-model"
     cb._bootstrap_loader = MagicMock()
     cb._bootstrap_loader.load = MagicMock(return_value=OrderedDict(bootstrap))
@@ -62,10 +63,8 @@ def _stub_builder(bootstrap: dict) -> ContextBuilder:
     cb.storage = MagicMock()
     # ``ContextManager.build_context`` (#1309 elastic budget) calls
     # ``measure_mandatory_system_tokens`` to size the non-borrowable
-    # governance floor. The MagicMock counter in this stub returns
-    # MagicMock from ``count()``, which would propagate into the
-    # ElasticTokenBudget constructor as a non-int. Override with a
-    # zero-floor stub so the tests focus on the tracking assembler.
+    # governance floor. Override it with a zero-floor stub so these tests
+    # focus on tracking assembly rather than the fixture's synthetic content.
     cb.measure_mandatory_system_tokens = lambda *a, **kw: 0
     return cb
 
@@ -296,14 +295,12 @@ async def test_context_manager_ephemeral_honors_budget(tmp_path):
         include_briefing=False,
         privacy_mode="EPHEMERAL",
         system_prompt_addendum=addendum,
-        system_prompt_budget_bytes=300,
+        system_prompt_budget_bytes=1_000,
     )
-    # The ephemeral notice gets appended after the budget-aware
-    # assembly; verify the budget-aware portion + notice still
-    # contains the addendum and the assembler-portion respects
-    # the cap (notice is operator-fixed, not part of the budget
-    # contract).
+    # The addendum and fixed ephemeral notice both participate in the cap;
+    # this ceiling fits their mandatory combined floor.
     assert addendum in result.system_prompt
+    assert len(result.system_prompt.encode("utf-8")) <= 1_000
 
 
 @pytest.mark.asyncio

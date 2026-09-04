@@ -1,17 +1,19 @@
 """Tests for the Feature Store API endpoints (endpoints/features.py)."""
 
+import asyncio
 import shlex
 import sys
-from dataclasses import asdict
+from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-from fastapi import FastAPI
-from types import SimpleNamespace
-
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign import cli
+from kestrel_sovereign.endpoints import features as features_endpoint
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -111,6 +113,14 @@ def _lifecycle_agent(features=None):
     agent.wait_registry = WaitRegistry()
     agent.features = features or {}
     return agent
+
+
+async def _propagate_cancelled_child(*_args):
+    """Raise cancellation created inside feature-owned async work."""
+
+    child = asyncio.create_task(asyncio.sleep(0))
+    child.cancel()
+    await child
 
 
 FAKE_REGISTRY = {
@@ -292,6 +302,792 @@ class TestGetFeatureDetail:
 
 
 class TestEnableFeature:
+    @pytest.mark.asyncio
+    async def test_isolated_reenable_settles_declared_config_before_opening_ingress(
+        self,
+    ):
+        """Re-enable cannot drain a callback queued on its conversation lock."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class IsolatedOrderingFeature(SDKFixtureFeature):
+            contribution_prefix = "isolated-enable-config-order"
+            config_schema = {"type": "object", "additionalProperties": True}
+            _apply_host_config_before_initialize = True
+
+            def __init__(self, agent):
+                super().__init__(agent)
+                self.config = {"mode": "old"}
+                self.ingress_open = False
+                self.ingress_started = asyncio.Event()
+                self.ingress_finished = asyncio.Event()
+                self.drain_waited_on_conversation = asyncio.Event()
+                self.rescue_deadlock = asyncio.Event()
+                self.ingress_task = None
+                self.call_order = []
+
+            async def initialize(self):
+                self.call_order.append("initialize")
+                self.ingress_open = True
+
+                async def inbound_callback():
+                    self.ingress_started.set()
+                    async with self.agent.feature_config_transition():
+                        self.ingress_finished.set()
+
+                self.ingress_task = asyncio.create_task(inbound_callback())
+                await self.ingress_started.wait()
+                # Let the callback queue on the transition's CONVERSATION lock
+                # before initialize returns to the activation sequence.
+                await asyncio.sleep(0)
+
+            async def get_config(self):
+                return dict(self.config)
+
+            async def set_config(self, config):
+                self.call_order.append("set_config")
+                if self.ingress_open and not self.ingress_finished.is_set():
+                    # A real proxy drains its admitted callback here. The bounded
+                    # rescue makes the pre-fix lock cycle observable without
+                    # leaving a permanently hung pytest task.
+                    self.drain_waited_on_conversation.set()
+                    await self.rescue_deadlock.wait()
+                self.config = dict(config)
+
+        agent = _lifecycle_agent()
+        feature = IsolatedOrderingFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        agent._declared_feature_config = lambda _name: {"mode": "declared"}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async def bounded_rescue():
+            await asyncio.sleep(0.05)
+            feature.rescue_deadlock.set()
+
+        rescue = asyncio.create_task(bounded_rescue())
+        try:
+            response = await asyncio.wait_for(
+                features_endpoint.enable_feature(request, feature.name),
+                timeout=1,
+            )
+            assert response["status"] == "enabled"
+            assert feature.call_order == ["set_config", "initialize"]
+            assert not feature.drain_waited_on_conversation.is_set()
+            await asyncio.wait_for(feature.ingress_task, timeout=1)
+            assert feature.ingress_finished.is_set()
+        finally:
+            feature.rescue_deadlock.set()
+            await rescue
+            if feature.ingress_task is not None and not feature.ingress_task.done():
+                feature.ingress_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await feature.ingress_task
+
+    @pytest.mark.asyncio
+    async def test_enable_and_config_use_ingress_before_conversation_lock(self):
+        """A config PATCH cannot deadlock a concurrent runtime re-enable."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class IngressFeature(SDKFixtureFeature):
+            contribution_prefix = "enable-config-lock-order"
+            config_schema = {"type": "object", "additionalProperties": True}
+
+            def __init__(self, agent):
+                super().__init__(agent)
+                self._config_ingress_lock = asyncio.Lock()
+                self.activation_started = asyncio.Event()
+                self.release_activation = asyncio.Event()
+                self.config = {"mode": "old"}
+                self._active_lease = None
+                self._authorized_task = None
+
+            async def initialize(self):
+                self.activation_started.set()
+                await self.release_activation.wait()
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                async with self._config_ingress_lock:
+                    lease = object()
+                    self._active_lease = lease
+                    try:
+                        yield lease
+                    finally:
+                        self._active_lease = None
+                        self._authorized_task = None
+
+            def claim_config_transition_ingress_fence(self, lease):
+                if lease is not self._active_lease:
+                    return False
+                self._authorized_task = asyncio.current_task()
+                return True
+
+            async def get_config(self):
+                return dict(self.config)
+
+            async def set_config(self, config):
+                if asyncio.current_task() is self._authorized_task:
+                    self.config = dict(config)
+                    return
+                async with self._config_ingress_lock:
+                    self.config = dict(config)
+
+        agent = _lifecycle_agent()
+        feature = IngressFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        agent._declared_feature_config = lambda _name: {"mode": "declared"}
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        enable = asyncio.create_task(
+            features_endpoint.enable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(feature.activation_started.wait(), timeout=1)
+        update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "patched"}),
+            )
+        )
+        # Give the competing request a chance to take the wrong first lock.
+        await asyncio.sleep(0.05)
+        feature.release_activation.set()
+
+        _done, pending = await asyncio.wait({enable, update}, timeout=0.5)
+        deadlocked = bool(pending)
+        if deadlocked:
+            # A queued PATCH owns ingress while enable owns CONVERSATION. Cancel
+            # the queued PATCH so its fence unwinds and the test can fail cleanly.
+            update.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(update, timeout=1)
+            await asyncio.wait_for(enable, timeout=1)
+
+        assert not deadlocked
+        assert (await enable)["status"] == "enabled"
+        assert (await update)["config"] == {"mode": "patched"}
+
+    @pytest.mark.asyncio
+    async def test_queued_cognition_rechecks_safe_mode_after_transition_lock(self):
+        """A turn admitted before a quarantine latch cannot run afterward."""
+
+        agent = _lifecycle_agent()
+        agent.storage = object()
+        agent.context_manager = object()
+        agent.bootstrap_service = None
+        agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+        agent._maybe_audit = AsyncMock()
+        agent._process_input_traced_locked = AsyncMock(return_value="MODEL-RAN")
+        real_turn_lifecycle = agent._turn_lifecycle
+        lock_attempted = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_turn_lifecycle():
+            lock_attempted.set()
+            async with real_turn_lifecycle():
+                yield
+
+        agent._turn_lifecycle = observed_turn_lifecycle
+
+        async with real_turn_lifecycle():
+            turn = asyncio.create_task(agent.process_input("queued cognition"))
+            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            assert not turn.done()
+            agent._safe_mode = True
+            agent._safe_mode_reason = "feature contribution quarantine failed"
+
+        response = await asyncio.wait_for(turn, timeout=1)
+
+        assert "SAFE MODE ACTIVE" in response
+        agent._process_input_traced_locked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queued_stream_rechecks_safe_mode_after_transition_lock(self):
+        """The streaming entry point shares the post-lock cognition guard."""
+
+        agent = _lifecycle_agent()
+        agent.storage = object()
+        agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+        agent._maybe_audit = AsyncMock()
+        model_started = False
+        real_turn_lifecycle = agent._turn_lifecycle
+        lock_attempted = asyncio.Event()
+
+        @asynccontextmanager
+        async def observed_turn_lifecycle():
+            lock_attempted.set()
+            async with real_turn_lifecycle():
+                yield
+
+        agent._turn_lifecycle = observed_turn_lifecycle
+
+        async def stream_model(*_args, **_kwargs):
+            nonlocal model_started
+            model_started = True
+            yield "MODEL-RAN"
+
+        agent._process_input_streaming_traced_locked = stream_model
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in agent.process_input_streaming(
+                    "queued streaming cognition"
+                )
+            ]
+
+        async with real_turn_lifecycle():
+            turn = asyncio.create_task(collect())
+            await asyncio.wait_for(lock_attempted.wait(), timeout=1)
+            assert not turn.done()
+            agent._safe_mode = True
+            agent._safe_mode_reason = "feature contribution quarantine failed"
+
+        chunks = await asyncio.wait_for(turn, timeout=1)
+
+        assert len(chunks) == 1
+        assert "SAFE MODE ACTIVE" in chunks[0]
+        assert model_started is False
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_can_reenter_privacy_transition(self):
+        """The owned mutation task must own the conversation boundary.
+
+        A feature hook is allowed to perform a privacy-governed write.  If the
+        HTTP parent owns ``CONVERSATION`` while the hook runs in the shielded
+        child task, the child waits on its parent forever.
+        """
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        entered = asyncio.Event()
+
+        async def enable_with_privacy_transition():
+            async with agent.privacy_transition():
+                entered.set()
+
+        feature.on_enable.side_effect = enable_with_privacy_transition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, "TestFeature"),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_cognition_is_rejected_before_partial_publication(self):
+        """A pre-commit hook cannot inspect a half-published generation."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        observed = []
+
+        async def enable_with_cognition():
+            async with agent._turn_lifecycle():
+                observed.append(feature.enabled)
+
+        feature.on_enable.side_effect = enable_with_cognition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature transition generation is fully committed",
+        ):
+            await asyncio.wait_for(
+                features_endpoint.enable_feature(request, "TestFeature"),
+                timeout=1,
+            )
+
+        assert observed == []
+        assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_child_cognition_is_rejected_without_deadlock(self):
+        """Transition ancestry must fail closed across an inherited task context."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        child_started = asyncio.Event()
+        cognition_task = None
+
+        async def child_cognition():
+            child_started.set()
+            async with agent._turn_lifecycle():
+                raise AssertionError("pre-commit child cognition was admitted")
+
+        async def enable_with_child_cognition():
+            nonlocal cognition_task
+            cognition_task = asyncio.create_task(child_cognition())
+            await cognition_task
+
+        feature.on_enable.side_effect = enable_with_child_cognition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+        operation = asyncio.create_task(
+            features_endpoint.enable_feature(request, "TestFeature")
+        )
+
+        try:
+            await asyncio.wait_for(child_started.wait(), timeout=1)
+            with pytest.raises(
+                RuntimeError,
+                match="feature transition generation is fully committed",
+            ):
+                await asyncio.wait_for(asyncio.shield(operation), timeout=0.2)
+        finally:
+            if cognition_task is not None and not cognition_task.done():
+                cognition_task.cancel()
+                await asyncio.gather(cognition_task, return_exceptions=True)
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+        assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_detached_child_cannot_outlive_transition_ancestry(self):
+        """A descendant cannot wait for commit and reuse stale hook authority."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        release_child = asyncio.Event()
+        child_started = asyncio.Event()
+        cognition_entered = False
+        detached_task = None
+
+        async def delayed_child_cognition():
+            nonlocal cognition_entered
+            child_started.set()
+            await release_child.wait()
+            async with agent._turn_lifecycle():
+                cognition_entered = True
+
+        async def enable_with_detached_child():
+            nonlocal detached_task
+            detached_task = asyncio.create_task(delayed_child_cognition())
+            await child_started.wait()
+
+        feature.on_enable.side_effect = enable_with_detached_child
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await features_endpoint.enable_feature(request, "TestFeature")
+        assert response["status"] == "enabled"
+        assert detached_task is not None
+
+        release_child.set()
+        with pytest.raises(RuntimeError, match="expired feature transition"):
+            await asyncio.wait_for(detached_task, timeout=1)
+
+        assert cognition_entered is False
+
+    @pytest.mark.asyncio
+    async def test_committed_enable_ready_hook_can_await_cognition(self):
+        """The explicit post-commit ready seam remains cognition-capable."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        observed = []
+
+        async def ready_with_cognition(_agent):
+            async with agent._turn_lifecycle():
+                observed.append(feature.enabled)
+
+        feature.on_agent_ready = AsyncMock(side_effect=ready_with_cognition)
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, "TestFeature"),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert observed == [True]
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_ready_hook_observes_complete_enabled_generation(
+        self, mock_registry
+    ):
+        """No package ready hook can enter cognition between member commits."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstReadyFeature(SDKFixtureFeature):
+            contribution_prefix = "ready-first"
+
+        class SecondReadyFeature(SDKFixtureFeature):
+            contribution_prefix = "ready-second"
+
+        agent = _lifecycle_agent()
+        first = FirstReadyFeature(agent)
+        second = SecondReadyFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        observations = []
+
+        async def observe_complete_generation(_agent):
+            async with agent._turn_lifecycle():
+                observations.append(
+                    (
+                        first.enabled,
+                        second.enabled,
+                        len(
+                            agent.feature_contribution_runtime.active_context_clauses()
+                        ),
+                    )
+                )
+
+        first.on_agent_ready = observe_complete_generation
+        agent.features = {first.name: first, second.name: second}
+        info = FeaturePackageInfo(
+            name="ready-pkg",
+            package="kestrel-feature-ready",
+            git="",
+            features=[first.name, second.name],
+            description="ready generation fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await asyncio.wait_for(
+            features_endpoint.enable_feature(request, info.name),
+            timeout=1,
+        )
+
+        assert response["status"] == "enabled"
+        assert observations == [(True, True, 2)]
+
+    @pytest.mark.asyncio
+    async def test_enable_waits_for_active_turn_before_publication(self):
+        """No contribution can become prompt-visible mid-turn."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            enable = asyncio.create_task(
+                features_endpoint.enable_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            feature.initialize.assert_not_awaited()
+            assert feature.enabled is False
+
+        response = await asyncio.wait_for(enable, timeout=1)
+        assert response["status"] == "enabled"
+        feature.initialize.assert_awaited_once()
+        assert feature.enabled is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_enable_settles_published_generation_before_unlock(self):
+        """A disconnect after publication cannot expose a half-enabled feature."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_enable():
+            entered.set()
+            await release.wait()
+
+        feature.on_enable = slow_enable
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        enable = asyncio.create_task(
+            features_endpoint.enable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert feature.enabled is False
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
+        enable.cancel()
+        await asyncio.sleep(0)
+        assert not enable.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(enable, timeout=1)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    async def test_hook_cancelled_error_rolls_back_enable_generation(self):
+        """Feature-owned cancellation is a failed activation, not a disconnect."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.on_enable = _propagate_cancelled_child
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.enable_feature(request, feature.name)
+
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    async def test_failed_activation_quarantines_context_after_teardown_drift(self):
+        """A failed enable cannot retain prompt bytes when exact cleanup drifts."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class DriftedActivationFeature(SDKFixtureFeature):
+            contribution_prefix = "drifted-activation-fixture"
+
+        agent = _lifecycle_agent()
+        feature = DriftedActivationFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+
+        async def drift_then_fail():
+            agent.wait_registry.deregister(
+                feature.wait_provider.kind,
+                feature.wait_provider,
+            )
+            raise RuntimeError("activation failed after contribution drift")
+
+        feature.on_enable = drift_then_fail
+
+        with pytest.raises(
+            RuntimeError,
+            match="activation failed after contribution drift",
+        ):
+            await agent._activate_feature_runtime(feature)
+
+        runtime = agent.feature_contribution_runtime
+        assert feature.enabled is False
+        assert not runtime.is_active(feature)
+        assert runtime.active_context_clauses() == ()
+
+    @pytest.mark.asyncio
+    async def test_failed_activation_latches_safe_mode_if_quarantine_fails(
+        self, monkeypatch
+    ):
+        """Unrepairable activation ownership blocks later cognition."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class UnrepairableActivationFeature(SDKFixtureFeature):
+            contribution_prefix = "unrepairable-activation-fixture"
+
+        agent = _lifecycle_agent()
+        feature = UnrepairableActivationFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+
+        async def drift_then_fail():
+            agent.wait_registry.deregister(
+                feature.wait_provider.kind,
+                feature.wait_provider,
+            )
+            raise RuntimeError("activation failure must be superseded")
+
+        feature.on_enable = drift_then_fail
+        monkeypatch.setattr(
+            agent,
+            "_quarantine_feature_contributions",
+            MagicMock(side_effect=RuntimeError("private quarantine failure")),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="failed activation contributions could not be quarantined",
+        ):
+            await agent._activate_feature_runtime(feature)
+
+        assert agent._safe_mode is True
+        assert "quarantine failed" in agent._safe_mode_reason
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_hook_cancellation_rolls_back_prior_enabled_member(
+        self, mock_registry
+    ):
+        """A later member's cancellation cannot strand an earlier member live."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class CancellingFeature(SDKFixtureFeature):
+            contribution_prefix = "cancelling-agent-fixture"
+
+        agent = _lifecycle_agent()
+        first = SDKFixtureFeature(agent)
+        second = CancellingFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        second.on_enable = _propagate_cancelled_child
+        agent.features = {first.name: first, second.name: second}
+        mock_registry.return_value = {
+            "fixture-pkg": FeaturePackageInfo(
+                name="fixture-pkg",
+                package="kestrel-feature-fixture",
+                git="",
+                features=[first.name, second.name],
+                description="fixture",
+            )
+        }
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.enable_feature(request, "fixture-pkg")
+
+        assert first.enabled is False
+        assert second.enabled is False
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_package_enable_quarantines_prior_member_after_rollback_drift(
+        self, mock_registry
+    ):
+        """A failed package enable cannot retain a disabled member's context."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstPackageFeature(SDKFixtureFeature):
+            contribution_prefix = "rollback-drift-first"
+
+        class SecondPackageFeature(SDKFixtureFeature):
+            contribution_prefix = "rollback-drift-second"
+
+        agent = _lifecycle_agent()
+        first = FirstPackageFeature(agent)
+        second = SecondPackageFeature(agent)
+        first.enabled = False
+        second.enabled = False
+
+        async def drift_first_then_fail():
+            agent.wait_registry.deregister(
+                first.wait_provider.kind,
+                first.wait_provider,
+            )
+            raise RuntimeError("later package activation failed")
+
+        second.on_enable = drift_first_then_fail
+        agent.features = {first.name: first, second.name: second}
+        mock_registry.return_value = {
+            "rollback-drift-pkg": FeaturePackageInfo(
+                name="rollback-drift-pkg",
+                package="kestrel-feature-rollback-drift",
+                git="",
+                features=[first.name, second.name],
+                description="rollback drift fixture",
+            )
+        }
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="later package activation failed"):
+            await features_endpoint.enable_feature(request, "rollback-drift-pkg")
+
+        runtime = agent.feature_contribution_runtime
+        assert first.enabled is False
+        assert second.enabled is False
+        assert not runtime.is_active(first)
+        assert not runtime.is_active(second)
+        assert runtime.active_context_clauses() == ()
+
+    @pytest.mark.asyncio
+    async def test_quarantine_safe_mode_helper_latches_after_entry_failure(self):
+        """Package rollback has a synchronous fail-closed compatibility latch."""
+
+        agent = SimpleNamespace(_safe_mode=False)
+
+        async def fail_entry(_reason):
+            raise RuntimeError("safe-mode persistence unavailable")
+
+        agent.enter_safe_mode = fail_entry
+        await features_endpoint._enter_feature_quarantine_safe_mode(
+            agent,
+            "package quarantine failed",
+        )
+
+        assert agent._safe_mode is True
+        assert agent._safe_mode_reason == "package quarantine failed"
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
+
+    @pytest.mark.asyncio
+    async def test_ready_hook_cancelled_error_remains_best_effort(self):
+        """The committed generation survives optional ready-hook cancellation."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.on_agent_ready = _propagate_cancelled_child
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await features_endpoint.enable_feature(request, feature.name)
+
+        assert response["status"] == "enabled"
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
     def test_enable_calls_on_enable(self):
         feature = _make_feature(enabled=False)
         agent = _lifecycle_agent(features={"TestFeature": feature})
@@ -400,6 +1196,277 @@ class TestEnableFeature:
 
 
 class TestDisableFeature:
+    @pytest.mark.asyncio
+    async def test_disable_waits_for_active_turn_before_teardown(self):
+        """A live turn retains one stable feature/context generation."""
+
+        feature = _make_feature()
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            disable = asyncio.create_task(
+                features_endpoint.disable_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            feature.on_disable.assert_not_awaited()
+            assert feature.enabled is True
+
+        response = await asyncio.wait_for(disable, timeout=1)
+        assert response["status"] == "disabled"
+        feature.on_disable.assert_awaited_once()
+        assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_disable_settles_removed_generation_before_unlock(self):
+        """A disconnect after depublication cannot expose a half-disabled feature."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_disable():
+            entered.set()
+            await release.wait()
+
+        feature.on_disable = slow_disable
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        disable = asyncio.create_task(
+            features_endpoint.disable_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert feature.enabled is True
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+        disable.cancel()
+        await asyncio.sleep(0)
+        assert not disable.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(disable, timeout=1)
+
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    async def test_hook_cancelled_error_rolls_back_disable_generation(self):
+        """Feature-owned cancellation cannot leave teardown half-published."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        feature.on_disable = _propagate_cancelled_child
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.disable_feature(request, feature.name)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_failure_restores_cross_feature_setup_batch(
+        self, mock_registry
+    ):
+        """Disable rollback retains one valid interdependent generation."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstFeature(SDKFixtureFeature):
+            contribution_prefix = "disable-first"
+
+        class SecondFeature(SDKFixtureFeature):
+            contribution_prefix = "disable-second"
+
+        agent = _lifecycle_agent()
+        first = FirstFeature(agent)
+        second = SecondFeature(agent)
+        second.setup_registration = replace(
+            second.setup_registration,
+            after=(first.setup_registration.name,),
+        )
+        transition = agent._prepare_feature_contribution_transition((first, second))
+        for feature, prepared in transition.activatable((first, second)):
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared,
+            )
+
+        original_shutdown = second.shutdown
+        shutdown_calls = 0
+
+        async def fail_first_shutdown():
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            if shutdown_calls == 1:
+                raise RuntimeError("second disable failed")
+            await original_shutdown()
+
+        second.shutdown = fail_first_shutdown
+        observations = []
+
+        async def observe_complete_rollback(_agent):
+            async with agent._turn_lifecycle():
+                observations.append(
+                    (
+                        first.enabled,
+                        second.enabled,
+                        len(
+                            agent.feature_contribution_runtime.active_context_clauses()
+                        ),
+                    )
+                )
+
+        first.on_agent_ready = observe_complete_rollback
+        info = FeaturePackageInfo(
+            name="dependent-pkg",
+            package="kestrel-feature-dependent",
+            git="",
+            features=[first.name, second.name],
+            description="cross-feature setup dependency fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="second disable failed"):
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert agent.features[first.name] is first
+        assert agent.features[second.name] is second
+        assert first.enabled is True
+        assert second.enabled is True
+        assert agent.setup_step_registry.get(first.setup_registration.name) is (
+            first.setup_registration
+        )
+        assert agent.setup_step_registry.get(second.setup_registration.name) is (
+            second.setup_registration
+        )
+        assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+        assert observations == [(True, True, 2)]
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_rollback_repairs_drifted_active_member(
+        self, mock_registry
+    ):
+        """One failed exact inverse cannot block restoration of its package."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstDriftFeature(SDKFixtureFeature):
+            contribution_prefix = "drift-first"
+
+        class SecondDriftFeature(SDKFixtureFeature):
+            contribution_prefix = "drift-second"
+
+        agent = _lifecycle_agent()
+        first = FirstDriftFeature(agent)
+        second = SecondDriftFeature(agent)
+        first.enabled = False
+        second.enabled = False
+        transition = agent._prepare_feature_contribution_transition((first, second))
+        for feature, prepared in transition.activatable((first, second)):
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared,
+                notify_ready=False,
+            )
+        agent.wait_registry.deregister(
+            second.wait_provider.kind, second.wait_provider
+        )
+        info = FeaturePackageInfo(
+            name="drift-pkg",
+            package="kestrel-feature-drift",
+            git="",
+            features=[first.name, second.name],
+            description="drifted teardown fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="wait-provider"):
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert first.enabled is True
+        assert second.enabled is True
+        assert agent.feature_contribution_runtime.is_active(first)
+        assert agent.feature_contribution_runtime.is_active(second)
+        assert agent.wait_registry.contains(
+            second.wait_provider.kind, second.wait_provider
+        )
+        assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    async def test_disable_rollback_latches_safe_mode_on_foreign_context_drift(
+        self, mock_registry
+    ):
+        """An unprovable rollback blocks cognition over the surviving clause."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        runtime = agent.feature_contribution_runtime
+        original = runtime.active_context_clauses()[0]
+        foreign = replace(original, body="foreign replacement prompt bytes")
+        runtime.context_clause_registry._clauses[original.identity] = foreign
+        info = FeaturePackageInfo(
+            name="foreign-drift-pkg",
+            package="kestrel-feature-foreign-drift",
+            git="",
+            features=[feature.name],
+            description="foreign context drift fixture",
+        )
+        mock_registry.return_value = {info.name: info}
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="complete feature generation") as error:
+            await features_endpoint.disable_feature(request, info.name)
+
+        assert error.value.__cause__ is None
+        assert agent._safe_mode is True
+        assert "rollback" in agent._safe_mode_reason.lower()
+        assert feature.enabled is False
+        assert runtime.is_active(feature)
+        assert runtime.active_context_clauses() == (foreign,)
+
     @pytest.mark.parametrize(
         "feature_name",
         [
@@ -781,6 +1848,265 @@ class TestInstallFeature:
 
 
 class TestRemoveFeature:
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_hook_cancelled_error_rolls_back_remove_generation(
+        self, mock_pkg, mock_run
+    ):
+        """Removal rolls back before its irreversible data/package boundary."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        feature.on_disable = _propagate_cancelled_child
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.remove_feature(request, feature.name)
+
+        assert feature.enabled is True
+        assert agent.features[feature.name] is feature
+        assert agent.feature_contribution_runtime.active_context_clauses()
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_remove_failure_restores_cross_feature_setup_batch(
+        self, mock_pkg, mock_run
+    ):
+        """Rollback restores a package whose setup steps depend on each other."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        class FirstFeature(SDKFixtureFeature):
+            contribution_prefix = "remove-first"
+
+        class SecondFeature(SDKFixtureFeature):
+            contribution_prefix = "remove-second"
+
+        agent = _lifecycle_agent()
+        first = FirstFeature(agent)
+        second = SecondFeature(agent)
+        second.setup_registration = replace(
+            second.setup_registration,
+            after=(first.setup_registration.name,),
+        )
+        transition = agent._prepare_feature_contribution_transition((first, second))
+        for feature, prepared in transition.activatable((first, second)):
+            await agent._activate_feature_runtime(
+                feature,
+                prepared_contributions=prepared,
+            )
+
+        original_shutdown = second.shutdown
+        shutdown_calls = 0
+
+        async def fail_first_shutdown():
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            if shutdown_calls == 1:
+                raise RuntimeError("second teardown failed")
+            await original_shutdown()
+
+        second.shutdown = fail_first_shutdown
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="dependent-pkg",
+            package="kestrel-feature-dependent",
+            git="",
+            features=[first.name, second.name],
+            description="cross-feature setup dependency fixture",
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="second teardown failed"):
+            await features_endpoint.remove_feature(request, first.name)
+
+        assert agent.features[first.name] is first
+        assert agent.features[second.name] is second
+        assert first.enabled is True
+        assert second.enabled is True
+        assert agent.setup_step_registry.get(first.setup_registration.name) is (
+            first.setup_registration
+        )
+        assert agent.setup_step_registry.get(second.setup_registration.name) is (
+            second.setup_registration
+        )
+        assert len(agent.feature_contribution_runtime.active_context_clauses()) == 2
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_cancelled_queued_remove_performs_no_later_mutation(
+        self, mock_pkg, mock_run
+    ):
+        """Cancellation before the turn boundary means removal never starts."""
+
+        feature = _make_feature()
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=["TestFeature"],
+            description="fixture",
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            removal = asyncio.create_task(
+                features_endpoint.remove_feature(request, "TestFeature")
+            )
+            await asyncio.sleep(0)
+            removal.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(removal, timeout=1)
+
+        # There is no orphaned owned task waiting to mutate after the old turn
+        # releases its lock.
+        await asyncio.sleep(0.05)
+        feature.on_disable.assert_not_awaited()
+        feature.on_remove.assert_not_awaited()
+        assert agent.features["TestFeature"] is feature
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_remove_waits_for_active_turn_before_teardown(
+        self, mock_pkg, mock_run
+    ):
+        """Removal preserves the complete runtime generation for a live turn."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        teardown_entered = asyncio.Event()
+
+        async def record_disable():
+            teardown_entered.set()
+
+        feature.on_disable = record_disable
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            removal = asyncio.create_task(
+                features_endpoint.remove_feature(request, feature.name)
+            )
+            # Give an incorrectly unserialized teardown ample time to enter;
+            # the correct path is still queued on the active turn boundary.
+            await asyncio.sleep(0.05)
+            assert not teardown_entered.is_set()
+            assert feature.name in agent.features
+            assert agent.feature_contribution_runtime.active_context_clauses()
+            assert not feature.disabled
+
+        response = await asyncio.wait_for(removal, timeout=1)
+        assert response["status"] == "removed"
+        assert feature.name not in agent.features
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+        mock_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
+    @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
+    async def test_cancelled_remove_finishes_before_releasing_turn_boundary(
+        self, mock_pkg, mock_run
+    ):
+        """Once removal starts, disconnect cannot expose its partial state."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        turn_entered = asyncio.Event()
+
+        async def slow_remove():
+            entered.set()
+            await release.wait()
+
+        async def enter_turn():
+            async with agent._turn_lifecycle():
+                turn_entered.set()
+
+        feature.on_remove = slow_remove
+        mock_pkg.return_value = FeaturePackageInfo(
+            name="fixture-pkg",
+            package="kestrel-feature-fixture",
+            git="",
+            features=[feature.name],
+            description="fixture",
+        )
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        removal = asyncio.create_task(
+            features_endpoint.remove_feature(request, feature.name)
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        removal.cancel()
+        await asyncio.sleep(0)
+        assert not removal.done()
+
+        contender = asyncio.create_task(enter_turn())
+        await asyncio.sleep(0)
+        assert not turn_entered.is_set()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(removal, timeout=1)
+        await asyncio.wait_for(contender, timeout=1)
+
+        assert feature.name not in agent.features
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+        assert turn_entered.is_set()
+        mock_run.assert_called_once()
+
     @patch("kestrel_sovereign.endpoints.features.get_package_for_feature")
     def test_remove_core_returns_400(self, mock_pkg):
         mock_pkg.return_value = FeaturePackageInfo(
@@ -946,6 +2272,354 @@ class TestGetFeatureConfig:
 
 
 class TestUpdateFeatureConfig:
+    @pytest.mark.asyncio
+    async def test_late_isolated_ingress_generation_change_returns_retryable_409(
+        self,
+    ):
+        """A lease lost under the lifecycle lock is a conflict, not a 500."""
+
+        from kestrel_sovereign.features.isolated_runtime import (
+            IsolatedRuntimeConfigGenerationChanged,
+        )
+
+        lease = object()
+
+        class LateGenerationChangeFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            async def get_config(self):
+                return {"mode": "old"}
+
+            async def set_config(self, _config):
+                raise IsolatedRuntimeConfigGenerationChanged(
+                    "private generation detail"
+                )
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                yield lease
+
+            def claim_config_transition_ingress_fence(self, candidate):
+                return candidate is lease
+
+        feature = LateGenerationChangeFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(HTTPException) as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "next"}),
+            )
+
+        assert error.value.status_code == 409
+        assert "retry against the current generation" in error.value.detail
+        assert "private generation detail" not in error.value.detail
+        agent.refresh_feature_context_clauses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_turn_can_call_isolated_tool_after_config_fence_closes(
+        self, monkeypatch, tmp_path
+    ):
+        """A queued config transition cannot strand its current live turn."""
+
+        from kestrel_sovereign.features.isolated_runtime import (
+            InstalledFeatureRuntime,
+            ProxyFeature,
+        )
+
+        class Storage:
+            def __init__(self, agent_id):
+                self.agent_id = agent_id
+                self.nodes = {}
+
+            async def get_node(self, node_id):
+                return self.nodes.get(node_id)
+
+            async def compare_and_swap_node(self, node_id, expected, node):
+                current = self.nodes.get(node_id)
+                properties = None if current is None else current.properties
+                if properties != expected:
+                    return "predicate_failed"
+                self.nodes[node_id] = node
+                return "swapped"
+
+        tool_called = asyncio.Event()
+
+        class Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.event_handler = None
+
+            async def start(self):
+                return None
+
+            async def stop(self):
+                return None
+
+            async def health(self):
+                return True
+
+            @property
+            def capabilities(self):
+                return {"inbound_producer": False}
+
+            async def list_tools(self):
+                return [
+                    {
+                        "name": "ping",
+                        "description": "Ping",
+                        "category": "utility",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                            "required": ["message"],
+                        },
+                    }
+                ]
+
+            async def call_tool(self, name, args):
+                tool_called.set()
+                return {"name": name, "args": dict(args)}
+
+            def on_event(self, handler):
+                self.event_handler = handler
+
+        agent = _lifecycle_agent()
+        agent.storage = Storage(agent.did)
+        agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        runtime = InstalledFeatureRuntime(
+            class_name="DelayedToolFeature",
+            entry_point="test_pkg.feature:DelayedToolFeature",
+            distribution="test-pkg",
+            runtime="isolated-venv",
+            service="test_service",
+            description="Delayed tool fixture",
+        )
+        monkeypatch.setenv(
+            "KESTREL_FEATURE_DELAYEDTOOLFEATURE_BIN", "/bin/test-service"
+        )
+        feature = ProxyFeature(agent, runtime, client_factory=Client)
+        await feature.initialize()
+        agent.features[feature.name] = feature
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+        update = None
+        detached = None
+        rescue = None
+        blocked = False
+        try:
+            async with agent._turn_lifecycle():
+                update = asyncio.create_task(
+                    features_endpoint.update_feature_config(
+                        request,
+                        feature.name,
+                        features_endpoint.ConfigUpdateRequest(
+                            config={"enabled": True}
+                        ),
+                    )
+                )
+                for _ in range(100):
+                    if feature._traffic_gate.closed:
+                        break
+                    await asyncio.sleep(0.01)
+                assert feature._traffic_gate.closed is True
+
+                # A detached child inherits the ambient turn id, but it does
+                # not own the live turn and must remain behind the fence.
+                detached = asyncio.create_task(
+                    feature.call_isolated_tool("ping", {"message": "detached"})
+                )
+                await asyncio.sleep(0.02)
+                assert detached.done() is False
+                detached.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await detached
+
+                async def release_deadlock() -> None:
+                    nonlocal blocked
+                    await asyncio.sleep(0.05)
+                    if not tool_called.is_set():
+                        blocked = True
+                        # Cancel the queued config child so the gate reopens and
+                        # the live turn can report the cycle without leaking it.
+                        update.cancel()
+
+                rescue = asyncio.create_task(release_deadlock())
+                result = await feature.call_isolated_tool(
+                    "ping", {"message": "late"}
+                )
+                assert result == {
+                    "success": True,
+                    "tool": "ping",
+                    "result": {
+                        "name": "ping",
+                        "args": {"message": "late"},
+                    },
+                }
+                if not rescue.done():
+                    rescue.cancel()
+                with suppress(asyncio.CancelledError):
+                    await rescue
+
+            if not blocked:
+                response = await asyncio.wait_for(update, timeout=1)
+                assert response["config"] == {"enabled": True}
+                assert feature._traffic_gate.closed is False
+                assert feature._config_ingress_live_turn_bypass_active is False
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(update, timeout=1)
+        finally:
+            if update is not None and not update.done():
+                update.cancel()
+            if detached is not None and not detached.done():
+                detached.cancel()
+            if rescue is not None and not rescue.done():
+                rescue.cancel()
+            await feature.shutdown()
+
+        assert not blocked
+
+    @pytest.mark.asyncio
+    async def test_isolated_ingress_drains_before_config_takes_turn_lock(self):
+        """An admitted callback cannot invert ingress-drain and turn locks."""
+
+        state = {"mode": "old"}
+        release_cognition = asyncio.Event()
+        cognition_done = asyncio.Event()
+        fence_entered = False
+
+        class AdmittedIngressFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            async def get_config(self):
+                return dict(state)
+
+            async def set_config(self, config):
+                # The old endpoint first takes CONVERSATION, then reaches the
+                # isolated setter's traffic drain. The admitted callback below
+                # needs that same turn lock, reproducing the production cycle.
+                release_cognition.set()
+                await asyncio.wait_for(cognition_done.wait(), timeout=0.05)
+                state.clear()
+                state.update(config)
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                nonlocal fence_entered
+                fence_entered = True
+                release_cognition.set()
+                await asyncio.wait_for(cognition_done.wait(), timeout=1)
+                yield
+
+        feature = AdmittedIngressFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async def admitted_cognition():
+            await release_cognition.wait()
+            async with agent._turn_lifecycle():
+                cognition_done.set()
+
+        cognition = asyncio.create_task(admitted_cognition())
+        try:
+            response = await asyncio.wait_for(
+                features_endpoint.update_feature_config(
+                    request,
+                    feature.name,
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                ),
+                timeout=1,
+            )
+        finally:
+            release_cognition.set()
+            await asyncio.wait_for(cognition, timeout=1)
+
+        assert fence_entered is True
+        assert state == {"mode": "new"}
+        assert response["config"] == {"mode": "new"}
+
+    @pytest.mark.asyncio
+    async def test_config_rejects_fence_from_superseded_feature_lifecycle(self):
+        """The generation fenced before CONVERSATION must still own ingress."""
+
+        fence_entered = asyncio.Event()
+        state = {"mode": "old"}
+
+        class LifecycleBoundFeature:
+            name = "TestFeature"
+            enabled = True
+            config_schema = None
+
+            def __init__(self):
+                self.generation = 0
+                self.set_calls = 0
+
+            async def get_config(self):
+                return dict(state)
+
+            async def set_config(self, config):
+                self.set_calls += 1
+                state.clear()
+                state.update(config)
+
+            @asynccontextmanager
+            async def config_transition_ingress_fence(self):
+                lease = (self, self.generation)
+                fence_entered.set()
+                yield lease
+
+            def claim_config_transition_ingress_fence(self, lease):
+                return lease == (self, self.generation)
+
+        feature = LifecycleBoundFeature()
+        agent = _lifecycle_agent(features={feature.name: feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent.feature_config_transition():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    feature.name,
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.wait_for(fence_entered.wait(), timeout=1)
+            feature.generation += 1
+
+        with pytest.raises(HTTPException) as error:
+            await asyncio.wait_for(update, timeout=1)
+
+        assert error.value.status_code == 409
+        assert "changed while configuration was queued" in error.value.detail
+        assert feature.set_calls == 0
+        assert state == {"mode": "old"}
+
     def test_updates_config(self):
         feature = _make_feature(config={"enabled": True})
         agent = _make_agent(features={"TestFeature": feature})
@@ -959,6 +2633,512 @@ class TestUpdateFeatureConfig:
 
         assert resp.status_code == 200
         feature.set_config.assert_awaited_once_with({"enabled": False})
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
+
+    def test_refresh_failure_restores_config_and_previous_context_snapshot(self):
+        """Tools and cached prompt policy roll back as one failed transition."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = [
+            RuntimeError("new clause renderer failed"),
+            None,
+        ]
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        assert state == {"mode": "old"}
+        assert [call.args[0] for call in feature.set_config.await_args_list] == [
+            {"mode": "new"},
+            {"mode": "old"},
+        ]
+        assert agent.refresh_feature_context_clauses.call_count == 2
+
+    def test_refresh_failure_uses_generation_owned_rollback_when_available(self):
+        """Hosted rollback receives the exact commit receipt, not a blind write."""
+
+        receipt = object()
+        feature = _make_feature(config={"mode": "old"})
+        feature.set_config.return_value = receipt
+        feature.rollback_config_transition = AsyncMock()
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = [
+            RuntimeError("new clause renderer failed"),
+            None,
+        ]
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        feature.rollback_config_transition.assert_awaited_once_with(receipt)
+        feature.set_config.assert_awaited_once_with({"mode": "new"})
+
+    @pytest.mark.asyncio
+    async def test_endpoint_config_transition_waits_for_active_turn(self):
+        """The HTTP transition shares the production conversation lock."""
+
+        feature = _make_feature(config={"mode": "old"})
+        applied = asyncio.Event()
+
+        async def set_config(_config):
+            applied.set()
+
+        feature.set_config.side_effect = set_config
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not applied.is_set()
+
+        response = await asyncio.wait_for(update, timeout=1)
+        assert response["config"] == {"mode": "old"}
+        assert applied.is_set()
+
+    @pytest.mark.asyncio
+    async def test_queued_config_update_re_resolves_after_feature_removal(self):
+        """A waiter cannot mutate the stale feature generation it first saw."""
+
+        stale = _make_feature(config={"mode": "old"})
+        agent = _lifecycle_agent(features={"TestFeature": stale})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        async with agent._turn_lifecycle():
+            update = asyncio.create_task(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                )
+            )
+            await asyncio.sleep(0)
+            assert not update.done()
+            assert agent.features.pop("TestFeature") is stale
+
+        with pytest.raises(HTTPException) as exc_info:
+            await asyncio.wait_for(update, timeout=1)
+
+        assert exc_info.value.status_code == 404
+        stale.set_config.assert_not_awaited()
+        agent.refresh_feature_context_clauses.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_config_setter_can_reenter_privacy_transition(self):
+        """A hosted setter cannot deadlock on its mutation's own turn lock."""
+
+        feature = _make_feature(config={"mode": "old"})
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        entered = asyncio.Event()
+
+        async def set_config(_config):
+            async with agent.privacy_transition():
+                entered.set()
+
+        feature.set_config.side_effect = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        await asyncio.wait_for(
+            features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            ),
+            timeout=1,
+        )
+
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_config_setter_cognition_is_rejected_before_context_refresh(self):
+        """A setter cannot expose new live config beside old cached context."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+        feature.get_config.side_effect = lambda: dict(state)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        observed = []
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            async with agent._turn_lifecycle():
+                observed.append(dict(state))
+
+        feature.set_config.side_effect = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature transition generation is fully committed",
+        ):
+            await asyncio.wait_for(
+                features_endpoint.update_feature_config(
+                    request,
+                    "TestFeature",
+                    features_endpoint.ConfigUpdateRequest(
+                        config={"mode": "new"}
+                    ),
+                ),
+                timeout=1,
+            )
+
+        assert observed == []
+        assert state == {"mode": "new"}
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
+
+    @pytest.mark.asyncio
+    async def test_config_updates_are_not_serialized_across_agents(self):
+        """A slow tenant setter must not block an unrelated tenant."""
+
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        first = _make_feature(config={"mode": "old"})
+        second = _make_feature(config={"mode": "old"})
+
+        async def block_first(_config):
+            first_started.set()
+            await release_first.wait()
+
+        first.set_config.side_effect = block_first
+        first_agent = _lifecycle_agent(features={"TestFeature": first})
+        second_agent = _lifecycle_agent(features={"TestFeature": second})
+        first_agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        second_agent.refresh_feature_context_clauses = MagicMock(return_value=())
+
+        def request_for(agent):
+            return SimpleNamespace(
+                state=SimpleNamespace(agent=agent),
+                app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+            )
+
+        first_update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request_for(first_agent),
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "first"}),
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request_for(second_agent),
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "second"}),
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait({second_update}, timeout=0.5)
+            assert second_update in done
+            assert second_update.result()["config"] == {"mode": "old"}
+        finally:
+            release_first.set()
+            await asyncio.gather(first_update, second_update)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_after_commit_waits_for_context_reconciliation(self):
+        """A disconnected PATCH cannot strand new config with old clauses."""
+
+        state = {"mode": "old"}
+        committed = asyncio.Event()
+        release_setter = asyncio.Event()
+        refreshed = asyncio.Event()
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            committed.set()
+            await release_setter.wait()
+
+        def refresh(_feature):
+            refreshed.set()
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = refresh
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        update = asyncio.create_task(
+            features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+        )
+        await asyncio.wait_for(committed.wait(), timeout=1)
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done()
+        assert not refreshed.is_set()
+        update.cancel()
+        await asyncio.sleep(0)
+        assert not update.done()
+
+        release_setter.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(update, timeout=1)
+
+        assert state == {"mode": "new"}
+        assert refreshed.is_set()
+
+    @pytest.mark.asyncio
+    async def test_setter_owned_cancellation_reconciles_committed_context(self):
+        """A setter's cancelled child cannot split live config from clauses."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.context_text = "context:old"
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            feature.context_text = f"context:{state['mode']}"
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert state == {"mode": "new"}
+        assert feature.enabled is True
+        clauses = agent.feature_contribution_runtime.active_context_clauses()
+        assert [(clause.name, clause.body) for clause in clauses] == [
+            ("agent-fixture-context", "context:new")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_setter_owned_cancellation_disables_when_reconcile_fails(self):
+        """Ambiguous commit plus failed republish removes tools and clauses."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        feature.context_text = "context:old"
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            feature.context_text = f"context:{state['mode']}"
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        agent.refresh_feature_context_clauses = MagicMock(
+            side_effect=RuntimeError("private renderer detail")
+        )
+        # Simulate ownership-ledger drift before the config transition must
+        # fail closed. The retained exact source must still be withdrawn.
+        del agent.signal_registry._claims[feature.source.name]
+        agent.wait_registry.deregister(
+            feature.wait_provider.kind, feature.wait_provider
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(RuntimeError, match="feature was disabled") as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert error.value.__cause__ is None
+        assert state == {"mode": "new"}
+        assert feature.enabled is False
+        assert agent.features[feature.name] is feature
+        assert not agent.feature_contribution_runtime.is_active(feature)
+        assert not agent.feature_contribution_runtime.active_context_clauses()
+        assert agent.signal_registry.get(feature.source.name) is None
+
+    @pytest.mark.asyncio
+    async def test_config_quarantine_failure_latches_safe_mode(self):
+        """A failed config repair cannot leave prompt authority cognitive."""
+
+        from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+
+        state = {"mode": "old"}
+        agent = _lifecycle_agent()
+        feature = SDKFixtureFeature(agent)
+        feature.enabled = False
+        agent.features[feature.name] = feature
+        await agent._activate_feature_runtime(feature)
+        runtime = agent.feature_contribution_runtime
+        original = runtime.active_context_clauses()[0]
+        foreign = replace(original, body="foreign config replacement")
+        runtime.context_clause_registry._clauses[original.identity] = foreign
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            state.clear()
+            state.update(config)
+            await _propagate_cancelled_child()
+
+        feature.get_config = get_config
+        feature.set_config = set_config
+        agent.refresh_feature_context_clauses = MagicMock(
+            side_effect=RuntimeError("private renderer detail")
+        )
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="feature contributions could not be quarantined",
+        ) as error:
+            await features_endpoint.update_feature_config(
+                request,
+                feature.name,
+                features_endpoint.ConfigUpdateRequest(config={"mode": "new"}),
+            )
+
+        assert error.value.__cause__ is None
+        assert agent._safe_mode is True
+        assert "quarantine failed" in agent._safe_mode_reason
+        assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+        assert agent._feature_lifecycle_integrity_uncertain is True
+        assert feature.enabled is False
+        assert runtime.is_active(feature)
+        assert runtime.active_context_clauses() == (foreign,)
+
+    def test_failed_refresh_and_rollback_disables_feature_runtime(self):
+        """A doubly-failed transition is quarantined instead of split-brain."""
+
+        state = {"mode": "old"}
+        feature = _make_feature(config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def set_config(config):
+            if config == {"mode": "old"}:
+                raise RuntimeError("durable rollback failed")
+            state.clear()
+            state.update(config)
+
+        feature.get_config.side_effect = get_config
+        feature.set_config.side_effect = set_config
+        agent = _make_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses.side_effect = RuntimeError(
+            "new clause renderer failed"
+        )
+        agent._unregister_feature_runtime = AsyncMock()
+        app = _make_app(agent)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"mode": "new"}},
+            )
+
+        assert resp.status_code == 500
+        assert feature.enabled is False
+        agent._unregister_feature_runtime.assert_awaited_once_with(
+            feature, unload=False
+        )
+
+    def test_updates_disabled_feature_without_refreshing_inactive_context(self):
+        feature = _make_feature(config={"enabled": False}, enabled=False)
+        agent = _make_agent(features={"TestFeature": feature})
+        app = _make_app(agent)
+
+        with TestClient(app) as client:
+            resp = client.patch(
+                "/api/features/TestFeature/config",
+                json={"config": {"enabled": True}},
+            )
+
+        assert resp.status_code == 200
+        feature.set_config.assert_awaited_once_with({"enabled": True})
+        agent.refresh_feature_context_clauses.assert_not_called()
 
     def test_validates_required_fields(self):
         schema = {
@@ -1102,6 +3282,46 @@ SECRET_SCHEMA = {
 
 
 class TestSecretMasking:
+    @pytest.mark.asyncio
+    async def test_atomic_secret_setter_cancellation_reconciles_context(self):
+        """The hosted atomic setter shares the ambiguous-commit boundary."""
+
+        state = {"api_key": "stored-key", "enabled": True}
+        feature = _make_feature(config_schema=SECRET_SCHEMA, config=state)
+
+        async def get_config():
+            return dict(state)
+
+        async def atomic_update(incoming, secret_fields, validate):
+            assert secret_fields == {"api_key"}
+            effective = {**state, **incoming}
+            validate(effective)
+            state.clear()
+            state.update(effective)
+            await _propagate_cancelled_child()
+
+        feature.get_config.side_effect = get_config
+        feature.set_config_with_secret_preservation = AsyncMock(
+            side_effect=atomic_update
+        )
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        agent.refresh_feature_context_clauses = MagicMock(return_value=())
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await features_endpoint.update_feature_config(
+                request,
+                "TestFeature",
+                features_endpoint.ConfigUpdateRequest(config={"enabled": False}),
+            )
+
+        assert state == {"api_key": "stored-key", "enabled": False}
+        agent.refresh_feature_context_clauses.assert_called_once_with(feature)
+        feature.set_config.assert_not_awaited()
+
     def test_get_config_strips_secret_and_reports_presence(self):
         feature = _make_feature(
             config_schema=SECRET_SCHEMA,

@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from kestrel_sdk.features.host_base import HostFeature
 
 from kestrel_sovereign.features.contribution_runtime import (
+    FeatureContributionCollectionError,
     FeatureContributionRuntime,
     FeatureContributionRuntimeError,
 )
@@ -215,8 +216,11 @@ async def start_host_features(
             # the transition so callers cannot serve a partially-active set.
             await _rollback_started_host_features(started, ctx, runtime)
             ctx.started_host_features = previously_started
+            if isinstance(exc, FeatureContributionCollectionError):
+                raise
             raise FeatureContributionRuntimeError(
-                f"host feature {feature!r} contribution activation failed"
+                f"host feature {_host_feature_name(feature)!r} "
+                "contribution activation failed"
             ) from exc
         try:
             await feature.on_host_start(ctx)
