@@ -386,8 +386,15 @@ class DockerExecutor(BaseExecutor):
                 cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
 
         cmd.extend(["-w", container_cwd])
-        cmd.extend(["--entrypoint", program])
         log_safe_cmd = list(cmd)
+
+        # The program is the caller's text on the command path. Its name
+        # is worth logging — it is what the policy vetted — but not
+        # raw: a newline in it would forge whole log lines. ``repr``
+        # escapes them, and ``shlex.join`` alone would not (it quotes a
+        # newline, it does not encode it).
+        cmd.extend(["--entrypoint", program])
+        log_safe_cmd.extend(["--entrypoint", repr(program)])
         for key, value in environment.items():
             cmd.extend(["-e", f"{key}={value}"])
             log_safe_cmd.extend(["-e", f"{key}=<redacted>"])
@@ -480,7 +487,14 @@ class DockerExecutor(BaseExecutor):
             program=command.argv[0],
         )
         cmd.extend(command.argv[1:])
-        log_safe_cmd.extend(command.argv[1:])
+        # Count, not contents. Arguments are where a caller's secrets
+        # live — a bearer token, a `--password` — and the environment
+        # values on this same line are redacted for exactly that
+        # reason. The script path never logged them either: they were
+        # inside a file, and the line ended at `sh /scripts/script.sh`.
+        # Restoring them here would have been a new sink for secrets,
+        # and a way to forge log lines with an embedded newline.
+        log_safe_cmd.append(f"<{len(command.argv) - 1} argument(s) not logged>")
 
         logger.info("Executing command %s... in Docker container", command.id[:8])
         # Quoted, unlike the script path's log line: here the reader is

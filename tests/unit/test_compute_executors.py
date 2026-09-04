@@ -1411,6 +1411,68 @@ async def test_docker_command_mode_redacts_environment_values_from_the_log(
 
 
 @pytest.mark.asyncio
+async def test_docker_command_mode_logs_how_many_arguments_not_which(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Arguments are where a caller's secrets are (codex round 2 P1).
+
+    The environment values on this same log line are redacted for that
+    reason, and the script path never logged arguments at all — they
+    were inside a file, and the line ended at ``sh /scripts/script.sh``.
+    The program still appears: it is what the policy vetted, and it is
+    the one thing a reader of this line needs.
+    """
+    caplog.set_level(logging.DEBUG, logger=docker_executor_module.logger.name)
+    argv = ["curl", "-H", "Authorization: Bearer s3cret-token", "https://x"]
+    captured, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=argv)),
+    )
+
+    # The secret still reaches the container — this is about the log.
+    assert "Authorization: Bearer s3cret-token" in captured
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "s3cret-token" not in logged
+    assert "3 argument(s) not logged" in logged
+    assert "curl" in logged, "the program is what the reader needs"
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_cannot_have_a_log_line_forged_through_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A newline in the program name must not become a new log line.
+
+    ``shlex.join`` quotes a newline; it does not encode it, so the raw
+    byte would still land in the log and everything after it would read
+    as a separate record.
+    """
+    caplog.set_level(logging.DEBUG, logger=docker_executor_module.logger.name)
+    forged = "prog\nERROR forged-by-the-caller"
+    await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=[forged, "x"])),
+    )
+
+    container_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "Container command" in record.getMessage()
+    ]
+    assert container_lines, "the container command was never logged"
+    for line in container_lines:
+        assert "\nERROR forged-by-the-caller" not in line
+        assert "forged-by-the-caller" in line, "escaped, not dropped"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("executor_name", ("local", "uv"))
 async def test_a_script_executor_refuses_an_argv_vector(
     monkeypatch: pytest.MonkeyPatch,
