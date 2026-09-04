@@ -96,8 +96,8 @@ class TaskFeature(Feature):
     def _recipient_agent_id(self) -> str:
         """Return the runtime-bound inbox principal for every task operation."""
 
-        value = getattr(self.agent, "did", None)
-        if not isinstance(value, str) or not value:
+        value = self._durable_agent_id()
+        if value is None:
             raise ValueError("Task recipient identity unavailable")
         return value
 

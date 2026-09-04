@@ -150,7 +150,10 @@ async def test_unauthorized_failure_does_not_write_victim_observability(tmp_path
                 recipient_agent_id=PEER,
             )
 
-        task = await manager.get_task("unauthorized-failure")
+        task = await manager.get_task_for_recipient(
+            "unauthorized-failure",
+            RECIPIENT,
+        )
         assert task.status.state is TaskState.SUBMITTED
         error_events = await manager.observability_store._backend.fetch_all(
             """
@@ -254,8 +257,12 @@ async def test_response_and_artifact_fail_closed_without_durable_identity(tmp_pa
         assert artifact.status is ToolResultStatus.ERROR
         assert "durable identity" in response.error
         assert "durable identity" in artifact.error
-        response_task = await manager.get_task("identityless-response")
-        artifact_task = await manager.get_task("identityless-artifact")
+        response_task = await manager.task_store._get_unscoped(
+            "identityless-response"
+        )
+        artifact_task = await manager.task_store._get_unscoped(
+            "identityless-artifact"
+        )
         assert response_task.status.state is TaskState.SUBMITTED
         assert not artifact_task.artifacts
     finally:
@@ -383,7 +390,10 @@ async def test_worker_display_name_does_not_replace_durable_recipient_authority(
         await worker._poll_and_process()
         await asyncio.gather(*worker._tasks)
 
-        persisted = await manager.get_task("display-named-worker")
+        persisted = await manager.get_task_for_recipient(
+            "display-named-worker",
+            RECIPIENT,
+        )
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == (
             "finished by the DID recipient"
@@ -533,7 +543,10 @@ async def test_handler_terminal_outcome_reconciles_live_cas_without_replacing_wi
         else:
             await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(handler.task.id)
+        persisted = await manager.get_task_for_recipient(
+            handler.task.id,
+            RECIPIENT,
+        )
         assert persisted is not None
         assert persisted.status.state is expected_state
         if expected_state is TaskState.COMPLETED:
@@ -604,7 +617,7 @@ async def test_handler_nonterminal_outcome_reconciles_live_progress(tmp_path, sy
         if not sync:
             await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(returned.id)
+        persisted = await manager.get_task_for_recipient(returned.id, RECIPIENT)
         assert persisted is not None
         assert persisted.status.state is TaskState.INPUT_REQUIRED
         assert persisted.status.message.parts[0].text == "Which account?"
@@ -684,7 +697,7 @@ async def test_async_terminal_commit_lost_ack_still_emits_completion_wake(tmp_pa
 
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(submitted.id)
+        persisted = await manager.get_task_for_recipient(submitted.id, RECIPIENT)
         assert persisted is not None
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == "committed result"
@@ -771,7 +784,7 @@ async def test_matching_terminal_token_retains_wake_when_canonical_reread_fails(
 
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(submitted.id)
+        persisted = await manager.get_task_for_recipient(submitted.id, RECIPIENT)
         assert persisted is not None
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == (
@@ -853,7 +866,7 @@ async def test_lost_ack_with_normalized_terminal_payload_still_emits_wake(tmp_pa
 
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(submitted.id)
+        persisted = await manager.get_task_for_recipient(submitted.id, RECIPIENT)
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.artifacts[0].parts[0].data == {
             "when": "2020-01-01 00:00:00"
@@ -934,7 +947,7 @@ async def test_uncertain_terminal_write_does_not_claim_different_payload(tmp_pat
 
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(submitted.id)
+        persisted = await manager.get_task_for_recipient(submitted.id, RECIPIENT)
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == "competing result"
         assert completions == []
@@ -1014,7 +1027,7 @@ async def test_uncertain_terminal_write_does_not_claim_identical_competing_paylo
 
         await manager.drain_execution_tasks()
 
-        persisted = await manager.get_task(submitted.id)
+        persisted = await manager.get_task_for_recipient(submitted.id, RECIPIENT)
         assert persisted.status.state is TaskState.COMPLETED
         assert persisted.status.message.parts[0].text == "same result"
         assert completions == []

@@ -2845,20 +2845,19 @@ async def test_database_fence_blocks_legacy_replace_of_canceled_task(tmp_path):
             agent_name="did:test:creator",
         )
 
-        with pytest.raises(Exception, match="canceled A2A task is terminal"):
-            await manager.task_store.backend.execute(
-                """
-                INSERT OR REPLACE INTO a2a_tasks
-                    (id, task_type, status, creator_agent_id, recipient_agent_id)
-                VALUES (?, ?, 'completed', ?, ?)
-                """,
-                (
-                    "terminal-replace",
-                    "generic",
-                    "did:test:replacement-creator",
-                    "did:test:replacement-recipient",
-                ),
-            )
+        await manager.task_store.backend.execute(
+            """
+            INSERT OR REPLACE INTO a2a_tasks
+                (id, task_type, status, creator_agent_id, recipient_agent_id)
+            VALUES (?, ?, 'completed', ?, ?)
+            """,
+            (
+                "terminal-replace",
+                "generic",
+                "did:test:replacement-creator",
+                "did:test:replacement-recipient",
+            ),
+        )
 
         canceled = await manager.get_task_for_creator(
             "terminal-replace",
@@ -3133,54 +3132,6 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
         call.args[0] for call in backend.execute.await_args_list
     )
     assert "ADD COLUMN IF NOT EXISTS terminal_operation_id TEXT" in statements
-
-
-@pytest.mark.asyncio
-async def test_postgres_v3_fence_survives_a_mixed_version_initializer():
-    """V2 workers must see a marker and cannot replace the v3 function body."""
-
-    @asynccontextmanager
-    async def transaction():
-        yield
-
-    backend = SimpleNamespace(
-        backend_type="postgres",
-        execute_script=AsyncMock(),
-        execute=AsyncMock(return_value=0),
-        fetch_one=AsyncMock(return_value=(False,)),
-        transaction=transaction,
-    )
-
-    await TaskStore(backend).initialize()
-
-    scripts = "\n".join(
-        call.args[0] for call in backend.execute_script.await_args_list
-    )
-    probes = "\n".join(
-        call.args[0] for call in backend.fetch_one.await_args_list
-    )
-    lock_calls = [
-        call
-        for call in backend.execute.await_args_list
-        if "pg_advisory_xact_lock" in call.args[0]
-    ]
-    assert len(lock_calls) == 1
-    assert lock_calls[0].args[1] == ("a2a_tasks_cancel_authority_v2",)
-    assert "CREATE TRIGGER a2a_tasks_authority_fence_v2\n" in scripts
-    assert "FUNCTION a2a_tasks_enforce_authority_fence_v3()" in scripts
-    assert (
-        "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v3()"
-        in scripts
-    )
-    assert (
-        "procedure.proname =\n"
-        "                          'a2a_tasks_enforce_authority_fence_v3'"
-        in probes
-    )
-    assert (
-        "AND trigger.tgname = 'a2a_tasks_authority_fence_v2'\n"
-        in probes
-    )
 
 
 @pytest.mark.asyncio

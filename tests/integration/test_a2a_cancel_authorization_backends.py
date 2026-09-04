@@ -302,7 +302,7 @@ async def test_sqlite_fence_upgrade_never_exposes_terminal_row_to_legacy_writer(
         if migration is not None:
             await migration
         await migrating_backend._connection.set_trace_callback(None)
-        persisted = await store.get(task_id)
+        persisted = await store._get_unscoped(task_id)
         await legacy_backend.close()
         await migrating_backend.close()
 
