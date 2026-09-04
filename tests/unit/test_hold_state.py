@@ -2265,6 +2265,68 @@ async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
 
 
 @pytest.mark.asyncio
+async def test_stale_candidate_cannot_replace_a_newer_stable_anchor(
+    tmp_path,
+    monkeypatch,
+):
+    """Restoring an old DB/candidate pair cannot erase a later active Hold."""
+
+    path = tmp_path / "stale-candidate.db"
+    old_database = tmp_path / "stale-candidate-old.db"
+    old_candidate = tmp_path / "stale-candidate-old.pending"
+
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+
+    def interrupt_promotion(_payload):
+        raise RuntimeError("injected interruption before first promotion")
+
+    monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
+    with pytest.raises(RuntimeError, match="before first promotion"):
+        await store.set_hold(
+            scope="agent",
+            target_id="did:agent:stale-candidate",
+            actor_id="did:sovereign:operator",
+            reason="first hold",
+            operation_id="stale-candidate-first",
+        )
+    await db.close()
+    shutil.copyfile(path, old_database)
+    shutil.copyfile(store._history_candidate_path, old_candidate)
+
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:stale-candidate",
+        actor_id="did:sovereign:operator",
+        reason="later active hold",
+        operation_id="stale-candidate-later",
+    )
+    stable_path = store._history_anchor_path
+    candidate_path = store._history_candidate_path
+    assert stable_path is not None
+    assert candidate_path is not None
+    newer_anchor = stable_path.read_bytes()
+    await db.close()
+
+    shutil.copyfile(old_database, path)
+    shutil.copyfile(old_candidate, candidate_path)
+    restored = await AsyncDatabase.sqlite(str(path))
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="staged Hold history publication conflicts with the stable",
+        ):
+            await HoldStore(restored).ensure_schema()
+        assert stable_path.read_bytes() == newer_anchor
+    finally:
+        await restored.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_staged_evidence_rejects_ambiguous_primary_restore(
     tmp_path, monkeypatch
 ):
@@ -3811,6 +3873,61 @@ async def test_bootstrap_intent_cannot_reanchor_different_receipt_history(tmp_pa
             await store.ensure_schema()
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_bootstrap_intent_cannot_replace_a_newer_stable_anchor(
+    tmp_path,
+):
+    """Bootstrap recovery refuses an older DB/intent pair after a later Hold."""
+
+    path = tmp_path / "stale-bootstrap.db"
+    old_database = tmp_path / "stale-bootstrap-old.db"
+
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:stale-bootstrap",
+        actor_id="did:sovereign:operator",
+        reason="first hold",
+        operation_id="stale-bootstrap-first",
+    )
+    old_anchor = await store._current_history_anchor_payload()
+    await db.close()
+    shutil.copyfile(path, old_database)
+
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    await store.set_hold(
+        scope="agent",
+        target_id="did:agent:stale-bootstrap",
+        actor_id="did:sovereign:operator",
+        reason="later active hold",
+        operation_id="stale-bootstrap-later",
+    )
+    witness_path = store._initialization_witness_path
+    stable_path = store._history_anchor_path
+    assert witness_path is not None
+    assert stable_path is not None
+    newer_anchor = stable_path.read_bytes()
+    await db.close()
+
+    shutil.copyfile(old_database, path)
+    store._remove_file_evidence(witness_path, label="test initialization witness")
+    store._write_bootstrap_intent(old_anchor)
+    restored = await AsyncDatabase.sqlite(str(path))
+    try:
+        with pytest.raises(
+            HoldCorruptStateError,
+            match="bootstrap intent conflicts with the stable history anchor",
+        ):
+            await HoldStore(restored).ensure_schema()
+        assert stable_path.read_bytes() == newer_anchor
+    finally:
+        await restored.close()
 
 
 @pytest.mark.asyncio

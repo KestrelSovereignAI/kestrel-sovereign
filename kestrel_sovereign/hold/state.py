@@ -1600,6 +1600,38 @@ class HoldStore:
         )
         return self._history_anchor_payload_from_rows(rows)
 
+    @classmethod
+    def _is_immediate_history_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+    ) -> bool:
+        """Whether ``predecessor`` is exactly ``current_rows`` minus one receipt.
+
+        A Hold mutation appends exactly one immutable receipt before staging its
+        candidate head. Recovery is rare, so exhaustively proving which single
+        receipt was appended is preferable to trusting only the monotonically
+        increasing receipt count: two divergent histories can have the same
+        count. This proof prevents a restored primary/candidate pair from
+        replacing a newer stable external head.
+        """
+
+        predecessor = cls._validate_history_anchor_payload(predecessor)
+        parts = predecessor.splitlines()
+        if int(parts[1]) != len(current_rows) - 1:
+            return False
+        return any(
+            cls._history_anchor_payload_from_rows(
+                tuple(
+                    row
+                    for position, row in enumerate(current_rows)
+                    if position != omitted
+                )
+            )
+            == predecessor
+            for omitted in range(len(current_rows))
+        )
+
     @staticmethod
     def _history_anchor_payload_from_rows(rows: list[Any] | tuple[Any, ...]) -> bytes:
         """Build the canonical receipt head, including the empty history."""
@@ -1738,9 +1770,20 @@ class HoldStore:
         candidate = await self._read_external_history_candidate()
         if candidate is None:
             return
-        current = await self._current_history_anchor_payload()
+        current_rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
+        )
+        current = self._history_anchor_payload_from_rows(current_rows)
         stable = await self._read_history_anchor()
         if current == candidate:
+            if stable != candidate and (
+                stable is None
+                or not self._is_immediate_history_predecessor(stable, current_rows)
+            ):
+                raise HoldCorruptStateError(
+                    "staged Hold history publication conflicts with the stable "
+                    "history anchor"
+                )
             if self._history_anchor_path is not None:
                 self._write_file_evidence(
                     self._history_anchor_path,
@@ -1948,6 +1991,14 @@ class HoldStore:
         ):
             raise HoldCorruptStateError(
                 "Hold bootstrap intent does not match receipt history"
+            )
+        if (
+            bootstrap_history is not None
+            and anchored is not None
+            and anchored != bootstrap_history
+        ):
+            raise HoldCorruptStateError(
+                "Hold bootstrap intent conflicts with the stable history anchor"
             )
         if initialized:
             missing = sorted(_HOLD_SCHEMA_TABLES - existing)
