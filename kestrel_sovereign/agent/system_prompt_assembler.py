@@ -78,6 +78,28 @@ SYNTHETIC_HOST_AUDIT_NAMES = frozenset(
     }
 )
 
+# The compatibility renderer and context-plan consumer publish these lowercase
+# subsection identities.  They are just as host-owned as the canonical tracked
+# names above: a feature using one would either impersonate mandatory content or
+# create an indistinguishable duplicate audit row.
+LEGACY_MANDATORY_SYSTEM_SUBSECTIONS = frozenset(
+    {"constitution", "soul", "bootstrap_agents", "state_of_mind"}
+)
+LEGACY_HOST_AUDIT_NAMES = frozenset(
+    {
+        *LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
+        "additional_context",
+        "prompt_adaptation",
+        "reflection_guidance",
+        "session_briefing",
+        "style_reminder",
+        "system_prompt_addendum",
+    }
+)
+HOST_OWNED_AUDIT_NAMES = frozenset(
+    SYNTHETIC_HOST_AUDIT_NAMES | LEGACY_HOST_AUDIT_NAMES
+)
+
 # The Tortoise Doctrine file is a special-cased anchored doctrine
 # entry that gets priority 2 (between constitution and AGENTS.md).
 # Other anchored files default to priority 3.
@@ -88,8 +110,18 @@ AGENTS_FILENAME = "AGENTS.md"
 _JOINER = "\n\n"
 
 
+def legacy_bootstrap_audit_name(filename: str) -> str | None:
+    """Return the compatibility renderer's audit identity for one filename."""
+
+    if filename == "HEARTBEAT.md":
+        return None
+    if filename == "SOUL.md":
+        return "soul"
+    return f"bootstrap_{filename.replace('.md', '').lower()}"
+
+
 class SystemPromptNamespaceError(ValueError):
-    """A host-owned prompt source claims a synthetic audit identity."""
+    """A host-owned prompt source claims another reserved audit identity."""
 
 
 class MandatorySystemPromptBudgetError(ValueError):
@@ -122,11 +154,11 @@ class MandatorySystemPromptBudgetError(ValueError):
 
 
 def validate_anchored_doctrine_names(names: Iterable[str]) -> tuple[str, ...]:
-    """Reject anchors that impersonate synthetic host audit clauses."""
+    """Reject anchors that impersonate any host-owned audit identity."""
 
     values = tuple(names)
     conflict = next(
-        (name for name in values if name in SYNTHETIC_HOST_AUDIT_NAMES),
+        (name for name in values if name in HOST_OWNED_AUDIT_NAMES),
         None,
     )
     if conflict is not None:

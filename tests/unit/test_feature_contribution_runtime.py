@@ -404,6 +404,35 @@ def test_runtime_bootstrap_name_is_rejected_before_feature_rendering(tmp_path):
     assert runtime.active_owners() == ()
 
 
+def test_runtime_bootstrap_legacy_audit_alias_is_reserved(tmp_path):
+    """A live bootstrap file also owns its legacy ``bootstrap_*`` row name."""
+
+    agent = _agent(tmp_path)
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.context_builder = ContextBuilder(
+        agent.storage,
+        agent_data_path=str(tmp_path),
+        context_clause_registry=runtime.context_clause_registry,
+    )
+    assert agent.context_builder._bootstrap_loader.add_file("POLICY.yaml")
+    feature = SDKFixtureFeature(agent)
+    feature.context_registration = ContextClauseRegistration(
+        owner=feature.contribution_owner,
+        name="bootstrap_policy.yaml",
+        priority=30,
+        renderer=feature._render_context_clause,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        runtime.prepare_transition((feature,))
+
+    assert feature.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
 @pytest.mark.asyncio
 async def test_owner_conflict_rejects_complete_transition_before_mutation(tmp_path):
     agent = _agent(tmp_path)

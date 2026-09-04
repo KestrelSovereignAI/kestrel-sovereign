@@ -15,10 +15,15 @@ import json
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from .token_counter import TokenCounter, get_token_counter
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+from .system_prompt_assembler import (
+    LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
+    legacy_bootstrap_audit_name,
+)
+from .token_counter import TokenCounter, get_token_counter
 
 
 # Per-message overhead used by format_conversation_history and the
@@ -36,9 +41,7 @@ _MESSAGE_OVERHEAD = 4
 # ``soul`` subsection). Everything else is optional unless the agent
 # config promotes it later — a follow-up can let the operator declare
 # additional mandatory subsections per-agent.
-MANDATORY_SYSTEM_SUBSECTIONS = frozenset(
-    {"constitution", "soul", "bootstrap_agents", "state_of_mind"}
-)
+MANDATORY_SYSTEM_SUBSECTIONS = LEGACY_MANDATORY_SYSTEM_SUBSECTIONS
 
 
 def _count_tool_schema_tokens(
@@ -899,7 +902,9 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 )
             else:
                 label = filename.replace(".md", "").upper()
-                subsection = f"bootstrap_{filename.replace('.md', '').lower()}"
+                subsection = legacy_bootstrap_audit_name(filename)
+                if subsection is None:  # HEARTBEAT.md is excluded above.
+                    continue
                 groups.append(
                     (
                         subsection,

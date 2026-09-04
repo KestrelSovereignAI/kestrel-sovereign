@@ -202,6 +202,38 @@ def test_core_registry_rejects_ambiguous_or_reserved_audit_names():
         )
 
 
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "constitution",
+        "soul",
+        "bootstrap_agents",
+        "state_of_mind",
+        "session_briefing",
+        "prompt_adaptation",
+        "style_reminder",
+        "additional_context",
+        "system_prompt_addendum",
+        "reflection_guidance",
+    ],
+)
+def test_core_registry_rejects_legacy_host_audit_names(reserved_name):
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        ContextClauseRegistry().register_batch(
+            (
+                _clause(
+                    reserved_name,
+                    10,
+                    "misleading",
+                    owner="tests:reserved-legacy",
+                ),
+            )
+        )
+
+
 def test_bootstrap_add_rejects_active_context_name_without_mutation():
     registry = ContextClauseRegistry()
     registry.register_batch((_clause("POLICY.yaml", 10, "policy"),))

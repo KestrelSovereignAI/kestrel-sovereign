@@ -28,8 +28,9 @@ from kestrel_sdk.operator import ServiceScope
 
 from kestrel_sovereign.agent.system_prompt_assembler import (
     AGENTS_FILENAME,
-    SYNTHETIC_HOST_AUDIT_NAMES,
+    HOST_OWNED_AUDIT_NAMES,
     TORTOISE_DOCTRINE_FILENAME,
+    legacy_bootstrap_audit_name,
 )
 from kestrel_sovereign.features.bootstrap.loader import DEFAULT_BOOTSTRAP_FILES
 from kestrel_sovereign.operator import (
@@ -129,17 +130,25 @@ class ContextClauseRegistry:
             Callable[[], Iterable[str]] | None
         ) = None
 
-    _SYNTHETIC_HOST_AUDIT_NAMES = SYNTHETIC_HOST_AUDIT_NAMES
+    _HOST_OWNED_AUDIT_NAMES = HOST_OWNED_AUDIT_NAMES
     _RESERVED_AUDIT_NAMES = frozenset(
         set(DEFAULT_BOOTSTRAP_FILES)
         | {AGENTS_FILENAME, TORTOISE_DOCTRINE_FILENAME}
-        | _SYNTHETIC_HOST_AUDIT_NAMES
+        | _HOST_OWNED_AUDIT_NAMES
     )
 
     def _local_reserved_audit_names(self) -> frozenset[str]:
         names = set(self._RESERVED_AUDIT_NAMES)
+        bootstrap_names = set(DEFAULT_BOOTSTRAP_FILES)
         if self._reserved_audit_name_provider is not None:
-            names.update(self._reserved_audit_name_provider())
+            provided_names = tuple(self._reserved_audit_name_provider())
+            names.update(provided_names)
+            bootstrap_names.update(provided_names)
+        names.update(
+            audit_name
+            for filename in bootstrap_names
+            if (audit_name := legacy_bootstrap_audit_name(filename)) is not None
+        )
         return frozenset(names)
 
     def _visible_reserved_audit_names(self) -> frozenset[str]:
@@ -211,19 +220,25 @@ class ContextClauseRegistry:
             raise FeatureContributionRuntimeError(
                 "duplicate bootstrap audit name"
             )
-        synthetic_conflict = next(
+        host_conflict = next(
             (
                 name
                 for name in values
-                if name in self._SYNTHETIC_HOST_AUDIT_NAMES
+                if name in self._HOST_OWNED_AUDIT_NAMES
             ),
             None,
         )
-        if synthetic_conflict is not None:
+        if host_conflict is not None:
             raise FeatureContributionRuntimeError(
-                f"bootstrap name {synthetic_conflict!r} is a reserved host "
+                f"bootstrap name {host_conflict!r} is a reserved host "
                 "audit name"
             )
+        derived_audit_names = tuple(
+            audit_name
+            for filename in values
+            if (audit_name := legacy_bootstrap_audit_name(filename)) is not None
+        )
+        prospective_audit_names = (*values, *derived_audit_names)
         resident_names = {
             clause.name
             for clause in (
@@ -232,7 +247,10 @@ class ContextClauseRegistry:
                 *self._dependent_clauses(),
             )
         }
-        conflict = next((name for name in values if name in resident_names), None)
+        conflict = next(
+            (name for name in prospective_audit_names if name in resident_names),
+            None,
+        )
         if conflict is not None:
             raise FeatureContributionRuntimeError(
                 f"context-clause name is already registered: {conflict!r}"

@@ -621,6 +621,90 @@ class TestEnableFeature:
         assert feature.enabled is False
 
     @pytest.mark.asyncio
+    async def test_enable_hook_child_cognition_is_rejected_without_deadlock(self):
+        """Transition ancestry must fail closed across an inherited task context."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        child_started = asyncio.Event()
+        cognition_task = None
+
+        async def child_cognition():
+            child_started.set()
+            async with agent._turn_lifecycle():
+                raise AssertionError("pre-commit child cognition was admitted")
+
+        async def enable_with_child_cognition():
+            nonlocal cognition_task
+            cognition_task = asyncio.create_task(child_cognition())
+            await cognition_task
+
+        feature.on_enable.side_effect = enable_with_child_cognition
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+        operation = asyncio.create_task(
+            features_endpoint.enable_feature(request, "TestFeature")
+        )
+
+        try:
+            await asyncio.wait_for(child_started.wait(), timeout=1)
+            with pytest.raises(
+                RuntimeError,
+                match="feature transition generation is fully committed",
+            ):
+                await asyncio.wait_for(asyncio.shield(operation), timeout=0.2)
+        finally:
+            if cognition_task is not None and not cognition_task.done():
+                cognition_task.cancel()
+                await asyncio.gather(cognition_task, return_exceptions=True)
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+
+        assert feature.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_enable_hook_detached_child_cannot_outlive_transition_ancestry(self):
+        """A descendant cannot wait for commit and reuse stale hook authority."""
+
+        feature = _make_feature(enabled=False)
+        agent = _lifecycle_agent(features={"TestFeature": feature})
+        release_child = asyncio.Event()
+        child_started = asyncio.Event()
+        cognition_entered = False
+        detached_task = None
+
+        async def delayed_child_cognition():
+            nonlocal cognition_entered
+            child_started.set()
+            await release_child.wait()
+            async with agent._turn_lifecycle():
+                cognition_entered = True
+
+        async def enable_with_detached_child():
+            nonlocal detached_task
+            detached_task = asyncio.create_task(delayed_child_cognition())
+            await child_started.wait()
+
+        feature.on_enable.side_effect = enable_with_detached_child
+        request = SimpleNamespace(
+            state=SimpleNamespace(agent=agent),
+            app=SimpleNamespace(state=SimpleNamespace(agent=None)),
+        )
+
+        response = await features_endpoint.enable_feature(request, "TestFeature")
+        assert response["status"] == "enabled"
+        assert detached_task is not None
+
+        release_child.set()
+        with pytest.raises(RuntimeError, match="expired feature transition"):
+            await asyncio.wait_for(detached_task, timeout=1)
+
+        assert cognition_entered is False
+
+    @pytest.mark.asyncio
     async def test_committed_enable_ready_hook_can_await_cognition(self):
         """The explicit post-commit ready seam remains cognition-capable."""
 

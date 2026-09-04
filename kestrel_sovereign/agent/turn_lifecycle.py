@@ -72,6 +72,20 @@ class _TurnSessionBinding:
 _BOUND_TURN_SESSION: contextvars.ContextVar[Optional[_TurnSessionBinding]] = (
     contextvars.ContextVar("kestrel_agent_bound_turn_session", default=None)
 )
+
+
+@dataclass(slots=True)
+class _FeatureTransitionAncestry:
+    """Task-tree capability for one CONVERSATION-owned feature transition."""
+
+    agent: object
+    owner_task: object | None
+    active: bool = True
+
+
+_FEATURE_TRANSITION_ANCESTRY: contextvars.ContextVar[
+    Optional[_FeatureTransitionAncestry]
+] = contextvars.ContextVar("kestrel_feature_transition_ancestry", default=None)
 _COMMITTED_FEATURE_TRANSITION_AGENT: contextvars.ContextVar[object | None] = (
     contextvars.ContextVar(
         "kestrel_committed_feature_transition_agent",
@@ -442,7 +456,20 @@ class TurnLifecycleMixin:
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} feature-config"
         async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
-            yield
+            ancestry = _FeatureTransitionAncestry(
+                agent=self,
+                owner_task=asyncio.current_task(),
+            )
+            token = _FEATURE_TRANSITION_ANCESTRY.set(ancestry)
+            try:
+                yield
+            finally:
+                # A task created by an uncommitted hook inherits the same object.
+                # Invalidating it before restoring this task's ContextVar stops a
+                # detached descendant from waiting until commit and laundering
+                # its pre-commit authority into a later cognition turn.
+                ancestry.active = False
+                _FEATURE_TRANSITION_ANCESTRY.reset(token)
 
     @contextmanager
     def committed_feature_transition_cognition(self) -> Iterator[None]:
@@ -533,6 +560,30 @@ class TurnLifecycleMixin:
         started = time.monotonic()
         holder = mgr.holder(ResourceLock.CONVERSATION)
         current_task = asyncio.current_task()
+        transition_ancestry = _FEATURE_TRANSITION_ANCESTRY.get()
+        if (
+            transition_ancestry is not None
+            and transition_ancestry.agent is self
+        ):
+            if not transition_ancestry.active:
+                raise RuntimeError(
+                    "cognition cannot start from an expired feature transition"
+                )
+            if transition_ancestry.owner_task is not current_task:
+                if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is self:
+                    raise RuntimeError(
+                        "committed feature-transition cognition cannot cross "
+                        "a task boundary"
+                    )
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
+            if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
         if (
             holder is not None
             and holder.owner_task is current_task
