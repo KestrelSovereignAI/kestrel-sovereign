@@ -11,12 +11,12 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from kestrel_sovereign.features.security.permissions import SUBAGENT_DISPATCH_ACTION
 from kestrel_sovereign.security.tool_audit import ACTION_TOOL_RESOLUTION, ACTION_TOOL_VALIDATION
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 from kestrel_sovereign.features.security.permissions import (
     SEARCH_TOOL_NAME,
+    SUBAGENT_DISPATCH_ACTION,
     PermissionLevel,
     PermissionStore,
     assert_sdk_permission_level_parity,

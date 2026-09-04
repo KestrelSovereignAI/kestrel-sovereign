@@ -503,11 +503,16 @@ class PermissionStore:
         self.db_path = db_path
         self._session_overrides: Dict[str, PermissionLevel] = {}
         # Tool names that are feature-as-subagent DISPATCH entries — see
-        # :meth:`mark_dispatch_entry`. Repopulated on every boot by feature
-        # registration, so it is always current without a schema column.
+        # :meth:`mark_dispatch_entry`. The in-memory set is the union of what
+        # this boot's feature registration marked and the durable
+        # ``security_dispatch_entries`` table (``sync_dispatch_entries``), so
+        # a feature removed or renamed since still filters its historical
+        # envelope rows.
         self._dispatch_entries: set = set()
-        # Marked this boot but not yet persisted — flushed on the next read so
-        # registration stays synchronous and cheap.
+        # Marked this boot but not yet persisted — a flush task writes them to
+        # the durable table as soon as a loop is running, and the next read
+        # flushes anything still pending, so registration itself stays
+        # synchronous and cheap.
         self._dispatch_entries_dirty: set = set()
         # Flush tasks are held here so a running flush is never garbage
         # collected mid-await (asyncio keeps only weak references).
@@ -1040,10 +1045,13 @@ class PermissionStore:
         on the event misses the second by construction.
 
         This is keyed on the NAME instead, which both rows share and which the
-        feature itself declares at registration. In memory rather than a
-        column: registration runs every boot, so the set is always current,
-        and a column would be a second source of truth for something the
-        registry already knows.
+        feature itself declares at registration. The name goes into the
+        in-memory set for this boot AND, durably, into the
+        ``security_dispatch_entries`` table (flushed eagerly here, and on the
+        next read): the audit log outlives the feature list, so a name that
+        ever denoted a dispatch entry must keep filtering after its feature is
+        removed or renamed — the in-memory set alone lost that (round 28
+        review corrected the earlier claim that no durable record was needed).
         """
         if tool_name:
             self._dispatch_entries.add(tool_name)

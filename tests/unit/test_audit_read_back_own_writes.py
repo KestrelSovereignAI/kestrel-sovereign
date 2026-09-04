@@ -2006,8 +2006,11 @@ def test_a_truncated_row_quoting_a_key_in_prose_loses_nothing():
 # masker every parseable row gets; a JSON-valued string is decided by parsing.
 # --------------------------------------------------------------------------
 
-def test_complete_truncated_json_closes_what_the_cut_left_open():
-    from kestrel_sovereign.features.security.args_summary import complete_truncated_json as c
+def test_repair_json_text_closes_what_the_cut_left_open():
+    from kestrel_sovereign.features.security.args_summary import repair_json_text
+
+    def c(text):
+        return repair_json_text(text)[0]
 
     assert c('{"a": 1, "b": {"c": [1, 2') == {"a": 1, "b": {"c": [1, 2]}}
     assert c('{"a": "unterminated str') == {"a": "unterminated str"}
@@ -2626,3 +2629,17 @@ async def test_a_bracket_in_the_refusal_reason_does_not_blank_the_row(tmp_path):
     feature.permission_store = store
     found = await feature.security_audit_search(query="kestrel-sovereign")
     assert found.data["count"] == 1 and found.data["refused"] == 1
+
+
+def test_a_nested_reconstruction_under_an_intact_prefixed_row_is_marked():
+    """The outer region of a tool_audit row parses at trim 0 (altered False);
+    only the nested payload needed the read-path slack. The marker has to
+    ride on the nested flag through repair_unparseable_summary, and reverting
+    that OR left the suite green (round 28 review)."""
+    from kestrel_sovereign.features.security.args_summary import remask_summary, repair_json_text
+
+    row = 'refused create_issue | args={"payload": "{\\"api_key\\": \\"sk-live", "n": 1}'
+    assert repair_json_text(row[row.index("{"):])[1] is False   # the outer region is intact
+    shown = remask_summary(row)
+    assert shown.startswith("refused create_issue | args=") and "sk-live" not in shown
+    assert "***MASKED***" in shown and shown.endswith("..."), shown

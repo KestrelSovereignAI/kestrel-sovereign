@@ -109,13 +109,6 @@ def _close_open_structures(text: str) -> Optional[str]:
     return tail + "".join(reversed(closers))
 
 
-def complete_truncated_json(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> Any:
-    """Parse JSON text that a truncation cut, or return None (see
-    :func:`repair_json_text` for whether the text had to be altered)."""
-    parsed, _altered = repair_json_text(text, max_trim=max_trim)
-    return parsed
-
-
 def repair_json_text(text: Any, *, max_trim: int = _MAX_REPAIR_TRIM) -> tuple[Any, bool]:
     """Parse JSON text that a truncation cut: ``(parsed, altered)``.
 
