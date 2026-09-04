@@ -129,6 +129,157 @@ class PostgresHoldCustodySnapshot:
     evidence_binding: str | None = None
 
 
+def validate_postgres_hold_readiness_snapshot(
+    *,
+    existing_tables: set[str] | frozenset[str],
+    receipt_rows: list[Any] | tuple[Any, ...],
+    evidence_rows: list[Any] | tuple[Any, ...],
+) -> None:
+    """Validate the read-only PostgreSQL state that boot will trust.
+
+    Doctor cannot call :meth:`HoldStore.ensure_schema` because a diagnostic is
+    forbidden to create, migrate, or recover durable state.  This pure
+    validator mirrors the external bootstrap/history decisions far enough to
+    distinguish a clean or recoverable deployment from one boot will reject.
+    In particular, the independent history head must agree with the complete
+    immutable receipt set rather than merely with the two custody role rows.
+    """
+
+    allowed_evidence = {
+        _POSTGRES_WITNESS_KEY,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_HISTORY_CANDIDATE_KEY,
+        _POSTGRES_BOOTSTRAP_INTENT_KEY,
+    }
+    evidence: dict[str, bytes] = {}
+    for row in evidence_rows:
+        if (
+            len(row) != 2
+            or not isinstance(row[0], str)
+            or row[0] not in allowed_evidence
+            or row[0] in evidence
+            or not isinstance(row[1], str)
+        ):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold protocol evidence is invalid"
+            )
+        try:
+            evidence[row[0]] = row[1].encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold protocol evidence is invalid"
+            ) from exc
+
+    witness = evidence.get(_POSTGRES_WITNESS_KEY)
+    if witness is not None and witness != _INITIALIZATION_WITNESS_PAYLOAD:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold initialization witness has invalid durable evidence"
+        )
+    initialized = witness is not None
+
+    anchored = evidence.get(_POSTGRES_HISTORY_ANCHOR_KEY)
+    if anchored is not None:
+        anchored = HoldStore._validate_history_anchor_payload(anchored)
+    candidate = evidence.get(_POSTGRES_HISTORY_CANDIDATE_KEY)
+    if candidate is not None:
+        candidate = HoldStore._validate_history_anchor_payload(candidate)
+    bootstrap_payload = evidence.get(_POSTGRES_BOOTSTRAP_INTENT_KEY)
+    bootstrap_history = None
+    if bootstrap_payload is not None:
+        if not bootstrap_payload.startswith(_BOOTSTRAP_INTENT_PAYLOAD):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold bootstrap intent has invalid durable evidence"
+            )
+        try:
+            bootstrap_history = HoldStore._validate_history_anchor_payload(
+                bootstrap_payload.removeprefix(_BOOTSTRAP_INTENT_PAYLOAD)
+            )
+        except HoldCorruptStateError as exc:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold bootstrap intent has invalid durable evidence"
+            ) from exc
+
+    existing = set(existing_tables)
+    if any(not isinstance(table, str) for table in existing):
+        raise HoldCorruptStateError("PostgreSQL Hold schema probe is invalid")
+    unexpected = existing - _HOLD_SCHEMA_TABLES
+    if unexpected:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold schema probe returned unexpected tables"
+        )
+    HoldStore._validate_schema_evidence(
+        initialized=initialized,
+        anchored=anchored,
+        existing=existing,
+        bootstrap_pending=bootstrap_history is not None,
+    )
+
+    rows = tuple(receipt_rows)
+    if "hold_receipts" not in existing:
+        if rows:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold receipt probe returned rows without its table"
+            )
+        current = HoldStore._history_anchor_payload_from_rows(())
+    else:
+        current = HoldStore._history_anchor_payload_from_rows(rows)
+
+    if bootstrap_history is not None and bootstrap_history != current:
+        raise HoldCorruptStateError(
+            "Hold bootstrap intent does not match receipt history"
+        )
+    if (
+        bootstrap_history is not None
+        and anchored is not None
+        and anchored != bootstrap_history
+    ):
+        raise HoldCorruptStateError(
+            "Hold bootstrap intent conflicts with the stable history anchor"
+        )
+
+    if not initialized:
+        if candidate is not None:
+            raise HoldCorruptStateError(
+                "Hold history publication exists without initialized schema"
+            )
+        return
+
+    missing = sorted(_HOLD_SCHEMA_TABLES - existing)
+    if missing:
+        raise HoldCorruptStateError(
+            "initialized Hold schema is missing required tables: "
+            + ", ".join(missing)
+        )
+
+    effective_anchor = anchored
+    if candidate is not None:
+        if current == candidate:
+            if anchored != candidate and (
+                anchored is None
+                or not HoldStore._is_immediate_history_predecessor(anchored, rows)
+            ):
+                raise HoldCorruptStateError(
+                    "staged Hold history publication conflicts with the stable "
+                    "history anchor"
+                )
+            # Boot can safely finish this exact interrupted publication.
+            effective_anchor = candidate
+        elif anchored is not None and current == anchored:
+            raise HoldCorruptStateError(
+                "ambiguous staged Hold history publication matches the stable "
+                "anchor; refusing to discard possible committed evidence"
+            )
+        else:
+            raise HoldCorruptStateError(
+                "interrupted Hold history publication matches neither durable state"
+            )
+
+    if effective_anchor != current:
+        raise HoldCorruptStateError(
+            "Hold history anchor does not match receipt history"
+        )
+
+
 def postgres_hold_custody_binding_payload(
     pair_id: UUID,
     primary_identity: str,
@@ -3317,4 +3468,5 @@ __all__ = [
     "HoldState",
     "HoldStateError",
     "HoldStore",
+    "validate_postgres_hold_readiness_snapshot",
 ]
