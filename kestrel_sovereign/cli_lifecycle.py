@@ -311,7 +311,7 @@ def _start_inprocess_mode(
     if not host_api_key.strip():
         print(
             "❌ Multi-agent host requires a stable KESTREL_API_KEY in the "
-            "project .env. Run `kestrel setup --steps keys` and retry."
+            "project .env. Run `kestrel setup keys` and retry."
         )
         return 1
     browser_url = (

@@ -70,6 +70,8 @@ def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "KESTREL_API_KEY" in output
     assert "multi-agent host" in output.lower()
+    assert "kestrel setup keys" in output
+    assert "--steps" not in output
 
 
 def test_named_start_output_uses_assigned_agent_port(tmp_path, capsys):

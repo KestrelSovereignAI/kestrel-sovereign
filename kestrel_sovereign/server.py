@@ -556,7 +556,7 @@ def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
     if not api_key.strip():
         raise RuntimeError(
             "Multi-agent hosts require a stable KESTREL_API_KEY provisioned "
-            "out of band; run `kestrel setup --steps keys` before startup"
+            "out of band; run `kestrel setup keys` before startup"
         )
     return api_key
 

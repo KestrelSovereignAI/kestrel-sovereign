@@ -173,7 +173,7 @@ def test_multi_agent_server_rejects_missing_out_of_band_host_key(monkeypatch):
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="KESTREL_API_KEY"):
+    with pytest.raises(RuntimeError, match="kestrel setup keys"):
         server._require_multi_agent_host_api_key(os.environ)
 
 

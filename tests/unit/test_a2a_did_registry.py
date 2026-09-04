@@ -338,6 +338,35 @@ def test_windows_registry_transport_switches_at_environment_value_limit(
     large_path.unlink()
 
 
+def test_linux_registry_transport_accounts_for_environment_entry_overhead(
+    tmp_path,
+    monkeypatch,
+):
+    """Near-limit JSON must not exceed Linux's per-entry execve boundary."""
+    from kestrel_sovereign.a2a import did_registry
+
+    monkeypatch.setattr(did_registry.sys, "platform", "linux")
+    empty_document = json.dumps(
+        [{"payload": ""}],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    target_bytes = did_registry._MAX_PROCESS_REGISTRY_BYTES - 1
+    documents = [
+        {"payload": "K" * (target_bytes - len(empty_document.encode("utf-8")))}
+    ]
+
+    environment, registry_path = stage_process_a2a_did_registry(
+        documents,
+        launch_root=tmp_path,
+    )
+
+    assert A2A_PEER_IDENTITY_DOCUMENTS_ENV not in environment
+    assert A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV in environment
+    assert registry_path is not None
+    registry_path.unlink()
+
+
 def test_process_registry_file_handoff_keeps_feature_initialize_idempotent(
     tmp_path,
     monkeypatch,

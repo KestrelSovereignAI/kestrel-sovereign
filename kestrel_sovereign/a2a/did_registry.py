@@ -36,6 +36,7 @@ A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV = (
 )
 _MAX_PROCESS_REGISTRY_BYTES = 128 * 1024
 _MAX_WINDOWS_ENV_VALUE_CHARS = 32_766
+_MAX_LINUX_ENV_ENTRY_BYTES = 128 * 1024
 _PROCESS_REGISTRY_DIRECTORY = ".kestrel-launch"
 _PROCESS_REGISTRY_PREFIX = "a2a-peer-identities-"
 
@@ -49,14 +50,22 @@ def _platform_requires_process_registry_file(encoded_documents: str) -> bool:
 
     Modern Windows permits large Unicode environment blocks, but a single
     user-defined variable is limited to 32,767 characters including its NUL.
-    POSIX launchers keep the established inline contract, whose explicit
-    128-KiB cap is below the per-entry limit on supported hosts.
+    Linux's 128-KiB per-string ``execve`` limit includes the environment name,
+    ``=``, and terminating NUL. Near-limit values therefore use the file lane
+    even though the JSON itself remains within the accepted registry cap.
     """
 
-    return (
-        sys.platform == "win32"
-        and len(encoded_documents) > _MAX_WINDOWS_ENV_VALUE_CHARS
-    )
+    if sys.platform == "win32":
+        return len(encoded_documents) > _MAX_WINDOWS_ENV_VALUE_CHARS
+    if sys.platform.startswith("linux"):
+        entry_size = (
+            len(A2A_PEER_IDENTITY_DOCUMENTS_ENV.encode("utf-8"))
+            + 1
+            + len(encoded_documents.encode("utf-8"))
+            + 1
+        )
+        return entry_size > _MAX_LINUX_ENV_ENTRY_BYTES
+    return False
 
 
 def stage_process_a2a_did_registry(
