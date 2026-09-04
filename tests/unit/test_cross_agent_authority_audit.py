@@ -6,10 +6,13 @@ import ast
 import re
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
+from kestrel_sovereign.endpoints.models import require_sovereign_host_lifecycle
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
@@ -280,7 +283,7 @@ def _is_indirect_tool_dispatcher(
 
 
 def _discovered_tool_surfaces() -> set[str]:
-    """Return every core feature tool, including apparently local tools.
+    """Return every core feature tool, including generated dispatch boundaries.
 
     Cross-agent capability is a property of implementation and deployment,
     not a public-name convention.  Exact inventory of the complete registered
@@ -304,6 +307,67 @@ def _discovered_tool_surfaces() -> set[str]:
                     continue
                 relative = path.relative_to(REPO_ROOT).as_posix()
                 surfaces.add(f"{relative}::{public_name}")
+    return surfaces | _discovered_runtime_generated_tool_surfaces()
+
+
+def _discovered_runtime_generated_tool_surfaces() -> set[str]:
+    """Find core execution boundaries whose public names are runtime data.
+
+    ``Feature.get_tools`` creates ``DynamicTool`` wrappers for the statically
+    discovered ``@tool`` methods. Isolated features instead advertise arbitrary
+    tool names during their child handshake. Finally every visible Feature can
+    be exposed as one high-level orchestrator tool through
+    ``to_orchestrator_tool``. Their names cannot all be recovered from a
+    decorator, so classify the generic core boundaries themselves.
+    """
+
+    surfaces: set[str] = set()
+    feature_root = REPO_ROOT / "kestrel_sovereign/features"
+
+    def base_name(base: ast.expr) -> str:
+        if isinstance(base, ast.Name):
+            return base.id
+        if isinstance(base, ast.Attribute):
+            return base.attr
+        return ""
+
+    def walk_statements(
+        statements: list[ast.stmt],
+        relative: str,
+        parents: tuple[str, ...] = (),
+    ) -> None:
+        for node in statements:
+            if isinstance(node, ast.ClassDef):
+                qualified = (*parents, node.name)
+                if any(base_name(base) == "AgentTool" for base in node.bases):
+                    for member in node.body:
+                        if (
+                            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and member.name == "execute"
+                        ):
+                            surfaces.add(
+                                f"{relative}::{'.'.join((*qualified, member.name))}"
+                            )
+                walk_statements(node.body, relative, qualified)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = (*parents, node.name)
+                if node.name == "to_orchestrator_tool":
+                    surfaces.add(f"{relative}::{'.'.join(qualified)}")
+                walk_statements(node.body, relative, qualified)
+            else:
+                nested_statements = [
+                    child
+                    for child in ast.iter_child_nodes(node)
+                    if isinstance(child, ast.stmt)
+                ]
+                walk_statements(nested_statements, relative, parents)
+
+    for path in feature_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        walk_statements(
+            tree.body,
+            path.relative_to(REPO_ROOT).as_posix(),
+        )
     return surfaces
 
 
@@ -657,6 +721,31 @@ def test_generic_indirect_dispatch_tools_are_classified() -> None:
         assert _is_indirect_tool_dispatcher(tool_nodes[0])
 
 
+def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
+    """Runtime-generated names must not evade the exact tool inventory."""
+
+    expected = {
+        "kestrel_sovereign/features/base.py::"
+        "Feature.get_tools.DynamicTool.execute",
+        "kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool",
+        "kestrel_sovereign/features/isolated_runtime.py::"
+        "IsolatedFeatureTool.execute",
+    }
+    assert _discovered_runtime_generated_tool_surfaces() == expected
+    assert expected <= _discovered_tool_surfaces()
+
+    registry_path = REPO_ROOT / "kestrel_sovereign/agent/tool_registry.py"
+    registry_tree = ast.parse(
+        registry_path.read_text(encoding="utf-8"),
+        filename=str(registry_path),
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and _call_name(node) == "to_orchestrator_tool"
+        for node in ast.walk(registry_tree)
+    ), "The classified high-level Feature tool must remain wired into registration"
+
+
 def test_relation_free_control_names_are_still_discovered() -> None:
     """A control door need not say ``agent`` or ``task`` to cross a boundary."""
 
@@ -778,6 +867,25 @@ def test_app_level_host_authority_routes_are_discovered() -> None:
     auth_matrix = AUTH_SURFACE_MATRIX_PATH.read_text(encoding="utf-8")
     assert "| `Public-Localhost`" in auth_matrix
     assert "/api/auth/key" in auth_matrix
+
+
+def test_bootstrap_api_key_authority_matches_host_lifecycle_gate() -> None:
+    """The audit must not confuse the signing key with runtime API-key power."""
+
+    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+    request = SimpleNamespace(state=SimpleNamespace(caller=caller))
+    assert require_sovereign_host_lifecycle(request) is caller
+
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Bootstrap host API credential ")
+    )
+    assert "CallerRole.SOVEREIGN" in row
+    assert "satisfies the current #3149 host-lifecycle gate" in row
+    assert "create or withdraw hosted agents" in row
+    assert "distinct from the constitutional sovereign signing key" in row
 
 
 def test_canonical_host_authentication_routes_are_discovered() -> None:
@@ -1080,12 +1188,31 @@ def _provenance_aliases(
         # boolean wrappers whose result still represents the metadata itself.
         while isinstance(value, (ast.Await, ast.Expr)):
             value = value.value
-        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript, ast.Constant)):
+        if isinstance(
+            value,
+            (
+                ast.Name,
+                ast.Attribute,
+                ast.Subscript,
+                ast.Constant,
+                ast.List,
+                ast.Tuple,
+                ast.Set,
+                ast.Dict,
+            ),
+        ):
             return _has_provenance_token(value, aliases)
         if isinstance(value, ast.Call) and _call_name(value) in {
             "bool",
+            "copy",
+            "deepcopy",
+            "dict",
+            "frozenset",
             "get",
             "getattr",
+            "list",
+            "set",
+            "tuple",
         }:
             return _has_provenance_token(value, aliases)
         # Boolean normalization does not erase the authority input. Common
@@ -1271,6 +1398,18 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
         "    chain = request.causation_chain\n"
         "    return authorize(chain)\n"
     )
+    collection_wrappers = ast.parse(
+        "def authorize_list(request):\n"
+        "    chain = list(request.causation_chain)\n"
+        "    if chain:\n"
+        "        return True\n\n"
+        "def authorize_tuple(request):\n"
+        "    chain = tuple(request.causation_chain)\n"
+        "    return bool(chain)\n\n"
+        "def authorize_copy(request):\n"
+        "    chain = [*request.causation_chain]\n"
+        "    return bool(chain)\n"
+    )
     authority_helper = ast.parse(
         "def scheduler_authority_for(request):\n"
         "    return bool(request.causation_chain)\n"
@@ -1328,6 +1467,7 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(canonical_frame) == {2}
     assert _authority_provenance_lines(compared_alias) == {2, 3}
     assert _authority_provenance_lines(permission_call_alias) == {3}
+    assert _authority_provenance_lines(collection_wrappers) == {3, 8, 12}
     assert _authority_provenance_lines(authority_helper) == {2}
     assert _authority_provenance_lines(access_helper) == {2}
     assert _authority_provenance_lines(require_call) == {3}

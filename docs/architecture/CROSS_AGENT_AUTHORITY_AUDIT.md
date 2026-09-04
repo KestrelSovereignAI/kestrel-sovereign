@@ -63,7 +63,7 @@ narrow, revocable, signed delegation.
 | Operate on routed-agent state | Remaining `/api/agent/*` status, notification, health, heartbeat, privacy, attachment, and channel-link routes, plus their deprecated `/agent/*` spellings | The agent pinned by trusted request routing | Self or host-authenticated external operation | On a multi-agent host every singular route is addressable through `/api/agents/{name}/...`; the trusted routing middleware pins the runtime before the handler runs. The complete canonical and compatibility namespaces are machine-inventoried below so a future cross-agent operation cannot hide behind an innocuous suffix. |
 | General webhook ingress | `POST /webhooks/{webhook_name}` | The request-bound agent when agent-prefixed; otherwise the first enabled receiver matching the name | Outside agent hierarchy; explicitly configured external ingress | Agent-prefixed routing binds the target from trusted request state. The unprefixed multi-agent route aggregates receivers and does not reject duplicate names, so iteration order can choose the target. Defect: [#3216](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3216). The supported `auth_type="none"`, `rate_limit=0` combination accepts every reachable request without throttling; `allow_unauthenticated` acknowledges that choice but adds no gate. A bounded operator policy therefore requires a real auth mode and a positive rate limit. Payload fields create no agent authority. |
 | Rasa webhook ingress | `POST /webhooks/rest/webhook`; synthesized `/api/agents/{name}/webhooks/rest/webhook` alias | The host-default agent, even when the request prefix names a different agent | Outside agent hierarchy; sovereign-configured external ingress | Rasa requires its sovereign-configured shared secret and applies a fixed request rate, but the handler reads `app.state.agent` rather than the request-routed target. The prefixed alias can therefore invoke the wrong agent or fail when no default exists: [#3220](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3220). The payload sender becomes session/provenance data only and creates no agent authority. |
-| Bootstrap host API credential | `GET /api/auth/key` | The host-wide API authentication boundary | Public-localhost provisioning exception | The endpoint is disabled unless bootstrap policy enables it, restricts callers to loopback/Docker gateway/explicit allowed hosts, and is rate-limited. It returns the host API key, which authenticates broad API access but is not the sovereign signing key and cannot satisfy the stronger #3149 lifecycle gate. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
+| Bootstrap host API credential | `GET /api/auth/key` | The host-wide API authentication boundary | Public-localhost provisioning exception that yields runtime sovereign authority | The endpoint is disabled unless bootstrap policy enables it, restricts callers to loopback/Docker gateway/explicit allowed hosts, and is rate-limited. It returns the host API key. Runtime authentication maps that key to `CallerRole.SOVEREIGN`, so it satisfies the current #3149 host-lifecycle gate and can create or withdraw hosted agents. The API key remains distinct from the constitutional sovereign signing key; bootstrap policy is nevertheless a path to host administration. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Authenticate a host user / inspect credentials | `/auth/login`, `/auth/callback`, `/auth/logout`, `/auth/token`, `/auth/me`, `/auth/verify` | The host-wide OAuth session or JWT authentication boundary | Outside agent hierarchy; configured human authentication | Login, callback, logout, and token are self-authenticating entrypoints; token issuance is allowlist/password checked and rate-limited. `me` and `verify` first require central host authentication and apply their endpoint semantics. A synthesized `/api/agents/{name}/auth/*` prefix is host-authenticated by the outer middleware and does not make these host credential handlers target-agent-local or confer relation authority. This classification is reconciled with `docs/audit/AUTH_SURFACE_MATRIX.md`. |
 | Read host UI state / issue browser tokens | `GET /api/host/ui/contributions`; `GET /api/host/csrf`; `POST /api/host/phoenix/session` | Shared host UI manifest, CSRF token, or Phoenix embed session | Host-authenticated external operation | Central API-key/JWT/session middleware protects these app-level routes. The CSRF token is a double-submit value rather than standalone authority; the Phoenix route mints a short-lived path-scoped cookie only after host authentication and backend reachability. |
 | Read host/fleet health or process metrics | `GET /health`; `GET /health/detailed`; `GET /metrics` | Public aggregate readiness, authenticated per-agent fleet diagnostics, or public process-wide Prometheus telemetry | Outside agent hierarchy; deployment/operator observation policy | `/health` intentionally exposes only aggregate readiness and `/metrics` is an explicitly public scraper surface. Global authentication protects `/health/detailed`, whose multi-agent response names agents and their checks. None of these observations creates control authority. |
@@ -97,17 +97,25 @@ machine-checked inventory below before shipping.
 ## Machine-checked tool inventory
 
 The contract test discovers every core feature `@tool`, including tools that
-appear agent-local or external. Cross-agent capability is a property of the
-implementation and deployment, not a public-name convention: exact inventory
-of the complete registered set prevents a shared-host mutation from hiding
-behind an innocuous name. False positives remain explicitly classified. The
-inventory therefore also includes generic `execute_skill`,
-`execute_named_tool`, and `_create_schedule` dispatchers; those meta-tools can
-reach an authority-bearing target even when their own names contain no relation
-or control words.
+appear agent-local or external, plus every core runtime-generated `AgentTool`
+execution boundary and the generic `Feature.to_orchestrator_tool` registration
+boundary. Cross-agent capability is a property of the implementation and
+deployment, not a public-name convention: exact inventory of the complete
+registered set prevents a shared-host mutation from hiding behind an innocuous
+name. False positives remain explicitly classified. The inventory therefore
+also includes generic `execute_skill`, `execute_named_tool`, and
+`_create_schedule` dispatchers; those meta-tools can reach an
+authority-bearing target even when their own names contain no relation or
+control words. Runtime-advertised isolated-feature names cannot be enumerated
+from the core checkout, so their single core forwarding boundary is classified
+here and each out-of-tree feature repository remains responsible for its own
+exact method inventory and target-specific authority.
 
 | Surface ID | Classification |
 |---|---|
+| `kestrel_sovereign/features/base.py::Feature.get_tools.DynamicTool.execute` | Generic runtime wrapper for the separately inventoried core `@tool` methods; it introduces no target authority and the wrapped method retains its target-specific gate. |
+| `kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool` | Generic high-level dispatcher registered once per visible feature, including `deploy_feature` and `restart_coordinator_feature`. PRE_SUBAGENT_CALL/PRE_TOOL_USE are operational consent gates, not relation authority; the selected downstream method retains its target-specific authority requirement and known defects #3223/#3148. |
+| `kestrel_sovereign/features/isolated_runtime.py::IsolatedFeatureTool.execute` | Generic forwarding boundary for runtime-advertised out-of-tree tools. Core preserves ordinary tool governance but cannot infer relation authority from child metadata; the owning feature must inventory and enforce every target-specific authority boundary. |
 | `kestrel_sovereign/features/bootstrap/feature.py::rename_agent` | Self-only display-name mutation; not a peer door. |
 | `kestrel_sovereign/features/bootstrap/feature.py::restart_discovery` | Self-only bootstrap-state retry; not a host restart. |
 | `kestrel_sovereign/features/deploy/feature.py::deploy_agent` | D-3223 — a checked-in multi-agent profile can deploy or teardown the fleet through generic ASK rather than sovereign/delegated authority. |
