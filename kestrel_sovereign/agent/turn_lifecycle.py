@@ -17,6 +17,7 @@ The dispatcher does NOT pre-acquire `CONVERSATION` for COGNITION sources
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 import time
@@ -70,6 +71,26 @@ class _TurnSessionBinding:
 
 _BOUND_TURN_SESSION: contextvars.ContextVar[Optional[_TurnSessionBinding]] = (
     contextvars.ContextVar("kestrel_agent_bound_turn_session", default=None)
+)
+
+
+@dataclass(slots=True)
+class _FeatureTransitionAncestry:
+    """Task-tree capability for one CONVERSATION-owned feature transition."""
+
+    agent: object
+    owner_task: object | None
+    active: bool = True
+
+
+_FEATURE_TRANSITION_ANCESTRY: contextvars.ContextVar[
+    Optional[_FeatureTransitionAncestry]
+] = contextvars.ContextVar("kestrel_feature_transition_ancestry", default=None)
+_COMMITTED_FEATURE_TRANSITION_AGENT: contextvars.ContextVar[object | None] = (
+    contextvars.ContextVar(
+        "kestrel_committed_feature_transition_agent",
+        default=None,
+    )
 )
 
 
@@ -369,6 +390,151 @@ class TurnLifecycleMixin:
         else:
             _CURRENT_CHAIN.set([])
 
+    async def _await_host_context_publication(self) -> None:
+        """Wait until server startup has published host-owned prompt policy.
+
+        A standalone scheduler (and other ready hooks) can wake during
+        ``KestrelAgent.initialize()`` while the host feature lifecycle is still
+        being assembled by the server.  The server installs one shared event
+        before initialization and sets it only after the host context registry
+        has been bound.  Multi-agent initialization can still be absent from
+        the manager's fan-out at that instant, so gate release also reconciles
+        the shared publication generation before cognition may continue.
+        Directly-created/test agents have no shared state and retain their
+        established behavior.
+        """
+
+        gate = getattr(self, "_host_context_publication_gate", None)
+        if gate is not None and not gate.is_set():
+            await gate.wait()
+        self._synchronize_host_context_publication()
+
+    def _synchronize_host_context_publication(self) -> None:
+        """Bind the manager's latest host registry at the cognition barrier.
+
+        An agent is deliberately not routable until ``initialize()`` returns,
+        but its ready hooks can start cognition during initialization.  A
+        manager fan-out therefore cannot be the only publication mechanism:
+        the still-unregistered agent may be waiting on the same event that the
+        host is about to release.  The manager shares a generation box with
+        every constructed agent; this synchronous check makes rebinding atomic
+        with leaving the gate and is also safe when a late cold wake observes
+        an already-set gate.
+        """
+
+        state = getattr(self, "_host_context_publication_state", None)
+        if state is None:
+            return
+        generation = getattr(state, "generation", None)
+        if type(generation) is not int or generation < 0:
+            raise RuntimeError("host context publication state is invalid")
+        if getattr(self, "_host_context_publication_generation", None) == generation:
+            return
+
+        validate_registry = getattr(
+            self, "validate_host_context_clause_registry", None
+        )
+        bind_registry = getattr(self, "bind_host_context_clause_registry", None)
+        if not callable(validate_registry) or not callable(bind_registry):
+            raise RuntimeError("agent cannot synchronize host context publication")
+
+        registry = getattr(state, "registry", None)
+        validate_registry(registry)
+        bind_registry(registry)
+        self._host_context_publication_generation = generation
+
+    @asynccontextmanager
+    async def feature_config_transition(self) -> AsyncIterator[None]:
+        """Serialize one config/context transition with cognition turns.
+
+        Prompts consume an immutable rendered clause snapshot while feature
+        tools consume the feature's live config.  Holding the same
+        ``CONVERSATION`` resource as a turn prevents either half of a turn from
+        observing a different config generation.
+        """
+
+        mgr = self._get_lock_manager()
+        label = f"{getattr(self, 'agent_name', None) or 'agent'} feature-config"
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            ancestry = _FeatureTransitionAncestry(
+                agent=self,
+                owner_task=asyncio.current_task(),
+            )
+            token = _FEATURE_TRANSITION_ANCESTRY.set(ancestry)
+            try:
+                yield
+            finally:
+                # A task created by an uncommitted hook inherits the same object.
+                # Invalidating it before restoring this task's ContextVar stops a
+                # detached descendant from waiting until commit and laundering
+                # its pre-commit authority into a later cognition turn.
+                ancestry.active = False
+                _FEATURE_TRANSITION_ANCESTRY.reset(token)
+
+    @contextmanager
+    def committed_feature_transition_cognition(self) -> Iterator[None]:
+        """Admit same-task cognition after a feature generation commits.
+
+        Feature mutation hooks run while their owner holds ``CONVERSATION``.
+        Re-entering cognition from an arbitrary hook would expose whichever
+        subset of config, clauses, tools, and enablement that hook has already
+        changed.  Only a lifecycle seam that has completed the whole commit may
+        opt in here; currently that is runtime ``on_agent_ready``.
+        """
+
+        token = _COMMITTED_FEATURE_TRANSITION_AGENT.set(self)
+        try:
+            yield
+        finally:
+            _COMMITTED_FEATURE_TRANSITION_AGENT.reset(token)
+
+    def _caller_belongs_to_live_turn(self) -> bool:
+        """Whether this task is executing as part of this agent's live turn.
+
+        The turn owner is authoritative.  A provider callback that runs on a
+        reader-spawned task is also admitted only when it carries the explicit
+        binding captured by :func:`capture_turn_session_binding`; a detached
+        task that merely inherited ``_CURRENT_TURN_ID`` is not allowed to
+        bypass the conversation lock.
+        """
+
+        if asyncio.current_task() is getattr(self, "_live_turn_task", None):
+            return True
+        propagated = _BOUND_TURN_SESSION.get()
+        return bool(
+            propagated is not None
+            and propagated.agent is self
+            and propagated.turn_id
+            and propagated.turn_id == getattr(self, "_live_turn_id", None)
+        )
+
+    @asynccontextmanager
+    async def privacy_transition(self) -> AsyncIterator[None]:
+        """Serialize a privacy transition with complete cognition turns.
+
+        External callers acquire ``CONVERSATION`` before the privacy mutex, so
+        a prompt assembled under the old privacy policy cannot remain in flight
+        after a restrictive transition reports success.  An in-turn command or
+        explicitly-bound provider tool already belongs to the live turn and
+        therefore acquires only the task-reentrant privacy mutex, avoiding a
+        recursive ``CONVERSATION`` deadlock.  The global lock order remains
+        CONVERSATION -> privacy everywhere.
+        """
+
+        transition_lock = self._get_privacy_transition_lock()
+        mgr = self._get_lock_manager()
+        if self._caller_belongs_to_live_turn() or mgr.is_owned_by_current_task(
+            ResourceLock.CONVERSATION
+        ):
+            async with transition_lock:
+                yield
+            return
+
+        label = f"{getattr(self, 'agent_name', None) or 'agent'} privacy-transition"
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            async with transition_lock:
+                yield
+
     @asynccontextmanager
     async def _turn_lifecycle(self) -> AsyncIterator[str]:
         """Enter a turn: acquire CONVERSATION, yield a fresh turn_id,
@@ -387,69 +553,113 @@ class TurnLifecycleMixin:
         production. Two INFO lines per turn is a deliberate trade for a bounded
         region that can otherwise silently hold an agent hostage for minutes.
         """
+        await self._await_host_context_publication()
         turn_id = f"turn_{uuid4().hex[:12]}"
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"
         started = time.monotonic()
-        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
-            logger.info("turn_lifecycle: %s begin", label)
-            token = _CURRENT_TURN_ID.set(turn_id)
-            # Agent-scoped mirror of "which turn is LIVE" — i.e. which one
-            # holds the CONVERSATION lock and therefore owns the value of
-            # `_active_session_id`. Set and cleared inside the lock, so at most
-            # one turn is ever live. `get_turn_bound_session_id` compares it
-            # against the task-local id to tell a caller that owns the turn
-            # from one that merely inherited its ContextVar (#2877).
-            self._live_turn_id = turn_id
-            # A background task created inside an explicitly-bound callback
-            # inherits that binding. If it later enters its own cognition turn
-            # (the signal-dispatch wake path), turn entry is the unambiguous
-            # ownership boundary: the new turn's lifecycle/session authority
-            # supersedes the callback binding it inherited. Passive callbacks
-            # never enter this boundary, so their explicit stale/unbound veto
-            # remains intact (#2928 review P1).
-            bound_token = _BOUND_TURN_SESSION.set(None)
-            request_id = current_invocation_id()
-            request_generation = None
-            request_binding_registered = False
-            try:
-                if request_id is not None:
-                    generation_accessor = getattr(
-                        self,
-                        "_request_generation_for_current_task",
-                        None,
+        holder = mgr.holder(ResourceLock.CONVERSATION)
+        current_task = asyncio.current_task()
+        transition_ancestry = _FEATURE_TRANSITION_ANCESTRY.get()
+        if (
+            transition_ancestry is not None
+            and transition_ancestry.agent is self
+        ):
+            if not transition_ancestry.active:
+                raise RuntimeError(
+                    "cognition cannot start from an expired feature transition"
+                )
+            if transition_ancestry.owner_task is not current_task:
+                if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is self:
+                    raise RuntimeError(
+                        "committed feature-transition cognition cannot cross "
+                        "a task boundary"
                     )
-                    if callable(generation_accessor):
-                        request_generation = generation_accessor(request_id)
-                    self._register_turn_request_id(
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
+            if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
+        if (
+            holder is not None
+            and holder.owner_task is current_task
+            and current_task is not getattr(self, "_live_turn_task", None)
+        ):
+            if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
+                raise RuntimeError(
+                    "cognition cannot start before the feature transition "
+                    "generation is fully committed"
+                )
+            # The committed ready phase still owns CONVERSATION in this task.
+            # Reuse that exact boundary; an arbitrary mid-transition hook is
+            # rejected above, and a genuine live turn is excluded so recursive
+            # process_input cannot replace the outer turn's authority.
+            async with self._active_turn_scope(turn_id, label, started):
+                yield turn_id
+            return
+
+        async with mgr.acquire({ResourceLock.CONVERSATION}, label=label):
+            async with self._active_turn_scope(turn_id, label, started):
+                yield turn_id
+
+    @asynccontextmanager
+    async def _active_turn_scope(
+        self,
+        turn_id: str,
+        label: str,
+        started: float,
+    ) -> AsyncIterator[None]:
+        """Publish one live turn inside an already-owned conversation bound."""
+
+        logger.info("turn_lifecycle: %s begin", label)
+        token = _CURRENT_TURN_ID.set(turn_id)
+        # Agent-scoped mirror of "which turn is LIVE" — i.e. which one holds
+        # the CONVERSATION lock and therefore owns `_active_session_id`.
+        self._live_turn_id = turn_id
+        self._live_turn_task = asyncio.current_task()
+        # A background task created inside an explicitly-bound callback inherits
+        # that binding. New turn entry supersedes it with turn-owned authority.
+        bound_token = _BOUND_TURN_SESSION.set(None)
+        request_id = current_invocation_id()
+        request_generation = None
+        request_binding_registered = False
+        try:
+            if request_id is not None:
+                generation_accessor = getattr(
+                    self,
+                    "_request_generation_for_current_task",
+                    None,
+                )
+                if callable(generation_accessor):
+                    request_generation = generation_accessor(request_id)
+                self._register_turn_request_id(
+                    turn_id,
+                    request_id,
+                    request_generation,
+                )
+                request_binding_registered = True
+            yield
+        finally:
+            try:
+                if request_binding_registered:
+                    self._unregister_turn_request_id(
                         turn_id,
                         request_id,
                         request_generation,
                     )
-                    request_binding_registered = True
-                yield turn_id
             finally:
-                try:
-                    if request_binding_registered:
-                        self._unregister_turn_request_id(
-                            turn_id,
-                            request_id,
-                            request_generation,
-                        )
-                finally:
-                    _BOUND_TURN_SESSION.reset(bound_token)
-                    _CURRENT_TURN_ID.reset(token)
-                    self._live_turn_id = None
-                    # Clear the per-turn active session on exit so an out-of-turn
-                    # caller (e.g. a CLI/system-filed request_restart after a chat
-                    # turn) cannot read a stale session and misroute its wake into
-                    # an old chat window (#1809). Set inside the turn body by
-                    # process_input / the streaming turn; both run under this lock.
-                    self._active_session_id = None
-                    # Duration on the exit line so a slow turn is measurable from
-                    # the log alone, without correlating two timestamps by hand.
-                    logger.info(
-                        "turn_lifecycle: %s end after %.1fs",
-                        label,
-                        time.monotonic() - started,
-                    )
+                _BOUND_TURN_SESSION.reset(bound_token)
+                _CURRENT_TURN_ID.reset(token)
+                self._live_turn_id = None
+                self._live_turn_task = None
+                # An out-of-turn caller must never reuse a stale chat session.
+                self._active_session_id = None
+                logger.info(
+                    "turn_lifecycle: %s end after %.1fs",
+                    label,
+                    time.monotonic() - started,
+                )

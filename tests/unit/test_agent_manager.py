@@ -15,6 +15,7 @@ import pytest
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.isolated_runtime import (
     IsolatedRuntimeNamespaceError,
@@ -43,6 +44,7 @@ from kestrel_sovereign.multi_agent.agent_manager import (
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
+from kestrel_sovereign.signals import OrderedLockManager
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
@@ -262,6 +264,62 @@ class TestAgentManagerBasics:
         assert len(result) == 2
         assert result["Alpha"] is agent1
         assert result["Beta"] is agent2
+
+    def test_host_context_registry_binds_existing_agents_and_is_retained(self):
+        manager = AgentManager()
+        agent1 = _make_mock_agent("did:1")
+        agent2 = _make_mock_agent("did:2")
+        manager._agents.update({"Alpha": agent1, "Beta": agent2})
+        registry = object()
+
+        manager.bind_host_context_clause_registry(registry)
+
+        for agent in (agent1, agent2):
+            agent.validate_host_context_clause_registry.assert_called_once_with(
+                registry
+            )
+            agent.bind_host_context_clause_registry.assert_called_once_with(
+                registry
+            )
+            assert (
+                agent._host_context_publication_state
+                is manager._host_context_publication_state
+            )
+            assert agent._host_context_publication_generation == 1
+        assert manager._host_context_clause_registry is registry
+        assert manager._host_context_publication_state.registry is registry
+        assert manager._host_context_publication_state.generation == 1
+
+    def test_registration_rebinds_host_context_published_during_initialization(self):
+        """A cold agent cannot retain the registry snapshot from construction."""
+
+        manager = AgentManager()
+        current_registry = object()
+        publication_gate = asyncio.Event()
+        # Model the window after construction but before registration: neither
+        # fan-out can see the still-unpublished agent.
+        manager.bind_host_context_clause_registry(current_registry)
+        manager.set_host_context_publication_gate(publication_gate)
+        agent = _make_mock_agent("did:cold")
+
+        manager._register_agent("Cold", agent)
+
+        agent.validate_host_context_clause_registry.assert_called_once_with(
+            current_registry
+        )
+        agent.bind_host_context_clause_registry.assert_called_once_with(
+            current_registry
+        )
+        assert agent._host_context_publication_gate is publication_gate
+        assert (
+            agent._host_context_publication_state
+            is manager._host_context_publication_state
+        )
+        assert (
+            agent._host_context_publication_generation
+            == manager._host_context_publication_state.generation
+        )
+        assert manager.get_agent("Cold") is agent
 
     def test_get_agent_name(self):
         manager = AgentManager()
@@ -4155,6 +4213,447 @@ class TestAgentManagerBasics:
 
 class TestLoadFromConfig:
     """Test loading agents from MultiAgentConfig."""
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_future_agent_receives_bound_host_context_registry(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        mock_get_did.return_value = "did:future"
+        future_agent = _make_mock_agent("did:future")
+        mock_agent_cls.return_value = future_agent
+        manager = AgentManager(base_data_dir=tmp_path)
+        registry = object()
+        publication_gate = asyncio.Event()
+        manager.bind_host_context_clause_registry(registry)
+        manager.set_host_context_publication_gate(publication_gate)
+
+        async def initialize_with_gate_bound():
+            assert future_agent._host_context_publication_gate is publication_gate
+            assert (
+                future_agent._host_context_publication_state
+                is manager._host_context_publication_state
+            )
+            assert future_agent._host_context_publication_generation is None
+            assert not publication_gate.is_set()
+
+        future_agent.initialize.side_effect = initialize_with_gate_bound
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            await manager._initialize_agent(
+                "future",
+                LocalAgentConfig(data_dir=Path("future"), port=8801),
+            )
+
+        assert (
+            mock_agent_cls.call_args.kwargs["host_context_clause_registry"]
+            is registry
+        )
+        assert future_agent._host_context_publication_gate is publication_gate
+        future_agent.defer_agent_readiness_to_host.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new_callable=AsyncMock,
+    )
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_initializing_turn_rebinds_registry_before_gate_release(
+        self,
+        mock_llm_cls,
+        mock_agent_cls,
+        mock_get_did,
+        tmp_path,
+    ):
+        """An unregistered ready-hook turn observes the published host policy."""
+
+        old_registry = object()
+        current_registry = object()
+        publication_gate = asyncio.Event()
+        initialize_started = asyncio.Event()
+
+        class InitializingTurnAgent(TurnLifecycleMixin):
+            def __init__(self):
+                self.did = "did:initializing"
+                self.agent_id = self.did
+                self._lock_manager = OrderedLockManager()
+                self._host_context_clause_registry = old_registry
+                self.observed_registry = None
+
+            def validate_host_context_clause_registry(self, registry):
+                return None
+
+            def bind_host_context_clause_registry(self, registry):
+                self._host_context_clause_registry = registry
+
+            def defer_agent_readiness_to_host(self):
+                self.readiness_owned_by_host = True
+
+            async def initialize(self):
+                initialize_started.set()
+                async with self._turn_lifecycle():
+                    self.observed_registry = self._host_context_clause_registry
+
+            async def shutdown(self):
+                return None
+
+        agent = InitializingTurnAgent()
+        mock_agent_cls.return_value = agent
+        mock_get_did.return_value = agent.did
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager.bind_host_context_clause_registry(old_registry)
+        manager.set_host_context_publication_gate(publication_gate)
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            initialize_task = asyncio.create_task(
+                manager._initialize_agent(
+                    "initializing",
+                    LocalAgentConfig(data_dir=Path("initializing"), port=8801),
+                )
+            )
+            await asyncio.wait_for(initialize_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert manager.list_agents() == {}
+
+            # Host publication misses ``_agents`` but advances the shared state
+            # before releasing every ready-hook turn waiting on the same gate.
+            manager.bind_host_context_clause_registry(current_registry)
+            publication_gate.set()
+            initialized = await asyncio.wait_for(initialize_task, timeout=1)
+
+        assert initialized is agent
+        assert agent.observed_registry is current_registry
+        assert agent._host_context_publication_generation == 2
+        assert manager.list_agents() == {}
+
+    @pytest.mark.asyncio
+    async def test_open_gate_cold_agent_readiness_waits_for_onboarding(
+        self,
+        tmp_path,
+    ):
+        """A real cold-agent ready pass cannot outrun dynamic registration."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()  # Startup publication/sweep already completed.
+        onboarding_done = False
+        observations: list[tuple[bool, bool]] = []
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = KestrelAgent(
+            "did:open-gate-cold",
+            storage_path=str(tmp_path / "cold.db"),
+            llm_service=MagicMock(),
+        )
+
+        async def ready_hook(_agent):
+            async with manager.a2a_execution_lease():
+                observations.append(
+                    (
+                        manager.get_agent("open-gate-cold") is agent,
+                        onboarding_done,
+                    )
+                )
+
+        agent.features["readiness-probe"] = SimpleNamespace(
+            name="readiness-probe",
+            on_agent_ready=ready_hook,
+        )
+
+        async def initialize_through_real_readiness_path():
+            await agent._run_or_defer_agent_ready_hooks()
+
+        agent.initialize = initialize_through_real_readiness_path
+        agent.shutdown = AsyncMock()
+
+        with (
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+                new=AsyncMock(return_value=agent.did),
+            ),
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+                return_value=agent,
+            ),
+            patch("kestrel_sovereign.multi_agent.agent_manager.LLMService"),
+            patch.object(LocalAgentConfig, "validate_runtime", return_value=[]),
+        ):
+            loaded = await asyncio.wait_for(
+                manager.load_agent(
+                    "open-gate-cold",
+                    LocalAgentConfig(
+                        data_dir=Path("open-gate-cold"),
+                        port=8801,
+                    ),
+                ),
+                timeout=1,
+            )
+
+        assert loaded is agent
+        assert observations == [(True, True)]
+        assert agent._agent_ready_hooks_completed is True
+        assert agent._agent_readiness_host_owned is False
+        assert agent._agent_ready_hooks_deferred is False
+
+    @pytest.mark.asyncio
+    async def test_late_registration_consumes_deferred_readiness_after_snapshot(self):
+        """A cold agent cannot miss the server's one-time readiness sweep."""
+
+        manager = AgentManager()
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()  # The server snapshot has already completed.
+
+        agent = _make_mock_agent("did:late-ready")
+        agent.complete_deferred_agent_readiness = AsyncMock()
+        manager._register_agent("late-ready", agent)
+
+        await manager._on_agent_registered("late-ready", agent)
+        await manager._complete_registered_agent_readiness(agent)
+
+        assert manager.get_agent("late-ready") is agent
+        agent.complete_deferred_agent_readiness.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_readiness_snapshot_waits_for_registration_onboarding(self):
+        """The startup sweep cannot observe a half-onboarded publication."""
+
+        manager = AgentManager()
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        onboarding_started = asyncio.Event()
+        release_onboarding = asyncio.Event()
+        onboarding_done = False
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_started.set()
+            await release_onboarding.wait()
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = _make_mock_agent("did:registering")
+
+        async def complete_readiness():
+            assert onboarding_done is True
+            # A feature-ready cognition may execute an A2A tool. The manager
+            # must release its publication writer before invoking the hook.
+            async with manager.a2a_execution_lease():
+                pass
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+
+        async def publish_and_onboard():
+            async with manager.a2a_lifecycle_lease():
+                manager._register_agent("registering", agent)
+                await manager._on_agent_registered("registering", agent)
+            await manager._complete_registered_agent_readiness(agent)
+
+        registration = asyncio.create_task(publish_and_onboard())
+        await asyncio.wait_for(onboarding_started.wait(), timeout=1)
+
+        startup_sweep = asyncio.create_task(
+            manager.complete_deferred_agent_readiness()
+        )
+        await asyncio.sleep(0)
+        agent.complete_deferred_agent_readiness.assert_not_awaited()
+
+        release_onboarding.set()
+        await asyncio.wait_for(
+            asyncio.gather(registration, startup_sweep),
+            timeout=1,
+        )
+
+        # Registration consumes the deferred hook after onboarding; the
+        # serialized startup sweep then observes the same exact-once agent
+        # contract and becomes a no-op in production.
+        assert agent.complete_deferred_agent_readiness.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_dynamic_registration_releases_writer_before_ready_cognition(
+        self,
+        tmp_path,
+    ):
+        """The real load path lets a ready-hook turn acquire an A2A reader."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        onboarding_done = False
+
+        async def onboard(_name, _agent):
+            nonlocal onboarding_done
+            onboarding_done = True
+
+        manager.set_agent_registration_hook(onboard)
+        agent = _make_mock_agent("did:dynamic-ready")
+
+        async def complete_readiness():
+            assert onboarding_done is True
+            async with manager.a2a_execution_lease():
+                pass
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._initialize_agent = AsyncMock(return_value=agent)
+
+        loaded = await asyncio.wait_for(
+            manager.load_agent(
+                "dynamic-ready",
+                LocalAgentConfig(data_dir=Path("dynamic-ready"), port=8801),
+            ),
+            timeout=1,
+        )
+
+        assert loaded is agent
+        assert manager.get_agent("dynamic-ready") is agent
+        agent.complete_deferred_agent_readiness.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_dynamic_registration_cancellation_settles_ready_hook(
+        self,
+        tmp_path,
+    ):
+        """Caller cancellation cannot strand a published deferred-ready agent."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-cancel")
+        readiness_started = asyncio.Event()
+        release_readiness = asyncio.Event()
+        readiness_done = False
+
+        async def complete_readiness():
+            nonlocal readiness_done
+            readiness_started.set()
+            await release_readiness.wait()
+            readiness_done = True
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._initialize_agent = AsyncMock(return_value=agent)
+
+        load = asyncio.create_task(
+            manager.load_agent(
+                "dynamic-cancel",
+                LocalAgentConfig(data_dir=Path("dynamic-cancel"), port=8801),
+            )
+        )
+        await asyncio.wait_for(readiness_started.wait(), timeout=1)
+        load.cancel()
+        await asyncio.sleep(0)
+        assert load.done() is False
+
+        release_readiness.set()
+        assert await asyncio.wait_for(load, timeout=1) is agent
+
+        assert readiness_done is True
+        assert manager.get_agent("dynamic-cancel") is agent
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_create_preserves_config_when_ready_hook_cancels(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A best-effort hook cancellation cannot skip the create handoff."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-ready-child-cancel")
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=asyncio.CancelledError("ready child cancelled")
+        )
+        manager._data_key_custody_conflict = lambda: None
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            AsyncMock(),
+        )
+
+        loaded = await manager.create_agent("DynamicReadyChildCancel")
+
+        assert loaded is agent
+        assert manager.get_agent("DynamicReadyChildCancel") is agent
+        assert manager._created_configs["DynamicReadyChildCancel"] == LocalAgentConfig(
+            data_dir=Path("agent_data") / "DynamicReadyChildCancel",
+            port=8801,
+            autostart=True,
+        )
+        agent.shutdown.assert_not_awaited()
+        assert manager._agent_operations == {}
+
+    @pytest.mark.asyncio
+    async def test_create_cancellation_during_readiness_preserves_config_handoff(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A published create remains persistable after caller cancellation."""
+
+        manager = AgentManager(base_data_dir=tmp_path)
+        publication_gate = asyncio.Event()
+        manager.set_host_context_publication_gate(publication_gate)
+        publication_gate.set()
+        agent = _make_mock_agent("did:dynamic-create-cancel")
+        readiness_started = asyncio.Event()
+        release_readiness = asyncio.Event()
+
+        async def complete_readiness():
+            readiness_started.set()
+            await release_readiness.wait()
+
+        agent.complete_deferred_agent_readiness = AsyncMock(
+            side_effect=complete_readiness
+        )
+        manager._data_key_custody_conflict = lambda: None
+        manager._initialize_agent = AsyncMock(return_value=agent)
+        monkeypatch.setattr(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            AsyncMock(),
+        )
+
+        create = asyncio.create_task(manager.create_agent("DynamicCreate"))
+        await asyncio.wait_for(readiness_started.wait(), timeout=1)
+        create.cancel()
+        await asyncio.sleep(0)
+        assert create.done() is False
+
+        release_readiness.set()
+        assert await asyncio.wait_for(create, timeout=1) is agent
+        assert manager.get_agent("DynamicCreate") is agent
+        assert manager._created_configs["DynamicCreate"] == LocalAgentConfig(
+            data_dir=Path("agent_data") / "DynamicCreate",
+            port=8801,
+            autostart=True,
+        )
+        assert manager._agent_operations == {}
 
     @pytest.mark.asyncio
     async def test_load_from_config_initializes_concurrently_and_registers_in_order(self):

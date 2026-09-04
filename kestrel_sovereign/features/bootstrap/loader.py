@@ -17,7 +17,7 @@ Features:
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,8 @@ class BootstrapLoader:
         db: Optional async database handle.  If provided, the loader
             will read/write the ``bootstrap_config`` table.
         agent_id: Agent DID, required when *db* is provided.
+        audit_name_validator: Optional pre-mutation validator for the complete
+            prospective file-name order.
     """
 
     def __init__(
@@ -105,6 +107,7 @@ class BootstrapLoader:
         file_order: Optional[List[str]] = None,
         db=None,
         agent_id: Optional[str] = None,
+        audit_name_validator: Optional[Callable[[Iterable[str]], object]] = None,
     ):
         self._agent_data_path = Path(agent_data_path) if agent_data_path else None
         self._extra_paths: List[Path] = [
@@ -115,6 +118,7 @@ class BootstrapLoader:
         self._file_order: List[str] = list(file_order or DEFAULT_BOOTSTRAP_FILES)
         self._db = db
         self._agent_id = agent_id
+        self._audit_name_validator = audit_name_validator
 
         # Cached content: filename -> content (ordered)
         self._cache: OrderedDict[str, str] = OrderedDict()
@@ -220,6 +224,8 @@ class BootstrapLoader:
         """
         if filename in self._file_order:
             return False
+        if self._audit_name_validator is not None:
+            self._audit_name_validator((*self._file_order, filename))
         self._file_order.append(filename)
         # Force reload to pick up the new file
         self._loaded = False

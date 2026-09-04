@@ -266,6 +266,37 @@ class TestEffectiveBudget:
         assert elastic.effective_budget("not-a-section") == 0
 
 
+class TestExternalReservation:
+    def test_repeated_reservations_reduce_allocation_for_the_cumulative_total(self):
+        elastic = ElasticTokenBudget("gpt-4")
+
+        elastic.reserve_external(100)
+        elastic.reserve_external(50)
+
+        allocated = sum(item.budget for item in elastic.allocations.values())
+        assert elastic.get_summary()["external_reserved_tokens"] == 150
+        assert allocated + 150 <= elastic.total_budget
+
+    def test_repeated_reservations_protect_the_mandatory_floor_cumulatively(self):
+        total_budget = ElasticTokenBudget("gpt-4").total_budget
+        elastic = ElasticTokenBudget(
+            "gpt-4",
+            mandatory_system_tokens=total_budget - 125,
+        )
+
+        elastic.reserve_external(100)
+        allocations_before_failure = {
+            name: item.budget for name, item in elastic.allocations.items()
+        }
+        with pytest.raises(DegradedModeError, match="150 tokens"):
+            elastic.reserve_external(50)
+
+        assert elastic.get_summary()["external_reserved_tokens"] == 100
+        assert {
+            name: item.budget for name, item in elastic.allocations.items()
+        } == allocations_before_failure
+
+
 class TestNegativeInputRejection:
     """Negative tokens/items are a caller bug — reject loudly and leave
     accounting (used, items, elastic pool) untouched. Zero is a valid

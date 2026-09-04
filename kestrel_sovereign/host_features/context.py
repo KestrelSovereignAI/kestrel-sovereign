@@ -433,10 +433,17 @@ async def build_host_context(
     )
 
 
+async def close_host_context(ctx: Any) -> None:
+    """Compatibility name for cancellation-safe host resource cleanup."""
+
+    await close_host_context_resources(ctx)
+
+
 __all__ = [
     "FLEET_TENANT_ID",
     "FleetSessionFactory",
     "SovereignHostContext",
     "build_host_context",
     "close_host_context_resources",
+    "close_host_context",
 ]

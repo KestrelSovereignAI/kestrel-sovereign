@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import traceback
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from kestrel_sdk.features import ContributionContractError
+from kestrel_sdk.features import (
+    ContextClauseRegistration,
+    ContributionContractError,
+)
 from kestrel_sdk.operator import ExecutionTargetDescriptor
 
 from kestrel_sovereign import server
+from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionCollectionError,
@@ -21,6 +28,7 @@ from kestrel_sovereign.operator import (
     OperatorRegistrationIdentityError,
     OperatorRuntimeRegistry,
 )
+from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 from kestrel_sovereign.ui_contributions import compute_ui_manifest
@@ -81,18 +89,348 @@ async def test_agent_lifecycle_registers_exact_sdk_contributions_once(tmp_path):
         "workflows": 1,
         "permissions": 1,
         "setup": 1,
+        "context": 1,
     }
+    assert feature.context_renderer_calls == 1
+    clauses = agent.feature_contribution_runtime.active_context_clauses()
+    assert [clause.body for clause in clauses] == [
+        "stable context from agent-fixture"
+    ]
     _assert_live(agent, feature, True)
 
+    builder = ContextBuilder(
+        agent.storage,
+        context_clause_registry=(
+            agent.feature_contribution_runtime.context_clause_registry
+        ),
+    )
+    first_prompt = builder.build_system_prompt("C", include_briefing=False)
+    second_prompt = builder.build_system_prompt("C", include_briefing=False)
+    assert first_prompt.encode() == second_prompt.encode()
+    assert feature.context_renderer_calls == 1
+
     await agent._unregister_feature_runtime(feature, unload=False)
+    assert agent.feature_contribution_runtime.active_context_clauses() == ()
     _assert_live(agent, feature, False)
 
     await agent._activate_feature_runtime(feature)
     assert set(feature.contribution_calls.values()) == {2}
+    assert feature.context_renderer_calls == 2
     _assert_live(agent, feature, True)
 
     await agent._unregister_feature_runtime(feature, unload=True)
     _assert_live(agent, feature, False)
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_config_refresh_rerenders_without_recollecting(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+
+    feature.context_text = "updated persisted configuration"
+    runtime = agent.feature_contribution_runtime
+    assert runtime.active_context_clauses()[0].body == (
+        "stable context from agent-fixture"
+    )
+
+    refreshed = agent.refresh_feature_context_clauses(feature)
+
+    assert refreshed[0].body == "updated persisted configuration"
+    assert feature.contribution_calls["context"] == 1
+    assert feature.context_renderer_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_privacy_transition_republishes_all_active_context_clauses(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+
+    feature.context_text = "privacy-safe replacement"
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    await agent._apply_privacy_mode_locked(PrivacyMode.NORMAL)
+
+    assert runtime.active_context_clauses()[0].body == "privacy-safe replacement"
+    assert feature.context_renderer_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_privacy_suppression_failure_latches_safe_mode(tmp_path):
+    """A privacy transition never resumes cognition over untrusted context."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    await agent._register_feature(feature)
+    runtime = agent.feature_contribution_runtime
+    original = runtime.active_context_clauses()[0]
+    foreign = replace(original, body="foreign privacy replacement")
+    runtime.context_clause_registry._clauses[original.identity] = foreign
+    agent.storage = SimpleNamespace(set_privacy_mode=lambda _mode: None)
+    agent.privacy_agent = SimpleNamespace(
+        set_mode=lambda _mode: "Privacy mode changed.",
+        privacy_config=None,
+    )
+    agent._privacy_mode = PrivacyMode.NORMAL
+    agent.features = {}
+    agent.llm_service = None
+
+    with pytest.raises(
+        RuntimeError,
+        match="feature context could not be suppressed during privacy transition",
+    ) as error:
+        await agent._apply_privacy_mode_locked(PrivacyMode.ISOLATED)
+
+    assert error.value.__cause__ is None
+    assert agent._safe_mode is True
+    assert "privacy transition" in agent._safe_mode_reason.lower()
+    assert agent._safe_mode_cause == "feature_lifecycle_uncertain"
+    assert agent._feature_lifecycle_integrity_uncertain is True
+    assert agent._privacy_mode is PrivacyMode.ISOLATED
+    assert runtime.is_active(feature)
+    assert runtime.active_context_clauses() == (foreign,)
+
+
+def test_lifecycle_integrity_validation_rejects_foreign_context_generation(
+    tmp_path,
+):
+    """Restart repair proof validates the exact live contribution generation."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    runtime.validate_active_integrity()
+
+    original = runtime.active_context_clauses()[0]
+    runtime.context_clause_registry._clauses[original.identity] = replace(
+        original,
+        body="foreign lifecycle generation",
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="active feature contribution integrity does not match",
+    ):
+        runtime.validate_active_integrity()
+
+
+def test_agent_accepts_only_ready_clean_lifecycle_generation(tmp_path):
+    """A clean restart must be READY and exact before Safe Mode can exit."""
+
+    from kestrel_sovereign.agent.boot import BootPhaseState
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    assert agent.verify_feature_lifecycle_integrity() is False
+    agent._boot_state = BootPhaseState.READY
+    assert agent.verify_feature_lifecycle_integrity() is True
+
+    agent._feature_lifecycle_integrity_uncertain = True
+    assert agent.verify_feature_lifecycle_integrity() is False
+
+
+def test_host_refresh_failure_suppresses_stale_context_without_rerendering(
+    tmp_path, caplog
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    def fail_renderer():
+        raise RuntimeError("PRIVATE-RENDERER-FAILURE-DETAIL")
+
+    object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+
+    refreshed = agent.refresh_all_feature_context_clauses(fail_closed=True)
+
+    assert refreshed[0].body == ""
+    assert runtime.active_context_clauses()[0].body == ""
+    assert "PRIVATE-RENDERER-FAILURE-DETAIL" not in caplog.text
+
+
+def test_context_getter_absent_on_older_sdk_feature_is_skipped(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    feature.get_context_clause_registrations = None
+
+    prepared = agent._prepare_feature_contribution_transition((feature,)).only()
+
+    assert prepared.contributions.context_clauses == ()
+
+
+def test_context_renderer_failure_precedes_registry_mutation(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+
+    def fail_renderer():
+        raise RuntimeError("renderer secret must stay behind typed boundary")
+
+    object.__setattr__(feature.context_registration, "renderer", fail_renderer)
+    runtime = agent._ensure_feature_contribution_runtime()
+    prepared = runtime.prepare_transition((feature,)).only()
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.activate(prepared)
+
+    assert exc_info.value.getter == "render_context_clauses"
+    assert runtime.active_owners() == ()
+    assert runtime.active_context_clauses() == ()
+    assert len(agent.wait_registry.kinds()) == 0
+    assert len(agent.signal_registry) == 0
+
+
+def test_duplicate_context_names_fail_complete_transition_preflight(tmp_path):
+    agent = _agent(tmp_path)
+
+    class FirstFixture(SDKFixtureFeature):
+        contribution_prefix = "first-context"
+
+    class SecondFixture(SDKFixtureFeature):
+        contribution_prefix = "second-context"
+
+    first = FirstFixture(agent)
+    second = SecondFixture(agent)
+    second.context_registration = ContextClauseRegistration(
+        owner=second.contribution_owner,
+        name=first.context_registration.name,
+        priority=30,
+        renderer=second._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="duplicate context-clause name in contribution transition",
+    ):
+        runtime.prepare_transition((first, second))
+
+    assert first.context_renderer_calls == 0
+    assert second.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
+def test_active_context_name_conflict_is_rejected_before_rendering(tmp_path):
+    agent = _agent(tmp_path)
+
+    class FirstFixture(SDKFixtureFeature):
+        contribution_prefix = "first-active-context"
+
+    class SecondFixture(SDKFixtureFeature):
+        contribution_prefix = "second-active-context"
+
+    first = FirstFixture(agent)
+    second = SecondFixture(agent)
+    second.context_registration = ContextClauseRegistration(
+        owner=second.contribution_owner,
+        name=first.context_registration.name,
+        priority=30,
+        renderer=second._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((first,)).only())
+
+    transition = runtime.prepare_transition((second,))
+
+    assert transition.accepted == ()
+    assert len(transition.rejected) == 1
+    assert transition.rejected[0].feature is second
+    assert "context clause already registered" in transition.rejected[0].reason
+    assert first.context_renderer_calls == 1
+    assert second.context_renderer_calls == 0
+    assert runtime.active_owners() == (first.contribution_owner,)
+
+
+def test_bootstrap_yaml_name_is_rejected_before_rendering(tmp_path):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    feature.context_registration = ContextClauseRegistration(
+        owner=feature.contribution_owner,
+        name="STRATEGY.yaml",
+        priority=30,
+        renderer=feature._render_context_clause,
+    )
+    runtime = agent._ensure_feature_contribution_runtime()
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        runtime.prepare_transition((feature,))
+
+    assert feature.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
+def test_runtime_bootstrap_name_is_rejected_before_feature_rendering(tmp_path):
+    """The live bootstrap namespace, not only defaults, reserves audit names."""
+
+    agent = _agent(tmp_path)
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.context_builder = ContextBuilder(
+        agent.storage,
+        agent_data_path=str(tmp_path),
+        context_clause_registry=runtime.context_clause_registry,
+    )
+    assert agent.context_builder._bootstrap_loader.add_file("POLICY.yaml")
+    feature = SDKFixtureFeature(agent)
+    feature.context_registration = ContextClauseRegistration(
+        owner=feature.contribution_owner,
+        name="POLICY.yaml",
+        priority=30,
+        renderer=feature._render_context_clause,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        runtime.prepare_transition((feature,))
+
+    assert feature.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
+
+
+def test_runtime_bootstrap_legacy_audit_alias_is_reserved(tmp_path):
+    """A live bootstrap file also owns its legacy ``bootstrap_*`` row name."""
+
+    agent = _agent(tmp_path)
+    runtime = agent._ensure_feature_contribution_runtime()
+    agent.context_builder = ContextBuilder(
+        agent.storage,
+        agent_data_path=str(tmp_path),
+        context_clause_registry=runtime.context_clause_registry,
+    )
+    assert agent.context_builder._bootstrap_loader.add_file("POLICY.yaml")
+    feature = SDKFixtureFeature(agent)
+    feature.context_registration = ContextClauseRegistration(
+        owner=feature.contribution_owner,
+        name="bootstrap_policy.yaml",
+        priority=30,
+        renderer=feature._render_context_clause,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="reserved host audit name",
+    ):
+        runtime.prepare_transition((feature,))
+
+    assert feature.context_renderer_calls == 0
+    assert runtime.active_owners() == ()
 
 
 @pytest.mark.asyncio
@@ -349,6 +687,70 @@ def test_every_contribution_getter_uses_one_sanitized_typed_boundary(
     assert error.stage == expected_stage
     assert f"credential-from-{getter}" not in str(error)
     assert error.__cause__ is original
+    assert runtime.active_owners() == ()
+
+
+def test_context_clause_getter_failure_discards_secret_exception_chain(
+    tmp_path, monkeypatch
+):
+    """User-authored context collection errors never reach traceback logging."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    secret = "api-key=context-getter-must-stay-private"
+
+    def fail_collection():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        feature,
+        "get_context_clause_registrations",
+        fail_collection,
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.feature is feature
+    assert error.getter == "get_context_clause_registrations"
+    assert error.stage == "context-clause collection"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert runtime.active_owners() == ()
+
+
+def test_context_clause_getter_cannot_forge_cancellation_with_secret_text(
+    tmp_path, monkeypatch
+):
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    secret = "token=context-getter-cancel-must-stay-private"
+
+    def cancel_collection():
+        raise asyncio.CancelledError(secret)
+
+    monkeypatch.setattr(
+        feature,
+        "get_context_clause_registrations",
+        cancel_collection,
+    )
+
+    with pytest.raises(FeatureContributionCollectionError) as exc_info:
+        runtime.prepare_transition((feature,))
+
+    error = exc_info.value
+    assert error.getter == "get_context_clause_registrations"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
     assert runtime.active_owners() == ()
 
 
@@ -979,3 +1381,231 @@ def test_a_failed_declarative_teardown_keeps_its_source(tmp_path):
     # The contribution is still active, so its source is still there.
     assert runtime.is_active(feature)
     assert runtime.source_registry.get(name) is feature.source
+
+
+def test_quarantine_withdraws_exact_survivors_after_teardown_drift(tmp_path):
+    """Emergency cleanup tolerates an already-absent exact contribution."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+
+    runtime.wait_registry.unregister(feature.wait_provider.kind)
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.active_context_clauses() == ()
+    _assert_live(agent, feature, False)
+
+
+def test_quarantine_refuses_foreign_context_before_any_mutation(tmp_path):
+    """A replacement at the same identity belongs to another generation."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    original = runtime.active_context_clauses()[0]
+    replacement = replace(original, body="foreign replacement")
+    runtime.context_clause_registry._clauses[original.identity] = replacement
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="context clauses could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert runtime.is_active(feature)
+    assert runtime.context_clause_registry._clauses[original.identity] is replacement
+    _assert_live(agent, feature, True)
+
+
+def test_quarantine_preserves_a_foreign_signal_source_replacement(tmp_path):
+    """Releasing the stale claim must not delete another generation's source."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    replacement = _rival_source(feature.source)
+    runtime.source_registry._sources[feature.source.name] = replacement
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.source_registry.get(feature.source.name) is replacement
+    assert runtime.source_registry.owners_of(feature.source.name) == ()
+
+
+def test_quarantine_removes_operator_survivors_after_partial_drift(tmp_path):
+    """One absent service cannot leave the exact workflow callable."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    del runtime.operator_registry._services[feature.service_registration.reference]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None
+
+
+def test_quarantine_removes_operator_survivors_without_set_ledger(tmp_path):
+    """The retained exact objects remain cleanup authority after ledger drift."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    active = runtime._active[id(feature)].operator_registrations
+    del runtime.operator_registry._active_sets[id(active)]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None
+
+
+def test_quarantine_reports_rejected_operator_issuance(tmp_path):
+    """A rejected capability withdrawal cannot be reported as successful."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    active = runtime._active[id(feature)].operator_registrations
+    del runtime.operator_registry._issued_set_seals[id(active)]
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert runtime.is_active(feature)
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is feature.service
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is feature.actor
+
+
+def test_quarantine_retry_preserves_consumed_operator_withdrawal(
+    monkeypatch, tmp_path
+):
+    """A later cleanup failure must not make one-shot withdrawal unretryable."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    operator_set = runtime._active[id(feature)].operator_registrations
+
+    original_unregister = runtime.permission_defaults_registry.unregister
+    calls = 0
+
+    def fail_once(registration):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient permission cleanup failure")
+        return original_unregister(registration)
+
+    monkeypatch.setattr(
+        runtime.permission_defaults_registry,
+        "unregister",
+        fail_once,
+    )
+
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    # The operator set is an authenticated one-shot capability. Its successful
+    # withdrawal consumes the seal even though the later permission cleanup
+    # failed and the lifecycle record must remain for a retry.
+    assert operator_set._registry_seal is None
+    assert id(operator_set) not in runtime.operator_registry._issued_set_seals
+    assert runtime.operator_registry.resolve_service(
+        feature.service_registration.reference
+    ) is None
+    assert runtime.operator_registry.resolve_workflow_actor(
+        feature.workflow_registration.name
+    ) is None
+    assert runtime.is_active(feature)
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    _assert_live(agent, feature, False)
+
+
+def test_quarantine_retry_skips_completed_target_set_after_issuance_repair(tmp_path):
+    """Repairing a rejected set lets retry finish past an earlier consumed set."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    target = ExecutionTargetRegistration(
+        owner=feature.contribution_owner,
+        descriptor=ExecutionTargetDescriptor(
+            target_id="quarantine-retry-target",
+            target_kind="container",
+            display_name="Quarantine retry target",
+            tenant_id="tenant",
+            boundary_id="workspace",
+            capabilities=frozenset({"shell.execute"}),
+        ),
+        handle=object(),
+    )
+    target_set = runtime.register_execution_targets(feature, (target,))
+    active = runtime._active[id(feature)]
+    base_set = active.operator_registrations
+
+    # Target sets are quarantined in reverse order before the base service and
+    # workflow set. Simulate issuance-ledger drift in that later base set.
+    base_issuance = runtime.operator_registry._issued_set_seals.pop(id(base_set))
+    with pytest.raises(
+        FeatureContributionRuntimeError,
+        match="feature contributions could not be quarantined",
+    ):
+        runtime.quarantine(feature)
+
+    assert target_set._registry_seal is None
+    assert id(target_set) in active.quarantined_operator_set_ids
+    assert runtime.is_active(feature)
+
+    # Once the rejected capability's provenance is repaired, the retry must
+    # skip the already-consumed target set and complete the lifecycle cleanup.
+    runtime.operator_registry._issued_set_seals[id(base_set)] = base_issuance
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    _assert_live(agent, feature, False)
+
+
+def test_quarantine_removes_exact_signal_source_without_claim_ledger(tmp_path):
+    """An unheld exact source cannot remain dispatchable after fail-close."""
+
+    agent = _agent(tmp_path)
+    feature = SDKFixtureFeature(agent)
+    runtime = agent._ensure_feature_contribution_runtime()
+    runtime.activate(runtime.prepare_transition((feature,)).only())
+    del runtime.source_registry._claims[feature.source.name]
+
+    assert runtime.quarantine(feature) is True
+    assert not runtime.is_active(feature)
+    assert runtime.source_registry.get(feature.source.name) is None
+    assert runtime.source_registry.owners_of(feature.source.name) == ()

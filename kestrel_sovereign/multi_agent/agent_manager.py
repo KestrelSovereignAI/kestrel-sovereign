@@ -602,6 +602,14 @@ def _loaded_agent_did(agent: object) -> Optional[str]:
     return None
 
 
+@dataclass
+class _HostContextPublicationState:
+    """Shared host registry generation observed by initializing agents."""
+
+    registry: object | None = None
+    generation: int = 0
+
+
 class AgentManager:
     """In-process multi-agent manager.
 
@@ -640,6 +648,9 @@ class AgentManager:
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
+        self._host_context_clause_registry = None
+        self._host_context_publication_gate: asyncio.Event | None = None
+        self._host_context_publication_state = _HostContextPublicationState()
         # A multi-agent host owns one mutable isolated-feature root.  The
         # per-agent namespace is derived below from the stable DID rather than
         # accepting the routing name as a path component.
@@ -1452,6 +1463,83 @@ class AgentManager:
         if hook is not None:
             await hook(name, agent)
 
+    async def _complete_registered_agent_readiness(
+        self,
+        agent: KestrelAgent,
+    ) -> bool:
+        """Finish deferred hooks after onboarding releases the topology writer.
+
+        A ready hook may start a cognition turn whose tools acquire a shared
+        A2A execution lease.  Registration therefore must not run it while
+        retaining the exclusive lifecycle writer used for publication and
+        app-owned onboarding.  Drive the hook task to settlement so caller
+        cancellation cannot strand a successfully published agent forever in
+        its deferred-ready state. Return whether the caller was cancelled while
+        the manager-owned hook task settled. Once publication has committed,
+        that cancellation cannot turn the load into a reported failure: callers
+        such as ``create_agent`` still have a persistence handoff to finish.
+        """
+
+        gate = self._host_context_publication_gate
+        complete_readiness = getattr(
+            agent,
+            "complete_deferred_agent_readiness",
+            None,
+        )
+        if gate is not None and gate.is_set() and callable(complete_readiness):
+            task = asyncio.create_task(
+                complete_readiness(),
+                name=(
+                    "agent_deferred_readiness:"
+                    f"{_loaded_agent_did(agent) or 'unknown'}"
+                ),
+            )
+            cancelled, failure = await await_lifecycle_task_completion(task)
+            if isinstance(failure, asyncio.CancelledError):
+                # ``on_agent_ready`` is a best-effort post-publication phase.
+                # Real agents consume a hook-owned child cancellation inside
+                # that phase, but keep this boundary defensive for compatible
+                # agent implementations: reporting load cancellation here
+                # would leave a routable committed agent while its caller
+                # skips persistence handoff.  Caller cancellation is carried
+                # separately by ``cancelled`` because the manager-owned task
+                # is shielded and driven to settlement.
+                logger.warning(
+                    "Deferred best-effort readiness cancelled for published "
+                    "agent %r; preserving the committed load",
+                    _loaded_agent_did(agent),
+                )
+                return cancelled
+            if failure is not None:
+                raise failure
+            return cancelled
+        return False
+
+    async def complete_deferred_agent_readiness(self) -> None:
+        """Complete startup readiness behind the registration writer boundary.
+
+        The server opens the host-context gate after publishing host policy.
+        A registration may already have inserted an agent into ``_agents`` but
+        still be awaiting app-owned onboarding under the A2A lifecycle writer.
+        Taking that same writer here makes the startup sweep linearize either
+        before publication or after onboarding; it can never run a feature's
+        ``on_agent_ready`` hook in the partial interval between them.
+
+        Registrations that publish after this sweep retain the complementary
+        post-onboarding call in the registration path.
+        """
+
+        async with self._a2a_lifecycle_lock:
+            agents = list(self._agents.values())
+
+        seen: set[int] = set()
+        for agent in agents:
+            if id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            if await self._complete_registered_agent_readiness(agent):
+                raise asyncio.CancelledError()
+
     async def _initialize_agent(
         self,
         name: str,
@@ -1619,6 +1707,7 @@ class AgentManager:
                         self._shared_postgres_backend
                     ),
                     allowed_features=allowed_features,
+                    host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     isolated_runtime_root=runtime_root,
@@ -1657,6 +1746,7 @@ class AgentManager:
                     storage_path=db_path,
                     llm_service=llm_service,
                     allowed_features=allowed_features,
+                    host_context_clause_registry=self._host_context_clause_registry,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     semantic_inference_profile=semantic_inference_profile,
@@ -1677,6 +1767,25 @@ class AgentManager:
             agent._scheduler_polling_managed_by_host = (
                 self._scheduler_polling_managed_by_host
             )
+            agent._host_context_publication_gate = (
+                self._host_context_publication_gate
+            )
+            # Keep the live state box attached before initialize: ready hooks
+            # can enter cognition while the agent is still absent from
+            # ``_agents`` and therefore invisible to manager fan-out.  Leave
+            # the observed generation unset until the cognition barrier or
+            # registration seam performs a validated bind; construction alone
+            # is not proof that the prompt builder already consumes it.
+            agent._host_context_publication_state = (
+                self._host_context_publication_state
+            )
+            agent._host_context_publication_generation = None
+            if self._host_context_publication_gate is not None:
+                # Host ownership is independent of whether the one-time gate
+                # is already open.  A cold/dynamic agent must not publish
+                # ready hooks until registration and app-owned onboarding have
+                # committed under the A2A lifecycle writer.
+                agent.defer_agent_readiness_to_host()
             if scheduler_registration is not None:
                 agent._dynamic_scheduler_tenant_registration = (
                     scheduler_registration
@@ -1909,6 +2018,38 @@ class AgentManager:
                 "Cannot publish an agent DID already routed under a different "
                 f"name: {agent_id!r} -> {bound_name!r}"
             )
+
+        # Construction snapshots host context before ``initialize()``.  Host
+        # feature publication can finish while a cold agent is still starting,
+        # after the manager's fan-out has already walked ``_agents``.  The turn
+        # barrier handles cognition during that window; rebind again at this
+        # final admission seam so the agent cannot become routable with a stale
+        # snapshot.  Validate before adding either routing entry: a namespace
+        # collision must reject onboarding without making the agent briefly
+        # addressable.
+        registry = self._host_context_clause_registry
+        validate_registry = getattr(
+            agent, "validate_host_context_clause_registry", None
+        )
+        bind_registry = getattr(agent, "bind_host_context_clause_registry", None)
+        if registry is not None and (
+            not callable(validate_registry) or not callable(bind_registry)
+        ):
+            raise RuntimeError(
+                f"Cannot publish agent {name!r} without host context registry support"
+            )
+        if callable(validate_registry) and callable(bind_registry):
+            validate_registry(registry)
+            bind_registry(registry)
+
+        # Refresh every shared publication pointer before the agent becomes
+        # routable.  This also records that the direct rebind above consumed the
+        # current generation, avoiding redundant work on its first normal turn.
+        agent._host_context_publication_gate = self._host_context_publication_gate
+        agent._host_context_publication_state = self._host_context_publication_state
+        agent._host_context_publication_generation = (
+            self._host_context_publication_state.generation
+        )
         self._agents[name] = agent
         self._agent_names[agent_id] = name
         # Publish the registered routing key as the human display name so the
@@ -2376,6 +2517,15 @@ class AgentManager:
                         raise
                     committed = True
                     admission.published = True
+                readiness_cancelled = (
+                    await self._complete_registered_agent_readiness(agent)
+                )
+                if readiness_cancelled:
+                    logger.info(
+                        "Agent %r finished deferred readiness after caller "
+                        "cancellation; preserving the committed load result",
+                        name,
+                    )
                 return agent
             except BaseException:
                 if not committed:
@@ -2563,6 +2713,8 @@ class AgentManager:
                             admission.published = True
                         unpublished.pop(name, None)
                         loaded += 1
+                        if await self._complete_registered_agent_readiness(result):
+                            raise asyncio.CancelledError()
                     except BaseException as onboarding_failure:
                         # Claim before the first cleanup await.  If that cleanup
                         # fails, the outer batch handler must not discover and
@@ -2684,6 +2836,37 @@ class AgentManager:
     def list_agents(self) -> dict[str, KestrelAgent]:
         """Return all loaded agents as {name: agent}."""
         return dict(self._agents)
+
+    def validate_host_context_clause_registry(self, registry) -> None:
+        """Preflight one host registry against every currently loaded agent."""
+
+        for agent in self._agents.values():
+            agent.validate_host_context_clause_registry(registry)
+
+    def bind_host_context_clause_registry(self, registry) -> None:
+        """Publish host context to loaded, initializing, and future agents."""
+
+        self.validate_host_context_clause_registry(registry)
+        agents = tuple(self._agents.values())
+        for agent in agents:
+            agent.bind_host_context_clause_registry(registry)
+        self._host_context_clause_registry = registry
+        state = self._host_context_publication_state
+        state.registry = registry
+        state.generation += 1
+        for agent in agents:
+            agent._host_context_publication_state = state
+            agent._host_context_publication_generation = state.generation
+
+    def set_host_context_publication_gate(self, gate: asyncio.Event) -> None:
+        """Gate current and future agent turns until host policy is published."""
+
+        self._host_context_publication_gate = gate
+        for agent in self._agents.values():
+            agent._host_context_publication_gate = gate
+            agent._host_context_publication_state = (
+                self._host_context_publication_state
+            )
 
     async def local_agent_configs_by_did(
         self,
