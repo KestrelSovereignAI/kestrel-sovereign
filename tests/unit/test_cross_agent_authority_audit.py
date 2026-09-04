@@ -37,6 +37,12 @@ CONTROL_NAME_TERMS = (
     "restart",
     "host",
     "fleet",
+    # Agent and process adapters often expose lifecycle verbs without an
+    # agent-shaped qualifier.  These remain control sinks when provenance is
+    # used to decide whether they run (for example ``target.shutdown()`` or
+    # ``ProcessManager.kill_process(...)``).
+    "shutdown",
+    "kill_process",
 )
 PERMISSION_NAME_TERMS = (
     "authoriz",
@@ -52,6 +58,29 @@ PERMISSION_NAME_TERMS = (
     "gate",
     "require",
 )
+PROVENANCE_TRANSFORM_CALLS = {
+    "all",
+    "any",
+    "bool",
+    "copy",
+    "deepcopy",
+    "dict",
+    "enumerate",
+    "filter",
+    "frozenset",
+    "get",
+    "getattr",
+    "len",
+    "list",
+    "map",
+    "max",
+    "min",
+    "reversed",
+    "set",
+    "sorted",
+    "sum",
+    "tuple",
+}
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
     # /api/agents/{name}/... alias in multi-agent mode.  Inventory the complete
@@ -440,7 +469,10 @@ def _discovered_scheduler_surfaces() -> set[str]:
     feature_constants = _module_string_constants(feature_tree, feature_path)
     builtin_handlers: dict[str, str] | None = None
     for node in ast.walk(feature_tree):
-        if not isinstance(node, ast.Call) or _call_name(node) != "build_cron_registrations":
+        if not (
+            isinstance(node, ast.Call)
+            and _call_name(node) == "build_cron_registrations"
+        ):
             continue
         keyword = next(
             (item for item in node.keywords if item.arg == "builtin_handlers"),
@@ -495,8 +527,116 @@ def _discovered_scheduler_surfaces() -> set[str]:
             f"kestrel_sovereign/signals/sources/scheduler.py::cron.{name}"
             for name in task_names
         ),
-        *(f"kestrel_sovereign/features/scheduler/feature.py::{name}" for name in builtin_handlers.values()),
+        *(
+            f"kestrel_sovereign/features/scheduler/feature.py::{name}"
+            for name in builtin_handlers.values()
+        ),
     }
+
+
+def _discovered_core_signal_source_surfaces() -> set[str]:
+    """Inventory every core ``SourceRegistration`` plus cron handlers.
+
+    Source registrations are execution boundaries even when they are neither
+    scheduler targets nor named after agents.  Scan every constructor under
+    core instead of maintaining a list of today's always-on modules.  The one
+    generic factory currently used by workflow rescue is resolved through its
+    string-valued call arguments; unresolved future name expressions fail the
+    contract rather than disappearing from the audit.
+    """
+
+    surfaces = _discovered_scheduler_surfaces()
+    scheduler_path = (
+        REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
+    )
+    for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        constructors = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and _call_name(node).endswith("SourceRegistration")
+        ]
+        if not constructors:
+            continue
+        if path == scheduler_path:
+            # The scheduler constructor receives ``cron.<task>`` from the
+            # machine-discovered CRON_TASKS table above.
+            continue
+
+        constants = _module_string_constants(tree, path)
+        parents: dict[ast.AST, ast.AST] = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for constructor in constructors:
+            name_keyword = next(
+                (item for item in constructor.keywords if item.arg == "name"),
+                None,
+            )
+            name_expression = (
+                name_keyword.value
+                if name_keyword is not None
+                else constructor.args[0]
+                if constructor.args
+                else None
+            )
+            if name_expression is None:
+                raise AssertionError(
+                    f"SourceRegistration without a name in {relative}"
+                )
+            names: set[str] = set()
+            direct_name = _resolved_string(name_expression, constants)
+            if direct_name is not None:
+                names.add(direct_name)
+            elif isinstance(name_expression, ast.Name):
+                enclosing: ast.AST | None = constructor
+                while enclosing is not None and not isinstance(
+                    enclosing, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    enclosing = parents.get(enclosing)
+                if isinstance(enclosing, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    parameters = [
+                        *enclosing.args.posonlyargs,
+                        *enclosing.args.args,
+                        *enclosing.args.kwonlyargs,
+                    ]
+                    parameter_names = [parameter.arg for parameter in parameters]
+                    if name_expression.id in parameter_names:
+                        parameter_index = parameter_names.index(name_expression.id)
+                        for call in ast.walk(tree):
+                            if not (
+                                isinstance(call, ast.Call)
+                                and _call_name(call) == enclosing.name
+                            ):
+                                continue
+                            argument: ast.expr | None = None
+                            if parameter_index < len(call.args):
+                                argument = call.args[parameter_index]
+                            else:
+                                keyword = next(
+                                    (
+                                        item
+                                        for item in call.keywords
+                                        if item.arg == name_expression.id
+                                    ),
+                                    None,
+                                )
+                                if keyword is not None:
+                                    argument = keyword.value
+                            if argument is not None:
+                                resolved = _resolved_string(argument, constants)
+                                if resolved is not None:
+                                    names.add(resolved)
+            if not names:
+                raise AssertionError(
+                    "Unresolved SourceRegistration name expression in "
+                    f"{relative}: {ast.unparse(name_expression)}"
+                )
+            surfaces.update(f"{relative}::{name}" for name in names)
+    return surfaces
 
 
 def _discovered_runtime_generated_tool_surfaces() -> set[str]:
@@ -1386,12 +1526,18 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
     ), "The classified high-level Feature tool must remain wired into registration"
 
 
-def test_every_builtin_scheduler_target_and_handler_is_classified() -> None:
-    discovered = _discovered_scheduler_surfaces()
+def test_every_core_signal_source_and_builtin_handler_is_classified() -> None:
+    discovered = _discovered_core_signal_source_surfaces()
     assert discovered == _documented_surfaces(
-        "## Machine-checked scheduled target inventory"
+        "## Machine-checked core signal source inventory"
     )
     for surface in (
+        "kestrel_sovereign/signals/sources/a2a_task_submitted.py::"
+        "a2a.task_submitted",
+        "kestrel_sovereign/signals/sources/a2a_question_answered.py::"
+        "a2a.question_answered",
+        "kestrel_sovereign/signals/sources/workflow_rescue.py::"
+        "a2a_repair_dispatch",
         "kestrel_sovereign/signals/sources/scheduler.py::"
         "cron.restart_coordinator",
         "kestrel_sovereign/features/scheduler/feature.py::"
@@ -1400,6 +1546,29 @@ def test_every_builtin_scheduler_target_and_handler_is_classified() -> None:
         "_run_wait_reconcile",
     ):
         assert surface in discovered
+
+
+def test_signal_source_inventory_scans_beyond_scheduler_module() -> None:
+    discovered = _discovered_core_signal_source_surfaces()
+    non_scheduler_sources = {
+        surface
+        for surface in discovered
+        if "/signals/sources/" in surface
+        and "/scheduler.py::" not in surface
+    }
+
+    assert len(non_scheduler_sources) == 17
+    assert {
+        "kestrel_sovereign/signals/sources/a2a.py::a2a.task_complete",
+        "kestrel_sovereign/signals/sources/channels.py::channel.message",
+        "kestrel_sovereign/signals/sources/heartbeat.py::heartbeat",
+        "kestrel_sovereign/signals/sources/restart.py::restart.completed",
+        "kestrel_sovereign/signals/sources/system_resumed.py::system.resumed",
+        "kestrel_sovereign/signals/sources/wallet.py::"
+        "webhook.stripe.deposit_complete",
+        "kestrel_sovereign/signals/sources/workflow_rescue.py::"
+        "fleet_stalled_sweep",
+    } <= non_scheduler_sources
 
 
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
@@ -2279,6 +2448,20 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
     )
 
 
+def _has_provenance_value(
+    node: ast.AST,
+    aliases: set[str] | None = None,
+    provenance_return_helpers: set[str] | None = None,
+) -> bool:
+    """Whether an expression reads provenance directly or via a local helper."""
+
+    return _has_provenance_token(node, aliases) or any(
+        isinstance(child, ast.Call)
+        and _call_name(child).casefold() in (provenance_return_helpers or set())
+        for child in ast.walk(node)
+    )
+
+
 def _cross_agent_control_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> set[str]:
@@ -2346,6 +2529,7 @@ def _is_cross_agent_control_call(
 
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
+    provenance_return_helpers: set[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -2360,6 +2544,12 @@ def _provenance_aliases(
         # not, even when the call carries lineage for propagation.
         while isinstance(value, (ast.Await, ast.Expr)):
             value = value.value
+        calls_known_helper = any(
+            isinstance(node, ast.Call)
+            and _call_name(node).casefold()
+            in (provenance_return_helpers or set())
+            for node in ast.walk(value)
+        )
         if isinstance(
             value,
             (
@@ -2374,37 +2564,19 @@ def _provenance_aliases(
             ),
         ):
             return _has_provenance_token(value, aliases)
-        if isinstance(value, ast.Call) and _call_name(value) in {
-            "all",
-            "any",
-            "bool",
-            "copy",
-            "deepcopy",
-            "dict",
-            "enumerate",
-            "filter",
-            "frozenset",
-            "get",
-            "getattr",
-            "len",
-            "list",
-            "map",
-            "max",
-            "min",
-            "reversed",
-            "set",
-            "sorted",
-            "sum",
-            "tuple",
-        }:
-            return _has_provenance_token(value, aliases)
+        if (
+            isinstance(value, ast.Call)
+            and _call_name(value) in PROVENANCE_TRANSFORM_CALLS
+        ):
+            return _has_provenance_token(value, aliases) or calls_known_helper
         if isinstance(value, ast.Call):
             call_name = _call_name(value).casefold()
+            if call_name in (provenance_return_helpers or set()):
+                return True
             if call_name.startswith(("can_", "has_", "is_", "may_")) or (
                 _is_permission_name(call_name)
-                and _has_provenance_token(value, aliases)
             ):
-                return _has_provenance_token(value, aliases)
+                return _has_provenance_token(value, aliases) or calls_known_helper
         # Normalization does not erase the authority input. Comparisons,
         # arithmetic, comprehensions, and conditional expressions remain
         # provenance-derived when a later gate consumes their result.
@@ -2422,7 +2594,7 @@ def _provenance_aliases(
                 ast.UnaryOp,
             ),
         ):
-            return _has_provenance_token(value, aliases)
+            return _has_provenance_token(value, aliases) or calls_known_helper
         return False
 
     def target_names(target: ast.AST) -> set[str]:
@@ -2620,8 +2792,8 @@ def _provenance_aliases(
                         )
 
             if isinstance(statement, (ast.If, ast.While)):
-                branch_selection = inherited_selection or _has_provenance_token(
-                    statement.test, aliases
+                branch_selection = inherited_selection or _has_provenance_value(
+                    statement.test, aliases, provenance_return_helpers
                 )
                 selected.update(
                     provenance_selected_decisions(
@@ -2635,13 +2807,15 @@ def _provenance_aliases(
                 )
                 continue
             if isinstance(statement, ast.Match):
-                subject_selection = inherited_selection or _has_provenance_token(
-                    statement.subject, aliases
+                subject_selection = inherited_selection or _has_provenance_value(
+                    statement.subject, aliases, provenance_return_helpers
                 )
                 for case in statement.cases:
                     case_selection = subject_selection or (
                         case.guard is not None
-                        and _has_provenance_token(case.guard, aliases)
+                        and _has_provenance_value(
+                            case.guard, aliases, provenance_return_helpers
+                        )
                     )
                     selected.update(
                         provenance_selected_decisions(
@@ -2683,7 +2857,9 @@ def _provenance_aliases(
                     permission_shaped_target
                     or bool(guard_decision_names)
                 )
-                and _has_provenance_token(value, aliases)
+                and _has_provenance_value(
+                    value, aliases, provenance_return_helpers
+                )
             )
             if target_derived:
                 provenance_selected_targets.update(target_names)
@@ -2691,6 +2867,69 @@ def _provenance_aliases(
                 aliases.update(names)
                 changed = True
     return aliases, provenance_selected_targets
+
+
+def _local_provenance_return_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Find local helpers whose return value is provenance-derived.
+
+    This is a small interprocedural summary, deliberately limited to the
+    current syntax tree.  A neutral refactor such as ``derive(request)`` must
+    not erase the fact that its result came from ``request.causation_chain``.
+    Iterate to a fixed point so one local helper may wrap another.
+    """
+
+    helper_names: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            if function.name.casefold() in helper_names:
+                continue
+            aliases, _selected_targets = _provenance_aliases(
+                function, helper_names
+            )
+            returns_provenance = False
+            for node in _walk_lexical_scope(function):
+                if not isinstance(node, ast.Return) or node.value is None:
+                    continue
+                value = node.value
+                while isinstance(value, ast.Await):
+                    value = value.value
+                if isinstance(value, ast.Call):
+                    call_name = _call_name(value).casefold()
+                    calls_known_helper = any(
+                        isinstance(child, ast.Call)
+                        and _call_name(child).casefold() in helper_names
+                        for child in ast.walk(value)
+                    )
+                    returns_provenance = (
+                        call_name in helper_names
+                        or call_name in PROVENANCE_TRANSFORM_CALLS
+                        and (
+                            _has_provenance_token(value, aliases)
+                            or calls_known_helper
+                        )
+                        or call_name.startswith(("can_", "has_", "is_", "may_"))
+                        and (
+                            _has_provenance_token(value, aliases)
+                            or calls_known_helper
+                        )
+                        or _is_permission_name(call_name)
+                        and (
+                            _has_provenance_token(value, aliases)
+                            or calls_known_helper
+                        )
+                    )
+                else:
+                    returns_provenance = _has_provenance_token(value, aliases)
+                if returns_provenance:
+                    break
+            if returns_provenance:
+                helper_names.add(function.name.casefold())
+                changed = True
+    return helper_names
 
 
 def _contains_cross_agent_control_call(
@@ -2785,6 +3024,7 @@ def _guard_clause_provenance_lines(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_aliases: set[str],
     control_aliases: set[str],
+    provenance_return_helpers: set[str] | None = None,
 ) -> set[int]:
     """Find provenance conditions that gate a later control by exiting early."""
 
@@ -2806,15 +3046,21 @@ def _guard_clause_provenance_lines(
                 )
             )
             if controls_continuation and isinstance(statement, ast.Assert):
-                if _has_provenance_token(statement.test, provenance_aliases):
+                if _has_provenance_value(
+                    statement.test,
+                    provenance_aliases,
+                    provenance_return_helpers,
+                ):
                     lines.add(statement.lineno)
             elif controls_continuation and isinstance(statement, ast.If):
                 body_exits = _block_guaranteed_exits(statement.body)
                 orelse_exits = _block_guaranteed_exits(statement.orelse)
                 if (
                     body_exits != orelse_exits
-                    and _has_provenance_token(
-                        statement.test, provenance_aliases
+                    and _has_provenance_value(
+                        statement.test,
+                        provenance_aliases,
+                        provenance_return_helpers,
                     )
                 ):
                     lines.add(statement.lineno)
@@ -2842,15 +3088,19 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
+    provenance_return_helpers = _local_provenance_return_helpers(functions)
     for function in functions:
         function_name = function.name.casefold()
         control_aliases = _cross_agent_control_aliases(function)
         provenance_aliases, provenance_selected_targets = (
-            _provenance_aliases(function)
+            _provenance_aliases(function, provenance_return_helpers)
         )
         lines.update(
             _guard_clause_provenance_lines(
-                function, provenance_aliases, control_aliases
+                function,
+                provenance_aliases,
+                control_aliases,
+                provenance_return_helpers,
             )
         )
         function_is_permission_boundary = (
@@ -2866,7 +3116,11 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 )
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if is_permission_call and any(
-                    _has_provenance_token(argument, provenance_aliases)
+                    _has_provenance_value(
+                        argument,
+                        provenance_aliases,
+                        provenance_return_helpers,
+                    )
                     for argument in arguments
                 ):
                     lines.add(node.lineno)
@@ -2898,15 +3152,21 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 }
                 if (
                     any(_is_permission_name(token) for token in target_tokens)
-                    and _has_provenance_token(
-                        assignment_value, provenance_aliases
+                    and _has_provenance_value(
+                        assignment_value,
+                        provenance_aliases,
+                        provenance_return_helpers,
                     )
                 ):
                     lines.add(node.lineno)
             if isinstance(node, ast.Return):
                 if (
                     node.value is not None
-                    and _has_provenance_token(node.value, provenance_aliases)
+                    and _has_provenance_value(
+                        node.value,
+                        provenance_aliases,
+                        provenance_return_helpers,
+                    )
                     and (
                         function_is_permission_boundary
                         or any(
@@ -2918,7 +3178,11 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                     lines.add(node.lineno)
                 continue
             if isinstance(node, ast.Match):
-                if _has_provenance_token(node.subject, provenance_aliases) and (
+                if _has_provenance_value(
+                    node.subject,
+                    provenance_aliases,
+                    provenance_return_helpers,
+                ) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
                         [statement for case in node.cases for statement in case.body],
@@ -2929,8 +3193,10 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 for case in node.cases:
                     if (
                         case.guard is not None
-                        and _has_provenance_token(
-                            case.guard, provenance_aliases
+                        and _has_provenance_value(
+                            case.guard,
+                            provenance_aliases,
+                            provenance_return_helpers,
                         )
                         and (
                             function_is_permission_boundary
@@ -2942,7 +3208,11 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                         lines.add(case.guard.lineno)
                 continue
             if isinstance(node, (ast.For, ast.AsyncFor)):
-                if _has_provenance_token(node.iter, provenance_aliases) and (
+                if _has_provenance_value(
+                    node.iter,
+                    provenance_aliases,
+                    provenance_return_helpers,
+                ) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
                         [*node.body, *node.orelse], control_aliases
@@ -2952,7 +3222,11 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 continue
             if isinstance(node, ast.BoolOp):
                 if (
-                    _has_provenance_token(node, provenance_aliases)
+                    _has_provenance_value(
+                        node,
+                        provenance_aliases,
+                        provenance_return_helpers,
+                    )
                     and _contains_cross_agent_control_call(
                         node.values, control_aliases
                     )
@@ -2970,7 +3244,11 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
                 ]
                 if (
                     any(
-                        _has_provenance_token(condition, provenance_aliases)
+                        _has_provenance_value(
+                            condition,
+                            provenance_aliases,
+                            provenance_return_helpers,
+                        )
                         for condition in conditions
                     )
                     and _contains_cross_agent_control_call(
@@ -2982,8 +3260,10 @@ def _authority_provenance_lines(tree: ast.AST) -> set[int]:
             if not isinstance(node, (ast.If, ast.IfExp, ast.Assert, ast.While)):
                 continue
             tokens = _identifier_tokens(node.test)
-            has_provenance = _has_provenance_token(
-                node.test, provenance_aliases
+            has_provenance = _has_provenance_value(
+                node.test,
+                provenance_aliases,
+                provenance_return_helpers,
             )
             has_permission = any(_is_permission_name(token) for token in tokens)
             guarded_nodes: list[ast.AST] = [node.test]
@@ -3343,7 +3623,7 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(comprehension_control) == {2}
     assert _authority_provenance_lines(propagation_only_helper) == set()
     assert _authority_provenance_lines(neutral_control_forms) == {3, 9, 10, 14}
-    assert _authority_provenance_lines(ownership_predicate) == {2}
+    assert _authority_provenance_lines(ownership_predicate) == {2, 5}
     assert _authority_provenance_lines(guard_clauses) == {2, 7, 15}
     assert _authority_provenance_lines(loop_guard_clauses) == {3, 9}
     assert _authority_provenance_lines(match_guards) == {3, 9}
@@ -3447,6 +3727,64 @@ def test_provenance_scanner_taints_control_targets_selected_by_provenance() -> N
     assert _authority_provenance_lines(conditional_target) == {3}
     assert _authority_provenance_lines(conditional_kwargs) == {3}
     assert _authority_provenance_lines(branch_selected_member) == {5}
+
+
+def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None:
+    target_shutdown = ast.parse(
+        "async def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        await target.shutdown()\n"
+    )
+    process_kill = ast.parse(
+        "async def dispatch(request, manager, target):\n"
+        "    if request.orchestrator:\n"
+        "        await manager.kill_process(target)\n"
+    )
+
+    assert _authority_provenance_lines(target_shutdown) == {2}
+    assert _authority_provenance_lines(process_kill) == {2}
+
+
+def test_provenance_scanner_follows_local_helper_return_values() -> None:
+    neutral_helper = ast.parse(
+        "def derive(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def dispatch(request, target):\n"
+        "    allowed = derive(request)\n"
+        "    if allowed:\n"
+        "        terminate_child(target)\n"
+    )
+    wrapped_helper = ast.parse(
+        "def extract(context):\n"
+        "    return context.orchestrator\n\n"
+        "def normalize(context):\n"
+        "    return bool(extract(context))\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    decision = normalize(request)\n"
+        "    if decision:\n"
+        "        manager.kill_process(target)\n"
+    )
+    direct_helper_guard = ast.parse(
+        "def derive(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "async def dispatch(request, target):\n"
+        "    if not derive(request):\n"
+        "        return\n"
+        "    await target.shutdown()\n"
+    )
+    propagation_only_helper = ast.parse(
+        "def emit(context):\n"
+        "    return publish(causation=context.causation_chain)\n\n"
+        "def dispatch(request, state):\n"
+        "    emitted = emit(request)\n"
+        "    if emitted:\n"
+        "        state['sent'] = True\n"
+    )
+
+    assert _authority_provenance_lines(neutral_helper) == {5, 6}
+    assert _authority_provenance_lines(wrapped_helper) == {9}
+    assert _authority_provenance_lines(direct_helper_guard) == {5}
+    assert _authority_provenance_lines(propagation_only_helper) == set()
 
 
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:

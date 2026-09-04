@@ -345,13 +345,16 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/features/wellness/feature.py::wellness_export` | Caller runtime wellness state; no co-hosted-agent target. |
 | `kestrel_sovereign/features/wellness/feature.py::wellness_history` | Caller runtime wellness state; no co-hosted-agent target. |
 
-## Machine-checked scheduled target inventory
+## Machine-checked core signal source inventory
 
-`CRON_TASKS` names are executable entry doors even when they have no `@tool`
-declaration. The contract discovers every name from the source table and every
-literal bespoke-handler mapping supplied to `build_cron_registrations`. A
-schedule and its resulting signal remain owned by the local agent; registration
-and causation metadata grant no authority over a peer or the host.
+Every core `SourceRegistration` is an execution boundary even when it is not a
+scheduler target and its name contains no agent-shaped word. The contract scans
+every constructor under `kestrel_sovereign`, resolves generic factory names
+from their string-valued call sites, discovers every `CRON_TASKS` entry, and
+includes every literal bespoke-handler mapping supplied to
+`build_cron_registrations`. A registration authenticates and constrains a
+source; its signal and causation metadata do not grant authority over a peer or
+the host. Target-specific authority remains mandatory at the invoked handler.
 
 | Surface ID | Classification |
 |---|---|
@@ -362,6 +365,14 @@ and causation metadata grant no authority over a peer or the host.
 | `kestrel_sovereign/features/scheduler/feature.py::_run_github_pr_watch` | Bespoke caller-agent repository watcher for `cron.github_pr_watch`; #3147 binds any resulting wake to the scheduler owner. |
 | `kestrel_sovereign/features/scheduler/feature.py::_run_trash_retention` | Bespoke caller-agent retention handler for `cron.trash_retention`; no co-hosted-agent target. |
 | `kestrel_sovereign/features/scheduler/feature.py::_run_wait_reconcile` | Bespoke caller-agent wait reconciliation for `cron.wait_reconcile`; resulting wakes remain locally targeted. |
+| `kestrel_sovereign/signals/sources/a2a.py::a2a.task_complete` | Bounded peer-completion wake for the local task creator. The signed or authenticated peer event supplies causation, not control authority; cycle detection and rate limits remain mandatory. |
+| `kestrel_sovereign/signals/sources/a2a_question_answered.py::a2a.question_answered` | Local resumption wake for a question the caller sent. Durable task correlation binds the waiting session; peer identity and causation metadata grant no control authority. |
+| `kestrel_sovereign/signals/sources/a2a_task_submitted.py::a2a.task_submitted` | Bounded inbound peer-work wake. Recipient routing authenticates the target and the signal inherits cycle detection and rate limits; submission grants communication, not lifecycle authority. |
+| `kestrel_sovereign/signals/sources/channels.py::channel.message` | External-channel ingress for the locally configured receiver. Channel authentication and target routing remain the boundary; sender or thread metadata grants no agent authority. |
+| `kestrel_sovereign/signals/sources/ecosystem_discovery.py::ecosystem.discovery_findings` | Caller-agent repository-watch observation. Provider access policy remains enforcement and discovered repository metadata grants no peer or host authority. |
+| `kestrel_sovereign/signals/sources/github_pr_watch.py::github.pr_activity` | Caller-owned GitHub watch wake. #3147 binds the wake to the scheduler owner; repository activity and causation metadata grant no relation authority. |
+| `kestrel_sovereign/signals/sources/heartbeat.py::heartbeat` | Self-owned periodic wake registered on the agent's dispatcher. Host timing metadata grants no peer or host authority. |
+| `kestrel_sovereign/signals/sources/restart.py::restart.completed` | Requester-bound post-restart wake. The completion event conveys host-coordination state only; it cannot authorize the restart/update operation tracked by #3148. |
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.backup_snapshot` | Self-owned backup action; schedule ownership and the local dispatcher bind the target agent. |
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.bootstrap_timeout_check` | Self-owned bootstrap watchdog; no peer or host target. |
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.ecosystem_discovery_watch` | Self-owned repository watch; its provider and downstream tool policies remain enforcement. |
@@ -375,6 +386,15 @@ and causation metadata grant no authority over a peer or the host.
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.training_cycle` | Caller-agent training/model workflow; shared-provider policy remains independently required. |
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.trash_retention` | Self-owned memory-retention action with a bespoke local handler. |
 | `kestrel_sovereign/signals/sources/scheduler.py::cron.wait_reconcile` | Self-owned wait reconciliation; resulting signals remain locally targeted. |
+| `kestrel_sovereign/signals/sources/system_resumed.py::system.resumed` | Local host-resume maintenance event. It may re-anchor the caller's dispatcher but grants no peer, fleet, or lifecycle authority. |
+| `kestrel_sovereign/signals/sources/wait.py::wait.complete` | Caller-owned wait resumption selected through the caller's registered provider. Provider result metadata and causation grant no relation authority. |
+| `kestrel_sovereign/signals/sources/wallet.py::webhook.stripe.deposit_complete` | Authenticated external payment event routed to the configured local receiver. Webhook authenticity permits this ingress only and grants no peer or host control. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::a2a_repair_dispatch` | Provider-neutral workflow stage that records explicitly selected repair targets. Workflow consent and causation are not relation authority; any downstream A2A or lifecycle boundary must independently authorize its exact target. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::close_resolved_todos` | Evidence-gated workflow bookkeeping for the caller's todo namespace; no co-hosted-agent lifecycle authority follows from the pipeline. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::evidence_verify` | Read-only workflow evidence stage. Observed state grants no mutation or agent authority. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::fleet_stalled_sweep` | Read-only fleet-work observation with optional provider-bound discovery. Visibility grants no authority to repair, stop, or otherwise control an observed agent. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::governance_review` | Records intervention intent but explicitly does not authorize it. A later target-specific authority boundary remains mandatory. |
+| `kestrel_sovereign/signals/sources/workflow_rescue.py::reopen_resolved_todos` | Compensation bookkeeping for the caller's todo workflow; no co-hosted-agent lifecycle authority follows from the pipeline. |
 
 ## Machine-checked dynamic router boundary inventory
 
