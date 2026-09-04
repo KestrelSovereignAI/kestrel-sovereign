@@ -323,18 +323,18 @@ async def build_host_context(
     hold_boot_state: tuple[Any, ...] = ()
     backend_error = ""
     try:
-        from kestrel_sovereign.host_features.storage import (
-            prepare_host_database,
-            validate_sqlite_family_private,
-        )
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
-        from kestrel_sovereign.storage.sqla.session import make_session_factory
         from kestrel_sovereign.hold import HoldStore
         from kestrel_sovereign.hold.state import (
             hold_history_anchor_path,
             hold_initialization_witness_path,
             initialize_postgres_hold_databases,
         )
+        from kestrel_sovereign.host_features.storage import (
+            prepare_host_database,
+            validate_sqlite_family_private,
+        )
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla.session import make_session_factory
 
         resolved = prepare_host_database(db_path)
         db = await AsyncDatabase.sqlite(str(resolved))

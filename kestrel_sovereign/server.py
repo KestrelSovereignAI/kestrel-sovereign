@@ -2680,8 +2680,9 @@ async def _lifespan_startup(app: FastAPI):
     # not wait for them. Reversible imperative failures remain isolated; an
     # invalid complete contribution set fails startup before mounted state is
     # changed.
-    from kestrel_sovereign import host_features as _hf
     from kestrel_sdk.features import ContributionContractError
+
+    from kestrel_sovereign import host_features as _hf
     from kestrel_sovereign.features.contribution_runtime import (
         FeatureContributionRuntimeError,
     )
