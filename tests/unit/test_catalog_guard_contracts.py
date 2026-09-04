@@ -31,6 +31,21 @@ def _model(id_: str, vendor: str) -> ModelInfo:
     )
 
 
+def _guard_subject(LLMService):
+    """Build the guard's subject with every attribute it actually reads.
+
+    There were two places constructing this double, and only one was updated
+    when the guard's dependencies changed — so the fixture tests passed while
+    the inline one raised AttributeError. One builder, so the next dependency
+    cannot be added to only half of them.
+    """
+    svc = SimpleNamespace()
+    svc._model_available_for_route = (
+        LLMService._model_available_for_route.__get__(svc)
+    )
+    return svc
+
+
 @pytest.fixture
 def svc_with_catalog():
     """Build a minimal service-like object with the guard helper wired up."""
@@ -53,10 +68,7 @@ def svc_with_catalog():
         "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
         return_value=fake_cache,
     ):
-        svc = SimpleNamespace()
-        # Bind the unbound method so we can call it as svc._model_available_for_route(...)
-        svc._model_available_for_route = LLMService._model_available_for_route.__get__(svc)
-        yield svc
+        yield _guard_subject(LLMService)
 
 
 def test_guard_accepts_model_in_vendor_catalog(svc_with_catalog):
@@ -112,8 +124,7 @@ def test_guard_permits_when_cache_empty():
         "kestrel_sovereign.llm.model_cache.get_shared_model_cache",
         return_value=empty_cache,
     ):
-        svc = SimpleNamespace()
-        svc._model_available_for_route = LLMService._model_available_for_route.__get__(svc)
+        svc = _guard_subject(LLMService)
         route = {"vendor": "openai", "route": "api", "model": "auto"}
         assert svc._model_available_for_route(route, "gpt-5-mini") is True
 

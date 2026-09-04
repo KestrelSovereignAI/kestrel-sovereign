@@ -38,6 +38,15 @@ checks:
   - name: Canonical feature inventory sync
     command: uv run pytest tests/unit/test_canonical_inventory_sync.py -q
 
+  # Gate 4.1 of docs/development/DETERMINISTIC_DEV_GATES.md. Only the tests run
+  # here for now: the surfacing invocation itself
+  # (`uv run python scripts/check_co_change.py`) exits 0 by design, and
+  # QualityResult.failure_summary() builds its sections from FAILED checks only,
+  # so its report would be captured and discarded. It lands as a check when
+  # kestrel-talon#230 adds an advisory state. Until then run it by hand.
+  - name: Co-change gate unit tests
+    command: uv run pytest tests/unit/test_check_co_change.py -q
+
   - name: OKF docs unit tests
     command: uv run pytest tests/unit/test_docs_okf.py tests/unit/test_docs_verify.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q
 

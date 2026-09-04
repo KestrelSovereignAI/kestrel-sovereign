@@ -32,10 +32,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from kestrel_sovereign.constitution.hierarchy import (
     DANGEROUS_CAPABILITIES,
@@ -57,11 +58,123 @@ from .policy import (
     BinaryPolicy,
     Decision,
     PathPolicy,
+    command_word_is_shell_grammar,
     evaluate_argv_paths,
+    first_shell_significant_character,
+    quote_words_containing_shell_syntax,
     split_command,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# What a shell would have done with the characters callers most often
+# reach for, so the refusal names the behaviour they were counting on
+# rather than the character they typed. Anything absent gets the
+# general phrasing — the rule is an allow-list of inert characters, so
+# this map does not have to be complete to be correct.
+_SHELL_CHARACTER_MEANINGS = {
+    "|": "pipe one command's output into the next",
+    "&": "background this command, or join it to another",
+    ";": "run a second command after this one",
+    "<": "redirect a file into the command's input",
+    ">": "redirect the command's output into a file",
+    "`": "substitute another command's output",
+    "$": "expand a variable, or substitute another command's output",
+    "(": "group commands in a subshell",
+    ")": "group commands in a subshell",
+    "*": "expand to the filenames it matches",
+    "?": "expand to the filenames it matches",
+    "[": "expand to the filenames it matches",
+    "{": "expand into several arguments",
+    "~": "expand to a home directory",
+    "#": "start a comment hiding the rest of the line",
+    "\\": "escape the next character",
+    "\n": "run a second command on the next line",
+    "\r": "stay inside the word rather than separating it",
+}
+
+# A control character with no printable form still has to be nameable
+# in an audit row and readable in a refusal.
+_UNPRINTABLE_NAMES = {"\n": "newline", "\r": "carriage-return", "\t": "tab"}
+
+
+def shell_syntax_refusal(
+    command: str,
+    argv: List[str],
+) -> Optional[tuple[str, str]]:
+    """Explain why ``command`` cannot run as written, or ``None``.
+
+    Returns ``(audit_rule, message)``.
+
+    ``shell`` tokenizes with ``shlex`` and hands the argv vector to a
+    backend — no shell interprets the string, so a control character is
+    not a control character, it is an ordinary argument. ``ls | head
+    -20`` runs ``ls`` with three extra arguments, prints everything,
+    and exits 0: the bound the caller asked for is discarded and
+    nothing says so (#3129, measured at 128 live calls).
+
+    "No shell interprets the string" is the tool's contract, not a
+    property of every backend. The local backend execs the vector; the
+    Docker backend rebuilds a bash script from it and runs that, so
+    quoting is what neutralises metacharacters there and command-position
+    grammar is what escapes quoting. Both halves of the refusal exist
+    for that reason. The backend's own claim to exec argv is #3187.
+
+    Refusing is the only option that does not execute a different
+    command than the one written. Routing the string through ``bash
+    -lc`` here instead would make the deny-list's unit (``argv[0]``)
+    stop describing what runs, since only ``bash`` would be vetted for
+    a line that can invoke anything — and the vetting that would have
+    to make up the difference reads ``shlex`` tokens, which is #3130.
+
+    The remedy offered is quoting, and quoting only. It is bounded by
+    construction: single-quoted text is inert to bash and to ``shlex``
+    alike, so the rewrite's argv is its words, and those words are what
+    the gates that ran before this one already vetted.
+    """
+    # Command position first: a word there may be grammar rather than a
+    # program, and every character in it can be inert. One backend does
+    # not exec the argv it is handed — DockerSandboxBackend rebuilds a
+    # bash script from it — so `eval 'dd ...'` and `FOO=x dd ...` reach
+    # a shell with only `eval` or `FOO=x` vetted (#3187).
+    if argv:
+        grammar = command_word_is_shell_grammar(argv[0])
+        if grammar is not None:
+            return (
+                f"shell_grammar:{argv[0]}",
+                f"shell runs one program with arguments, and {argv[0]!r} is "
+                f"not a program — it is {grammar}. Nothing ran. Name the "
+                f"program you want to run.",
+            )
+
+    found = first_shell_significant_character(command)
+    if found is None:
+        return None
+    char = found.char
+    named = _UNPRINTABLE_NAMES.get(char) or repr(char)
+    meaning = _SHELL_CHARACTER_MEANINGS.get(char)
+    would = f" cannot {meaning}" if meaning else " is not interpreted"
+    # When the character IS the first token there is no binary it would
+    # have been handed to, so that clause would name the character as
+    # its own recipient.
+    handed_to = (
+        f", and reaches {Path(argv[0]).name!r} as a literal argument"
+        if argv and argv[0] != char
+        else ""
+    )
+    quoted = quote_words_containing_shell_syntax(command)
+    remedy = (
+        f" If you meant it literally, quote it: {quoted}"
+        if quoted and quoted != command
+        else ""
+    )
+    return (
+        f"shell_syntax:{_UNPRINTABLE_NAMES.get(char, char)}",
+        f"shell does not run a shell: the command is tokenized and executed "
+        f"directly, so the {named} at position {found.index}{would}"
+        f"{handed_to}. Nothing ran.{remedy}",
+    )
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
@@ -505,6 +618,25 @@ class ComputerUseFeature(Feature):
                 )
             if argv_path.decision is Decision.REQUIRE_APPROVAL:
                 require_approval = True
+
+            # 4.4 Shell syntax (#3129). The argv vector is what runs, so a
+            # control character in a raw command string never becomes one:
+            # the command that executes is not the command that was
+            # written, and it exits 0 saying nothing. Refuse here rather
+            # than at the tool boundary — AFTER the deny-lists have had
+            # their say, so a denied path or binary is still reported as
+            # the denial it is (and audited as one), and BEFORE the queue,
+            # so the operator is never asked to approve a line that is not
+            # the line that would run.
+            if isinstance(argv, str):
+                refusal = shell_syntax_refusal(argv, split_command(argv))
+                if refusal is not None:
+                    rule, message = refusal
+                    payload["rule"] = rule
+                    await self._audit_denied(
+                        tool_name, payload, allowed_by + ["denied:shell_syntax"]
+                    )
+                    return _GateOutcome(False, allowed_by, message)
         else:
             require_approval = False
 
@@ -941,7 +1073,12 @@ class ComputerUseFeature(Feature):
     @tool(
         name="shell",
         description=(
-            "Run a shell command. Deny-listed binaries hard-refuse; "
+            "Run a command. The command is tokenized and executed "
+            "directly — there is NO shell, so a bare character a shell "
+            "would interpret (`|`, `;`, `>`, `$`, `*`, `~`, `#`, `{`, "
+            "backtick, backslash) is refused rather than passed through "
+            "as a literal. Quote it if you meant it literally: "
+            "`echo 'price$'`. Deny-listed binaries hard-refuse; "
             "auto-approved binaries run without a prompt; everything "
             "else routes through the ApprovalQueue."
         ),
@@ -949,7 +1086,7 @@ class ComputerUseFeature(Feature):
         command_prefix="!shell",
     )
     async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
-        """Run a shell command after policy + (conditional) approval.
+        """Run a command after policy + (conditional) approval.
 
         Approval semantics (#1694):
 
@@ -959,18 +1096,39 @@ class ComputerUseFeature(Feature):
         - Anything else → routes through ApprovalQueue (operator or
           scoped auto-approve rule decides).
 
-        The compound-command guard (raw string with unquoted ``;``,
-        ``&&``, backticks, ``$(...)``, redirects, newline) downgrades
-        ALLOW to REQUIRE_APPROVAL so an allow-listed first token can't
-        bless a piggy-backed second command.
+        ``BinaryPolicy``'s compound-command guard downgrades ALLOW to
+        REQUIRE_APPROVAL when a raw string carries an unquoted control
+        character, so an allow-listed first token cannot bless a
+        piggy-backed second command. It no longer decides anything on
+        this path — #3129 refuses such a string in the same gate
+        sequence, after the deny-lists and before the queue, which is
+        the stronger answer where nothing would have executed the
+        second command anyway. The guard stays load-bearing for the
+        codex bridge, whose flat ``command`` string IS run by a real
+        shell.
+
+        Shell syntax is NOT available (#3129). The command is tokenized
+        with ``shlex`` and the argv vector is executed directly, so a
+        pipe, redirect or command separator would arrive at the binary
+        as a literal argument. Rather than run a command the caller did
+        not write, one carrying any bare character a shell would read
+        is refused — an allow-list of inert characters, because
+        enumerating what a shell DOES is writing a shell.
+
+        No shell form is offered back: deciding what bash would run
+        needs a shell parser, and the gates here read ``shlex`` tokens
+        (#3130). Quoting is offered instead, because a quoted word is
+        inert to bash and to ``shlex`` alike.
 
         Args:
-            command: The shell command to run; tokenized with shlex.
+            command: The command to run; tokenized with shlex and
+                executed directly, without a shell.
             timeout: Wall-clock seconds before the process is killed. Coerced
                 to int at the boundary; a non-numeric value is rejected.
 
         Returns:
-            ToolResult.ok when the command exits 0; PARTIAL when the
+            ToolResult.ok when the command exits 0; ERROR when the
+            command uses shell syntax this tool cannot honour; PARTIAL when the
             command ran but exited non-zero or timed out (the LLM
             should NOT claim success — but the shell did run, which
             matters for audit and for follow-up steps that read
