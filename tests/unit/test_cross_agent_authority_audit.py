@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -1406,18 +1407,27 @@ def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
                     },
                 )
             )
-        elif (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            source = (
-                node.value.id
-                if isinstance(node.value, ast.Name)
-                else _imported_module_attribute_name(tree, node.value)
-            )
-            if source is not None:
-                assignments.append((node.targets[0].id, source))
+        else:
+            assignment_pairs: list[tuple[str, ast.AST]] = []
+            if isinstance(node, ast.Assign):
+                assignment_pairs = [
+                    pair
+                    for target in node.targets
+                    for pair in _static_assignment_pairs(target, node.value)
+                ]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                assignment_pairs = _static_assignment_pairs(
+                    node.target,
+                    node.value,
+                )
+            for target, value in assignment_pairs:
+                source = (
+                    value.id
+                    if isinstance(value, ast.Name)
+                    else _imported_module_attribute_name(tree, value)
+                )
+                if source is not None:
+                    assignments.append((target, source))
     changed = True
     while changed:
         changed = False
@@ -1715,11 +1725,22 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self._visit_definition(node)
 
         def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
-            if self.aliases and self._is_registry(node.value):
-                self.aliases[-1].update(
-                    target.id
+            assignment_pairs = [
+                pair
+                for target in node.targets
+                for pair in _static_assignment_pairs(target, node.value)
+            ]
+            if self.aliases:
+                rebound_names = {
+                    name
                     for target in node.targets
-                    if isinstance(target, ast.Name)
+                    for name in _assignment_target_names(target)
+                }
+                self.aliases[-1].difference_update(rebound_names)
+                self.aliases[-1].update(
+                    target
+                    for target, value in assignment_pairs
+                    if self._is_registry(value)
                 )
             if any(
                 isinstance(target, ast.Subscript)
@@ -1739,13 +1760,19 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self.generic_visit(node)
 
         def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
-            if (
-                node.value is not None
-                and self.aliases
-                and self._is_registry(node.value)
-            ):
-                if isinstance(node.target, ast.Name):
-                    self.aliases[-1].add(node.target.id)
+            if self.aliases:
+                self.aliases[-1].difference_update(
+                    _assignment_target_names(node.target)
+                )
+                if node.value is not None:
+                    self.aliases[-1].update(
+                        target
+                        for target, value in _static_assignment_pairs(
+                            node.target,
+                            node.value,
+                        )
+                        if self._is_registry(value)
+                    )
             if (
                 isinstance(node.target, ast.Subscript)
                 and self._is_registry(node.target.value)
@@ -1931,20 +1958,92 @@ def _core_cli_command_names(
     tree: ast.Module,
     string_constants: dict[str, str],
 ) -> set[str]:
-    """Resolve the canonical dispatch dictionary without dropping keys."""
+    """Replay the canonical dispatch dictionary without dropping later keys."""
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "commands"
-            for target in node.targets
-        ):
-            continue
-        if not isinstance(node.value, ast.Dict):
-            raise AssertionError("Core CLI commands assignment is not a dictionary")
-        command_names: set[str] = set()
-        for key in node.value.keys:
+    def is_dispatch_lookup(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "commands"
+        )
+
+    def scope_contains(
+        scope: ast.FunctionDef | ast.AsyncFunctionDef,
+        predicate: Callable[[ast.AST], bool],
+    ) -> bool:
+        found = False
+
+        class DirectScopeVisitor(ast.NodeVisitor):
+            def visit(self, node: ast.AST) -> None:
+                nonlocal found
+                if found:
+                    return
+                if predicate(node):
+                    found = True
+                    return
+                super().visit(node)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+                return
+
+            def visit_AsyncFunctionDef(  # noqa: N802
+                self, node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+                return
+
+        visitor = DirectScopeVisitor()
+        for statement in scope.body:
+            visitor.visit(statement)
+        return found
+
+    scopes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    candidates = [
+        scope
+        for scope in scopes
+        if scope_contains(scope, is_dispatch_lookup)
+    ]
+    if not candidates:
+        candidates = [
+            scope
+            for scope in scopes
+            if scope_contains(
+                scope,
+                lambda node: isinstance(node, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(target, ast.Name) and target.id == "commands"
+                    for target in (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                ),
+            )
+        ]
+    if len(candidates) != 1:
+        raise AssertionError(
+            "Could not uniquely identify the core CLI command dispatch scope"
+        )
+    scope = candidates[0]
+
+    def dictionary_keys(node: ast.AST) -> set[str]:
+        if not isinstance(node, ast.Dict):
+            raise AssertionError(
+                "Core CLI commands mutation does not use a dictionary"
+            )
+        resolved: set[str] = set()
+        for key in node.keys:
             if key is None:
                 raise AssertionError(
                     "Core CLI command dispatch uses unresolved dictionary unpacking"
@@ -1955,7 +2054,87 @@ def _core_cli_command_names(
                     "Unresolved core CLI command key expression: "
                     f"{ast.unparse(key)}"
                 )
-            command_names.add(command)
+            resolved.add(command)
+        return resolved
+
+    command_names: set[str] | None = None
+    for statement in scope.body:
+        if any(is_dispatch_lookup(node) for node in ast.walk(statement)):
+            if command_names is None:
+                raise AssertionError(
+                    "Core CLI command dispatch is read before initialization"
+                )
+            return command_names
+        if isinstance(statement, ast.Assign):
+            if any(
+                isinstance(target, ast.Name) and target.id == "commands"
+                for target in statement.targets
+            ):
+                command_names = dictionary_keys(statement.value)
+                continue
+            command_keys = [
+                target.slice
+                for target in statement.targets
+                if isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "commands"
+            ]
+            if command_keys:
+                if command_names is None:
+                    raise AssertionError(
+                        "Core CLI command dispatch is mutated before initialization"
+                    )
+                for key in command_keys:
+                    command = _resolved_string(key, string_constants)
+                    if command is None:
+                        raise AssertionError(
+                            "Unresolved core CLI command key expression: "
+                            f"{ast.unparse(key)}"
+                        )
+                    command_names.add(command)
+                continue
+        if (
+            isinstance(statement, ast.AugAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == "commands"
+        ):
+            if command_names is None:
+                raise AssertionError(
+                    "Core CLI command dispatch is mutated before initialization"
+                )
+            if not isinstance(statement.op, ast.BitOr):
+                raise AssertionError("Unresolved core CLI command-map mutation")
+            command_names.update(dictionary_keys(statement.value))
+            continue
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and isinstance(statement.value.func.value, ast.Name)
+            and statement.value.func.value.id == "commands"
+        ):
+            call = statement.value
+            if command_names is None:
+                raise AssertionError(
+                    "Core CLI command dispatch is mutated before initialization"
+                )
+            if call.func.attr != "update" or len(call.args) > 1:
+                raise AssertionError("Unresolved core CLI command-map mutation")
+            if call.args:
+                command_names.update(dictionary_keys(call.args[0]))
+            if any(keyword.arg is None for keyword in call.keywords):
+                raise AssertionError("Unresolved core CLI command-map mutation")
+            command_names.update(
+                keyword.arg for keyword in call.keywords if keyword.arg is not None
+            )
+            continue
+        if command_names is not None and any(
+            isinstance(node, ast.Name) and node.id == "commands"
+            for node in ast.walk(statement)
+        ):
+            raise AssertionError("Unresolved core CLI command-map mutation")
+
+    if command_names is not None:
         return command_names
     raise AssertionError("Could not find the core CLI command dispatch dictionary")
 
@@ -2066,6 +2245,62 @@ def _dynamic_router_publication_surfaces(
                 merged.update(state)
             self.aliases[-1] = merged
 
+        def _binding_for(self, value: ast.AST) -> tuple[str, str] | None:
+            if isinstance(value, ast.Attribute):
+                if value.attr.casefold() == "include_router":
+                    return ast.unparse(value.value), "include_router"
+                return None
+            if isinstance(value, ast.Name):
+                return self.aliases[-1].get(value.id)
+            if isinstance(value, ast.IfExp):
+                branch_bindings = [
+                    binding
+                    for branch in (value.body, value.orelse)
+                    if (binding := self._binding_for(branch)) is not None
+                ]
+                if not branch_bindings:
+                    return None
+                if (
+                    len(branch_bindings) == 2
+                    and branch_bindings[0] == branch_bindings[1]
+                ):
+                    return branch_bindings[0]
+                return (
+                    branch_bindings[0][0],
+                    _UNRESOLVED_ROUTE_REGISTRATION,
+                )
+            return None
+
+        def _assignment_bindings(
+            self,
+            targets: list[ast.AST],
+            value: ast.AST,
+        ) -> dict[str, tuple[str, str]]:
+            pairs = [
+                pair
+                for target in targets
+                for pair in _static_assignment_pairs(target, value)
+            ]
+            if pairs:
+                return {
+                    name: binding
+                    for name, paired_value in pairs
+                    if (binding := self._binding_for(paired_value)) is not None
+                }
+            nested_bindings = [
+                binding
+                for child in ast.walk(value)
+                if (binding := self._binding_for(child)) is not None
+            ]
+            if not nested_bindings:
+                return {}
+            receiver = nested_bindings[0][0]
+            return {
+                name: (receiver, _UNRESOLVED_ROUTE_REGISTRATION)
+                for target in targets
+                for name in _assignment_target_names(target)
+            }
+
         def _visit_block(self, statements: list[ast.stmt]) -> None:
             for statement in statements:
                 if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
@@ -2081,24 +2316,17 @@ def _dynamic_router_publication_surfaces(
                     targets = [statement.target]
                     value = statement.value
                 target_names = {
-                    target.id
+                    name
                     for target in targets
-                    if isinstance(target, ast.Name)
+                    for name in _assignment_target_names(target)
                 }
                 for target_name in target_names:
                     self.aliases[-1].pop(target_name, None)
                 if value is None:
                     continue
-                binding: tuple[str, str] | None = None
-                if isinstance(value, ast.Attribute):
-                    if value.attr.casefold() == "include_router":
-                        binding = (ast.unparse(value.value), "include_router")
-                elif isinstance(value, ast.Name):
-                    binding = self.aliases[-1].get(value.id)
-                if binding is not None:
-                    self.aliases[-1].update(
-                        {target_name: binding for target_name in target_names}
-                    )
+                self.aliases[-1].update(
+                    self._assignment_bindings(targets, value)
+                )
 
         def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
             self._visit_block(node.body)
@@ -3278,6 +3506,19 @@ def test_dynamic_tool_registry_aliases_flow_into_nested_functions() -> None:
     }
 
 
+def test_dynamic_tool_registry_resolves_destructured_aliases() -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def publish(self, tool):\n"
+        "        registry, ignored = self._direct_tools, None\n"
+        "        registry['x'] = tool\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.publish"
+    }
+
+
 def test_every_core_signal_source_and_builtin_handler_is_classified() -> None:
     discovered = _discovered_core_signal_source_surfaces()
     assert discovered == _documented_surfaces(
@@ -3476,6 +3717,18 @@ def test_signal_source_constructor_import_aliases_are_resolved() -> None:
     assert _call_name(module_constructors[0]) == "Registration"
 
 
+def test_signal_source_constructor_annotated_aliases_are_resolved() -> None:
+    tree = ast.parse(
+        "Registration: type = SourceRegistration\n"
+        "Registration(name='annotated.source')\n"
+    )
+
+    assert "Registration" in _source_registration_constructor_aliases(tree)
+    constructors = _source_registration_constructors(tree)
+    assert len(constructors) == 1
+    assert _call_name(constructors[0]) == "Registration"
+
+
 def test_signal_source_registration_subclasses_are_resolved() -> None:
     local_subclass = ast.parse(
         "class Specialized(SourceRegistration):\n"
@@ -3548,6 +3801,18 @@ def test_dynamic_router_publication_resolves_bound_aliases() -> None:
     }
 
 
+def test_dynamic_router_publication_resolves_destructured_aliases() -> None:
+    tree = ast.parse(
+        "def mount(app, router):\n"
+        "    publish, ignored = app.include_router, noop\n"
+        "    publish(router)\n"
+    )
+
+    assert _dynamic_router_publication_surfaces(tree, "example.py") == {
+        "example.py::mount.include_router[0]"
+    }
+
+
 def test_relation_free_control_names_are_still_discovered() -> None:
     """A control door need not say ``agent`` or ``task`` to cross a boundary."""
 
@@ -3610,6 +3875,24 @@ def test_core_cli_command_keys_resolve_constants_and_fail_closed() -> None:
     )
     with pytest.raises(AssertionError, match="unresolved dictionary unpacking"):
         _core_cli_command_names(unpacked, {})
+
+
+def test_core_cli_command_inventory_replays_dispatch_map_mutations() -> None:
+    tree = ast.parse(
+        "def helper():\n"
+        "    commands = {'irrelevant': noop}\n\n"
+        "def dispatch():\n"
+        "    commands = {'start': start}\n"
+        "    commands['terminate'] = terminate\n"
+        "    commands.update({'restart': restart})\n"
+        "    handler = commands.get(args.command)\n"
+    )
+
+    assert _core_cli_command_names(tree, {}) == {
+        "start",
+        "terminate",
+        "restart",
+    }
 
 
 def test_every_cross_agent_http_route_is_classified() -> None:
