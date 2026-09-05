@@ -1514,8 +1514,62 @@ def _static_alias_closure(
     return aliases
 
 
-def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
-    """Resolve import and lexical-scope aliases for the ``tool`` decorator."""
+def _call_produced_decorator_bindings(
+    statements: list[ast.stmt],
+    is_factory_call: Callable[[ast.Call], bool],
+    inherited: dict[str, ast.Call] | None = None,
+) -> dict[str, ast.Call]:
+    """Resolve names bound to the result of a static decorator-factory call.
+
+    Both FastAPI registrations and ``@tool`` are callable factories: their
+    first call returns a decorator that may be stored, aliased, and applied
+    later.  Keep that Python binding behavior in one source-ordered flow so
+    neither inventory silently depends on the two calls being adjacent.
+    """
+
+    calls_by_key: dict[str, ast.Call] = {}
+
+    def binding_for(call: ast.Call) -> _StaticBinding:
+        key = str(id(call))
+        calls_by_key[key] = call
+        return "decorator-factory", key
+
+    initial_bindings = {
+        name: binding_for(call) for name, call in (inherited or {}).items()
+    }
+
+    def direct(value: ast.AST) -> _StaticBinding | None:
+        if isinstance(value, ast.Call) and is_factory_call(value):
+            return binding_for(value)
+        return None
+
+    def ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+        if bindings and all(binding == bindings[0] for binding in bindings[1:]):
+            return bindings[0]
+        return "decorator-factory", "<unresolved>"
+
+    flow = _StaticBindingFlow(direct, ambiguous, initial_bindings)
+    flow.replay(statements)
+    unresolved = [
+        name for name, binding in flow.bindings.items()
+        if binding == ("decorator-factory", "<unresolved>")
+    ]
+    if unresolved:
+        raise AssertionError(
+            "Ambiguous stored decorator factory: "
+            + ", ".join(sorted(unresolved))
+        )
+    return {
+        name: calls_by_key[binding[1]]
+        for name, binding in flow.bindings.items()
+        if binding[0] == "decorator-factory" and binding[1] in calls_by_key
+    }
+
+
+def _tool_decorator_aliases(
+    tree: ast.Module,
+) -> dict[str, ast.Call | None]:
+    """Resolve direct and call-produced aliases of the ``tool`` decorator."""
 
     aliases = {"tool"}
     for node in ast.walk(tree):
@@ -1523,7 +1577,42 @@ def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
             for imported in node.names:
                 if imported.name == "tool":
                     aliases.add(imported.asname or imported.name)
-    return _static_alias_closure(aliases, _static_alias_edges(tree))
+    aliases = _static_alias_closure(aliases, _static_alias_edges(tree))
+
+    produced: dict[str, ast.Call] = {}
+    scopes = [tree.body]
+    scopes.extend(
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+    )
+    for statements in scopes:
+        local = _call_produced_decorator_bindings(
+            statements,
+            lambda call: (
+                (
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                )
+                in aliases
+            ),
+        )
+        for name, call in local.items():
+            previous = produced.get(name)
+            if previous is not None and ast.dump(
+                previous, include_attributes=False
+            ) != ast.dump(call, include_attributes=False):
+                raise AssertionError(
+                    f"Ambiguous stored @tool decorator factory: {name}"
+                )
+            produced[name] = call
+    return {**dict.fromkeys(aliases), **produced}
 
 
 def test_module_string_constants_follow_source_order_on_reassignment() -> None:
@@ -1710,7 +1799,7 @@ def _public_tool_name(
     decorator: ast.expr,
     fallback: str,
     constants: dict[str, str] | None = None,
-    decorator_aliases: set[str] | None = None,
+    decorator_aliases: dict[str, ast.Call | None] | None = None,
 ) -> str | None:
     call = decorator if isinstance(decorator, ast.Call) else None
     function = call.func if call is not None else decorator
@@ -1721,8 +1810,12 @@ def _public_tool_name(
         if isinstance(function, ast.Attribute)
         else ""
     )
-    if decorator_name not in (decorator_aliases or {"tool"}):
+    aliases = decorator_aliases or {"tool": None}
+    if decorator_name not in aliases:
         return None
+    stored_factory = aliases[decorator_name]
+    if call is None and stored_factory is not None:
+        call = stored_factory
     if call is None:
         return fallback
     if any(keyword.arg is None for keyword in call.keywords):
@@ -3820,6 +3913,41 @@ def _scope_route_callable_aliases(
     return flow.bindings
 
 
+def _scope_route_decorator_factories(
+    statements: list[ast.stmt],
+    prefixes: dict[str, str],
+    route_aliases: dict[str, tuple[str, str]],
+    inherited: dict[str, ast.Call] | None = None,
+) -> dict[str, ast.Call]:
+    """Resolve stored decorators returned by bound FastAPI registrations."""
+
+    return _call_produced_decorator_bindings(
+        statements,
+        lambda call: (
+            _route_registration_name(call, route_aliases)
+            in {
+                "api_route",
+                "delete",
+                "get",
+                "head",
+                "options",
+                "patch",
+                "post",
+                "put",
+                "route",
+                "trace",
+                "websocket",
+                "websocket_route",
+            }
+            and (
+                (receiver := _route_receiver_name(call, route_aliases)) == "app"
+                or receiver in prefixes
+            )
+        ),
+        inherited,
+    )
+
+
 def _route_registration_name(
     call: ast.Call,
     aliases: dict[str, tuple[str, str]] | None = None,
@@ -3889,11 +4017,67 @@ def _programmatic_route_path(
     return f"<dynamic:{ast.unparse(path_node)}>"
 
 
+def _route_object_methods_and_path(
+    route_object: ast.AST,
+    active_strings: dict[str, str],
+    active_methods: dict[str, tuple[str, ...]],
+) -> tuple[tuple[str, ...], str]:
+    """Decode one statically constructed Starlette/FastAPI route object."""
+
+    if not isinstance(route_object, ast.Call):
+        raise AssertionError(
+            "Unresolved route object publication: "
+            f"{ast.unparse(route_object)}"
+        )
+    constructor = _call_name(route_object)
+    if constructor in {
+        "APIWebSocketRoute",
+        "StarletteWebSocketRoute",
+        "WebSocketRoute",
+    }:
+        methods = ("WEBSOCKET",)
+    elif constructor == "Mount":
+        methods = ("MOUNT",)
+    elif constructor in {"APIRoute", "Route", "StarletteRoute"}:
+        method_expression = next(
+            (
+                keyword.value
+                for keyword in route_object.keywords
+                if keyword.arg == "methods"
+            ),
+            None,
+        )
+        if method_expression is None and len(route_object.args) >= 3:
+            method_expression = route_object.args[2]
+        registration = "api_route" if constructor == "APIRoute" else "route"
+        synthetic = ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id="router", ctx=ast.Load()),
+                attr=registration,
+                ctx=ast.Load(),
+            ),
+            args=[route_object.args[0]] if route_object.args else [],
+            keywords=(
+                [ast.keyword(arg="methods", value=method_expression)]
+                if method_expression is not None
+                else []
+            ),
+        )
+        methods = _route_methods(synthetic, active_methods)
+    else:
+        raise AssertionError(
+            "Unsupported route object publication: "
+            f"{ast.unparse(route_object)}"
+        )
+    return methods, _programmatic_route_path(route_object, active_strings)
+
+
 def _fastapi_generated_route_declarations(
     statements: list[ast.stmt],
     constants: dict[str, str],
+    method_constants: dict[str, tuple[str, ...]],
 ) -> list[tuple[tuple[str, ...], str]]:
-    """Return FastAPI's constructor-generated OpenAPI/documentation doors."""
+    """Return FastAPI constructor-supplied and generated route doors."""
 
     declarations: list[tuple[tuple[str, ...], str]] = []
 
@@ -3920,6 +4104,29 @@ def _fastapi_generated_route_declarations(
         value = statement.value
         if not isinstance(value, ast.Call) or _call_name(value) != "FastAPI":
             continue
+        routes_keyword = next(
+            (item for item in value.keywords if item.arg == "routes"),
+            None,
+        )
+        if routes_keyword is not None:
+            route_values = routes_keyword.value
+            if isinstance(route_values, ast.Constant) and route_values.value is None:
+                route_objects: list[ast.AST] = []
+            elif isinstance(route_values, (ast.List, ast.Tuple, ast.Set)):
+                route_objects = list(route_values.elts)
+            else:
+                raise AssertionError(
+                    "Unresolved FastAPI constructor routes: "
+                    f"{ast.unparse(route_values)}"
+                )
+            declarations.extend(
+                _route_object_methods_and_path(
+                    route_object,
+                    constants,
+                    method_constants,
+                )
+                for route_object in route_objects
+            )
         openapi_path = optional_path(value, "openapi_url", "/openapi.json")
         if openapi_path is None:
             continue
@@ -3976,6 +4183,11 @@ def _route_declarations(
     module_runtime_route_aliases = _scope_route_callable_aliases(
         tree.body, module_runtime_prefixes
     )
+    module_runtime_route_factories = _scope_route_decorator_factories(
+        tree.body,
+        module_runtime_prefixes,
+        module_runtime_route_aliases,
+    )
 
     def route_collection_receiver(expression: ast.AST) -> str | None:
         if not isinstance(expression, ast.Attribute) or expression.attr != "routes":
@@ -3998,47 +4210,11 @@ def _route_declarations(
         active_methods: dict[str, tuple[str, ...]],
         prefixes: dict[str, str],
     ) -> tuple[tuple[str, ...], str]:
-        if not isinstance(route_object, ast.Call):
-            raise AssertionError(
-                "Unresolved route object publication: "
-                f"{ast.unparse(route_object)}"
-            )
-        constructor = _call_name(route_object)
-        if constructor in {"APIWebSocketRoute", "StarletteWebSocketRoute", "WebSocketRoute"}:
-            methods = ("WEBSOCKET",)
-        elif constructor == "Mount":
-            methods = ("MOUNT",)
-        elif constructor in {"APIRoute", "Route", "StarletteRoute"}:
-            method_expression = next(
-                (
-                    keyword.value
-                    for keyword in route_object.keywords
-                    if keyword.arg == "methods"
-                ),
-                None,
-            )
-            if method_expression is None and len(route_object.args) >= 3:
-                method_expression = route_object.args[2]
-            registration = "api_route" if constructor == "APIRoute" else "route"
-            synthetic = ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="router", ctx=ast.Load()),
-                    attr=registration,
-                    ctx=ast.Load(),
-                ),
-                args=[route_object.args[0]] if route_object.args else [],
-                keywords=(
-                    [ast.keyword(arg="methods", value=method_expression)]
-                    if method_expression is not None
-                    else []
-                ),
-            )
-            methods = _route_methods(synthetic, active_methods)
-        else:
-            raise AssertionError(
-                "Unsupported route object publication: "
-                f"{ast.unparse(route_object)}"
-            )
+        methods, path = _route_object_methods_and_path(
+            route_object,
+            active_strings,
+            active_methods,
+        )
 
         receiver = route_collection_receiver(collection)
         if receiver == "app":
@@ -4052,7 +4228,7 @@ def _route_declarations(
             )
         return (
             methods,
-            prefix + _programmatic_route_path(route_object, active_strings),
+            prefix + path,
         )
 
     def appended_route_objects(call: ast.Call) -> tuple[ast.AST, list[ast.AST]] | None:
@@ -4137,6 +4313,7 @@ def _route_declarations(
         inherited_strings: dict[str, str],
         inherited_methods: dict[str, tuple[str, ...]],
         inherited_route_aliases: dict[str, tuple[str, str]],
+        inherited_route_factories: dict[str, ast.Call],
         *,
         module_scope: bool = False,
         class_body_uses_module_globals: bool = False,
@@ -4148,6 +4325,7 @@ def _route_declarations(
             active_strings: dict[str, str],
             active_methods: dict[str, tuple[str, ...]],
             active_route_aliases: dict[str, tuple[str, str]],
+            active_route_factories: dict[str, ast.Call],
         ) -> None:
             if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
                 disturbed = _compound_binding_names(
@@ -4170,6 +4348,7 @@ def _route_declarations(
                         nested_strings,
                         nested_methods,
                         active_route_aliases,
+                        active_route_factories,
                     )
                 for block in blocks:
                     # A registration alias can be introduced and consumed in
@@ -4183,6 +4362,7 @@ def _route_declarations(
                         nested_strings,
                         nested_methods,
                         active_route_aliases,
+                        active_route_factories,
                         module_scope=module_scope,
                         class_body_uses_module_globals=(
                             class_body_uses_module_globals
@@ -4191,17 +4371,24 @@ def _route_declarations(
                 return
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
-                    if not isinstance(decorator, ast.Call):
+                    route_decorator = (
+                        decorator
+                        if isinstance(decorator, ast.Call)
+                        else active_route_factories.get(decorator.id)
+                        if isinstance(decorator, ast.Name)
+                        else None
+                    )
+                    if route_decorator is None:
                         continue
                     methods = _route_methods(
-                        decorator,
+                        route_decorator,
                         active_methods,
                         active_route_aliases,
                     )
                     if not methods:
                         continue
                     receiver = _route_receiver_name(
-                        decorator, active_route_aliases
+                        route_decorator, active_route_aliases
                     )
                     if receiver == "app":
                         prefix = ""
@@ -4210,10 +4397,14 @@ def _route_declarations(
                     else:
                         raise AssertionError(
                             "Unresolved route decorator receiver: "
-                            f"{ast.unparse(decorator.func)}"
+                            f"{ast.unparse(route_decorator.func)}"
                         )
                     declarations.append(
-                        (methods, prefix + _route_path(decorator, active_strings))
+                        (
+                            methods,
+                            prefix
+                            + _route_path(route_decorator, active_strings),
+                        )
                     )
                 # Top-level function bodies run after module initialization,
                 # as do methods defined in a top-level class. Nested functions
@@ -4240,12 +4431,18 @@ def _route_declarations(
                     if module_scope or class_body_uses_module_globals
                     else active_route_aliases
                 )
+                child_route_factories = (
+                    module_runtime_route_factories
+                    if module_scope or class_body_uses_module_globals
+                    else active_route_factories
+                )
                 walk_scope(
                     node.body,
                     child_prefixes,
                     child_strings,
                     child_methods,
                     child_route_aliases,
+                    child_route_factories,
                 )
                 return
             if isinstance(node, ast.ClassDef):
@@ -4255,6 +4452,7 @@ def _route_declarations(
                     active_strings,
                     active_methods,
                     active_route_aliases,
+                    active_route_factories,
                     class_body_uses_module_globals=(
                         module_scope or class_body_uses_module_globals
                     ),
@@ -4296,7 +4494,11 @@ def _route_declarations(
                         for route_object in route_objects
                     )
                 decorator_factory = (
-                    node.func if isinstance(node.func, ast.Call) else None
+                    node.func
+                    if isinstance(node.func, ast.Call)
+                    else active_route_factories.get(node.func.id)
+                    if isinstance(node.func, ast.Name)
+                    else None
                 )
                 factory_registration = (
                     _route_registration_name(
@@ -4435,6 +4637,7 @@ def _route_declarations(
                     active_strings,
                     active_methods,
                     active_route_aliases,
+                    active_route_factories,
                 )
 
         for index, statement in enumerate(statements):
@@ -4451,7 +4654,7 @@ def _route_declarations(
             if module_scope:
                 declarations.extend(
                     _fastapi_generated_route_declarations(
-                        [statement], active_strings
+                        [statement], active_strings, active_methods
                     )
                 )
             new_prefixes = _scope_router_prefixes(
@@ -4468,14 +4671,21 @@ def _route_declarations(
             active_route_aliases = _scope_route_callable_aliases(
                 statements[:index], prefixes, inherited_route_aliases
             )
+            active_route_factories = _scope_route_decorator_factories(
+                statements[:index],
+                prefixes,
+                active_route_aliases,
+                inherited_route_factories,
+            )
             visit(
                 statement,
                 active_strings,
                 active_methods,
                 active_route_aliases,
+                active_route_factories,
             )
 
-    walk_scope(tree.body, {}, {}, {}, {}, module_scope=True)
+    walk_scope(tree.body, {}, {}, {}, {}, {}, module_scope=True)
     return declarations
 
 
@@ -6051,6 +6261,9 @@ def test_decorator_factory_route_registrations_are_inventoried() -> None:
         'router.websocket("/agents/{agent}/events")(socket_handler)\n'
         'publish = app.patch\n'
         'publish("/api/agents/{agent}/restart")(handler)\n'
+        'stored = router.delete("/agents/{agent}/terminate")\n'
+        'stored_alias = stored\n'
+        'stored_alias(handler)\n'
     )
 
     assert _route_declarations(tree, {}, {}) == [
@@ -6058,6 +6271,7 @@ def test_decorator_factory_route_registrations_are_inventoried() -> None:
         (("POST", "DELETE"), "/api/agents/{agent}/hold"),
         (("WEBSOCKET",), "/api/agents/{agent}/events"),
         (("PATCH",), "/api/agents/{agent}/restart"),
+        (("DELETE",), "/api/agents/{agent}/terminate"),
     ]
 
 
@@ -6112,6 +6326,22 @@ def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
     docs_disabled = ast.parse("app = FastAPI(docs_url=None)\n")
     assert _route_declarations(docs_disabled, {}, {}) == [
         (("GET", "HEAD"), "/openapi.json"),
+        (("GET", "HEAD"), "/redoc"),
+    ]
+
+    supplied_routes = ast.parse(
+        'app = FastAPI(routes=[\n'
+        '    Route("/api/agents/{name}/terminate", endpoint, '
+        'methods=["DELETE"]),\n'
+        '    WebSocketRoute("/api/agents/{name}/events", socket_endpoint),\n'
+        '])\n'
+    )
+    assert _route_declarations(supplied_routes, {}, {}) == [
+        (("DELETE",), "/api/agents/{name}/terminate"),
+        (("WEBSOCKET",), "/api/agents/{name}/events"),
+        (("GET", "HEAD"), "/openapi.json"),
+        (("GET", "HEAD"), "/docs"),
+        (("GET", "HEAD"), "/docs/oauth2-redirect"),
         (("GET", "HEAD"), "/redoc"),
     ]
 
@@ -6311,6 +6541,25 @@ def test_tool_decorator_aliases_include_annotated_bindings() -> None:
         {},
         _tool_decorator_aliases(tree),
     ) == "annotated_tool"
+
+
+def test_call_produced_tool_decorators_are_inventoried() -> None:
+    tree = ast.parse(
+        'publish = tool("terminate_child", "Terminate a child")\n'
+        "publish_alias = publish\n"
+        "@publish_alias\n"
+        "def implementation(target):\n"
+        "    pass\n"
+    )
+    function = tree.body[2]
+    assert isinstance(function, ast.FunctionDef)
+
+    assert _public_tool_name(
+        function.decorator_list[0],
+        function.name,
+        {},
+        _tool_decorator_aliases(tree),
+    ) == "terminate_child"
 
 
 def test_repository_scans_reuse_parsed_trees_and_analysis_summaries(
@@ -8119,6 +8368,46 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
         return sources
     if factory_name in {"partial", "partialmethod"} and node.args:
         return _control_reference_sources(node.args[0])
+    # Type adapters and decorator helpers preserve a callable argument in
+    # their return value.  Do not generalize this to every call: an ordinary
+    # consumer may accept a callback without returning it, and treating that
+    # result as callable creates fleet-wide false positives.
+    wrapper_names = {
+        "cache",
+        "cast",
+        "identity",
+        "lru_cache",
+        "singledispatch",
+        "singledispatchmethod",
+        "update_wrapper",
+        "wraps",
+    }
+    nested_factory_name = (
+        _call_name(node.func).casefold()
+        if isinstance(node.func, ast.Call)
+        else ""
+    )
+    if factory_name in wrapper_names or nested_factory_name in wrapper_names:
+        return {
+            source
+            for argument in [
+                *(
+                    [*node.func.args, *node.args]
+                    if isinstance(node.func, ast.Call)
+                    else node.args
+                ),
+                *(
+                    keyword.value
+                    for call in (
+                        [node.func, node]
+                        if isinstance(node.func, ast.Call)
+                        else [node]
+                    )
+                    for keyword in call.keywords
+                ),
+            ]
+            for source in _control_reference_sources(argument)
+        }
     return set()
 
 
@@ -12542,10 +12831,31 @@ def test_provenance_scanner_follows_callable_control_factories() -> None:
         "    if request.causation_chain:\n"
         "        getattr(manager, 'terminate_child')(target)\n"
     )
+    wrapped_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = cast(Callable, terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    keyword_wrapped_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = identity(value=terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    decorator_wrapped_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = wraps(terminate_child)(terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
 
     assert _authority_provenance_lines(getattr_callback) == {3}
     assert _authority_provenance_lines(partial_callback) == {5}
     assert _authority_provenance_lines(direct_getattr) == {2}
+    assert _authority_provenance_lines(wrapped_callback) == {3}
+    assert _authority_provenance_lines(keyword_wrapped_callback) == {3}
+    assert _authority_provenance_lines(decorator_wrapped_callback) == {3}
 
 
 def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> None:
