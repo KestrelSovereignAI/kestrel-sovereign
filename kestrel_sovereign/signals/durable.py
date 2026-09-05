@@ -14,10 +14,13 @@ from acknowledging a delivery that was reclaimed by another executor.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
+import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -34,7 +37,7 @@ from typing import (
     runtime_checkable,
 )
 
-from kestrel_sdk.signals import Signal
+from kestrel_sdk.signals import RateLimit, Signal
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.signals.store import _json_default, _serialize_chain
@@ -85,6 +88,93 @@ _POSTGRES_SOURCE_SEQUENCE_COUNTER_FUNCTION_PREFIX = (
 )
 _POSTGRES_SOURCE_SEQUENCE_BACKFILL_BATCH_SIZE = 256
 _POSTGRES_SOURCE_SEQUENCE_INDEX_LOCK = (0x4B455354, 0x53455149)
+
+
+def _runtime_owner_lock_platform_name() -> str:
+    """Return the native file-lock lane (a seam for cross-platform tests)."""
+
+    return os.name
+
+
+def _try_lock_windows_runtime_owner_descriptor(
+    descriptor: int,
+) -> tuple[bool, Any]:
+    """Try one exclusive Windows byte-range lock without blocking."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    overlapped = _Overlapped()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    claimed = kernel32.LockFileEx(
+        wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
+        0x00000002 | 0x00000001,  # EXCLUSIVE | FAIL_IMMEDIATELY
+        0,
+        1,
+        0,
+        ctypes.byref(overlapped),
+    )
+    if claimed:
+        return True, overlapped
+    error_code = ctypes.get_last_error()
+    if error_code == 33:  # ERROR_LOCK_VIOLATION: another runtime owns it.
+        return False, None
+    raise ctypes.WinError(error_code)
+
+
+def _unlock_windows_runtime_owner_descriptor(descriptor: int, token: Any) -> None:
+    """Release a Windows byte-range lock acquired above."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.UnlockFileEx(
+        wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
+        0,
+        1,
+        0,
+        ctypes.byref(token),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _try_lock_runtime_owner_descriptor(descriptor: int) -> tuple[bool, Any]:
+    """Try the platform's process-wide exclusive advisory file lock."""
+
+    if _runtime_owner_lock_platform_name() == "nt":
+        return _try_lock_windows_runtime_owner_descriptor(descriptor)
+
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False, None
+    return True, None
+
+
+def _unlock_runtime_owner_descriptor(descriptor: int, token: Any) -> None:
+    """Release the platform advisory lock acquired above."""
+
+    if _runtime_owner_lock_platform_name() == "nt":
+        _unlock_windows_runtime_owner_descriptor(descriptor, token)
+        return
+
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
 _SOURCE_SEQUENCE_LOSS_ERROR = (
     "both exact counter copies were lost for a previously seen scope "
     "or provide no positive high-water evidence"
@@ -908,6 +998,10 @@ class DurableEventPersistence:
     retention_until: Optional[datetime] = None
     initial_reservations: tuple["DurableInitialDeliveryReservation", ...] = ()
     source_sequence: Optional[int] = None
+    # True only when this newly-created event was retained as the durable
+    # receipt for an authority-bearing rate-limit refusal.  It never consumes
+    # a rate admission itself.
+    rate_limited: bool = False
 
 
 @dataclass(frozen=True)
@@ -1037,6 +1131,10 @@ class DurableSignalStore(UnifiedStoreBase):
     # Payload-eliding privacy modes cannot retain their canonical input in the
     # event row. This side table stores only a fixed-width integrity binding.
     EVENT_INTEGRITY = "durable_signal_event_integrity"
+    # Admission timestamps for sources whose rate limits are authority-bearing
+    # across restarts.  This is deliberately separate from event retention:
+    # deleting a zero-retention event must not replenish an hourly allowance.
+    RATE_ADMISSIONS = "durable_signal_rate_admissions"
 
     def __init__(self, backend: DatabaseBackend):
         # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
@@ -1239,6 +1337,14 @@ class DurableSignalStore(UnifiedStoreBase):
                 integrity_binding TEXT NOT NULL,
                 FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
                     ON DELETE CASCADE
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.RATE_ADMISSIONS} (
+                event_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                admitted_at {ts_type} NOT NULL
             )
             """,
         )
@@ -3199,6 +3305,10 @@ class DurableSignalStore(UnifiedStoreBase):
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
             f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
         )
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.RATE_ADMISSIONS}_scope_time "
+            f"ON {self.RATE_ADMISSIONS}(agent_id, source, admitted_at)"
+        )
 
     # ------------------------------------------------------------------
     # Subscription registration and event persistence
@@ -3402,6 +3512,9 @@ class DurableSignalStore(UnifiedStoreBase):
         integrity_binding: Optional[str] = None,
         caller_identity: Optional[str] = None,
         caller_identity_factory: Optional[Callable[[], str]] = None,
+        durable_rate_limit: Optional[RateLimit] = None,
+        exclusive_runtime_owner_id: Optional[str] = None,
+        runtime_owner_stale_after: Optional[timedelta] = None,
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
     ) -> DurableEventPersistence:
@@ -3435,6 +3548,12 @@ class DurableSignalStore(UnifiedStoreBase):
         callbacks are synchronous deliberately:
         yielding between installing the sidecar and committing would reopen
         the very visibility race this handoff closes.
+
+        ``durable_rate_limit`` is checked and recorded under the same
+        agent/source handoff as event identity. A refused attempt retains its
+        event receipt but not a quota admission. ``exclusive_runtime_owner_id``
+        additionally makes runtime-local ACTION inventory fail closed whenever
+        the liveness ledger shows zero or multiple owners for the agent.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -3455,6 +3574,18 @@ class DurableSignalStore(UnifiedStoreBase):
             )
         if caller_identity_factory is not None and not callable(caller_identity_factory):
             raise ValueError("caller_identity_factory must be callable when set")
+        if (exclusive_runtime_owner_id is None) != (
+            runtime_owner_stale_after is None
+        ):
+            raise ValueError(
+                "exclusive runtime owner and stale boundary must be supplied together"
+            )
+        if exclusive_runtime_owner_id is not None:
+            self._require_nonempty(
+                "exclusive_runtime_owner_id", exclusive_runtime_owner_id
+            )
+            if runtime_owner_stale_after.total_seconds() <= 0:
+                raise ValueError("runtime_owner_stale_after must be positive")
         source_event_id = self._normalize_source_event_id(source_event_id)
         payload_json = _json_dump(signal.payload)
         chain_json = _json_dump(_serialize_chain(signal.causation_chain))
@@ -3480,6 +3611,20 @@ class DurableSignalStore(UnifiedStoreBase):
                 # handoff lock. Start persisted event timing only after that
                 # contention has cleared, never from method entry.
                 now = self.now_utc()
+                if exclusive_runtime_owner_id is not None:
+                    await self._require_exclusive_runtime_owner_locked(
+                        agent_id=agent_id,
+                        owner_id=exclusive_runtime_owner_id,
+                        stale_before=now - runtime_owner_stale_after,
+                    )
+                rate_limited = False
+                if durable_rate_limit is not None:
+                    rate_limited = await self._durable_rate_limit_exceeded_locked(
+                        agent_id=agent_id,
+                        source=signal.source,
+                        rate_limit=durable_rate_limit,
+                        now=now,
+                    )
                 retention_until = now + timedelta(days=retention_days)
                 source_sequence = await self._advance_source_sequence_locked(
                     agent_id=agent_id, source=signal.source
@@ -3551,13 +3696,33 @@ class DurableSignalStore(UnifiedStoreBase):
                         (signal.id, integrity_binding),
                     )
 
-                consumer_rows = await self._backend.fetch_all(
-                    f"""
-                    SELECT consumer_id, correlation_selector, max_attempts, lease_seconds
-                    FROM {self.CONSUMERS}
-                    WHERE agent_id = ? AND source = ? AND active = ?
-                    """,
-                    (agent_id, signal.source, self.to_bool_param(True)),
+                if durable_rate_limit is not None and not rate_limited:
+                    await self._backend.execute(
+                        f"""
+                        INSERT INTO {self.RATE_ADMISSIONS} (
+                            event_id, agent_id, source, admitted_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            signal.id,
+                            agent_id,
+                            signal.source,
+                            self.to_timestamp_param(now),
+                        ),
+                    )
+
+                consumer_rows = (
+                    []
+                    if rate_limited
+                    else await self._backend.fetch_all(
+                        f"""
+                        SELECT consumer_id, correlation_selector, max_attempts,
+                               lease_seconds
+                        FROM {self.CONSUMERS}
+                        WHERE agent_id = ? AND source = ? AND active = ?
+                        """,
+                        (agent_id, signal.source, self.to_bool_param(True)),
+                    )
                 )
                 event = self._event_from_signal(
                     signal,
@@ -3608,6 +3773,7 @@ class DurableSignalStore(UnifiedStoreBase):
                     retention_until=retention_until,
                     initial_reservations=tuple(initial_reservations),
                     source_sequence=source_sequence,
+                    rate_limited=rate_limited,
                 )
                 if before_commit is not None:
                     before_commit(persistence)
@@ -3617,6 +3783,54 @@ class DurableSignalStore(UnifiedStoreBase):
             raise
         assert persistence is not None
         return persistence
+
+    async def _durable_rate_limit_exceeded_locked(
+        self,
+        *,
+        agent_id: str,
+        source: str,
+        rate_limit: RateLimit,
+        now: datetime,
+    ) -> bool:
+        """Check one restart-stable per-source quota under its handoff lock."""
+
+        cutoff_hour = now - timedelta(hours=1)
+        await self._backend.execute(
+            f"""
+            DELETE FROM {self.RATE_ADMISSIONS}
+            WHERE agent_id = ? AND source = ? AND admitted_at < ?
+            """,
+            (agent_id, source, self.to_timestamp_param(cutoff_hour)),
+        )
+
+        async def count_since(cutoff: datetime) -> int:
+            return int(
+                await self._backend.fetch_val(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {self.RATE_ADMISSIONS}
+                    WHERE agent_id = ? AND source = ? AND admitted_at >= ?
+                    """,
+                    (agent_id, source, self.to_timestamp_param(cutoff)),
+                )
+                or 0
+            )
+
+        if (
+            rate_limit.per_hour is not None
+            and await count_since(cutoff_hour) >= rate_limit.per_hour
+        ):
+            return True
+        if (
+            rate_limit.per_minute is not None
+            and await count_since(now - timedelta(minutes=1))
+            >= rate_limit.per_minute
+        ):
+            return True
+        return bool(
+            rate_limit.burst is not None
+            and await count_since(now - timedelta(seconds=1)) >= rate_limit.burst
+        )
 
     async def upgrade_legacy_delivery_for_redelivery(
         self,
@@ -4209,15 +4423,70 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
-        async with self._backend.transaction():
-            await self._lock_runtime_owner_scope(agent_id=agent_id)
-            # Entering this transaction may wait behind a real writer.  A
-            # default timestamp is liveness evidence, so sample it only after
-            # that contention clears rather than publishing an old heartbeat.
-            touch_now = requested_now or self.now_utc()
-            await self._touch_runtime_owner_locked(
-                agent_id=agent_id, owner_id=owner_id, now=touch_now
-            )
+        async with self._runtime_owner_liveness_fence(
+            agent_id=agent_id
+        ) as transaction_open:
+            if transaction_open:
+                touch_now = requested_now or self.now_utc()
+                await self._touch_runtime_owner_locked(
+                    agent_id=agent_id, owner_id=owner_id, now=touch_now
+                )
+            else:
+                async with self._backend.transaction():
+                    await self._lock_runtime_owner_scope(agent_id=agent_id)
+                    # Entering this transaction may wait behind a real writer.
+                    # Sample default liveness only after contention clears.
+                    touch_now = requested_now or self.now_utc()
+                    await self._touch_runtime_owner_locked(
+                        agent_id=agent_id, owner_id=owner_id, now=touch_now
+                    )
+
+    @asynccontextmanager
+    async def fence_runtime_local_action(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        stale_after: timedelta,
+    ) -> AsyncIterator[None]:
+        """Keep the sole live runtime inventory stable through one ACTION.
+
+        Peer Stop mutates process-local work. Merely sampling the owner ledger
+        when its event is committed leaves a check/use gap in which another
+        dispatcher can register and expose uncancelled work under the same DID.
+        Registration and heartbeat take the same tenant-wide liveness fence as
+        this execution path. Holding it through the bounded action therefore
+        makes the sole-owner decision and the local mutation one indivisible
+        cross-process boundary.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        if stale_after.total_seconds() <= 0:
+            raise ValueError("stale_after must be positive")
+        async with self._runtime_owner_liveness_fence(
+            agent_id=agent_id
+        ) as transaction_open:
+            if transaction_open:
+                now = self.now_utc()
+                await self._require_exclusive_runtime_owner_locked(
+                    agent_id=agent_id,
+                    owner_id=owner_id,
+                    stale_before=now - stale_after,
+                )
+                yield
+            else:
+                # SQLite uses an OS lock for registration exclusion so the
+                # cancelled request remains free to finish its own database
+                # cleanup. Keep the database transaction only for this check.
+                async with self._backend.transaction():
+                    await self._lock_runtime_owner_scope(agent_id=agent_id)
+                    now = self.now_utc()
+                    await self._require_exclusive_runtime_owner_locked(
+                        agent_id=agent_id,
+                        owner_id=owner_id,
+                        stale_before=now - stale_after,
+                    )
+                yield
 
     async def heartbeat_runtime_owner(
         self,
@@ -4230,18 +4499,25 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("owner_id", owner_id)
         requested_now = _as_utc(now) if now is not None else None
-        async with self._backend.transaction():
-            # Recovery uses this exact scope before it decides whether a
-            # managed lease owner is stale.  Without the common lock a
-            # PostgreSQL recovery snapshot can classify the old heartbeat as
-            # stale while this refresh is concurrently committing.
-            await self._lock_runtime_owner_scope(agent_id=agent_id)
-            # See register_runtime_owner: a heartbeat taken before waiting on
-            # this transaction is not trustworthy liveness evidence.
-            touch_now = requested_now or self.now_utc()
-            await self._touch_runtime_owner_locked(
-                agent_id=agent_id, owner_id=owner_id, now=touch_now
-            )
+        async with self._runtime_owner_liveness_fence(
+            agent_id=agent_id
+        ) as transaction_open:
+            if transaction_open:
+                touch_now = requested_now or self.now_utc()
+                await self._touch_runtime_owner_locked(
+                    agent_id=agent_id, owner_id=owner_id, now=touch_now
+                )
+            else:
+                async with self._backend.transaction():
+                    # Recovery uses this exact scope before it decides whether
+                    # a managed lease owner is stale. Without the common DB
+                    # lock a recovery snapshot can race this refresh.
+                    await self._lock_runtime_owner_scope(agent_id=agent_id)
+                    # See register_runtime_owner: sample after DB contention.
+                    touch_now = requested_now or self.now_utc()
+                    await self._touch_runtime_owner_locked(
+                        agent_id=agent_id, owner_id=owner_id, now=touch_now
+                    )
 
     async def release_initial_reservations(
         self,
@@ -5175,6 +5451,74 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
+    @asynccontextmanager
+    async def _runtime_owner_liveness_fence(
+        self, *, agent_id: str
+    ) -> AsyncIterator[bool]:
+        """Exclude liveness changes without blocking unrelated SQLite writes.
+
+        Yields whether the fence itself owns a database transaction. PostgreSQL
+        uses its tenant-scoped transaction advisory lock; that lock does not
+        obstruct the cancelled request's ordinary database cleanup. SQLite's
+        equivalent writer transaction would obstruct every write and could
+        deadlock Stop while it waits for request completion, so file-backed
+        databases use a non-blocking native advisory lock keyed by resolved DB
+        path and agent (``flock`` on POSIX, ``LockFileEx`` on Windows).
+        In-memory and embedded test SQLite backends without a path cannot be
+        shared across processes and use one backend-attached asyncio lock.
+        """
+        if self.is_postgres:
+            async with self._backend.transaction():
+                await self._lock_runtime_owner_scope(agent_id=agent_id)
+                yield True
+            return
+        if self._backend.backend_type != "sqlite":
+            raise RuntimeError(
+                "Durable runtime-owner registration fence does not support "
+                f"backend {self._backend.backend_type!r}"
+            )
+
+        db_path = getattr(self._backend, "db_path", None)
+        if db_path == ":memory:" or not isinstance(db_path, str) or not db_path:
+            locks = getattr(
+                self._backend, "_durable_runtime_owner_liveness_locks", None
+            )
+            if locks is None:
+                locks = {}
+                setattr(
+                    self._backend,
+                    "_durable_runtime_owner_liveness_locks",
+                    locks,
+                )
+            lock = locks.setdefault(agent_id, asyncio.Lock())
+            async with lock:
+                yield False
+            return
+
+        lock_key = hashlib.sha256(
+            f"{os.path.normcase(os.path.realpath(db_path))}\x00{agent_id}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        lock_path = os.path.join(
+            tempfile.gettempdir(), f"kestrel-runtime-owner-{lock_key}.lock"
+        )
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
+        lock_token: Any = None
+        try:
+            while not acquired:
+                acquired, lock_token = _try_lock_runtime_owner_descriptor(
+                    descriptor
+                )
+                if not acquired:
+                    await asyncio.sleep(0.01)
+            yield False
+        finally:
+            if acquired:
+                _unlock_runtime_owner_descriptor(descriptor, lock_token)
+            os.close(descriptor)
+
     async def _lock_initial_delivery_transfer(
         self, *, agent_id: str, consumer_id: str, delivery_id: str
     ) -> Optional[tuple[Any, ...]]:
@@ -5274,6 +5618,29 @@ class DurableSignalStore(UnifiedStoreBase):
                     self.to_timestamp_param(now),
                     self.to_timestamp_param(now),
                 ),
+            )
+
+    async def _require_exclusive_runtime_owner_locked(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        stale_before: datetime,
+    ) -> None:
+        """Require one exact live owner while its tenant lock is held."""
+        live_owners = await self._backend.fetch_all(
+            f"""
+            SELECT owner_id
+            FROM {self.RUNTIME_OWNERS}
+            WHERE agent_id = ?
+              AND stopped_at IS NULL
+              AND heartbeat_at >= ?
+            """,
+            (agent_id, self.to_timestamp_param(stale_before)),
+        )
+        if {str(row[0]) for row in live_owners} != {owner_id}:
+            raise RuntimeError(
+                "durable action requires exactly one live runtime owner"
             )
 
     async def _recover_expired_leases(

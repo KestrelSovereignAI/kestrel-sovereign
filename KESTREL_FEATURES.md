@@ -495,6 +495,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `send_a2a_message` | `!a2a tell` | `communication` | `recipient`, `message`, `session_id` | 161 | `enabled` |
 | `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `session_id`, `timeout_seconds`, `artifacts`, `references` | 445 | `enabled` |
 | `send_a2a_task` | `!a2a send` | `communication` | `recipient`, `message`, `skill_id`, `session_id`, `artifacts`, `references` | 488 | `enabled` |
+| `stop_peer` | `!peer stop` | `communication` | `recipient`, `reason`, `scope`, `target`, `cascade` | 179 | `enabled` |
 
 ### `response_audit` (ResponseAuditFeature)
 
@@ -738,6 +739,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/invoke`
   - `GET /api/agent/notifications`
   - `GET /api/agent/notifications/sse`
+  - `POST /api/agent/peer/stop`
   - `GET /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode/cancel`
@@ -1043,6 +1045,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!a2a send` | `peers` | `<recipient> <message> [skill_id] [session_id] [artifacts] [references]` | Submit a tracked A2A task to another agent. Persists in the recipient's TaskStore, fires the a2a.task_submitted signal so they wake and process it, returns the task_id for tracking. Caller can poll status via get_a2a_task (or receive the a2a.task_complete signal). Use this for delegated work you'll check on later. For an answer now use send_a2a_question; for a fire-and-forget notification use send_a2a_message.<br><br>SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or ``references`` to hand off durable payload (planning docs, evidence bundles, saved-memory/recall references, logs, diffs) WITH the task — the recipient retrieves them from the task store via get_task_result/check_task_status. This is the SEND side; it is distinct from the RESPONDER-side attach_artifact_to_a2a_task tool, which a RECIPIENT uses to attach output onto an INCOMING task before responding. Each artifact is a dict like {'name': 'plan', 'text': '...'} (or 'data': {...} for structured metadata, optional 'index'/'last_chunk' for chunked bodies). Each reference is a dict descriptor like {'ref_type': 'memory', 'id': '...', 'label': '...'}. |
 | `!a2a tell` | `peers` | `<recipient> <message> [session_id]` | Send an async message to another agent — fire-and-forget, no reply expected. Persists in the recipient's TaskStore and fires the a2a.task_submitted signal so they wake and see it on their next cognition turn, but the caller does NOT track lifecycle. Use this for notifications, FYIs, status updates ('I just shipped PR 42'). For a tracked work assignment use send_a2a_task; for a synchronous Q&A use send_a2a_question. |
 | `!ask` | `peers` | `<agent_name> <message>` | Send a message to another agent in the multi_agent and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents. |
+| `!peer stop` | `peers` | `<recipient> [reason] [scope] [target] [cascade]` | Cooperatively stop a peer agent's current in-flight work through the authenticated signal rail. Any authorized peer may pull this bounded andon cord; it does not Hold, terminate, or grant hierarchy. Use scope='agent' for the peer's current work, or scope='turn' with that exact observable turn address. |
 | `!peers` | `peers` |  | List all available peer agents in the multi_agent. |
 | `!audit` | `response_audit` |  | Show audit configuration and status |
 | `!audit-off` | `response_audit` |  | Disable per-response audit |

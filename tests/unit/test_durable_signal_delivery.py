@@ -339,6 +339,74 @@ async def test_committed_signal_replays_after_restart_with_normalized_payload(tm
 
 
 @pytest.mark.asyncio
+async def test_durable_rate_admission_serializes_across_sqlite_instances(tmp_path):
+    """Concurrent workers share one atomic quota and restarts cannot refill it."""
+
+    path = tmp_path / "durable-rate-admission.db"
+    first_backend = SQLiteBackend(str(path))
+    second_backend = SQLiteBackend(str(path))
+    await first_backend.connect()
+    await second_backend.connect()
+    first = DurableSignalStore(first_backend)
+    second = DurableSignalStore(second_backend)
+    limit = RateLimit(per_minute=4, per_hour=20, burst=4)
+    agent_id = "did:agent:durable-rate"
+    source = "a2a.peer_stop"
+    try:
+        await first.initialize()
+        await second.initialize()
+        attempts = await asyncio.gather(
+            *(
+                store.persist_signal(
+                    _signal(
+                        agent_id=agent_id,
+                        source=source,
+                        message=f"attempt-{index}",
+                    ),
+                    agent_id=agent_id,
+                    source_event_id=f"durable-rate:{index}",
+                    retention_days=0,
+                    durable_rate_limit=limit,
+                )
+                for index, store in enumerate(
+                    (first, second, first, second, first)
+                )
+            )
+        )
+        assert all(attempt.created for attempt in attempts)
+        assert sum(attempt.rate_limited for attempt in attempts) == 1
+        assert await first_backend.fetch_val(
+            f"SELECT COUNT(*) FROM {first.RATE_ADMISSIONS} "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 4
+    finally:
+        await second_backend.close()
+        await first_backend.close()
+
+    restarted_backend = SQLiteBackend(str(path))
+    await restarted_backend.connect()
+    restarted = DurableSignalStore(restarted_backend)
+    try:
+        await restarted.initialize()
+        after_restart = await restarted.persist_signal(
+            _signal(agent_id=agent_id, source=source, message="after-restart"),
+            agent_id=agent_id,
+            source_event_id="durable-rate:after-restart",
+            retention_days=0,
+            durable_rate_limit=limit,
+        )
+        assert after_restart.rate_limited
+        assert await restarted_backend.fetch_val(
+            f"SELECT COUNT(*) FROM {restarted.RATE_ADMISSIONS} "
+            "WHERE agent_id = ? AND source = ?",
+            (agent_id, source),
+        ) == 4
+    finally:
+        await restarted_backend.close()
+
+
+@pytest.mark.asyncio
 async def test_public_source_boundary_orders_ingress_without_timestamps(tmp_path):
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "source-boundary.db", "did:agent:one"

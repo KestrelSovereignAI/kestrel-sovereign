@@ -9,6 +9,7 @@ database is shared across workers or instances.
 from __future__ import annotations
 
 import asyncio
+import secrets
 
 
 class SharedReplayNonceStore:
@@ -33,10 +34,25 @@ class SharedReplayNonceStore:
                     nonce TEXT NOT NULL,
                     seen_at DOUBLE PRECISION NOT NULL,
                     expires_at DOUBLE PRECISION NOT NULL,
+                    envelope_digest TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (sender, nonce)
                 )
                 """
             )
+            if getattr(self._db, "backend_type", "sqlite") == "postgres":
+                await self._db.execute(
+                    "ALTER TABLE a2a_replay_nonces ADD COLUMN IF NOT EXISTS "
+                    "envelope_digest TEXT NOT NULL DEFAULT ''"
+                )
+            else:
+                columns = await self._db.fetchall(
+                    "PRAGMA table_info(a2a_replay_nonces)"
+                )
+                if "envelope_digest" not in {str(row[1]) for row in columns}:
+                    await self._db.execute(
+                        "ALTER TABLE a2a_replay_nonces ADD COLUMN "
+                        "envelope_digest TEXT NOT NULL DEFAULT ''"
+                    )
             await self._db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_a2a_replay_nonces_expires
@@ -52,6 +68,7 @@ class SharedReplayNonceStore:
         *,
         now_ts: float,
         ttl_seconds: int,
+        envelope_digest: str = "",
     ) -> bool:
         """Atomically reserve ``(sender, nonce)`` across workers.
 
@@ -72,15 +89,39 @@ class SharedReplayNonceStore:
         backend_type = getattr(self._db, "backend_type", "sqlite")
         if backend_type == "postgres":
             sql = """
-                INSERT INTO a2a_replay_nonces (sender, nonce, seen_at, expires_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO a2a_replay_nonces (
+                    sender, nonce, seen_at, expires_at, envelope_digest
+                )
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (sender, nonce) DO NOTHING
             """
         else:
             sql = """
                 INSERT OR IGNORE INTO a2a_replay_nonces
-                    (sender, nonce, seen_at, expires_at)
-                VALUES (?, ?, ?, ?)
+                    (sender, nonce, seen_at, expires_at, envelope_digest)
+                VALUES (?, ?, ?, ?, ?)
             """
-        affected = await self._db.execute(sql, (sender, nonce, now_ts, expires_at))
+        affected = await self._db.execute(
+            sql, (sender, nonce, now_ts, expires_at, envelope_digest)
+        )
         return int(affected or 0) > 0
+
+    async def matches(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        envelope_digest: str,
+    ) -> bool:
+        """Return whether the durable reservation binds this exact envelope."""
+        await self.ensure_table()
+        row = await self._db.fetchone(
+            "SELECT envelope_digest FROM a2a_replay_nonces "
+            "WHERE sender = ? AND nonce = ?",
+            (sender, nonce),
+        )
+        return bool(
+            row
+            and row[0]
+            and secrets.compare_digest(str(row[0]), envelope_digest)
+        )

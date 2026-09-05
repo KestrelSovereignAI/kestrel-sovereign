@@ -536,6 +536,7 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # The Workflows built-in is registrable without Talon or any other
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+        assert "a2a.peer_stop" in agent.signal_registry
     finally:
         await _cleanup(agent)
 
@@ -641,6 +642,7 @@ async def test_injected_phase_failure_rolls_back_and_fails_terminally(
                 assert agent.task_manager is None
                 # Core signal sources were unregistered on rollback.
                 assert "a2a.task_complete" not in agent.signal_registry
+                assert "a2a.peer_stop" not in agent.signal_registry
 
             # Memory system (phase 6).
             if fail_index >= 6:

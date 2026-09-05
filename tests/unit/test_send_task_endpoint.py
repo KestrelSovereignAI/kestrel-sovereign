@@ -12,6 +12,7 @@ response. This is the send-side mirror of the responder-side
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1540,3 +1541,248 @@ def test_transport_only_process_rejects_unsigned_without_feature_policy(
 
     assert resp.status_code == 403
     agent.task_manager.create_task.assert_not_awaited()
+
+
+def _peer_stop_body(
+    sign=None,
+    *,
+    scope="agent",
+    target=None,
+    extra_intent=None,
+    audience="did:test:recipient",
+):
+    from kestrel_sovereign.signals.sources.peer_stop import encode_peer_stop_intent
+    from kestrel_sovereign.stop import StopScope
+
+    correlation_id = "peer-stop-signed-action"
+    session_id = "peer-stop-signed-session"
+    intent = {
+        "scope": StopScope(scope),
+        "target": target,
+        "reason": "andon cord",
+        "cascade": True,
+        "correlation_id": correlation_id,
+    }
+    intent.update(extra_intent or {})
+    message = encode_peer_stop_intent(**intent)
+    metadata = {
+        "sender": _SENDER_DID,
+        "a2a_verb": "peer_stop",
+        "a2a_audience": audience,
+    }
+    if sign is not None:
+        metadata["signature"] = sign(
+            [message],
+            task_id=correlation_id,
+            session_id=session_id,
+            metadata=metadata,
+        )
+    return {
+        "id": correlation_id,
+        "sessionId": session_id,
+        "message": {
+            "role": "user",
+            "parts": [{"type": "text", "text": message}],
+        },
+        "metadata": metadata,
+    }
+
+
+def test_signed_peer_stop_dispatches_with_verified_envelope_principals(app_with_send):
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.signals.sources.peer_stop import peer_stop_source_event_id
+    from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    outcome = StopOutcome(
+        scope=StopScope.AGENT,
+        requested_target=agent.did,
+        resolved_target=agent.did,
+        agent_id=agent.did,
+        disposition=StopDisposition.STOPPED,
+        correlation_id="peer-stop-signed-action",
+    )
+
+    async def dispatch(signal, *, source_event_id=None):
+        assert signal.caller == _SENDER_DID
+        assert signal.target_agent == agent.did
+        assert signal.payload.get("actor_id") is None
+        assert signal.payload.get("target_agent_id") is None
+        assert source_event_id == peer_stop_source_event_id(
+            _SENDER_DID,
+            "peer-stop-signed-action",
+        )
+        return SignalResult(
+            signal_id=signal.id,
+            status=Status.OK,
+            mode=SignalMode.ACTION,
+            duration_ms=1,
+            action_result=[outcome.to_dict()],
+        )
+
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock(side_effect=dispatch))
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign)
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 200
+    assert response.json()["signal_receipt"]["status"] == "ok"
+    assert response.json()["stop_outcomes"] == [outcome.to_dict()]
+    agent.dispatcher.dispatch_signal.assert_awaited_once()
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_signed_peer_stop_rejects_envelope_forwarded_to_another_recipient(
+    app_with_send,
+):
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    outcome = StopOutcome(
+        scope=StopScope.AGENT,
+        requested_target=agent.did,
+        resolved_target=agent.did,
+        agent_id=agent.did,
+        disposition=StopDisposition.STOPPED,
+        correlation_id="peer-stop-signed-action",
+    )
+    agent.dispatcher = SimpleNamespace(
+        dispatch_signal=AsyncMock(
+            return_value=SignalResult(
+                signal_id="wrong-recipient-signal",
+                status=Status.OK,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                action_result=[outcome.to_dict()],
+            )
+        )
+    )
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign, audience="did:test:intended-recipient")
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_unsigned_peer_stop_is_not_legacy_task_compatibility(app_with_send):
+    agent = _stub_agent()
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=_peer_stop_body())
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_signed_peer_stop_verbatim_retry_reaches_durable_signal_dedupe(
+    app_with_send,
+):
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    dispatch_count = 0
+
+    async def dispatch(signal, *, source_event_id=None):
+        nonlocal dispatch_count
+        dispatch_count += 1
+        if dispatch_count == 2:
+            return SignalResult(
+                signal_id=signal.id,
+                status=Status.COALESCED,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                error="Duplicate source event ID already accepted",
+            )
+        outcome = StopOutcome(
+            scope=StopScope.AGENT,
+            requested_target=agent.did,
+            resolved_target=agent.did,
+            agent_id=agent.did,
+            disposition=StopDisposition.STOPPED,
+            correlation_id=signal.payload["correlation_id"],
+        )
+        return SignalResult(
+            signal_id=signal.id,
+            status=Status.OK,
+            mode=SignalMode.ACTION,
+            duration_ms=1,
+            action_result=[outcome.to_dict()],
+        )
+
+    agent.dispatcher = SimpleNamespace(
+        dispatch_signal=AsyncMock(side_effect=dispatch)
+    )
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign)
+
+    with TestClient(app_with_send) as client:
+        first = client.post("/api/agent/peer/stop", json=body)
+        replay = client.post("/api/agent/peer/stop", json=body)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["signal_receipt"]["status"] == "coalesced"
+    assert (
+        replay.json()["stop_outcomes"][0]["disposition"]
+        == StopDisposition.UNREACHABLE.value
+    )
+    assert agent.dispatcher.dispatch_signal.await_count == 2
+
+
+def test_peer_stop_signature_binds_exact_intent(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign)
+    body["message"]["parts"][0]["text"] = body["message"]["parts"][0][
+        "text"
+    ].replace("andon cord", "tampered intent")
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_peer_stop_rejects_host_scope_and_payload_actor(app_with_send):
+    agent = _stub_agent()
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    host_body = _peer_stop_body()
+    host_message = json.loads(host_body["message"]["parts"][0]["text"])
+    host_message["scope"] = "host"
+    host_body["message"]["parts"][0]["text"] = json.dumps(
+        host_message, sort_keys=True, separators=(",", ":")
+    )
+    actor_body = _peer_stop_body()
+    actor_message = json.loads(actor_body["message"]["parts"][0]["text"])
+    actor_message["actor_id"] = "did:test:forged"
+    actor_body["message"]["parts"][0]["text"] = json.dumps(
+        actor_message, sort_keys=True, separators=(",", ":")
+    )
+
+    with TestClient(app_with_send) as client:
+        host_response = client.post("/api/agent/peer/stop", json=host_body)
+        actor_response = client.post("/api/agent/peer/stop", json=actor_body)
+
+    assert host_response.status_code == 400
+    assert actor_response.status_code == 400
+    agent.dispatcher.dispatch_signal.assert_not_awaited()

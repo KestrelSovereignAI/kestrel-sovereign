@@ -28,6 +28,7 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 from kestrel_sovereign.signals import (
+    AlwaysElidedActionSourceRegistration,
     RegistrationError,
     SourceRegistrationWithPromptOverride,
     SourceRegistry,
@@ -121,6 +122,36 @@ def test_register_valid_action_source():
     reg.register(_valid_action_reg())
     assert "test" in reg
     assert len(reg) == 1
+
+
+def test_always_elided_action_is_a_validated_contract_axis():
+    base = _valid_action_reg("always_elided").__dict__
+    elided = AlwaysElidedActionSourceRegistration(**base)
+    plain = SourceRegistration(**base)
+
+    registry = SourceRegistry()
+    registry.register(elided)
+    assert registry.get("always_elided") is elided
+    assert not SourceRegistry.contract_equivalent(elided, plain)
+
+    untrusted = AlwaysElidedActionSourceRegistration(
+        **{**base, "name": "untrusted_elided", "trust": Trust.UNTRUSTED}
+    )
+    with pytest.raises(RegistrationError, match="must be trusted"):
+        SourceRegistry().register(untrusted)
+
+    raw_logging = AlwaysElidedActionSourceRegistration(
+        **{
+            **base,
+            "name": "raw_logging_elided",
+            "log_redaction": RedactionPolicy(
+                summarize=lambda _payload: "",
+                store_raw_trusted=True,
+            ),
+        }
+    )
+    with pytest.raises(RegistrationError, match="cannot retain raw"):
+        SourceRegistry().register(raw_logging)
 
 
 def test_register_rejects_duplicate_name():

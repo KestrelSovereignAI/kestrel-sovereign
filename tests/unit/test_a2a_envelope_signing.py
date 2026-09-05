@@ -100,6 +100,46 @@ def test_tampered_bound_field_fails():
     assert v.ok is False
 
 
+def test_optional_a2a_audience_is_cryptographically_bound():
+    """An action envelope cannot be forwarded to a different recipient."""
+    from kestrel_sovereign.a2a.envelope_signing import (
+        A2A_AUDIENCE_METADATA_KEY,
+        bound_envelope_fields,
+    )
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    signed_metadata = {
+        "a2a_verb": "peer_stop",
+        A2A_AUDIENCE_METADATA_KEY: "did:test:intended-recipient",
+    }
+    block = sign_envelope(
+        kp,
+        sender=DID,
+        task_id="peer-stop-1",
+        message="stop",
+        timestamp=ts,
+        bound=bound_envelope_fields(signed_metadata),
+    )
+    forwarded_metadata = {
+        **signed_metadata,
+        A2A_AUDIENCE_METADATA_KEY: "did:test:other-recipient",
+    }
+
+    verdict = verify_envelope(
+        doc,
+        block,
+        sender=DID,
+        task_id="peer-stop-1",
+        message="stop",
+        timestamp=ts,
+        nonce=block["nonce"],
+        bound=bound_envelope_fields(forwarded_metadata),
+    )
+
+    assert verdict.ok is False
+
+
 def test_tampered_message_fails():
     kp, doc = _keypair_and_doc()
     ts = _now_iso()
@@ -163,7 +203,16 @@ def test_wrong_key_fails():
 # --------------------------------------------------------------------------
 
 
-def _signed_metadata(kp, *, sender=DID, task_id="t", message="m", session_id=None, ts=None):
+def _signed_metadata(
+    kp,
+    *,
+    sender=DID,
+    task_id="t",
+    message="m",
+    session_id=None,
+    ts=None,
+    nonce=None,
+):
     from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
 
     ts = ts or _now_iso()
@@ -174,7 +223,7 @@ def _signed_metadata(kp, *, sender=DID, task_id="t", message="m", session_id=Non
     bound = bound_envelope_fields(meta, artifacts=None)
     meta["signature"] = sign_envelope(
         kp, sender=sender, task_id=task_id, message=message, timestamp=ts,
-        session_id=session_id, bound=bound,
+        session_id=session_id, bound=bound, nonce=nonce,
     )
     return meta
 
@@ -266,6 +315,92 @@ def test_replay_of_same_envelope_rejected():
     assert "repla" in second.reason.lower()
 
 
+def test_idempotent_action_may_admit_only_a_verified_replay():
+    """The explicit retry lane still verifies the signature before admitting
+    a spent nonce, and reports the admitted replay to its caller."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    guard = ReplayGuard()
+    first = asyncio.run(
+        verify_inbound_envelope(
+            meta,
+            task_id="t",
+            message="m",
+            resolver=lambda did: doc,
+            replay_guard=guard,
+            allow_verified_replay=True,
+        )
+    )
+    replay = asyncio.run(
+        verify_inbound_envelope(
+            meta,
+            task_id="t",
+            message="m",
+            resolver=lambda did: doc,
+            replay_guard=guard,
+            allow_verified_replay=True,
+        )
+    )
+    tampered = asyncio.run(
+        verify_inbound_envelope(
+            meta,
+            task_id="t",
+            message="different",
+            resolver=lambda did: doc,
+            replay_guard=guard,
+            allow_verified_replay=True,
+        )
+    )
+
+    assert first.ok is True and first.replayed is False
+    assert replay.ok is True and replay.verified is True
+    assert replay.replayed is True
+    assert tampered.ok is False
+
+
+def test_idempotent_action_rejects_different_valid_envelope_reusing_nonce():
+    """The retry lane binds the nonce to the original canonical signed bytes."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    original = _signed_metadata(kp, task_id="stop-1", message="first")
+    reused_nonce = original["signature"]["nonce"]
+    different = _signed_metadata(
+        kp,
+        task_id="stop-2",
+        message="second",
+        nonce=reused_nonce,
+    )
+    guard = ReplayGuard()
+
+    first = asyncio.run(
+        verify_inbound_envelope(
+            original,
+            task_id="stop-1",
+            message="first",
+            resolver=lambda _did: doc,
+            replay_guard=guard,
+            allow_verified_replay=True,
+        )
+    )
+    refused = asyncio.run(
+        verify_inbound_envelope(
+            different,
+            task_id="stop-2",
+            message="second",
+            resolver=lambda _did: doc,
+            replay_guard=guard,
+            allow_verified_replay=True,
+        )
+    )
+
+    assert first.ok is True
+    assert refused.ok is False
+    assert "different envelope" in refused.reason
+
+
 def test_shared_replay_store_rejects_replay_across_process_guards(tmp_path):
     """A replay landing on a different worker has a fresh in-process guard, so
     the shared DB reservation must reject it (#1733)."""
@@ -306,6 +441,61 @@ def test_shared_replay_store_rejects_replay_across_process_guards(tmp_path):
     asyncio.run(run())
 
 
+def test_idempotent_action_may_admit_verified_replay_across_workers(tmp_path):
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def run():
+        db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+        try:
+            store = SharedReplayNonceStore(db)
+            kp, doc = _keypair_and_doc()
+            meta = _signed_metadata(kp)
+            different = _signed_metadata(
+                kp,
+                task_id="different-task",
+                message="different-message",
+                nonce=meta["signature"]["nonce"],
+            )
+            first = await verify_inbound_envelope(
+                meta,
+                task_id="t",
+                message="m",
+                resolver=lambda did: doc,
+                replay_guard=ReplayGuard(),
+                replay_store=store,
+                allow_verified_replay=True,
+            )
+            replay = await verify_inbound_envelope(
+                meta,
+                task_id="t",
+                message="m",
+                resolver=lambda did: doc,
+                replay_guard=ReplayGuard(),
+                replay_store=store,
+                allow_verified_replay=True,
+            )
+            mismatched_replay = await verify_inbound_envelope(
+                different,
+                task_id="different-task",
+                message="different-message",
+                resolver=lambda did: doc,
+                replay_guard=ReplayGuard(),
+                replay_store=store,
+                allow_verified_replay=True,
+            )
+
+            assert first.ok is True and first.replayed is False
+            assert replay.ok is True and replay.replayed is True
+            assert mismatched_replay.ok is False
+            assert "shared window" in mismatched_replay.reason
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
 def test_shared_replay_store_expiry_allows_nonce_after_ttl(tmp_path):
     from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -317,6 +507,45 @@ def test_shared_replay_store_expiry_allows_nonce_after_ttl(tmp_path):
             assert await store.reserve("sender", "nonce", now_ts=1000.0, ttl_seconds=10)
             assert not await store.reserve("sender", "nonce", now_ts=1005.0, ttl_seconds=10)
             assert await store.reserve("sender", "nonce", now_ts=1011.0, ttl_seconds=10)
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_shared_replay_store_migrates_existing_nonce_rows_fail_closed(tmp_path):
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def run():
+        db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-shared.db"))
+        try:
+            await db.execute(
+                """
+                CREATE TABLE a2a_replay_nonces (
+                    sender TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    seen_at DOUBLE PRECISION NOT NULL,
+                    expires_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (sender, nonce)
+                )
+                """
+            )
+            await db.execute(
+                "INSERT INTO a2a_replay_nonces "
+                "(sender, nonce, seen_at, expires_at) VALUES (?, ?, ?, ?)",
+                ("sender", "legacy-nonce", 1000.0, 2000.0),
+            )
+            store = SharedReplayNonceStore(db)
+            await store.ensure_table()
+
+            columns = await db.fetchall("PRAGMA table_info(a2a_replay_nonces)")
+            assert "envelope_digest" in {str(row[1]) for row in columns}
+            assert not await store.matches(
+                "sender",
+                "legacy-nonce",
+                envelope_digest="a" * 64,
+            )
         finally:
             await db.close()
 

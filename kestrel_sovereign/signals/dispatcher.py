@@ -140,6 +140,9 @@ from kestrel_sovereign.signals.durable import (
     DurableSourceBoundary,
     DurableSignalStore,
 )
+from kestrel_sovereign.signals.durable_payload_policy import (
+    AlwaysElidedActionSourceRegistration,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.sources.channels import (
@@ -2198,7 +2201,9 @@ class SignalDispatcher:
             timer.cancel()
 
     def _signal_for_durable_persistence(
-        self, signal: Signal
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
     ) -> _DurableSignalProjection:
         """Return the privacy-safe event projection for the durable ledger.
 
@@ -2213,6 +2218,22 @@ class SignalDispatcher:
         downgrade into a plaintext durable write, so this boundary fails
         closed by persisting only the marker.
         """
+        if isinstance(registration, AlwaysElidedActionSourceRegistration):
+            # This fixed marker is the complete durable ACTION projection, not
+            # a volatile-mode handoff.  No durable consumer re-executes the
+            # handler, and any matching source-event replay is coalesced, so a
+            # keyed copy of the private live payload is neither needed nor
+            # safe.  Elide the caller too; using ``payload_elided=True`` here
+            # would unnecessarily require a configured data key for its live
+            # handoff MAC.
+            return _DurableSignalProjection(
+                signal=replace(
+                    signal,
+                    payload={_DURABLE_PRIVACY_GATED_MARKER: "source_policy"},
+                    caller=None,
+                ),
+            )
+
         config = resolve_agent_privacy_config(self._agent)
         if config is None:
             return _DurableSignalProjection(signal=signal)
@@ -2713,16 +2734,24 @@ class SignalDispatcher:
             # KestrelAgent provides a task-reentrant lock; lightweight
             # embeddings with no transition machinery intentionally run
             # unguarded through ``optional_transition_lock``.
-            async with optional_transition_lock(
-                _resolve_transition_lock(self._agent)
-            ):
+            transition_lock = (
+                None
+                if isinstance(
+                    registration, AlwaysElidedActionSourceRegistration
+                )
+                else _resolve_transition_lock(self._agent)
+            )
+            async with optional_transition_lock(transition_lock):
                 # Normalize the opaque caller once before either the protected
                 # normal-row representation or an elided row's keyed MAC sees
                 # it. This makes caller identity stable across retries and
                 # prevents a user-defined ``__str__`` from entering either
                 # security boundary.
                 signal.caller = self._canonical_caller_identity(signal.caller)
-                durable_projection = self._signal_for_durable_persistence(signal)
+                durable_projection = self._signal_for_durable_persistence(
+                    signal,
+                    registration,
+                )
                 # Snapshot the normalized payload before the durable commit so
                 # a deepcopy failure cannot leave a committed marker with no
                 # corresponding live handoff.
@@ -2816,7 +2845,35 @@ class SignalDispatcher:
                     "caller_identity_factory": (
                         None
                         if durable_projection.payload_elided
-                        else lambda: self._protect_durable_caller_identity(signal)
+                        else lambda: self._protect_durable_caller_identity(
+                            durable_projection.signal
+                        )
+                    ),
+                    # Peer Stop's bounds are authority, not best-effort
+                    # throttling.  Admit it against the shared durable scope
+                    # so restarts cannot replenish the quota, and refuse when
+                    # two live runtimes could acknowledge different local
+                    # cancellation inventories for one agent identity.
+                    "durable_rate_limit": (
+                        registration.rate_limit
+                        if isinstance(
+                            registration, AlwaysElidedActionSourceRegistration
+                        )
+                        else None
+                    ),
+                    "exclusive_runtime_owner_id": (
+                        self._durable_delivery_owner
+                        if isinstance(
+                            registration, AlwaysElidedActionSourceRegistration
+                        )
+                        else None
+                    ),
+                    "runtime_owner_stale_after": (
+                        self._runtime_owner_stale_after
+                        if isinstance(
+                            registration, AlwaysElidedActionSourceRegistration
+                        )
+                        else None
                     ),
                     "before_commit": (
                         install_transient_handoffs
@@ -2943,6 +3000,15 @@ class SignalDispatcher:
                     ),
                     signal.id,
                 )
+            )
+
+        if persisted.rate_limited:
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_RATE_LIMIT,
+                error="Durable per-source rate limit exceeded",
+                registration=registration,
             )
 
         # The row that already exists controls replay authority.  A retry can
@@ -3713,7 +3779,9 @@ class SignalDispatcher:
                 )
 
         # Step 5: rate limit
-        if self._rate.check_and_record(
+        if not isinstance(
+            registration, AlwaysElidedActionSourceRegistration
+        ) and self._rate.check_and_record(
             signal.source, registration.rate_limit, now=time.monotonic()
         ):
             return self._fail(
@@ -3826,11 +3894,22 @@ class SignalDispatcher:
                 if signal.mode == SignalMode.ACTION:
                     assert registration.handler is not None
                     write_audit_callback = requested_handler_write_audit_callback()
-                    if write_audit_callback is None:
-                        action_result = await registration.handler(signal.payload)
+                    if isinstance(
+                        registration, AlwaysElidedActionSourceRegistration
+                    ):
+                        action_fence = self._durable_store.fence_runtime_local_action(
+                            agent_id=self._agent.did,
+                            owner_id=self._durable_delivery_owner,
+                            stale_after=self._runtime_owner_stale_after,
+                        )
                     else:
-                        with capture_write_queries(write_audit_callback):
+                        action_fence = _noop_async_context()
+                    async with action_fence:
+                        if write_audit_callback is None:
                             action_result = await registration.handler(signal.payload)
+                        else:
+                            with capture_write_queries(write_audit_callback):
+                                action_result = await registration.handler(signal.payload)
                     return self._success(
                         signal, start, registration, action_result=action_result
                     )
@@ -5210,6 +5289,11 @@ def _build_ui_event_payload(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _noop_async_context():
+    yield
 
 
 def _time_in_window(now: dtime, start: dtime, end: dtime) -> bool:

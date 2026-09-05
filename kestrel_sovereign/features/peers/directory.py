@@ -190,6 +190,14 @@ class PeerDirectoryRouter(Protocol):
     ) -> Mapping[str, Any]:
         """Authorize and deliver one signed cancellation to its recipient."""
 
+    async def stop_peer(
+        self,
+        requester: PeerRequester,
+        peer: PeerIdentity,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Authorize and deliver one cooperative Stop signal to a peer."""
+
     def subscribe_a2a_task(
         self,
         requester: PeerRequester,
@@ -243,6 +251,7 @@ class LocalHostPeerDirectory:
         transport_key: str = "",
         client_factory: Callable[..., Any] = httpx.AsyncClient,
         local_cancel: Optional[Callable[..., Any]] = None,
+        local_stop: Optional[Callable[..., Any]] = None,
         local_get: Optional[Callable[..., Any]] = None,
         local_subscribe: Optional[Callable[..., Any]] = None,
         principal_payload_factory: Optional[
@@ -254,6 +263,7 @@ class LocalHostPeerDirectory:
         self._client_factory = client_factory
         # Host-owned process-local capability; never serialized onto the wire.
         self._local_cancel = local_cancel
+        self._local_stop = local_stop
         self._local_get = local_get
         self._local_subscribe = local_subscribe
         # Subprocess peers cannot receive the manager's process-local creator
@@ -586,6 +596,48 @@ class LocalHostPeerDirectory:
                     response, action="canceling A2A task"
                 )
                 return self._as_mapping(response, action="canceling A2A task")
+        except PeerDirectoryError:
+            raise
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            raise PeerTransportError("Could not reach local peer host") from exc
+
+    async def stop_peer(
+        self,
+        requester: PeerRequester,
+        peer: PeerIdentity,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Route Stop only after current directory authorization."""
+
+        self._require_requester(requester)
+        try:
+            authorized_peer = await self._authorize_peer(requester, peer)
+            if callable(self._local_stop):
+                result = self._local_stop(requester, authorized_peer, payload)
+                if hasattr(result, "__await__"):
+                    result = await result
+                if not isinstance(result, Mapping):
+                    raise PeerProtocolError(
+                        "Local host returned an invalid peer Stop receipt"
+                    )
+                return result
+            async with self._client_factory() as client:
+                response = await client.post(
+                    self._peer_url(
+                        authorized_peer,
+                        "api/agent/peer/stop",
+                    ),
+                    json=dict(payload),
+                    headers=self._headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_READ_TIMEOUT,
+                        write=PEER_READ_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+                self._raise_for_route_status(response, action="stopping peer work")
+                return self._as_mapping(response, action="stopping peer work")
         except PeerDirectoryError:
             raise
         except (httpx.RequestError, httpx.TimeoutException) as exc:

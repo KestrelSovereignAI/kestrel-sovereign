@@ -40,11 +40,17 @@ logger = logging.getLogger(__name__)
 
 def _digest(data: Any) -> str:
     """Stable sha256 over a JSON-serializable value. Used for payload,
-    artifact, action_result, and causation chain digests."""
+    artifact, action_result, and causation chain digests.
+
+    Rejected input may contain a lone Unicode surrogate: it is valid in a
+    Python/JSON value but not encodable as ordinary UTF-8.  Audit the refusal
+    with a deterministic surrogate-preserving digest instead of losing the
+    outcome row after validation has already failed.
+    """
     serialized = json.dumps(
         data, sort_keys=True, default=_json_default, ensure_ascii=False
     )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return hashlib.sha256(serialized.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _json_default(obj: Any) -> Any:

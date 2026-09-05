@@ -1377,6 +1377,7 @@ def _hosted_peer_directory_context(
         if not callable(refresh):
             return None, None
         local_cancel = None
+        local_stop = None
         local_get = None
         local_subscribe = None
         if manager is not None:
@@ -1386,6 +1387,14 @@ def _hosted_peer_directory_context(
                     requester=requester,
                     peer=peer,
                     task_id=task_id,
+                    payload=payload,
+                )
+
+            async def local_stop(requester, peer, payload):
+                return await manager.stop_host_attested_local_peer(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
                     payload=payload,
                 )
 
@@ -1409,6 +1418,7 @@ def _hosted_peer_directory_context(
             host_url=host_url,
             transport_key=ensure_a2a_transport_key(),
             local_cancel=local_cancel,
+            local_stop=local_stop,
             local_get=local_get,
             local_subscribe=local_subscribe,
         )

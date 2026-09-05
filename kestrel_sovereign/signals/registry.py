@@ -50,6 +50,9 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sovereign.signals.durable_payload_policy import (
+    AlwaysElidedActionSourceRegistration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -432,8 +435,8 @@ class SourceRegistry:
         Returns a :class:`RegistrationOutcome`. A same-name source is only
         accepted when it is *contract-equivalent* to the existing one (see
         :meth:`contract_signature`); a differing trust/mode/redaction/handler/
-        ownership is a ``MISMATCH`` — reported (and raised for MANDATORY /
-        IDEMPOTENT) rather than silently equated.
+        ownership/durable-payload policy is a ``MISMATCH`` — reported (and
+        raised for MANDATORY / IDEMPOTENT) rather than silently equated.
 
         ``owner=None`` means the HOST — a permanent holder — and nothing else;
         the policy has no say in who is claiming (#3074). An owner MUST name
@@ -556,9 +559,10 @@ class SourceRegistry:
         ownership + self-loop policy, the redaction policy's *flags and
         summarizer* (not merely its class), retention, the four
         constitutional-injection fields, and the per-signal prompt-override
-        opt-in (``allow_prompt_override``). A re-registration that changes any
-        of them is therefore caught as a MISMATCH instead of being silently
-        accepted as equivalent.
+        opt-in (``allow_prompt_override``), plus the typed always-elided ACTION
+        durable-payload policy. A re-registration that changes any of them is
+        therefore caught as a MISMATCH instead of being silently accepted as
+        equivalent.
 
         ``allow_prompt_override`` is validated at registration time (only a
         ``bool`` is accepted) yet governs a real dispatch decision — whether a
@@ -621,6 +625,7 @@ class SourceRegistry:
             reg.constitution_injection,
             reg.system_prompt_budget_bytes,
             getattr(reg, "allow_prompt_override", False),
+            isinstance(reg, AlwaysElidedActionSourceRegistration),
         )
 
     @classmethod
@@ -704,6 +709,21 @@ class SourceRegistry:
                 f"Source '{reg.name}': allow_prompt_override must be a bool "
                 f"when declared, got {type(allow_prompt_override).__name__}."
             )
+        if isinstance(reg, AlwaysElidedActionSourceRegistration):
+            if reg.allowed_modes != frozenset({SignalMode.ACTION}):
+                raise RegistrationError(
+                    f"Source '{reg.name}': an always-elided registration must "
+                    "allow ACTION mode only."
+                )
+            if reg.trust is not Trust.TRUSTED:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an always-elided ACTION must be trusted."
+                )
+            if reg.log_redaction.store_raw_trusted:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an always-elided ACTION cannot retain "
+                    "raw trusted payloads in the outcome log."
+                )
 
     @staticmethod
     def _validate_constitution_injection(reg: SourceRegistration) -> None:

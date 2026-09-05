@@ -396,6 +396,70 @@ ping-pong on the SAME source is a loop.
 
 ---
 
+## Peer Stop is an authenticated ACTION source
+
+`a2a.peer_stop` is the andon-cord rail for cooperative peer Stop. It is an
+ACTION because cancellation is deterministic, enters no cognition turn, and
+must still work while the recipient is already busy. It is intentionally not
+the local/operator HTTP Stop door and never implements Hold or process
+termination.
+
+The remote adapter carries the existing replay-protected hybrid A2A envelope;
+the same-process adapter carries an unforgeable manager capability. Both
+adapters resolve the sender and recipient from their authenticated routing
+contexts and only then build a `Signal`:
+
+- `Signal.caller` is the verified or host-attested stable sender principal.
+- `Signal.target_agent` is the recipient selected by the scoped directory. The
+  remote envelope also binds that recipient as a signed audience, which the
+  receiver compares to its trusted route identity before dispatch. The
+  audience assertion never supplies the signal principal.
+- The signed payload contains only Stop intent (`scope`, work address, reason,
+  cascade, correlation id). It cannot claim either principal, and host scope is
+  rejected. Agent and public-turn scopes are supported; tool-call scope fails
+  closed until the runtime exposes a live tool-call cancellation inventory.
+- The sender's signed or host-observed causation chain is preserved. The source
+  keeps `allow_self_loops=False`, so repeated `(target, a2a.peer_stop)` chains
+  and depth beyond the normal TTL become `DROPPED_CYCLE`.
+- The source allows four attempts per minute and twenty per hour. These limits
+  are authority-bearing: a peer that could stop every replacement turn without
+  limit would have synthesized Hold.
+- The authenticated sender plus correlation id becomes the durable
+  `source_event_id`. The signed-envelope nonce is separately bound to a digest
+  of the exact canonical signed fields: only a verbatim authenticated retry may
+  enter this idempotent lane, while a different valid Stop reusing the nonce is
+  rejected. A durable replay then returns `COALESCED` without running the
+  cancellation handler or consuming another rate-limit slot.
+- Its typed registration always elides the durable payload and caller,
+  retaining only a fixed marker plus the ordinary source-event identity.
+  Because that projection is independent of privacy mode, dispatcher admission
+  does not wait on the privacy lock held by the stream it may need to cancel;
+  cycle, durable replay, coalescing, and rate-limit policy still run on the
+  ordinary dispatcher rail.
+- Its quota is admitted transactionally in the durable ledger, so process
+  restart cannot replenish the four-per-minute or twenty-per-hour authority.
+  The same admission refuses when more than one live dispatcher owns the
+  recipient DID. Immediately before cancellation, the handler also holds the
+  runtime-owner registration fence through completion of the bounded action;
+  a replica appearing after event commit therefore either blocks until the
+  action is complete or makes the action abort before cancellation.
+  Active-work inventory is runtime-local, and guessing which replica owns the
+  work would make an idle replica's no-op receipt lie.
+  Supported cloud deployment therefore remains capped at one instance until a
+  shared cancellation/fan-out substrate exists.
+
+The peer response always includes the signal status beside typed
+`StopOutcome` rows. Cycle, validation, and rate-limit drops are `REFUSED`;
+pipeline failure is `UNREACHABLE`. A `COALESCED` retry is also `UNREACHABLE`:
+coalescing proves that duplicate execution was suppressed, but the dispatcher
+does not retain the original terminal cancellation outcome, so the adapter
+must not fabricate completion. A transport must not collapse those states into
+a success boolean. The response exposes only generic status-specific detail;
+raw dispatcher and storage exceptions remain server-side. Senders validate the
+receipt shape and may confirm Stop only when its signal status is `OK`.
+
+---
+
 ## Common patterns
 
 ### Default-deny visibility

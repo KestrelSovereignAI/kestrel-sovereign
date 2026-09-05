@@ -50,6 +50,9 @@ ENVELOPE_SIG_VERSION = 2
 ENVELOPE_SIG_ALG = "hybrid-v2"
 # Default replay window: a signed envelope older than this is rejected.
 DEFAULT_MAX_AGE_SECONDS = 300
+# Optional signed audience for recipient-bound A2A actions.  It is projected
+# only when present so ordinary v2 envelopes remain wire-compatible.
+A2A_AUDIENCE_METADATA_KEY = "a2a_audience"
 
 # A resolver maps a sender DID -> its DID document (or None if unknown). It may
 # be sync or async; ``verify_inbound_envelope`` awaits awaitables.
@@ -66,8 +69,19 @@ class ReplayNonceStore(Protocol):
         *,
         now_ts: float,
         ttl_seconds: int,
+        envelope_digest: str,
     ) -> bool:
         """Reserve ``(sender, nonce)``. Return False when already consumed."""
+        ...
+
+    async def matches(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        envelope_digest: str,
+    ) -> bool:
+        """Return whether a consumed nonce belongs to this exact envelope."""
         ...
 
 
@@ -91,6 +105,10 @@ class EnvelopeVerification:
     # this verdict. Hosted callers bind it to the manager's live sender
     # identity through authorization and task commit.
     verification_document_fingerprint: str = ""
+    # True only when a caller explicitly admits a cryptographically valid
+    # nonce replay for an action whose downstream rail supplies the durable
+    # idempotency key. Ordinary task/read/cancel callers never opt in.
+    replayed: bool = False
 
 
 def verification_document_fingerprint(
@@ -177,13 +195,21 @@ def bound_envelope_fields(
     ``TaskSendParams`` field, not part of ``metadata``.
     """
     md = metadata or {}
-    return {
+    bound = {
         "skill": str(md.get("skill") or md.get("skill_id") or ""),
         "a2a_verb": str(md.get("a2a_verb") or ""),
         "reply_expected": bool(md.get("reply_expected", False)),
         "causation_chain": _canonical_chain(md.get("causation_chain")),
         "artifacts": _canonical_artifacts(artifacts),
     }
+    # Audience was added without bumping the envelope version because only
+    # audience-bearing action envelopes opt in.  Omitting the key for all
+    # other v2 envelopes preserves their existing canonical bytes.
+    if A2A_AUDIENCE_METADATA_KEY in md:
+        bound[A2A_AUDIENCE_METADATA_KEY] = str(
+            md.get(A2A_AUDIENCE_METADATA_KEY) or ""
+        )
+    return bound
 
 
 def canonical_signing_bytes(
@@ -408,14 +434,21 @@ class ReplayGuard:
 
     def __init__(self, ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
         self._ttl = ttl_seconds
-        self._seen: "dict[str, float]" = {}
+        self._seen: "dict[str, tuple[float, str]]" = {}
         self._lock = threading.Lock()
 
     @staticmethod
     def _key(sender: str, nonce: str) -> str:
         return f"{sender}\x00{nonce}"
 
-    def reserve(self, sender: str, nonce: str, *, now_ts: float) -> bool:
+    def reserve(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        now_ts: float,
+        envelope_digest: str = "",
+    ) -> bool:
         """Atomically reserve a ``(sender, nonce)``. Return True if fresh (now
         reserved), False if already reserved/consumed in-window (a replay).
 
@@ -429,12 +462,34 @@ class ReplayGuard:
             cutoff = now_ts - self._ttl
             # Opportunistic prune of expired entries.
             if len(self._seen) > 1024:
-                self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
-            seen_at = self._seen.get(key)
-            if seen_at is not None and seen_at >= cutoff:
+                self._seen = {
+                    k: item for k, item in self._seen.items() if item[0] >= cutoff
+                }
+            seen = self._seen.get(key)
+            if seen is not None and seen[0] >= cutoff:
                 return False
-            self._seen[key] = now_ts
+            self._seen[key] = (now_ts, envelope_digest)
             return True
+
+    def matches(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        envelope_digest: str,
+        now_ts: float,
+    ) -> bool:
+        """Return whether a live reservation is for these exact signed bytes."""
+        if not nonce:
+            return False
+        key = self._key(sender, nonce)
+        with self._lock:
+            seen = self._seen.get(key)
+            return bool(
+                seen is not None
+                and seen[0] >= now_ts - self._ttl
+                and secrets.compare_digest(seen[1], envelope_digest)
+            )
 
 
 # Process-wide default guard used by the inbound endpoint when no guard is
@@ -473,6 +528,7 @@ async def verify_inbound_envelope(
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
     replay_store: Optional[ReplayNonceStore] = None,
+    allow_verified_replay: bool = False,
     now: Optional[datetime] = None,
 ) -> EnvelopeVerification:
     """Decide whether to accept an inbound A2A envelope based on its signature.
@@ -495,6 +551,13 @@ async def verify_inbound_envelope(
       escape hatch is genuinely *unsigned* traffic above.
     * ``signature`` present and sender resolvable: cryptographically verify
       (including the freshness window and replay nonce); any failure is rejected.
+
+    ``allow_verified_replay`` is a narrow escape hatch for idempotent actions:
+    after the signature, DID, and freshness checks pass, a previously consumed
+    nonce is reported as an admitted verified replay. Callers may set it only
+    when the downstream action has its own authenticated durable idempotency
+    key. It remains false for ordinary task, read, subscription, and cancel
+    actions.
 
     A present-but-structurally-malformed block (``{}``, ``[]``, ``""``, or a
     mapping without ``signatures``) is rejected up front, regardless of
@@ -572,13 +635,61 @@ async def verify_inbound_envelope(
     if nonce:
         now_dt = now or datetime.now(timezone.utc)
         now_ts = now_dt.timestamp()
-        if replay_guard is not None and not replay_guard.reserve(
-            sender, nonce, now_ts=now_ts
-        ):
-            logger.warning("A2A: rejecting replayed envelope from %r (nonce reuse).", sender)
-            return EnvelopeVerification(
-                ok=False, reason="replayed envelope (nonce already seen in window)"
+        envelope_digest = hashlib.sha256(
+            canonical_signing_bytes(
+                sender=sender,
+                task_id=task_id,
+                session_id=session_id,
+                message=message,
+                timestamp=timestamp,
+                nonce=nonce,
+                bound=bound,
             )
+        ).hexdigest()
+        local_reserved = True
+        exact_local_replay = False
+        if replay_guard is not None:
+            local_reserved = replay_guard.reserve(
+                sender,
+                nonce,
+                now_ts=now_ts,
+                envelope_digest=envelope_digest,
+            )
+        if not local_reserved:
+            exact_local_replay = replay_guard is not None and replay_guard.matches(
+                sender,
+                nonce,
+                now_ts=now_ts,
+                envelope_digest=envelope_digest,
+            )
+            if allow_verified_replay and exact_local_replay and replay_store is None:
+                logger.info(
+                    "A2A: admitting exact verified replay from %r for an "
+                    "idempotent action.",
+                    sender,
+                )
+                return EnvelopeVerification(
+                    ok=True,
+                    reason="exact verified replay admitted for idempotent action",
+                    verified=True,
+                    sender=sender,
+                    nonce=nonce,
+                    verification_document_fingerprint=document_fingerprint,
+                    replayed=True,
+                )
+            if not allow_verified_replay or not exact_local_replay:
+                logger.warning(
+                    "A2A: rejecting replayed envelope from %r "
+                    "(nonce reused by a different envelope).",
+                    sender,
+                )
+                return EnvelopeVerification(
+                    ok=False,
+                    reason=(
+                        "replayed envelope (nonce already seen in window for "
+                        "a different envelope)"
+                    ),
+                )
         if replay_store is not None:
             try:
                 reserved = await replay_store.reserve(
@@ -586,6 +697,16 @@ async def verify_inbound_envelope(
                     nonce,
                     now_ts=now_ts,
                     ttl_seconds=2 * max_age_seconds,
+                    envelope_digest=envelope_digest,
+                )
+                exact_shared_replay = (
+                    not reserved
+                    and allow_verified_replay
+                    and await replay_store.matches(
+                        sender,
+                        nonce,
+                        envelope_digest=envelope_digest,
+                    )
                 )
             except Exception:  # noqa: BLE001 - local guard is the fallback path
                 logger.warning(
@@ -594,17 +715,46 @@ async def verify_inbound_envelope(
                 )
             else:
                 if not reserved:
+                    if exact_shared_replay:
+                        logger.info(
+                            "A2A: admitting exact verified cross-worker replay "
+                            "from %r for an idempotent action.",
+                            sender,
+                        )
+                        return EnvelopeVerification(
+                            ok=True,
+                            reason=(
+                                "exact verified replay admitted for idempotent action"
+                            ),
+                            verified=True,
+                            sender=sender,
+                            nonce=nonce,
+                            verification_document_fingerprint=(
+                                document_fingerprint
+                            ),
+                            replayed=True,
+                        )
                     logger.warning(
-                        "A2A: rejecting cross-worker replayed envelope from %r (nonce reuse).",
+                        "A2A: rejecting cross-worker replayed envelope from %r "
+                        "(nonce reuse).",
                         sender,
                     )
                     return EnvelopeVerification(
                         ok=False,
-                        reason="replayed envelope (nonce already seen in shared window)",
+                        reason=(
+                            "replayed envelope (nonce already seen in shared window)"
+                        ),
                     )
     # Surface the verified sender+nonce on the verdict for observability/audit.
     return EnvelopeVerification(
-        ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
+        ok=verdict.ok,
+        reason=(
+            "exact verified replay admitted for idempotent action"
+            if nonce and exact_local_replay
+            else verdict.reason
+        ),
+        verified=verdict.verified,
         sender=sender, nonce=nonce,
         verification_document_fingerprint=document_fingerprint,
+        replayed=bool(nonce and exact_local_replay),
     )

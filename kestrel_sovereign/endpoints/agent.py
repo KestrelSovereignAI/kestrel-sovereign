@@ -46,11 +46,11 @@ from kestrel_sovereign.storage.privacy_wrapper import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
-    CooperativeStopTarget,
     StopDisposition,
     StopCleanupRegistry,
     StopRequest,
     StopScope,
+    build_agent_stop_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -1015,159 +1015,6 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        active_request_ids = set(
-            getattr(agent, "_active_request_ids", set()) or set()
-        )
-        abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
-        if isinstance(abandoned_turns, dict):
-            active_request_ids.update(abandoned_turns)
-        current_turn = getattr(agent, "_current_request_id", None)
-        if isinstance(current_turn, str) and current_turn:
-            active_request_ids.add(current_turn)
-        if request_id is not None:
-            active_request_ids.add(request_id)
-        instance_binding_accessor = vars(agent).get(
-            "active_turn_request_bindings"
-        )
-        if callable(instance_binding_accessor):
-            has_binding_accessor = True
-            raw_turn_bindings = instance_binding_accessor()
-        else:
-            class_binding_accessor = getattr(
-                type(agent),
-                "active_turn_request_bindings",
-                None,
-            )
-            has_binding_accessor = callable(class_binding_accessor)
-            raw_turn_bindings = (
-                class_binding_accessor(agent) if has_binding_accessor else None
-            )
-        if has_binding_accessor:
-            if not isinstance(raw_turn_bindings, dict):
-                raise TypeError("agent turn binding inventory has an invalid type")
-            turn_request_ids = {}
-            turn_request_generations = {}
-            for indexed_turn_id, binding in raw_turn_bindings.items():
-                if (
-                    not isinstance(indexed_turn_id, str)
-                    or not isinstance(binding, tuple)
-                    or len(binding) != 2
-                    or not isinstance(binding[0], str)
-                ):
-                    raise TypeError("agent turn binding inventory is malformed")
-                try:
-                    validate_invocation_id(indexed_turn_id)
-                    validate_invocation_id(binding[0])
-                except ValueError as error:
-                    raise TypeError(
-                        "agent turn binding inventory is malformed"
-                    ) from error
-                turn_request_ids[indexed_turn_id] = binding[0]
-                if binding[1] is not None:
-                    if (
-                        not isinstance(binding[1], int)
-                        or isinstance(binding[1], bool)
-                        or binding[1] <= 0
-                    ):
-                        raise TypeError("agent turn generation is malformed")
-                    turn_request_generations[indexed_turn_id] = binding[1]
-        else:
-            turn_index_accessor = vars(agent).get("active_turn_request_ids")
-            if not callable(turn_index_accessor):
-                turn_index_accessor = getattr(
-                    type(agent),
-                    "active_turn_request_ids",
-                    None,
-                )
-                if callable(turn_index_accessor):
-                    turn_request_ids = turn_index_accessor(agent)
-                else:
-                    turn_request_ids = {}
-            else:
-                turn_request_ids = turn_index_accessor()
-            turn_request_generations = {}
-        if not isinstance(turn_request_ids, dict):
-            raise TypeError("agent turn request inventory has an invalid type")
-        turn_addresses = active_request_ids.union(turn_request_ids)
-
-        async def cancel_request(stop_request: StopRequest) -> StopDisposition:
-            cancelled_request_ids: list[Optional[str]] = []
-            if stop_request.scope is StopScope.TURN:
-                cancel_kwargs = {"request_id": stop_request.target}
-                if stop_request.request_generation is not None:
-                    cancel_kwargs["generation"] = stop_request.request_generation
-                canceled = agent.cancel_current_request(**cancel_kwargs)
-                if canceled:
-                    cancelled_request_ids.append(stop_request.target)
-                else:
-                    # The matching invoke/stream may have been dispatched by
-                    # the client but not yet reached lifecycle registration.
-                    # Fence that exact ID briefly; registration consumes the
-                    # tombstone before cognition can begin.  Unknown IDs keep
-                    # the historical ALREADY_COMPLETE result.
-                    reserve = getattr(
-                        type(agent),
-                        "reserve_request_cancellation",
-                        None,
-                    )
-                    if (
-                        stop_request.request_generation is None
-                        and callable(reserve)
-                    ):
-                        reserve(agent, stop_request.target)
-            else:
-                canceled = False
-                for active_request_id in sorted(active_request_ids):
-                    request_cancelled = agent.cancel_current_request(
-                        request_id=active_request_id
-                    )
-                    if request_cancelled:
-                        cancelled_request_ids.append(active_request_id)
-                    canceled = request_cancelled or canceled
-                if not active_request_ids:
-                    canceled = agent.cancel_current_request(request_id=None)
-                    if canceled:
-                        cancelled_request_ids.append(None)
-            if canceled:
-                wait_for_completion = getattr(
-                    agent,
-                    "wait_for_request_completion",
-                    None,
-                )
-                if not callable(wait_for_completion):
-                    raise RuntimeError(
-                        "agent cannot confirm request lifecycle completion"
-                    )
-                # Every cancellation marker is installed before the first
-                # await, so agent-wide Stop reaches all snapshotted turns at
-                # once. STOPPED is returned only after each one has run its
-                # endpoint cleanup; CancellationAuthority bounds this wait.
-                abandoned = False
-                for cancelled_request_id in cancelled_request_ids:
-                    wait_kwargs = {}
-                    if (
-                        stop_request.scope is StopScope.TURN
-                        and stop_request.request_generation is not None
-                    ):
-                        wait_kwargs["generation"] = (
-                            stop_request.request_generation
-                        )
-                    completion_disposition = await wait_for_completion(
-                        cancelled_request_id,
-                        **wait_kwargs,
-                    )
-                    abandoned = abandoned or (
-                        completion_disposition
-                        is RequestCompletionDisposition.ABANDONED
-                    )
-                if abandoned:
-                    return StopDisposition.UNREACHABLE
-            return (
-                StopDisposition.STOPPED
-                if canceled
-                else StopDisposition.ALREADY_COMPLETE
-            )
-
         cleanup_registry = getattr(
             request.app.state,
             "stop_cleanup_registry",
@@ -1181,13 +1028,10 @@ async def stop_agent_request(request: Request):
 
         authority = CancellationAuthority(
             lambda: (
-                CooperativeStopTarget(
-                    target_id=agent_id,
-                    agent_id=agent_id,
-                    cancel=cancel_request,
-                    turn_ids=frozenset(turn_addresses),
-                    turn_request_ids=turn_request_ids,
-                    turn_request_generations=turn_request_generations,
+                build_agent_stop_target(
+                    agent,
+                    include_request_id=request_id,
+                    target_identity=agent_id,
                 ),
             ),
             cleanup_registry=cleanup_registry,
@@ -2645,6 +2489,8 @@ async def _create_a2a_task_under_lifecycle_lease(
     manager,
     hosted_policy=None,
     commit=None,
+    *,
+    allow_verified_replay=False,
 ):
     """Verify, authorize, and commit one A2A action under stable topology."""
     from kestrel_sovereign.a2a.envelope_signing import (
@@ -2697,6 +2543,7 @@ async def _create_a2a_task_under_lifecycle_lease(
         resolver=resolver,
         require_signed=require_signed,
         replay_store=_a2a_replay_store(agent),
+        allow_verified_replay=allow_verified_replay,
     )
     if not sender_verdict.ok:
         raise HTTPException(
@@ -2958,6 +2805,8 @@ async def _create_verified_a2a_task(
     raw_artifacts,
     sender_artifacts,
     commit=None,
+    *,
+    allow_verified_replay=False,
 ):
     """Use a shared manager lease for hosted recipients; preserve standalone flow."""
     manager = getattr(agent, "_a2a_host_manager", None)
@@ -2987,6 +2836,7 @@ async def _create_verified_a2a_task(
                 manager,
                 hosted_policy,
                 commit,
+                allow_verified_replay=allow_verified_replay,
             )
     return await _create_a2a_task_under_lifecycle_lease(
         agent,
@@ -2997,6 +2847,7 @@ async def _create_verified_a2a_task(
         None,
         None,
         commit,
+        allow_verified_replay=allow_verified_replay,
     )
 
 
@@ -3158,6 +3009,112 @@ async def send_task(request: Request):
     # Return the canonical A2A Task envelope (model_dump produces the
     # standard JSON-RPC-friendly shape).
     return task.model_dump()
+
+
+@router.post("/peer/stop")
+@limiter.limit("120/minute")
+async def stop_from_peer(request: Request):
+    """Dispatch one signed peer andon-cord request through signal policy.
+
+    This is not the local/operator ``POST /stop`` door.  The shared transport
+    key admits the connection, while the ordinary replay-protected A2A hybrid
+    envelope proves and authorizes the peer principal.  Only after that
+    decision does the recipient construct ``a2a.peer_stop`` and let the
+    dispatcher decide cycle, depth, durable replay, and rate-limit outcomes.
+    """
+
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+    from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+    from kestrel_sovereign.signals.sources.peer_stop import (
+        build_peer_stop_signal,
+        decode_peer_stop_action_envelope,
+        peer_stop_audience,
+        signal_result_to_peer_stop_response,
+    )
+    from kestrel_sovereign.stop import agent_stop_identity
+
+    agent = get_agent(request)
+    dispatcher = getattr(agent, "dispatcher", None)
+    if dispatcher is None or not callable(
+        getattr(dispatcher, "dispatch_signal", None)
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Peer Stop signal dispatcher is unavailable",
+        )
+
+    body = await _parse_json_body(request)
+    try:
+        intent, correlation_id, session_id, metadata = (
+            decode_peer_stop_action_envelope(body)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if HOST_ATTESTED_LOCAL_SUBMISSION_METADATA in metadata:
+        raise HTTPException(
+            status_code=400,
+            detail="host-attested local A2A provenance is not accepted over the wire",
+        )
+    message_text = body["message"]["parts"][0]["text"]
+    try:
+        params = TaskSendParams(
+            id=correlation_id,
+            sessionId=session_id,
+            message=Message(role="user", parts=[TextPart(text=message_text)]),
+            metadata=metadata,
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid peer Stop action: {error}",
+        ) from error
+
+    async def _dispatch(authorized_sender_id: str):
+        if (
+            not isinstance(authorized_sender_id, str)
+            or not authorized_sender_id.strip()
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Peer Stop requires an authenticated agent",
+            )
+        trusted_target_id = agent_stop_identity(agent)
+        if peer_stop_audience(metadata) != trusted_target_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Peer Stop signed audience does not match this recipient",
+            )
+        signal = build_peer_stop_signal(
+            agent=agent,
+            actor_id=authorized_sender_id,
+            intent=intent,
+            causation_chain=_deserialize_chain(params.metadata),
+        )
+        result = await dispatcher.dispatch_signal(
+            signal,
+            source_event_id=signal.dedupe_key,
+        )
+        return signal_result_to_peer_stop_response(
+            result,
+            target_agent_id=signal.target_agent,
+            intent=intent,
+        )
+
+    return await _create_verified_a2a_task(
+        agent,
+        params,
+        params.message.parts,
+        [],
+        [],
+        commit=_dispatch,
+        # Unlike task creation, this action has a durable authenticated
+        # actor+correlation idempotency key at the signal dispatcher. Admit a
+        # valid verbatim transport retry so that rail can return COALESCED.
+        allow_verified_replay=True,
+    )
 
 
 async def _parse_a2a_principal_action(

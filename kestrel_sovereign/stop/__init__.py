@@ -8,6 +8,11 @@ from .authority import (
     CooperativeStopTarget,
     StopCleanupRegistry,
 )
+from .agent_target import (
+    agent_stop_identity,
+    build_agent_cancellation_authority,
+    build_agent_stop_target,
+)
 from .types import StopDisposition, StopOutcome, StopRequest, StopScope
 
 __all__ = [
@@ -18,4 +23,7 @@ __all__ = [
     "StopOutcome",
     "StopRequest",
     "StopScope",
+    "agent_stop_identity",
+    "build_agent_cancellation_authority",
+    "build_agent_stop_target",
 ]

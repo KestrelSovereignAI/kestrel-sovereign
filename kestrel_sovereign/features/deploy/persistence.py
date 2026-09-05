@@ -79,9 +79,9 @@ def validate_cloudrun_persistence(profile: DeploymentProfile) -> None:
     if mode == EPHEMERAL_DEMO:
         if profile.max_instances != 1:
             raise DeployManagerError(
-                "ephemeral_demo Cloud Run profiles require max_instances=1; "
-                "otherwise separate instances can mint different keys for "
-                "the same configured service"
+                "Kestrel Cloud Run profiles currently require max_instances=1; "
+                "peer Stop has process-local active-work inventory and refuses "
+                "multi-runtime execution"
             )
         if environment in {"prod", "production"}:
             raise DeployManagerError(
@@ -100,6 +100,18 @@ def validate_cloudrun_persistence(profile: DeploymentProfile) -> None:
             "durable_sovereign Cloud Run currently supports single-agent "
             "profiles only; multi-agent profiles need per-agent custody and "
             "database bindings and are refused"
+        )
+    # Cooperative Stop inventories live work inside one runtime. Until that
+    # inventory has a shared cancellation/fan-out substrate, two replicas can
+    # acknowledge different answers for one DID and an idle replica can hide
+    # work on the busy one. Refuse the topology at the supported deployment
+    # boundary rather than advertise horizontally scalable custody as
+    # horizontally coherent execution.
+    if profile.max_instances != 1:
+        raise DeployManagerError(
+            "Kestrel Cloud Run profiles currently require max_instances=1; "
+            "peer Stop has process-local active-work inventory and refuses "
+            "multi-runtime execution"
         )
     if backend != "postgres":
         raise DeployManagerError(

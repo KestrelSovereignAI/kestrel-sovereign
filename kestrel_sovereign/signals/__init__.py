@@ -69,6 +69,9 @@ from kestrel_sovereign.signals.durable import (
     DurableSourceBoundary,
     DurableSignalStore,
 )
+from kestrel_sovereign.signals.durable_payload_policy import (
+    AlwaysElidedActionSourceRegistration,
+)
 from kestrel_sovereign.signals.handlers import template_artifact_handler
 from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
 from kestrel_sovereign.signals.prompt_overrides import (
@@ -107,6 +110,7 @@ __all__ = [
     "Urgency",
     "Visibility",
     # Runtime
+    "AlwaysElidedActionSourceRegistration",
     "DEFAULT_COALESCING_WINDOW",
     "DEFAULT_TTL",
     "DurableAdmissionDisposition",

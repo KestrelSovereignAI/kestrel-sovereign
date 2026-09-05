@@ -1544,6 +1544,97 @@ class AgentManager:
                 ).get("cancellation_receipt"),
             }
 
+    async def stop_host_attested_local_peer(
+        self,
+        *,
+        sender: object,
+        requester: object,
+        peer: object,
+        payload: object,
+    ) -> dict[str, object]:
+        """Dispatch a same-host peer Stop using manager-attested principals.
+
+        Pre-ceremony local agents cannot produce a hybrid wire signature.  The
+        router capability instead binds the exact published sender object; the
+        manager revalidates both ends and the recipient's directory policy
+        under its lifecycle lease.  It then dispatches the same ACTION signal
+        as the signed HTTP path.  No local path may call cancellation directly.
+        """
+
+        from collections.abc import Mapping
+
+        from kestrel_sovereign.features.peers.directory import (
+            PeerAccessDeniedError,
+            PeerProtocolError,
+            PeerUnavailableError,
+        )
+        from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            build_peer_stop_signal,
+            decode_peer_stop_action_envelope,
+            peer_stop_audience,
+            signal_result_to_peer_stop_response,
+        )
+
+        if not isinstance(payload, Mapping):
+            raise PeerProtocolError("Local peer Stop request is malformed")
+        try:
+            intent, _correlation_id, _session_id, metadata = (
+                decode_peer_stop_action_envelope(payload)
+            )
+        except ValueError as error:
+            raise PeerProtocolError("Local peer Stop request is malformed") from error
+
+        async with self.a2a_execution_lease():
+            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
+                sender=sender,
+                requester=requester,
+                peer=peer,
+            )
+            recipient_id = _loaded_agent_did(recipient)
+            if (
+                recipient_id is None
+                or peer_stop_audience(metadata) != recipient_id
+            ):
+                raise PeerAccessDeniedError(
+                    "Local peer Stop audience does not match the routed recipient"
+                )
+            dispatcher = getattr(recipient, "dispatcher", None)
+            if dispatcher is None or not callable(
+                getattr(dispatcher, "dispatch_signal", None)
+            ):
+                raise PeerUnavailableError(
+                    "Local peer Stop signal dispatcher is unavailable"
+                )
+
+            # Causation is host-observed from the exact live sender task.  The
+            # payload's metadata may be caller-shaped in this compatibility
+            # lane and therefore never controls the loop-detection chain.
+            serialized_chain = None
+            chain_provider = getattr(sender, "_provide_causation_chain", None)
+            if callable(chain_provider):
+                serialized_chain = chain_provider()
+            chain = _deserialize_chain(
+                {"causation_chain": serialized_chain}
+                if serialized_chain
+                else {}
+            )
+            signal = build_peer_stop_signal(
+                agent=recipient,
+                actor_id=sender_id,
+                intent=intent,
+                causation_chain=chain,
+            )
+            result = await dispatcher.dispatch_signal(
+                signal,
+                source_event_id=signal.dedupe_key,
+            )
+            return signal_result_to_peer_stop_response(
+                result,
+                target_agent_id=signal.target_agent,
+                intent=intent,
+            )
+
     @staticmethod
     def _published_a2a_display_identity(agent: object) -> Optional[str]:
         """Return the live display identity published by ``/api/agents``.

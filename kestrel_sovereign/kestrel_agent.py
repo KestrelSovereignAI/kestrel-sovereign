@@ -2671,6 +2671,7 @@ class KestrelAgent(
         # Each build_* is unconditional (not gated on any feature):
         #   a2a.task_complete    — peer-task completion wake (#889 Phase 5)
         #   a2a.task_submitted   — inbound peer-task wake (#645)
+        #   a2a.peer_stop       — authenticated peer andon cord (#3169)
         #   stripe.deposit       — Stripe deposit webhook (UNTRUSTED COGNITION)
         #   a2a.question_answered— send_a2a_question resumption rail (#1444)
         #   wait.complete        — generic wait reconciler rail (#1860)
@@ -2682,6 +2683,9 @@ class KestrelAgent(
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_a2a_task_submitted_registration,
+        )
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            build_peer_stop_registration,
         )
         from kestrel_sovereign.signals.sources.wallet import (
             build_stripe_deposit_registration,
@@ -2699,6 +2703,7 @@ class KestrelAgent(
         core_source_registrations = [
             build_a2a_task_complete_registration(),
             build_a2a_task_submitted_registration(),
+            build_peer_stop_registration(self),
             build_stripe_deposit_registration(),
             build_a2a_question_answered_registration(),
             build_wait_complete_registration(),

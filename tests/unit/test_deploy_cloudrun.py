@@ -177,7 +177,7 @@ class TestCloudRunProviderDeploy:
         durable = replace(
             deployment_profile,
             persistence_mode="durable_sovereign",
-            max_instances=100,
+            max_instances=1,
             env_vars={
                 "KESTREL_ENV": "production",
                 "KESTREL_DB_BACKEND": "postgres",
@@ -198,6 +198,19 @@ class TestCloudRunProviderDeploy:
                 service_name="kestrel-prod",
                 profile=durable,
                 env_vars={"KESTREL_DB_BACKEND": "sqlite"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_rejects_multi_runtime_peer_stop_inventory(
+        self, deployment_profile
+    ):
+        provider = CloudRunProvider(project_id="test-project")
+
+        with pytest.raises(DeployManagerError, match="process-local active-work"):
+            await provider.deploy(
+                image="gcr.io/test-project/kestrel:immutable",
+                service_name="kestrel-dev",
+                profile=replace(deployment_profile, max_instances=2),
             )
 
     @pytest.mark.asyncio
