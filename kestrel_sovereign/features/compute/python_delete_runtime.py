@@ -14,6 +14,7 @@ import json as _json
 import os as _os
 from pathlib import Path as _Path
 import shutil as _shutil
+import stat as _stat
 import tempfile as _tempfile
 import unicodedata as _unicodedata
 
@@ -127,6 +128,7 @@ def install_safe_delete_runtime(
     audit_log = trash_root / "agent_data_access_audit.jsonl"
 
     original_unlink = _os.unlink
+    original_link = _os.link
     original_rename = _os.rename
     original_replace = _os.replace
     original_truncate = _os.truncate
@@ -163,6 +165,30 @@ def install_safe_delete_runtime(
             pass
 
     def assert_agent_data_allowed(path: _Path, action: str) -> None:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} path whose hard-link custody cannot be "
+                f"verified: {path}"
+            ) from exc
+        if (
+            metadata is not None
+            and _stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink != 1
+        ):
+            audit_agent_data(
+                path,
+                action,
+                "blocked",
+                "ambiguous_hard_link_custody",
+            )
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} multiply-linked file with ambiguous "
+                f"Hold custody: {path}"
+            )
         if _paths_overlap_by_filesystem_identity(path, host_control_data):
             audit_agent_data(path, action, "blocked", "host_hold_custody")
             raise _KestrelAgentDataProtectionError(
@@ -292,6 +318,17 @@ def install_safe_delete_runtime(
         assert_agent_data_allowed(_Path(dst).resolve(strict=False), "replace")
         return original_replace(src, dst)
 
+    def safe_link(src, dst, *args, **kwargs):
+        if internal_filesystem_operation.get():
+            return original_link(src, dst, *args, **kwargs)
+        if args or kwargs:
+            raise ValueError(
+                "Safe hard-link creation does not support dir_fd/options"
+            )
+        assert_agent_data_allowed(_Path(src).resolve(strict=False), "hard_link")
+        assert_agent_data_allowed(_Path(dst).resolve(strict=False), "hard_link")
+        return original_link(src, dst)
+
     def safe_truncate(path, length, *args, **kwargs):
         try:
             resolved = _Path(path).expanduser().resolve(strict=False)
@@ -371,6 +408,7 @@ def install_safe_delete_runtime(
 
     _os.remove = safe_remove
     _os.unlink = safe_remove
+    _os.link = safe_link
     _os.rename = safe_rename
     _os.replace = safe_replace
     _os.truncate = safe_truncate

@@ -827,10 +827,10 @@ os._exit(0)
 
         assert list(config.agents) == ["real-agent"]
 
-    def test_auto_discover_excludes_nested_host_control_subtree(
+    def test_auto_discover_refuses_nonexact_nested_host_control_subtree(
         self, tmp_path, monkeypatch
     ):
-        """A custom nested custody path reserves its direct child subtree."""
+        """An ancestor candidate cannot be silently discarded as control data."""
 
         agent_data = tmp_path / "agent_data"
         agent_dir = agent_data / "real-agent"
@@ -841,9 +841,24 @@ os._exit(0)
             "KESTREL_HOST_DB_PATH", str(host_dir / "kestrel_host.db")
         )
 
-        config = MultiAgentConfig.auto_discover(agent_data, include_empty=True)
+        with pytest.raises(ValueError, match="not its exact dedicated"):
+            MultiAgentConfig.auto_discover(agent_data, include_empty=True)
 
-        assert list(config.agents) == ["real-agent"]
+    def test_auto_discover_refuses_control_directory_above_candidates(
+        self, tmp_path, monkeypatch
+    ):
+        """A broad host path cannot silently suppress every empty agent."""
+
+        agent_data = tmp_path / "agent_data"
+        (agent_data / "alice").mkdir(parents=True)
+        (agent_data / "bob").mkdir()
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(agent_data / "host-features.db"),
+        )
+
+        with pytest.raises(ValueError, match="not its exact dedicated"):
+            MultiAgentConfig.auto_discover(agent_data, include_empty=True)
 
     def test_auto_discover_refuses_existing_agent_at_host_control_root(
         self, tmp_path, monkeypatch

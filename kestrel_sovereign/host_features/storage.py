@@ -238,6 +238,7 @@ def _hold_evidence_family(path: Path) -> tuple[Path, ...]:
     # module import time.  Hold itself imports this module for its read-only
     # SQLite readiness checks.
     from kestrel_sovereign.hold.state import (
+        hold_backend_binding_path,
         hold_history_anchor_path,
         hold_initialization_witness_path,
         hold_sqlite_custody_marker_path,
@@ -251,6 +252,7 @@ def _hold_evidence_family(path: Path) -> tuple[Path, ...]:
         Path(f"{history}.bootstrap"),
         Path(f"{history}.lock"),
         hold_sqlite_custody_marker_path(path),
+        hold_backend_binding_path(path),
     )
 
 

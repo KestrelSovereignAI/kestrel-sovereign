@@ -24,6 +24,7 @@ from kestrel_sovereign.identity.local_anchor import (
 )
 from kestrel_sovereign.paths import spawned_agent_env
 from kestrel_sovereign.security.path_identity import (
+    paths_equal_by_filesystem_identity,
     paths_overlap_by_filesystem_identity,
 )
 from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
@@ -555,7 +556,17 @@ class MultiAgentConfig(BaseModel):
                         "agent directory or set KESTREL_HOST_DB_PATH to a "
                         "dedicated path outside agent_data before restarting"
                     )
-                continue
+                if paths_equal_by_filesystem_identity(
+                    resolved_subdir,
+                    host_control_dir,
+                ):
+                    continue
+                raise ValueError(
+                    f"Auto-discovered agent directory {subdir} overlaps host "
+                    f"Hold custody at {host_control_dir}, but is not its exact "
+                    "dedicated control directory. Move the agent or set "
+                    "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
+                )
             if not db_path.exists() and not include_empty:
                 continue
             candidate = LocalAgentConfig(

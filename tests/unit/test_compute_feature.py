@@ -801,6 +801,121 @@ class TestDestructivePolicy:
         assert "host Hold custody" in result.stderr
         assert target.read_bytes() == b"sovereign state"
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    def test_python_wrapper_blocks_existing_hard_link_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """An outside pathname cannot make the same protected inode writable."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "outside-alias.db"
+        os.link(target, alias)
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "hard-link-alias.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"open({str(alias)!r}, 'w').write('gone')\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "ambiguous Hold custody" in result.stderr
+        assert target.read_bytes() == b"sovereign state"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    @pytest.mark.parametrize("api", ["os", "pathlib"])
+    def test_python_wrapper_blocks_hard_link_creation_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        api,
+    ):
+        """A compute process cannot first manufacture an outside alias."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = tmp_path / f"{api}-alias.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        operation = (
+            f"os.link({str(target)!r}, {str(alias)!r})"
+            if api == "os"
+            else f"Path({str(alias)!r}).hardlink_to({str(target)!r})"
+        )
+        import_line = "import os\n" if api == "os" else "from pathlib import Path\n"
+        script_path = tmp_path / f"hard-link-{api}.py"
+        script_path.write_text(
+            policy.rewrite_python_script(f"{import_line}{operation}\n")
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert not alias.exists()
+        assert target.read_bytes() == b"sovereign state"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    def test_shell_rewrite_blocks_existing_hard_link_alias_with_ambiguous_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Static shell admission applies the same existing-alias rule."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "shell-alias.db"
+        os.link(target, alias)
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        assert policy.is_deletable_path(str(alias)) is False
+        with pytest.raises(AgentDataProtectionError, match="ambiguous Hold custody"):
+            policy.rewrite_bash_script(f"printf gone > {alias}")
+
+        assert target.read_bytes() == b"sovereign state"
+
     def test_parent_policy_blocks_uncreated_case_alias_to_hold_custody(
         self,
         temp_trash_dir,

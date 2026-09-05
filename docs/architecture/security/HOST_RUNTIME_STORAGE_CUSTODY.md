@@ -40,6 +40,9 @@ agent's writable `data_dir` or explicit `identity_export_dir`. When an operator
 supplies `KESTREL_MULTI_AGENT_CONFIG` outside the project, relative agent paths
 are still checked against the live server's project base—the same base used by
 `AgentManager`—rather than against the config file's storage directory.
+Auto-discovery skips only the exact dedicated control directory; an ancestor or
+descendant overlap is invalid and fails startup rather than silently dropping
+candidate agents.
 
 The supported SQLite Docker images derive this path beneath the effective
 `KESTREL_DB_PATH` (`<agent-data>/host-data/host-features.db`). Recreating a
@@ -63,6 +66,10 @@ The same directory carries an immutable `sqlite` or `postgres` backend binding.
 Kestrel claims it before first Hold initialization and refuses a later backend
 change unless an operator performs a verified state migration. Selecting a
 fresh empty backend is never an implicit release of latches or receipt history.
+Surviving SQLite initialization/history witnesses or Hold schema objects retain
+that authority even if the marker or binding is missing. Automatic host-path
+migration refuses every backend binding with the rest of the Hold evidence;
+operators must relocate the complete custody root as one verified operation.
 
 ## Secure SQLite creation
 
@@ -83,6 +90,11 @@ The POSIX mode contract is `0700` for the parent and `0600` for the main DB,
 WAL, SHM, and journal. Windows does not expose equivalent POSIX mode semantics;
 link/type validation still applies and ACL policy remains the operator's
 responsibility.
+
+Compute mutation guards also refuse multiply-linked regular files because an
+outside pathname cannot prove which protected directory owns the same inode.
+Python hard-link creation is guarded at its source and destination boundary;
+existing aliases remain non-writable even if another process created them.
 
 ## Two host databases, two responsibilities
 

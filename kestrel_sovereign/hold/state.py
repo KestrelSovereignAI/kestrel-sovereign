@@ -4373,6 +4373,47 @@ class HoldStore:
             return receipt
 
 
+def _sqlite_backend_custody_artifacts(database: Path) -> tuple[Path, ...]:
+    """Return authoritative external evidence of prior SQLite Hold state."""
+
+    history = hold_history_anchor_path(database)
+    return (
+        hold_initialization_witness_path(database),
+        history,
+        Path(f"{history}.pending"),
+        Path(f"{history}.bootstrap"),
+        hold_sqlite_custody_marker_path(database),
+    )
+
+
+def _sqlite_database_has_hold_schema(database: Path) -> bool:
+    """Read-only probe for any surviving SQLite Hold schema object."""
+
+    if not path_exists(database):
+        return False
+    names = tuple(sorted(_HOLD_SCHEMA_TABLES))
+    placeholders = ", ".join("?" for _ in names)
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{database.as_uri()}?mode=ro",
+                uri=True,
+            )
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            row = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                f"WHERE name IN ({placeholders}) LIMIT 1",
+                names,
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            f"database is free of Hold state: {exc}"
+        ) from exc
+    return row is not None
+
+
 def validate_hold_backend_custody(
     control_db_path: str | Path,
     backend: str,
@@ -4383,9 +4424,17 @@ def validate_hold_backend_custody(
     if selected not in {"sqlite", "postgres"}:
         raise HoldStateError("Hold backend custody must be 'sqlite' or 'postgres'")
     database = absolute_without_following_leaf(Path(control_db_path))
-    if selected != "sqlite" and path_exists(
-        hold_sqlite_custody_marker_path(database)
-    ):
+    sqlite_artifacts = (
+        selected != "sqlite"
+        and (
+            any(
+                path_exists(path)
+                for path in _sqlite_backend_custody_artifacts(database)
+            )
+            or _sqlite_database_has_hold_schema(database)
+        )
+    )
+    if sqlite_artifacts:
         raise HoldCorruptStateError(
             "Hold backend switch would abandon existing SQLite custody state; "
             "a verified migration is required"

@@ -376,6 +376,37 @@ def test_agent_data_root_migrates_previous_default_host_database(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_agent_data_root_refuses_migration_with_backend_custody_binding(
+    tmp_path,
+    monkeypatch,
+):
+    """An implicit root change cannot strand a PostgreSQL Hold selection."""
+
+    from kestrel_sovereign.hold.state import (
+        claim_hold_backend_custody,
+        hold_backend_binding_path,
+    )
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    data_root = tmp_path / "mounted-data"
+    destination = data_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="postgres-host-features")
+    claim_hold_backend_custody(previous, "postgres")
+    binding = hold_backend_binding_path(previous)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv("KESTREL_DB_PATH", str(data_root))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+
+    with pytest.raises(HostStorageError, match="Hold custody evidence"):
+        prepare_host_database()
+
+    assert previous.exists()
+    assert binding.exists()
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
 def test_launcher_derived_host_path_keeps_implicit_migration_semantics(
     tmp_path,
     monkeypatch,

@@ -18,6 +18,7 @@ from typing import Optional
 
 from kestrel_sovereign.host_features.storage import host_database_path
 from kestrel_sovereign.security.path_identity import (
+    is_multiply_linked_regular_file,
     paths_overlap_by_filesystem_identity,
 )
 
@@ -173,6 +174,17 @@ class DestructiveOperationPolicy:
         path: str | Path,
         action: str = "delete",
     ) -> None:
+        if is_multiply_linked_regular_file(_resolve_path(path)):
+            self.audit_agent_data_access(
+                path,
+                action,
+                "blocked",
+                "ambiguous_hard_link_custody",
+            )
+            raise AgentDataProtectionError(
+                f"Refusing to {action} multiply-linked file with ambiguous "
+                f"Hold custody: {_resolve_path(path)}"
+            )
         if self.touches_host_hold_custody(path):
             self.audit_agent_data_access(
                 path,
@@ -212,6 +224,8 @@ class DestructiveOperationPolicy:
         except (OSError, RuntimeError, ValueError):
             return None
 
+        if is_multiply_linked_regular_file(resolved_path):
+            return None
         if self.touches_host_hold_custody(resolved_path):
             return None
 

@@ -10,6 +10,7 @@ the same inode through another spelling.
 from __future__ import annotations
 
 import os
+import stat
 import unicodedata
 from pathlib import Path
 
@@ -84,4 +85,42 @@ def paths_overlap_by_filesystem_identity(first: Path, second: Path) -> bool:
     return first_parts[:shorter] == second_parts[:shorter]
 
 
-__all__ = ["paths_overlap_by_filesystem_identity"]
+def paths_equal_by_filesystem_identity(first: Path, second: Path) -> bool:
+    """Return whether two paths name the same leaf on their filesystem."""
+
+    first = first.resolve(strict=False)
+    second = second.resolve(strict=False)
+    if first == second:
+        return True
+    try:
+        if first.exists() and second.exists() and first.samefile(second):
+            return True
+    except OSError:
+        pass
+    if not (
+        _filesystem_is_case_insensitive(first)
+        or _filesystem_is_case_insensitive(second)
+    ):
+        return False
+    return _casefolded_parts(first) == _casefolded_parts(second)
+
+
+def is_multiply_linked_regular_file(path: Path) -> bool:
+    """Return whether a mutation target has an unknowable hard-link owner."""
+
+    try:
+        metadata = path.resolve(strict=False).stat()
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError):
+        # A mutation boundary must not convert an uninspectable existing path
+        # into permission to overwrite a possibly shared inode.
+        return True
+    return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1
+
+
+__all__ = [
+    "is_multiply_linked_regular_file",
+    "paths_equal_by_filesystem_identity",
+    "paths_overlap_by_filesystem_identity",
+]

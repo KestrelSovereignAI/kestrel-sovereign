@@ -1298,6 +1298,50 @@ async def test_host_context_refuses_postgres_to_sqlite_hold_backend_switch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("survivor", ["initialization", "history", "schema"])
+async def test_postgres_claim_refuses_surviving_sqlite_custody_evidence(
+    tmp_path,
+    survivor,
+):
+    """Losing newer selectors cannot erase older SQLite authority evidence."""
+
+    from kestrel_sovereign.hold.state import (
+        claim_hold_backend_custody,
+        hold_backend_binding_path,
+        hold_sqlite_custody_marker_path,
+    )
+
+    database = tmp_path / "host.db"
+    first = await build_host_context(db_path=str(database))
+    assert first.hold_store is not None, first.backend_error
+    await first.hold_store.set_hold(
+        scope="host",
+        actor_id="did:sovereign:operator",
+        reason="surviving SQLite evidence remains authoritative",
+        operation_id=f"sqlite-survivor-{survivor}",
+    )
+    await close_host_context_resources(first)
+
+    initialization = hold_initialization_witness_path(database)
+    history = hold_history_anchor_path(database)
+    binding = hold_backend_binding_path(database)
+    marker = hold_sqlite_custody_marker_path(database)
+    binding.unlink()
+    marker.unlink()
+    if survivor != "initialization":
+        initialization.unlink()
+    if survivor != "history":
+        history.unlink()
+    if survivor != "schema":
+        database.unlink()
+
+    with pytest.raises(HoldCorruptStateError, match="existing SQLite custody"):
+        claim_hold_backend_custody(database, "postgres")
+
+    assert not binding.exists()
+
+
+@pytest.mark.asyncio
 async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
     monkeypatch,
     tmp_path,
