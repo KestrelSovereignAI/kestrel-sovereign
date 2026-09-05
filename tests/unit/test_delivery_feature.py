@@ -16,6 +16,7 @@ import asyncio
 import json
 import pytest
 import pytest_asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,7 +33,7 @@ from kestrel_sovereign.features.delivery.queue import (
     BASE_DELAY_SECONDS,
     MAX_DELAY_SECONDS,
 )
-from kestrel_sovereign.storage.db.interface import TransactionError
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
 
 # =========================================================================
@@ -47,7 +48,12 @@ def _make_mock_db():
     db.fetchall = AsyncMock(return_value=[])
     db.fetchone = AsyncMock(return_value=None)
     db.fetchval = AsyncMock(return_value=0)
-    db.table_exists = AsyncMock(return_value=True)
+
+    @asynccontextmanager
+    async def migration_lock(_name):
+        yield
+
+    db.migration_lock = migration_lock
     return db
 
 
@@ -541,8 +547,25 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 4 indexes = 7 execute calls
+        # 3 tables + 4 indexes.
         assert queue._db.execute.call_count == 7
+
+    @pytest.mark.asyncio
+    async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
+        entered = False
+
+        @asynccontextmanager
+        async def migration_lock(name):
+            nonlocal entered
+            assert name == "delivery_queue_schema_v2"
+            entered = True
+            yield
+
+        queue._db.migration_lock = migration_lock
+
+        await queue._ensure_tables()
+
+        assert entered
 
     @pytest.mark.asyncio
     async def test_ensure_tables_includes_delivery_queue(self, queue):
@@ -838,6 +861,44 @@ class TestQueueIdempotency:
             idempotency_key="retry-after-rollback",
         )
         assert entry_id
+
+    @pytest.mark.asyncio
+    async def test_caught_nested_insert_failure_does_not_commit_claim(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_nested_delivery_insert
+            BEFORE INSERT ON delivery_queue
+            BEGIN
+                SELECT RAISE(ABORT, 'injected nested queue insert failure');
+            END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="injected nested queue insert failure"):
+                await queue.enqueue(
+                    "email",
+                    "person@example.com",
+                    {"body": "hello"},
+                    idempotency_key="retry-after-nested-failure",
+                )
+
+        row = await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+        assert row == (0,)
+
+        await queue._db.execute("DROP TRIGGER reject_nested_delivery_insert")
+        assert await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-after-nested-failure",
+        )
 
 
 # =========================================================================

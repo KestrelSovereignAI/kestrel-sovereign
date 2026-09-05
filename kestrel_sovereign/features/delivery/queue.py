@@ -351,27 +351,42 @@ class DeliveryQueue:
                     logger.debug("Adopted idempotent delivery entry: %s", existing[0])
                     return existing[0]
 
-                await self._db.execute(
-                    """
-                    INSERT INTO delivery_queue
-                        (id, agent_id, channel_type, recipient, content_json,
-                         content_hash, status, attempts, max_retries,
-                         next_retry_at, last_error, created_at, delivered_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
-                    """,
-                    (
-                        entry_id,
-                        self._agent_id,
-                        channel_type,
-                        recipient,
-                        content_json,
-                        content_hash,
-                        DeliveryStatus.PENDING.value,
-                        retries,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
+                try:
+                    await self._db.execute(
+                        """
+                        INSERT INTO delivery_queue
+                            (id, agent_id, channel_type, recipient, content_json,
+                             content_hash, status, attempts, max_retries,
+                             next_retry_at, last_error, created_at, delivered_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
+                        """,
+                        (
+                            entry_id,
+                            self._agent_id,
+                            channel_type,
+                            recipient,
+                            content_json,
+                            content_hash,
+                            DeliveryStatus.PENDING.value,
+                            retries,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                except BaseException:
+                    # SQLite intentionally joins a same-task outer transaction
+                    # instead of opening a savepoint. Compensate the claim here
+                    # so a caller that catches this failure and commits its
+                    # outer transaction cannot poison the replay key.
+                    await self._db.execute(
+                        """
+                        DELETE FROM delivery_idempotency
+                        WHERE agent_id = ? AND idempotency_key_digest = ?
+                              AND entry_id = ?
+                        """,
+                        (self._agent_id, key_digest, entry_id),
+                    )
+                    raise
         except Exception as error:
             conflict = self._find_idempotency_conflict(error)
             if conflict is not None:
@@ -882,7 +897,15 @@ class DeliveryQueue:
         )
 
     async def _ensure_tables(self):
-        """Create the delivery_queue and delivery_dead_letter tables if needed."""
+        """Create the delivery tables under one concurrency-safe migration."""
+        async with self._db.migration_lock("delivery_queue_schema_v2"):
+            # Every existence check is performed by the IF NOT EXISTS DDL only
+            # after the lock is held. This makes the statements both the probe
+            # and the re-probe and keeps the complete schema change atomic.
+            await self._ensure_tables_locked()
+
+    async def _ensure_tables_locked(self) -> None:
+        """Create delivery schema while ``delivery_queue_schema_v2`` is held."""
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS delivery_queue (
