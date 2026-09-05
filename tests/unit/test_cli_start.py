@@ -55,7 +55,7 @@ def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
     assert f"URL:      http://localhost:{DEFAULT_HOST_PORT}" in output
     assert f"Starting server on :{DEFAULT_HOST_PORT}" in output
     assert f"MultiAgent ready: http://localhost:{DEFAULT_HOST_PORT}" in output
-    assert f"http://localhost:{DEFAULT_HOST_PORT}/#key=host-test-key" in output
+    assert "host-test-key" not in output
 
 
 def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):

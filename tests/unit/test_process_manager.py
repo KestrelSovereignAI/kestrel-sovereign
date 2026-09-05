@@ -45,8 +45,9 @@ from kestrel_sovereign.config import (
 # -----------------------------------------------------------------------
 
 @pytest.fixture
-def project_dir(tmp_path):
+def project_dir(tmp_path, monkeypatch):
     """Create a project directory with agent data directories."""
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
     # Create agent directories
     claw_dir = tmp_path / "agent_data" / "claw"
     claw_dir.mkdir(parents=True)
@@ -56,8 +57,9 @@ def project_dir(tmp_path):
     testbot_dir.mkdir(parents=True)
     (testbot_dir / "kestrel_prime.db").touch()
 
-    # Create .env file
-    (tmp_path / ".env").write_text("KESTREL_API_KEY=test-key\n")
+    # Most managed-child tests deliberately have no co-resident sovereign
+    # credential. Individual standalone/refusal cases install one explicitly.
+    (tmp_path / ".env").write_text("")
 
     return tmp_path
 
@@ -430,6 +432,29 @@ class TestRegisterAgent:
 class TestStartAgent:
     """Test starting agent processes (mocked subprocess)."""
 
+    def test_managed_subprocess_refuses_co_resident_sovereign_key(
+        self,
+        pm,
+        project_dir,
+    ):
+        """A same-UID child must never start beside a readable host key."""
+
+        cfg = LocalAgentConfig(
+            data_dir=Path("agent_data/claw"), port=8801,
+        )
+        (project_dir / ".env").write_text(
+            "KESTREL_API_KEY=host-sovereign-key\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch("subprocess.Popen") as mock_popen,
+            pytest.raises(RuntimeError, match="sovereign credential"),
+        ):
+            pm.start_agent("claw", cfg)
+
+        mock_popen.assert_not_called()
+
     def test_start_agent_spawns_process(self, pm, project_dir):
         """Start spawns a subprocess and records PID."""
         cfg = LocalAgentConfig(
@@ -496,6 +521,10 @@ class TestStartAgent:
 
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
+        )
+        (project_dir / ".env").write_text(
+            "KESTREL_API_KEY=test-key\n",
+            encoding="utf-8",
         )
         mock_process = MagicMock(pid=12345)
 

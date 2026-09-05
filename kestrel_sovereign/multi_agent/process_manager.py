@@ -908,6 +908,24 @@ class ProcessManager:
 
         # Build env
         env = self._load_env()
+        from kestrel_sovereign.auth import normalize_api_key
+
+        if (
+            not standalone
+            and normalize_api_key(env.get("KESTREL_API_KEY")) is not None
+        ):
+            # A same-UID child can read the launcher's project files and, on
+            # some platforms, inspect sibling process state. Blanking its
+            # inherited variable is therefore not credential isolation. The
+            # normal fleet path is the in-process host; a separate-process
+            # supervisor must establish an OS/container boundary before it can
+            # safely coexist with a sovereign bearer credential.
+            raise RuntimeError(
+                "Managed subprocess launch refused because this launcher has "
+                "a co-resident sovereign credential but cannot attest OS-level "
+                "isolation; use the default in-process fleet host or an "
+                "isolated deployment"
+            )
         # Automatic peers receive a transport-only credential, never the
         # sovereign operator key. The selected key is shared by this host's
         # child processes and is route-scoped again by server auth.

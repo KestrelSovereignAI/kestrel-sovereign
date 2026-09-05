@@ -17,7 +17,6 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import quote
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import (
@@ -334,12 +333,11 @@ def _start_inprocess_mode(
         )
         return 1
     browser_url = f"http://localhost:{multi_agent.host.port}/"
-    if host_api_key:
-        browser_url += f"#key={quote(host_api_key, safe='')}"
 
     print("\U0001F985 Kestrel MultiAgent starting (in-process)...")
-    # The fragment is never sent in an HTTP request or access log. app.js
-    # consumes it into sessionStorage and strips it from the address bar.
+    # A URL fragment avoids HTTP access logs, but the launcher itself is often
+    # supervised and its stdout retained. Never put the sovereign bearer key
+    # in either startup line; operators already hold it out of band.
     print(f"   URL:      {browser_url}")
 
     if autostart or manual:
