@@ -3829,16 +3829,17 @@ def _local_provenance_return_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     control_helpers: set[str] | None = None,
     module_provenance_aliases: set[str] | None = None,
+    imported_provenance_helpers: set[str] | None = None,
 ) -> set[str]:
-    """Find local helpers whose return value is provenance-derived.
+    """Find visible helpers whose return value is provenance-derived.
 
-    This is a small interprocedural summary, deliberately limited to the
-    current syntax tree.  A neutral refactor such as ``derive(request)`` must
-    not erase the fact that its result came from ``request.causation_chain``.
-    Iterate to a fixed point so one local helper may wrap another.
+    Seed the fixed point with repository-local imported helper summaries so a
+    neutral refactor such as ``derive(request)`` does not erase the fact that
+    its result came from ``request.causation_chain``.  Local helpers may then
+    wrap either imported or local helpers without escaping the contract.
     """
 
-    helper_names: set[str] = set()
+    helper_names: set[str] = set(imported_provenance_helpers or ())
     changed = True
     while changed:
         changed = False
@@ -4159,6 +4160,221 @@ def _module_imported_provenance_accessor_aliases(tree: ast.AST) -> set[str]:
     return aliases
 
 
+def _resolved_repository_import_path(
+    source_path: Path,
+    module_name: str | None,
+    level: int = 0,
+) -> Path | None:
+    """Resolve a Python import to a source module available in this checkout."""
+
+    module_parts = tuple(part for part in (module_name or "").split(".") if part)
+    if level:
+        base = source_path.parent
+        for _ in range(level - 1):
+            base = base.parent
+        roots = (base,)
+    else:
+        # Project-qualified imports resolve from the checkout root.  A
+        # same-directory fallback also makes isolated synthetic modules model
+        # ordinary source-tree imports without manipulating sys.path.
+        roots = (REPO_ROOT, source_path.parent)
+
+    for root in roots:
+        candidate = root.joinpath(*module_parts)
+        module_file = candidate.with_suffix(".py")
+        if module_file.is_file():
+            return module_file.resolve()
+        package_file = candidate / "__init__.py"
+        if package_file.is_file():
+            return package_file.resolve()
+    return None
+
+
+@lru_cache(maxsize=None)
+def _direct_provenance_helper_names(source_path: Path) -> frozenset[str]:
+    """Summarize helpers derived within one module, before following imports."""
+
+    tree = _parsed_module(source_path.resolve())
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    module_provenance_aliases = (
+        _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_accessor_aliases(tree)
+    )
+    control_helpers = _local_control_helpers(
+        functions,
+        _module_imported_control_aliases(tree),
+    )
+    return frozenset(
+        _local_provenance_return_helpers(
+            functions,
+            control_helpers,
+            module_provenance_aliases,
+        )
+    )
+
+
+def _repository_provenance_helper_names(
+    source_path: Path,
+    requested_names: set[str],
+    seen: frozenset[tuple[Path, str]],
+) -> set[str]:
+    """Resolve requested helper summaries through narrow local import edges."""
+
+    source_path = source_path.resolve()
+    requested_names = {name.casefold() for name in requested_names}
+    requested_names = {
+        name
+        for name in requested_names
+        if (source_path, name) not in seen
+    }
+    if not requested_names:
+        return set()
+
+    direct_helpers = set(_direct_provenance_helper_names(source_path))
+    resolved = requested_names.intersection(direct_helpers)
+    if resolved == requested_names:
+        return resolved
+
+    active = seen | {
+        (source_path, name) for name in requested_names - resolved
+    }
+    tree = _parsed_module(source_path)
+    imported_helpers = _module_imported_provenance_return_helper_aliases(
+        tree,
+        source_path,
+        active,
+    )
+    if not imported_helpers:
+        return resolved
+
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    module_provenance_aliases = (
+        _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_accessor_aliases(tree)
+    )
+    control_helpers = _local_control_helpers(
+        functions,
+        _module_imported_control_aliases(tree),
+    )
+    all_helpers = _local_provenance_return_helpers(
+        functions,
+        control_helpers,
+        module_provenance_aliases,
+        imported_helpers,
+    )
+    return requested_names.intersection(all_helpers)
+
+
+def _module_imported_provenance_return_helper_aliases(
+    tree: ast.AST,
+    source_path: Path | None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+) -> set[str]:
+    """Return called local bindings for provenance-returning imports.
+
+    Only follow imports that are actually invoked by this module.  This keeps
+    the repository-wide contract proportional to the authority call graph
+    rather than recursively summarizing the checkout's entire import graph.
+    """
+
+    if not isinstance(tree, ast.Module) or source_path is None:
+        return set()
+
+    source_path = source_path.resolve()
+    seen = seen or frozenset()
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_names = {_call_name(call).casefold() for call in calls}
+    aliases: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                for imported in node.names:
+                    child_path = _resolved_repository_import_path(
+                        source_path,
+                        imported.name,
+                        node.level,
+                    )
+                    if child_path is not None:
+                        module_calls = {
+                            call.func.attr.casefold()
+                            for call in calls
+                            if isinstance(call.func, ast.Attribute)
+                            and isinstance(call.func.value, ast.Name)
+                            and call.func.value.id.casefold()
+                            == (imported.asname or imported.name).casefold()
+                        }
+                        aliases.update(
+                            _repository_provenance_helper_names(
+                                child_path,
+                                module_calls,
+                                seen,
+                            )
+                        )
+                continue
+
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            bindings = {
+                (imported.asname or imported.name).casefold(): imported.name.casefold()
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold() in called_names
+            }
+            star_names = called_names if any(
+                imported.name == "*" for imported in node.names
+            ) else set()
+            requested = set(bindings.values()) | star_names
+            resolved = _repository_provenance_helper_names(
+                imported_path,
+                requested,
+                seen,
+            )
+            aliases.update(
+                local_name
+                for local_name, remote_name in bindings.items()
+                if remote_name in resolved
+            )
+            aliases.update(star_names.intersection(resolved))
+        elif isinstance(node, ast.Import):
+            for imported in node.names:
+                imported_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                )
+                if imported_path is not None:
+                    bound_name = (
+                        imported.asname or imported.name.split(".", 1)[0]
+                    ).casefold()
+                    module_calls = {
+                        call.func.attr.casefold()
+                        for call in calls
+                        if isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id.casefold() == bound_name
+                    }
+                    aliases.update(
+                        _repository_provenance_helper_names(
+                            imported_path,
+                            module_calls,
+                            seen,
+                        )
+                    )
+    return aliases
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -4174,9 +4390,15 @@ def _authority_provenance_lines(
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
     )
+    imported_provenance_helpers = (
+        _module_imported_provenance_return_helper_aliases(tree, source_path)
+    )
     control_helpers = _local_control_helpers(functions, module_control_aliases)
     provenance_return_helpers = _local_provenance_return_helpers(
-        functions, control_helpers, module_provenance_aliases
+        functions,
+        control_helpers,
+        module_provenance_aliases,
+        imported_provenance_helpers,
     )
     for function in functions:
         function_name = function.name.casefold()
@@ -4228,23 +4450,11 @@ def _authority_provenance_lines(
                 ):
                     lines.add(node.lineno)
                 if _is_cross_agent_control_call(node, control_aliases):
-                    direct_control_inputs = [*node.args]
-                    direct_control_inputs.extend(
-                        keyword.value
-                        for keyword in node.keywords
-                        if keyword.arg is None
-                        or any(
-                            term in keyword.arg.casefold().split("_")
-                            for term in (
-                                "target",
-                                "agent",
-                                "peer",
-                                "child",
-                                "name",
-                                "id",
-                            )
-                        )
-                    )
+                    # Parameter spelling is not an authority boundary.  A
+                    # known control sink may call its target ``candidate``,
+                    # ``subject``, or anything else, so inspect every supplied
+                    # value rather than maintaining a bypassable name list.
+                    direct_control_inputs = arguments
                     if (
                         _has_provenance_value(
                             node.func,
@@ -4432,10 +4642,13 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     imported_or_local_provenance = _module_provenance_constant_aliases(
         tree, source_path
     )
+    imported_provenance_helpers = (
+        _module_imported_provenance_return_helper_aliases(tree, source_path)
+    )
     if not any(
         marker in source
         for marker in ("causation", "orchestrator", "current_chain")
-    ) and not imported_or_local_provenance:
+    ) and not imported_or_local_provenance and not imported_provenance_helpers:
         return frozenset()
     return frozenset(
         _authority_provenance_lines(tree, source_path)
@@ -4947,6 +5160,12 @@ def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers(
         "def dispatch(request):\n"
         "    terminate_child(request.causation_chain[-1].agent_id)\n"
     )
+    neutral_keyword_target = ast.parse(
+        "def dispatch(request):\n"
+        "    terminate_child(\n"
+        "        candidate=request.causation_chain[-1].agent_id\n"
+        "    )\n"
+    )
     canonical_accessors = ast.parse(
         "def dispatch(self, target):\n"
         "    if self._get_current_chain():\n"
@@ -4983,6 +5202,7 @@ def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers(
     )
 
     assert _authority_provenance_lines(direct_target) == {2}
+    assert _authority_provenance_lines(neutral_keyword_target) == {2}
     assert _authority_provenance_lines(canonical_accessors) == {2, 7}
     assert _authority_provenance_lines(neutral_control_helpers) == {8}
     assert _authority_provenance_lines(mapped_callback) == {2}
@@ -5096,6 +5316,34 @@ def test_provenance_scanner_resolves_accessor_aliases() -> None:
     assert _authority_provenance_lines(assigned_accessor) == {3}
     assert _authority_provenance_lines(imported_accessor) == {4}
     assert _authority_provenance_lines(module_accessor) == {4}
+
+
+def test_provenance_scanner_follows_repository_local_imported_helpers(
+    tmp_path: Path,
+) -> None:
+    lineage_path = tmp_path / "lineage.py"
+    lineage_path.write_text(
+        "def read(request):\n"
+        "    return bool(request.causation_chain)\n",
+        encoding="utf-8",
+    )
+    helpers_path = tmp_path / "helpers.py"
+    helpers_path.write_text(
+        "from .lineage import read\n\n"
+        "def derive(request):\n"
+        "    return read(request)\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from .helpers import derive as decide\n\n"
+        "def dispatch(request, target):\n"
+        "    if decide(request):\n"
+        "        terminate_child(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
 
 def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
