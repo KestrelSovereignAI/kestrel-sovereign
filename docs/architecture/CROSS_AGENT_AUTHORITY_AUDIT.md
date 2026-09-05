@@ -127,12 +127,14 @@ method inventory and target-specific authority.
 | Surface ID | Classification |
 |---|---|
 | `kestrel_sovereign/agent/orchestrator_engine.py::_dispatch_direct_tool` | Generic governed execution boundary for runtime-registered direct tools. PRE/POST_TOOL_USE and ordinary tool permission checks still apply, but the owning non-feature provider must inventory and enforce target-specific relation authority. |
+| `kestrel_sovereign/agent/orchestrator_engine.py::_dispatch_feature_tool` | Live high-level feature dispatcher used by chat tool calls. It applies PRE_SUBAGENT_CALL and forwards the denied-tool set into feature execution; those operational gates do not create relation authority, and the selected downstream method retains its target-specific gate. |
 | `kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool` | Generic transport-neutral dispatcher that can resolve runtime-registered direct tools as well as feature tools. Dispatch supplies governance hooks, not relation authority; the selected tool retains its target-specific gate. |
 | `kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools` | Generic publication boundary for arbitrary runtime tool names, including MCP providers. The registry defaults unknown tools to ASK but cannot infer target authority; provider-owned controls require their own exact inventory and enforcement. |
 | `kestrel_sovereign/kestrel_agent.py::KestrelAgent._handle_constitution_receipt_tool` | Execution boundary for the ephemeral constitution-receipt canary. It records exact system-prompt receipt for one local cognition turn and grants no agent relation authority. |
 | `kestrel_sovereign/kestrel_agent.py::KestrelAgent.register_constitution_receipt_tool` | Direct publication boundary for the ephemeral constitution-receipt canary. The dispatcher owns its expected value and lifetime; publication grants no peer, parent, or host authority. |
+| `kestrel_sovereign/features/base.py::Feature.execute_as_subagent` | Live generic feature-subagent execution loop reached by high-level feature dispatch. Its selected `@tool` method executes under the feature/tool governance hooks and still owns every target-specific authority check. |
 | `kestrel_sovereign/features/base.py::Feature.get_tools.DynamicTool.execute` | Generic runtime wrapper for the separately inventoried core `@tool` methods; it introduces no target authority and the wrapped method retains its target-specific gate. |
-| `kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool` | Generic high-level dispatcher registered once per visible feature, including `deploy_feature` and `restart_coordinator_feature`. PRE_SUBAGENT_CALL/PRE_TOOL_USE are operational consent gates, not relation authority; the selected downstream method retains its target-specific authority requirement, including #3148 enforcement and known defect #3223. |
+| `kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool` | Schema-publication boundary registered once per visible feature, including `deploy_feature` and `restart_coordinator_feature`. It advertises the high-level tool but does not execute it; `_dispatch_feature_tool` and `execute_as_subagent` are the live execution seams. |
 | `kestrel_sovereign/features/isolated_runtime.py::IsolatedFeatureTool.execute` | Generic forwarding boundary for runtime-advertised out-of-tree tools. Core preserves ordinary tool governance but cannot infer relation authority from child metadata; the owning feature must inventory and enforce every target-specific authority boundary. |
 | `kestrel_sovereign/features/bootstrap/feature.py::rename_agent` | Self-only display-name mutation; not a peer door. |
 | `kestrel_sovereign/features/bootstrap/feature.py::restart_discovery` | Self-only bootstrap-state retry; not a host restart. |
@@ -463,11 +465,13 @@ behind either the feature-tool inventory or a command-name heuristic.
 
 ## Machine-checked core CLI inventory
 
-The contract test reads every key from the canonical core CLI dispatch table.
-It deliberately classifies the whole table, including commands unrelated to
-cross-agent control: selecting only agent-shaped names would miss verbs such as
-`ask`, `create`, and `update`. Feature-contributed entry-point groups remain
-outside core and must define their own operator policy.
+The contract test reconciles every key from the canonical core CLI dispatch
+table with literal top-level parser registrations and command branches handled
+before map dispatch. It deliberately classifies the whole resulting set,
+including commands unrelated to cross-agent control: selecting only
+agent-shaped names would miss verbs such as `ask`, `create`, and `update`.
+Feature-contributed entry-point groups remain outside core and must define their
+own operator policy.
 
 | Surface ID | Classification |
 |---|---|
@@ -484,6 +488,7 @@ outside core and must define their own operator policy.
 | `kestrel_sovereign/cli.py::kestrel embeddings` | Local operator audit/reindex of selected agent storage. |
 | `kestrel_sovereign/cli.py::kestrel feature` | Local operator feature package/runtime management; not agent hierarchy. |
 | `kestrel_sovereign/cli.py::kestrel health` | Deprecated local operator diagnostic alias for `doctor`. |
+| `kestrel_sovereign/cli.py::kestrel help` | Local operator CLI help/catalog read; no agent target. |
 | `kestrel_sovereign/cli.py::kestrel identity` | Local operator identity-export custody maintenance. |
 | `kestrel_sovereign/cli.py::kestrel ipfs` | Local operator control of external storage infrastructure. |
 | `kestrel_sovereign/cli.py::kestrel list` | Local operator read of the configured agent fleet. |

@@ -2477,6 +2477,7 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
 
     writers: set[str] = set()
     local_functions = _unique_module_functions(tree)
+    string_constants = _module_string_constants(tree)
 
     class DirectToolWriterVisitor(ast.NodeVisitor):
         PUBLISH_METHODS = {"__setitem__", "setdefault", "update"}
@@ -2674,6 +2675,18 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            setattr_value: ast.AST | None = None
+            if (
+                _call_name(node) == "setattr"
+                and len(node.args) >= 3
+                and _resolved_string(node.args[1], string_constants)
+                == "_direct_tools"
+            ):
+                setattr_value = node.args[2]
+            replaces_registry = setattr_value is not None and not (
+                isinstance(setattr_value, ast.Dict)
+                and not setattr_value.keys
+            )
             direct_member = _static_member_reference(node.func)
             bound_method = self.flows[-1].resolve(node.func)
             publishes_directly = bool(
@@ -2700,7 +2713,7 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                     direct_assignment_member="_direct_tools",
                 )
             )
-            if publishes_directly or publishes_via_helper:
+            if replaces_registry or publishes_directly or publishes_via_helper:
                 self._record()
             self.generic_visit(node)
 
@@ -2752,7 +2765,7 @@ def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
                 walk_statements(node.body, relative, qualified)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualified = (*parents, node.name)
-                if node.name == "to_orchestrator_tool":
+                if node.name in {"to_orchestrator_tool", "execute_as_subagent"}:
                     surfaces.add(f"{relative}::{'.'.join(qualified)}")
                 walk_statements(node.body, relative, qualified)
             else:
@@ -2783,6 +2796,7 @@ def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
         REPO_ROOT / "kestrel_sovereign/agent/orchestrator_engine.py": {
             "execute_named_tool",
             "_dispatch_direct_tool",
+            "_dispatch_feature_tool",
         },
     }
     for path, names in dynamic_boundaries.items():
@@ -2856,11 +2870,245 @@ def _discovered_builtin_command_surfaces() -> frozenset[str]:
     return frozenset(surfaces)
 
 
+def _core_cli_parser_command_names(
+    tree: ast.Module,
+    string_constants: dict[str, str],
+) -> set[str]:
+    """Return literal commands registered on the canonical top-level parser."""
+
+    builders = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "build_parser"
+    ]
+    if not builders:
+        return set()
+    if len(builders) != 1:
+        raise AssertionError("Could not uniquely identify the core CLI parser builder")
+    builder = builders[0]
+
+    root_names: set[str] = set()
+    assignments: list[tuple[set[str], ast.AST | None]] = []
+    for node in ast.walk(builder):
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value: ast.AST | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        target_names = {
+            name
+            for target in targets
+            for name in _assignment_target_names(target)
+        }
+        assignments.append((target_names, value))
+        if not (
+            isinstance(value, ast.Call)
+            and (member := _static_member_reference(value.func)) is not None
+            and member[1] == "add_subparsers"
+        ):
+            continue
+        destination = next(
+            (keyword.value for keyword in value.keywords if keyword.arg == "dest"),
+            None,
+        )
+        if destination is not None and (
+            _resolved_string(destination, string_constants) == "command"
+        ):
+            root_names.update(target_names)
+
+    if not root_names:
+        raise AssertionError("Could not find the core CLI top-level subparser")
+
+    # Follow simple aliases so renaming ``subparsers`` or publishing through a
+    # second local name cannot make a parser registration disappear.
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in assignments:
+            if isinstance(value, ast.Name) and value.id in root_names:
+                new_names = targets - root_names
+                if new_names:
+                    root_names.update(new_names)
+                    changed = True
+
+    commands: set[str] = set()
+
+    class TopLevelParserVisitor(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            member = _static_member_reference(node.func)
+            if not (
+                member is not None
+                and member[1] == "add_parser"
+                and isinstance(member[0], ast.Name)
+                and member[0].id in root_names
+            ):
+                self.generic_visit(node)
+                return
+            if not node.args:
+                raise AssertionError("Core CLI add_parser call has no command name")
+            command = _resolved_string(node.args[0], string_constants)
+            if command is None:
+                raise AssertionError(
+                    "Unresolved core CLI parser command: "
+                    f"{ast.unparse(node.args[0])}"
+                )
+            commands.add(command)
+            if any(keyword.arg is None for keyword in node.keywords):
+                raise AssertionError("Core CLI parser registration uses keyword unpacking")
+            aliases = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "aliases"),
+                None,
+            )
+            if aliases is not None:
+                if not isinstance(aliases, (ast.List, ast.Tuple, ast.Set)):
+                    raise AssertionError("Unresolved core CLI parser aliases")
+                for alias_node in aliases.elts:
+                    alias = _resolved_string(alias_node, string_constants)
+                    if alias is None:
+                        raise AssertionError("Unresolved core CLI parser alias")
+                    commands.add(alias)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    parser_visitor = TopLevelParserVisitor()
+    for statement in builder.body:
+        parser_visitor.visit(statement)
+    return commands
+
+
+def _core_cli_predispatch_command_names(
+    statements: list[ast.stmt],
+    string_constants: dict[str, str],
+) -> set[str]:
+    """Return concrete ``args.command`` branches before map dispatch."""
+
+    commands: set[str] = set()
+
+    def is_selector(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "command"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+        )
+
+    def contains_selector(node: ast.AST) -> bool:
+        return any(is_selector(child) for child in ast.walk(node))
+
+    def resolved_values(node: ast.AST) -> set[str]:
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            values = {_resolved_string(element, string_constants) for element in node.elts}
+            if None in values:
+                raise AssertionError("Unresolved core CLI pre-dispatch command set")
+            return {value for value in values if value is not None}
+        value = _resolved_string(node, string_constants)
+        if value is None:
+            raise AssertionError(
+                "Unresolved core CLI pre-dispatch command expression: "
+                f"{ast.unparse(node)}"
+            )
+        return {value}
+
+    def condition_values(node: ast.AST) -> set[str]:
+        if not contains_selector(node):
+            return set()
+        if is_selector(node):
+            return set()
+        if isinstance(node, ast.UnaryOp) and is_selector(node.operand):
+            return set()
+        if isinstance(node, ast.BoolOp):
+            return {
+                value
+                for expression in node.values
+                for value in condition_values(expression)
+            }
+        if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+            left, right = node.left, node.comparators[0]
+            if is_selector(left):
+                return resolved_values(right)
+            if is_selector(right):
+                return resolved_values(left)
+        raise AssertionError(
+            "Unresolved core CLI pre-dispatch command condition: "
+            f"{ast.unparse(node)}"
+        )
+
+    def pattern_values(pattern: ast.pattern) -> set[str]:
+        if isinstance(pattern, ast.MatchValue):
+            return resolved_values(pattern.value)
+        if isinstance(pattern, ast.MatchOr):
+            return {
+                value
+                for alternative in pattern.patterns
+                for value in pattern_values(alternative)
+            }
+        if isinstance(pattern, ast.MatchAs):
+            return (
+                pattern_values(pattern.pattern)
+                if pattern.pattern is not None
+                else set()
+            )
+        if isinstance(pattern, ast.MatchSingleton):
+            return set()
+        raise AssertionError("Unresolved core CLI pre-dispatch match pattern")
+
+    class PredispatchVisitor(ast.NodeVisitor):
+        def visit_If(self, node: ast.If) -> None:  # noqa: N802
+            commands.update(condition_values(node.test))
+            self.generic_visit(node)
+
+        def visit_Match(self, node: ast.Match) -> None:  # noqa: N802
+            if not is_selector(node.subject):
+                self.generic_visit(node)
+                return
+            for case in node.cases:
+                commands.update(pattern_values(case.pattern))
+                if case.guard is not None:
+                    commands.update(condition_values(case.guard))
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = PredispatchVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return commands
+
+
 def _core_cli_command_names(
     tree: ast.Module,
     string_constants: dict[str, str],
 ) -> set[str]:
-    """Replay the canonical dispatch dictionary without dropping later keys."""
+    """Reconcile parser, pre-dispatch, and command-map entry doors."""
 
     def is_dispatch_lookup(node: ast.AST) -> bool:
         return (
@@ -2965,13 +3213,34 @@ def _core_cli_command_names(
         lambda _value: None,
         lambda bindings: bindings[0],
     )
-    for statement in scope.body:
+    parser_commands = _core_cli_parser_command_names(tree, string_constants)
+    for statement_index, statement in enumerate(scope.body):
         if any(is_dispatch_lookup(node) for node in ast.walk(statement)):
             if command_names is None:
                 raise AssertionError(
                     "Core CLI command dispatch is read before initialization"
                 )
-            return command_names
+            predispatch_commands = _core_cli_predispatch_command_names(
+                scope.body[:statement_index],
+                string_constants,
+            )
+            unknown_predispatch = predispatch_commands - (
+                parser_commands | command_names
+            )
+            if unknown_predispatch:
+                raise AssertionError(
+                    "Pre-dispatch core CLI commands lack parser or map entries: "
+                    + ", ".join(sorted(unknown_predispatch))
+                )
+            undispatched_parser_commands = parser_commands - (
+                predispatch_commands | command_names
+            )
+            if undispatched_parser_commands:
+                raise AssertionError(
+                    "Core CLI parser commands lack a dispatch path: "
+                    + ", ".join(sorted(undispatched_parser_commands))
+                )
+            return command_names | predispatch_commands
         if isinstance(statement, ast.Assign):
             if any(
                 isinstance(target, ast.Name) and target.id == "commands"
@@ -4188,12 +4457,16 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
     expected = {
         "kestrel_sovereign/agent/orchestrator_engine.py::"
         "_dispatch_direct_tool",
+        "kestrel_sovereign/agent/orchestrator_engine.py::"
+        "_dispatch_feature_tool",
         "kestrel_sovereign/agent/orchestrator_engine.py::execute_named_tool",
         "kestrel_sovereign/agent/tool_registry.py::register_dynamic_tools",
         "kestrel_sovereign/kestrel_agent.py::"
         "KestrelAgent._handle_constitution_receipt_tool",
         "kestrel_sovereign/kestrel_agent.py::"
         "KestrelAgent.register_constitution_receipt_tool",
+        "kestrel_sovereign/features/base.py::"
+        "Feature.execute_as_subagent",
         "kestrel_sovereign/features/base.py::"
         "Feature.get_tools.DynamicTool.execute",
         "kestrel_sovereign/features/base.py::Feature.to_orchestrator_tool",
@@ -4213,6 +4486,24 @@ def test_runtime_generated_tool_dispatch_boundaries_are_classified() -> None:
         and _call_name(node) == "to_orchestrator_tool"
         for node in ast.walk(registry_tree)
     ), "The classified high-level Feature tool must remain wired into registration"
+
+    engine_path = REPO_ROOT / "kestrel_sovereign/agent/orchestrator_engine.py"
+    engine_tree = ast.parse(
+        engine_path.read_text(encoding="utf-8"),
+        filename=str(engine_path),
+    )
+    feature_dispatchers = [
+        node
+        for node in ast.walk(engine_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_dispatch_feature_tool"
+    ]
+    assert len(feature_dispatchers) == 1
+    assert any(
+        isinstance(node, ast.Call)
+        and _call_name(node) == "execute_as_subagent"
+        for node in ast.walk(feature_dispatchers[0])
+    ), "The classified feature dispatcher must call the execution loop"
 
 
 def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
@@ -4240,8 +4531,12 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
         "        publish(tools)\n\n"
         "    def replace(self, tools):\n"
         "        self._direct_tools = tools\n\n"
+        "    def setattr_replace(self, tools):\n"
+        "        setattr(self, '_direct_tools', tools)\n\n"
         "    def initialize(self):\n"
         "        self._direct_tools = {}\n\n"
+        "    def setattr_initialize(self):\n"
+        "        setattr(self, '_direct_tools', {})\n\n"
         "    def remove(self):\n"
         "        self._direct_tools.pop('x', None)\n"
     )
@@ -4253,6 +4548,7 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
         "example.py::Publisher.default",
         "example.py::Publisher.direct",
         "example.py::Publisher.replace",
+        "example.py::Publisher.setattr_replace",
         "example.py::Publisher.union",
     }
 
@@ -4748,6 +5044,43 @@ def test_core_cli_agent_and_fleet_controls_are_discovered() -> None:
     discovered = _discovered_core_cli_surfaces()
     for command in ("ask", "create", "terminate", "restart", "update"):
         assert f"kestrel_sovereign/cli.py::kestrel {command}" in discovered
+
+
+def test_core_cli_predispatch_and_parser_commands_are_discovered() -> None:
+    discovered = _discovered_core_cli_surfaces()
+    assert "kestrel_sovereign/cli.py::kestrel help" in discovered
+
+    tree = ast.parse(
+        "def build_parser():\n"
+        "    subparsers = parser.add_subparsers(dest='command')\n"
+        "    alias = subparsers\n"
+        "    alias.add_parser('help', aliases=['assist'])\n\n"
+        "def main():\n"
+        "    if not args.command:\n"
+        "        return 1\n"
+        "    if args.command in {'help', 'assist'}:\n"
+        "        return 0\n"
+        "    commands = {'start': start}\n"
+        "    handler = commands.get(args.command)\n"
+    )
+    assert _core_cli_command_names(tree, {}) == {
+        "assist",
+        "help",
+        "start",
+    }
+
+
+def test_core_cli_parser_commands_without_dispatch_fail_closed() -> None:
+    tree = ast.parse(
+        "def build_parser():\n"
+        "    subparsers = parser.add_subparsers(dest='command')\n"
+        "    subparsers.add_parser('orphan')\n\n"
+        "def main():\n"
+        "    commands = {'start': start}\n"
+        "    handler = commands.get(args.command)\n"
+    )
+    with pytest.raises(AssertionError, match="lack a dispatch path"):
+        _core_cli_command_names(tree, {})
 
 
 def test_core_cli_command_keys_resolve_constants_and_fail_closed() -> None:
