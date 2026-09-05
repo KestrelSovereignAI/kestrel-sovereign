@@ -20,6 +20,12 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, T
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
+from kestrel_sovereign.auth import (
+    caller_context_binding_scope,
+    caller_context_lifetime,
+    caller_context_scope,
+)
+
 
 MAX_INVOCATION_ID_LENGTH = 256
 _HEADER_UNRESERVED = frozenset(
@@ -277,7 +283,9 @@ def bind_async_invocation(
             with invocation_scope(
                 bound.arguments.get(parameter),
                 provenance=bound.arguments.get("invocation_provenance"),
-            ) as invocation_id:
+            ) as invocation_id, caller_context_scope(
+                bound.arguments.get("caller")
+            ):
                 bound.arguments[parameter] = invocation_id
                 lifecycle_owner = args[0] if args else None
                 registered = False
@@ -494,26 +502,29 @@ def bind_async_generator_invocation(
                 if supplied_provenance is not None
                 else _current_invocation_provenance.get()
             )
-            iterator = function(*bound.args, **bound.kwargs)
-            try:
-                while True:
-                    with _exact_invocation_scope(
-                        effective_id,
-                        effective_provenance,
-                    ):
-                        try:
-                            item = await anext(iterator)
-                        except StopAsyncIteration:
-                            return
-                    yield item
-            finally:
-                close_iterator = getattr(iterator, "aclose", None)
-                if callable(close_iterator):
-                    with _exact_invocation_scope(
-                        effective_id,
-                        effective_provenance,
-                    ):
-                        await close_iterator()
+            with caller_context_lifetime(
+                bound.arguments.get("caller")
+            ) as caller_binding:
+                iterator = function(*bound.args, **bound.kwargs)
+                try:
+                    while True:
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                        ), caller_context_binding_scope(caller_binding):
+                            try:
+                                item = await anext(iterator)
+                            except StopAsyncIteration:
+                                return
+                        yield item
+                finally:
+                    close_iterator = getattr(iterator, "aclose", None)
+                    if callable(close_iterator):
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                        ), caller_context_binding_scope(caller_binding):
+                            await close_iterator()
 
         return wrapped
 

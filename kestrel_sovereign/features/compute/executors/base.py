@@ -18,6 +18,7 @@ from typing import Optional, TypeVar, cast
 from uuid import uuid4
 
 from ..models import ComputeScript, ExecutionRecord
+from kestrel_sovereign.security.subprocess_env import SAFE_SUBPROCESS_ENV_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +34,11 @@ _T = TypeVar("_T")
 # Never pass API keys, tokens, encryption keys (e.g. KESTREL_DATA_KEY), or
 # other secrets. Shared by every executor that builds a subprocess env so the
 # host environment is never leaked into script code (F129).
-_SAFE_ENV_VARS = {
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TERM",
-    "TZ",
-    "PYTHONPATH",
-    "VIRTUAL_ENV",
-}
+# Preserve the executor's public-by-convention module contract: LocalExecutor
+# and UvExecutor re-export this exact mutable ``set`` object.  The process-wide
+# source allowlist remains an immutable frozenset; compute gets its historical
+# local copy while the new computer-use boundary shares the canonical values.
+_SAFE_ENV_VARS = set(SAFE_SUBPROCESS_ENV_VARS)
 
 
 @dataclass(frozen=True, slots=True)

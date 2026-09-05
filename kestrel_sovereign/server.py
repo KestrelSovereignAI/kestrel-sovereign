@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
@@ -571,6 +572,7 @@ def get_api_key():
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
+        mark_ephemeral_sovereign_key(generated_key)
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
@@ -3319,7 +3321,10 @@ async def auth_middleware(request: Request, call_next):
         # Check X-API-Key header
         api_key_header = request.headers.get(API_KEY_NAME)
         if api_key_header and secrets.compare_digest(api_key_header, expected_key):
-            caller = CallerContext.sovereign(AuthMethod.API_KEY)
+            caller = CallerContext.sovereign(
+                AuthMethod.API_KEY,
+                credential=api_key_header,
+            )
 
         # Check Bearer token (API key OR JWT)
         if caller is None:
@@ -3328,7 +3333,10 @@ async def auth_middleware(request: Request, call_next):
                 token = auth_header[7:]
                 # First try: API key match
                 if secrets.compare_digest(token, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=token,
+                    )
                 else:
                     # Second try: JWT token
                     try:
@@ -3359,7 +3367,10 @@ async def auth_middleware(request: Request, call_next):
             ) or _scope_path.endswith("/link-qr.png")
             if api_key_query and _query_key_ok:
                 if secrets.compare_digest(api_key_query, expected_key):
-                    caller = CallerContext.sovereign(AuthMethod.API_KEY)
+                    caller = CallerContext.sovereign(
+                        AuthMethod.API_KEY,
+                        credential=api_key_query,
+                    )
 
         # Check OAuth session cookie
         if caller is None:

@@ -16,10 +16,27 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import database_clock
+
+from .authority import (
+    RestartDelegation,
+    RestartAuthorityError,
+    issue_restart_delegation,
+    issue_restart_delegation_revocation,
+    issue_restart_authority,
+    restart_authority_delegation_binding,
+    restart_authority_evidence_generation,
+    restart_authority_generation,
+    restart_delegation_allows,
+    reseal_restart_safety_state,
+    rotate_restart_authority_generation,
+    verify_restart_authority,
+    verify_restart_delegation,
+    verify_restart_delegation_revocation,
+)
 
 
 # Terminal states — a request in any of these is locked. The
@@ -125,6 +142,11 @@ _ADDED_COLUMNS = (
     # inserted with 1 explicitly, so only a pre-upgrade backlog needs the
     # one-time acknowledgement before bounded escalation may override idle.
     ("escalation_acknowledged", "INTEGER DEFAULT 0"),
+    # Exact sovereign-key authorization for the host mutation. Legacy rows
+    # stay blank and are rejected by the executor; authority is never inferred
+    # from their requester, age, status, or prior approval.
+    ("authority_evidence", "TEXT DEFAULT ''"),
+    ("authority_signature", "TEXT DEFAULT ''"),
 )
 
 # One-time data backfills for legacy rows, keyed by the column whose addition
@@ -178,7 +200,8 @@ _COLUMNS = (
     "update_allow_migrations, update_log, requester_request_id, "
     "executing_boot_id, origin_session_id, wake_delivered, "
     "wake_dispatched_at, wake_dispatch_boot_id, wake_dispatch_count, "
-    "first_blocked_at, escalation_acknowledged"
+    "first_blocked_at, escalation_acknowledged, authority_evidence, "
+    "authority_signature"
 )
 
 
@@ -230,6 +253,10 @@ class RestartRequest:
     # Fresh rows opt into bounded escalation. Migrated rows remain false until
     # an explicit acknowledgement records acceptance of the new behavior.
     escalation_acknowledged: bool = False
+    # Host-sealed exact request bounds. The signature is intentionally omitted
+    # from ``to_public_dict`` so an agent cannot harvest/replay authority.
+    authority_evidence: str = ""
+    authority_signature: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -264,6 +291,8 @@ class RestartRequest:
             wake_dispatch_count=int(g(22) or 0),
             first_blocked_at=str(g(23) or ""),
             escalation_acknowledged=bool(int(g(24) or 0)),
+            authority_evidence=str(g(25) or ""),
+            authority_signature=str(g(26) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -338,7 +367,9 @@ async def ensure_restart_requests_table(db) -> None:
             wake_dispatch_boot_id TEXT DEFAULT '',
             wake_dispatch_count INTEGER DEFAULT 0,
             first_blocked_at TEXT DEFAULT '',
-            escalation_acknowledged INTEGER DEFAULT 0
+            escalation_acknowledged INTEGER DEFAULT 0,
+            authority_evidence TEXT DEFAULT '',
+            authority_signature TEXT DEFAULT ''
         )
         """
     )
@@ -359,6 +390,348 @@ async def ensure_restart_requests_table(db) -> None:
         ON restart_requests(requested_by_agent, status)
         """
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_consumptions (
+            lifecycle_generation TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            consumed_at TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_authority_consumptions_request
+        ON restart_authority_consumptions(request_id)
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_retry_permissions (
+            lifecycle_generation TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            granted_at TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_authority_retry_request
+        ON restart_authority_retry_permissions(request_id)
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_issuances (
+            request_id TEXT PRIMARY KEY,
+            lifecycle_generation TEXT NOT NULL UNIQUE,
+            issued_at TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            subject_agent_did TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            authority_evidence TEXT NOT NULL,
+            authority_signature TEXT NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_restart_delegations_subject
+        ON restart_authority_delegations(subject_agent_did, expires_at)
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS restart_authority_delegation_revocations (
+            delegation_id TEXT PRIMARY KEY,
+            revoked_at TEXT NOT NULL,
+            revoked_by TEXT NOT NULL,
+            revocation_evidence TEXT NOT NULL,
+            revocation_signature TEXT NOT NULL
+        )
+        """
+    )
+    # This table was introduced after signed request rows. A verifiable legacy
+    # row is safe to adopt once: its signature authenticates the generation.
+    # Invalid rows stay unissued and therefore fail closed at execution.
+    for request in await list_requests(db):
+        verified, _ = await verify_restart_authority_at_use(db, request)
+        if not verified:
+            continue
+        try:
+            generation = restart_authority_generation(request)
+        except RestartAuthorityError:
+            continue
+        await db.execute(
+            "INSERT INTO restart_authority_issuances "
+            "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(request_id) DO NOTHING",
+            (request.id, generation, request.requested_at),
+        )
+        if request.status in TERMINAL_STATES:
+            await db.execute(
+                "INSERT INTO restart_authority_consumptions "
+                "(lifecycle_generation, request_id, consumed_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                (generation, request.id, request.completed_at or request.requested_at),
+            )
+
+
+async def _load_restart_delegation(
+    db, delegation_id: str,
+) -> tuple[RestartDelegation | None, str]:
+    rows = await db.fetchall(
+        "SELECT delegation_id, subject_agent_did, issued_at, expires_at, "
+        "authority_evidence, authority_signature "
+        "FROM restart_authority_delegations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if not rows:
+        return None, "restart delegation is absent"
+    row = rows[0]
+    parsed, reason = verify_restart_delegation(row[4], row[5])
+    if parsed is None:
+        return None, reason
+    if (
+        parsed.delegation_id != str(row[0])
+        or parsed.subject_agent_did != str(row[1])
+        or parsed.issued_at != str(row[2])
+        or parsed.expires_at != str(row[3])
+    ):
+        return None, "restart delegation index fields do not match signed evidence"
+    return parsed, reason
+
+
+async def resolve_restart_delegation(
+    db,
+    delegation_id: str,
+    *,
+    subject_agent_did: str,
+    operation: str,
+    update_repo_path: str,
+    update_target_ref: str,
+    update_profile: str,
+    update_allow_migrations: bool,
+    expected_signature: str | None = None,
+) -> tuple[RestartDelegation | None, str]:
+    """Resolve one live delegation and enforce its exact mutation bounds."""
+
+    delegation, reason = await _load_restart_delegation(db, delegation_id)
+    if delegation is None:
+        return None, reason
+    if expected_signature is not None and delegation.signature != expected_signature:
+        return None, "restart delegation no longer matches the request binding"
+    # Read the database clock before the revocation witness.  The revocation
+    # lookup is the final awaited decision in this resolver, so a revocation
+    # that commits while clock/expiry state is being read is observed before
+    # delegated host authority is returned to the mutation boundary.
+    now = await database_clock(db)
+    revoked = await db.fetchone(
+        "SELECT revoked_at, revoked_by, revocation_evidence, "
+        "revocation_signature FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if revoked is not None:
+        receipt, receipt_reason = verify_restart_delegation_revocation(
+            revoked[2], revoked[3], delegation_id=delegation_id
+        )
+        if receipt is None or (
+            receipt["revoked_at"] != str(revoked[0])
+            or receipt["revoked_by"] != str(revoked[1])
+        ):
+            return None, (
+                "restart delegation has an invalid revocation receipt: "
+                f"{receipt_reason}"
+            )
+        return None, "restart delegation was revoked"
+    issued_at = datetime.fromisoformat(delegation.issued_at)
+    expires_at = datetime.fromisoformat(delegation.expires_at)
+    if now < issued_at:
+        return None, "restart delegation is not yet valid"
+    if now >= expires_at:
+        return None, "restart delegation has expired"
+    allowed, reason = restart_delegation_allows(
+        delegation,
+        subject_agent_did=subject_agent_did,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+    )
+    return (delegation, reason) if allowed else (None, reason)
+
+
+async def verify_restart_authority_at_use(
+    db, request: RestartRequest,
+) -> tuple[bool, str]:
+    """Verify a request seal plus live delegation/revocation state."""
+
+    verified, reason = verify_restart_authority(request)
+    if not verified:
+        return False, reason
+    try:
+        binding = restart_authority_delegation_binding(request)
+    except RestartAuthorityError as error:
+        return False, str(error)
+    if binding is None:
+        return True, reason
+    delegation, reason = await resolve_restart_delegation(
+        db,
+        binding[0],
+        subject_agent_did=request.requested_by_agent,
+        operation=request.operation,
+        update_repo_path=request.update_repo_path,
+        update_target_ref=request.update_target_ref,
+        update_profile=request.update_profile,
+        update_allow_migrations=request.update_allow_migrations,
+        expected_signature=binding[1],
+    )
+    return delegation is not None, reason
+
+
+async def insert_restart_delegation(
+    db,
+    *,
+    subject_agent_did: str,
+    operation: str,
+    update_repo_path: str,
+    update_target_ref: str,
+    update_profile: str,
+    update_allow_migrations: bool,
+    expires_in_seconds: int,
+) -> RestartDelegation:
+    """Issue and durably record one sovereign-signed delegation."""
+
+    issued_at = await database_clock(db)
+    expires_at = issued_at + timedelta(seconds=expires_in_seconds)
+    evidence, signature = issue_restart_delegation(
+        subject_agent_did=subject_agent_did,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+        issued_at=issued_at.isoformat(),
+        expires_at=expires_at.isoformat(),
+    )
+    delegation, reason = verify_restart_delegation(evidence, signature)
+    if delegation is None:
+        raise RestartAuthorityError(reason)
+    await db.execute(
+        "INSERT INTO restart_authority_delegations "
+        "(delegation_id, subject_agent_did, issued_at, expires_at, "
+        "authority_evidence, authority_signature) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            delegation.delegation_id,
+            delegation.subject_agent_did,
+            delegation.issued_at,
+            delegation.expires_at,
+            delegation.evidence,
+            delegation.signature,
+        ),
+    )
+    return delegation
+
+
+async def revoke_restart_delegation(
+    db, delegation_id: str,
+) -> tuple[bool, dict[str, str] | None]:
+    """Append an idempotent, signed sovereign revocation receipt."""
+
+    delegation, _ = await _load_restart_delegation(db, delegation_id)
+    if delegation is None:
+        return False, None
+    revoked_at = (await database_clock(db)).isoformat()
+    evidence, signature = issue_restart_delegation_revocation(
+        delegation_id=delegation_id,
+        revoked_at=revoked_at,
+    )
+    document, reason = verify_restart_delegation_revocation(
+        evidence, signature, delegation_id=delegation_id
+    )
+    if document is None:
+        raise RestartAuthorityError(reason)
+    await db.execute(
+        "INSERT INTO restart_authority_delegation_revocations "
+        "(delegation_id, revoked_at, revoked_by, revocation_evidence, "
+        "revocation_signature) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(delegation_id) DO NOTHING",
+        (
+            delegation_id,
+            document["revoked_at"],
+            document["revoked_by"],
+            evidence,
+            signature,
+        ),
+    )
+    row = await db.fetchone(
+        "SELECT revoked_at, revoked_by FROM "
+        "restart_authority_delegation_revocations WHERE delegation_id = ?",
+        (delegation_id,),
+    )
+    if row is None:
+        return False, None
+    return True, {"revoked_at": str(row[0]), "revoked_by": str(row[1])}
+
+
+async def list_restart_delegations(
+    db, *, subject_agent_did: str,
+) -> List[dict[str, Any]]:
+    """Return public delegation state only for its exact subject."""
+
+    rows = await db.fetchall(
+        "SELECT delegation_id FROM restart_authority_delegations "
+        "WHERE subject_agent_did = ? ORDER BY issued_at DESC",
+        (subject_agent_did,),
+    )
+    now = await database_clock(db)
+    results: List[dict[str, Any]] = []
+    for row in rows:
+        delegation, reason = await _load_restart_delegation(db, str(row[0]))
+        if delegation is None:
+            results.append({
+                "delegation_id": str(row[0]),
+                "active": False,
+                "status_reason": reason,
+            })
+            continue
+        revoked = await db.fetchone(
+            "SELECT revoked_at, revoked_by, revocation_evidence, "
+            "revocation_signature FROM "
+            "restart_authority_delegation_revocations WHERE delegation_id = ?",
+            (delegation.delegation_id,),
+        )
+        valid_revocation = None
+        if revoked is not None:
+            valid_revocation, _ = verify_restart_delegation_revocation(
+                revoked[2], revoked[3], delegation_id=delegation.delegation_id
+            )
+        public = delegation.to_public_dict()
+        public.update({
+            "active": revoked is None and now < datetime.fromisoformat(
+                delegation.expires_at
+            ),
+            "revoked_at": (
+                valid_revocation["revoked_at"]
+                if valid_revocation is not None else ""
+            ),
+            "revoked_by": (
+                valid_revocation["revoked_by"]
+                if valid_revocation is not None else ""
+            ),
+        })
+        results.append(public)
+    return results
 
 
 async def insert_request(
@@ -376,27 +749,68 @@ async def insert_request(
     update_allow_migrations: bool = False,
     requester_request_id: str = "",
     origin_session_id: str = "",
+    delegation_id: str = "",
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
-    now_sql = database_now_sql(db)
-    await db.execute(
-        f"""
-        INSERT INTO restart_requests (
-            id, requested_by_agent, reason, requested_at,
-            desired_window, urgency, policy, status, status_reason,
-            completed_at, operation, update_repo_path, update_target_ref,
-            update_profile, update_allow_migrations, update_log,
-            requester_request_id, origin_session_id, escalation_acknowledged
+    requested_at = (await database_clock(db)).isoformat()
+    async with db.transaction(immediate=True):
+        delegation = None
+        if delegation_id:
+            delegation, delegation_reason = await resolve_restart_delegation(
+                db,
+                delegation_id,
+                subject_agent_did=requested_by_agent,
+                operation=operation,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=update_profile,
+                update_allow_migrations=update_allow_migrations,
+            )
+            if delegation is None:
+                raise RestartAuthorityError(delegation_reason)
+        authority_evidence, authority_signature = issue_restart_authority(
+            request_id=req_id,
+            requested_by_agent=requested_by_agent,
+            reason=reason,
+            urgency=urgency,
+            policy=policy,
+            desired_window=desired_window,
+            operation=operation,
+            update_repo_path=update_repo_path,
+            update_target_ref=update_target_ref,
+            update_profile=update_profile,
+            update_allow_migrations=update_allow_migrations,
+            requester_request_id=requester_request_id,
+            origin_session_id=origin_session_id,
+            requested_at=requested_at,
+            delegation=delegation,
         )
-        VALUES (?, ?, ?, {now_sql}, ?, ?, ?, 'pending', '', NULL,
-                ?, ?, ?, ?, ?, '', ?, ?, 1)
-        """,
-        (req_id, requested_by_agent, reason, desired_window,
-         urgency, policy, operation, update_repo_path, update_target_ref,
-         update_profile, 1 if update_allow_migrations else 0,
-         requester_request_id, origin_session_id),
-    )
+        generation = restart_authority_evidence_generation(authority_evidence)
+        await db.execute(
+            """
+            INSERT INTO restart_requests (
+                id, requested_by_agent, reason, requested_at,
+                desired_window, urgency, policy, status, status_reason,
+                completed_at, operation, update_repo_path, update_target_ref,
+                update_profile, update_allow_migrations, update_log,
+                requester_request_id, origin_session_id, escalation_acknowledged,
+                authority_evidence, authority_signature
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL,
+                    ?, ?, ?, ?, ?, '', ?, ?, 1, ?, ?)
+            """,
+            (req_id, requested_by_agent, reason, requested_at, desired_window,
+             urgency, policy, operation, update_repo_path, update_target_ref,
+             update_profile, 1 if update_allow_migrations else 0,
+             requester_request_id, origin_session_id, authority_evidence,
+             authority_signature),
+        )
+        await db.execute(
+            "INSERT INTO restart_authority_issuances "
+            "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?)",
+            (req_id, generation, requested_at),
+        )
     inserted = await get_request(db, req_id)
     if inserted is None:
         raise RuntimeError("restart request insert did not become visible")
@@ -576,34 +990,86 @@ async def mark_deferral_started(
     from a lost lifecycle race.
     """
 
-    stamp_sql = "?" if blocked_at is not None else database_now_sql(db)
-    params = (
-        (blocked_at, request_id, expected_current_status)
-        if blocked_at is not None
-        else (request_id, expected_current_status)
-    )
+    current = await get_request(db, request_id)
+    if current is None:
+        return None
+    verified, _ = await verify_restart_authority_at_use(db, current)
+    if not verified:
+        return None
+    if current.first_blocked_at:
+        return current
+    stamped_at = blocked_at or (await database_clock(db)).isoformat()
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at=stamped_at,
+        )
+    except RestartAuthorityError:
+        return None
     await db.execute(
-        f"UPDATE restart_requests SET first_blocked_at = {stamp_sql} "
+        "UPDATE restart_requests SET first_blocked_at = ?, "
+        "authority_evidence = ?, authority_signature = ? "
         "WHERE id = ? AND status = ? "
-        "AND (first_blocked_at IS NULL OR first_blocked_at = '')",
-        params,
+        "AND (first_blocked_at IS NULL OR first_blocked_at = '') "
+        "AND authority_signature = ?",
+        (
+            stamped_at,
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.authority_signature,
+        ),
     )
     return await get_request(db, request_id)
 
 
 async def clear_deferral_started(
     db, request_id: str, *, expected_current_status: str,
-) -> bool:
-    """Clear a busy interval after fleet quiescence is observed."""
+) -> Optional[RestartRequest]:
+    """Clear a busy interval and return the exact newly resealed row."""
 
+    current = await get_request(db, request_id)
+    if current is None:
+        return None
+    verified, _ = await verify_restart_authority_at_use(db, current)
+    if not verified:
+        return None
+    try:
+        authority_evidence, authority_signature = reseal_restart_safety_state(
+            current,
+            first_blocked_at="",
+        )
+    except RestartAuthorityError:
+        return None
     result = await db.execute(
-        "UPDATE restart_requests SET first_blocked_at = '' "
-        "WHERE id = ? AND status = ?",
-        (request_id, expected_current_status),
+        "UPDATE restart_requests SET first_blocked_at = '', "
+        "authority_evidence = ?, authority_signature = ? "
+        "WHERE id = ? AND status = ? AND first_blocked_at = ? "
+        "AND authority_signature = ?",
+        (
+            authority_evidence,
+            authority_signature,
+            request_id,
+            expected_current_status,
+            current.first_blocked_at,
+            current.authority_signature,
+        ),
     )
-    return await _write_landed(
+    landed = await _write_landed(
         db, result, request_id, lambda row: row.first_blocked_at == "",
     )
+    if not landed:
+        return None
+    refreshed = await get_request(db, request_id)
+    if (
+        refreshed is None
+        or refreshed.status != expected_current_status
+        or refreshed.first_blocked_at
+        or refreshed.authority_signature != authority_signature
+    ):
+        return None
+    return refreshed
 
 
 async def acknowledge_escalation(
@@ -612,20 +1078,93 @@ async def acknowledge_escalation(
     *,
     requested_by_agent: str,
 ) -> bool:
-    """Acknowledge a migrated row only for its durable requester."""
+    """Sovereign-authorize and acknowledge a row for its durable requester."""
 
-    result = await db.execute(
-        "UPDATE restart_requests SET escalation_acknowledged = 1 "
-        "WHERE id = ? AND requested_by_agent = ? "
-        "AND status IN ('pending', 'approved')",
-        (request_id, requested_by_agent),
-    )
-    return await _write_landed(
-        db,
-        result,
-        request_id,
-        lambda row: row.escalation_acknowledged,
-        requested_by_agent=requested_by_agent,
+    current = await get_request_for_agent(db, request_id, requested_by_agent)
+    if current is None or current.status not in PENDING_STATES:
+        return False
+
+    current_evidence = current.authority_evidence or ""
+    current_signature = current.authority_signature or ""
+    if current_evidence or current_signature:
+        verified, _ = await verify_restart_authority_at_use(db, current)
+        if not verified:
+            return False
+        authority_evidence = current_evidence
+        authority_signature = current_signature
+    else:
+        authority_evidence, authority_signature = issue_restart_authority(
+            request_id=current.id,
+            requested_by_agent=current.requested_by_agent,
+            reason=current.reason,
+            urgency=current.urgency,
+            policy=current.policy,
+            desired_window=current.desired_window,
+            operation=current.operation,
+            update_repo_path=current.update_repo_path,
+            update_target_ref=current.update_target_ref,
+            update_profile=current.update_profile,
+            update_allow_migrations=current.update_allow_migrations,
+            requester_request_id=current.requester_request_id,
+            origin_session_id=current.origin_session_id,
+            requested_at=current.requested_at,
+            first_blocked_at=current.first_blocked_at,
+        )
+
+    generation = restart_authority_evidence_generation(authority_evidence)
+    async with db.transaction(immediate=True):
+        result = await db.execute(
+            "UPDATE restart_requests SET escalation_acknowledged = 1, "
+            "authority_evidence = ?, authority_signature = ? "
+            "WHERE id = ? AND requested_by_agent = ? "
+            "AND status IN ('pending', 'approved') "
+            "AND COALESCE(authority_evidence, '') = ? "
+            "AND COALESCE(authority_signature, '') = ?",
+            (
+                authority_evidence,
+                authority_signature,
+                request_id,
+                requested_by_agent,
+                current_evidence,
+                current_signature,
+            ),
+        )
+        landed = await _write_landed(
+            db,
+            result,
+            request_id,
+            lambda row: (
+                row.escalation_acknowledged
+                and row.authority_signature == authority_signature
+            ),
+            requested_by_agent=requested_by_agent,
+        )
+        if not landed:
+            return False
+        await db.execute(
+            "INSERT INTO restart_authority_issuances "
+            "(request_id, lifecycle_generation, issued_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(request_id) DO NOTHING",
+            (request_id, generation, (await database_clock(db)).isoformat()),
+        )
+        issued = await db.fetchone(
+            "SELECT lifecycle_generation FROM restart_authority_issuances "
+            "WHERE request_id = ?",
+            (request_id,),
+        )
+        if issued is None or issued[0] != generation:
+            # Raising is what makes the context manager roll back the row CAS;
+            # returning False here would commit signed-but-unissued authority.
+            raise RestartAuthorityError(
+                "restart authority issuance conflicts with acknowledged evidence"
+            )
+    refreshed = await get_request_for_agent(db, request_id, requested_by_agent)
+    return bool(
+        refreshed is not None
+        and refreshed.escalation_acknowledged
+        and refreshed.authority_evidence == authority_evidence
+        and refreshed.authority_signature == authority_signature
+        and (await verify_restart_authority_at_use(db, refreshed))[0]
     )
 
 
@@ -639,20 +1178,105 @@ async def cancel_request_if_owned(
 ) -> bool:
     """Atomically cancel a pending row owned by ``requested_by_agent``."""
 
-    result = await db.execute(
-        "UPDATE restart_requests SET status = 'canceled', "
-        "status_reason = ?, completed_at = ? "
-        "WHERE id = ? AND requested_by_agent = ? "
-        "AND status IN ('pending', 'approved')",
-        (status_reason, completed_at, request_id, requested_by_agent),
-    )
-    return await _write_landed(
-        db,
-        result,
-        request_id,
-        lambda row: row.status == "canceled",
-        requested_by_agent=requested_by_agent,
-    )
+    current = await get_request_for_agent(db, request_id, requested_by_agent)
+    if current is None or current.status not in PENDING_STATES:
+        return False
+    verified, _ = verify_restart_authority(current)
+    if verified:
+        async with db.transaction(immediate=True):
+            issued = await db.fetchone(
+                "SELECT lifecycle_generation FROM restart_authority_issuances "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+            generation = issued[0] if issued is not None else None
+            result = await db.execute(
+                "UPDATE restart_requests SET status = 'canceled', "
+                "status_reason = ?, completed_at = ? "
+                "WHERE id = ? AND requested_by_agent = ? "
+                "AND status IN ('pending', 'approved') "
+                "AND authority_signature = ?",
+                (
+                    status_reason,
+                    completed_at,
+                    request_id,
+                    requested_by_agent,
+                    current.authority_signature,
+                ),
+            )
+            changed = (
+                result
+                if isinstance(result, int)
+                else getattr(result, "rowcount", 0)
+            )
+            if not isinstance(changed, int) or changed <= 0:
+                return False
+            if generation is not None:
+                await db.execute(
+                    "INSERT INTO restart_authority_consumptions "
+                    "(lifecycle_generation, request_id, consumed_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                    (
+                        generation,
+                        request_id,
+                        (await database_clock(db)).isoformat(),
+                    ),
+                )
+            # Cancellation is terminal even when the lifecycle generation was
+            # already consumed by an earlier claim.  The retry permission is
+            # a separate one-shot capability for recovering a legitimate
+            # interrupted update; leaving it behind would let a raw rewrite
+            # of this canceled row to ``updating`` mint fresh authority.
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+        return True
+
+    # Let an owner dispose of invalid/legacy rows without manufacturing new
+    # authority. If the host previously issued one, revoke that ledger value:
+    # the row may be invalid only because its editable evidence was swapped.
+    async with db.transaction(immediate=True):
+        issued = await db.fetchone(
+            "SELECT lifecycle_generation FROM restart_authority_issuances "
+            "WHERE request_id = ?",
+            (request_id,),
+        )
+        result = await db.execute(
+            "UPDATE restart_requests SET status = 'canceled', "
+            "status_reason = ?, completed_at = ? "
+            "WHERE id = ? AND requested_by_agent = ? "
+            "AND status IN ('pending', 'approved')",
+            (status_reason, completed_at, request_id, requested_by_agent),
+        )
+        landed = await _write_landed(
+            db,
+            result,
+            request_id,
+            lambda row: row.status == "canceled",
+            requested_by_agent=requested_by_agent,
+        )
+        if landed:
+            if issued is not None:
+                await db.execute(
+                    "INSERT INTO restart_authority_consumptions "
+                    "(lifecycle_generation, request_id, consumed_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                    (
+                        issued[0],
+                        request_id,
+                        (await database_clock(db)).isoformat(),
+                    ),
+                )
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+        return landed
 
 
 async def record_update_log(db, request_id: str, update_log: str) -> None:
@@ -668,6 +1292,107 @@ async def record_update_log(db, request_id: str, update_log: str) -> None:
     )
 
 
+async def claim_request_for_execution(
+    db,
+    request: RestartRequest,
+    *,
+    status: str,
+    status_reason: str,
+    executing_boot_id: Optional[str] = None,
+) -> str:
+    """Consume one signed lifecycle generation and cross into host mutation.
+
+    Returns ``claimed``, ``consumed``, ``invalid``, or ``lost_race``. The
+    consumption row lives outside ``restart_requests`` deliberately: a caller
+    that can edit a request row cannot reactivate a completed/canceled/rejected
+    request by changing its status back to pending.
+    """
+
+    if status not in {"updating", "executing"}:
+        raise ValueError("an execution claim must enter updating or executing")
+    try:
+        generation = restart_authority_generation(request)
+    except RestartAuthorityError:
+        return "invalid"
+
+    async with db.transaction(immediate=True):
+        fresh = await get_request(db, request.id)
+        if (
+            fresh is None
+            or fresh.status != request.status
+            or fresh.authority_signature != request.authority_signature
+        ):
+            return "lost_race"
+        verified, _ = await verify_restart_authority_at_use(db, fresh)
+        if not verified:
+            return "invalid"
+        if restart_authority_generation(fresh) != generation:
+            return "lost_race"
+        issued = await db.fetchone(
+            "SELECT lifecycle_generation FROM restart_authority_issuances "
+            "WHERE request_id = ?",
+            (request.id,),
+        )
+        if issued is None or issued[0] != generation:
+            return "invalid"
+
+        inserted = await db.execute(
+            "INSERT INTO restart_authority_consumptions "
+            "(lifecycle_generation, request_id, consumed_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(lifecycle_generation) DO NOTHING",
+            (generation, request.id, (await database_clock(db)).isoformat()),
+        )
+        inserted_count = (
+            inserted
+            if isinstance(inserted, int)
+            else getattr(inserted, "rowcount", 0)
+        )
+        if not isinstance(inserted_count, int) or inserted_count <= 0:
+            return "consumed"
+
+        await db.execute(
+            "INSERT INTO restart_authority_retry_permissions "
+            "(lifecycle_generation, request_id, granted_at) VALUES (?, ?, ?)",
+            (generation, request.id, (await database_clock(db)).isoformat()),
+        )
+
+        sql = (
+            "UPDATE restart_requests SET status = ?, status_reason = ?"
+            + (
+                ", executing_boot_id = ?"
+                if executing_boot_id is not None
+                else ""
+            )
+            + " WHERE id = ? AND status = ? AND authority_signature = ?"
+        )
+        params: List[Any] = [status, status_reason]
+        if executing_boot_id is not None:
+            params.append(executing_boot_id)
+        params.extend([request.id, request.status, request.authority_signature])
+        updated = await db.execute(sql, tuple(params))
+        updated_count = (
+            updated
+            if isinstance(updated, int)
+            else getattr(updated, "rowcount", 0)
+        )
+        if not isinstance(updated_count, int) or updated_count <= 0:
+            # Undo the just-inserted consumption inside the same transaction
+            # when the lifecycle CAS loses. No other claimant could have
+            # inserted this generation because our insert returned >0.
+            await db.execute(
+                "DELETE FROM restart_authority_consumptions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (generation, request.id),
+            )
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (generation, request.id),
+            )
+            return "lost_race"
+    return "claimed"
+
+
 async def update_status(
     db,
     request_id: str,
@@ -676,14 +1401,15 @@ async def update_status(
     status_reason: str = "",
     completed_at: Optional[str] = None,
     expected_current_status: Optional[str] = None,
+    expected_authority_signature: Optional[str] = None,
     executing_boot_id: Optional[str] = None,
 ) -> bool:
     """Atomic status transition. Returns True if a row was updated.
 
-    When ``expected_current_status`` is provided, the update is gated
-    on the row currently having that status — protects against
-    racing coordinators (or a concurrent cancel) overwriting an
-    in-flight ``executing`` row.
+    ``expected_current_status`` protects against lifecycle races.
+    ``expected_authority_signature`` additionally binds a transition to the
+    exact signed safety-state version the caller evaluated, so a concurrent
+    deferral-clock reseal cannot turn a stale safe observation into execution.
 
     When ``executing_boot_id`` is provided, it is stamped onto the row
     alongside the status (#1796) — the caller passes the current host
@@ -691,23 +1417,146 @@ async def update_status(
     post-restart sweep can tell a prior-process restart (real) from a
     live-process one (still in flight / failed).
     """
-    sql = (
-        "UPDATE restart_requests SET status = ?, status_reason = ?"
-        + (", completed_at = ?" if completed_at is not None else "")
-        + (", executing_boot_id = ?" if executing_boot_id is not None else "")
-        + " WHERE id = ?"
+    authority_evidence: Optional[str] = None
+    authority_signature: Optional[str] = None
+    retry_generation: Optional[str] = None
+    terminal_generation: Optional[str] = None
+    retry_transition = (
+        status == "pending" and expected_current_status not in PENDING_STATES
     )
-    params_final: List[Any] = [status, status_reason]
-    if completed_at is not None:
-        params_final.append(completed_at)
-    if executing_boot_id is not None:
-        params_final.append(executing_boot_id)
-    params_final.append(request_id)
-    if expected_current_status is not None:
-        sql += " AND status = ?"
-        params_final.append(expected_current_status)
-    result = await db.execute(sql, tuple(params_final))
-    # >0 = updated; 0 = expected-status mismatch, i.e. lost the race.
-    return await _write_landed(
-        db, result, request_id, lambda row: row.status == status,
-    )
+
+    # Retry authority is a capability outside the caller-editable request row.
+    # A legitimate execution claim grants it; the first active -> pending
+    # transition consumes it while rotating to a new lifecycle generation.
+    # Consequently, rewriting a terminal request row back to ``updating`` or
+    # ``executing`` cannot manufacture a retry after the terminal transition
+    # has revoked the separate permission.
+    async with db.transaction(immediate=True):
+        if retry_transition:
+            current = await get_request(db, request_id)
+            if current is None or not (
+                await verify_restart_authority_at_use(db, current)
+            )[0]:
+                return False
+            if (
+                expected_current_status is not None
+                and current.status != expected_current_status
+            ):
+                return False
+            if (
+                expected_authority_signature is not None
+                and current.authority_signature != expected_authority_signature
+            ):
+                return False
+            try:
+                retry_generation = restart_authority_generation(current)
+            except RestartAuthorityError:
+                return False
+            permission = await db.fetchone(
+                "SELECT 1 FROM restart_authority_retry_permissions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (retry_generation, request_id),
+            )
+            if permission is None:
+                return False
+            try:
+                authority_evidence, authority_signature = (
+                    rotate_restart_authority_generation(current)
+                )
+            except RestartAuthorityError:
+                return False
+            # Bind the retry reseal to the exact generation just consumed,
+            # even when an older caller omitted the optional signature CAS.
+            if expected_authority_signature is None:
+                expected_authority_signature = current.authority_signature
+        elif status in TERMINAL_STATES:
+            # Terminalization must revoke what the host actually issued, even
+            # when an editor has replaced or malformed the copy embedded in the
+            # request row. The issuance ledger is outside that mutable surface.
+            issued = await db.fetchone(
+                "SELECT lifecycle_generation FROM restart_authority_issuances "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+            terminal_generation = issued[0] if issued is not None else None
+
+        sql = (
+            "UPDATE restart_requests SET status = ?, status_reason = ?"
+            + (", completed_at = ?" if completed_at is not None else "")
+            + (", executing_boot_id = ?" if executing_boot_id is not None else "")
+            + (
+                ", authority_evidence = ?, authority_signature = ?"
+                if authority_evidence is not None
+                else ""
+            )
+            + " WHERE id = ?"
+        )
+        params_final: List[Any] = [status, status_reason]
+        if completed_at is not None:
+            params_final.append(completed_at)
+        if executing_boot_id is not None:
+            params_final.append(executing_boot_id)
+        if authority_evidence is not None:
+            params_final.extend([authority_evidence, authority_signature])
+        params_final.append(request_id)
+        if expected_current_status is not None:
+            sql += " AND status = ?"
+            params_final.append(expected_current_status)
+        if expected_authority_signature is not None:
+            sql += " AND authority_signature = ?"
+            params_final.append(expected_authority_signature)
+        result = await db.execute(sql, tuple(params_final))
+        landed = await _write_landed(
+            db, result, request_id, lambda row: row.status == status,
+        )
+        if not landed:
+            return False
+        if retry_generation is not None and authority_evidence is not None:
+            replacement_generation = restart_authority_evidence_generation(
+                authority_evidence
+            )
+            issuance_update = await db.execute(
+                "UPDATE restart_authority_issuances SET "
+                "lifecycle_generation = ?, issued_at = ? "
+                "WHERE request_id = ? AND lifecycle_generation = ?",
+                (
+                    replacement_generation,
+                    (await database_clock(db)).isoformat(),
+                    request_id,
+                    retry_generation,
+                ),
+            )
+            issuance_count = (
+                issuance_update
+                if isinstance(issuance_update, int)
+                else getattr(issuance_update, "rowcount", 0)
+            )
+            if not isinstance(issuance_count, int) or issuance_count <= 0:
+                raise RuntimeError(
+                    "restart authority issuance rotation lost its generation CAS"
+                )
+        if terminal_generation is not None:
+            await db.execute(
+                "INSERT INTO restart_authority_consumptions "
+                "(lifecycle_generation, request_id, consumed_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(lifecycle_generation) DO NOTHING",
+                (
+                    terminal_generation,
+                    request_id,
+                    (await database_clock(db)).isoformat(),
+                ),
+            )
+        if retry_generation is not None:
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE lifecycle_generation = ? AND request_id = ?",
+                (retry_generation, request_id),
+            )
+        elif status in TERMINAL_STATES:
+            await db.execute(
+                "DELETE FROM restart_authority_retry_permissions "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+        return True
