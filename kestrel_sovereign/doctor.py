@@ -23,6 +23,10 @@ Checks performed:
     fail-closed integrity audit safe-modes an agent on either at boot;
     doctor surfaces them pre-upgrade so operators can reanchor first
     (#2616) — see ``_check_anchor_consistency``.
+  - PostgreSQL hosts provide a reachable
+    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL`` on an independent cluster, and
+    both runtime roles can read ``pg_catalog.pg_control_system()`` so that
+    independence is proved before setup reports ready.
   - Legacy local identity exports are inspected by metadata only. Unsafe
     directory/file modes, links, and non-regular entries are reported without
     opening or parsing package contents.
@@ -113,6 +117,8 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_constitution_drift(readings, report)
     _check_anchor_consistency(readings, report)
+    _check_sqlite_hold_readiness(resolved, project_dir, report)
+    _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
     _check_semantic_registry(report)
 
@@ -299,6 +305,559 @@ def _anchor_is_the_runtime_database(env: dict) -> bool:
     """
     backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
     return not (backend == "postgres" and env.get("KESTREL_DATABASE_URL"))
+
+
+_POSTGRES_CLUSTER_ID_SQL = (
+    "SELECT system_identifier::text FROM pg_catalog.pg_control_system()"
+)
+_POSTGRES_HOLD_METADATA_TABLE_SQL = (
+    "SELECT to_regclass('agent_metadata')::text"
+)
+_POSTGRES_HOLD_CUSTODY_SQL = (
+    "SELECT key, value FROM agent_metadata "
+    "WHERE agent_id = $1 AND key IN ($2, $3, $4)"
+)
+_POSTGRES_HOLD_SCHEMA_SQL = (
+    "SELECT table_name FROM information_schema.tables "
+    "WHERE table_schema = current_schema() AND table_name IN "
+    "('hold_latches', 'hold_receipts', 'hold_receipt_witnesses', "
+    "'hold_receipt_content_witnesses', 'hold_operation_witnesses', "
+    "'hold_schema_migrations') ORDER BY table_name"
+)
+_POSTGRES_HOLD_RECEIPTS_SQL = (
+    "SELECT receipt_id, operation_id, action, disposition, scope, target_id, "
+    "reason, actor_id, occurred_at, expected_hold_receipt_id, "
+    "prior_hold_receipt_id, resulting_hold_receipt_id "
+    "FROM hold_receipts ORDER BY receipt_id"
+)
+_POSTGRES_HOLD_LATCHES_SQL = (
+    "SELECT scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, "
+    "revision FROM hold_latches ORDER BY scope, target_id"
+)
+_POSTGRES_HOLD_RECEIPT_COUNTS_SQL = (
+    "SELECT scope, target_id, receipt_count FROM hold_receipt_witnesses "
+    "ORDER BY scope, target_id"
+)
+_POSTGRES_HOLD_CONTENT_WITNESSES_SQL = (
+    "SELECT receipt_id, scope, target_id, receipt_digest "
+    "FROM hold_receipt_content_witnesses ORDER BY receipt_id"
+)
+_POSTGRES_HOLD_OPERATION_WITNESSES_SQL = (
+    "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
+    "ORDER BY operation_id"
+)
+_POSTGRES_HOLD_MIGRATIONS_SQL = (
+    "SELECT name FROM hold_schema_migrations ORDER BY name"
+)
+_POSTGRES_HOLD_PROTOCOL_SQL = (
+    "SELECT key, value FROM agent_metadata "
+    "WHERE agent_id = $1 AND key IN ($2, $3, $4, $5) ORDER BY key"
+)
+
+
+def _postgres_cluster_probe_source(
+    dsn: str,
+    env: dict[str, str],
+    project_dir: Path,
+) -> _GovernanceSource:
+    """Build the existing redaction/launch context for a cluster probe."""
+
+    return _GovernanceSource(
+        anchor_path=Path("."),
+        agent_did="",
+        dsn=dsn,
+        dsn_identity=_postgres_redaction_identity(dsn, env),
+        postgres_home=env.get("HOME") or env.get("USERPROFILE"),
+        postgres_env=dict(env),
+        postgres_cwd=str(project_dir.resolve()),
+    )
+
+
+def _read_postgres_cluster_identity(
+    dsn: str,
+    *,
+    label: str,
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+) -> str | None:
+    """Read the same privileged cluster identity Hold requires at boot."""
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    try:
+        rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_CLUSTER_ID_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - asyncpg has its own exception tree
+        failure = _postgres_probe_failure_kind(exc)
+        if failure == "connection":
+            report.fail.append(
+                f"PostgreSQL Hold {label} database is unreachable: "
+                f"{_safe(exc, source)}"
+            )
+        elif failure == "runtime_database":
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                "the runtime role requires EXECUTE on "
+                f"pg_catalog.pg_control_system() ({_safe(exc, source)})"
+            )
+        elif failure == "diagnostic_timeout":
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                f"the bounded diagnostic timed out ({_safe(exc, source)})"
+            )
+        else:
+            report.fail.append(
+                f"PostgreSQL Hold {label} cluster identity NOT verified: "
+                f"diagnostic tooling failed ({_safe(exc, source)})"
+            )
+        return None
+
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 1
+        or not isinstance(rows[0][0], str)
+        or not rows[0][0].strip()
+    ):
+        report.fail.append(
+            f"PostgreSQL Hold {label} cluster identity NOT verified: "
+            "pg_catalog.pg_control_system() returned invalid data"
+        )
+        return None
+    return rows[0][0]
+
+
+def _runtime_postgres_connection_failed(readings: list[_AgentGovernance]) -> bool:
+    """Reuse an already-observed runtime outage instead of reconnecting."""
+
+    return any(
+        isinstance(reading.source, _UnreadableDB)
+        and reading.source.postgres_failure
+        in {"connection", "diagnostic_timeout", "diagnostic_tooling"}
+        for reading in readings
+    )
+
+
+def _read_postgres_hold_custody_snapshot(
+    dsn: str,
+    *,
+    cluster_identity: str,
+    label: str,
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+):
+    """Read existing durable custody roles without initializing a schema."""
+
+    from kestrel_sovereign.hold.state import (
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_WITNESS_AGENT_ID,
+        postgres_hold_custody_snapshot_from_rows,
+    )
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    try:
+        table_rows = _fetch_postgres_rows_isolated(
+            dsn,
+            _POSTGRES_HOLD_METADATA_TABLE_SQL,
+            postgres_home=source.postgres_home,
+            postgres_env=source.postgres_env,
+            postgres_cwd=source.postgres_cwd,
+            dsn_identity=source.dsn_identity,
+        )
+        if len(table_rows) != 1 or len(table_rows[0]) != 1:
+            raise ValueError("metadata-table probe returned invalid data")
+        table_name = table_rows[0][0]
+        if table_name is None:
+            metadata_rows = []
+        else:
+            if not isinstance(table_name, str) or not table_name.strip():
+                raise ValueError("metadata-table probe returned invalid data")
+            metadata_rows = _fetch_postgres_rows_isolated(
+                dsn,
+                _POSTGRES_HOLD_CUSTODY_SQL,
+                (
+                    _POSTGRES_WITNESS_AGENT_ID,
+                    _POSTGRES_ROLLBACK_DOMAIN_KEY,
+                    _POSTGRES_PRIMARY_BINDING_KEY,
+                    _POSTGRES_EVIDENCE_BINDING_KEY,
+                ),
+                postgres_home=source.postgres_home,
+                postgres_env=source.postgres_env,
+                postgres_cwd=source.postgres_cwd,
+                dsn_identity=source.dsn_identity,
+            )
+        return (
+            postgres_hold_custody_snapshot_from_rows(
+                cluster_identity,
+                metadata_rows,
+                label=label,
+            ),
+            table_name is not None,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+        report.fail.append(
+            f"PostgreSQL Hold {label} custody roles NOT verified: "
+            f"{_safe(exc, source)}"
+        )
+        return None
+
+
+def _read_postgres_hold_protocol_rows(
+    dsn: str,
+    *,
+    metadata_table_exists: bool,
+    env: dict[str, str],
+    project_dir: Path,
+) -> list:
+    """Read external Hold protocol evidence without requiring a new table."""
+
+    if not metadata_table_exists:
+        return []
+    from kestrel_sovereign.hold.state import (
+        _POSTGRES_BOOTSTRAP_INTENT_KEY,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_HISTORY_CANDIDATE_KEY,
+        _POSTGRES_WITNESS_AGENT_ID,
+        _POSTGRES_WITNESS_KEY,
+    )
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    return _fetch_postgres_rows_isolated(
+        dsn,
+        _POSTGRES_HOLD_PROTOCOL_SQL,
+        (
+            _POSTGRES_WITNESS_AGENT_ID,
+            _POSTGRES_WITNESS_KEY,
+            _POSTGRES_HISTORY_ANCHOR_KEY,
+            _POSTGRES_HISTORY_CANDIDATE_KEY,
+            _POSTGRES_BOOTSTRAP_INTENT_KEY,
+        ),
+        postgres_home=source.postgres_home,
+        postgres_env=source.postgres_env,
+        postgres_cwd=source.postgres_cwd,
+        dsn_identity=source.dsn_identity,
+    )
+
+
+def _read_postgres_hold_primary_state(
+    dsn: str,
+    *,
+    env: dict[str, str],
+    project_dir: Path,
+) -> object:
+    """Read the complete primary Hold state without mutation."""
+
+    from kestrel_sovereign.hold.state import (
+        _HOLD_SCHEMA_TABLES,
+        HoldDatabaseSnapshot,
+    )
+
+    source = _postgres_cluster_probe_source(dsn, env, project_dir)
+    table_rows = _fetch_postgres_rows_isolated(
+        dsn,
+        _POSTGRES_HOLD_SCHEMA_SQL,
+        postgres_home=source.postgres_home,
+        postgres_env=source.postgres_env,
+        postgres_cwd=source.postgres_cwd,
+        dsn_identity=source.dsn_identity,
+    )
+    tables: set[str] = set()
+    for row in table_rows:
+        if (
+            len(row) != 1
+            or not isinstance(row[0], str)
+            or row[0] not in _HOLD_SCHEMA_TABLES
+            or row[0] in tables
+        ):
+            raise ValueError("Hold schema probe returned invalid data")
+        tables.add(row[0])
+    def read_table(table: str, sql: str) -> tuple:
+        if table not in tables:
+            return ()
+        return tuple(
+            _fetch_postgres_rows_isolated(
+                dsn,
+                sql,
+                postgres_home=source.postgres_home,
+                postgres_env=source.postgres_env,
+                postgres_cwd=source.postgres_cwd,
+                dsn_identity=source.dsn_identity,
+            )
+        )
+
+    return HoldDatabaseSnapshot(
+        existing_tables=frozenset(tables),
+        latch_rows=read_table("hold_latches", _POSTGRES_HOLD_LATCHES_SQL),
+        receipt_rows=read_table("hold_receipts", _POSTGRES_HOLD_RECEIPTS_SQL),
+        receipt_count_witness_rows=read_table(
+            "hold_receipt_witnesses",
+            _POSTGRES_HOLD_RECEIPT_COUNTS_SQL,
+        ),
+        content_witness_rows=read_table(
+            "hold_receipt_content_witnesses",
+            _POSTGRES_HOLD_CONTENT_WITNESSES_SQL,
+        ),
+        operation_witness_rows=read_table(
+            "hold_operation_witnesses",
+            _POSTGRES_HOLD_OPERATION_WITNESSES_SQL,
+        ),
+        migration_rows=read_table(
+            "hold_schema_migrations",
+            _POSTGRES_HOLD_MIGRATIONS_SQL,
+        ),
+    )
+
+
+def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
+    """Resolve the host database exactly as its spawned runtime will."""
+
+    explicit = env.get("KESTREL_HOST_DB_PATH")
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_dir / candidate
+        return Path(os.path.abspath(candidate))
+    configured_home = env.get("KESTREL_HOME")
+    if configured_home:
+        base = Path(configured_home).expanduser()
+        if not base.is_absolute():
+            base = project_dir / base
+    else:
+        runtime_home = env.get("HOME") or env.get("USERPROFILE")
+        base = (
+            Path(runtime_home).expanduser() / ".kestrel"
+            if runtime_home
+            else Path.home() / ".kestrel"
+        )
+    return Path(os.path.abspath(base / "host-data" / "host-features.db"))
+
+
+def _check_sqlite_hold_readiness(
+    env: dict[str, str],
+    project_dir: Path,
+    report: DoctorReport,
+) -> None:
+    """Verify the mandatory local Hold database and external sidecars."""
+
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    if backend == "postgres" and env.get("KESTREL_DATABASE_URL"):
+        return
+    from kestrel_sovereign.hold.state import validate_sqlite_hold_readiness
+
+    database = _sqlite_hold_database_path(env, project_dir)
+    try:
+        validate_sqlite_hold_readiness(database)
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(f"SQLite Hold readiness NOT verified: {exc}")
+        return
+    report.ok.append(f"SQLite Hold state verified at {database}")
+
+
+def _check_postgres_hold_readiness(
+    env: dict[str, str],
+    project_dir: Path,
+    readings: list[_AgentGovernance],
+    report: DoctorReport,
+) -> None:
+    """Verify the mandatory independent PostgreSQL Hold custody service."""
+
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    primary_dsn = env.get("KESTREL_DATABASE_URL")
+    if backend != "postgres" or not primary_dsn:
+        return
+    try:
+        _doctor_postgres_timeout_seconds(env)
+    except ValueError:
+        # Governance already records the actionable configuration error. Do
+        # not bypass that invalid bound with further Hold-specific probes.
+        report.fail.append(
+            "PostgreSQL Hold readiness NOT verified because the PostgreSQL "
+            "doctor configuration is invalid"
+        )
+        return
+
+    evidence_dsn = env.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
+    if not evidence_dsn:
+        report.fail.append(
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for PostgreSQL "
+            "Hold rollback evidence"
+        )
+        return
+    if evidence_dsn == primary_dsn:
+        report.fail.append(
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an independent "
+            "PostgreSQL cluster"
+        )
+        return
+    primary_identity = None
+    if _runtime_postgres_connection_failed(readings):
+        report.fail.append(
+            "PostgreSQL Hold primary cluster identity NOT verified because "
+            "runtime database reachability was not established"
+        )
+    else:
+        primary_identity = _read_postgres_cluster_identity(
+            primary_dsn,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+    evidence_identity = _read_postgres_cluster_identity(
+        evidence_dsn,
+        label="evidence",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    if primary_identity is None or evidence_identity is None:
+        return
+    if primary_identity == evidence_identity:
+        report.fail.append(
+            "PostgreSQL Hold evidence requires an independent PostgreSQL cluster"
+        )
+        return
+    primary_reading = _read_postgres_hold_custody_snapshot(
+        primary_dsn,
+        cluster_identity=primary_identity,
+        label="primary",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    evidence_reading = _read_postgres_hold_custody_snapshot(
+        evidence_dsn,
+        cluster_identity=evidence_identity,
+        label="evidence",
+        env=env,
+        project_dir=project_dir,
+        report=report,
+    )
+    if primary_reading is None or evidence_reading is None:
+        return
+    primary_snapshot, _primary_metadata_exists = primary_reading
+    evidence_snapshot, evidence_metadata_exists = evidence_reading
+    try:
+        from kestrel_sovereign.hold.state import (
+            validate_postgres_hold_custody,
+            validate_postgres_hold_readiness_snapshot,
+        )
+
+        validate_postgres_hold_custody(primary_snapshot, evidence_snapshot)
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(
+            f"PostgreSQL Hold custody NOT verified: {exc}"
+        )
+        return
+    primary_source = _postgres_cluster_probe_source(primary_dsn, env, project_dir)
+    evidence_source = _postgres_cluster_probe_source(evidence_dsn, env, project_dir)
+    try:
+        evidence_before = _read_postgres_hold_protocol_rows(
+            evidence_dsn,
+            metadata_table_exists=evidence_metadata_exists,
+            env=env,
+            project_dir=project_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+        report.fail.append(
+            "PostgreSQL Hold protocol evidence NOT verified: "
+            f"{_safe(exc, evidence_source)}"
+        )
+        return
+    try:
+        primary_state = _read_postgres_hold_primary_state(
+            primary_dsn,
+            env=env,
+            project_dir=project_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+        report.fail.append(
+            "PostgreSQL Hold primary state NOT verified: "
+            f"{_safe(exc, primary_source)}"
+        )
+        return
+    try:
+        evidence_after = _read_postgres_hold_protocol_rows(
+            evidence_dsn,
+            metadata_table_exists=evidence_metadata_exists,
+            env=env,
+            project_dir=project_dir,
+        )
+        if evidence_before != evidence_after:
+            raise RuntimeError(
+                "Hold protocol evidence changed during the diagnostic snapshot"
+            )
+        final_primary_identity = _read_postgres_cluster_identity(
+            primary_dsn,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        final_evidence_identity = _read_postgres_cluster_identity(
+            evidence_dsn,
+            label="evidence",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        if final_primary_identity is None or final_evidence_identity is None:
+            return
+        if (final_primary_identity, final_evidence_identity) != (
+            primary_identity,
+            evidence_identity,
+        ):
+            raise RuntimeError(
+                "PostgreSQL Hold cluster identity changed during the diagnostic "
+                "snapshot"
+            )
+        primary_after = _read_postgres_hold_custody_snapshot(
+            primary_dsn,
+            cluster_identity=final_primary_identity,
+            label="primary",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        evidence_custody_after = _read_postgres_hold_custody_snapshot(
+            evidence_dsn,
+            cluster_identity=final_evidence_identity,
+            label="evidence",
+            env=env,
+            project_dir=project_dir,
+            report=report,
+        )
+        if primary_after is None or evidence_custody_after is None:
+            return
+        if (
+            primary_after != primary_reading
+            or evidence_custody_after != evidence_reading
+        ):
+            raise RuntimeError(
+                "Hold custody roles changed during the diagnostic snapshot"
+            )
+        validate_postgres_hold_custody(primary_after[0], evidence_custody_after[0])
+        validate_postgres_hold_readiness_snapshot(
+            snapshot=primary_state,
+            evidence_rows=evidence_after,
+        )
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(
+            f"PostgreSQL Hold history NOT verified: {_safe(exc, evidence_source)}"
+        )
+        return
+    report.ok.append(
+        "PostgreSQL Hold evidence: independent clusters, custody roles, and "
+        "receipt history verified"
+    )
 
 
 @dataclass(frozen=True)

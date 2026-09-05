@@ -2134,20 +2134,752 @@ class _FakePostgres:
 def _postgres_host(monkeypatch, fake):
     from kestrel_sovereign import doctor as doctor_module
 
+    runtime_dsn = "postgresql://durable.example/kestrel"
+    evidence_dsn = "postgresql://evidence.example/kestrel"
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
-    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable.example/kestrel")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", runtime_dsn)
+    monkeypatch.setenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", evidence_dsn)
+
+    def _fetch(dsn, sql, params=(), **_kwargs):
+        if "pg_control_system" in sql:
+            identity = (
+                "primary-cluster" if dsn == runtime_dsn else "evidence-cluster"
+            )
+            return [(identity,)]
+        if sql == doctor_module._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [(None,)]
+        return doctor_module._postgres_fetch_rows_in_process(
+            dsn,
+            sql,
+            params,
+            connect=fake.connect,
+        )
+
     monkeypatch.setattr(
         doctor_module,
         "_fetch_postgres_rows_isolated",
-        lambda dsn, sql, params=(), **_kwargs: (
-            doctor_module._postgres_fetch_rows_in_process(
-                dsn,
-                sql,
-                params,
-                connect=fake.connect,
+        _fetch,
+    )
+
+
+def test_postgres_doctor_requires_hold_evidence_database(tmp_path, monkeypatch):
+    """Doctor cannot report ready when server boot lacks mandatory custody."""
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL" in message
+        for message in report.fail
+    ), report.fail
+
+
+def test_postgres_doctor_does_not_reprobe_failed_primary_for_hold(
+    tmp_path,
+    monkeypatch,
+):
+    """A governance outage already proves the primary is not ready."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(
+        monkeypatch,
+        _FakePostgres({}, connect_error=OSError("connection timed out")),
+    )
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    cluster_probes: list[str] = []
+
+    def _track_cluster_probes(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            cluster_probes.append(dsn)
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _track_cluster_probes,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert cluster_probes == ["postgresql://evidence.example/kestrel"]
+    assert any(
+        "runtime database reachability was not established" in message
+        for message in report.fail
+    ), report.fail
+
+
+def test_postgres_doctor_rejects_same_cluster_hold_evidence(tmp_path, monkeypatch):
+    """Different connection strings cannot disguise one restore domain."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+
+    def _same_cluster(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            return [("same-cluster",)]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _same_cluster)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+def test_postgres_doctor_rejects_swapped_persisted_custody_roles(
+    tmp_path,
+    monkeypatch,
+):
+    """Readiness cannot approve a pair that runtime refuses before mutation."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+
+    def _persisted_roles(dsn, sql, params=(), **kwargs):
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [("agent_metadata",)]
+        if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
+            wrong_key = (
+                "hold_evidence_custody_binding_v1"
+                if dsn == primary_dsn
+                else "hold_primary_custody_binding_v1"
             )
+            return [(wrong_key, "persisted-role")]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _persisted_roles,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("wrong durable custody role" in message for message in report.fail)
+    assert not any("custody roles verified" in message for message in report.ok)
+
+
+def test_postgres_doctor_rejects_primary_receipt_history_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor must predict the same external-anchor refusal as server boot."""
+
+    from uuid import UUID
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import (
+        _HOLD_SCHEMA_TABLES,
+        _INITIALIZATION_WITNESS_PAYLOAD,
+        _POSTGRES_EVIDENCE_BINDING_KEY,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_PRIMARY_BINDING_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_KEY,
+        _POSTGRES_ROLLBACK_DOMAIN_PREFIX,
+        _POSTGRES_WITNESS_KEY,
+        HoldStore,
+        postgres_hold_custody_binding_payload,
+    )
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+    primary_domain = _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(
+        UUID("11111111-1111-4111-8111-111111111111")
+    )
+    evidence_domain = _POSTGRES_ROLLBACK_DOMAIN_PREFIX + str(
+        UUID("22222222-2222-4222-8222-222222222222")
+    )
+    binding = postgres_hold_custody_binding_payload(
+        UUID("33333333-3333-4333-8333-333333333333"),
+        primary_domain,
+        evidence_domain,
+    )
+    first_receipt = (
+        "receipt-one",
+        "operation-one",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "first hold",
+        "did:operator:sovereign",
+        "2026-09-04T12:00:00+00:00",
+        "",
+        "",
+        "receipt-one",
+    )
+    second_receipt = (
+        "receipt-two",
+        "operation-two",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "replacement hold",
+        "did:operator:sovereign",
+        "2026-09-04T12:01:00+00:00",
+        "",
+        "receipt-one",
+        "receipt-two",
+    )
+    newer_anchor = HoldStore._history_anchor_payload_from_rows(
+        (first_receipt, second_receipt)
+    ).decode("ascii")
+
+    def _rolled_back_primary(dsn, sql, params=(), **kwargs):
+        if sql == doctor._POSTGRES_HOLD_METADATA_TABLE_SQL:
+            return [("agent_metadata",)]
+        if sql == doctor._POSTGRES_HOLD_CUSTODY_SQL:
+            if dsn == primary_dsn:
+                return [
+                    (_POSTGRES_ROLLBACK_DOMAIN_KEY, primary_domain),
+                    (_POSTGRES_PRIMARY_BINDING_KEY, binding),
+                ]
+            return [
+                (_POSTGRES_ROLLBACK_DOMAIN_KEY, evidence_domain),
+                (_POSTGRES_EVIDENCE_BINDING_KEY, binding),
+            ]
+        if "information_schema.tables" in sql and "hold_latches" in sql:
+            return [(table,) for table in sorted(_HOLD_SCHEMA_TABLES)]
+        if sql.lstrip().startswith("SELECT receipt_id, operation_id"):
+            # The primary was restored to the first receipt while independent
+            # evidence still binds the deployment to the two-receipt history.
+            return [first_receipt]
+        if sql == doctor._POSTGRES_HOLD_PROTOCOL_SQL:
+            return [
+                (
+                    _POSTGRES_WITNESS_KEY,
+                    _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+                ),
+                (_POSTGRES_HISTORY_ANCHOR_KEY, newer_anchor),
+            ]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _rolled_back_primary,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready, f"ok={report.ok} fail={report.fail}"
+    assert any("history anchor" in message for message in report.fail), report.fail
+    assert not any("custody roles verified" in message for message in report.ok)
+
+
+def test_postgres_doctor_rejects_protocol_changed_during_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """A Hold publication racing Doctor cannot become a stitched clean read."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        _HOLD_SCHEMA_TABLES,
+        _INITIALIZATION_WITNESS_PAYLOAD,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_WITNESS_KEY,
+        HoldDatabaseSnapshot,
+        HoldStore,
+        PostgresHoldCustodySnapshot,
+    )
+
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda _dsn, *, cluster_identity, **_kwargs: (
+            PostgresHoldCustodySnapshot(cluster_identity=cluster_identity),
+            True,
         ),
     )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_primary_state",
+        lambda *_args, **_kwargs: HoldDatabaseSnapshot(
+            existing_tables=frozenset(_HOLD_SCHEMA_TABLES),
+            migration_rows=(("hold_state_witness_ledgers_v1",),),
+        ),
+    )
+    empty_anchor = HoldStore._history_anchor_payload_from_rows(()).decode("ascii")
+    protocol_reads = iter(
+        (
+            [],
+            [
+                (
+                    _POSTGRES_WITNESS_KEY,
+                    _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+                ),
+                (_POSTGRES_HISTORY_ANCHOR_KEY, empty_anchor),
+            ],
+        )
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: next(protocol_reads),
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("changed during the diagnostic snapshot" in item for item in report.fail)
+
+
+def test_postgres_doctor_rejects_missing_hold_content_witness(
+    tmp_path,
+    monkeypatch,
+):
+    """Doctor must reject initialized state that runtime boot rejects."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        _HOLD_SCHEMA_TABLES,
+        _INITIALIZATION_WITNESS_PAYLOAD,
+        _POSTGRES_HISTORY_ANCHOR_KEY,
+        _POSTGRES_WITNESS_KEY,
+        HoldStore,
+        PostgresHoldCustodySnapshot,
+    )
+
+    receipt = (
+        "receipt-one",
+        "operation-one",
+        "hold",
+        "applied",
+        "agent",
+        "did:agent:kite",
+        "operator pause",
+        "did:operator:sovereign",
+        "2026-09-04T12:00:00+00:00",
+        "",
+        "",
+        "receipt-one",
+    )
+    anchor = HoldStore._history_anchor_payload_from_rows((receipt,)).decode("ascii")
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda _dsn, *, cluster_identity, **_kwargs: (
+            PostgresHoldCustodySnapshot(cluster_identity=cluster_identity),
+            True,
+        ),
+    )
+    latch = (
+        "agent",
+        "did:agent:kite",
+        1,
+        "receipt-one",
+        "operator pause",
+        "did:operator:sovereign",
+        "2026-09-04T12:00:00+00:00",
+        1,
+    )
+    queried: list[str] = []
+
+    def _primary_rows(_dsn, sql, *_args, **_kwargs):
+        queried.append(sql)
+        if sql == doctor._POSTGRES_HOLD_SCHEMA_SQL:
+            return [(table,) for table in sorted(_HOLD_SCHEMA_TABLES)]
+        return {
+            doctor._POSTGRES_HOLD_LATCHES_SQL: [latch],
+            doctor._POSTGRES_HOLD_RECEIPTS_SQL: [receipt],
+            doctor._POSTGRES_HOLD_RECEIPT_COUNTS_SQL: [
+                ("agent", "did:agent:kite", 1)
+            ],
+            doctor._POSTGRES_HOLD_CONTENT_WITNESSES_SQL: [],
+            doctor._POSTGRES_HOLD_OPERATION_WITNESSES_SQL: [
+                ("operation-one", "receipt-one")
+            ],
+            doctor._POSTGRES_HOLD_MIGRATIONS_SQL: [
+                ("hold_state_witness_ledgers_v1",)
+            ],
+        }[sql]
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _primary_rows)
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: [
+            (
+                _POSTGRES_WITNESS_KEY,
+                _INITIALIZATION_WITNESS_PAYLOAD.decode("ascii"),
+            ),
+            (_POSTGRES_HISTORY_ANCHOR_KEY, anchor),
+        ],
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("content witness" in item for item in report.fail), report.fail
+    assert doctor._POSTGRES_HOLD_CONTENT_WITNESSES_SQL in queried
+
+
+def test_postgres_doctor_rejects_custody_roles_changed_during_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """A concurrent first boot cannot reverse roles behind Doctor's read."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        HoldDatabaseSnapshot,
+        PostgresHoldCustodySnapshot,
+    )
+
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda _dsn, *, label, **_kwargs: f"{label}-cluster",
+    )
+    custody_reads = iter(
+        (
+            (PostgresHoldCustodySnapshot(cluster_identity="primary-cluster"), False),
+            (PostgresHoldCustodySnapshot(cluster_identity="evidence-cluster"), False),
+            (
+                PostgresHoldCustodySnapshot(
+                    cluster_identity="primary-cluster",
+                    evidence_binding="wrong-role",
+                ),
+                True,
+            ),
+            (
+                PostgresHoldCustodySnapshot(
+                    cluster_identity="evidence-cluster",
+                    primary_binding="wrong-role",
+                ),
+                True,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda *_args, **_kwargs: next(custody_reads),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_primary_state",
+        lambda *_args, **_kwargs: HoldDatabaseSnapshot(existing_tables=frozenset()),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: [],
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("custody" in item.lower() for item in report.fail), report.fail
+
+
+def test_postgres_doctor_rejects_cluster_targets_changed_during_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """Endpoint failover cannot leave stale identities on fresh custody rows."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.hold.state import (
+        HoldDatabaseSnapshot,
+        PostgresHoldCustodySnapshot,
+    )
+
+    identity_reads = iter(
+        (
+            "primary-cluster",
+            "evidence-cluster",
+            "shared-cluster",
+            "shared-cluster",
+        )
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_cluster_identity",
+        lambda *_args, **_kwargs: next(identity_reads),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_custody_snapshot",
+        lambda _dsn, *, cluster_identity, **_kwargs: (
+            PostgresHoldCustodySnapshot(cluster_identity=cluster_identity),
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_primary_state",
+        lambda *_args, **_kwargs: HoldDatabaseSnapshot(existing_tables=frozenset()),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_read_postgres_hold_protocol_rows",
+        lambda *_args, **_kwargs: [],
+    )
+    report = DoctorReport()
+
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("cluster" in item.lower() for item in report.fail), report.fail
+
+
+@pytest.mark.asyncio
+async def test_sqlite_doctor_rejects_missing_hold_history_anchor(
+    tmp_path,
+):
+    """Doctor must inspect the mandatory SQLite Hold sidecars read at boot."""
+
+    from kestrel_sovereign.hold.state import hold_history_anchor_path
+    from kestrel_sovereign.host_features.context import (
+        build_host_context,
+        close_host_context_resources,
+    )
+
+    _seed_ready(tmp_path)
+    host_dir = tmp_path / "host-data"
+    host_dir.mkdir(mode=0o700)
+    host_db = host_dir / "host-features.db"
+    context = await build_host_context(db_path=str(host_db))
+    assert context.hold_store is not None, context.backend_error
+    await context.hold_store.set_hold(
+        scope="agent",
+        target_id="did:agent:kite",
+        actor_id="did:operator:sovereign",
+        reason="verify Doctor boot parity",
+        operation_id="doctor-sqlite-hold",
+    )
+    await close_host_context_resources(context)
+    with (tmp_path / ".env").open("a", encoding="utf-8") as env_file:
+        env_file.write(f"KESTREL_HOST_DB_PATH={host_db}\n")
+
+    before = {
+        str(path.relative_to(host_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in host_dir.rglob("*")
+        if path.is_file()
+    }
+    ready = diagnose(tmp_path)
+    assert ready.ready, ready.fail
+    after = {
+        str(path.relative_to(host_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in host_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+    hold_history_anchor_path(host_db).unlink()
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("Hold history anchor" in item for item in report.fail), report.fail
+
+
+def test_postgres_doctor_rejects_same_hold_evidence_url_without_probing(
+    tmp_path,
+    monkeypatch,
+):
+    """The obvious same-service configuration fails before any connection."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    runtime_dsn = "postgresql://durable.example/kestrel"
+    monkeypatch.setenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", runtime_dsn)
+
+    original_fetch = doctor._fetch_postgres_rows_isolated
+
+    def _unexpected_probe(dsn, sql, params=(), **kwargs):
+        if "pg_control_system" in sql:
+            pytest.fail("identical Hold DSNs reached the cluster probe")
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _unexpected_probe)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("independent PostgreSQL cluster" in message for message in report.fail)
+
+
+@pytest.mark.parametrize(
+    ("target", "failure", "message", "forbidden"),
+    [
+        ("primary", "connection", "primary database is unreachable", ""),
+        ("evidence", "connection", "evidence database is unreachable", ""),
+        (
+            "primary",
+            "query",
+            "requires EXECUTE on pg_catalog.pg_control_system",
+            "",
+        ),
+        (
+            "evidence",
+            "query",
+            "requires EXECUTE on pg_catalog.pg_control_system",
+            "",
+        ),
+        (
+            "primary",
+            "timeout",
+            "bounded diagnostic timed out",
+            "requires EXECUTE",
+        ),
+        (
+            "evidence",
+            "tooling",
+            "diagnostic tooling failed",
+            "requires EXECUTE",
+        ),
+    ],
+)
+def test_postgres_doctor_probes_hold_database_connectivity_and_privilege(
+    tmp_path,
+    monkeypatch,
+    target,
+    failure,
+    message,
+    forbidden,
+):
+    """Both custody services require connection and cluster-identity access."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    primary_dsn = "postgresql://durable.example/kestrel"
+    evidence_dsn = "postgresql://evidence.example/kestrel"
+    failed_dsn = primary_dsn if target == "primary" else evidence_dsn
+
+    def _fail_cluster_probe(dsn, sql, params=(), **kwargs):
+        if dsn == failed_dsn and "pg_control_system" in sql:
+            error_type = {
+                "connection": doctor._PostgresProbeConnectionError,
+                "query": doctor._PostgresProbeQueryError,
+                "timeout": doctor._PostgresProbeTimeoutError,
+                "tooling": doctor._PostgresProbeError,
+            }[failure]
+            raise error_type("injected evidence probe failure")
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(
+        doctor,
+        "_fetch_postgres_rows_isolated",
+        _fail_cluster_probe,
+    )
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(message in item for item in report.fail), report.fail
+    if forbidden:
+        assert not any(forbidden in item for item in report.fail), report.fail
+
+
+def test_postgres_doctor_rejects_invalid_cluster_identity(tmp_path, monkeypatch):
+    """A successful query must still return one canonical non-empty identity."""
+
+    from kestrel_sovereign import doctor
+
+    _seed_matching_anchor(tmp_path, monkeypatch)
+    _postgres_host(monkeypatch, _FakePostgres({}))
+    original_fetch = doctor._fetch_postgres_rows_isolated
+    evidence_dsn = "postgresql://evidence.example/kestrel"
+
+    def _invalid_identity(dsn, sql, params=(), **kwargs):
+        if dsn == evidence_dsn and "pg_control_system" in sql:
+            return [("",)]
+        return original_fetch(dsn, sql, params, **kwargs)
+
+    monkeypatch.setattr(doctor, "_fetch_postgres_rows_isolated", _invalid_identity)
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any("returned invalid data" in item for item in report.fail), report.fail
 
 
 def test_on_postgres_the_drift_verdict_comes_from_the_runtime_database(
@@ -2290,7 +3022,12 @@ def test_a_postgres_host_whose_anchor_names_no_agent_is_skipped_not_guessed(
     report = diagnose(tmp_path)
 
     assert any("names no agent" in m for m in report.warn), report.warn
-    assert not fake.executed, "doctor queried PostgreSQL without a tenant"
+    tenant_reads = [
+        sql
+        for sql, _params in fake.executed
+        if "FROM graph_nodes" in sql or "FROM graph_edges" in sql
+    ]
+    assert not tenant_reads, "doctor queried PostgreSQL governance without a tenant"
 
 
 def test_sqlite_hosts_never_reach_for_postgres(tmp_path, monkeypatch):

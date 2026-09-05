@@ -22,6 +22,24 @@ PORT="${PORT:-8080}"
 MULTI_AGENT_CONFIG="${KESTREL_MULTI_AGENT_CONFIG:-/app/multi_agent.toml}"
 AGENT_DATA_DIR="${KESTREL_AGENT_DATA_DIR:-/app/agent_data}"
 PERSISTENCE_MODE="${KESTREL_DEPLOYMENT_PERSISTENCE:-}"
+HOST_CONTROL_DIR="$(dirname -- "${KESTREL_HOST_DB_PATH:-/app/agent_data/host-data/host-features.db}")"
+
+# Compare canonical paths below. A supported relative KESTREL_HOST_DB_PATH
+# otherwise cannot match the absolute agent-directory glob, and a restart can
+# mistake the persistent host-control directory for a new agent. Python is
+# already the image-owned runtime used by this entrypoint and resolves missing
+# leaf paths without creating them.
+canonicalize_path() {
+    /app/.venv/bin/python - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).expanduser().resolve(strict=False))
+PY
+}
+AGENT_DATA_DIR="$(canonicalize_path "$AGENT_DATA_DIR")"
+HOST_CONTROL_DIR="$(canonicalize_path "$HOST_CONTROL_DIR")"
+unset -f canonicalize_path
 
 if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]; then
     echo "FATAL: durable multi-agent Cloud Run needs one custody bundle and database binding per agent; refusing local inception." >&2
@@ -77,6 +95,12 @@ fi
 # Bootstrap identity and initialize DB for each agent data dir
 for dir in "$AGENT_DATA_DIR"/*/; do
     [ -d "$dir" ] || continue
+    # The Hold database lives on the persistent agent-data volume, but its
+    # directory is host infrastructure. A restart must not mint an identity or
+    # an agent database inside it.
+    case "${HOST_CONTROL_DIR%/}/" in
+        "${dir%/}/"*) continue ;;
+    esac
     agent_name=$(basename "$dir")
 
     # Bootstrap identity if missing

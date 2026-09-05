@@ -18,7 +18,9 @@ sessions against the host backend (SQLite default), so Phase 1 works standalone.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -127,12 +129,20 @@ class SovereignHostContext:
         backplane: Any = None,
         config: Any = None,
         session_factory: Optional[FleetSessionFactory] = None,
+        hold_store: Any = None,
+        hold_db: Any = None,
+        hold_evidence_db: Any = None,
+        hold_boot_state: tuple[Any, ...] = (),
         backend_error: str = "",
     ) -> None:
         self._db = db
         self._backplane = backplane
         self._config = config if config is not None else {}
         self._session_factory = session_factory
+        self._hold_store = hold_store
+        self._hold_db = hold_db
+        self._hold_evidence_db = hold_evidence_db
+        self._hold_boot_state = tuple(hold_boot_state)
         self._backend_error = str(backend_error or "")
 
     @property
@@ -151,6 +161,30 @@ class SovereignHostContext:
     def session_factory(self) -> Optional[FleetSessionFactory]:
         """Fleet tenant-scoped session factory on the host backend."""
         return self._session_factory
+
+    @property
+    def hold_store(self) -> Any:
+        """Durable host/agent Hold latches on the host control backend."""
+
+        return self._hold_store
+
+    @property
+    def hold_db(self) -> Any:
+        """Backend owned solely by Hold, or :attr:`db` when they coincide."""
+
+        return self._hold_db
+
+    @property
+    def hold_evidence_db(self) -> Any:
+        """Independent PostgreSQL rollback witness backend, when configured."""
+
+        return self._hold_evidence_db
+
+    @property
+    def hold_boot_state(self) -> tuple[Any, ...]:
+        """Validated active latches observed before work admission opens."""
+
+        return self._hold_boot_state
 
     @property
     def backend_error(self) -> str:
@@ -173,6 +207,98 @@ class SovereignHostContext:
         return FLEET_TENANT_ID
 
 
+async def _close_partial_host_resources(
+    session_factory: Optional[FleetSessionFactory],
+    hold_evidence_db: Any,
+    hold_db: Any,
+    db: Any,
+) -> None:
+    """Close every resource acquired before host bootstrap completed."""
+
+    cancelled = False
+    if session_factory is not None:
+        try:
+            await session_factory.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as close_exc:  # noqa: BLE001 - finish later resources
+            logger.warning("Could not close partial host session factory: %s", close_exc)
+    if (
+        hold_evidence_db is not None
+        and hold_evidence_db is not hold_db
+        and hold_evidence_db is not db
+        and hasattr(hold_evidence_db, "close")
+    ):
+        try:
+            await hold_evidence_db.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as close_exc:  # noqa: BLE001 - finish later resources
+            logger.warning(
+                "Could not close partial Hold evidence backend: %s", close_exc
+            )
+    if hold_db is not None and hold_db is not db and hasattr(hold_db, "close"):
+        try:
+            await hold_db.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as close_exc:  # noqa: BLE001 - finish later resources
+            logger.warning("Could not close partial Hold backend: %s", close_exc)
+    if db is not None and hasattr(db, "close"):
+        try:
+            await db.close()
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as close_exc:  # noqa: BLE001 - finish later resources
+            logger.warning("Could not close partial host backend: %s", close_exc)
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
+async def _finish_partial_host_cleanup(
+    session_factory: Optional[FleetSessionFactory],
+    hold_evidence_db: Any,
+    hold_db: Any,
+    db: Any,
+) -> None:
+    """Own partial bootstrap cleanup through repeated caller cancellation."""
+
+    cleanup = asyncio.create_task(
+        _close_partial_host_resources(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        ),
+        name="partial-host-bootstrap-cleanup",
+    )
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A supervisor may cancel shutdown more than once. The resource
+            # owner is independent, so every acquired backend still closes.
+            cancelled = True
+            continue
+    await cleanup
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
+async def close_host_context_resources(context: Any) -> None:
+    """Cancellation-safely close all databases owned by one host context."""
+
+    if context is None:
+        return
+    await _finish_partial_host_cleanup(
+        getattr(context, "session_factory", None),
+        getattr(context, "hold_evidence_db", None),
+        getattr(context, "hold_db", None),
+        getattr(context, "db", None),
+    )
+
+
 async def build_host_context(
     *,
     config: Any = None,
@@ -180,17 +306,29 @@ async def build_host_context(
 ) -> SovereignHostContext:
     """Build the host context: open a host backend + fleet session factory.
 
-    The host is not an agent, so it owns a dedicated host backend (SQLite by
-    default) distinct from any agent DB. ``db_path`` overrides the default
-    location (``$KESTREL_HOST_DB_PATH`` or the private host-data root). Failure
-    to secure or open the backend degrades gracefully to a context with a
-    ``None`` db/session_factory — the host still starts and host features whose
-    routers/UI don't need a store keep working.
+    The established host-feature backend remains the dedicated SQLite file so
+    an upgrade cannot make existing workflow/feature rows disappear. Hold is
+    the cross-worker control plane exception: PostgreSQL deployments give it a
+    separate ``KESTREL_DATABASE_URL`` backend plus an independently restored
+    ``KESTREL_HOLD_EVIDENCE_DATABASE_URL``. ``db_path`` overrides the host
+    SQLite location (``$KESTREL_HOST_DB_PATH`` or the private host-data root).
+    Failure to secure or open either backend degrades gracefully to a context
+    with no store; production Hold enforcement then fails closed at boot.
     """
     db = None
     session_factory: Optional[FleetSessionFactory] = None
+    hold_store = None
+    hold_db = None
+    hold_evidence_db = None
+    hold_boot_state: tuple[Any, ...] = ()
     backend_error = ""
     try:
+        from kestrel_sovereign.hold import HoldStore
+        from kestrel_sovereign.hold.state import (
+            hold_history_anchor_path,
+            hold_initialization_witness_path,
+            initialize_postgres_hold_databases,
+        )
         from kestrel_sovereign.host_features.storage import (
             prepare_host_database,
             validate_sqlite_family_private,
@@ -203,23 +341,78 @@ async def build_host_context(
         validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)
         session_factory = FleetSessionFactory(inner)
-        logger.info(
-            "Host backend opened at %s (fleet tenant=%s)", resolved, FLEET_TENANT_ID
-        )
-    except Exception as exc:  # noqa: BLE001 - host must start even without a store
-        if session_factory is not None:
-            try:
-                await session_factory.close()
-            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
-                logger.warning(
-                    "Could not close partial host session factory: %s", close_exc
+
+        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        dsn = os.environ.get("KESTREL_DATABASE_URL")
+        if backend == "postgres" and dsn:
+            evidence_dsn = os.environ.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
+            if not evidence_dsn:
+                raise RuntimeError(
+                    "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for "
+                    "PostgreSQL Hold rollback evidence"
                 )
-        if db is not None and hasattr(db, "close"):
-            try:
-                await db.close()
-            except Exception as close_exc:  # noqa: BLE001 - preserve degradation
-                logger.warning("Could not close partial host backend: %s", close_exc)
+            if evidence_dsn == dsn:
+                raise RuntimeError(
+                    "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
+                    "independent rollback domain"
+                )
+            # Hold operations are serialized by their independent evidence
+            # protocol, so wider pools add connection demand without adding
+            # useful concurrency. The paired initializer keeps both pools
+            # load-bearingly small and, critically, initializes schema on the
+            # same connected backends whose cluster identity and custody roles
+            # it inspected. Reopening by DSN here would create a failover/
+            # load-balancer window between validation and the first write.
+            hold_db, hold_evidence_db = await initialize_postgres_hold_databases(
+                dsn,
+                evidence_dsn,
+            )
+            hold_location = "configured PostgreSQL database"
+            initialization_witness_path = None
+            history_anchor_path = None
+        else:
+            hold_db = db
+            hold_location = str(resolved)
+            initialization_witness_path = hold_initialization_witness_path(
+                resolved
+            )
+            history_anchor_path = hold_history_anchor_path(resolved)
+        hold_store = HoldStore(
+            hold_db,
+            initialization_witness_path=initialization_witness_path,
+            history_anchor_path=history_anchor_path,
+            evidence_db=hold_evidence_db,
+        )
+        await hold_store.ensure_schema()
+        hold_boot_state = await hold_store.read_boot_state()
+        logger.info(
+            "Host backend opened at %s (fleet tenant=%s); Hold backend=%s",
+            resolved,
+            FLEET_TENANT_ID,
+            hold_location,
+        )
+    except asyncio.CancelledError as cancellation:
+        await _finish_partial_host_cleanup(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        )
+        raise cancellation
+    except Exception as exc:  # noqa: BLE001 - host must start even without a store
+        # Cleanup owns its task independently so cancellation arriving after
+        # the opening failure closes every acquired backend and then
+        # propagates instead of returning a degraded context during shutdown.
+        await _finish_partial_host_cleanup(
+            session_factory,
+            hold_evidence_db,
+            hold_db,
+            db,
+        )
         session_factory = None
+        hold_store = None
+        hold_evidence_db = None
+        hold_db = None
         db = None
         backend_error = f"{type(exc).__name__}: {exc}"
         # ERROR, not warning: everything that depends on the host store is
@@ -232,26 +425,18 @@ async def build_host_context(
         backplane=None,
         config=config,
         session_factory=session_factory,
+        hold_store=hold_store,
+        hold_db=hold_db,
+        hold_evidence_db=hold_evidence_db,
+        hold_boot_state=hold_boot_state,
         backend_error=backend_error,
     )
 
 
 async def close_host_context(ctx: Any) -> None:
-    """Best-effort close of every resource owned by one host context."""
+    """Compatibility name for cancellation-safe host resource cleanup."""
 
-    session_factory = getattr(ctx, "session_factory", None)
-    try:
-        if session_factory is not None:
-            await session_factory.close()
-    except Exception as exc:  # noqa: BLE001 - the database must still close
-        logger.warning("Host feature session-factory shutdown failed: %s", exc)
-    finally:
-        db = getattr(ctx, "db", None)
-        if db is not None and hasattr(db, "close"):
-            try:
-                await db.close()
-            except Exception as exc:  # noqa: BLE001 - terminal cleanup
-                logger.warning("Host feature database shutdown failed: %s", exc)
+    await close_host_context_resources(ctx)
 
 
 __all__ = [
@@ -259,5 +444,6 @@ __all__ = [
     "FleetSessionFactory",
     "SovereignHostContext",
     "build_host_context",
+    "close_host_context_resources",
     "close_host_context",
 ]

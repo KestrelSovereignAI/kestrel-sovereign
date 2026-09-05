@@ -27,6 +27,7 @@ DURABLE_SOVEREIGN = "durable_sovereign"
 
 _DURABLE_SECRET_KEYS = (
     "KESTREL_DATABASE_URL",
+    "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
     "KESTREL_DATA_KEY",
     "KESTREL_IDENTITY_BUNDLE",
 )
@@ -132,6 +133,14 @@ def validate_cloudrun_persistence(profile: DeploymentProfile) -> None:
             "durable_sovereign custody secrets must use immutable numeric "
             "Secret Manager versions (never :latest): "
             + ", ".join(unpinned)
+        )
+    if (
+        profile.secrets["KESTREL_DATABASE_URL"]
+        == profile.secrets["KESTREL_HOLD_EVIDENCE_DATABASE_URL"]
+    ):
+        raise DeployManagerError(
+            "durable_sovereign Hold custody requires independent primary and "
+            "evidence database secret references"
         )
 
 

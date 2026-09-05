@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CANONICAL_AGENT_DATA_DIR = "/app/agent_data"
+CANONICAL_HOST_DB_PATH = "/app/agent_data/host-data/host-features.db"
 
 
 def _read(relative_path: str) -> str:
@@ -29,16 +30,31 @@ def test_single_agent_dockerfiles_use_agent_data_dir_for_db_path():
     for dockerfile in dockerfiles:
         text = _read(dockerfile)
         assert f"ENV KESTREL_DB_PATH={CANONICAL_AGENT_DATA_DIR}" in text
+        assert f"ENV KESTREL_HOST_DB_PATH={CANONICAL_HOST_DB_PATH}" in text
         assert "ENV KESTREL_DB_PATH=/app/kestrel.db" not in text
         assert "ENV KESTREL_DB_PATH=/app/kestrel_prime.db" not in text
+
+
+def test_multi_agent_image_persists_host_control_database_on_agent_volume():
+    text = _read("docker/Dockerfile.multi_agent")
+
+    assert f"ENV KESTREL_HOST_DB_PATH={CANONICAL_HOST_DB_PATH}" in text
 
 
 def test_compose_mount_and_env_point_to_same_agent_data_dir():
     text = _read("docker-compose.yml")
 
     assert f"KESTREL_DB_PATH={CANONICAL_AGENT_DATA_DIR}" in text
+    assert f"KESTREL_HOST_DB_PATH={CANONICAL_HOST_DB_PATH}" in text
     assert "./agent_data:/app/agent_data" in text
     assert "/usr/src/app/kestrel.db" not in text
+
+
+def test_sovereign_image_keeps_host_control_state_on_its_data_volume():
+    text = _read("docker/Dockerfile.sovereign")
+
+    assert "ENV KESTREL_DB_PATH=/data" in text
+    assert "ENV KESTREL_HOST_DB_PATH=/data/host-data/host-features.db" in text
 
 
 def test_container_entrypoint_initializes_db_inside_agent_data_dir():

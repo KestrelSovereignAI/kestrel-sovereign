@@ -170,6 +170,7 @@ def test_prod_profile_has_bash_parity_secrets(live_config):
         "OPENAI_API_KEY",
         "KESTREL_API_KEY",
         "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
         "GOOGLE_CLIENT_ID",
@@ -295,6 +296,7 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
     assert not prod.is_multi_agent
     for key in (
         "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
     ):
@@ -310,14 +312,57 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
         validate_cloudrun_persistence(multi_prod)
 
 
+def test_durable_cloudrun_rejects_identical_hold_database_secret_refs(live_config):
+    """A statically identical secret cannot represent independent custody."""
+    from dataclasses import replace
+
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+    from kestrel_sovereign.features.deploy.persistence import (
+        validate_cloudrun_persistence,
+    )
+
+    manager = DeployManager(config=live_config)
+    prod = manager.get_profile("prod")
+    primary_ref = prod.secrets["KESTREL_DATABASE_URL"]
+    unsafe = replace(
+        prod,
+        env_vars={
+            **prod.env_vars,
+            "KESTREL_EXPECTED_DID": "did:web:agents.example.com:kestrel",
+        },
+        secrets={
+            **prod.secrets,
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": primary_ref,
+        },
+    )
+
+    with pytest.raises(DeployManagerError, match="independent primary and evidence"):
+        validate_cloudrun_persistence(unsafe)
+
+
+def test_production_ceremony_provisions_only_the_cluster_probe_privilege():
+    """Least-privilege runtime roles can read the Hold cluster identity."""
+
+    deployment_guide = (REPO_ROOT / "docs/deployment/README.md").read_text()
+
+    assert (
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()"
+        in deployment_guide
+    )
+    assert "both PostgreSQL runtime roles" in deployment_guide
+    assert "GRANT pg_monitor" not in deployment_guide
+
+
 def test_prod_instance_cap_matches_provisioned_database(live_config):
     """``prod``'s scaling numbers must match the substrate behind them.
 
     ``durable_sovereign`` *permits* horizontal scale, but permission is not
     capacity.  Each serving instance opens up to ``max_pool_size`` (10) pooled
-    plus ``_advisory_max_pool_size`` (4) PostgreSQL connections, and the
-    provisioned Cloud SQL instance is a ``db-f1-micro`` with a ~25 connection
-    ceiling — so a second instance exhausts it.
+    plus ``_advisory_max_pool_size`` (4) runtime PostgreSQL connections, then
+    Hold's one operational and one advisory connection on the primary database.
+    The provisioned Cloud SQL instance is a ``db-f1-micro`` with a ~25
+    connection ceiling — so a
+    second instance exhausts it.
 
     The floor is the same argument read the other way: scaling to zero is safe
     only because custody is durable.  A cold start restores the pinned bundle
@@ -349,7 +394,13 @@ def test_prod_instance_cap_matches_provisioned_database(live_config):
     # Pin the per-instance connection cost the cap is derived from, so a change
     # to pool sizing surfaces here rather than as exhaustion in production.
     backend = PostgresBackend(dsn="postgresql://u:p@127.0.0.1:5432/db")
-    per_instance = backend._max_pool_size + backend._advisory_max_pool_size
+    hold_primary_pool_size = 1
+    per_instance = (
+        backend._max_pool_size
+        + backend._advisory_max_pool_size
+        + hold_primary_pool_size
+    )
+    assert per_instance <= 25
     assert per_instance * 2 > 25, (
         "two instances no longer exhaust a db-f1-micro; re-derive the cap "
         "instead of assuming this rationale still holds"

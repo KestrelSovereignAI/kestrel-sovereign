@@ -14,6 +14,7 @@ services:
       - KESTREL_ENV=test
       - IPFS_API_URL=${IPFS_API_URL:-http://ipfs:5001}
       - KESTREL_DB_PATH=/app/agent_data
+      - KESTREL_HOST_DB_PATH=/app/agent_data/host-data/host-features.db
       - KESTREL_IDENTITY_PATH=/usr/src/app/kestrel_did.json
     volumes:
       - ./agent_data:/app/agent_data

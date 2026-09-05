@@ -66,6 +66,7 @@ ENV PYTHONUNBUFFERED=1
 ENV KESTREL_ENV=production
 ENV KESTREL_MULTI_AGENT_CONFIG=/app/multi_agent.toml
 ENV KESTREL_HOST_AUTOSTART=true
+ENV KESTREL_HOST_DB_PATH=/app/agent_data/host-data/host-features.db
 ENV PORT=8080
 
 # Cloud Run / ACA injects PORT env var

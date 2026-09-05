@@ -11,6 +11,7 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
@@ -347,6 +348,28 @@ class MultiAgentConfig(BaseModel):
             MultiAgentConfig with auto-discovered agents
         """
         base_path = Path(base_dir)
+        resolved_base_path = base_path.resolve(strict=False)
+        host_db_path = os.environ.get("KESTREL_HOST_DB_PATH")
+        host_control_dir = (
+            Path(host_db_path).expanduser().resolve(strict=False).parent
+            if host_db_path
+            else None
+        )
+        host_control_root = None
+        if host_control_dir is not None:
+            try:
+                relative_control_dir = host_control_dir.relative_to(
+                    resolved_base_path
+                )
+            except ValueError:
+                # A host database outside agent_data cannot collide with a
+                # direct child discovered as an agent.
+                pass
+            else:
+                if relative_control_dir.parts:
+                    host_control_root = (
+                        resolved_base_path / relative_control_dir.parts[0]
+                    )
         agents: dict[str, LocalAgentConfig] = {}
         next_port = DEFAULT_AGENT_START_PORT
 
@@ -358,7 +381,15 @@ class MultiAgentConfig(BaseModel):
         for subdir in sorted(base_path.iterdir()):
             if not subdir.is_dir():
                 continue
-
+            # The supported multi-agent image keeps the host-owned Hold store
+            # below the persistent agent-data volume. That directory is host
+            # infrastructure, never an agent, even when include_empty=True is
+            # selecting freshly provisioned agent directories.
+            if (
+                host_control_root is not None
+                and subdir.resolve(strict=False) == host_control_root
+            ):
+                continue
             db_path = subdir / "kestrel_prime.db"
             if not db_path.exists() and not include_empty:
                 continue

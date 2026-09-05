@@ -5,6 +5,7 @@ FROM --platform=linux/${TARGETARCH} python:3.11-slim
 
 # Set environment variables for configuration
 ENV KESTREL_DB_PATH=/app/agent_data
+ENV KESTREL_HOST_DB_PATH=/app/agent_data/host-data/host-features.db
 ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
 ENV KESTREL_ENV=production
 ENV PYTHONUNBUFFERED=1

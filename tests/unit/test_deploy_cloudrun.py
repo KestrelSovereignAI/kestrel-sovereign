@@ -186,6 +186,7 @@ class TestCloudRunProviderDeploy:
             },
             secrets={
                 "KESTREL_DATABASE_URL": "database-url:4",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL": "hold-evidence-url:2",
                 "KESTREL_DATA_KEY": "data-key:7",
                 "KESTREL_IDENTITY_BUNDLE": "identity-bundle:9",
             },

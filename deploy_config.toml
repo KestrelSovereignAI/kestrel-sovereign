@@ -109,12 +109,16 @@ GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 # ``max_instances`` is capped at 1 to match the substrate that actually exists.
 # Durable custody *permits* horizontal scale — every instance restores the same
 # verified identity over the same transactional database — but permission is not
-# capacity. Each instance opens up to 10 pooled plus 4 advisory PostgreSQL
-# connections (storage/db/postgres.py), and the provisioned Cloud SQL instance is
-# a ``db-f1-micro`` whose connection ceiling is ~25: a second instance exhausts
-# it. The previous value of 100 declared headroom nothing had been provisioned to
-# serve, which is the same shape of defect as a durable record claiming an
-# unobserved event.
+# capacity. Each instance opens up to 10 pooled plus 4 advisory runtime
+# PostgreSQL connections plus Hold's one-connection operational pool and
+# separately bounded one-connection advisory pool on the primary database
+# (storage/db/postgres.py and host_features/context.py). The provisioned
+# Cloud SQL instance is a ``db-f1-micro`` whose connection ceiling is ~25, so a
+# second instance exhausts it. Hold's independent evidence database has the
+# same one-connection operational plus separately bounded one-connection
+# advisory pair; neither consumes this primary budget. The previous value of
+# 100 declared headroom nothing had been provisioned to serve, the same shape of
+# defect as a durable record claiming an unobserved event.
 #
 # Raising this is therefore a paired change: raise the Cloud SQL tier (or add a
 # connection pooler) in the same pass, or the cap is the only thing standing
@@ -147,6 +151,7 @@ KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 OPENAI_API_KEY = "kestrel-openai-key:latest"
 KESTREL_API_KEY = "kestrel-api-key:latest"
 KESTREL_DATABASE_URL = "kestrel-prod-database-url:1"
+KESTREL_HOLD_EVIDENCE_DATABASE_URL = "kestrel-prod-hold-evidence-database-url:1"
 KESTREL_DATA_KEY = "kestrel-data-key:1"
 KESTREL_IDENTITY_BUNDLE = "kestrel-prod-identity-bundle:1"
 GOOGLE_CLIENT_ID = "kestrel-google-client-id:latest"

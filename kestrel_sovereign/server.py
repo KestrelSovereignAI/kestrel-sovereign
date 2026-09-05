@@ -1678,9 +1678,9 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001 - preserve the existing best effort
         logger.warning("Host feature shutdown failed: %s", exc)
     finally:
-        # Router/UI state must not outlive a failed feature shutdown.  Each
+        # Router/UI state must not outlive a failed feature shutdown. Each
         # following cleanup is in a ``finally`` so one bad unmount cannot leave
-        # the host session factory or database live.
+        # the host context's independently-owned resources live.
         try:
             _hf.unmount_host_features(app)
         finally:
@@ -2272,6 +2272,23 @@ async def _lifespan_teardown_owner(app: FastAPI):
                 raise teardown_failure
 
 
+async def _build_host_control_context(app: FastAPI, host_config) -> object:
+    """Publish validated Hold state before any agent or scheduler can run."""
+
+    from kestrel_sovereign import host_features as _hf
+    from kestrel_sovereign.host_features.context import close_host_context_resources
+
+    ctx = await _hf.build_host_context(config=_host_config_mapping(host_config))
+    if getattr(ctx, "hold_store", None) is None:
+        reason = str(getattr(ctx, "backend_error", "") or "unknown backend failure")
+        await close_host_context_resources(ctx)
+        raise RuntimeError(
+            "Host Hold control state is unavailable before work admission: " + reason
+        )
+    app.state.host_context = ctx
+    return ctx
+
+
 @asynccontextmanager
 async def _lifespan_startup(app: FastAPI):
     """Initialize server resources; outer lifespan ownership handles teardown."""
@@ -2284,6 +2301,9 @@ async def _lifespan_startup(app: FastAPI):
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
+    app.state.host_features = []
+    app.state.host_context = None
+    app.state.host_ui_manifest = []
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -2411,6 +2431,7 @@ async def _lifespan_startup(app: FastAPI):
                 auto_discover_fallback=True,
             )
             _apply_platform_host_port(config, os.environ)
+            await _build_host_control_context(app, config)
             shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             manager = AgentManager(
                 base_data_dir=Path.cwd(),
@@ -2544,18 +2565,28 @@ async def _lifespan_startup(app: FastAPI):
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
+            storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+            db_path = os.path.join(storage_dir, "kestrel_prime.db")
 
             if db_backend.lower() == "postgres" and database_url:
                 logger.info("Using PostgreSQL backend for Kestrel")
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(
                     storage_dir,
                     db_backend="postgres",
                     database_url=database_url,
                 )
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
+            else:
+                agent_did = await get_agent_did_async(storage_dir)
+
+            # Identity/database verification must precede the first Hold schema
+            # or custody write. A misconfigured single-agent process must not
+            # bind another deployment's pre-Hold database to this host's
+            # evidence service before refusing the DID mismatch.
+            verify_identity_isolation(agent_did)
+            await _build_host_control_context(app, None)
+
+            llm_service = LLMService()
+            if db_backend.lower() == "postgres" and database_url:
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -2564,11 +2595,6 @@ async def _lifespan_startup(app: FastAPI):
                     db_backend="postgres",
                 )
             else:
-                storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
-                db_path = os.path.join(storage_dir, "kestrel_prime.db")
-                agent_did = await get_agent_did_async(storage_dir)
-                verify_identity_isolation(agent_did)
-                llm_service = LLMService()
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -2648,27 +2674,22 @@ async def _lifespan_startup(app: FastAPI):
     # --- Host-scoped features (issue #2293, consolidated onto server:app in
     # #2382) ---
     # Discover + mount host features at the host root (no agent prefix, no
-    # get_agent dependency), aggregate their host-scoped UI, build the fleet
-    # HostContext, and run their host lifecycle. Mounted UNCONDITIONALLY after
-    # agent setup — host features are host-scoped and independent of single- vs
-    # multi-agent mode. Reversible imperative failures remain isolated; an
+    # get_agent dependency), aggregate their host-scoped UI, and run their host
+    # lifecycle on the fleet HostContext already validated before agent work
+    # admission. Contributions mount after agent setup, but Hold custody does
+    # not wait for them. Reversible imperative failures remain isolated; an
     # invalid complete contribution set fails startup before mounted state is
     # changed.
-    from kestrel_sovereign import host_features as _hf
     from kestrel_sdk.features import ContributionContractError
+
+    from kestrel_sovereign import host_features as _hf
     from kestrel_sovereign.features.contribution_runtime import (
         FeatureContributionRuntimeError,
     )
     from kestrel_sovereign.paths import project_dir as _host_project_dir
 
-    if not hasattr(app.state, "host_features"):
-        app.state.host_features = []
-    if not hasattr(app.state, "host_context"):
-        app.state.host_context = None
-    if not hasattr(app.state, "host_ui_manifest"):
-        app.state.host_ui_manifest = []
     replacing_host_state = bool(app.state.host_features)
-    candidate_ctx = None
+    candidate_ctx = app.state.host_context
     candidate_started = []
     try:
         # Resolve the host manifest from the resolved PROJECT_DIR (KESTREL_HOME /
@@ -2679,12 +2700,12 @@ async def _lifespan_startup(app: FastAPI):
         features = _hf.instantiate_host_features(
             manifest_path=_host_project_dir() / _hf.HOST_MANIFEST_FILENAME,
         )
-        if features:
-            host_cfg = getattr(app.state, "multi_agent_config", None)
-            ctx = await _hf.build_host_context(
-                config=_host_config_mapping(host_cfg)
+        ctx = candidate_ctx
+        if ctx is None:
+            raise RuntimeError(
+                "Host features cannot start without validated Hold control state"
             )
-            candidate_ctx = ctx
+        if features:
             # Validate and activate the complete prospective contribution set
             # before changing any already-valid mounted host surface.
             started_features = await _hf.start_host_features(features, ctx)
@@ -2732,25 +2753,41 @@ async def _lifespan_startup(app: FastAPI):
                         host_context_registry
                     )
             logger.info("Host features initialized: %d", len(started_features))
-    except (ContributionContractError, FeatureContributionRuntimeError):
-        # Complete prospective-set rejection is a startup failure, not an
-        # optional-feature warning. No candidate was mounted and prior valid
-        # state remains visible.
-        if candidate_ctx is not None:
-            try:
-                if candidate_started:
-                    await _hf.stop_host_features(candidate_started, candidate_ctx)
-            finally:
-                await _hf.close_host_context(candidate_ctx)
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Host feature initialization failed: %s", exc)
-        if candidate_ctx is not None:
-            try:
-                if candidate_started:
-                    await _hf.stop_host_features(candidate_started, candidate_ctx)
-            finally:
-                await _hf.close_host_context(candidate_ctx)
+        else:
+            # The fleet control store is host infrastructure, not an optional
+            # feature side effect. Hold authority must therefore exist on the
+            # default zero-feature installation as well.
+            app.state.host_features = []
+            app.state.host_context = ctx
+            logger.info("Host features initialized: 0")
+    except BaseException as exc:  # noqa: BLE001 - close unpublished context
+        fatal = isinstance(
+            exc,
+            (ContributionContractError, FeatureContributionRuntimeError),
+        ) or not isinstance(exc, Exception)
+        if not fatal:
+            logger.warning("Host feature initialization failed: %s", exc)
+        try:
+            if candidate_ctx is not None and candidate_started:
+                await _hf.stop_host_features(candidate_started, candidate_ctx)
+        finally:
+            # A future replacement context might still fail before publication;
+            # close only that unpublished candidate. The boot Hold context is
+            # published before agents start and remains teardown-owned even when
+            # an optional contribution fails to mount.
+            if (
+                candidate_ctx is not None
+                and getattr(app.state, "host_context", None) is not candidate_ctx
+            ):
+                from kestrel_sovereign.host_features.context import (
+                    close_host_context_resources,
+                )
+
+                await close_host_context_resources(candidate_ctx)
+        if fatal:
+            # Complete prospective-set rejection is a startup failure, not an
+            # optional-feature warning. Prior valid state remains visible.
+            raise
 
     # No cognition turn may cross startup with the agent-only clause view.
     # This includes overdue standalone schedules armed from on_agent_ready and
