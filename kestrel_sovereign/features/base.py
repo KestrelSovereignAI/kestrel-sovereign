@@ -1515,11 +1515,17 @@ class Feature(_SdkFeature):
         )
         transition_reentry_token = current_bound_reentry_token()
         turn_session_binding = capture_turn_session_binding(self.agent)
+        from kestrel_sovereign.auth import capture_caller_context_binding
+
+        turn_caller_binding = capture_caller_context_binding()
 
         async def _exec(name: str, args: Dict[str, Any]):
+            from kestrel_sovereign.auth import caller_context_binding_scope
+
             with (
                 bind_transition_lock_reentry(transition_reentry_token),
                 bind_turn_session(turn_session_binding),
+                caller_context_binding_scope(turn_caller_binding),
             ):
                 return await self._execute_subagent_tool(
                     tool_name=name,

@@ -429,6 +429,145 @@ class TestScheduleList:
 
 class TestRetiredCronCleanup:
     @pytest.mark.asyncio
+    async def test_post_load_removes_persisted_authority_bound_schedules(self):
+        """Upgrade closes authority-bound rows accepted by older releases."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "request_restart",
+                    "id": "legacy-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "acknowledge_restart_escalation",
+                    "id": "legacy-ack-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "acknowledge_restart_escalation",
+                    "id": "legacy-ack-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "grant_restart_delegation",
+                    "id": "legacy-grant-live",
+                    "enabled": True,
+                },
+                {
+                    "task_name": "revoke_restart_delegation",
+                    "id": "legacy-revoke-paused",
+                    "enabled": False,
+                },
+                {
+                    "task_name": "backup_snapshot",
+                    "id": "keep-default",
+                    "enabled": True,
+                },
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.ok(confirmation="removed")
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        removed_ids = {call.args[0] for call in f.schedule_remove.await_args_list}
+        assert removed_ids == {
+            "legacy-live",
+            "legacy-paused",
+            "legacy-ack-live",
+            "legacy-ack-paused",
+            "legacy-grant-live",
+            "legacy-revoke-paused",
+        }
+        readded = {
+            call.kwargs.get("task_name")
+            for call in f._ensure_builtin_schedule.await_args_list
+        }
+        assert "request_restart" not in readded
+        assert "acknowledge_restart_escalation" not in readded
+        assert "grant_restart_delegation" not in readded
+        assert "revoke_restart_delegation" not in readded
+
+    @pytest.mark.asyncio
+    async def test_post_load_fails_closed_when_authority_schedule_removal_fails(self):
+        """An obsolete request_restart row must not survive a successful boot."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [{
+                "task_name": "request_restart",
+                "id": "legacy-still-durable",
+                "enabled": True,
+            }]},
+        ))
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(error="delete transaction failed")
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to remove authority-bound schedule.*delete transaction failed",
+        ):
+            await f.post_all_features_loaded(agent)
+
+    @pytest.mark.asyncio
+    async def test_post_load_accepts_concurrent_authority_schedule_removal(self):
+        """A peer replica deleting the same legacy row is successful cleanup."""
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        legacy = {
+            "task_name": "request_restart",
+            "id": "legacy-concurrent-removal",
+            "enabled": True,
+        }
+        f.schedule_list = AsyncMock(side_effect=[
+            ToolResult.ok(confirmation="listed", data={"tasks": [legacy]}),
+            ToolResult.ok(confirmation="listed", data={"tasks": []}),
+        ])
+        f.schedule_remove = AsyncMock(
+            return_value=ToolResult.failed(
+                error="Task legacy-concurrent-removal not found"
+            )
+        )
+        f._ensure_builtin_schedule = AsyncMock(
+            return_value=ToolResult.ok(
+                confirmation="added", data={"next_run_at": None}
+            )
+        )
+
+        await f.post_all_features_loaded(agent)
+
+        f.schedule_remove.assert_awaited_once_with("legacy-concurrent-removal")
+        assert f.schedule_list.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_post_load_removes_retired_builtin_schedules(self):
         """Persisted rows for removed core sources must be deleted on upgrade."""
         from kestrel_sdk.tools.result import ToolResult
@@ -1114,6 +1253,35 @@ class TestScheduleAdd:
             task_name="wellness_check",
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "request_restart",
+            "acknowledge_restart_escalation",
+            "grant_restart_delegation",
+            "revoke_restart_delegation",
+        ],
+    )
+    async def test_add_rejects_authority_bound_restart_tool(self, feature, tool_name):
+        """An unattended scheduler tick cannot supply sovereign authority."""
+
+        restart_tool = MagicMock()
+        restart_tool.name = tool_name
+        restart_feature = MagicMock()
+        restart_feature.get_tools = MagicMock(return_value=[restart_tool])
+        feature.agent.features = {"RestartCoordinatorFeature": restart_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name=tool_name,
+        )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert tool_name not in result.data["valid_task_names"]
+        feature._db.execute.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_rejects_disabled_feature_tool(self, feature):
