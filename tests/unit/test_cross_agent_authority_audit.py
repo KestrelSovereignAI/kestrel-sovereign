@@ -769,16 +769,28 @@ class _StaticBindingFlow:
             self.bindings,
         )
 
-    def resolve(self, value: ast.AST) -> _StaticBinding | None:
-        direct = self.direct_resolver(value)
+    def resolve(
+        self,
+        value: ast.AST,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ] | None = None,
+    ) -> _StaticBinding | None:
+        direct = (
+            supplemental_resolver(value)
+            if supplemental_resolver is not None
+            else None
+        )
+        if direct is None:
+            direct = self.direct_resolver(value)
         if direct is not None:
             return direct
         if isinstance(value, ast.Name):
             return self.bindings.get(value.id)
         if isinstance(value, ast.IfExp):
             return self._merge_values([
-                self.resolve(value.body),
-                self.resolve(value.orelse),
+                self.resolve(value.body, supplemental_resolver),
+                self.resolve(value.orelse, supplemental_resolver),
             ])
         return None
 
@@ -798,6 +810,9 @@ class _StaticBindingFlow:
         self,
         targets: list[ast.AST],
         value: ast.AST,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ] | None = None,
     ) -> dict[str, _StaticBinding]:
         pairs = [
             pair
@@ -808,13 +823,21 @@ class _StaticBindingFlow:
             return {
                 name: binding
                 for name, paired_value in pairs
-                if (binding := self.resolve(paired_value)) is not None
+                if (
+                    binding := self.resolve(
+                        paired_value,
+                        supplemental_resolver,
+                    )
+                )
+                is not None
             }
 
         nested = [
             binding
             for child in ast.walk(value)
-            if (binding := self.resolve(child)) is not None
+            if (
+                binding := self.resolve(child, supplemental_resolver)
+            ) is not None
         ]
         if not nested:
             return {}
@@ -825,7 +848,23 @@ class _StaticBindingFlow:
             for name in _assignment_target_names(target)
         }
 
-    def assign(self, targets: list[ast.AST], value: ast.AST | None) -> None:
+    def assign(
+        self,
+        targets: list[ast.AST],
+        value: ast.AST | None,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ] | None = None,
+    ) -> None:
+        assigned = (
+            self.assignment_bindings(
+                targets,
+                value,
+                supplemental_resolver,
+            )
+            if value is not None
+            else {}
+        )
         rebound = {
             name
             for target in targets
@@ -833,10 +872,15 @@ class _StaticBindingFlow:
         }
         for name in rebound:
             self.bindings.pop(name, None)
-        if value is not None:
-            self.bindings.update(self.assignment_bindings(targets, value))
+        self.bindings.update(assigned)
 
-    def replay_expression_bindings(self, expression: ast.AST) -> None:
+    def replay_expression_bindings(
+        self,
+        expression: ast.AST,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ] | None = None,
+    ) -> None:
         """Replay walrus bindings without descending into nested scopes."""
 
         flow = self
@@ -844,7 +888,11 @@ class _StaticBindingFlow:
         class NamedExpressionVisitor(ast.NodeVisitor):
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
                 self.visit(node.value)
-                flow.assign([node.target], node.value)
+                flow.assign(
+                    [node.target],
+                    node.value,
+                    supplemental_resolver,
+                )
 
             def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
                 return
@@ -884,31 +932,51 @@ class _StaticBindingFlow:
             is not None
         }
 
-    def replay(self, statements: list[ast.stmt]) -> None:
+    def replay(
+        self,
+        statements: list[ast.stmt],
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ] | None = None,
+    ) -> None:
         for statement in statements:
             if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
                 expressions, blocks = _compound_flow_parts(statement)
                 for expression in expressions:
-                    self.replay_expression_bindings(expression)
+                    self.replay_expression_bindings(
+                        expression,
+                        supplemental_resolver,
+                    )
                 branches = []
                 for block in blocks:
                     branch = self.fork()
-                    branch.replay(block)
+                    branch.replay(block, supplemental_resolver)
                     branches.append(branch)
                 branches.append(self.disturbed_fork(statement))
                 self.join(branches)
                 continue
             if isinstance(statement, ast.Assign):
-                self.assign(list(statement.targets), statement.value)
+                self.assign(
+                    list(statement.targets),
+                    statement.value,
+                    supplemental_resolver,
+                )
             elif isinstance(statement, ast.AnnAssign):
-                self.assign([statement.target], statement.value)
+                self.assign(
+                    [statement.target],
+                    statement.value,
+                    supplemental_resolver,
+                )
             elif isinstance(
                 statement,
                 (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
             ):
                 self.bindings.pop(statement.name, None)
             else:
-                self.replay_expression_bindings(statement)
+                self.replay_expression_bindings(
+                    statement,
+                    supplemental_resolver,
+                )
 
 
 @pytest.mark.parametrize(
@@ -935,6 +1003,10 @@ class _StaticBindingFlow:
             },
         ),
         (
+            "alias = root.publish\nalias = alias",
+            {"alias": ("root", "publish")},
+        ),
+        (
             'alias = getattr(root, "publish")',
             {"alias": ("root", "publish")},
         ),
@@ -957,6 +1029,7 @@ class _StaticBindingFlow:
         "chained",
         "destructured",
         "alias-chain",
+        "self-alias",
         "static-getattr",
         "named-expression",
         "branch-join",
@@ -1391,9 +1464,30 @@ def _cron_task_names(
         lambda _value: None,
         lambda bindings: bindings[0],
     )
+
+    def cron_method_binding(value: ast.AST) -> _StaticBinding | None:
+        member = _static_member_reference(value)
+        if member is None or alias_flow.resolve(member[0]) != cron_binding:
+            return None
+        return cron_binding[0], f"method:{member[1]}"
+
     for index, node in enumerate(tree.body):
         prefix = ast.Module(body=tree.body[:index], type_ignores=[])
         constants = _module_string_constants(prefix, source_path)
+
+        mutation_targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            mutation_targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            mutation_targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            mutation_targets = list(node.targets)
+        if any(
+            isinstance(target, ast.Subscript)
+            and alias_flow.resolve(target.value) == cron_binding
+            for target in mutation_targets
+        ):
+            raise AssertionError("Unsupported subscript CRON_TASKS mutation")
 
         assignment_target: ast.AST | None = None
         assignment_value: ast.AST | None = None
@@ -1472,6 +1566,18 @@ def _cron_task_names(
                 f"{ast.unparse(direct_call)}"
             )
 
+        if isinstance(direct_call, ast.Call):
+            bound_method = alias_flow.resolve(direct_call.func)
+            if (
+                bound_method is not None
+                and bound_method[0] == cron_binding[0]
+                and bound_method[1].startswith("method:")
+            ):
+                raise AssertionError(
+                    "Unsupported bound CRON_TASKS method mutation: "
+                    f"{ast.unparse(direct_call)}"
+                )
+
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         # Replay a compound block before inspecting its descendants.  The
@@ -1479,7 +1585,7 @@ def _cron_task_names(
         # so a later mutation in that same branch cannot disappear merely
         # because its receiver was not bound before the compound statement.
         if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
-            alias_flow.replay([node])
+            alias_flow.replay([node], cron_method_binding)
         if any(
             isinstance(child, ast.Name)
             and child.id == "CRON_TASKS"
@@ -1497,9 +1603,17 @@ def _cron_task_names(
             )
 
         if isinstance(node, ast.Assign):
-            alias_flow.assign(list(node.targets), node.value)
+            alias_flow.assign(
+                list(node.targets),
+                node.value,
+                cron_method_binding,
+            )
         elif isinstance(node, ast.AnnAssign):
-            alias_flow.assign([node.target], node.value)
+            alias_flow.assign(
+                [node.target],
+                node.value,
+                cron_method_binding,
+            )
 
     if task_names is None:
         raise AssertionError("Could not find the CRON_TASKS declaration")
@@ -1789,81 +1903,163 @@ def _runtime_signal_publication_surfaces(
     surfaces: set[str] = set()
 
     class RuntimeSignalPublisherVisitor(ast.NodeVisitor):
+        PUBLISH_METHODS = {"register", "register_batch", "register_with_policy"}
+        REGISTRY_BINDING = ("signal_registry", "mutable-registry")
+        PUBLISH_BINDINGS = {
+            method: ("signal_registry", f"publish:{method}")
+            for method in PUBLISH_METHODS
+        }
+
         def __init__(self) -> None:
             self.scope: list[str] = []
+            self.flows: list[_StaticBindingFlow] = []
 
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
-            self.scope.append(node.name)
-            self.generic_visit(node)
-            self.scope.pop()
+        def _ambiguous(
+            self, bindings: list[_StaticBinding]
+        ) -> _StaticBinding:
+            for binding in bindings:
+                if binding in self.PUBLISH_BINDINGS.values():
+                    return binding
+            if self.REGISTRY_BINDING in bindings:
+                return self.REGISTRY_BINDING
+            return bindings[0]
 
-        def _visit_function(
-            self, node: ast.FunctionDef | ast.AsyncFunctionDef
-        ) -> None:
-            self.scope.append(node.name)
-            scope_nodes = _walk_lexical_scope(node)
-            registry_aliases = {"signal_registry", "source_registry"}
-            alias_assignments: list[tuple[set[str], set[str]]] = []
-            for child in scope_nodes:
-                targets: list[ast.AST] = []
-                value: ast.AST | None = None
-                if isinstance(child, ast.Assign):
-                    targets = list(child.targets)
-                    value = child.value
-                elif isinstance(child, ast.AnnAssign):
-                    targets = [child.target]
-                    value = child.value
-                elif isinstance(child, ast.NamedExpr):
-                    targets = [child.target]
-                    value = child.value
-                if value is None:
-                    continue
-                alias_assignments.append(
-                    (
-                        {
-                            name
-                            for target in targets
-                            for name in _reference_binding_names(target)
-                        },
-                        set(_identifier_tokens(value)),
-                    )
-                )
-            changed = True
-            while changed:
-                changed = False
-                for targets, sources in alias_assignments:
-                    if sources.intersection(registry_aliases):
-                        new_aliases = targets - registry_aliases
-                        if new_aliases:
-                            registry_aliases.update(new_aliases)
-                            changed = True
-            direct_registry_publish = any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr
-                in {"register", "register_batch", "register_with_policy"}
-                and bool(
-                    _identifier_tokens(child.func.value).intersection(
-                        registry_aliases
-                    )
-                )
-                for child in scope_nodes
+        @staticmethod
+        def _direct_binding(node: ast.AST) -> _StaticBinding | None:
+            if isinstance(node, ast.Name) and node.id in {
+                "signal_registry",
+                "source_registry",
+            }:
+                return RuntimeSignalPublisherVisitor.REGISTRY_BINDING
+            member = _static_member_reference(node)
+            if member is not None and member[1] in {
+                "signal_registry",
+                "source_registry",
+            }:
+                return RuntimeSignalPublisherVisitor.REGISTRY_BINDING
+            return None
+
+        def _new_flow(
+            self, bindings: dict[str, _StaticBinding] | None = None
+        ) -> _StaticBindingFlow:
+            return _StaticBindingFlow(
+                self._direct_binding,
+                self._ambiguous,
+                bindings,
             )
-            imperative_publish = (
+
+        def _is_registry(self, node: ast.AST) -> bool:
+            return bool(self.flows) and (
+                self.flows[-1].resolve(node) == self.REGISTRY_BINDING
+            )
+
+        def _bound_publish_method(
+            self, node: ast.AST
+        ) -> _StaticBinding | None:
+            member = _static_member_reference(node)
+            if (
+                member is not None
+                and member[1] in self.PUBLISH_METHODS
+                and self._is_registry(member[0])
+            ):
+                return self.PUBLISH_BINDINGS[member[1]]
+            return None
+
+        def _assign(
+            self,
+            targets: list[ast.AST],
+            value: ast.AST | None,
+        ) -> None:
+            self.flows[-1].assign(
+                targets,
+                value,
+                self._bound_publish_method,
+            )
+
+        def _record(self) -> None:
+            if self.scope:
+                surfaces.add(f"{relative}::{'.'.join(self.scope)}")
+
+        def _visit_block(self, statements: list[ast.stmt]) -> None:
+            for statement in statements:
+                if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+                    expressions, blocks = _compound_flow_parts(statement)
+                    for expression in expressions:
+                        self.visit(expression)
+                    inherited = self.flows[-1]
+                    for expression in expressions:
+                        inherited.replay_expression_bindings(
+                            expression,
+                            self._bound_publish_method,
+                        )
+                    branches: list[_StaticBindingFlow] = []
+                    for block in blocks:
+                        branch = inherited.fork()
+                        self.flows[-1] = branch
+                        self._visit_block(block)
+                        branches.append(branch)
+                    branches.append(inherited.disturbed_fork(statement))
+                    self.flows[-1] = inherited
+                    inherited.join(branches)
+                    continue
+                self.visit(statement)
+                if isinstance(statement, ast.Assign):
+                    self._assign(list(statement.targets), statement.value)
+                elif isinstance(statement, ast.AnnAssign):
+                    self._assign([statement.target], statement.value)
+                else:
+                    self.flows[-1].replay_expression_bindings(
+                        statement,
+                        self._bound_publish_method,
+                    )
+
+        def _visit_definition(
+            self,
+            node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> None:
+            inherited_bindings = (
+                dict(self.flows[-1].bindings)
+                if self.flows
+                and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else {}
+            )
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                parameters = [
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                ]
+                for parameter in parameters:
+                    inherited_bindings.pop(parameter.arg, None)
+                if node.args.vararg is not None:
+                    inherited_bindings.pop(node.args.vararg.arg, None)
+                if node.args.kwarg is not None:
+                    inherited_bindings.pop(node.args.kwarg.arg, None)
+            self.scope.append(node.name)
+            self.flows.append(self._new_flow(inherited_bindings))
+            self._visit_block(node.body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
                 node.name == "_register_signal_sources"
                 and {"register_batch", "register_with_policy"}.issubset(
                     {
                         child.value
-                        for child in scope_nodes
+                        for child in _walk_lexical_scope(node)
                         if isinstance(child, ast.Constant)
                         and isinstance(child.value, str)
                     }
                 )
-            )
-            if direct_registry_publish or imperative_publish:
-                surfaces.add(f"{relative}::{'.'.join(self.scope)}")
-            self.generic_visit(node)
+            ):
+                self._record()
+            self.flows.pop()
             self.scope.pop()
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self._visit_definition(node)
+
+        def _visit_function(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_definition(node)
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
             self._visit_function(node)
@@ -1873,7 +2069,20 @@ def _runtime_signal_publication_surfaces(
         ) -> None:
             self._visit_function(node)
 
-    RuntimeSignalPublisherVisitor().visit(tree)
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            direct_member = _static_member_reference(node.func)
+            bound_method = self.flows[-1].resolve(node.func)
+            if bool(
+                direct_member is not None
+                and direct_member[1] in self.PUBLISH_METHODS
+                and self._is_registry(direct_member[0])
+            ) or bound_method in self.PUBLISH_BINDINGS.values():
+                self._record()
+            self.generic_visit(node)
+
+    visitor = RuntimeSignalPublisherVisitor()
+    visitor.flows.append(visitor._new_flow())
+    visitor._visit_block(tree.body)
     return surfaces
 
 
@@ -1985,13 +2194,23 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
     class DirectToolWriterVisitor(ast.NodeVisitor):
         PUBLISH_METHODS = {"__setitem__", "setdefault", "update"}
         REGISTRY_BINDING = ("_direct_tools", "mutable-registry")
+        PUBLISH_BINDINGS = {
+            method: ("_direct_tools", f"publish:{method}")
+            for method in PUBLISH_METHODS
+        }
 
         def __init__(self) -> None:
             self.scope: list[str] = []
             self.flows: list[_StaticBindingFlow] = []
 
-        @staticmethod
-        def _ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+        def _ambiguous(
+            self, bindings: list[_StaticBinding]
+        ) -> _StaticBinding:
+            for binding in bindings:
+                if binding in self.PUBLISH_BINDINGS.values():
+                    return binding
+            if self.REGISTRY_BINDING in bindings:
+                return self.REGISTRY_BINDING
             return bindings[0]
 
         def _direct_binding(self, node: ast.AST) -> _StaticBinding | None:
@@ -2045,6 +2264,29 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                 self.flows[-1].resolve(node) == self.REGISTRY_BINDING
             )
 
+        def _bound_publish_method(
+            self, node: ast.AST
+        ) -> _StaticBinding | None:
+            member = _static_member_reference(node)
+            if (
+                member is not None
+                and member[1] in self.PUBLISH_METHODS
+                and self._is_registry(member[0])
+            ):
+                return self.PUBLISH_BINDINGS[member[1]]
+            return None
+
+        def _assign(
+            self,
+            targets: list[ast.AST],
+            value: ast.AST | None,
+        ) -> None:
+            self.flows[-1].assign(
+                targets,
+                value,
+                self._bound_publish_method,
+            )
+
         def _visit_block(self, statements: list[ast.stmt]) -> None:
             for statement in statements:
                 if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
@@ -2053,7 +2295,10 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                         self.visit(expression)
                     inherited = self.flows[-1]
                     for expression in expressions:
-                        inherited.replay_expression_bindings(expression)
+                        inherited.replay_expression_bindings(
+                            expression,
+                            self._bound_publish_method,
+                        )
                     branches: list[_StaticBindingFlow] = []
                     for block in blocks:
                         branch = inherited.fork()
@@ -2066,13 +2311,14 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                     continue
                 self.visit(statement)
                 if isinstance(statement, ast.Assign):
-                    self.flows[-1].assign(
-                        list(statement.targets), statement.value
-                    )
+                    self._assign(list(statement.targets), statement.value)
                 elif isinstance(statement, ast.AnnAssign):
-                    self.flows[-1].assign([statement.target], statement.value)
+                    self._assign([statement.target], statement.value)
                 else:
-                    self.flows[-1].replay_expression_bindings(statement)
+                    self.flows[-1].replay_expression_bindings(
+                        statement,
+                        self._bound_publish_method,
+                    )
 
         def _record(self) -> None:
             if not self.scope:
@@ -2135,11 +2381,13 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in self.PUBLISH_METHODS
-                and self._is_registry(node.func.value)
-            ):
+            direct_member = _static_member_reference(node.func)
+            bound_method = self.flows[-1].resolve(node.func)
+            if bool(
+                direct_member is not None
+                and direct_member[1] in self.PUBLISH_METHODS
+                and self._is_registry(direct_member[0])
+            ) or bound_method in self.PUBLISH_BINDINGS.values():
                 self._record()
             self.generic_visit(node)
 
@@ -3667,6 +3915,16 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
         "    def union(self, tools):\n"
         "        registry = self._direct_tools\n"
         "        registry |= tools\n\n"
+        "    def bound(self, tools):\n"
+        "        publish = self._direct_tools.update\n"
+        "        publish(tools)\n\n"
+        "    def conditional(self, tools, disabled):\n"
+        "        publish = consume if disabled else self._direct_tools.update\n"
+        "        publish(tools)\n\n"
+        "    def rebound(self, tools):\n"
+        "        publish = self._direct_tools.update\n"
+        "        publish = consume\n"
+        "        publish(tools)\n\n"
         "    def replace(self, tools):\n"
         "        self._direct_tools = tools\n\n"
         "    def initialize(self):\n"
@@ -3677,6 +3935,8 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
 
     assert _direct_tool_writer_surfaces(tree, "example.py") == {
         "example.py::Publisher.alias",
+        "example.py::Publisher.bound",
+        "example.py::Publisher.conditional",
         "example.py::Publisher.default",
         "example.py::Publisher.direct",
         "example.py::Publisher.replace",
@@ -3765,10 +4025,24 @@ def test_runtime_signal_publication_resolves_registry_spellings_and_aliases() ->
         "        self.signal_registry.register(source)\n\n"
         "    def local_alias(self, sources):\n"
         "        registry = self.source_registry\n"
-        "        registry.register_batch(sources)\n"
+        "        registry.register_batch(sources)\n\n"
+        "    def bound_method(self, source):\n"
+        "        publish = self.source_registry.register_with_policy\n"
+        "        publish(source)\n\n"
+        "    def conditional_method(self, source, disabled):\n"
+        "        publish = (\n"
+        "            consume if disabled else self.source_registry.register\n"
+        "        )\n"
+        "        publish(source)\n\n"
+        "    def rebound_method(self, source):\n"
+        "        publish = self.source_registry.register\n"
+        "        publish = consume\n"
+        "        publish(source)\n"
     )
 
     assert _runtime_signal_publication_surfaces(tree, "example.py") == {
+        "example.py::Publisher.bound_method",
+        "example.py::Publisher.conditional_method",
         "example.py::Publisher.local_alias",
         "example.py::Publisher.signal_registry",
     }
@@ -3888,6 +4162,54 @@ def test_scheduler_inventory_rejects_compound_alias_mutations() -> None:
     with pytest.raises(
         AssertionError,
         match="Conditional or indirect CRON_TASKS mutation",
+    ):
+        _cron_task_names(tree)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "CRON_TASKS[:] = [('late', mode, resources)]",
+        "tasks = CRON_TASKS\ntasks[0] = ('late', mode, resources)",
+        "del CRON_TASKS[0]",
+    ],
+    ids=["slice", "alias-item", "delete-item"],
+)
+def test_scheduler_inventory_rejects_subscript_mutations(
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "CRON_TASKS = [('base', mode, resources)]\n" + mutation + "\n"
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Unsupported subscript CRON_TASKS mutation",
+    ):
+        _cron_task_names(tree)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "mutate = CRON_TASKS.append",
+        'mutate = getattr(CRON_TASKS, "append")',
+        "if enabled:\n    mutate = CRON_TASKS.append",
+    ],
+    ids=["attribute", "static-getattr", "conditional"],
+)
+def test_scheduler_inventory_rejects_bound_method_mutations(
+    binding: str,
+) -> None:
+    tree = ast.parse(
+        "CRON_TASKS = [('base', mode, resources)]\n"
+        + binding
+        + "\nmutate(('late', mode, resources))\n"
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Unsupported bound CRON_TASKS method mutation",
     ):
         _cron_task_names(tree)
 
@@ -5439,6 +5761,132 @@ def _binding_target_names(target: ast.AST) -> set[str]:
     return set()
 
 
+def _match_pattern_provenance_marker(pattern: ast.pattern) -> ast.AST | None:
+    """Return one static provenance marker named by a match pattern."""
+
+    if isinstance(pattern, ast.MatchValue):
+        return pattern.value if _has_provenance_token(pattern.value) else None
+    if isinstance(pattern, ast.MatchMapping):
+        for key in pattern.keys:
+            if _has_provenance_token(key):
+                return key
+        children = pattern.patterns
+    elif isinstance(pattern, ast.MatchClass):
+        if _has_provenance_token(pattern.cls):
+            return pattern.cls
+        for attribute in pattern.kwd_attrs:
+            marker = ast.Constant(value=attribute)
+            if _has_provenance_token(marker):
+                return marker
+        children = [*pattern.patterns, *pattern.kwd_patterns]
+    elif isinstance(pattern, ast.MatchAs):
+        children = [pattern.pattern] if pattern.pattern is not None else []
+    elif isinstance(pattern, (ast.MatchOr, ast.MatchSequence)):
+        children = pattern.patterns
+    else:
+        children = []
+    return next(
+        (
+            marker
+            for child in children
+            if (marker := _match_pattern_provenance_marker(child)) is not None
+        ),
+        None,
+    )
+
+
+def _match_pattern_provenance_assignments(
+    pattern: ast.pattern,
+    subject_source: ast.AST | None,
+) -> list[tuple[set[str], ast.AST]]:
+    """Model names bound from provenance-bearing match components."""
+
+    assignments: list[tuple[set[str], ast.AST]] = []
+    if isinstance(pattern, ast.MatchAs):
+        binding_source = (
+            _match_pattern_provenance_marker(pattern.pattern)
+            if pattern.pattern is not None
+            else None
+        )
+        if binding_source is None:
+            binding_source = subject_source
+        if pattern.name is not None and binding_source is not None:
+            assignments.append(({pattern.name.casefold()}, binding_source))
+        if pattern.pattern is not None:
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    pattern.pattern,
+                    subject_source,
+                )
+            )
+        return assignments
+    if isinstance(pattern, ast.MatchStar):
+        if pattern.name is not None and subject_source is not None:
+            assignments.append(({pattern.name.casefold()}, subject_source))
+        return assignments
+    if isinstance(pattern, ast.MatchMapping):
+        for key, child_pattern in zip(pattern.keys, pattern.patterns):
+            child_source = (
+                key if _has_provenance_token(key) else subject_source
+            )
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    child_pattern,
+                    child_source,
+                )
+            )
+        if pattern.rest is not None and subject_source is not None:
+            assignments.append(({pattern.rest.casefold()}, subject_source))
+        return assignments
+    if isinstance(pattern, ast.MatchClass):
+        class_source = (
+            pattern.cls
+            if _has_provenance_token(pattern.cls)
+            else subject_source
+        )
+        for child_pattern in pattern.patterns:
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    child_pattern,
+                    class_source,
+                )
+            )
+        for attribute, child_pattern in zip(
+            pattern.kwd_attrs,
+            pattern.kwd_patterns,
+        ):
+            child_source = (
+                ast.Constant(value=attribute)
+                if _has_provenance_token(ast.Constant(value=attribute))
+                else class_source
+            )
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    child_pattern,
+                    child_source,
+                )
+            )
+        return assignments
+    if isinstance(pattern, ast.MatchSequence):
+        for child_pattern in pattern.patterns:
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    child_pattern,
+                    subject_source,
+                )
+            )
+        return assignments
+    if isinstance(pattern, ast.MatchOr):
+        for child_pattern in pattern.patterns:
+            assignments.extend(
+                _match_pattern_provenance_assignments(
+                    child_pattern,
+                    subject_source,
+                )
+            )
+    return assignments
+
+
 _CROSS_AGENT_STATE_COLLECTIONS = {
     "_agents",
     "agents",
@@ -6827,6 +7275,22 @@ def _provenance_aliases(
         )
         if names:
             assignments.append((names, value, statement_owners.get(node, node)))
+
+    for node in scope_nodes:
+        if not isinstance(node, ast.Match):
+            continue
+        for case in node.cases:
+            assignments.extend(
+                (
+                    names,
+                    source,
+                    node,
+                )
+                for names, source in _match_pattern_provenance_assignments(
+                    case.pattern,
+                    node.subject,
+                )
+            )
 
     # An arbitrary helper may compute an authority decision without advertising
     # that fact in its name. Mark assignment targets that later guard a control,
@@ -9200,11 +9664,15 @@ def _authority_provenance_lines(
                     lines.add(node.lineno)
                 continue
             if isinstance(node, ast.Match):
-                if _has_provenance_value(
+                subject_or_pattern_has_provenance = _has_provenance_value(
                     node.subject,
                     provenance_aliases,
                     decision_provenance_helpers,
-                ) and (
+                ) or any(
+                    _match_pattern_provenance_marker(case.pattern) is not None
+                    for case in node.cases
+                )
+                if subject_or_pattern_has_provenance and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
                         [statement for case in node.cases for statement in case.body],
@@ -9753,6 +10221,28 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(match_guards) == {3, 9}
     assert _authority_provenance_lines(branch_assigned_decision) == {5}
     assert _authority_provenance_lines(transformed_accessor) == {2, 3}
+
+
+def test_provenance_scanner_taints_match_pattern_bindings() -> None:
+    tree = ast.parse(
+        "def mapping(request, target):\n"
+        "    match request:\n"
+        "        case {'causation_chain': chain}:\n"
+        "            if chain:\n"
+        "                terminate_child(target)\n\n"
+        "def class_pattern(frame, target):\n"
+        "    match frame:\n"
+        "        case CausationFrame(parent=parent):\n"
+        "            if parent:\n"
+        "                terminate_child(target)\n\n"
+        "def mapping_as(request, target):\n"
+        "    match request:\n"
+        "        case {'causation_chain': chain} as payload:\n"
+        "            if payload:\n"
+        "                terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 4, 8, 10, 14, 16}
 
 
 def test_provenance_scanner_inspects_authorization_decorators() -> None:
