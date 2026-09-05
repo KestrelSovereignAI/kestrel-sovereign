@@ -413,6 +413,42 @@ def test_linux_registry_transport_accounts_for_environment_entry_overhead(
     registry_path.unlink()
 
 
+def test_supported_hybrid_fleet_fits_file_backed_registry_cap(
+    tmp_path,
+    monkeypatch,
+):
+    """The default 64-agent fleet must fit with normal hybrid DID documents."""
+    from kestrel_sovereign.a2a import did_registry
+
+    monkeypatch.setattr(
+        did_registry,
+        "_platform_requires_process_registry_file",
+        lambda _encoded: True,
+    )
+    documents = [
+        {
+            "id": f"did:web:example.test:peer-{index}",
+            "verificationMethod": [
+                {
+                    "id": f"did:web:example.test:peer-{index}#key-1",
+                    "controller": f"did:web:example.test:peer-{index}",
+                    "publicKeyMultibase": "z" + ("K" * 3_200),
+                }
+            ],
+        }
+        for index in range(64)
+    ]
+
+    environment, registry_path = stage_process_a2a_did_registry(
+        documents,
+        launch_root=tmp_path,
+    )
+
+    assert A2A_PEER_IDENTITY_DOCUMENTS_FILE_ENV in environment
+    assert registry_path is not None
+    registry_path.unlink()
+
+
 def test_process_registry_file_handoff_keeps_feature_initialize_idempotent(
     tmp_path,
     monkeypatch,

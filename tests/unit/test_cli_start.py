@@ -77,30 +77,26 @@ def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):
     assert "--steps" not in output
 
 
-def test_oauth_only_host_start_does_not_require_api_key(tmp_path, capsys):
+def test_oauth_only_host_start_still_requires_sovereign_api_key(tmp_path, capsys):
     config = _quickstart_config(tmp_path)
     process_manager = MagicMock(spec=ProcessManager)
     process_manager.read_pid_record.return_value = PidRecord(
         PidStatus.ABSENT, None, None, None, "no PID file"
     )
-    process_manager.is_port_in_use.return_value = False
     process_manager._load_env.return_value = {
         "KESTREL_REQUIRE_OAUTH": "true",
         "GOOGLE_CLIENT_ID": "operator-client-id",
         "GOOGLE_CLIENT_SECRET": "operator-client-secret",
+        "KESTREL_ALLOWED_EMAILS": "operator@example.com",
     }
-    process_manager.wait_for_health.return_value = True
 
     result = _start_inprocess_mode(tmp_path, config, process_manager)
 
-    assert result == 0
-    process_manager._spawn_detached.assert_called_once()
-    spawned_env = process_manager._spawn_detached.call_args.args[1]
-    assert spawned_env["KESTREL_REQUIRE_OAUTH"] == "true"
-    assert "KESTREL_API_KEY" not in spawned_env
+    assert result == 1
+    process_manager._spawn_detached.assert_not_called()
     output = capsys.readouterr().out
-    assert f"http://localhost:{DEFAULT_HOST_PORT}/" in output
-    assert "#key=" not in output
+    assert "stable KESTREL_API_KEY" in output
+    assert "kestrel setup keys" in output
 
 
 def test_oauth_flag_without_credentials_does_not_start_keyless_host(
@@ -118,7 +114,7 @@ def test_oauth_flag_without_credentials_does_not_start_keyless_host(
     assert result == 1
     process_manager._spawn_detached.assert_not_called()
     output = capsys.readouterr().out
-    assert "Google OAuth credentials" in output
+    assert "stable KESTREL_API_KEY" in output
 
 
 def test_already_running_host_ignores_credentials_for_a_future_launch(

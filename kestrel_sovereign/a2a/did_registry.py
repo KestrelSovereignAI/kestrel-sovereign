@@ -35,7 +35,10 @@ A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV = (
     "KESTREL_A2A_PEER_IDENTITY_DOCUMENTS_SHA256"
 )
 A2A_PEER_STABLE_AGENT_ID_FIELD = "kestrelAgentId"
-_MAX_PROCESS_REGISTRY_BYTES = 128 * 1024
+# The default fleet limit is 64 agents. A normal Ed25519 + ML-DSA-65 public
+# verification document is roughly 3.2 KiB, so retain a bounded 256-KiB file
+# lane that can represent every peer in one supported default fleet.
+_MAX_PROCESS_REGISTRY_BYTES = 256 * 1024
 _MAX_WINDOWS_ENV_VALUE_CHARS = 32_766
 _MAX_LINUX_ENV_ENTRY_BYTES = 128 * 1024
 _PROCESS_REGISTRY_DIRECTORY = ".kestrel-launch"

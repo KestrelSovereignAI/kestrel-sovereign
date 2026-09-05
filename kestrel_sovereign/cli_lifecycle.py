@@ -318,36 +318,19 @@ def _start_inprocess_mode(
     if existing.needs_cleanup:
         pm.clear_pid(host_pid_file)
 
-    # An API-key fleet cannot mint a sovereign credential at runtime: every
-    # managed child can reach the same loopback bootstrap route as a browser.
-    # Setup normally provisions this value in the project .env. OAuth-required
-    # fleets already have a complete operator-authentication lane and do not
-    # need a parallel API key.
+    # A fleet cannot mint a sovereign credential at runtime: every managed
+    # child can reach the same loopback bootstrap route as a browser. OAuth can
+    # authenticate an operator but deliberately does not confer sovereign
+    # authority, so setup must provision the mandate-holder key in project .env.
     env = pm._load_env()
-    from kestrel_sovereign.auth import (
-        normalize_api_key,
-        required_oauth_is_configured,
-    )
+    from kestrel_sovereign.auth import normalize_api_key
 
     host_api_key = normalize_api_key(env.get("KESTREL_API_KEY")) or ""
-    oauth_required = env.get("KESTREL_REQUIRE_OAUTH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    keyless_oauth_configured = required_oauth_is_configured(env)
-    if not host_api_key.strip() and not keyless_oauth_configured:
-        if oauth_required:
-            print(
-                "❌ Keyless multi-agent OAuth requires configured Google OAuth "
-                "credentials (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET). "
-                "Otherwise run `kestrel setup keys` and retry."
-            )
-            return 1
+    if not host_api_key.strip():
         print(
             "❌ Multi-agent host requires a stable KESTREL_API_KEY in the "
-            "project .env. Run `kestrel setup keys` and retry."
+            "project .env for sovereign authority. Run `kestrel setup keys` "
+            "and retry."
         )
         return 1
     browser_url = f"http://localhost:{multi_agent.host.port}/"

@@ -208,17 +208,34 @@ def test_multi_agent_server_rejects_missing_out_of_band_host_key(monkeypatch):
         server._require_multi_agent_host_api_key(os.environ)
 
 
-def test_oauth_only_multi_agent_server_does_not_require_api_key(monkeypatch):
-    """Required OAuth is a complete sovereign host-authentication lane."""
+def test_oauth_only_multi_agent_server_still_requires_sovereign_key(monkeypatch):
+    """Allowlisted OAuth authenticates users but does not mint mandate authority."""
     from kestrel_sovereign import server
 
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "operator-client-id")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "operator-client-secret")
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "operator@example.com")
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
 
-    assert server._require_multi_agent_host_api_key(os.environ) == ""
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
+
+
+def test_multi_agent_server_rejects_keyless_oauth_with_empty_allowlist(monkeypatch):
+    """OAuth credentials alone cannot leave a fleet with no admitted operator."""
+    from kestrel_sovereign import server
+
+    monkeypatch.setenv("KESTREL_MULTI_AGENT", "true")
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "true")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "operator-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "operator-client-secret")
+    monkeypatch.delenv("KESTREL_ALLOWED_EMAILS", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
+        server._require_multi_agent_host_api_key(os.environ)
 
 
 def test_multi_agent_server_rejects_keyless_unconfigured_oauth(monkeypatch):
@@ -231,7 +248,7 @@ def test_multi_agent_server_rejects_keyless_unconfigured_oauth(monkeypatch):
     monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("KESTREL_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="Google OAuth credentials"):
+    with pytest.raises(RuntimeError, match="stable KESTREL_API_KEY"):
         server._require_multi_agent_host_api_key(os.environ)
 
 
