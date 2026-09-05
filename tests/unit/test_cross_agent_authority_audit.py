@@ -581,11 +581,11 @@ def _imported_module_attribute_name(
 
 
 def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
-    """Resolve direct import aliases for the SDK's ``tool`` decorator."""
+    """Resolve import and lexical-scope aliases for the ``tool`` decorator."""
 
     aliases = {"tool"}
     assignments: list[tuple[str, str]] = []
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for imported in node.names:
                 if imported.name == "tool":
@@ -1138,15 +1138,30 @@ def _resolved_source_factory_call_names(
 
 
 def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
-    """Resolve import and assignment aliases for source constructors."""
+    """Resolve base, subclass, import, and assignment constructor aliases."""
 
     aliases = {"SourceRegistration"}
     assignments: list[tuple[str, str]] = []
-    for node in tree.body:
+    class_bases: list[tuple[str, set[str]]] = []
+    for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for imported in node.names:
-                if imported.name == "SourceRegistration":
+                if "SourceRegistration" in imported.name:
                     aliases.add(imported.asname or imported.name)
+        elif isinstance(node, ast.ClassDef):
+            class_bases.append(
+                (
+                    node.name,
+                    {
+                        base.id
+                        if isinstance(base, ast.Name)
+                        else base.attr
+                        if isinstance(base, ast.Attribute)
+                        else ""
+                        for base in node.bases
+                    },
+                )
+            )
         elif (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
@@ -1166,6 +1181,10 @@ def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
             if source in aliases and target not in aliases:
                 aliases.add(target)
                 changed = True
+        for class_name, bases in class_bases:
+            if bases.intersection(aliases) and class_name not in aliases:
+                aliases.add(class_name)
+                changed = True
     return aliases
 
 
@@ -1178,7 +1197,7 @@ def _source_registration_constructors(tree: ast.Module) -> list[ast.Call]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and (
-            _call_name(node).endswith("SourceRegistration")
+            "SourceRegistration" in _call_name(node)
             or _call_name(node) in aliases
         )
     ]
@@ -1587,16 +1606,11 @@ def _discovered_core_cli_surfaces() -> frozenset[str]:
     })
 
 
-@lru_cache(maxsize=None)
-def _discovered_dynamic_router_surfaces() -> frozenset[str]:
-    """Return every function-scoped ``include_router`` extension boundary.
-
-    Decorators in out-of-tree agent and host features are unavailable to a
-    checkout-only scanner.  Their core publication calls are available, so an
-    exact inventory of those runtime calls is the fail-closed boundary.  Calls
-    at module scope mount checked-in routers whose decorators are already
-    enumerated by the HTTP inventory and are intentionally excluded here.
-    """
+def _dynamic_router_publication_surfaces(
+    tree: ast.Module,
+    relative: str,
+) -> set[str]:
+    """Return function-scoped router publications from one parsed module."""
 
     surfaces: set[str] = set()
 
@@ -1605,14 +1619,50 @@ def _discovered_dynamic_router_surfaces() -> frozenset[str]:
             self.relative = relative
             self.scope: list[str] = []
             self.scope_counts: list[int] = []
+            self.aliases: list[dict[str, tuple[str, str]]] = [{}]
+
+        def _visit_block(self, statements: list[ast.stmt]) -> None:
+            for statement in statements:
+                self.visit(statement)
+                targets: list[ast.AST] = []
+                value: ast.AST | None = None
+                if isinstance(statement, ast.Assign):
+                    targets = list(statement.targets)
+                    value = statement.value
+                elif isinstance(statement, ast.AnnAssign):
+                    targets = [statement.target]
+                    value = statement.value
+                target_names = {
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                }
+                for target_name in target_names:
+                    self.aliases[-1].pop(target_name, None)
+                if value is None:
+                    continue
+                binding: tuple[str, str] | None = None
+                if isinstance(value, ast.Attribute):
+                    if value.attr.casefold() == "include_router":
+                        binding = (ast.unparse(value.value), "include_router")
+                elif isinstance(value, ast.Name):
+                    binding = self.aliases[-1].get(value.id)
+                if binding is not None:
+                    self.aliases[-1].update(
+                        {target_name: binding for target_name in target_names}
+                    )
+
+        def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
+            self._visit_block(node.body)
 
         def _visit_scope(
             self, node: ast.FunctionDef | ast.AsyncFunctionDef
         ) -> None:
             self.scope.append(node.name)
             self.scope_counts.append(0)
-            for statement in node.body:
-                self.visit(statement)
+            self.aliases.append(dict(self.aliases[-1]))
+            self._visit_block(node.body)
+            self.aliases.pop()
             self.scope_counts.pop()
             self.scope.pop()
 
@@ -1626,12 +1676,16 @@ def _discovered_dynamic_router_surfaces() -> frozenset[str]:
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
             self.scope.append(node.name)
-            for statement in node.body:
-                self.visit(statement)
+            self.aliases.append(dict(self.aliases[-1]))
+            self._visit_block(node.body)
+            self.aliases.pop()
             self.scope.pop()
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-            if self.scope_counts and _call_name(node) == "include_router":
+            registration = _route_registration_name(
+                node, self.aliases[-1]
+            )
+            if self.scope_counts and registration == "include_router":
                 ordinal = self.scope_counts[-1]
                 self.scope_counts[-1] += 1
                 qualified = ".".join(self.scope)
@@ -1640,9 +1694,29 @@ def _discovered_dynamic_router_surfaces() -> frozenset[str]:
                 )
             self.generic_visit(node)
 
+    IncludeRouterVisitor(relative).visit(tree)
+    return surfaces
+
+
+@lru_cache(maxsize=None)
+def _discovered_dynamic_router_surfaces() -> frozenset[str]:
+    """Return every function-scoped ``include_router`` extension boundary.
+
+    Decorators in out-of-tree agent and host features are unavailable to a
+    checkout-only scanner.  Their core publication calls are available, so an
+    exact inventory of those runtime calls is the fail-closed boundary.  Calls
+    at module scope mount checked-in routers whose decorators are already
+    enumerated by the HTTP inventory and are intentionally excluded here.
+    """
+
+    surfaces: set[str] = set()
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
         tree = _parsed_module(path)
-        IncludeRouterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
+        surfaces.update(
+            _dynamic_router_publication_surfaces(
+                tree, path.relative_to(REPO_ROOT).as_posix()
+            )
+        )
     return frozenset(surfaces)
 
 
@@ -2687,6 +2761,29 @@ def test_signal_source_constructor_import_aliases_are_resolved() -> None:
     assert _call_name(module_constructors[0]) == "Registration"
 
 
+def test_signal_source_registration_subclasses_are_resolved() -> None:
+    local_subclass = ast.parse(
+        "class Specialized(SourceRegistration):\n"
+        "    pass\n\n"
+        "Specialized(name='specialized.source')\n"
+    )
+    imported_subclass = ast.parse(
+        "from kestrel_sovereign.signals import (\n"
+        "    SourceRegistrationWithPromptOverride as Specialized,\n"
+        ")\n"
+        "Specialized(name='overridden.source')\n"
+    )
+
+    assert {
+        _call_name(constructor)
+        for constructor in _source_registration_constructors(local_subclass)
+    } == {"Specialized"}
+    assert {
+        _call_name(constructor)
+        for constructor in _source_registration_constructors(imported_subclass)
+    } == {"Specialized"}
+
+
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
     expected = {
         "kestrel_sovereign/host_features/runtime.py::"
@@ -2700,6 +2797,19 @@ def test_every_dynamic_router_publication_boundary_is_classified() -> None:
     assert expected == _documented_surfaces(
         "## Machine-checked dynamic router boundary inventory"
     )
+
+
+def test_dynamic_router_publication_resolves_bound_aliases() -> None:
+    tree = ast.parse(
+        "def mount(app, feature):\n"
+        "    publish = app.include_router\n"
+        "    alias = publish\n"
+        "    alias(feature.get_router())\n"
+    )
+
+    assert _dynamic_router_publication_surfaces(tree, "example.py") == {
+        "example.py::mount.include_router[0]"
+    }
 
 
 def test_relation_free_control_names_are_still_discovered() -> None:
@@ -3348,6 +3458,34 @@ def test_tool_import_aliases_and_route_keyword_unpacking_fail_closed() -> None:
         )
 
 
+def test_tool_decorator_aliases_include_class_and_factory_scopes() -> None:
+    tree = ast.parse(
+        "class Feature:\n"
+        "    expose = tool\n"
+        "    @expose(name='class_tool')\n"
+        "    def class_impl(self):\n"
+        "        pass\n\n"
+        "def factory():\n"
+        "    publish = tool\n"
+        "    @publish(name='factory_tool')\n"
+        "    def factory_impl():\n"
+        "        pass\n"
+    )
+    aliases = _tool_decorator_aliases(tree)
+    decorated = {
+        node.name: _public_tool_name(
+            node.decorator_list[0], node.name, {}, aliases
+        )
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.decorator_list
+    }
+
+    assert decorated == {
+        "class_impl": "class_tool",
+        "factory_impl": "factory_tool",
+    }
+
+
 def test_repository_scans_reuse_parsed_trees_and_analysis_summaries() -> None:
     source_path = REPO_ROOT / "kestrel_sovereign/server.py"
     assert _parsed_module(source_path) is _parsed_module(source_path)
@@ -3797,7 +3935,7 @@ def _is_cross_agent_state_mutation_target(node: ast.AST) -> bool:
 def _is_cross_agent_state_mutation_call(call: ast.Call) -> bool:
     """Whether a mutator call writes directly through an agent registry."""
 
-    return (
+    attribute_mutation = (
         isinstance(call.func, ast.Attribute)
         and call.func.attr.casefold()
         in {
@@ -3817,6 +3955,12 @@ def _is_cross_agent_state_mutation_call(call: ast.Call) -> bool:
         }
         and _is_cross_agent_state_mutation_target(call.func.value)
     )
+    named_mutation = (
+        _call_name(call).casefold() in {"delattr", "setattr"}
+        and bool(call.args)
+        and _is_cross_agent_state_mutation_target(call.args[0])
+    )
+    return attribute_mutation or named_mutation
 
 
 @lru_cache(maxsize=None)
@@ -4101,12 +4245,13 @@ def _mutable_container_write(
     return names, value
 
 
-def _mutable_container_alias_groups(
+def _mutable_container_alias_snapshots(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> dict[str, frozenset[str]]:
-    """Resolve simple source-ordered aliases of mutable local containers."""
+) -> dict[ast.AST, frozenset[str]]:
+    """Capture live mutable-container aliases at each individual write."""
 
     groups: dict[str, set[str]] = {}
+    snapshots: dict[ast.AST, frozenset[str]] = {}
 
     def detach(name: str) -> None:
         group = groups.pop(name, None)
@@ -4130,6 +4275,12 @@ def _mutable_container_alias_groups(
         group.update(target_names)
         for member in group:
             groups[member] = group
+
+    def live_aliases(names: set[str]) -> frozenset[str]:
+        expanded = set(names)
+        for name in names:
+            expanded.update(groups.get(name, ()))
+        return frozenset(expanded)
 
     for node in _walk_lexical_scope(function):
         targets: list[ast.AST] = []
@@ -4176,6 +4327,11 @@ def _mutable_container_alias_groups(
                     receiver_names = _reference_binding_names(target.value)
                     if not any(name in groups for name in receiver_names):
                         bind(receiver_names, None)
+            snapshots[node] = live_aliases({
+                name
+                for target in targets
+                for name in _reference_binding_names(target)
+            })
 
         if isinstance(node, ast.Call):
             mutation = _mutable_container_write(node)
@@ -4183,11 +4339,9 @@ def _mutable_container_alias_groups(
                 receiver_names, _written_value = mutation
                 if not any(name in groups for name in receiver_names):
                     bind(receiver_names, None)
+                snapshots[node] = live_aliases(receiver_names)
 
-    return {
-        name: frozenset(group)
-        for name, group in groups.items()
-    }
+    return snapshots
 
 
 def _cross_agent_control_aliases(
@@ -4197,13 +4351,12 @@ def _cross_agent_control_aliases(
     """Resolve local names that reference cross-agent control callables."""
 
     assignments: list[tuple[str, str]] = []
-    container_aliases = _mutable_container_alias_groups(function)
+    container_aliases = _mutable_container_alias_snapshots(function)
 
-    def expand_container_aliases(names: set[str]) -> set[str]:
-        expanded = set(names)
-        for name in names:
-            expanded.update(container_aliases.get(name, ()))
-        return expanded
+    def expand_container_aliases(
+        names: set[str], node: ast.AST
+    ) -> set[str]:
+        return names | set(container_aliases.get(node, ()))
 
     positional_parameters = [
         *function.args.posonlyargs,
@@ -4250,7 +4403,7 @@ def _cross_agent_control_aliases(
             mutation = _mutable_container_write(node)
             if mutation is not None:
                 target_names, value = mutation
-                target_names = expand_container_aliases(target_names)
+                target_names = expand_container_aliases(target_names, node)
                 sources = _control_reference_sources(value)
                 assignments.extend(
                     (target_name, source)
@@ -4265,7 +4418,7 @@ def _cross_agent_control_aliases(
             continue
         for target in targets:
             target_names = expand_container_aliases(
-                _reference_binding_names(target)
+                _reference_binding_names(target), node
             )
             assignments.extend(
                 (target_name, source)
@@ -4652,13 +4805,12 @@ def _provenance_aliases(
         else set()
     )
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
-    container_aliases = _mutable_container_alias_groups(function)
+    container_aliases = _mutable_container_alias_snapshots(function)
 
-    def expand_container_aliases(names: set[str]) -> set[str]:
-        expanded = set(names)
-        for name in names:
-            expanded.update(container_aliases.get(name, ()))
-        return expanded
+    def expand_container_aliases(
+        names: set[str], node: ast.AST
+    ) -> set[str]:
+        return names | set(container_aliases.get(node, ()))
 
     for node in scope_nodes:
         targets: list[ast.AST] = []
@@ -4680,19 +4832,24 @@ def _provenance_aliases(
             if mutation is not None:
                 names, value = mutation
                 assignments.append(
-                    (expand_container_aliases(names), value, node)
+                    (expand_container_aliases(names, node), value, node)
                 )
             continue
         if value is None:
             continue
-        names = expand_container_aliases({
-            name
-            for target in targets
-            for name in _binding_target_names(target)
-        })
+        names = expand_container_aliases(
+            {
+                name
+                for target in targets
+                for name in _binding_target_names(target)
+            },
+            node,
+        )
         for target in targets:
             names.update(
-                expand_container_aliases(_reference_binding_names(target))
+                expand_container_aliases(
+                    _reference_binding_names(target), node
+                )
             )
         # A provenance-selected member of a container passed to a control call
         # can choose the target through ``**kwargs`` or a structured argument.
@@ -6386,7 +6543,10 @@ def test_provenance_scanner_closes_direct_state_loop_and_comprehension_bypasses(
         "        del manager._agents[target]\n\n"
         "def pop(request, manager, target):\n"
         "    if request.causation_chain:\n"
-        "        manager._agents.pop(target)\n"
+        "        manager._agents.pop(target)\n\n"
+        "def setattr_entry(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        setattr(manager._agents[target], 'enabled', False)\n"
     )
     loop_else = ast.parse(
         "def dispatch(request, target):\n"
@@ -6412,7 +6572,7 @@ def test_provenance_scanner_closes_direct_state_loop_and_comprehension_bypasses(
         "    return list(map(terminate_child, request.causation_chain))\n"
     )
 
-    assert _authority_provenance_lines(direct_state) == {2, 6, 10}
+    assert _authority_provenance_lines(direct_state) == {2, 6, 10, 14}
     assert _authority_provenance_lines(loop_else) == {2}
     assert _authority_provenance_lines(comprehension) == {2}
     assert _authority_provenance_lines(nested_comprehension) == {2}
@@ -6666,12 +6826,22 @@ def test_provenance_scanner_follows_mutable_container_writes() -> None:
         "    if any(decisions):\n"
         "        terminate_child(target)\n"
     )
+    rebound_alias_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decisions = []\n"
+        "    alias = decisions\n"
+        "    alias.append(bool(request.causation_chain))\n"
+        "    alias = []\n"
+        "    if any(decisions):\n"
+        "        terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(append_decision) == {4}
     assert _authority_provenance_lines(update_decision) == {6}
     assert _authority_provenance_lines(setitem_decision) == {6}
     assert _authority_provenance_lines(setattr_decision) == {5}
     assert _authority_provenance_lines(aliased_decision) == {5}
+    assert _authority_provenance_lines(rebound_alias_decision) == {6}
 
 
 def test_provenance_scanner_follows_higher_order_control_dispatch() -> None:
@@ -6732,12 +6902,22 @@ def test_provenance_scanner_follows_controls_stored_in_containers() -> None:
         "    if request.causation_chain:\n"
         "        self.callbacks.run(target)\n"
     )
+    rebound_alias_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = []\n"
+        "    alias = callbacks\n"
+        "    alias.append(terminate_child)\n"
+        "    alias = []\n"
+        "    if request.causation_chain:\n"
+        "        callbacks[0](target)\n"
+    )
 
     assert _authority_provenance_lines(subscript_callback) == {4}
     assert _authority_provenance_lines(updated_callback) == {4}
     assert _authority_provenance_lines(default_callbacks) == {4, 6}
     assert _authority_provenance_lines(aliased_callback) == {5}
     assert _authority_provenance_lines(attribute_callback) == {3}
+    assert _authority_provenance_lines(rebound_alias_callback) == {6}
 
 
 def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> None:
