@@ -4189,7 +4189,7 @@ def test_repository_scan_prefilters_modules_without_provenance(
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
-    for issue in (3134, 3144, 3146, 3147, 3149):
+    for issue in (3134, 3144, 3146, 3147, 3148, 3149):
         row = next(line for line in audit.splitlines() if f"[#{issue}]" in line)
         assert "Enforced by" in row
         assert "Defect:" not in row
@@ -4245,6 +4245,24 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
         row = next(line for line in audit.splitlines() if surface in line)
         assert defect in row
         assert "shared PostgreSQL" in row
+
+
+def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    action_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Run host lifecycle CLI from agent shell |")
+    )
+    assert "[#3233]" in action_row
+    assert "Defect:" in action_row
+
+    for surface in (
+        "features/computer_use/feature.py::shell`",
+        "cli.py::kestrel terminate`",
+    ):
+        tool_row = next(line for line in audit.splitlines() if surface in line)
+        assert "D-3233" in tool_row
 
 
 def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
@@ -4506,6 +4524,8 @@ def _binding_target_names(target: ast.AST) -> set[str]:
 
     if isinstance(target, ast.Name):
         return {target.id.casefold()}
+    if isinstance(target, ast.Starred):
+        return _binding_target_names(target.value)
     if isinstance(target, (ast.List, ast.Tuple)):
         return {
             name
@@ -6139,6 +6159,7 @@ def _class_provenance_state_aliases(
             changed = False
             for method in methods:
                 aliases = set(module_provenance_aliases or ()) | shared
+                container_aliases = _mutable_container_alias_snapshots(method)
                 method_changed = True
                 while method_changed:
                     method_changed = False
@@ -6168,6 +6189,13 @@ def _class_provenance_state_aliases(
                                     f"{statement.args[0].id}.{attribute}".casefold()
                                 )
                                 value = statement.args[2]
+                        elif isinstance(statement, ast.Call):
+                            mutation = _mutable_container_write(statement)
+                            if mutation is not None:
+                                target_names, value = mutation
+                                target_names.update(
+                                    container_aliases.get(statement, ())
+                                )
                         if value is None:
                             continue
                         tokens = set(_identifier_tokens(value))
@@ -8267,6 +8295,21 @@ def test_provenance_scanner_propagates_static_setattr_state_across_methods() -> 
     assert _authority_provenance_lines(tree) == {6}
 
 
+def test_provenance_scanner_propagates_container_state_across_methods() -> None:
+    tree = ast.parse(
+        "class Gate:\n"
+        "    def capture(self, request):\n"
+        "        self.flags.update(\n"
+        "            {'allowed': bool(request.causation_chain)}\n"
+        "        )\n\n"
+        "    def run(self, target):\n"
+        "        if self.flags['allowed']:\n"
+        "            target.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {8}
+
+
 def test_provenance_scanner_propagates_state_through_module_globals() -> None:
     tree = ast.parse(
         "ready = False\n"
@@ -8279,6 +8322,17 @@ def test_provenance_scanner_propagates_state_through_module_globals() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {7}
+
+
+def test_provenance_scanner_follows_starred_assignment_targets() -> None:
+    tree = ast.parse(
+        "def run(request, target):\n"
+        "    head, *ancestors = request.causation_chain\n"
+        "    if ancestors:\n"
+        "        target.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {3}
 
 
 @pytest.mark.parametrize("keyword", ["with", "async with"])
