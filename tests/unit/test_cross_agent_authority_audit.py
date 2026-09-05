@@ -7329,14 +7329,69 @@ def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
     return False
 
 
-def _contains_current_loop_break(statements: list[ast.stmt]) -> bool:
-    """Whether a block can break its owning loop, excluding nested loops."""
+def _block_guaranteed_function_exit(statements: list[ast.stmt]) -> bool:
+    """Whether a block cannot reach code following its current loop.
 
-    class BreakVisitor(ast.NodeVisitor):
+    ``break`` and ``continue`` exit a local block, but unlike ``return`` and
+    ``raise`` they may still reach controls after the loop.  Keeping this
+    distinction prevents causation-dependent loop exits from hiding authority.
+    """
+
+    if not statements:
+        return False
+    terminal = statements[-1]
+    if isinstance(terminal, (ast.Raise, ast.Return)):
+        return True
+    if isinstance(terminal, (ast.Break, ast.Continue)):
+        return False
+    if isinstance(terminal, ast.If):
+        return _block_guaranteed_function_exit(
+            terminal.body
+        ) and _block_guaranteed_function_exit(terminal.orelse)
+    if isinstance(terminal, (ast.With, ast.AsyncWith)):
+        return _block_guaranteed_function_exit(terminal.body)
+    if isinstance(terminal, (ast.Try, ast.TryStar)):
+        if _block_guaranteed_function_exit(terminal.finalbody):
+            return True
+        normal_path_exits = _block_guaranteed_function_exit(
+            terminal.body
+        ) or _block_guaranteed_function_exit(terminal.orelse)
+        return normal_path_exits and all(
+            _block_guaranteed_function_exit(handler.body)
+            for handler in terminal.handlers
+        )
+    if isinstance(terminal, ast.Match):
+        has_catch_all = any(
+            case.guard is None
+            and isinstance(case.pattern, ast.MatchAs)
+            and case.pattern.pattern is None
+            for case in terminal.cases
+        )
+        return has_catch_all and all(
+            _block_guaranteed_function_exit(case.body)
+            for case in terminal.cases
+        )
+    return False
+
+
+def _contains_current_loop_transfer(
+    statements: list[ast.stmt],
+    *,
+    include_break: bool = True,
+    include_continue: bool = False,
+) -> bool:
+    """Whether a block can transfer its owning loop, excluding nested loops."""
+
+    class LoopTransferVisitor(ast.NodeVisitor):
         found = False
 
         def visit_Break(self, node: ast.Break) -> None:  # noqa: N802
-            self.found = True
+            if include_break:
+                self.found = True
+
+        def visit_Continue(self, node: ast.Continue) -> None:  # noqa: N802
+            if include_continue:
+                self.found = True
 
         def visit_For(self, node: ast.For) -> None:  # noqa: N802
             return
@@ -7361,10 +7416,32 @@ def _contains_current_loop_break(statements: list[ast.stmt]) -> bool:
         def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
             return
 
-    visitor = BreakVisitor()
+    visitor = LoopTransferVisitor()
     for statement in statements:
         visitor.visit(statement)
     return visitor.found
+
+
+def _contains_current_loop_break(statements: list[ast.stmt]) -> bool:
+    """Whether a block can break its owning loop, excluding nested loops."""
+
+    return _contains_current_loop_transfer(statements)
+
+
+def _block_then_suffix_guaranteed_function_exit(
+    block: list[ast.stmt],
+    suffix: list[ast.stmt],
+) -> bool:
+    """Whether one loop branch must exit the function before post-loop code."""
+
+    if _contains_current_loop_transfer(
+        block,
+        include_continue=True,
+    ):
+        return False
+    if _block_guaranteed_exits(block):
+        return _block_guaranteed_function_exit(block)
+    return _block_guaranteed_function_exit([*block, *suffix])
 
 
 def _loop_else_guards_continuation(
@@ -7800,6 +7877,11 @@ def _cross_agent_control_aliases(
         elif isinstance(node, ast.NamedExpr):
             targets = [node.target]
             value = node.value
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            # Iteration is assignment too: a callable stored in the iterable
+            # remains a control callable after it is bound to the loop target.
+            targets = [node.target]
+            value = node.iter
         elif isinstance(node, ast.Call):
             mutation = _mutable_container_write(node)
             if mutation is not None:
@@ -8454,6 +8536,7 @@ def _provenance_aliases(
     def collect_guard_decisions(
         statements: list[ast.stmt],
         enclosing_continuation_controls: bool = False,
+        enclosing_loop_continuation_controls: bool = False,
     ) -> None:
         suffix_controls = [False] * (len(statements) + 1)
         for index in range(len(statements) - 1, -1, -1):
@@ -8463,22 +8546,40 @@ def _provenance_aliases(
                 )
             )
         for index, statement in enumerate(statements):
-            controls_continuation = (
+            local_continuation_controls = (
                 suffix_controls[index + 1]
                 or enclosing_continuation_controls
+            )
+            controls_continuation = (
+                local_continuation_controls
+                or enclosing_loop_continuation_controls
             )
             if controls_continuation:
                 if isinstance(statement, ast.Assert):
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
                     )
-                elif isinstance(statement, ast.If) and (
-                    _block_guaranteed_exits(statement.body)
-                    != _block_guaranteed_exits(statement.orelse)
-                ):
-                    authority_decision_names.update(
-                        _identifier_tokens(statement.test)
+                elif isinstance(statement, ast.If):
+                    local_exit_differs = (
+                        local_continuation_controls
+                        and _block_guaranteed_exits(statement.body)
+                        != _block_guaranteed_exits(statement.orelse)
                     )
+                    loop_exit_differs = (
+                        enclosing_loop_continuation_controls
+                        and _block_then_suffix_guaranteed_function_exit(
+                            statement.body,
+                            statements[index + 1 :],
+                        )
+                        != _block_then_suffix_guaranteed_function_exit(
+                            statement.orelse,
+                            statements[index + 1 :],
+                        )
+                    )
+                    if local_exit_differs or loop_exit_differs:
+                        authority_decision_names.update(
+                            _identifier_tokens(statement.test)
+                        )
                 elif isinstance(
                     statement, (ast.For, ast.AsyncFor, ast.While)
                 ) and _loop_else_guards_continuation(statement):
@@ -8490,13 +8591,24 @@ def _provenance_aliases(
                     authority_decision_names.update(
                         _identifier_tokens(decision)
                     )
+            is_loop = isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
             child_continuation_controls = (
-                False
-                if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
-                else controls_continuation
+                False if is_loop else local_continuation_controls
+            )
+            child_loop_continuation_controls = (
+                (
+                    local_continuation_controls
+                    or enclosing_loop_continuation_controls
+                )
+                if is_loop
+                else enclosing_loop_continuation_controls
             )
             for block in _child_statement_blocks(statement):
-                collect_guard_decisions(block, child_continuation_controls)
+                collect_guard_decisions(
+                    block,
+                    child_continuation_controls,
+                    child_loop_continuation_controls,
+                )
 
     if authority_analysis:
         collect_guard_decisions(function.body)
@@ -9153,6 +9265,7 @@ def _guard_clause_provenance_lines(
     def scan_block(
         statements: list[ast.stmt],
         enclosing_continuation_controls: bool = False,
+        enclosing_loop_continuation_controls: bool = False,
     ) -> None:
         suffix_controls = [False] * (len(statements) + 1)
         for index in range(len(statements) - 1, -1, -1):
@@ -9162,9 +9275,13 @@ def _guard_clause_provenance_lines(
                 )
             )
         for index, statement in enumerate(statements):
-            controls_continuation = (
+            local_continuation_controls = (
                 suffix_controls[index + 1]
                 or enclosing_continuation_controls
+            )
+            controls_continuation = (
+                local_continuation_controls
+                or enclosing_loop_continuation_controls
             )
             if controls_continuation and isinstance(statement, ast.Assert):
                 if _has_provenance_value(
@@ -9176,30 +9293,68 @@ def _guard_clause_provenance_lines(
             elif controls_continuation and isinstance(statement, ast.If):
                 body_exits = _block_guaranteed_exits(statement.body)
                 orelse_exits = _block_guaranteed_exits(statement.orelse)
-                if (
-                    body_exits != orelse_exits
-                    and _has_provenance_value(
-                        statement.test,
-                        provenance_aliases,
-                        provenance_return_helpers,
+                body_function_exits = _block_guaranteed_function_exit(
+                    statement.body
+                )
+                orelse_function_exits = _block_guaranteed_function_exit(
+                    statement.orelse
+                )
+                if enclosing_loop_continuation_controls:
+                    body_function_exits = (
+                        _block_then_suffix_guaranteed_function_exit(
+                            statement.body,
+                            statements[index + 1 :],
+                        )
                     )
+                    orelse_function_exits = (
+                        _block_then_suffix_guaranteed_function_exit(
+                            statement.orelse,
+                            statements[index + 1 :],
+                        )
+                    )
+                if (
+                    (
+                        local_continuation_controls
+                        and body_exits != orelse_exits
+                    )
+                    or (
+                        enclosing_loop_continuation_controls
+                        and body_function_exits != orelse_function_exits
+                    )
+                ) and _has_provenance_value(
+                    statement.test,
+                    provenance_aliases,
+                    provenance_return_helpers,
                 ):
                     lines.add(statement.lineno)
             elif controls_continuation and isinstance(statement, ast.Match):
-                case_exits = [
-                    _block_guaranteed_exits(case.body)
-                    for case in statement.cases
-                ]
                 has_catch_all = any(
                     case.guard is None
                     and isinstance(case.pattern, ast.MatchAs)
                     and case.pattern.pattern is None
                     for case in statement.cases
                 )
-                match_can_continue = (
-                    not has_catch_all or not all(case_exits)
-                )
-                if any(case_exits) and match_can_continue:
+                case_exit_sets = []
+                if local_continuation_controls:
+                    case_exit_sets.append([
+                        _block_guaranteed_exits(case.body)
+                        for case in statement.cases
+                    ])
+                if enclosing_loop_continuation_controls:
+                    case_exit_sets.append([
+                        _block_then_suffix_guaranteed_function_exit(
+                            case.body,
+                            statements[index + 1 :],
+                        )
+                        for case in statement.cases
+                    ])
+                governing_exit_sets = [
+                    case_exits
+                    for case_exits in case_exit_sets
+                    if any(case_exits)
+                    and (not has_catch_all or not all(case_exits))
+                ]
+                if governing_exit_sets:
                     if _has_provenance_value(
                         statement.subject,
                         provenance_aliases,
@@ -9208,8 +9363,11 @@ def _guard_clause_provenance_lines(
                         lines.add(statement.lineno)
                     lines.update(
                         case.guard.lineno
-                        for case, exits in zip(statement.cases, case_exits)
-                        if exits
+                        for case_index, case in enumerate(statement.cases)
+                        if any(
+                            case_exits[case_index]
+                            for case_exits in governing_exit_sets
+                        )
                         and case.guard is not None
                         and _has_provenance_value(
                             case.guard,
@@ -9225,9 +9383,41 @@ def _guard_clause_provenance_lines(
                     _block_guaranteed_exits(handler.body)
                     for handler in statement.handlers
                 ]
+                try_function_exits = _block_guaranteed_function_exit(
+                    statement.body
+                )
+                handler_function_exits = [
+                    _block_guaranteed_function_exit(handler.body)
+                    for handler in statement.handlers
+                ]
+                if enclosing_loop_continuation_controls:
+                    try_function_exits = (
+                        _block_then_suffix_guaranteed_function_exit(
+                            statement.body,
+                            statements[index + 1 :],
+                        )
+                    )
+                    handler_function_exits = [
+                        _block_then_suffix_guaranteed_function_exit(
+                            handler.body,
+                            statements[index + 1 :],
+                        )
+                        for handler in statement.handlers
+                    ]
                 if (
                     handler_exits
-                    and any(exit_state != try_exits for exit_state in handler_exits)
+                    and (
+                        local_continuation_controls
+                        and any(
+                            exit_state != try_exits
+                            for exit_state in handler_exits
+                        )
+                        or enclosing_loop_continuation_controls
+                        and any(
+                            exit_state != try_function_exits
+                            for exit_state in handler_function_exits
+                        )
+                    )
                     and any(
                         _has_provenance_value(
                             node,
@@ -9254,18 +9444,28 @@ def _guard_clause_provenance_lines(
                     provenance_return_helpers,
                 ):
                     lines.add(statement.lineno)
-            # ``break``/``continue`` inside a loop do not prevent statements
-            # after the loop from running, so do not inherit that outer
-            # continuation into loop bodies. Other compound statements retain
-            # the enclosing continuation: a return/raise nested under ``with``
-            # or ``try`` still gates the later control call.
+            # Loop-local exits need their own continuation state: ``break`` may
+            # reach a control after the loop while ``return``/``raise`` cannot.
+            # Other compound statements preserve both ordinary sibling and
+            # enclosing-loop continuation dependencies.
+            is_loop = isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
             child_continuation_controls = (
-                False
-                if isinstance(statement, (ast.For, ast.AsyncFor, ast.While))
-                else controls_continuation
+                False if is_loop else local_continuation_controls
+            )
+            child_loop_continuation_controls = (
+                (
+                    local_continuation_controls
+                    or enclosing_loop_continuation_controls
+                )
+                if is_loop
+                else enclosing_loop_continuation_controls
             )
             for block in _child_statement_blocks(statement):
-                scan_block(block, child_continuation_controls)
+                scan_block(
+                    block,
+                    child_continuation_controls,
+                    child_loop_continuation_controls,
+                )
 
     scan_block(function.body)
     return lines
@@ -9805,6 +10005,142 @@ def _repository_import_paths(source_path: Path) -> frozenset[Path]:
     return _scope_repository_import_paths(tree, source_path)
 
 
+def _repository_reexport_bindings(
+    source_path: Path,
+    requested_names: set[str],
+) -> tuple[tuple[str, Path, str], ...]:
+    """Resolve requested facade names to their repository import bindings.
+
+    Python exposes module-level imports as module attributes whether or not the
+    facade consumes them locally.  Repository helper summaries therefore need
+    to follow both direct ``from x import y`` exports and simple module-level
+    aliases of those imports.
+    """
+
+    source_path = source_path.resolve()
+    requested_names = {name.casefold() for name in requested_names}
+    tree = _parsed_module(source_path)
+    imported_bindings: dict[str, list[tuple[Path, str]]] = {}
+    star_imports: list[Path] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or node.module is None:
+            continue
+        imported_path = _resolved_repository_import_path(
+            source_path,
+            node.module,
+            node.level,
+        )
+        if imported_path is None:
+            continue
+        for imported in node.names:
+            if imported.name == "*":
+                star_imports.append(imported_path)
+                continue
+            local_name = (imported.asname or imported.name).casefold()
+            imported_bindings.setdefault(local_name, []).append(
+                (imported_path, imported.name.casefold())
+            )
+
+    alias_edges: list[tuple[str, str]] = []
+    for node in tree.body:
+        assignment_pairs: list[tuple[str, ast.AST]] = []
+        if isinstance(node, ast.Assign):
+            assignment_pairs = [
+                pair
+                for target in node.targets
+                for pair in _static_assignment_pairs(target, node.value)
+            ]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignment_pairs = _static_assignment_pairs(node.target, node.value)
+        alias_edges.extend(
+            (target.casefold(), value.id.casefold())
+            for target, value in assignment_pairs
+            if isinstance(value, ast.Name)
+        )
+
+    resolved: list[tuple[str, Path, str]] = []
+    for requested_name in requested_names:
+        candidate_bindings = {requested_name}
+        changed = True
+        while changed:
+            changed = False
+            for target, source in alias_edges:
+                if target in candidate_bindings and source not in candidate_bindings:
+                    candidate_bindings.add(source)
+                    changed = True
+        resolved.extend(
+            (requested_name, imported_path, remote_name)
+            for candidate in candidate_bindings
+            for imported_path, remote_name in imported_bindings.get(candidate, ())
+        )
+        resolved.extend(
+            (requested_name, imported_path, requested_name)
+            for imported_path in star_imports
+        )
+    return tuple(resolved)
+
+
+@lru_cache(maxsize=None)
+def _source_references_repository_reexport(source_path: Path) -> bool:
+    """Whether invoked imports enter a repository facade re-export edge."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    visible_calls = _lexical_scope_calls(tree)
+    called_names = {_call_name(call).casefold() for call in visible_calls}
+    for node in _lexical_scope_imports(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            requested = {
+                imported.name.casefold()
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold() in called_names
+            }
+            if any(imported.name == "*" for imported in node.names):
+                requested.update(called_names)
+            if _repository_reexport_bindings(imported_path, requested):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                child_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                    node.level,
+                )
+                if child_path is None:
+                    continue
+                member_calls = _module_attribute_call_names(
+                    visible_calls,
+                    (imported.asname or imported.name).casefold(),
+                    tree,
+                )
+                if _repository_reexport_bindings(child_path, member_calls):
+                    return True
+        elif isinstance(node, ast.Import):
+            for imported in node.names:
+                imported_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                )
+                if imported_path is None:
+                    continue
+                member_calls = _module_attribute_call_names(
+                    visible_calls,
+                    (imported.asname or imported.name).casefold(),
+                    tree,
+                )
+                if _repository_reexport_bindings(imported_path, member_calls):
+                    return True
+    return False
+
+
 @lru_cache(maxsize=None)
 def _source_or_imports_may_expose_provenance(source_path: Path) -> bool:
     """Cheaply over-approximate provenance reachability through imports."""
@@ -10002,6 +10338,19 @@ def _repository_control_helper_names(
     active = seen | {
         (source_path, name) for name in requested_names - resolved
     }
+    for local_name, imported_path, remote_name in _repository_reexport_bindings(
+        source_path,
+        requested_names - resolved,
+    ):
+        if remote_name in _repository_control_helper_names(
+            imported_path,
+            {remote_name},
+            active,
+        ):
+            resolved.add(local_name)
+    if resolved == requested_names:
+        return resolved
+
     tree = _parsed_module(source_path)
     functions = [
         node
@@ -10107,6 +10456,19 @@ def _repository_provenance_helper_names(
     active = seen | {
         (source_path, name) for name in requested_names - resolved
     }
+    for local_name, imported_path, remote_name in _repository_reexport_bindings(
+        source_path,
+        requested_names - resolved,
+    ):
+        if remote_name in _repository_provenance_helper_names(
+            imported_path,
+            {remote_name},
+            active,
+        ):
+            resolved.add(local_name)
+    if resolved == requested_names:
+        return resolved
+
     tree = _parsed_module(source_path)
     functions = [
         node
@@ -10199,21 +10561,28 @@ def _scope_imported_provenance_return_helper_aliases(
                         imported.name,
                         node.level,
                     )
-                    if child_path is not None and (
+                    if child_path is None:
+                        continue
+                    module_calls = _module_attribute_call_names(
+                        visible_calls,
+                        (imported.asname or imported.name).casefold(),
+                        scope if isinstance(scope, ast.Module) else None,
+                    )
+                    if not (
                         _source_or_imports_may_expose_provenance(child_path)
+                        or _repository_reexport_bindings(
+                            child_path,
+                            module_calls,
+                        )
                     ):
-                        module_calls = _module_attribute_call_names(
-                            visible_calls,
-                            (imported.asname or imported.name).casefold(),
-                            scope if isinstance(scope, ast.Module) else None,
+                        continue
+                    aliases.update(
+                        _repository_provenance_helper_names(
+                            child_path,
+                            module_calls,
+                            seen,
                         )
-                        aliases.update(
-                            _repository_provenance_helper_names(
-                                child_path,
-                                module_calls,
-                                seen,
-                            )
-                        )
+                    )
                 continue
 
             imported_path = _resolved_repository_import_path(
@@ -10222,8 +10591,6 @@ def _scope_imported_provenance_return_helper_aliases(
                 node.level,
             )
             if imported_path is None:
-                continue
-            if not _source_or_imports_may_expose_provenance(imported_path):
                 continue
             bindings = {
                 (imported.asname or imported.name).casefold(): imported.name.casefold()
@@ -10235,6 +10602,11 @@ def _scope_imported_provenance_return_helper_aliases(
                 imported.name == "*" for imported in node.names
             ) else set()
             requested = set(bindings.values()) | star_names
+            if not (
+                _source_or_imports_may_expose_provenance(imported_path)
+                or _repository_reexport_bindings(imported_path, requested)
+            ):
+                continue
             resolved = _repository_provenance_helper_names(
                 imported_path,
                 requested,
@@ -10270,6 +10642,14 @@ def _scope_imported_provenance_return_helper_aliases(
                 )
                 if imported_path is not None and (
                     _source_or_imports_may_expose_provenance(imported_path)
+                    or _repository_reexport_bindings(
+                        imported_path,
+                        _module_attribute_call_names(
+                            visible_calls,
+                            (imported.asname or imported.name).casefold(),
+                            scope if isinstance(scope, ast.Module) else None,
+                        ),
+                    )
                 ):
                     bound_name = (imported.asname or imported.name).casefold()
                     module_calls = _module_attribute_call_names(
@@ -10974,6 +11354,8 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
         marker in source for marker in PROVENANCE_SOURCE_MARKERS
     ) and not _source_or_imports_may_expose_provenance(
         source_path
+    ) and not _source_references_repository_reexport(
+        source_path
     ) and not _function_local_imports_expose_provenance(source_path):
         return frozenset()
     tree = _parsed_module(source_path)
@@ -11607,6 +11989,22 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
     assert _authority_provenance_lines(keyword_callback) == {5}
 
 
+def test_provenance_scanner_follows_loop_bound_control_callbacks() -> None:
+    tree = ast.parse(
+        "def direct(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        for callback in [terminate_child]:\n"
+        "            callback(target)\n\n"
+        "async def aliased(request, target):\n"
+        "    callbacks = [stop_peer]\n"
+        "    if request.orchestrator:\n"
+        "        async for callback in callbacks:\n"
+        "            callback(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 8}
+
+
 def test_provenance_scanner_follows_conditionally_selected_controls() -> None:
     tree = ast.parse(
         "def dispatch(request, target, enabled):\n"
@@ -12181,6 +12579,48 @@ def test_provenance_scanner_follows_repository_local_imported_helpers(
     assert _cached_authority_provenance_lines(dotted_path) == frozenset({4})
 
 
+def test_provenance_scanner_follows_helpers_reexported_by_facades(
+    tmp_path: Path,
+) -> None:
+    package_path = tmp_path / "pkg"
+    package_path.mkdir()
+    (package_path / "lineage.py").write_text(
+        "def derive(request):\n"
+        "    return bool(request.causation_chain)\n",
+        encoding="utf-8",
+    )
+    (package_path / "controls.py").write_text(
+        "def apply(target):\n"
+        "    terminate_child(target)\n",
+        encoding="utf-8",
+    )
+    (package_path / "__init__.py").write_text(
+        "from .lineage import derive as _derive\n"
+        "decide = _derive\n"
+        "from .controls import apply\n",
+        encoding="utf-8",
+    )
+    provenance_path = tmp_path / "provenance_controller.py"
+    provenance_path.write_text(
+        "from pkg import decide\n\n"
+        "def dispatch(request, target):\n"
+        "    if decide(request):\n"
+        "        terminate_child(target)\n",
+        encoding="utf-8",
+    )
+    control_path = tmp_path / "control_controller.py"
+    control_path.write_text(
+        "from pkg import apply\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(provenance_path) == frozenset({4})
+    assert _cached_authority_provenance_lines(control_path) == frozenset({4})
+
+
 def test_provenance_scanner_follows_imported_class_provenance_helpers(
     tmp_path: Path,
 ) -> None:
@@ -12304,6 +12744,28 @@ def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
 
     assert _authority_provenance_lines(wrapped_exits) == {2, 8}
     assert _authority_provenance_lines(match_exit) == {2}
+
+
+def test_provenance_scanner_preserves_post_loop_control_reachability() -> None:
+    break_reaches_control = ast.parse(
+        "def dispatch(request, target):\n"
+        "    while True:\n"
+        "        if request.causation_chain:\n"
+        "            break\n"
+        "        return\n"
+        "    terminate_child(target)\n"
+    )
+    both_paths_return = ast.parse(
+        "def dispatch(request, target):\n"
+        "    while True:\n"
+        "        if request.causation_chain:\n"
+        "            return\n"
+        "        return\n"
+        "    terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(break_reaches_control) == {3}
+    assert _authority_provenance_lines(both_paths_return) == set()
 
 
 def test_provenance_scanner_follows_exception_guard_clause_exits() -> None:
