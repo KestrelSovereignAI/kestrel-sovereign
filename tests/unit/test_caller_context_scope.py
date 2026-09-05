@@ -10,7 +10,9 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.auth import (
     CallerContext,
+    caller_context_binding_scope,
     caller_context_scope,
+    capture_caller_context_binding,
     current_caller_context,
 )
 
@@ -64,3 +66,28 @@ async def test_detached_task_cannot_retain_caller_after_scope_exit():
 
     release.set()
     assert await task is None
+
+
+@pytest.mark.asyncio
+async def test_stream_callback_binding_lives_across_yields_and_revokes_on_close():
+    """One endpoint lease covers every Codex callback in the stream."""
+
+    captured = []
+
+    @bind_async_generator_invocation("request_id")
+    async def multi_yield_stream(*, caller=None, request_id=None):
+        captured.append(capture_caller_context_binding())
+        yield current_caller_context()
+        yield current_caller_context()
+
+    sovereign = CallerContext.sovereign(identity="operator")
+    stream = multi_yield_stream(caller=sovereign)
+
+    assert await anext(stream) is sovereign
+    with caller_context_binding_scope(captured[0]):
+        assert current_caller_context() is sovereign
+    assert await anext(stream) is sovereign
+    await stream.aclose()
+
+    with caller_context_binding_scope(captured[0]):
+        assert current_caller_context() is None

@@ -4468,6 +4468,87 @@ async def test_inline_restart_preserves_session_across_frozen_reader_task(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_inline_restart_carries_owning_caller_across_frozen_reader_task(
+    tmp_path,
+):
+    """The persistent Codex reader must receive this turn's exact caller."""
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    reader = _FrozenReaderHarness(agent)
+
+    # The app-server reader is born outside authenticated request handling and
+    # therefore carries no caller.  The later endpoint turn authenticates with
+    # the sovereign key and builds its per-turn executor on a different task.
+    with caller_context_scope(None):
+        await reader.start()
+    try:
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="endpoint-sovereign",
+                credential="restart-authority-test-key",
+            )
+        ):
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-authorized"
+                executor = agent._make_inline_tool_executor("chat-authorized")
+                _effective_args, result = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "authorized inline callback"},
+                )
+    finally:
+        await reader.stop()
+
+    assert reader.handler_turn_ids == [None]
+    assert result["success"] is True
+    row = await get_request(backend, result["data"]["request"]["id"])
+    assert row.reason == "authorized inline callback"
+
+
+@pytest.mark.asyncio
+async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller(
+    tmp_path,
+):
+    """A callback is authorized by its owning turn, never the reader's turn."""
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    reader = _FrozenReaderHarness(agent)
+
+    # Model overlap with turn A: the persistent reader and its handler task
+    # inherited A's still-live sovereign scope, while turn B explicitly has no
+    # caller.  B's executor must clear A instead of borrowing its authority.
+    with caller_context_scope(
+        CallerContext.sovereign(
+            identity="other-turn-sovereign",
+            credential="restart-authority-test-key",
+        )
+    ):
+        await reader.start()
+        try:
+            with caller_context_scope(None):
+                executor = agent._make_inline_tool_executor("unowned-turn")
+                _effective_args, result = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "must not borrow reader authority"},
+                )
+        finally:
+            await reader.stop()
+
+    assert result["success"] is False
+    assert "authenticated sovereign-key caller" in result["error"]
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
 async def test_inline_restart_without_turn_stays_unbound_across_reader_task(
     tmp_path,
 ):
@@ -4577,6 +4658,54 @@ async def test_nested_inline_restart_preserves_session_across_two_readers(
         backend, llm_service.result["data"]["request"]["id"]
     )
     assert row.origin_session_id == "chat-nested-42"
+
+
+@pytest.mark.asyncio
+async def test_nested_inline_restart_carries_caller_across_both_reader_tasks(
+    tmp_path,
+):
+    """A feature subagent re-presents the endpoint caller at its own callback."""
+
+    backend = await _backend(tmp_path)
+    agent = _InlineRestartAgent(backend)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {feat.name: feat}
+    parent_reader = _FrozenReaderHarness(agent)
+    feature_reader = _FrozenReaderHarness(agent)
+    llm_service = _NestedRestartLLMService(feature_reader)
+    agent.llm_service = llm_service
+
+    with caller_context_scope(None):
+        await parent_reader.start()
+        await feature_reader.start()
+    try:
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="endpoint-sovereign",
+                credential="restart-authority-test-key",
+            )
+        ):
+            async with agent._turn_lifecycle():
+                agent._active_session_id = "chat-nested-authorized"
+                parent_executor = agent._make_inline_tool_executor(
+                    "chat-nested-authorized"
+                )
+                _effective_args, result = await parent_reader.dispatch(
+                    parent_executor,
+                    feat.tool_name,
+                    {"task": "file an authorized nested restart request"},
+                )
+    finally:
+        await parent_reader.stop()
+        await feature_reader.stop()
+
+    assert result["success"] is True
+    assert llm_service.result["success"] is True
+    row = await get_request(
+        backend, llm_service.result["data"]["request"]["id"]
+    )
+    assert row.reason == "nested inline tool filed"
 
 
 @pytest.mark.asyncio

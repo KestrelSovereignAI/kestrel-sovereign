@@ -116,6 +116,62 @@ def current_caller_context() -> Optional[CallerContext]:
     return binding.caller
 
 
+def capture_caller_context_binding() -> Optional[_CallerContextBinding]:
+    """Capture the current revocable endpoint binding for a callback task.
+
+    The returned object is deliberately the binding, not merely its immutable
+    :class:`CallerContext`.  A persistent transport may execute a turn-owned
+    callback on a task whose ContextVar snapshot predates that turn.  Rebinding
+    this same object carries the exact caller while it remains owned by the
+    endpoint, and observes revocation as soon as the endpoint scope exits.
+    """
+
+    binding = _current_caller_context.get()
+    if binding is None or not binding.active:
+        return None
+    return binding
+
+
+@contextmanager
+def caller_context_lifetime(caller: Optional[CallerContext]):
+    """Own one revocable caller binding without implicitly publishing it.
+
+    Async-generator endpoints need a binding whose lifetime spans every
+    ``anext`` call, while publishing it only while their own generator body is
+    running.  Callback closures can capture the yielded binding and explicitly
+    re-present it on foreign transport tasks.  Exiting this lifetime revokes all
+    copied/re-presented views at once.
+    """
+
+    if caller is not None and not isinstance(caller, CallerContext):
+        raise TypeError("caller context must be endpoint-owned CallerContext")
+    binding = _CallerContextBinding(caller=caller)
+    try:
+        yield binding
+    finally:
+        binding.active = False
+
+
+@contextmanager
+def caller_context_binding_scope(
+    binding: Optional[_CallerContextBinding],
+):
+    """Re-present an existing revocable binding in the current task.
+
+    ``None`` explicitly clears any ambient caller.  This scope never extends a
+    binding's lifetime and never reactivates an expired binding; the owner from
+    :func:`caller_context_lifetime` remains the sole revocation authority.
+    """
+
+    if binding is not None and not isinstance(binding, _CallerContextBinding):
+        raise TypeError("caller binding must come from caller_context_lifetime")
+    token = _current_caller_context.set(binding)
+    try:
+        yield current_caller_context()
+    finally:
+        _current_caller_context.reset(token)
+
+
 @contextmanager
 def caller_context_scope(caller: Optional[CallerContext]):
     """Bind one endpoint-owned caller, explicitly clearing absent authority.
@@ -125,15 +181,6 @@ def caller_context_scope(caller: Optional[CallerContext]):
     wake must not inherit sovereign authority from the task that enqueued it.
     """
 
-    if caller is not None and not isinstance(caller, CallerContext):
-        raise TypeError("caller context must be endpoint-owned CallerContext")
-    binding = _CallerContextBinding(caller=caller)
-    token = _current_caller_context.set(binding)
-    try:
-        yield caller
-    finally:
-        # ContextVar values are copied into child tasks. Mutate the shared
-        # binding before restoring this task's prior value so a detached task
-        # cannot retain endpoint authority after the request scope closes.
-        binding.active = False
-        _current_caller_context.reset(token)
+    with caller_context_lifetime(caller) as binding:
+        with caller_context_binding_scope(binding):
+            yield caller
