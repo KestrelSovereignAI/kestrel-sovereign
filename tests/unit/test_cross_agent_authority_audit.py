@@ -22,8 +22,8 @@ _AUTHORITY_AUDIT_PATHS = tuple(
     sorted((REPO_ROOT / "kestrel_sovereign").rglob("*.py"))
 )
 _AUTHORITY_AUDIT_CHUNKS = tuple(
-    _AUTHORITY_AUDIT_PATHS[index : index + 24]
-    for index in range(0, len(_AUTHORITY_AUDIT_PATHS), 24)
+    _AUTHORITY_AUDIT_PATHS[index : index + 144]
+    for index in range(0, len(_AUTHORITY_AUDIT_PATHS), 144)
 )
 CONTROL_NAME_TERMS = (
     "agent",
@@ -92,6 +92,11 @@ PROVENANCE_TRANSFORM_CALLS = {
 PROVENANCE_ACCESSOR_SUFFIXES = (
     "causation_chain",
     "get_current_chain",
+)
+PROVENANCE_SOURCE_MARKERS = (
+    "causation",
+    "orchestrator",
+    "current_chain",
 )
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
@@ -4933,8 +4938,16 @@ def test_tool_decorator_aliases_include_annotated_bindings() -> None:
     ) == "annotated_tool"
 
 
-def test_repository_scans_reuse_parsed_trees_and_analysis_summaries() -> None:
-    source_path = REPO_ROOT / "kestrel_sovereign/server.py"
+def test_repository_scans_reuse_parsed_trees_and_analysis_summaries(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        target.shutdown()\n",
+        encoding="utf-8",
+    )
     assert _parsed_module(source_path) is _parsed_module(source_path)
     assert _cached_authority_provenance_lines(
         source_path
@@ -4963,12 +4976,24 @@ def test_repository_discovery_results_are_cached_and_immutable() -> None:
         _discovered_request_routed_alias_surfaces,
     )
     for discover in discoveries:
-        first = discover()
-        before_second = discover.cache_info()
-        second = discover()
-        assert isinstance(first, frozenset)
-        assert second is first
-        assert discover.cache_info().hits == before_second.hits + 1
+        assert discover.cache_parameters() == {
+            "maxsize": None,
+            "typed": False,
+        }
+
+    # Exercise the cache/immutability contract on the bounded built-in command
+    # inventory. The individual completeness tests exercise every expensive
+    # repository discovery; repeating all of them cold in this meta-test makes
+    # xdist duplicate the entire checkout scan in an otherwise isolated worker.
+    first = _discovered_builtin_command_surfaces()
+    before_second = _discovered_builtin_command_surfaces.cache_info()
+    second = _discovered_builtin_command_surfaces()
+    assert isinstance(first, frozenset)
+    assert second is first
+    assert (
+        _discovered_builtin_command_surfaces.cache_info().hits
+        == before_second.hits + 1
+    )
 
 
 def test_provenance_return_summaries_skip_authority_body_scans(
@@ -4998,6 +5023,7 @@ def test_provenance_return_summaries_skip_authority_body_scans(
 
 def test_repository_scan_prefilters_modules_without_provenance(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     source_path = REPO_ROOT / "kestrel_sovereign/__init__.py"
     source = _source_text(source_path).casefold()
@@ -5007,13 +5033,31 @@ def test_repository_scan_prefilters_modules_without_provenance(
     )
     _cached_authority_provenance_lines.cache_clear()
 
-    def forbidden_analysis(_tree: ast.AST) -> set[int]:
-        raise AssertionError("marker-free module reached authority analysis")
+    def forbidden_analysis(*_args: object, **_kwargs: object) -> set[int]:
+        raise AssertionError("marker-free module reached recursive analysis")
 
-    monkeypatch.setitem(
-        globals(), "_authority_provenance_lines", forbidden_analysis
-    )
+    for analyzer in (
+        "_module_provenance_constant_aliases",
+        "_module_imported_provenance_return_helper_aliases",
+        "_authority_provenance_lines",
+    ):
+        monkeypatch.setitem(globals(), analyzer, forbidden_analysis)
     assert _cached_authority_provenance_lines(source_path) == frozenset()
+
+    unused_helper = tmp_path / "unused_helper.py"
+    unused_helper.write_text(
+        "def context(request):\n"
+        "    return request.causation_chain\n",
+        encoding="utf-8",
+    )
+    unused_import = tmp_path / "unused_import.py"
+    unused_import.write_text(
+        "from unused_helper import context\n\n"
+        "def ordinary(value):\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    assert _cached_authority_provenance_lines(unused_import) == frozenset()
 
 
 def test_audit_records_remediated_authority_paths_as_enforced() -> None:
@@ -5670,6 +5714,46 @@ def _walk_lexical_scope(
     for statement in function.body:
         visitor.visit(statement)
     return tuple(nodes)
+
+
+@lru_cache(maxsize=None)
+def _lexical_statement_owners(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[ast.AST, ast.stmt]:
+    """Map each same-scope expression to its nearest owning statement."""
+
+    owners: dict[ast.AST, ast.stmt] = {}
+    statements: list[ast.stmt] = []
+
+    class OwnerVisitor(ast.NodeVisitor):
+        def visit(self, node: ast.AST) -> None:
+            is_statement = isinstance(node, ast.stmt)
+            if is_statement:
+                statements.append(node)
+            if statements:
+                owners[node] = statements[-1]
+            super().visit(node)
+            if is_statement:
+                statements.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = OwnerVisitor()
+    for statement in function.body:
+        visitor.visit(statement)
+    return owners
 
 
 def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
@@ -6613,6 +6697,7 @@ def _provenance_aliases(
         if is_provenance_derived(default, aliases):
             aliases.add(parameter.arg.casefold())
     scope_nodes = _walk_lexical_scope(function)
+    statement_owners = _lexical_statement_owners(function)
     decision_provenance_helpers = set(provenance_return_helpers or ()) | set(
         provenance_accessor_aliases or ()
     )
@@ -6679,7 +6764,11 @@ def _provenance_aliases(
             if mutation is not None:
                 names, value = mutation
                 assignments.append(
-                    (expand_container_aliases(names, node), value, node)
+                    (
+                        expand_container_aliases(names, node),
+                        value,
+                        statement_owners.get(node, node),
+                    )
                 )
             continue
         if value is None:
@@ -6712,7 +6801,7 @@ def _provenance_aliases(
             )
         )
         if names:
-            assignments.append((names, value, node))
+            assignments.append((names, value, statement_owners.get(node, node)))
 
     # An arbitrary helper may compute an authority decision without advertising
     # that fact in its name. Mark assignment targets that later guard a control,
@@ -7961,6 +8050,80 @@ def _resolved_repository_import_path(
     return None
 
 
+@lru_cache(maxsize=None)
+def _repository_import_paths(source_path: Path) -> frozenset[Path]:
+    """Return repository modules reachable by one static import edge."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    referenced_names = {
+        node.id.casefold()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+    }
+    paths: set[Path] = set()
+    for node in tree.body:
+        candidates: list[tuple[str | None, int]] = []
+        if isinstance(node, ast.Import):
+            candidates.extend(
+                (imported.name, 0)
+                for imported in node.names
+                if (
+                    imported.asname or imported.name.split(".", 1)[0]
+                ).casefold()
+                in referenced_names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            referenced_imports = [
+                imported
+                for imported in node.names
+                if imported.name == "*"
+                or (imported.asname or imported.name).casefold()
+                in referenced_names
+            ]
+            if referenced_imports:
+                candidates.append((node.module, node.level))
+            candidates.extend(
+                (
+                    ".".join(
+                        part
+                        for part in (node.module, imported.name)
+                        if part
+                    ),
+                    node.level,
+                )
+                for imported in referenced_imports
+                if imported.name != "*"
+            )
+        for module_name, level in candidates:
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                module_name,
+                level,
+            )
+            if imported_path is not None:
+                paths.add(imported_path)
+    return frozenset(paths)
+
+
+@lru_cache(maxsize=None)
+def _source_or_imports_may_expose_provenance(source_path: Path) -> bool:
+    """Cheaply over-approximate provenance reachability through imports."""
+
+    pending = [source_path.resolve()]
+    seen: set[Path] = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        source = _source_text(candidate).casefold()
+        if any(marker in source for marker in PROVENANCE_SOURCE_MARKERS):
+            return True
+        pending.extend(_repository_import_paths(candidate) - seen)
+    return False
+
+
 def _module_attribute_call_names(
     calls: list[ast.Call],
     bound_name: str,
@@ -8708,7 +8871,12 @@ def _authority_provenance_lines(
 def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     """Reuse one module's parsed tree and complete authority summary."""
 
+    source_path = source_path.resolve()
     source = _source_text(source_path).casefold()
+    if not any(
+        marker in source for marker in PROVENANCE_SOURCE_MARKERS
+    ) and not _source_or_imports_may_expose_provenance(source_path):
+        return frozenset()
     tree = _parsed_module(source_path)
     imported_or_local_provenance = _module_provenance_constant_aliases(
         tree, source_path
@@ -8717,8 +8885,7 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
         _module_imported_provenance_return_helper_aliases(tree, source_path)
     )
     if not any(
-        marker in source
-        for marker in ("causation", "orchestrator", "current_chain")
+        marker in source for marker in PROVENANCE_SOURCE_MARKERS
     ) and not imported_or_local_provenance and not imported_provenance_helpers:
         return frozenset()
     return frozenset(
@@ -9380,6 +9547,14 @@ def test_provenance_scanner_follows_mutable_container_writes() -> None:
         "    if any(decisions):\n"
         "        terminate_child(target)\n"
     )
+    selected_target = ast.parse(
+        "def dispatch(request, target):\n"
+        "    selected = []\n"
+        "    if request.causation_chain:\n"
+        "        selected.append(target)\n"
+        "    for item in selected:\n"
+        "        item.shutdown()\n"
+    )
 
     assert _authority_provenance_lines(append_decision) == {4}
     assert _authority_provenance_lines(update_decision) == {6}
@@ -9387,6 +9562,7 @@ def test_provenance_scanner_follows_mutable_container_writes() -> None:
     assert _authority_provenance_lines(setattr_decision) == {5}
     assert _authority_provenance_lines(aliased_decision) == {5}
     assert _authority_provenance_lines(rebound_alias_decision) == {6}
+    assert _authority_provenance_lines(selected_target) == {5, 6}
 
 
 def test_provenance_scanner_follows_higher_order_control_dispatch() -> None:
