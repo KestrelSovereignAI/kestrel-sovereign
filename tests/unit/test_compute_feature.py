@@ -695,7 +695,7 @@ class TestDestructivePolicy:
         assert "host Hold custody" in result.stderr
         assert host_db.read_text() == "sovereign state"
 
-    @pytest.mark.parametrize("api", ["builtins", "pathlib"])
+    @pytest.mark.parametrize("api", ["builtins", "pathlib", "io"])
     @pytest.mark.parametrize("mode", ["w", "a", "x", "r+b"])
     def test_python_wrapper_blocks_every_write_capable_open_mode_for_hold_custody(
         self,
@@ -722,9 +722,17 @@ class TestDestructivePolicy:
         opener = (
             f"open({str(target)!r}, {mode!r})"
             if api == "builtins"
-            else f"Path({str(target)!r}).open({mode!r})"
+            else (
+                f"Path({str(target)!r}).open({mode!r})"
+                if api == "pathlib"
+                else f"io.open({str(target)!r}, {mode!r})"
+            )
         )
-        import_line = "from pathlib import Path\n" if api == "pathlib" else ""
+        import_line = (
+            "from pathlib import Path\n"
+            if api == "pathlib"
+            else ("import io\n" if api == "io" else "")
+        )
         script_path = tmp_path / f"{api}-{mode.replace('+', 'plus')}.py"
         script_path.write_text(
             policy.rewrite_python_script(
@@ -746,6 +754,83 @@ class TestDestructivePolicy:
             assert not target.exists()
         else:
             assert target.read_bytes() == b"sovereign state"
+
+    def test_python_wrapper_blocks_case_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Generated guards honor the target volume's case identity."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "HOST-DATA" / "host-features.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        rewritten = policy.rewrite_python_script(
+            f"open({str(alias)!r}, 'w').write('gone')\n"
+        )
+        # Make the volume result deterministic on Linux CI while retaining the
+        # same runtime wiring used by native APFS/Windows detection.
+        rewritten = rewritten.replace(
+            "del _kestrel_runtime_namespace\n",
+            "_kestrel_runtime_namespace['_filesystem_is_case_insensitive'] = "
+            "lambda _path: True\n"
+            "del _kestrel_runtime_namespace\n",
+            1,
+        )
+        script_path = tmp_path / "case-alias.py"
+        script_path.write_text(rewritten)
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert target.read_bytes() == b"sovereign state"
+
+    def test_parent_policy_blocks_uncreated_case_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Rewrite-time admission uses the same filesystem identity rule."""
+
+        from kestrel_sovereign.security import path_identity
+
+        current = tmp_path / "agent_data"
+        current.mkdir()
+        host_data = current / "host-data"
+        alias = current / "HOST-DATA" / "future.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        monkeypatch.setattr(
+            path_identity,
+            "_filesystem_is_case_insensitive",
+            lambda _path: True,
+        )
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        assert policy.host_control_data_path == host_data
+        assert policy.touches_host_hold_custody(alias)
+        with pytest.raises(AgentDataProtectionError, match="host Hold custody"):
+            policy.assert_agent_data_deletion_allowed(alias)
 
     @pytest.mark.parametrize(
         ("flags", "target_exists"),

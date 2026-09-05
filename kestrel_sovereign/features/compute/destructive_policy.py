@@ -17,6 +17,9 @@ import shlex
 from typing import Optional
 
 from kestrel_sovereign.host_features.storage import host_database_path
+from kestrel_sovereign.security.path_identity import (
+    paths_overlap_by_filesystem_identity,
+)
 
 from . import python_delete_runtime
 from .shell_rewriter import ShellRewriteError, ShellScriptRewriter
@@ -163,11 +166,7 @@ class DestructiveOperationPolicy:
         except (OSError, RuntimeError, ValueError):
             return False
         protected = self.host_control_data_path
-        return (
-            resolved == protected
-            or resolved.is_relative_to(protected)
-            or protected.is_relative_to(resolved)
-        )
+        return paths_overlap_by_filesystem_identity(resolved, protected)
 
     def assert_agent_data_deletion_allowed(
         self,

@@ -505,6 +505,38 @@ class TestMultiAgentConfigLoading:
         with pytest.raises(ValueError, match="overlaps host Hold custody"):
             MultiAgentConfig.from_file(config_path)
 
+    def test_uncreated_case_alias_cannot_overlap_host_custody(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Admission predicts aliases before either leaf is created."""
+
+        from kestrel_sovereign.security import path_identity
+
+        root = tmp_path / "agent_data"
+        root.mkdir()
+        host_dir = root / "host-data"
+        agent_dir = root / "HOST-DATA" / "alice"
+        monkeypatch.setattr(
+            path_identity,
+            "_filesystem_is_case_insensitive",
+            lambda _path: True,
+        )
+        config_path = tmp_path / "multi_agent.toml"
+        config_path.write_text(
+            "[agents.alice]\n"
+            f'data_dir = "{agent_dir}"\n'
+            "port = 8801\n",
+            encoding="utf-8",
+        )
+        runtime_env = {
+            "KESTREL_HOST_DB_PATH": str(host_dir / "host-features.db"),
+        }
+
+        with pytest.raises(ValueError, match="overlaps host Hold custody"):
+            MultiAgentConfig.from_file(config_path, runtime_env=runtime_env)
+
     def test_from_file_uses_target_project_env_over_ambient_shell(
         self,
         tmp_path,

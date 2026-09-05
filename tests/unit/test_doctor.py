@@ -2567,6 +2567,36 @@ def test_postgres_doctor_skips_external_evidence_for_sqlite_hold(
 
 
 @pytest.mark.parametrize(
+    ("claimed_backend", "selected_backend"),
+    (("sqlite", "postgres"), ("postgres", "sqlite")),
+)
+def test_doctor_rejects_hold_backend_switch_before_readiness_probe(
+    tmp_path,
+    claimed_backend,
+    selected_backend,
+):
+    """Doctor predicts the runtime's immutable backend custody gate."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.hold.state import claim_hold_backend_custody
+
+    database = tmp_path / "host-data" / "host-features.db"
+    claim_hold_backend_custody(database, claimed_backend)
+    env = {
+        "KESTREL_HOST_DB_PATH": str(database),
+        "KESTREL_DB_BACKEND": selected_backend,
+        "KESTREL_HOLD_BACKEND": selected_backend,
+    }
+    report = doctor.DoctorReport()
+
+    doctor._check_postgres_hold_readiness(env, tmp_path, [], report)
+
+    assert not report.ready
+    assert "backend switch" in report.fail[0]
+    assert "verified migration" in report.fail[0]
+
+
+@pytest.mark.parametrize(
     "unsafe_environment",
     (
         {"KESTREL_ENV": "production", "KESTREL_DEMO_SERVER": "1"},

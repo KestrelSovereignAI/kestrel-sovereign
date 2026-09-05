@@ -9,11 +9,13 @@ their execution environment.
 import builtins as _builtins
 from contextvars import ContextVar as _ContextVar
 from datetime import datetime as _datetime, timezone as _timezone
+import io as _io
 import json as _json
 import os as _os
 from pathlib import Path as _Path
 import shutil as _shutil
 import tempfile as _tempfile
+import unicodedata as _unicodedata
 
 
 class _KestrelAgentDataProtectionError(PermissionError):
@@ -23,6 +25,65 @@ class _KestrelAgentDataProtectionError(PermissionError):
 def _is_relative_to(path: _Path, parent: _Path) -> bool:
     """Use component-aware containment; string prefixes are never boundaries."""
     return path == parent or path.is_relative_to(parent)
+
+
+def _nearest_existing_path(path: _Path) -> _Path:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _alternate_case(name: str) -> str | None:
+    for position, character in enumerate(name):
+        swapped = character.swapcase()
+        if swapped != character:
+            return name[:position] + swapped + name[position + 1 :]
+    return None
+
+
+def _filesystem_is_case_insensitive(path: _Path) -> bool:
+    if _os.name == "nt":
+        return True
+    existing = _nearest_existing_path(path)
+    for candidate in (existing, *existing.parents):
+        alternate_name = _alternate_case(candidate.name)
+        if alternate_name is None:
+            continue
+        alternate = candidate.with_name(alternate_name)
+        try:
+            if alternate.exists() and candidate.samefile(alternate):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _casefolded_parts(path: _Path) -> tuple[str, ...]:
+    return tuple(
+        _unicodedata.normalize("NFD", part).casefold() for part in path.parts
+    )
+
+
+def _paths_overlap_by_filesystem_identity(first: _Path, second: _Path) -> bool:
+    first = first.resolve(strict=False)
+    second = second.resolve(strict=False)
+    if _is_relative_to(first, second) or _is_relative_to(second, first):
+        return True
+    try:
+        if first.exists() and second.exists() and first.samefile(second):
+            return True
+    except OSError:
+        pass
+    if not (
+        _filesystem_is_case_insensitive(first)
+        or _filesystem_is_case_insensitive(second)
+    ):
+        return False
+    first_parts = _casefolded_parts(first)
+    second_parts = _casefolded_parts(second)
+    shorter = min(len(first_parts), len(second_parts))
+    return first_parts[:shorter] == second_parts[:shorter]
 
 
 def _is_agent_data_path(path: _Path) -> bool:
@@ -71,6 +132,7 @@ def install_safe_delete_runtime(
     original_truncate = _os.truncate
     original_os_open = _os.open
     original_open = _builtins.open
+    original_io_open = _io.open
     original_rmtree = _shutil.rmtree
     original_path_open = _Path.open
     internal_filesystem_operation = _ContextVar(
@@ -101,9 +163,7 @@ def install_safe_delete_runtime(
             pass
 
     def assert_agent_data_allowed(path: _Path, action: str) -> None:
-        if _is_relative_to(path, host_control_data) or _is_relative_to(
-            host_control_data, path
-        ):
+        if _paths_overlap_by_filesystem_identity(path, host_control_data):
             audit_agent_data(path, action, "blocked", "host_hold_custody")
             raise _KestrelAgentDataProtectionError(
                 f"Refusing to {action} host Hold custody: {path}"
@@ -120,9 +180,7 @@ def install_safe_delete_runtime(
 
     def direct_delete_root(path: _Path) -> _Path | None:
         """Return the concrete root that owns ``path`` at operation time."""
-        if _is_relative_to(path, host_control_data) or _is_relative_to(
-            host_control_data, path
-        ):
+        if _paths_overlap_by_filesystem_identity(path, host_control_data):
             return None
         for configured_prefix in configured_prefixes:
             prefix_parent = configured_prefix.parent.resolve(strict=False)
@@ -252,6 +310,16 @@ def install_safe_delete_runtime(
             return original_open(resolved, mode, *args, **kwargs)
         return original_open(file, mode, *args, **kwargs)
 
+    def safe_io_open(file, mode="r", *args, **kwargs):
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
+            try:
+                resolved = _Path(file).expanduser().resolve(strict=False)
+            except TypeError:
+                return original_io_open(file, mode, *args, **kwargs)
+            assert_agent_data_allowed(resolved, "open_write")
+            return original_io_open(resolved, mode, *args, **kwargs)
+        return original_io_open(file, mode, *args, **kwargs)
+
     def safe_os_open(file, flags, mode=0o777, *, dir_fd=None):
         mutation_flags = (
             _os.O_WRONLY
@@ -308,6 +376,7 @@ def install_safe_delete_runtime(
     _os.truncate = safe_truncate
     _os.open = safe_os_open
     _builtins.open = safe_open
+    _io.open = safe_io_open
     _shutil.rmtree = safe_rmtree
 
     # Path is an alias of the platform's concrete Path class.  Patching that

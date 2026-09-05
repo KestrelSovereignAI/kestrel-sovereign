@@ -991,6 +991,16 @@ def _check_postgres_hold_readiness(
                 "non-production Kite demo"
             )
             return
+    from kestrel_sovereign.hold.state import validate_hold_backend_custody
+
+    try:
+        validate_hold_backend_custody(
+            _sqlite_hold_database_path(env, project_dir),
+            hold_backend,
+        )
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(f"Hold backend custody NOT verified: {exc}")
+        return
     if hold_backend != "postgres":
         return
     if not primary_dsn:

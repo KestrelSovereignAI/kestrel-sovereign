@@ -1226,6 +1226,78 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
 
 
 @pytest.mark.asyncio
+async def test_host_context_refuses_sqlite_to_postgres_hold_backend_switch(
+    monkeypatch,
+    tmp_path,
+):
+    """A fresh PostgreSQL pair cannot abandon an active SQLite authority."""
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    database = tmp_path / "host.db"
+    first = await build_host_context(db_path=str(database))
+    try:
+        assert first.hold_store is not None, first.backend_error
+        mutation = await first.hold_store.set_hold(
+            scope="host",
+            actor_id="did:sovereign:operator",
+            reason="must not disappear during backend selection",
+            operation_id="hold-before-postgres-switch",
+        )
+        assert mutation.current is not None
+    finally:
+        await close_host_context_resources(first)
+
+    async def forbidden_initializer(*_args, **_kwargs):
+        pytest.fail("PostgreSQL initialization preceded backend custody refusal")
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://fresh/primary")
+    monkeypatch.setenv(
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "postgresql://fresh/evidence",
+    )
+    monkeypatch.setattr(
+        hold_state,
+        "initialize_postgres_hold_databases",
+        forbidden_initializer,
+    )
+
+    switched = await build_host_context(db_path=str(database))
+    try:
+        assert switched.hold_store is None
+        assert "backend switch" in switched.backend_error
+        assert "verified migration" in switched.backend_error
+    finally:
+        await close_host_context_resources(switched)
+
+
+@pytest.mark.asyncio
+async def test_host_context_refuses_postgres_to_sqlite_hold_backend_switch(
+    monkeypatch,
+    tmp_path,
+):
+    """A local empty store cannot replace previously selected PostgreSQL Hold."""
+
+    from kestrel_sovereign.hold.state import claim_hold_backend_custody
+
+    database = tmp_path / "host.db"
+    claim_hold_backend_custody(database, "postgres")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
+    monkeypatch.delenv("KESTREL_HOLD_BACKEND", raising=False)
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+
+    switched = await build_host_context(db_path=str(database))
+    try:
+        assert switched.hold_store is None
+        assert "backend switch" in switched.backend_error
+        assert "verified migration" in switched.backend_error
+    finally:
+        await close_host_context_resources(switched)
+
+
+@pytest.mark.asyncio
 async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
     monkeypatch,
     tmp_path,
@@ -4456,6 +4528,94 @@ async def test_external_history_anchor_rejects_empty_initialized_backup_restore(
 
 
 @pytest.mark.asyncio
+async def test_custody_head_rejects_synchronized_sqlite_family_rollback(
+    tmp_path,
+):
+    """A stopped restore cannot roll the DB and basename sidecars back together."""
+
+    path = tmp_path / "synchronized-rollback.db"
+    backup = tmp_path / "old-family"
+    backup.mkdir()
+    first_db = await AsyncDatabase.sqlite(str(path))
+    first = HoldStore(first_db)
+    await first.ensure_schema()
+    await first_db.close()
+    for artifact in tmp_path.glob(f"{path.name}*"):
+        shutil.copyfile(artifact, backup / artifact.name)
+
+    held_db = await AsyncDatabase.sqlite(str(path))
+    held = HoldStore(held_db)
+    await held.ensure_schema()
+    mutation = await held.set_hold(
+        scope="host",
+        actor_id="did:sovereign:operator",
+        reason="must survive a synchronized family restore",
+        operation_id="hold-before-synchronized-family-restore",
+    )
+    assert mutation.current is not None
+    await held_db.close()
+
+    for artifact in backup.iterdir():
+        shutil.copyfile(artifact, tmp_path / artifact.name)
+
+    restored_db = await AsyncDatabase.sqlite(str(path))
+    try:
+        with pytest.raises(HoldCorruptStateError, match="custody marker"):
+            await HoldStore(restored_db).ensure_schema()
+    finally:
+        await restored_db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_recovers_anchor_published_before_custody_head(
+    tmp_path,
+    monkeypatch,
+):
+    """A crash between the two external heads remains provably recoverable."""
+
+    path = tmp_path / "interrupted-custody-head.db"
+    db = await AsyncDatabase.sqlite(str(path))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    publish_custody = store._write_sqlite_custody_marker
+
+    def interrupt_custody_publication(_history_anchor):
+        raise RuntimeError("injected interruption before custody head")
+
+    monkeypatch.setattr(
+        store,
+        "_write_sqlite_custody_marker",
+        interrupt_custody_publication,
+    )
+    with pytest.raises(RuntimeError, match="before custody head"):
+        await store.set_hold(
+            scope="host",
+            actor_id="did:sovereign:operator",
+            reason="committed before external publication completed",
+            operation_id="interrupted-custody-head-hold",
+        )
+    monkeypatch.setattr(store, "_write_sqlite_custody_marker", publish_custody)
+    await db.close()
+    path.chmod(0o600)
+
+    diagnostic_state = validate_sqlite_hold_readiness(path)
+    assert len(diagnostic_state) == 1
+    assert diagnostic_state[0].scope is HoldScope.HOST
+
+    reopened_db = await AsyncDatabase.sqlite(str(path))
+    reopened = HoldStore(reopened_db)
+    try:
+        await reopened.ensure_schema()
+        boot_state = await reopened.read_boot_state()
+        assert len(boot_state) == 1
+        assert boot_state[0].scope is HoldScope.HOST
+        assert reopened._history_candidate_path is not None
+        assert not reopened._history_candidate_path.exists()
+    finally:
+        await reopened_db.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_external_anchor_rejects_primary_snapshot_rollback(
     tmp_path,
 ):
@@ -5242,4 +5402,8 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
     # history-destruction API; this fixture-only cleanup must deliberately
     # advance the independent anchor to the empty test state.
     await store._write_history_anchor()
+    if store._custody_marker_path is not None:
+        store._write_sqlite_custody_marker(
+            await store._current_history_anchor_payload()
+        )
     await store.ensure_schema()

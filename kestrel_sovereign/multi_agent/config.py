@@ -23,6 +23,9 @@ from kestrel_sovereign.identity.local_anchor import (
     read_anchor_agent_did_sync,
 )
 from kestrel_sovereign.paths import spawned_agent_env
+from kestrel_sovereign.security.path_identity import (
+    paths_overlap_by_filesystem_identity,
+)
 from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
@@ -83,9 +86,9 @@ def _host_control_directory(
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
-    """Return whether either resolved custody root contains the other."""
+    """Return whether either custody root contains the other on its volume."""
 
-    return first == second or first in second.parents or second in first.parents
+    return paths_overlap_by_filesystem_identity(first, second)
 
 # Canonical modules for the features that form every agent's sovereignty
 # foundation. Discovery imports these modules explicitly and fails closed, so

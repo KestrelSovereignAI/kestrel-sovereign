@@ -332,6 +332,7 @@ async def build_host_context(
     try:
         from kestrel_sovereign.hold import HoldStore
         from kestrel_sovereign.hold.state import (
+            claim_hold_backend_custody,
             hold_history_anchor_path,
             hold_initialization_witness_path,
             initialize_postgres_hold_databases,
@@ -388,6 +389,7 @@ async def build_host_context(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
                     "independent rollback domain"
                 )
+            claim_hold_backend_custody(resolved, hold_backend)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding
             # useful concurrency. The paired initializer keeps both pools
@@ -403,6 +405,7 @@ async def build_host_context(
             initialization_witness_path = None
             history_anchor_path = None
         else:
+            claim_hold_backend_custody(resolved, hold_backend)
             hold_db = db
             hold_location = str(resolved)
             initialization_witness_path = hold_initialization_witness_path(

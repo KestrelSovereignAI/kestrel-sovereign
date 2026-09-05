@@ -49,13 +49,20 @@ an operator moves the mounted data root. Custom images must provide an
 equivalent persistent mount; the process-home default is not a durability
 boundary inside a replaceable container.
 
-SQLite Hold also writes a database-name-bound initialization marker under the
+SQLite Hold also writes a database-name-bound receipt-history head under the
 private `<host-data>/.hold-custody/` directory. Its filename does not share the
-database basename: replacing `host-features.db*` therefore leaves a durable fact
-that the store existed, and a later boot refuses to reinterpret the missing
-family as a new empty installation. The marker is evidence, not a backup;
-operators must preserve it with the host-data directory and restore the database
-family rather than deleting the marker to make a failed custody check pass.
+database basename: replacing or rolling back `host-features.db*` therefore
+leaves both the fact that the store existed and the latest receipt head. A later
+boot refuses to reinterpret a missing family as a new empty installation or to
+accept an older, internally consistent database-and-sidecar backup. The marker
+is evidence, not a backup; operators must preserve it with the host-data
+directory and restore the database family rather than deleting the marker to
+make a failed custody check pass.
+
+The same directory carries an immutable `sqlite` or `postgres` backend binding.
+Kestrel claims it before first Hold initialization and refuses a later backend
+change unless an operator performs a verified state migration. Selecting a
+fresh empty backend is never an implicit release of latches or receipt history.
 
 ## Secure SQLite creation
 
