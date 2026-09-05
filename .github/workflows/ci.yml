@@ -394,6 +394,15 @@ jobs:
         env:
           KESTREL_AUDIT_MODE: skip
 
+      - name: Run cross-agent authority audit
+        # The exhaustive repository scan is an explicit gate rather than a
+        # minute-long tax on every ordinary sequential unit run. Keep xdist and
+        # the per-test hang guard identical to the main unit tier.
+        run: >-
+          uv run pytest tests/unit/test_cross_agent_authority_audit.py
+          -m authority_audit --run-authority-audit
+          -n auto -v --tb=short -x --timeout=60
+
       - name: Run voice playback JavaScript tests
         run: >-
           node --test

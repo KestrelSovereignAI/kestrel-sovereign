@@ -415,6 +415,7 @@ markers = [
     "integration: marks tests as integration tests",
     "load: Load/stress tests (opt-in with --run-load)",
     "adversarial: Security/bypass attempt tests for constitutional protections",
+    "authority_audit: Exhaustive repository-wide cross-agent authority scan (opt in with --run-authority-audit; dedicated CI gate)",
     "dual_backend: Tests that run on both SQLite and PostgreSQL",
     "cloud_resource: Tests that use cloud resources (RunPod, GPU, etc)",
     "docker: Tests that require Docker",

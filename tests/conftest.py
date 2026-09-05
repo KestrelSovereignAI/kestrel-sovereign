@@ -95,10 +95,27 @@ def pytest_addoption(parser):
         default=False,
         help="Run tests that require cloud resources (RunPod, etc.)"
     )
+    parser.addoption(
+        "--run-authority-audit",
+        action="store_true",
+        default=False,
+        help="Run exhaustive repository-wide authority audit tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip cloud_resource tests unless --run-cloud is provided."""
+    """Apply opt-in gates, then delegate shared cleanup collection hooks."""
+
+    if not config.getoption("--run-authority-audit"):
+        skip_authority_audit = pytest.mark.skip(
+            reason=(
+                "exhaustive authority audit requires --run-authority-audit; "
+                "CI runs it as a dedicated gate"
+            )
+        )
+        for item in items:
+            if "authority_audit" in item.keywords:
+                item.add_marker(skip_authority_audit)
     _cleanup_collection_modifyitems(config, items)
 
 

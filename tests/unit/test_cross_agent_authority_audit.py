@@ -4996,6 +4996,31 @@ def test_repository_discovery_results_are_cached_and_immutable() -> None:
     )
 
 
+def test_exhaustive_repository_scan_is_an_explicit_ci_gate() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    scan = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        == "test_causation_and_orchestrator_metadata_are_not_permission_inputs"
+    )
+    assert any(
+        isinstance(decorator, ast.Attribute)
+        and ast.unparse(decorator) == "pytest.mark.authority_audit"
+        for decorator in scan.decorator_list
+    )
+
+    conftest = (REPO_ROOT / "tests/conftest.py").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '"--run-authority-audit"' in conftest
+    assert '"authority_audit" in item.keywords' in conftest
+    assert "-m authority_audit --run-authority-audit" in workflow
+
+
 def test_provenance_return_summaries_skip_authority_body_scans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7071,6 +7096,9 @@ def _class_provenance_state_aliases(
     tree: ast.AST,
     provenance_return_helpers: set[str] | None = None,
     module_provenance_aliases: set[str] | None = None,
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
 ) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
     """Share provenance-bearing ``self``/``cls`` state across class methods."""
 
@@ -7091,6 +7119,11 @@ def _class_provenance_state_aliases(
             changed = False
             for method in methods:
                 aliases = set(module_provenance_aliases or ()) | shared
+                visible_helpers = set(provenance_return_helpers or ()) | set(
+                    (function_imported_provenance_helpers or {}).get(
+                        method, ()
+                    )
+                )
                 container_aliases = _mutable_container_alias_snapshots(method)
                 method_changed = True
                 while method_changed:
@@ -7159,7 +7192,7 @@ def _class_provenance_state_aliases(
                         calls_helper = any(
                             isinstance(child, ast.Call)
                             and _call_name(child).casefold()
-                            in (provenance_return_helpers or set())
+                            in visible_helpers
                             for child in ast.walk(value)
                         )
                         if not (
@@ -7194,6 +7227,9 @@ def _class_provenance_state_aliases(
 def _local_control_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     imported_control_aliases: set[str] | None = None,
+    function_imported_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
 ) -> set[str]:
     """Find local helpers that eventually invoke a control sink.
 
@@ -7291,9 +7327,12 @@ def _local_control_helpers(
             function_name = function.name.casefold()
             if function_name in helper_names:
                 continue
+            visible_control_aliases = helper_names | set(
+                (function_imported_control_aliases or {}).get(function, ())
+            )
             if any(
                 isinstance(node, ast.Call)
-                and _is_unambiguous_control_sink(node, helper_names)
+                and _is_unambiguous_control_sink(node, visible_control_aliases)
                 # An unresolved immediately-invoked ``getattr`` fails closed
                 # when it is itself provenance-guarded. Do not promote every
                 # neutral helper containing one into a repository-wide
@@ -7314,7 +7353,13 @@ def _local_control_helpers(
                 if _call_name(call).casefold() != function_name:
                     continue
                 caller_aliases = _cross_agent_control_aliases(
-                    caller, helper_names
+                    caller,
+                    helper_names
+                    | set(
+                        (function_imported_control_aliases or {}).get(
+                            caller, ()
+                        )
+                    ),
                 )
                 if any(
                     is_control_reference(argument, caller_aliases)
@@ -7336,6 +7381,9 @@ def _local_provenance_return_helpers(
     function_initial_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] | None = None,
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
 ) -> set[str]:
     """Find visible helpers whose return value is provenance-derived.
 
@@ -7352,9 +7400,14 @@ def _local_provenance_return_helpers(
         for function in functions:
             if function.name.casefold() in helper_names:
                 continue
+            visible_helpers = helper_names | set(
+                (function_imported_provenance_helpers or {}).get(
+                    function, ()
+                )
+            )
             aliases, _selected_targets = _provenance_aliases(
                 function,
-                helper_names,
+                visible_helpers,
                 control_helpers,
                 set(module_provenance_aliases or ())
                 | set((function_initial_aliases or {}).get(function, ())),
@@ -7371,12 +7424,12 @@ def _local_provenance_return_helpers(
                     call_name = _call_name(value).casefold()
                     calls_known_helper = any(
                         isinstance(child, ast.Call)
-                        and _call_name(child).casefold() in helper_names
+                        and _call_name(child).casefold() in visible_helpers
                         for child in ast.walk(value)
                     )
                     returns_provenance = (
                         _is_provenance_accessor_call(value)
-                        or call_name in helper_names
+                        or call_name in visible_helpers
                         or call_name in PROVENANCE_TRANSFORM_CALLS
                         and (
                             _has_provenance_token(value, aliases)
@@ -7646,15 +7699,48 @@ def _guard_clause_provenance_lines(
     return lines
 
 
-def _module_imported_control_aliases(
-    tree: ast.AST,
+def _lexical_scope_imports(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    """Return imports executed in exactly one lexical scope.
+
+    Module imports are limited to the module body. Function-local imports may
+    live under ordinary compound statements, but imports in nested functions
+    or classes belong to those child scopes and are deliberately excluded.
+    """
+
+    nodes: tuple[ast.AST, ...] = (
+        tuple(scope.body)
+        if isinstance(scope, ast.Module)
+        else _walk_lexical_scope(scope)
+    )
+    return tuple(
+        node for node in nodes if isinstance(node, (ast.Import, ast.ImportFrom))
+    )
+
+
+def _lexical_scope_calls(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.Call]:
+    """Return calls that can consume bindings visible in one import scope."""
+
+    nodes: tuple[ast.AST, ...] = (
+        tuple(ast.walk(scope))
+        if isinstance(scope, ast.Module)
+        else _walk_lexical_scope(scope)
+    )
+    return [node for node in nodes if isinstance(node, ast.Call)]
+
+
+def _scope_imported_control_aliases(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
     source_path: Path | None = None,
     seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
 ) -> set[str]:
-    """Return neutral local names imported from control-shaped callables."""
+    """Return control-callable imports visible within one lexical scope."""
 
-    if not isinstance(tree, ast.Module):
-        return set()
+    import_nodes = _lexical_scope_imports(scope)
 
     def is_control_callable(name: str) -> bool:
         lowered = name.casefold()
@@ -7683,7 +7769,7 @@ def _module_imported_control_aliases(
 
     aliases = {
         (imported.asname or imported.name).casefold()
-        for node in tree.body
+        for node in import_nodes
         if isinstance(node, ast.ImportFrom)
         for imported in node.names
         if is_control_callable(imported.name)
@@ -7742,7 +7828,8 @@ def _module_imported_control_aliases(
                 self._record([node.target], node.value)
                 self.generic_visit(node.value)
 
-        ModuleAssignmentVisitor().visit(tree)
+        for statement in scope.body:
+            ModuleAssignmentVisitor().visit(statement)
         changed = True
         while changed:
             changed = False
@@ -7762,9 +7849,9 @@ def _module_imported_control_aliases(
 
     source_path = source_path.resolve()
     seen = seen or frozenset()
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    called_names = {_call_name(call).casefold() for call in calls}
-    for node in tree.body:
+    visible_calls = calls if calls is not None else _lexical_scope_calls(scope)
+    called_names = {_call_name(call).casefold() for call in visible_calls}
+    for node in import_nodes:
         if isinstance(node, ast.ImportFrom):
             if node.module is None:
                 for imported in node.names:
@@ -7776,9 +7863,9 @@ def _module_imported_control_aliases(
                     if child_path is None:
                         continue
                     module_calls = _module_attribute_call_names(
-                        calls,
+                        visible_calls,
                         (imported.asname or imported.name).casefold(),
-                        tree,
+                        scope if isinstance(scope, ast.Module) else None,
                     )
                     aliases.update(
                         _repository_control_helper_names(
@@ -7821,7 +7908,9 @@ def _module_imported_control_aliases(
                     continue
                 qualifier = (imported.asname or imported.name).casefold()
                 member_calls = _module_attribute_call_names(
-                    calls, qualifier, tree
+                    visible_calls,
+                    qualifier,
+                    scope if isinstance(scope, ast.Module) else None,
                 )
                 aliases.update(
                     _repository_control_helper_names(
@@ -7840,7 +7929,9 @@ def _module_imported_control_aliases(
                     continue
                 bound_name = (imported.asname or imported.name).casefold()
                 module_calls = _module_attribute_call_names(
-                    calls, bound_name, tree
+                    visible_calls,
+                    bound_name,
+                    scope if isinstance(scope, ast.Module) else None,
                 )
                 aliases.update(
                     _repository_control_helper_names(
@@ -7850,6 +7941,19 @@ def _module_imported_control_aliases(
                     )
                 )
     return include_module_assignment_aliases()
+
+
+def _module_imported_control_aliases(
+    tree: ast.AST,
+    source_path: Path | None = None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
+) -> set[str]:
+    """Return control imports visible to every function in one module."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+    return _scope_imported_control_aliases(tree, source_path, seen, calls)
 
 
 def _module_provenance_constant_aliases(
@@ -7970,6 +8074,9 @@ def _module_provenance_state_aliases(
     function_accessor_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ],
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
 ) -> set[str]:
     """Share provenance stored through explicit module-global assignments."""
 
@@ -7991,7 +8098,12 @@ def _module_provenance_state_aliases(
             inherited = analyze(parent) if parent is not None else set()
             resolved, _selected_targets = _provenance_aliases(
                 function,
-                provenance_return_helpers,
+                provenance_return_helpers
+                | set(
+                    (function_imported_provenance_helpers or {}).get(
+                        function, ()
+                    )
+                ),
                 initial_aliases=(
                     aliases
                     | inherited
@@ -8051,18 +8163,24 @@ def _resolved_repository_import_path(
 
 
 @lru_cache(maxsize=None)
-def _repository_import_paths(source_path: Path) -> frozenset[Path]:
-    """Return repository modules reachable by one static import edge."""
+def _scope_repository_import_paths(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path,
+) -> frozenset[Path]:
+    """Resolve referenced repository imports in exactly one lexical scope."""
 
-    source_path = source_path.resolve()
-    tree = _parsed_module(source_path)
+    scope_nodes: tuple[ast.AST, ...] = (
+        tuple(ast.walk(scope))
+        if isinstance(scope, ast.Module)
+        else _walk_lexical_scope(scope)
+    )
     referenced_names = {
         node.id.casefold()
-        for node in ast.walk(tree)
+        for node in scope_nodes
         if isinstance(node, ast.Name)
     }
     paths: set[Path] = set()
-    for node in tree.body:
+    for node in _lexical_scope_imports(scope):
         candidates: list[tuple[str | None, int]] = []
         if isinstance(node, ast.Import):
             candidates.extend(
@@ -8107,6 +8225,15 @@ def _repository_import_paths(source_path: Path) -> frozenset[Path]:
 
 
 @lru_cache(maxsize=None)
+def _repository_import_paths(source_path: Path) -> frozenset[Path]:
+    """Return repository modules reachable by one static import edge."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    return _scope_repository_import_paths(tree, source_path)
+
+
+@lru_cache(maxsize=None)
 def _source_or_imports_may_expose_provenance(source_path: Path) -> bool:
     """Cheaply over-approximate provenance reachability through imports."""
 
@@ -8122,6 +8249,67 @@ def _source_or_imports_may_expose_provenance(source_path: Path) -> bool:
             return True
         pending.extend(_repository_import_paths(candidate) - seen)
     return False
+
+
+def _scope_or_imports_may_expose_provenance(
+    scope: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None,
+) -> bool:
+    """Bound deep helper resolution to scopes that can consume provenance."""
+
+    lexical_nodes = _walk_lexical_scope(scope)
+    lexical_values = {
+        node.id.casefold()
+        for node in lexical_nodes
+        if isinstance(node, ast.Name)
+    } | {
+        node.attr.casefold()
+        for node in lexical_nodes
+        if isinstance(node, ast.Attribute)
+    } | {
+        node.value.casefold()
+        for node in lexical_nodes
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    if any(
+        marker in value
+        for value in lexical_values
+        for marker in PROVENANCE_SOURCE_MARKERS
+    ):
+        return True
+    if source_path is None:
+        return False
+    return any(
+        _source_or_imports_may_expose_provenance(imported_path)
+        for imported_path in _scope_repository_import_paths(
+            scope,
+            source_path.resolve(),
+        )
+    )
+
+
+def _scope_contains_provenance_marker(
+    scope: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Whether one lexical function scope directly names provenance."""
+
+    return _scope_or_imports_may_expose_provenance(scope, None)
+
+
+@lru_cache(maxsize=None)
+def _function_local_imports_expose_provenance(source_path: Path) -> bool:
+    """Check only invoked local imports that resolve as provenance helpers."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    return any(
+        _scope_imported_provenance_return_helper_aliases(
+            function,
+            source_path,
+        )
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
 
 
 def _module_attribute_call_names(
@@ -8160,6 +8348,37 @@ def _module_attribute_call_names(
     return names
 
 
+def _functions_reachable_by_local_calls(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    requested_names: set[str],
+) -> set[ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Bound import resolution to requested helpers and their local callees."""
+
+    by_name: dict[
+        str, set[ast.FunctionDef | ast.AsyncFunctionDef]
+    ] = {}
+    for function in functions:
+        by_name.setdefault(function.name.casefold(), set()).add(function)
+    reachable = {
+        function
+        for name in requested_names
+        for function in by_name.get(name.casefold(), ())
+    }
+    pending = list(reachable)
+    while pending:
+        function = pending.pop()
+        called_names = {
+            _call_name(call).casefold()
+            for call in _lexical_scope_calls(function)
+        }
+        for name in called_names:
+            for callee in by_name.get(name, ()):
+                if callee not in reachable:
+                    reachable.add(callee)
+                    pending.append(callee)
+    return reachable
+
+
 @lru_cache(maxsize=None)
 def _direct_control_helper_names(source_path: Path) -> frozenset[str]:
     """Summarize control helpers defined within one repository module."""
@@ -8170,10 +8389,19 @@ def _direct_control_helper_names(source_path: Path) -> frozenset[str]:
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
+    # "Direct" summaries must not recursively traverse imports: repository
+    # resolution layers the cycle-aware import graph on top of this result.
+    module_aliases = _module_imported_control_aliases(tree)
     return frozenset(
         _local_control_helpers(
             functions,
-            _module_imported_control_aliases(tree),
+            module_aliases,
+            _function_control_import_aliases(
+                tree,
+                functions,
+                module_aliases,
+                None,
+            ),
         )
     )
 
@@ -8203,19 +8431,38 @@ def _repository_control_helper_names(
         (source_path, name) for name in requested_names - resolved
     }
     tree = _parsed_module(source_path)
-    imported_helpers = _module_imported_control_aliases(
-        tree,
-        source_path,
-        active,
-    )
-    if not imported_helpers:
-        return resolved
     functions = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    all_helpers = _local_control_helpers(functions, imported_helpers)
+    relevant_functions = _functions_reachable_by_local_calls(
+        functions,
+        requested_names,
+    )
+    relevant_calls = [
+        call
+        for function in relevant_functions
+        for call in _lexical_scope_calls(function)
+    ]
+    imported_helpers = _module_imported_control_aliases(
+        tree,
+        source_path,
+        active,
+        relevant_calls,
+    )
+    all_helpers = _local_control_helpers(
+        functions,
+        imported_helpers,
+        _function_control_import_aliases(
+            tree,
+            functions,
+            imported_helpers,
+            source_path,
+            seen=active,
+            eligible_functions=relevant_functions,
+        ),
+    )
     return requested_names.intersection(all_helpers)
 
 
@@ -8233,15 +8480,32 @@ def _direct_provenance_helper_names(source_path: Path) -> frozenset[str]:
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
     )
+    module_control_aliases = _module_imported_control_aliases(tree)
     control_helpers = _local_control_helpers(
         functions,
-        _module_imported_control_aliases(tree),
+        module_control_aliases,
+        _function_control_import_aliases(
+            tree,
+            functions,
+            module_control_aliases,
+            None,
+        ),
     )
+    imported_provenance_helpers: set[str] = set()
     return frozenset(
         _local_provenance_return_helpers(
             functions,
             control_helpers,
             module_provenance_aliases,
+            imported_provenance_helpers,
+            function_imported_provenance_helpers=(
+                _function_provenance_helper_import_aliases(
+                    tree,
+                    functions,
+                    imported_provenance_helpers,
+                    None,
+                )
+            ),
         )
     )
 
@@ -8272,57 +8536,89 @@ def _repository_provenance_helper_names(
         (source_path, name) for name in requested_names - resolved
     }
     tree = _parsed_module(source_path)
-    imported_helpers = _module_imported_provenance_return_helper_aliases(
-        tree,
-        source_path,
-        active,
-    )
-    if not imported_helpers:
-        return resolved
-
     functions = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
+    relevant_functions = _functions_reachable_by_local_calls(
+        functions,
+        requested_names,
+    )
+    relevant_calls = [
+        call
+        for function in relevant_functions
+        for call in _lexical_scope_calls(function)
+    ]
+    imported_helpers = _module_imported_provenance_return_helper_aliases(
+        tree,
+        source_path,
+        active,
+        relevant_calls,
+    )
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
     )
+    module_control_aliases = _module_imported_control_aliases(
+        tree,
+        source_path,
+        active,
+        relevant_calls,
+    )
     control_helpers = _local_control_helpers(
         functions,
-        _module_imported_control_aliases(tree),
+        module_control_aliases,
+        _function_control_import_aliases(
+            tree,
+            functions,
+            module_control_aliases,
+            source_path,
+            seen=active,
+            eligible_functions=relevant_functions,
+        ),
     )
     all_helpers = _local_provenance_return_helpers(
         functions,
         control_helpers,
         module_provenance_aliases,
         imported_helpers,
+        function_imported_provenance_helpers=(
+            _function_provenance_helper_import_aliases(
+                tree,
+                functions,
+                imported_helpers,
+                source_path,
+                seen=active,
+                eligible_functions=relevant_functions,
+            )
+        ),
     )
     return requested_names.intersection(all_helpers)
 
 
-def _module_imported_provenance_return_helper_aliases(
-    tree: ast.AST,
+def _scope_imported_provenance_return_helper_aliases(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
     source_path: Path | None,
     seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
 ) -> set[str]:
-    """Return called local bindings for provenance-returning imports.
+    """Return provenance-helper imports visible in one lexical scope.
 
-    Only follow imports that are actually invoked by this module.  This keeps
+    Only follow imports that are actually invoked by this scope.  This keeps
     the repository-wide contract proportional to the authority call graph
     rather than recursively summarizing the checkout's entire import graph.
     """
 
-    if not isinstance(tree, ast.Module) or source_path is None:
+    if source_path is None:
         return set()
 
     source_path = source_path.resolve()
     seen = seen or frozenset()
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    called_names = {_call_name(call).casefold() for call in calls}
+    visible_calls = calls if calls is not None else _lexical_scope_calls(scope)
+    called_names = {_call_name(call).casefold() for call in visible_calls}
     aliases: set[str] = set()
-    for node in tree.body:
+    for node in _lexical_scope_imports(scope):
         if isinstance(node, ast.ImportFrom):
             if node.module is None:
                 for imported in node.names:
@@ -8331,11 +8627,13 @@ def _module_imported_provenance_return_helper_aliases(
                         imported.name,
                         node.level,
                     )
-                    if child_path is not None:
+                    if child_path is not None and (
+                        _source_or_imports_may_expose_provenance(child_path)
+                    ):
                         module_calls = _module_attribute_call_names(
-                            calls,
+                            visible_calls,
                             (imported.asname or imported.name).casefold(),
-                            tree,
+                            scope if isinstance(scope, ast.Module) else None,
                         )
                         aliases.update(
                             _repository_provenance_helper_names(
@@ -8352,6 +8650,8 @@ def _module_imported_provenance_return_helper_aliases(
                 node.level,
             )
             if imported_path is None:
+                continue
+            if not _source_or_imports_may_expose_provenance(imported_path):
                 continue
             bindings = {
                 (imported.asname or imported.name).casefold(): imported.name.casefold()
@@ -8379,7 +8679,9 @@ def _module_imported_provenance_return_helper_aliases(
                     continue
                 qualifier = (imported.asname or imported.name).casefold()
                 member_calls = _module_attribute_call_names(
-                    calls, qualifier, tree
+                    visible_calls,
+                    qualifier,
+                    scope if isinstance(scope, ast.Module) else None,
                 )
                 aliases.update(
                     _repository_provenance_helper_names(
@@ -8394,10 +8696,14 @@ def _module_imported_provenance_return_helper_aliases(
                     source_path,
                     imported.name,
                 )
-                if imported_path is not None:
+                if imported_path is not None and (
+                    _source_or_imports_may_expose_provenance(imported_path)
+                ):
                     bound_name = (imported.asname or imported.name).casefold()
                     module_calls = _module_attribute_call_names(
-                        calls, bound_name, tree
+                        visible_calls,
+                        bound_name,
+                        scope if isinstance(scope, ast.Module) else None,
                     )
                     aliases.update(
                         _repository_provenance_helper_names(
@@ -8407,6 +8713,24 @@ def _module_imported_provenance_return_helper_aliases(
                         )
                     )
     return aliases
+
+
+def _module_imported_provenance_return_helper_aliases(
+    tree: ast.AST,
+    source_path: Path | None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
+) -> set[str]:
+    """Return provenance-helper imports visible to the module body."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+    return _scope_imported_provenance_return_helper_aliases(
+        tree,
+        source_path,
+        seen,
+        calls,
+    )
 
 
 def _nested_function_parents(
@@ -8445,6 +8769,97 @@ def _nested_function_parents(
     return parents
 
 
+def _visible_import_aliases_by_function(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    module_aliases: set[str],
+    source_path: Path | None,
+    resolver: Callable[
+        [ast.FunctionDef | ast.AsyncFunctionDef, Path | None], set[str]
+    ],
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ],
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
+    """Resolve imported bindings visible at each function's lexical floor."""
+
+    visible: dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]] = {}
+
+    def analyze(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        cached = visible.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = analyze(parent) if parent is not None else module_aliases
+        resolved = set(inherited) | resolver(function, source_path)
+        visible[function] = resolved
+        return resolved
+
+    for function in functions:
+        analyze(function)
+    return visible
+
+
+def _function_control_import_aliases(
+    tree: ast.AST,
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    module_aliases: set[str],
+    source_path: Path | None,
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ] | None = None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    eligible_functions: set[
+        ast.FunctionDef | ast.AsyncFunctionDef
+    ] | None = None,
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
+    return _visible_import_aliases_by_function(
+        functions,
+        module_aliases,
+        source_path,
+        lambda function, path: (
+            _scope_imported_control_aliases(function, path, seen)
+            if eligible_functions is None or function in eligible_functions
+            else set()
+        ),
+        function_parents or _nested_function_parents(tree),
+    )
+
+
+def _function_provenance_helper_import_aliases(
+    tree: ast.AST,
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    module_aliases: set[str],
+    source_path: Path | None,
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ] | None = None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    eligible_functions: set[
+        ast.FunctionDef | ast.AsyncFunctionDef
+    ] | None = None,
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
+    return _visible_import_aliases_by_function(
+        functions,
+        module_aliases,
+        source_path,
+        lambda function, path: (
+            _scope_imported_provenance_return_helper_aliases(
+                function,
+                path,
+                seen,
+            )
+            if eligible_functions is None or function in eligible_functions
+            else set()
+        ),
+        function_parents or _nested_function_parents(tree),
+    )
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -8455,10 +8870,8 @@ def _authority_provenance_lines(
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    module_control_aliases = _module_imported_control_aliases(
-        tree,
-        source_path,
-    )
+    module_control_aliases = _module_imported_control_aliases(tree)
+    function_parents = _nested_function_parents(tree)
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
@@ -8466,8 +8879,59 @@ def _authority_provenance_lines(
     imported_provenance_helpers = (
         _module_imported_provenance_return_helper_aliases(tree, source_path)
     )
-    control_helpers = _local_control_helpers(functions, module_control_aliases)
-    function_parents = _nested_function_parents(tree)
+    function_imported_provenance_helpers = (
+        _function_provenance_helper_import_aliases(
+            tree,
+            functions,
+            imported_provenance_helpers,
+            source_path,
+            function_parents,
+        )
+    )
+    control_import_functions = {
+        function
+        for function in functions
+        if _scope_contains_provenance_marker(function)
+        or any(
+            _call_name(call).casefold()
+            in function_imported_provenance_helpers[function]
+            for call in _lexical_scope_calls(function)
+        )
+    }
+    for function in tuple(control_import_functions):
+        parent = function_parents.get(function)
+        while parent is not None:
+            control_import_functions.add(parent)
+            parent = function_parents.get(parent)
+    control_import_functions.update(
+        _functions_reachable_by_local_calls(
+            functions,
+            {function.name.casefold() for function in control_import_functions},
+        )
+    )
+    relevant_control_calls = [
+        call
+        for function in control_import_functions
+        for call in _lexical_scope_calls(function)
+    ]
+    module_control_aliases = _module_imported_control_aliases(
+        tree,
+        source_path,
+        calls=relevant_control_calls,
+    )
+    function_control_imports = _function_control_import_aliases(
+        tree,
+        functions,
+        module_control_aliases,
+        source_path,
+        function_parents,
+        eligible_functions=control_import_functions,
+    )
+    control_helpers = _local_control_helpers(
+        functions,
+        module_control_aliases,
+        function_control_imports,
+    )
     function_accessor_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
@@ -8505,6 +8969,7 @@ def _authority_provenance_lines(
             tree,
             provenance_return_helpers,
             module_provenance_aliases,
+            function_imported_provenance_helpers,
         )
         provenance_return_helpers = _local_provenance_return_helpers(
             functions,
@@ -8512,6 +8977,7 @@ def _authority_provenance_lines(
             module_provenance_aliases,
             provenance_return_helpers,
             class_provenance_aliases,
+            function_imported_provenance_helpers,
         )
         module_provenance_aliases = _module_provenance_state_aliases(
             functions,
@@ -8520,6 +8986,7 @@ def _authority_provenance_lines(
             module_provenance_aliases,
             class_provenance_aliases,
             function_accessor_aliases,
+            function_imported_provenance_helpers,
         )
         analysis_changed = (
             module_provenance_aliases != previous_module_aliases
@@ -8567,8 +9034,9 @@ def _authority_provenance_lines(
         )
         resolved = _provenance_aliases(
             function,
-            provenance_return_helpers,
-            control_helpers,
+            provenance_return_helpers
+            | function_imported_provenance_helpers[function],
+            control_helpers | function_control_imports[function],
             module_provenance_aliases
             | class_provenance_aliases.get(function, set())
             | inherited,
@@ -8583,9 +9051,14 @@ def _authority_provenance_lines(
     for function in functions:
         function_name = function.name.casefold()
         decision_provenance_helpers = (
-            provenance_return_helpers | function_accessor_aliases[function]
+            provenance_return_helpers
+            | function_imported_provenance_helpers[function]
+            | function_accessor_aliases[function]
         )
-        control_aliases = _cross_agent_control_aliases(function, control_helpers)
+        control_aliases = _cross_agent_control_aliases(
+            function,
+            control_helpers | function_control_imports[function],
+        )
         state_object_aliases = function_state_objects[function]
         provenance_aliases, provenance_selected_targets = (
             function_provenance[function]
@@ -8875,19 +9348,11 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     source = _source_text(source_path).casefold()
     if not any(
         marker in source for marker in PROVENANCE_SOURCE_MARKERS
-    ) and not _source_or_imports_may_expose_provenance(source_path):
+    ) and not _source_or_imports_may_expose_provenance(
+        source_path
+    ) and not _function_local_imports_expose_provenance(source_path):
         return frozenset()
     tree = _parsed_module(source_path)
-    imported_or_local_provenance = _module_provenance_constant_aliases(
-        tree, source_path
-    )
-    imported_provenance_helpers = (
-        _module_imported_provenance_return_helper_aliases(tree, source_path)
-    )
-    if not any(
-        marker in source for marker in PROVENANCE_SOURCE_MARKERS
-    ) and not imported_or_local_provenance and not imported_provenance_helpers:
-        return frozenset()
     return frozenset(
         _authority_provenance_lines(tree, source_path)
     )
@@ -10115,6 +10580,46 @@ def test_provenance_scanner_follows_repository_local_control_helpers(
     assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
 
+def test_provenance_scanner_follows_function_local_imports_without_scope_leaks(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "controls.py").write_text(
+        "def apply(target):\n"
+        "    terminate_child(target)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "lineage.py").write_text(
+        "def decide(request):\n"
+        "    return bool(request.causation_chain)\n",
+        encoding="utf-8",
+    )
+    control_path = tmp_path / "local_control.py"
+    control_path.write_text(
+        "def dispatch(request, target):\n"
+        "    from controls import apply\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n\n"
+        "def sibling(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n",
+        encoding="utf-8",
+    )
+    provenance_path = tmp_path / "local_provenance.py"
+    provenance_path.write_text(
+        "def dispatch(request, target):\n"
+        "    from lineage import decide\n"
+        "    allowed = decide(request)\n"
+        "    if allowed:\n"
+        "        terminate_child(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(control_path) == frozenset({3})
+    assert _cached_authority_provenance_lines(provenance_path) == frozenset(
+        {3, 4}
+    )
+
+
 def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
     wrapped_exits = ast.parse(
         "def with_guard(request, target, lock):\n"
@@ -10379,6 +10884,7 @@ def test_provenance_scanner_excludes_benign_task_and_host_calls() -> None:
         f"{paths[-1].relative_to(REPO_ROOT).as_posix()}"
     ),
 )
+@pytest.mark.authority_audit
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs(
     paths: tuple[Path, ...],
 ) -> None:
