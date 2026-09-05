@@ -1477,8 +1477,27 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self,
             node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
         ) -> None:
+            inherited_aliases = (
+                set(self.aliases[-1])
+                if self.aliases
+                and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else set()
+            )
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                parameters = [
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                ]
+                inherited_aliases.difference_update(
+                    parameter.arg for parameter in parameters
+                )
+                if node.args.vararg is not None:
+                    inherited_aliases.discard(node.args.vararg.arg)
+                if node.args.kwarg is not None:
+                    inherited_aliases.discard(node.args.kwarg.arg)
             self.scope.append(node.name)
-            self.aliases.append(set())
+            self.aliases.append(inherited_aliases)
             self.generic_visit(node)
             self.aliases.pop()
             self.scope.pop()
@@ -3025,6 +3044,23 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
         "example.py::Publisher.direct",
         "example.py::Publisher.replace",
         "example.py::Publisher.union",
+    }
+
+
+def test_dynamic_tool_registry_aliases_flow_into_nested_functions() -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def outer(self):\n"
+        "        registry = self._direct_tools\n"
+        "        def publish(tool):\n"
+        "            registry['x'] = tool\n"
+        "        def shadowed(registry, tool):\n"
+        "            registry['x'] = tool\n"
+        "        return publish, shadowed\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.outer.publish"
     }
 
 
@@ -6108,6 +6144,7 @@ def _class_provenance_state_aliases(
                     method_changed = False
                     for statement in _walk_lexical_scope(method):
                         targets: list[ast.AST] = []
+                        target_names: set[str] = set()
                         value: ast.AST | None = None
                         if isinstance(statement, ast.Assign):
                             targets = list(statement.targets)
@@ -6118,6 +6155,19 @@ def _class_provenance_state_aliases(
                         elif isinstance(statement, ast.NamedExpr):
                             targets = [statement.target]
                             value = statement.value
+                        elif (
+                            isinstance(statement, ast.Call)
+                            and _call_name(statement).casefold() == "setattr"
+                            and len(statement.args) >= 3
+                            and isinstance(statement.args[0], ast.Name)
+                            and statement.args[0].id in {"self", "cls"}
+                        ):
+                            attribute = _resolved_string(statement.args[1])
+                            if attribute is not None:
+                                target_names.add(
+                                    f"{statement.args[0].id}.{attribute}".casefold()
+                                )
+                                value = statement.args[2]
                         if value is None:
                             continue
                         tokens = set(_identifier_tokens(value))
@@ -6160,11 +6210,11 @@ def _class_provenance_state_aliases(
                             or tokens.intersection(aliases)
                         ):
                             continue
-                        target_names = {
+                        target_names.update(
                             name
                             for target in targets
                             for name in _binding_target_names(target)
-                        }
+                        )
                         new_targets = target_names - aliases
                         if new_targets:
                             aliases.update(new_targets)
@@ -6941,6 +6991,70 @@ def _module_imported_provenance_accessor_aliases(tree: ast.AST) -> set[str]:
     return aliases
 
 
+def _module_provenance_state_aliases(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ],
+    provenance_return_helpers: set[str],
+    module_provenance_aliases: set[str],
+    function_initial_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    function_accessor_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+) -> set[str]:
+    """Share provenance stored through explicit module-global assignments."""
+
+    aliases = set(module_provenance_aliases)
+    changed = True
+    while changed:
+        changed = False
+        function_aliases: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+        ] = {}
+
+        def analyze(
+            function: ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> set[str]:
+            cached = function_aliases.get(function)
+            if cached is not None:
+                return cached
+            parent = function_parents.get(function)
+            inherited = analyze(parent) if parent is not None else set()
+            resolved, _selected_targets = _provenance_aliases(
+                function,
+                provenance_return_helpers,
+                initial_aliases=(
+                    aliases
+                    | inherited
+                    | function_initial_aliases.get(function, set())
+                ),
+                authority_analysis=False,
+                provenance_accessor_aliases=function_accessor_aliases.get(
+                    function, set()
+                ),
+            )
+            function_aliases[function] = resolved
+            return resolved
+
+        for function in functions:
+            declared_globals = {
+                name.casefold()
+                for node in _walk_lexical_scope(function)
+                if isinstance(node, ast.Global)
+                for name in node.names
+            }
+            discovered = declared_globals.intersection(analyze(function))
+            new_aliases = discovered - aliases
+            if new_aliases:
+                aliases.update(new_aliases)
+                changed = True
+    return aliases
+
+
 def _resolved_repository_import_path(
     source_path: Path,
     module_name: str | None,
@@ -7297,30 +7411,43 @@ def _authority_provenance_lines(
     for function in functions:
         analyze_function_accessors(function)
 
-    class_provenance_aliases = _class_provenance_state_aliases(
-        tree,
-        imported_provenance_helpers,
-        module_provenance_aliases,
-    )
-    provenance_return_helpers = _local_provenance_return_helpers(
-        functions,
-        control_helpers,
-        module_provenance_aliases,
-        imported_provenance_helpers,
-        class_provenance_aliases,
-    )
-    class_provenance_aliases = _class_provenance_state_aliases(
-        tree,
-        provenance_return_helpers,
-        module_provenance_aliases,
-    )
-    provenance_return_helpers = _local_provenance_return_helpers(
-        functions,
-        control_helpers,
-        module_provenance_aliases,
-        provenance_return_helpers,
-        class_provenance_aliases,
-    )
+    class_provenance_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {}
+    provenance_return_helpers = set(imported_provenance_helpers)
+    analysis_changed = True
+    while analysis_changed:
+        previous_module_aliases = set(module_provenance_aliases)
+        previous_helper_names = set(provenance_return_helpers)
+        previous_class_aliases = {
+            function: set(aliases)
+            for function, aliases in class_provenance_aliases.items()
+        }
+        class_provenance_aliases = _class_provenance_state_aliases(
+            tree,
+            provenance_return_helpers,
+            module_provenance_aliases,
+        )
+        provenance_return_helpers = _local_provenance_return_helpers(
+            functions,
+            control_helpers,
+            module_provenance_aliases,
+            provenance_return_helpers,
+            class_provenance_aliases,
+        )
+        module_provenance_aliases = _module_provenance_state_aliases(
+            functions,
+            function_parents,
+            provenance_return_helpers,
+            module_provenance_aliases,
+            class_provenance_aliases,
+            function_accessor_aliases,
+        )
+        analysis_changed = (
+            module_provenance_aliases != previous_module_aliases
+            or provenance_return_helpers != previous_helper_names
+            or class_provenance_aliases != previous_class_aliases
+        )
     function_state_objects: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
@@ -8125,6 +8252,33 @@ def test_provenance_scanner_propagates_object_state_across_methods() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {6}
+
+
+def test_provenance_scanner_propagates_static_setattr_state_across_methods() -> None:
+    tree = ast.parse(
+        "class Gate:\n"
+        "    def capture(self, request):\n"
+        "        setattr(self, 'ready', bool(request.causation_chain))\n\n"
+        "    def run(self, target):\n"
+        "        if self.ready:\n"
+        "            target.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {6}
+
+
+def test_provenance_scanner_propagates_state_through_module_globals() -> None:
+    tree = ast.parse(
+        "ready = False\n"
+        "def capture(request):\n"
+        "    global ready\n"
+        "    ready = bool(request.causation_chain)\n\n"
+        "def run(target):\n"
+        "    if ready:\n"
+        "        target.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {7}
 
 
 @pytest.mark.parametrize("keyword", ["with", "async with"])
