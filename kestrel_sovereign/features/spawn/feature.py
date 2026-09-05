@@ -565,10 +565,56 @@ class SpawnFeature(Feature):
         return True
 
     async def initialize(self):
-        self._agent_manager = None
-        self._lifecycle = None
+        # A bounded soft-disable may have returned while a cancellation-
+        # resistant delegated turn remains under this feature's detached
+        # shutdown owner. Re-enable must join that owner before resetting any
+        # lifecycle fields or reattaching its manager; otherwise shutdown and
+        # the enabled feature can concurrently own the same runtime.
+        existing_shutdown = getattr(self, "_standalone_shutdown_task", None)
+        if existing_shutdown is not None:
+            from kestrel_sovereign.kestrel_agent import (
+                await_lifecycle_task_completion,
+            )
+
+            cancelled, failure = await await_lifecycle_task_completion(
+                existing_shutdown
+            )
+            if self._standalone_shutdown_task is existing_shutdown:
+                self._standalone_shutdown_task = None
+            recorded_failure = getattr(
+                self, "_standalone_shutdown_failure", None
+            )
+            self._standalone_shutdown_failure = None
+            failure = recorded_failure if recorded_failure is not None else failure
+            if failure is not None:
+                raise failure
+            if cancelled:
+                raise asyncio.CancelledError()
+
+        # Runtime soft-disable stops descendants but deliberately leaves finite
+        # restart witnesses under their signed deadline. Preserve the exact
+        # private manager that owns those timers across re-enable; manufacturing
+        # a second manager would let the old timer retire authority underneath a
+        # child restored into the new runtime.
+        retained_manager = getattr(self, "_retained_standalone_manager", None)
+        self._retained_standalone_manager = retained_manager
+        self._agent_manager = retained_manager
+        self._lifecycle = (
+            getattr(retained_manager, "_lifecycle", None)
+            if retained_manager is not None
+            else None
+        )
+        self._standalone_restore_pending = retained_manager is not None
+        self._standalone_restore_task: asyncio.Task | None = None
+        self._standalone_shutdown_task: asyncio.Task | None = None
+        self._standalone_shutdown_failure: BaseException | None = None
+        self._standalone_manager_owned = retained_manager is not None
         self._child_results: dict[str, Any] = {}  # child_name -> latest result
         self._child_tasks: dict[str, asyncio.Task] = {}  # child_name -> running task
+        # Re-delegation replaces the public per-child result slot, but an old
+        # provider may suppress cancellation.  Retain every such turn until it
+        # is terminal so standalone shutdown cannot close its runtime early.
+        self._delegated_task_owners: set[asyncio.Task] = set()
 
     def get_router(self):
         """Return the Spawn panel router for dynamic mounting.
@@ -606,32 +652,75 @@ class SpawnFeature(Feature):
         single-agent mode we create a lightweight one on-the-fly so
         spawn_agent works regardless of deployment mode.
         """
-        if self._agent_manager is not None:
-            return self._agent_manager
-
-        # Try to get from the agent's registered manager
-        manager = getattr(self.agent, '_agent_manager', None)
+        manager = self._agent_manager
+        manager_was_injected = manager is not None
+        standalone_manager_created = False
         if manager is None:
-            manager = getattr(self.agent, 'agent_manager', None)
+            # Try to get from the agent's registered manager
+            manager = getattr(self.agent, '_agent_manager', None)
+            if manager is None:
+                manager = getattr(self.agent, 'agent_manager', None)
+
+        from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+        if (
+            isinstance(manager, AgentManager)
+            and getattr(self, "_standalone_manager_owned", False)
+        ):
+            # Reattach the same private manager during soft-enable before its
+            # restored children can expose tools or routes.
+            self.agent._agent_manager = manager
 
         # Single-agent mode: create a lightweight AgentManager
         if manager is None:
-            from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             storage_dir = getattr(self.agent, 'storage_path', None)
-            base_dir = Path(storage_dir).parent.parent if storage_dir else None
-            manager = AgentManager(base_data_dir=base_dir)
-            # Register the current agent so it appears as the parent
-            agent_name = getattr(self.agent, 'agent_name', None) or 'default'
-            manager._agents[agent_name] = self.agent
-            agent_did = getattr(self.agent, 'did', None) or ''
-            if agent_did:
-                manager._agent_names[agent_did] = agent_name
-            # Attach back to agent so endpoints and other code can find it
-            self.agent._agent_manager = manager
+            from kestrel_sovereign.spawn.authority_registry import (
+                standalone_spawn_manager_base_dir,
+            )
+
+            base_dir = standalone_spawn_manager_base_dir(storage_dir)
+            manager = AgentManager(
+                base_data_dir=base_dir,
+                startup_roster_enabled=False,
+            )
+            standalone_manager_created = True
+            self._standalone_manager_owned = True
+            self._standalone_restore_pending = True
             logger.info("Created lightweight AgentManager for single-agent spawn")
 
+        # Route every real manager through its canonical registration seam.
+        # This is idempotent for hosted agents, restores a single-agent child's
+        # durable mandate, and makes injected real managers obey the same depth
+        # and parent-control rules. Test doubles remain untouched.
+        if isinstance(manager, AgentManager) and standalone_manager_created:
+            agent_state = vars(self.agent)
+            agent_did = agent_state.get("did")
+            if not isinstance(agent_did, str) or not agent_did:
+                agent_did = agent_state.get("agent_id")
+            names = vars(manager).get("_agent_names", {})
+            agent_name = names.get(agent_did) if isinstance(names, dict) else None
+            if not isinstance(agent_name, str) or not agent_name:
+                for attribute in ("agent_name", "_agent_name"):
+                    candidate = getattr(self.agent, attribute, None)
+                    if isinstance(candidate, str) and candidate:
+                        agent_name = candidate
+                        break
+            if not isinstance(agent_name, str) or not agent_name:
+                agent_name = "default"
+            already_published = (
+                manager.get_agent(agent_name) is self.agent
+                and vars(manager).get("_agent_names", {}).get(agent_did)
+                == agent_name
+            )
+            if not already_published:
+                manager._register_agent(agent_name, self.agent)
+
         # Ensure lifecycle is wired up
-        if not getattr(manager, '_lifecycle', None):
+        if (
+            isinstance(manager, AgentManager)
+            and not manager_was_injected
+            and not getattr(manager, '_lifecycle', None)
+        ):
             from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
             lifecycle = SpawnedAgentLifecycle(manager)
             manager._lifecycle = lifecycle
@@ -641,9 +730,69 @@ class SpawnFeature(Feature):
         self._agent_manager = manager
         return manager
 
+    async def _get_ready_agent_manager(self):
+        """Resolve the manager and restore a standalone host exactly once."""
+
+        manager = self._get_agent_manager()
+        if not getattr(self, "_standalone_restore_pending", False):
+            return manager
+
+        from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+        if not isinstance(manager, AgentManager):
+            self._standalone_restore_pending = False
+            return manager
+        task = getattr(self, "_standalone_restore_task", None)
+        if task is None:
+            task = asyncio.create_task(
+                manager.restore_spawn_authority_tree(self.agent),
+                name="standalone_spawn_authority_restore",
+            )
+            self._standalone_restore_task = task
+        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+
+        caller_cancelled = False
+        try:
+            caller_cancelled, failure = await await_lifecycle_task_completion(task)
+            if failure is not None:
+                raise failure
+        except BaseException:
+            # Keep the pending bit so a later ready hook or tool call can retry.
+            raise
+        else:
+            # ``load_from_config`` deliberately reports per-agent startup
+            # failures out of band so a multi-agent host can keep healthy
+            # peers online.  A standalone parent has no lifespan handler to
+            # consume that report, and treating a normal return as success
+            # would permanently suppress retries for a transiently unavailable
+            # child.  Only a failure-free pass consumes the pending restore.
+            failures = manager.init_failures
+            if failures:
+                logger.warning(
+                    "Standalone spawn-authority restore retained for retry: %s",
+                    "; ".join(
+                        f"{name}: {type(error).__name__}: {error}"
+                        for name, error in failures
+                    ),
+                )
+            else:
+                self._standalone_restore_pending = False
+        finally:
+            if task.done() and self._standalone_restore_task is task:
+                self._standalone_restore_task = None
+        if caller_cancelled:
+            raise asyncio.CancelledError()
+        return manager
+
+    async def on_agent_ready(self, agent=None) -> None:
+        """Recover persistent standalone children after parent boot commits."""
+
+        await self._get_ready_agent_manager()
+
     def _set_agent_manager(self, manager):
         """Explicitly set the AgentManager (used in testing)."""
+        self._retained_standalone_manager = None
         self._agent_manager = manager
+        self._standalone_manager_owned = False
 
     def _get_lifecycle(self, manager):
         """Return the lifecycle manager when it is fully wired."""
@@ -707,7 +856,7 @@ class SpawnFeature(Feature):
             running in a multi-agent host), when a requested feature name is
             unknown, or the spawn raised.
         """
-        manager = self._get_agent_manager()
+        manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(
                 error="No AgentManager available — agent is not running in a multi_agent"
@@ -802,13 +951,25 @@ class SpawnFeature(Feature):
             lifecycle = getattr(manager, '_lifecycle', None)
             if isinstance(lifecycle, SpawnedAgentLifecycle):
                 from kestrel_sovereign.spawn.lifecycle import SpawnMode
+                committed_mandate = vars(child).get(
+                    "_persisted_spawn_mandate"
+                )
+                if not isinstance(committed_mandate, SpawnMandate):
+                    raise RuntimeError(
+                        "Spawned child has no committed spawn mandate"
+                    )
                 await lifecycle.register(
                     child_name=name,
                     child_did=child.agent_id,
                     parent_did=self.agent.agent_id,
-                    ttl_seconds=ttl,
-                    purpose=purpose,
-                    mode=SpawnMode.EPHEMERAL if ttl > 0 else SpawnMode.PERSISTENT,
+                    ttl_seconds=committed_mandate.ttl_seconds,
+                    purpose=committed_mandate.purpose,
+                    mode=(
+                        SpawnMode.EPHEMERAL
+                        if committed_mandate.ttl_seconds > 0
+                        else SpawnMode.PERSISTENT
+                    ),
+                    started_at=committed_mandate.created_at,
                 )
             return ToolResult.ok(
                 f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",
@@ -840,7 +1001,7 @@ class SpawnFeature(Feature):
             ``{"children": [], "error": "..."}`` shape that mixed
             empty-list-of-children with the no-host-error case.
         """
-        manager = self._get_agent_manager()
+        manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
 
@@ -907,7 +1068,7 @@ class SpawnFeature(Feature):
             ERROR for no-AgentManager, child-not-running, and
             child-not-belonging-to-this-parent paths.
         """
-        manager = self._get_agent_manager()
+        manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
 
@@ -935,26 +1096,36 @@ class SpawnFeature(Feature):
         # child persists until its TTL expires, an explicit terminate_child, or
         # parent shutdown — the paths that legitimately finalize it.
         async def _run_child_task():
+            owner = asyncio.current_task()
             try:
                 result = await child_agent.process_input(task)
-                self._child_results[child_name] = {
-                    "success": True,
-                    "result": result,
-                    "completed_at": time.time(),
-                }
+                if self._child_tasks.get(child_name) is owner:
+                    self._child_results[child_name] = {
+                        "success": True,
+                        "result": result,
+                        "completed_at": time.time(),
+                    }
             except Exception as e:
                 logger.error(f"Child '{child_name}' task failed: {e}")
-                self._child_results[child_name] = {
-                    "success": False,
-                    "error": str(e),
-                    "completed_at": time.time(),
-                }
+                if self._child_tasks.get(child_name) is owner:
+                    self._child_results[child_name] = {
+                        "success": False,
+                        "error": str(e),
+                        "completed_at": time.time(),
+                    }
 
         # Cancel any existing task for this child
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():
             self._child_tasks[child_name].cancel()
 
-        self._child_tasks[child_name] = asyncio.create_task(_run_child_task())
+        delegated = asyncio.create_task(_run_child_task())
+        self._child_tasks[child_name] = delegated
+        owners = getattr(self, "_delegated_task_owners", None)
+        if owners is None:
+            owners = set()
+            self._delegated_task_owners = owners
+        owners.add(delegated)
+        delegated.add_done_callback(owners.discard)
 
         return ToolResult.ok(
             f"Delegated task to '{child_name}'. Use get_child_result to retrieve the result.",
@@ -1066,7 +1237,7 @@ class SpawnFeature(Feature):
             not a child of this parent, or the underlying terminate
             call returned False.
         """
-        manager = self._get_agent_manager()
+        manager = await self._get_ready_agent_manager()
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
         if type(offboard_runtime) is not bool:
@@ -1163,10 +1334,164 @@ class SpawnFeature(Feature):
 
         return ToolResult.failed(error=f"Failed to terminate '{child_name}'")
 
+    async def _shutdown_standalone_after_delegated_tasks(
+        self,
+        manager,
+        child_tasks: list[asyncio.Task],
+    ) -> None:
+        """Quiesce delegated turns before closing their standalone runtimes."""
+
+        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+
+        outcomes: list[BaseException] = []
+        caller_cancelled = False
+        for task in child_tasks:
+            cancelled, failure = await await_lifecycle_task_completion(task)
+            caller_cancelled = caller_cancelled or cancelled
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                outcomes.append(failure)
+
+        descendant_shutdown = asyncio.create_task(
+            manager.shutdown_spawn_authority_tree(self.agent),
+            name="standalone_spawn_descendant_shutdown",
+        )
+        cancelled, failure = await await_lifecycle_task_completion(
+            descendant_shutdown
+        )
+        caller_cancelled = caller_cancelled or cancelled
+        if failure is not None:
+            outcomes.append(failure)
+
+        # A failed descendant drain can still own live runtimes. Keep the exact
+        # manager attached so the failure is observable and a later shutdown
+        # can retry instead of manufacturing a fresh, lineage-empty manager.
+        if failure is None:
+            self._retained_standalone_manager = manager
+            if vars(self.agent).get("_agent_manager") is manager:
+                self.agent._agent_manager = None
+            if vars(self.agent).get("agent_manager") is manager:
+                self.agent.agent_manager = None
+            if self._agent_manager is manager:
+                self._agent_manager = None
+                self._lifecycle = None
+                self._standalone_manager_owned = False
+
+        if caller_cancelled:
+            outcomes.append(asyncio.CancelledError())
+        if len(outcomes) == 1:
+            raise outcomes[0]
+        if outcomes:
+            raise BaseExceptionGroup(
+                "Spawn feature shutdown had terminal failures",
+                outcomes,
+            )
+
     async def shutdown(self):
-        """Clean up running tasks on feature shutdown."""
-        for task in self._child_tasks.values():
+        """Join private restore and retain descendant owners before root shutdown."""
+        from kestrel_sovereign.kestrel_agent import await_lifecycle_task_completion
+        from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+
+        outcomes: list[BaseException] = []
+        caller_cancelled = False
+        existing_shutdown = getattr(self, "_standalone_shutdown_task", None)
+        if existing_shutdown is not None:
+            if not existing_shutdown.done():
+                # The retained owner from an earlier bounded shutdown remains
+                # responsible for both delegated turns and descendant cleanup.
+                return
+            self._standalone_shutdown_task = None
+            cancelled, failure = await await_lifecycle_task_completion(
+                existing_shutdown
+            )
+            caller_cancelled = caller_cancelled or cancelled
+            recorded_failure = self._standalone_shutdown_failure
+            self._standalone_shutdown_failure = None
+            failure = recorded_failure if recorded_failure is not None else failure
+            if failure is not None:
+                raise failure
+            if caller_cancelled:
+                raise asyncio.CancelledError()
+            return
+        delegated_owners = getattr(self, "_delegated_task_owners", set())
+        child_tasks = list(
+            {*self._child_tasks.values(), *delegated_owners}
+        )
+        for task in child_tasks:
             if not task.done():
                 task.cancel()
         self._child_tasks.clear()
+        delegated_owners.clear()
         self._child_results.clear()
+
+        restore_task = getattr(self, "_standalone_restore_task", None)
+        if restore_task is not None:
+            if not restore_task.done():
+                restore_task.cancel()
+            cancelled, failure = await await_lifecycle_task_completion(restore_task)
+            caller_cancelled = caller_cancelled or cancelled
+            if failure is not None and not isinstance(
+                failure, asyncio.CancelledError
+            ):
+                outcomes.append(failure)
+            if self._standalone_restore_task is restore_task:
+                self._standalone_restore_task = None
+
+        manager = self._agent_manager
+        if (
+            getattr(self, "_standalone_manager_owned", False)
+            and isinstance(manager, AgentManager)
+        ):
+            standalone_shutdown = asyncio.create_task(
+                self._shutdown_standalone_after_delegated_tasks(
+                    manager,
+                    child_tasks,
+                ),
+                name="standalone_spawn_shutdown_owner",
+            )
+            self._standalone_shutdown_task = standalone_shutdown
+            if any(not task.done() for task in child_tasks):
+                # Cancellation-resistant cognition cannot be joined inside the
+                # feature's bounded shutdown slice, but its child dispatcher and
+                # storage cannot be closed underneath it either.  The strongly
+                # retained, cancellation-safe owner above performs that ordering
+                # after this control-plane call returns.
+                def retain_shutdown_outcome(completed: asyncio.Task) -> None:
+                    failure: BaseException | None
+                    if completed.cancelled():
+                        failure = asyncio.CancelledError()
+                    else:
+                        failure = completed.exception()
+                    self._standalone_shutdown_failure = failure
+                    if failure is not None:
+                        logger.error(
+                            "Detached standalone descendant shutdown failed; "
+                            "manager ownership retained for retry",
+                            exc_info=(
+                                type(failure),
+                                failure,
+                                failure.__traceback__,
+                            ),
+                        )
+
+                standalone_shutdown.add_done_callback(retain_shutdown_outcome)
+                self._standalone_restore_pending = False
+                return
+            cancelled, failure = await await_lifecycle_task_completion(
+                standalone_shutdown
+            )
+            caller_cancelled = caller_cancelled or cancelled
+            if failure is not None:
+                outcomes.append(failure)
+        self._standalone_restore_pending = False
+
+        if caller_cancelled:
+            outcomes.append(asyncio.CancelledError())
+        if len(outcomes) == 1:
+            raise outcomes[0]
+        if outcomes:
+            raise BaseExceptionGroup(
+                "Spawn feature shutdown had terminal failures",
+                outcomes,
+            )

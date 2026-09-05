@@ -467,6 +467,33 @@ def test_instance_bound_feature_router_dispatches_to_request_agent_and_reload():
         restore()
 
 
+def test_request_scoped_feature_route_closes_when_target_is_unpublished():
+    """A scoped route cannot outlive the manager publication it resolved from."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    target = _make_agent({"ProxyFeature": _InstanceBoundRouterFeature("retired")})
+    agents = {"target": target}
+    app, restore = _boot_multi_agent(agents)
+    manager = app.state.agent_manager
+
+    def resolve_then_unpublish(name):
+        candidate = agents.get(name)
+        agents.pop(name, None)
+        return candidate
+
+    manager.get_agent.side_effect = resolve_then_unpublish
+    path = "/test-feature-lifecycle/instance-bound"
+    try:
+        with TestClient(app) as client:
+            response = client.get(
+                f"/api/agents/target{path}",
+                headers={"X-API-Key": API_KEY},
+            )
+        assert response.status_code == 404
+    finally:
+        restore()
+
+
 def test_current_feature_route_keeps_app_overrides_and_live_dependencies():
     """Current feature dispatch must preserve FastAPI's app-bound execution.
 
@@ -540,6 +567,34 @@ def test_webhook_dispatch_is_live_and_enabled_filtered():
             assert resp.status_code == 200
     finally:
         restore()
+
+
+def test_first_dynamic_webhook_candidate_mounts_shared_dispatch_before_publish():
+    """Private onboarding sees the candidate before manager publication."""
+    from kestrel_sovereign import server
+
+    hook_feature = _WebhookFeatureStub()
+    candidate = _make_agent({"WebhookFeature": hook_feature})
+    app = FastAPI()
+    app.state.agent = None
+    app.state.agent_manager = SimpleNamespace(
+        list_agents=lambda: [],
+        get_agent=lambda _name: None,
+    )
+
+    server._mount_feature_routers(app, agents=(candidate,))
+
+    assert getattr(app.state, "_feature_webhook_dispatch_mounted", False)
+    assert any(
+        getattr(route, "path", None) == "/webhooks/{webhook_name}"
+        for route in app.routes
+    )
+    # Simulate the later atomic publication commit. The already-mounted live
+    # provider must now resolve and dispatch to this receiver.
+    app.state.agent = candidate
+    with TestClient(app) as client:
+        response = client.post("/webhooks/deposit", content=b"{}")
+    assert response.status_code == 200
 
 
 def test_agent_prefixed_webhook_disabled_target_does_not_dispatch_to_peer():
