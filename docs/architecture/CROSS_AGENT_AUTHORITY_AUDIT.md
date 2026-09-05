@@ -82,8 +82,8 @@ narrow, revocable, signed delegation.
 | Install/remove feature package | `POST /api/features/{name}/install`; `POST /api/features/{name}/remove` | Shared host interpreter and all loaded users of the package | Sovereign/delegated | The handlers currently require only an authenticated routed agent despite their sovereign-only docstrings. Defect: [#3214](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3214). |
 | Manage shared local models | `pull_model`; `cleanup_models(dry_run=False)` | Shared local-model service and model storage used by every co-hosted agent | Sovereign/delegated | The tools currently use ordinary feature permission and mutate the shared Ollama/model store. Cleanup protects only models used by the calling agent rather than accounting for all hosted agents. Defect: [#3221](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3221). |
 | Deploy/teardown shared agent hosting | `deploy_agent` with a multi-agent deployment profile | An external service hosting the entire configured agent fleet | Sovereign/delegated | The checked-in `dev` profile selects `deployment_mode="multi_agent"`, but an ordinary agent can invoke deployment or teardown after generic ASK consent, which may be auto-promoted and is not constitutional authority. Defect: [#3223](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3223). |
-| Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Outbound records retain creator/recipient binding. Shared-store reads and HTTP/SSE still need durable principal predicates: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`, built-in `!tasks`; task GET/list/SSE endpoints | Today, any row found by an unscoped ID/full-table query; intended recipient inbox or creator-owned result | Self (recipient or creator, according to operation) | The current tool, command, HTTP, and SSE reads omit a durable recipient/creator predicate on shared PostgreSQL, so the required Self class is not enforced. Defect: [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| Read outbound peer result/audit | `get_peer_task_result`, `list_outbound_a2a_tasks` | A task created by the caller | Self (creator) | Enforced by [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145): outbound audit rows retain and require creator/recipient binding; peer HTTP reads use a DID-signed, replay-protected creator envelope while local routing uses an unforgeable host capability. |
+| Read task inbox/status/result | `check_task_status`, `list_my_tasks`, `get_task_result`, built-in `!tasks`; task GET/list/SSE endpoints | The recipient-owned inbox/task, or a creator-owned peer result | Self (recipient or creator, according to operation) | Enforced by [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145): local tool, command, GET, list, and SSE reads require the durable recipient principal; peer read/subscription POSTs additionally authenticate the durable creator and bind the recipient. |
 | Respond/fail/complete or attach artifact | `respond_to_a2a_task`, `attach_artifact_to_a2a_task` | An incoming A2A task | Self (recipient) | Enforced by [#3144](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3144): each mutation binds the trusted caller DID and includes the recipient in the durable atomic predicate. |
 | Cancel A2A task | `cancel_task`; `POST /api/agent/tasks/{task_id:path}/cancel` | A non-terminal task | Self (creator or recipient) | Enforced by [#3134](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3134): durable creator/recipient authorization and an atomic cancellation predicate are shared by the tool and signed peer route. Causation/sender display metadata is not consulted. |
 | Create child | `spawn_agent` | A new child | Spawn mandate | The live path signs before the final child DID is known and then mutates `child_did`, invalidating the signature. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). A created child does not grant reciprocal authority. |
@@ -137,7 +137,7 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/features/bootstrap/feature.py::restart_discovery` | Self-only bootstrap-state retry; not a host restart. |
 | `kestrel_sovereign/features/deploy/feature.py::deploy_agent` | D-3223 — a checked-in multi-agent profile can deploy or teardown the fleet through generic ASK rather than sovereign/delegated authority. |
 | `kestrel_sovereign/features/peers/feature.py::ask_agent` | Universal peer communication through the scoped directory. |
-| `kestrel_sovereign/features/peers/feature.py::get_peer_task_result` | Creator-owned routed read; #3145. |
+| `kestrel_sovereign/features/peers/feature.py::get_peer_task_result` | Creator-owned routed read with #3145 durable creator/recipient binding. |
 | `kestrel_sovereign/features/peers/feature.py::list_outbound_a2a_tasks` | Self-owned outbound audit. |
 | `kestrel_sovereign/features/peers/feature.py::list_peers` | Universal scoped discovery. |
 | `kestrel_sovereign/features/peers/feature.py::send_a2a_message` | Universal bounded peer communication. |
@@ -159,9 +159,9 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/features/strategic_memory/feature.py::signal_dispatch` | Self-owned indirect dispatcher through the governed `workflow_run` tool; the contributed workflow and selected downstream controls retain their own consent, evidence, and target-authority gates. |
 | `kestrel_sovereign/features/tasks/feature.py::attach_artifact_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/tasks/feature.py::cancel_task` | Creator/recipient-owned mutation; #3134. |
-| `kestrel_sovereign/features/tasks/feature.py::check_task_status` | Unscoped task-ID read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/features/tasks/feature.py::get_task_result` | Unscoped task-ID read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/features/tasks/feature.py::list_my_tasks` | Unscoped shared-store inbox read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| `kestrel_sovereign/features/tasks/feature.py::check_task_status` | Recipient-owned task-ID read through the #3145 durable principal predicate. |
+| `kestrel_sovereign/features/tasks/feature.py::get_task_result` | Recipient-owned task-result read through the #3145 durable principal predicate. |
+| `kestrel_sovereign/features/tasks/feature.py::list_my_tasks` | Recipient-owned shared-store inbox read through the #3145 durable principal predicate. |
 | `kestrel_sovereign/features/tasks/feature.py::respond_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/tasks/feature.py::run_workflow` | Self-owned indirect dispatcher through `TaskManager.execute_skill`; each selected feature tool retains its PRE_TOOL_USE and target-specific authority checks, so the workflow supplies sequence, not relation authority. |
 | `kestrel_sovereign/features/todo/feature.py::todo_link_task` | Self-owned todo metadata link; not an A2A task control. |
@@ -454,7 +454,7 @@ behind either the feature-tool inventory or a command-name heuristic.
 | `kestrel_sovereign/command_handler.py::!anchor` | Caller memory-state anchor; no co-hosted-agent target. |
 | `kestrel_sovereign/command_handler.py::!set-app-context` | Caller active-session app context; no co-hosted-agent target. |
 | `kestrel_sovereign/command_handler.py::!legacy-echo` | Caller legacy app-context echo path; no co-hosted-agent target. |
-| `kestrel_sovereign/command_handler.py::!tasks` | Unscoped shared-store task listing; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| `kestrel_sovereign/command_handler.py::!tasks` | Recipient-owned shared-store task listing through the #3145 durable principal predicate. |
 | `kestrel_sovereign/command_handler.py::!continue` | Resumes only the caller's stopped request; not peer Stop or mandate-only Hold. |
 
 ## Machine-checked core CLI inventory
@@ -533,9 +533,11 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/privacy-mode` | Host-authenticated privacy transition on the request-routed agent. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/privacy-mode/cancel` | Host-authenticated cancellation of the request-routed agent's pending privacy transition. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/privacy-mode/confirm` | Host-authenticated confirmation of the request-routed agent's pending privacy transition. |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks` | Unscoped shared-store inbox read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}` | Unscoped task-ID read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}/subscribe` | Unscoped task-ID subscription; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks` | Recipient-owned shared-store inbox read through the #3145 durable principal predicate. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}` | Recipient-owned task-ID read through the #3145 durable principal predicate. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agent/tasks/{task_id}/subscribe` | Recipient-owned task subscription through the #3145 durable principal predicate. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/read` | Creator-owned task read; a DID-signed, replay-protected envelope authenticates the creator and #3145 also binds the recipient. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/subscribe` | Creator-owned task subscription with the same signed creator and durable recipient predicates as the #3145 read route. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/cancel` | Creator/recipient-owned mutation; the signed peer envelope authenticates the actor, live recipient scope is rechecked, and the durable transition uses the atomic #3134 authority predicate. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/stop` | Current routed-agent/self Stop; peer Stop must use the typed authority rail. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agent/tasks/send` | Scoped, authenticated A2A delivery. |
@@ -555,9 +557,11 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/privacy-mode` | Deprecated compatibility privacy transition on the request-routed agent. |
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/privacy-mode/cancel` | Deprecated compatibility cancellation of the request-routed agent's pending privacy transition. |
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/privacy-mode/confirm` | Deprecated compatibility confirmation of the request-routed agent's pending privacy transition. |
-| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks` | Deprecated compatibility shared-store inbox read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks/{task_id}` | Deprecated compatibility unscoped task-ID read; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
-| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks/{task_id}/subscribe` | Deprecated compatibility unscoped task-ID subscription; defect [#3145](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3145). |
+| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks` | Deprecated compatibility recipient-owned inbox read with the #3145 predicate. |
+| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks/{task_id}` | Deprecated compatibility recipient-owned task-ID read with the #3145 predicate. |
+| `kestrel_sovereign/endpoints/agent.py::GET /agent/tasks/{task_id}/subscribe` | Deprecated compatibility recipient-owned task subscription with the #3145 predicate. |
+| `kestrel_sovereign/endpoints/agent.py::POST /agent/tasks/{task_id:path}/read` | Deprecated compatibility creator-owned read with the same signed #3145 predicates as the canonical handler. |
+| `kestrel_sovereign/endpoints/agent.py::POST /agent/tasks/{task_id:path}/subscribe` | Deprecated compatibility creator-owned subscription with the same signed #3145 predicates as the canonical handler. |
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/tasks/{task_id:path}/cancel` | Deprecated compatibility creator/recipient-owned mutation with the same #3134 predicate as the canonical handler. |
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/stop` | Deprecated compatibility current-agent/self Stop. |
 | `kestrel_sovereign/endpoints/agent.py::POST /agent/tasks/send` | Deprecated compatibility scoped, authenticated A2A delivery. |
@@ -683,9 +687,9 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/notifications/sse` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/privacy-mode` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/reflection/status` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks` | D-3145 — shared-task read lacks principal scoping. |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}` | D-3145 — shared-task read lacks principal scoping. |
-| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}/subscribe` | D-3145 — shared-task read lacks principal scoping. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks` | A — routing selects the target runtime and #3145 constrains the read to that agent's durable recipient principal. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}` | A — target-local #3145 recipient policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::GET /api/agents/{selected_agent_name}/api/agent/tasks/{task_id}/subscribe` | A — target-local #3145 recipient subscription policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/attachments` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/health/trigger` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/heartbeat/trigger` | A — target-local policy remains enforcement. |
@@ -696,6 +700,8 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/stop` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/stream` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/send` | A — target-local policy remains enforcement. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/{task_id:path}/read` | A — routing binds the recipient runtime; #3145 independently requires the signed durable creator. |
+| `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/{task_id:path}/subscribe` | A — routing binds the recipient runtime; #3145 independently requires the signed durable creator. |
 | `kestrel_sovereign/endpoints/agent.py::POST /api/agents/{selected_agent_name}/api/agent/tasks/{task_id:path}/cancel` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/callback` | H — host OAuth callback; the selected-agent prefix grants no target-local or relation authority. |
 | `kestrel_sovereign/endpoints/auth_oauth.py::GET /api/agents/{selected_agent_name}/auth/login` | H — host OAuth login; the selected-agent prefix grants no target-local or relation authority. |

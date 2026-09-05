@@ -4006,7 +4006,7 @@ def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
     assert "multi-agent" in tool_row
 
 
-def test_task_reads_remain_labeled_unscoped_until_3145_lands() -> None:
+def test_task_reads_record_3145_durable_principal_enforcement() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
         line
@@ -4014,7 +4014,8 @@ def test_task_reads_remain_labeled_unscoped_until_3145_lands() -> None:
         if line.startswith("| Read task inbox/status/result |")
     )
     assert "[#3145]" in action_row
-    assert "unscoped" in action_row.casefold()
+    assert "Enforced by" in action_row
+    assert "durable recipient principal" in action_row
 
     for surface in (
         "features/tasks/feature.py::check_task_status",
@@ -4026,8 +4027,19 @@ def test_task_reads_remain_labeled_unscoped_until_3145_lands() -> None:
         "endpoints/agent.py::GET /api/agent/tasks/{task_id}/subscribe",
     ):
         row = next(line for line in audit.splitlines() if surface in line)
-        assert "[#3145]" in row
-        assert "unscoped" in row.casefold()
+        assert "#3145" in row
+        assert "recipient-owned" in row.casefold()
+
+    for surface in (
+        "endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/read",
+        "endpoints/agent.py::POST /api/agent/tasks/{task_id:path}/subscribe",
+        "endpoints/agent.py::POST /agent/tasks/{task_id:path}/read",
+        "endpoints/agent.py::POST /agent/tasks/{task_id:path}/subscribe",
+    ):
+        row = next(line for line in audit.splitlines() if surface in line)
+        assert "#3145" in row
+        assert "creator-owned" in row.casefold()
+        assert "signed" in row.casefold()
 
 
 def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
