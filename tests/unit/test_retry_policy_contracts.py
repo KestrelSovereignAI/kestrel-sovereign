@@ -4,6 +4,9 @@ The retry layer must:
   * treat permanent failures (401/403/404/422/400, invalid key, quota, model
     not found) as non-retryable — retrying a dead key burns wall-time and
     triggers abuse detection,
+  * EXCEPT a subscription plan-limit window, which Anthropic's plan endpoint
+    reports as a 400 with billing wording rather than a 429 — that is the same
+    transient condition as the 429 form and must be ridden out, not failed,
   * retry transient failures (429, 5xx, timeout, "rate", "try again"),
   * default to non-retryable for unknown errors (explicit is safer than the
     old "if any pattern matches, retry" which let oddly-worded messages
@@ -15,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from kestrel_sovereign.llm.retry import (
+    is_plan_limit_error,
     is_retryable_error,
     retry_after_seconds,
     with_retry,
@@ -272,3 +276,79 @@ async def test_throttle_uses_patient_budget():
 
     assert attempts["n"] == 8, attempts  # patient budget
     assert all(d <= 120.0 for d in slept), slept
+
+
+# ---------------------------------------------------------------------------
+# Plan-limit window wearing a 400 (the shape #2074 did not cover)
+# ---------------------------------------------------------------------------
+
+# Verbatim from logs/host.log, 2026-09-04 16:31 UTC, Emma on anthropic:plan.
+PLAN_LIMIT_400 = (
+    "Error code: 400 - {'type': 'error', 'error': {'type': "
+    "'invalid_request_error', 'message': \"You're out of extra usage. Add more "
+    "at claude.ai/settings/usage and keep going.\"}, "
+    "'request_id': 'req_011Ceiioyx9256gSqt4DStZL'}"
+)
+
+
+def test_plan_limit_400_is_recognized():
+    assert is_plan_limit_error(_FakeRateLimit(PLAN_LIMIT_400, status_code=400))
+
+
+def test_plan_limit_400_is_retryable_despite_the_status_code():
+    """The regression this fixes: the structured-400 short-circuit classified
+    a transient plan window as a permanent caller error, so it got ZERO
+    retries and surfaced as a hard route failure."""
+    err = _FakeRateLimit(PLAN_LIMIT_400, status_code=400)
+    assert is_retryable_error(err) is True
+
+
+def test_plan_limit_400_gets_the_patient_throttle_budget():
+    """A plan window needs the 8-attempt budget to be ridden out; the tight
+    failover budget would give up while the window is still open."""
+    from kestrel_sovereign.llm.retry import _is_throttle_error
+    assert _is_throttle_error(_FakeRateLimit(PLAN_LIMIT_400, status_code=400)) is True
+
+
+def test_ordinary_400_stays_non_retryable():
+    """Guard on the narrowness of the fix: a real malformed request must not
+    become retryable just because it shares the status code."""
+    err = _FakeRateLimit(
+        "Error code: 400 - {'type': 'error', 'error': {'type': "
+        "'invalid_request_error', 'message': 'messages.0: unexpected role'}}",
+        status_code=400,
+    )
+    assert is_plan_limit_error(err) is False
+    assert is_retryable_error(err) is False
+
+
+def test_prompt_too_long_400_stays_non_retryable():
+    """Emma's other real 400 (context over the model ceiling) is genuinely
+    permanent — retrying re-sends the same oversized prompt."""
+    err = _FakeRateLimit(
+        "Error code: 400 - {'type': 'error', 'error': {'type': "
+        "'invalid_request_error', 'message': 'prompt is too long: "
+        "1104046 tokens > 1000000 maximum'}}",
+        status_code=400,
+    )
+    assert is_retryable_error(err) is False
+
+
+@pytest.mark.asyncio
+async def test_with_retry_rides_out_a_plan_limit_400_then_succeeds():
+    """End to end: the window closes and the call goes through, so the
+    operator never sees it — exactly how the 429 form already behaves."""
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _FakeRateLimit(PLAN_LIMIT_400, status_code=400)
+        return "recovered"
+
+    async def fake_sleep(d):
+        pass
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        assert await with_retry(flaky) == "recovered"
+    assert calls["n"] == 3

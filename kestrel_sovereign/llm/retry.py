@@ -53,6 +53,29 @@ RETRYABLE_PATTERNS = [
     "try again",
 ]
 
+# Subscription/plan-route limit reported with a NON-429 status.
+#
+# Anthropic's subscription endpoint reports a transient plan-limit window as
+# ``400 invalid_request_error`` with billing wording ("You're out of extra
+# usage..."), NOT as the ``429 rate_limit_error`` that #2074 taught the retry
+# layer to ride out. Both are the same condition — a window that clears on its
+# own — so both must get the patient throttle budget.
+#
+# Measured 2026-09-04: the 400 window lasted ~3 minutes and cleared with no
+# intervention, while the account's plan usage sat at 3% (session) / 4%
+# (weekly) and its usage credits were switched OFF with a $0.00 balance. So
+# the message names a billing surface the request never actually reached; the
+# status code is the only thing that differs from the 429 form. Without this,
+# NON_RETRYABLE_STATUS_CODES short-circuits a 400 to zero retries and the
+# window surfaces to the operator as a hard route failure.
+#
+# Matched against the message BEFORE the status-code short-circuit, and kept
+# narrow on purpose: a genuine malformed-request 400 must stay permanent.
+PLAN_LIMIT_PATTERNS = [
+    "out of extra usage",
+]
+
+
 # Error message patterns that indicate permanent failure. Matched FIRST —
 # takes precedence over RETRYABLE_PATTERNS to prevent a 401 message that
 # happens to contain "internal server error text" from being retried.
@@ -111,11 +134,23 @@ def retry_after_seconds(error: Exception) -> Optional[float]:
     return None
 
 
+def is_plan_limit_error(error: Exception) -> bool:
+    """True when ``error`` is a subscription plan-limit window reported with a
+    non-429 status (see ``PLAN_LIMIT_PATTERNS``).
+
+    Classified on the message because the status code is precisely what makes
+    this shape indistinguishable from a caller error.
+    """
+    error_str = str(error).lower()
+    return any(pattern in error_str for pattern in PLAN_LIMIT_PATTERNS)
+
+
 def is_retryable_error(error: Exception) -> bool:
     """
     Check if an error is transient and should be retried.
 
     Order of checks:
+      0. PLAN_LIMIT_PATTERNS (plan window wearing a non-429 status) → retry.
       1. NON_RETRYABLE_STATUS_CODES (401/403/404/422/400) → no retry.
       2. NON_RETRYABLE_PATTERNS (auth/quota/invalid) → no retry.
       3. RETRYABLE_STATUS_CODES (429/5xx) → retry.
@@ -132,7 +167,13 @@ def is_retryable_error(error: Exception) -> bool:
     text doesn't literally contain the number — we classify on the actual
     error, not a hopeful substring.
     """
-    # 0. Structured status code from the SDK exception (most authoritative).
+    # 0a. Plan-limit window wearing a non-429 status. Checked before the
+    #     status-code short-circuit below, which would otherwise classify the
+    #     400 form as a permanent caller error and skip retry entirely.
+    if is_plan_limit_error(error):
+        return True
+
+    # 0b. Structured status code from the SDK exception (most authoritative).
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         if status_code in NON_RETRYABLE_STATUS_CODES:
@@ -174,6 +215,11 @@ def _is_throttle_error(error: Exception) -> bool:
     dead route). Only throttles get the patient plan-route budget; every other
     retryable error (5xx, timeout, "unavailable") uses the tight default so
     failover to a healthy route isn't stalled for minutes (#2074 regression)."""
+    # A plan-limit window is a throttle regardless of the status code it
+    # arrives with — it needs the patient budget to be ridden out, not the
+    # tight failover budget.
+    if is_plan_limit_error(error):
+        return True
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         return status_code == 429
