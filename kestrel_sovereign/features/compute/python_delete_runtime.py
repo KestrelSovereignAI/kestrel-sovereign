@@ -242,19 +242,19 @@ def install_safe_delete_runtime(
         return original_truncate(resolved, length, *args, **kwargs)
 
     def safe_open(file, mode="r", *args, **kwargs):
-        if isinstance(mode, str) and "w" in mode:
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
             try:
                 resolved = _Path(file).expanduser().resolve(strict=False)
             except TypeError:
                 return original_open(file, mode, *args, **kwargs)
-            assert_agent_data_allowed(resolved, "open_truncate")
+            assert_agent_data_allowed(resolved, "open_write")
             return original_open(resolved, mode, *args, **kwargs)
         return original_open(file, mode, *args, **kwargs)
 
     def path_safe_open(self, mode="r", *args, **kwargs):
-        if isinstance(mode, str) and "w" in mode:
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
             resolved = _Path(self).expanduser().resolve(strict=False)
-            assert_agent_data_allowed(resolved, "open_truncate")
+            assert_agent_data_allowed(resolved, "open_write")
             return original_path_open(resolved, mode, *args, **kwargs)
         return original_path_open(self, mode, *args, **kwargs)
 

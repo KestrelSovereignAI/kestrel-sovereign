@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -404,6 +405,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
     def _load_config(*_args, **kwargs):
         assert kwargs["runtime_base"] == runtime_base
+        assert kwargs["runtime_env"] is os.environ
         return fake_config
 
     monkeypatch.chdir(runtime_base)
@@ -438,6 +440,8 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     assert events == ["context-build", "reconcile", "preflight", "load", "host-start"]
     assert app.state.host_context is host_context
     assert app.state.host_context.hold_store is hold_store
+    assert app.state.multi_agent_runtime_base == runtime_base
+    assert app.state.multi_agent_runtime_env is os.environ
 
 
 @pytest.mark.asyncio

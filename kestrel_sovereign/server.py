@@ -2881,10 +2881,11 @@ async def _lifespan_startup(app: FastAPI):
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
             multi_agent_runtime_base = Path.cwd()
+            multi_agent_runtime_env = os.environ
             config = MultiAgentConfig.load(
                 str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
-                runtime_env=os.environ,
+                runtime_env=multi_agent_runtime_env,
                 runtime_base=multi_agent_runtime_base,
             )
             _apply_platform_host_port(config, os.environ)
@@ -2919,6 +2920,13 @@ async def _lifespan_startup(app: FastAPI):
             app.state.multi_agent_config_path = (
                 multi_agent_path if multi_agent_path.exists() else None
             )
+            # Endpoint roster reloads must validate against the same live
+            # environment and project base as startup. Reconstructing the
+            # context from the config file lets a project .env override an
+            # already-exported host custody path and makes one valid roster
+            # alternate between accepted and rejected while the host runs.
+            app.state.multi_agent_runtime_env = multi_agent_runtime_env
+            app.state.multi_agent_runtime_base = multi_agent_runtime_base
             app.state.agent = None  # No single default agent
             # Registration is the one path shared by autostart, runtime
             # creation, spawning, and scheduler cold wakes.  Install the

@@ -3565,6 +3565,49 @@ def test_sqlite_doctor_rejects_previous_default_and_agent_root_histories(
     assert any("both previous default" in item for item in report.fail)
 
 
+def test_sqlite_doctor_checks_launcher_derived_host_path_migration(
+    tmp_path,
+    monkeypatch,
+):
+    """A launcher marker preserves implicit migration checks in Doctor."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+    from kestrel_sovereign.host_features.storage import (
+        HostStorageError,
+        prepare_host_database,
+    )
+
+    home = tmp_path / "runtime-home"
+    previous = home / "host-data" / "host-features.db"
+    data_root = tmp_path / "mounted-data"
+    destination = data_root / "host-data" / "host-features.db"
+    previous.parent.mkdir(parents=True, mode=0o700)
+    destination.parent.mkdir(parents=True, mode=0o700)
+    with sqlite3.connect(previous) as connection:
+        connection.execute("CREATE TABLE existing_state (value TEXT)")
+    Path(f"{previous}.hold-initialized-v1").write_text("custody")
+    if os.name != "nt":
+        previous.chmod(0o600)
+    runtime_env = {
+        "KESTREL_HOME": str(home),
+        "KESTREL_DB_PATH": str(data_root),
+        "KESTREL_HOST_DB_PATH": str(destination),
+        "KESTREL_DERIVED_HOST_DB_PATH": str(destination),
+        "HOME": str(tmp_path),
+    }
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(runtime_env, tmp_path, report)
+
+    assert not report.ready
+    assert any("Hold custody evidence" in item for item in report.fail)
+    for key, value in runtime_env.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(HostStorageError, match="Hold custody evidence"):
+        prepare_host_database()
+
+
 @pytest.mark.asyncio
 async def test_sqlite_doctor_rejects_named_index_with_wrong_conflict_key(
     tmp_path,

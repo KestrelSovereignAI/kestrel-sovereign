@@ -695,6 +695,58 @@ class TestDestructivePolicy:
         assert "host Hold custody" in result.stderr
         assert host_db.read_text() == "sovereign state"
 
+    @pytest.mark.parametrize("api", ["builtins", "pathlib"])
+    @pytest.mark.parametrize("mode", ["w", "a", "x", "r+b"])
+    def test_python_wrapper_blocks_every_write_capable_open_mode_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        api,
+        mode,
+    ):
+        """Truncation is not the only ``open`` mode that can corrupt Hold."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / ("new.db" if "x" in mode else "host-features.db")
+        if "x" not in mode:
+            target.write_bytes(b"sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        opener = (
+            f"open({str(target)!r}, {mode!r})"
+            if api == "builtins"
+            else f"Path({str(target)!r}).open({mode!r})"
+        )
+        import_line = "from pathlib import Path\n" if api == "pathlib" else ""
+        script_path = tmp_path / f"{api}-{mode.replace('+', 'plus')}.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"{import_line}with {opener}:\n"
+                "    pass\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        if "x" in mode:
+            assert not target.exists()
+        else:
+            assert target.read_bytes() == b"sovereign state"
+
     def test_rewrite_bash_blocks_mv_of_other_agent_data(self, temp_trash_dir, tmp_path):
         """Test shell mv cannot relocate another agent's data directory."""
         current = tmp_path / "agent_data" / "emma"
@@ -875,7 +927,7 @@ print("Done")
         assert other_db.read_text() == "memory"
         audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
         entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
-        assert entries[-1]["action"] == "open_truncate"
+        assert entries[-1]["action"] == "open_write"
         assert entries[-1]["decision"] == "blocked"
 
     def test_python_wrapper_blocks_rename_other_agent_data(

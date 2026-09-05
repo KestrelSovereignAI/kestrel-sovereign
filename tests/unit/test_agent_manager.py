@@ -5710,6 +5710,56 @@ class TestAgentManagerBasics:
         assert result["persisted_registration_removed"] is True
 
     @pytest.mark.asyncio
+    async def test_offboard_reload_reuses_runtime_host_custody_context(
+        self,
+        tmp_path,
+    ):
+        """Offboarding uses the same exported custody path accepted at boot."""
+
+        from kestrel_sovereign.endpoints.models import delete_agent
+
+        config_path = tmp_path / "multi_agent.toml"
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data/Hosted"),
+            port=8801,
+            autostart=True,
+        )
+        config = MultiAgentConfig(agents={"Hosted": local})
+        config.save(config_path)
+        (tmp_path / ".env").write_text(
+            "KESTREL_HOST_DB_PATH=agent_data/Hosted/host-data/host-features.db\n"
+        )
+        runtime_env = {
+            "KESTREL_HOST_DB_PATH": str(tmp_path / "host" / "host.db")
+        }
+        manager = SimpleNamespace(
+            resolve_registered_agent_id=AsyncMock(return_value="did:test:hosted"),
+            remove_agent=_admitted_offboarding_success(),
+        )
+        state = SimpleNamespace(
+            agent_manager=manager,
+            multi_agent_config_path=config_path,
+            multi_agent_config=config,
+            multi_agent_runtime_env=runtime_env,
+            multi_agent_runtime_base=tmp_path,
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+        result = await delete_agent.__wrapped__(
+            request,
+            "Hosted",
+            offboard_runtime=True,
+        )
+
+        assert result["runtime_offboarded"] is True
+        assert result["persisted_registration_removed"] is True
+        assert MultiAgentConfig.from_file(
+            config_path,
+            runtime_env=runtime_env,
+            runtime_base=tmp_path,
+        ).agents == {}
+
+    @pytest.mark.asyncio
     async def test_cold_delete_restores_registration_when_offboarding_not_admitted(
         self,
         monkeypatch,

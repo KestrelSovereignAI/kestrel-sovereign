@@ -919,6 +919,8 @@ def _check_sqlite_hold_readiness(
 
     from kestrel_sovereign.hold.state import validate_sqlite_hold_readiness
     from kestrel_sovereign.host_features.storage import (
+        DERIVED_HOST_DB_PATH_ENV,
+        HOST_DB_PATH_ENV,
         validate_host_database_migration_readiness,
     )
     from kestrel_sovereign.storage.async_database import (
@@ -927,7 +929,12 @@ def _check_sqlite_hold_readiness(
 
     database = _sqlite_hold_database_path(env, project_dir)
     try:
-        if not env.get("KESTREL_HOST_DB_PATH"):
+        configured_host_path = env.get(HOST_DB_PATH_ENV)
+        launcher_derived_path = env.get(DERIVED_HOST_DB_PATH_ENV)
+        path_is_implicit = not configured_host_path or (
+            launcher_derived_path == configured_host_path
+        )
+        if path_is_implicit:
             sources: list[tuple[str, Path]] = []
             if env.get("KESTREL_DB_PATH"):
                 sources.append(
