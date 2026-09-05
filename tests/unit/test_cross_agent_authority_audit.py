@@ -1264,6 +1264,78 @@ def _source_registration_constructors(tree: ast.Module) -> list[ast.Call]:
     ]
 
 
+def _runtime_signal_publication_surfaces(
+    tree: ast.Module,
+    relative: str,
+) -> set[str]:
+    """Return generic seams that publish runtime-contributed signal sources."""
+
+    surfaces: set[str] = set()
+
+    class RuntimeSignalPublisherVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def _visit_function(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            self.scope.append(node.name)
+            scope_nodes = _walk_lexical_scope(node)
+            direct_registry_publish = any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr
+                in {"register", "register_batch", "register_with_policy"}
+                and "source_registry" in ast.unparse(child.func.value)
+                for child in scope_nodes
+            )
+            imperative_publish = (
+                node.name == "_register_signal_sources"
+                and {"register_batch", "register_with_policy"}.issubset(
+                    {
+                        child.value
+                        for child in scope_nodes
+                        if isinstance(child, ast.Constant)
+                        and isinstance(child.value, str)
+                    }
+                )
+            )
+            if direct_registry_publish or imperative_publish:
+                surfaces.add(f"{relative}::{'.'.join(self.scope)}")
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_function(node)
+
+    RuntimeSignalPublisherVisitor().visit(tree)
+    return surfaces
+
+
+@lru_cache(maxsize=None)
+def _discovered_runtime_signal_publication_surfaces() -> frozenset[str]:
+    surfaces: set[str] = set()
+    for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
+        tree = _parsed_module(path)
+        surfaces.update(
+            _runtime_signal_publication_surfaces(
+                tree,
+                path.relative_to(REPO_ROOT).as_posix(),
+            )
+        )
+    return frozenset(surfaces)
+
+
 @lru_cache(maxsize=None)
 def _discovered_core_signal_source_surfaces() -> frozenset[str]:
     """Inventory every core ``SourceRegistration`` plus cron handlers.
@@ -1277,6 +1349,7 @@ def _discovered_core_signal_source_surfaces() -> frozenset[str]:
     """
 
     surfaces = set(_discovered_scheduler_surfaces())
+    surfaces.update(_discovered_runtime_signal_publication_surfaces())
     scheduler_path = (
         REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
     )
@@ -2791,6 +2864,9 @@ def test_every_core_signal_source_and_builtin_handler_is_classified() -> None:
         "_run_github_pr_watch",
         "kestrel_sovereign/features/scheduler/feature.py::"
         "_run_wait_reconcile",
+        "kestrel_sovereign/features/base.py::Feature._register_signal_sources",
+        "kestrel_sovereign/features/contribution_runtime.py::"
+        "FeatureContributionRuntime.activate",
     ):
         assert surface in discovered
 
@@ -4813,7 +4889,15 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
         if attribute is None:
             return set()
         resolved = _resolved_string(attribute)
-        return {resolved.casefold()} if resolved is not None else set()
+        # This callable is invoked immediately. If its runtime-selected
+        # attribute cannot be resolved, the audit cannot prove it is not a
+        # lifecycle/control method, so retain a control-shaped fail-closed
+        # sentinel instead of silently dropping the call.
+        return (
+            {resolved.casefold()}
+            if resolved is not None
+            else {"dynamic_control_attribute"}
+        )
     if factory_name in {"partial", "partialmethod"} and node.args:
         return _control_reference_sources(node.args[0])
     return set()
@@ -5004,6 +5088,27 @@ def _provenance_aliases(
         return False
 
     aliases: set[str] = set(initial_aliases or ())
+    positional_parameters = [
+        *function.args.posonlyargs,
+        *function.args.args,
+    ]
+    default_bindings = [
+        *zip(
+            positional_parameters[-len(function.args.defaults) :],
+            function.args.defaults,
+        ),
+        *(
+            (parameter, default)
+            for parameter, default in zip(
+                function.args.kwonlyargs,
+                function.args.kw_defaults,
+            )
+            if default is not None
+        ),
+    ]
+    for parameter, default in default_bindings:
+        if is_provenance_derived(default, aliases):
+            aliases.add(parameter.arg.casefold())
     scope_nodes = _walk_lexical_scope(function)
     control_aliases = (
         _cross_agent_control_aliases(function, control_helpers)
@@ -6390,6 +6495,42 @@ def _module_imported_provenance_return_helper_aliases(
     return aliases
 
 
+def _nested_function_parents(
+    tree: ast.AST,
+) -> dict[
+    ast.FunctionDef | ast.AsyncFunctionDef,
+    ast.FunctionDef | ast.AsyncFunctionDef,
+]:
+    """Map nested functions to the function whose locals they close over."""
+
+    parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ] = {}
+    stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+
+    class FunctionParentVisitor(ast.NodeVisitor):
+        def _visit_function(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            if stack:
+                parents[node] = stack[-1]
+            stack.append(node)
+            self.generic_visit(node)
+            stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            self._visit_function(node)
+
+    FunctionParentVisitor().visit(tree)
+    return parents
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -6436,17 +6577,41 @@ def _authority_provenance_lines(
         provenance_return_helpers,
         class_provenance_aliases,
     )
+    function_parents = _nested_function_parents(tree)
+    function_provenance: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, tuple[set[str], set[str]]
+    ] = {}
+
+    def analyze_function_provenance(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[set[str], set[str]]:
+        cached = function_provenance.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = (
+            analyze_function_provenance(parent)[0]
+            if parent is not None
+            else set()
+        )
+        resolved = _provenance_aliases(
+            function,
+            provenance_return_helpers,
+            control_helpers,
+            module_provenance_aliases
+            | class_provenance_aliases.get(function, set())
+            | inherited,
+        )
+        function_provenance[function] = resolved
+        return resolved
+
+    for function in functions:
+        analyze_function_provenance(function)
     for function in functions:
         function_name = function.name.casefold()
         control_aliases = _cross_agent_control_aliases(function, control_helpers)
         provenance_aliases, provenance_selected_targets = (
-            _provenance_aliases(
-                function,
-                provenance_return_helpers,
-                control_helpers,
-                module_provenance_aliases
-                | class_provenance_aliases.get(function, set()),
-            )
+            function_provenance[function]
         )
         lines.update(
             _guard_clause_provenance_lines(
@@ -7129,6 +7294,50 @@ def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
     assert _authority_provenance_lines(nested_authority) == {3}
 
 
+@pytest.mark.parametrize(
+    ("inner_signature", "decision"),
+    [
+        ("target", "lineage"),
+        ("target, allowed=lineage", "allowed"),
+    ],
+    ids=["free-variable", "default-capture"],
+)
+def test_provenance_scanner_carries_outer_aliases_into_closures(
+    inner_signature: str,
+    decision: str,
+) -> None:
+    tree = ast.parse(
+        "def outer(request, target):\n"
+        "    lineage = request.causation_chain\n"
+        f"    def inner({inner_signature}):\n"
+        f"        if {decision}:\n"
+        "            terminate_child(target)\n"
+        "    return inner\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {4}
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "target, allowed=bool(causation_chain)",
+        "target, provider=_get_current_chain",
+        "target, *, allowed=bool(causation_chain)",
+    ],
+    ids=["positional-value", "accessor-callable", "keyword-only-value"],
+)
+def test_provenance_scanner_seeds_parameter_defaults(signature: str) -> None:
+    decision = "provider()" if "provider" in signature else "allowed"
+    tree = ast.parse(
+        f"def handle({signature}):\n"
+        f"    if {decision}:\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
 def test_provenance_scanner_propagates_object_state_across_methods() -> None:
     tree = ast.parse(
         "class Gate:\n"
@@ -7424,6 +7633,32 @@ def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None
 
     assert _authority_provenance_lines(target_shutdown) == {2}
     assert _authority_provenance_lines(process_kill) == {2}
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        (
+            "ACTION = 'terminate_child'\n"
+            "def handle(request, manager, target):\n"
+            "    if request.causation_chain:\n"
+            "        getattr(manager, ACTION)(target)\n",
+            3,
+        ),
+        (
+            "def handle(request, manager, target, action):\n"
+            "    if request.causation_chain:\n"
+            "        getattr(manager, action)(target)\n",
+            2,
+        ),
+    ],
+    ids=["module-constant", "runtime-name"],
+)
+def test_provenance_scanner_fails_closed_on_dynamic_control_attributes(
+    source: str,
+    expected_line: int,
+) -> None:
+    assert _authority_provenance_lines(ast.parse(source)) == {expected_line}
 
 
 def test_provenance_scanner_follows_local_helper_return_values() -> None:

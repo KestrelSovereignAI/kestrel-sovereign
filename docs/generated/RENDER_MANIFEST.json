@@ -262,6 +262,7 @@
         "kestrel_sovereign/features/consent/feature.py",
         "kestrel_sovereign/features/constitution.py",
         "kestrel_sovereign/features/context/feature.py",
+        "kestrel_sovereign/features/contribution_runtime.py",
         "kestrel_sovereign/features/delivery/feature.py",
         "kestrel_sovereign/features/deploy/feature.py",
         "kestrel_sovereign/features/health/feature.py",

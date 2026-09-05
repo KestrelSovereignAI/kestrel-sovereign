@@ -356,12 +356,17 @@ scheduler target and its name contains no agent-shaped word. The contract scans
 every constructor under `kestrel_sovereign`, resolves generic factory names
 from their string-valued call sites, discovers every `CRON_TASKS` entry, and
 includes every literal bespoke-handler mapping supplied to
-`build_cron_registrations`. A registration authenticates and constrains a
-source; its signal and causation metadata do not grant authority over a peer or
-the host. Target-specific authority remains mandatory at the invoked handler.
+`build_cron_registrations`. It also inventories the imperative and declarative
+publication seams through which installed features contribute sources whose
+constructors live outside this checkout. A registration authenticates and
+constrains a source; its signal and causation metadata do not grant authority
+over a peer or the host. Target-specific authority remains mandatory at the
+invoked handler.
 
 | Surface ID | Classification |
 |---|---|
+| `kestrel_sovereign/features/base.py::Feature._register_signal_sources` | Generic imperative publication boundary for feature-owned runtime signal sources. Registry ownership and source policy constrain publication; the contributed handler must still enforce its exact target authority. |
+| `kestrel_sovereign/features/contribution_runtime.py::FeatureContributionRuntime.activate` | Generic declarative publication boundary for out-of-tree workflow signal sources. Contribution validation and registry claims do not confer peer, host, or fleet authority on the contributed handler. |
 | `kestrel_sovereign/features/scheduler/feature.py::_handle_backup_snapshot` | Bespoke self-owned backup handler for `cron.backup_snapshot`; no co-hosted-agent target. |
 | `kestrel_sovereign/features/scheduler/feature.py::_handle_sleep` | Bespoke caller-agent memory-maintenance handler for `cron.sleep`; no co-hosted-agent target. |
 | `kestrel_sovereign/features/scheduler/feature.py::_run_bootstrap_timeout_check` | Bespoke caller-agent bootstrap watchdog for `cron.bootstrap_timeout_check`; no peer authority. |
