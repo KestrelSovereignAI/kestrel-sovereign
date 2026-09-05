@@ -325,6 +325,8 @@ def _compound_binding_names(
 def _module_constant_bindings(
     tree: ast.Module,
     source_path: Path | None = None,
+    initial_strings: dict[str, str] | None = None,
+    initial_collections: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
     """Replay scalar-string and string-collection bindings together.
 
@@ -333,8 +335,8 @@ def _module_constant_bindings(
     that history when an element name is rebound later.
     """
 
-    strings: dict[str, str] = {}
-    collections: dict[str, tuple[str, ...]] = {}
+    strings: dict[str, str] = dict(initial_strings or {})
+    collections: dict[str, tuple[str, ...]] = dict(initial_collections or {})
     collection_alias_groups: dict[str, set[str]] = {}
 
     def detach_collection_alias(name: str) -> None:
@@ -1967,14 +1969,12 @@ def _route_declarations(
     def walk_scope(
         statements: list[ast.stmt],
         inherited_prefixes: dict[str, str],
+        inherited_strings: dict[str, str],
+        inherited_methods: dict[str, tuple[str, ...]],
         *,
         module_scope: bool = False,
     ) -> None:
         prefixes = dict(inherited_prefixes)
-        if not module_scope:
-            prefixes.update(
-                _scope_router_prefixes(statements, string_constants)
-            )
 
         def visit(
             node: ast.AST,
@@ -2030,10 +2030,30 @@ def _route_declarations(
                     declarations.append(
                         (methods, prefix + _route_path(decorator, active_strings))
                     )
-                walk_scope(node.body, prefixes)
+                # Top-level function bodies run after module initialization,
+                # while nested bodies close over the bindings visible in
+                # their containing execution scope. In both cases replay the
+                # body's own assignments from that correct lexical floor.
+                child_strings = (
+                    string_constants if module_scope else active_strings
+                )
+                child_methods = (
+                    method_constants if module_scope else active_methods
+                )
+                walk_scope(
+                    node.body,
+                    prefixes,
+                    child_strings,
+                    child_methods,
+                )
                 return
             if isinstance(node, ast.ClassDef):
-                walk_scope(node.body, prefixes)
+                walk_scope(
+                    node.body,
+                    prefixes,
+                    active_strings,
+                    active_methods,
+                )
                 return
             if isinstance(node, ast.Call):
                 registration = _route_registration_name(
@@ -2132,35 +2152,33 @@ def _route_declarations(
                 )
 
         for index, statement in enumerate(statements):
-            active_strings = string_constants
-            active_methods = method_constants
+            preceding = ast.Module(
+                body=statements[:index],
+                type_ignores=[],
+            )
+            active_strings, active_methods = _module_constant_bindings(
+                preceding,
+                source_path if module_scope else None,
+                inherited_strings,
+                inherited_methods,
+            )
             if module_scope:
-                preceding = ast.Module(
-                    body=statements[:index],
-                    type_ignores=[],
-                )
-                active_strings = _module_string_constants(
-                    preceding, source_path
-                )
-                active_methods = _module_string_collections(
-                    preceding, source_path
-                )
                 declarations.extend(
                     _fastapi_generated_route_declarations(
                         [statement], active_strings
                     )
                 )
-                new_prefixes = _scope_router_prefixes(
-                    [statement], active_strings
-                )
-                for receiver, prefix in new_prefixes.items():
-                    previous = prefixes.get(receiver)
-                    if previous is not None and previous != prefix:
-                        raise AssertionError(
-                            "Ambiguous APIRouter prefix for "
-                            f"{receiver!r}: {previous!r} and {prefix!r}"
-                        )
-                    prefixes[receiver] = prefix
+            new_prefixes = _scope_router_prefixes(
+                [statement], active_strings
+            )
+            for receiver, prefix in new_prefixes.items():
+                previous = prefixes.get(receiver)
+                if previous is not None and previous != prefix:
+                    raise AssertionError(
+                        "Ambiguous APIRouter prefix for "
+                        f"{receiver!r}: {previous!r} and {prefix!r}"
+                    )
+                prefixes[receiver] = prefix
             active_route_aliases = _scope_route_callable_aliases(
                 statements[:index], prefixes
             )
@@ -2171,7 +2189,7 @@ def _route_declarations(
                 active_route_aliases,
             )
 
-    walk_scope(tree.body, {}, module_scope=True)
+    walk_scope(tree.body, {}, {}, {}, module_scope=True)
     return declarations
 
 
@@ -3042,6 +3060,29 @@ def test_route_declarations_resolve_bound_registration_aliases() -> None:
         _module_string_constants(tree),
         _module_string_collections(tree),
     ) == [(('DELETE',), '/api/agents/{name}')]
+
+
+def test_route_declarations_replay_nested_lexical_constants() -> None:
+    tree = ast.parse(
+        'PATH = "/health"\n'
+        'METHODS = ["GET"]\n'
+        'def factory():\n'
+        '    PATH = "/api/agents/{name}/terminate"\n'
+        '    METHODS = ["POST", "DELETE"]\n'
+        '    router = APIRouter(prefix="/v1")\n'
+        '    @router.api_route(PATH, methods=METHODS)\n'
+        '    def route():\n'
+        '        pass\n'
+        '    return router\n'
+    )
+
+    assert _route_declarations(
+        tree,
+        _module_string_constants(tree),
+        _module_string_collections(tree),
+    ) == [
+        (("POST", "DELETE"), "/v1/api/agents/{name}/terminate")
+    ]
 
 
 def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
@@ -4000,13 +4041,96 @@ def _has_provenance_value(
     )
 
 
-def _cross_agent_control_aliases(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-    control_helpers: set[str] | None = None,
-) -> set[str]:
-    """Resolve local names that reference cross-agent control callables."""
+_MUTABLE_CONTAINER_WRITE_ARGUMENTS = {
+    "__setitem__": (1,),
+    "add": (0,),
+    "append": (0,),
+    "extend": (0,),
+    "insert": (1,),
+    "setdefault": (1,),
+    "update": (0,),
+}
 
-    assignments: list[tuple[str, str]] = []
+
+def _reference_binding_names(node: ast.AST) -> set[str]:
+    """Return exact and callable-selector names for one stored reference."""
+
+    names = _binding_target_names(node)
+    if isinstance(node, ast.Attribute):
+        names.add(node.attr.casefold())
+    elif isinstance(node, ast.Subscript):
+        names.update(_control_reference_sources(node))
+    return names
+
+
+def _mutable_container_write(
+    node: ast.Call,
+) -> tuple[set[str], ast.AST] | None:
+    """Return the container binding and values written by a mutator call."""
+
+    receiver: ast.AST | None = None
+    value_nodes: list[ast.AST] = []
+    attribute_name: str | None = None
+    if isinstance(node.func, ast.Attribute):
+        method = node.func.attr.casefold()
+        indexes = _MUTABLE_CONTAINER_WRITE_ARGUMENTS.get(method)
+        if indexes is None:
+            return None
+        receiver = node.func.value
+        value_nodes.extend(
+            node.args[index] for index in indexes if index < len(node.args)
+        )
+        value_nodes.extend(keyword.value for keyword in node.keywords)
+    elif _call_name(node).casefold() == "setattr" and len(node.args) >= 3:
+        receiver = node.args[0]
+        value_nodes.append(node.args[2])
+        attribute_name = _resolved_string(node.args[1])
+    else:
+        return None
+
+    names = _reference_binding_names(receiver)
+    if attribute_name is not None:
+        names.add(attribute_name.casefold())
+    if not names or not value_nodes:
+        return None
+    value: ast.AST = (
+        value_nodes[0]
+        if len(value_nodes) == 1
+        else ast.Tuple(elts=value_nodes, ctx=ast.Load())
+    )
+    return names, value
+
+
+def _mutable_container_alias_groups(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, frozenset[str]]:
+    """Resolve simple source-ordered aliases of mutable local containers."""
+
+    groups: dict[str, set[str]] = {}
+
+    def detach(name: str) -> None:
+        group = groups.pop(name, None)
+        if group is not None:
+            group.discard(name)
+
+    def bind(target_names: set[str], source_names: set[str] | None) -> None:
+        for target_name in target_names:
+            detach(target_name)
+        if not target_names:
+            return
+        source_group = next(
+            (
+                groups[source_name]
+                for source_name in source_names or set()
+                if source_name in groups
+            ),
+            None,
+        )
+        group = source_group if source_group is not None else set()
+        group.update(target_names)
+        for member in group:
+            groups[member] = group
+
     for node in _walk_lexical_scope(function):
         targets: list[ast.AST] = []
         value: ast.AST | None = None
@@ -4019,21 +4143,135 @@ def _cross_agent_control_aliases(
         elif isinstance(node, ast.NamedExpr):
             targets = [node.target]
             value = node.value
+
+        if targets:
+            target_names = {
+                name
+                for target in targets
+                if not isinstance(target, ast.Subscript)
+                for name in _reference_binding_names(target)
+            }
+            source_names = (
+                _reference_binding_names(value)
+                if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript))
+                else set()
+            )
+            creates_container = isinstance(
+                value, (ast.Dict, ast.List, ast.Set)
+            ) or (
+                isinstance(value, ast.Call)
+                and _call_name(value).casefold()
+                in {"defaultdict", "deque", "dict", "list", "set"}
+            )
+            if creates_container or any(
+                source_name in groups for source_name in source_names
+            ):
+                bind(target_names, source_names)
+            else:
+                for target_name in target_names:
+                    detach(target_name)
+
+            for target in targets:
+                if isinstance(target, ast.Subscript):
+                    receiver_names = _reference_binding_names(target.value)
+                    if not any(name in groups for name in receiver_names):
+                        bind(receiver_names, None)
+
+        if isinstance(node, ast.Call):
+            mutation = _mutable_container_write(node)
+            if mutation is not None:
+                receiver_names, _written_value = mutation
+                if not any(name in groups for name in receiver_names):
+                    bind(receiver_names, None)
+
+    return {
+        name: frozenset(group)
+        for name, group in groups.items()
+    }
+
+
+def _cross_agent_control_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    control_helpers: set[str] | None = None,
+) -> set[str]:
+    """Resolve local names that reference cross-agent control callables."""
+
+    assignments: list[tuple[str, str]] = []
+    container_aliases = _mutable_container_alias_groups(function)
+
+    def expand_container_aliases(names: set[str]) -> set[str]:
+        expanded = set(names)
+        for name in names:
+            expanded.update(container_aliases.get(name, ()))
+        return expanded
+
+    positional_parameters = [
+        *function.args.posonlyargs,
+        *function.args.args,
+    ]
+    positional_defaults = (
+        zip(
+            positional_parameters[-len(function.args.defaults):],
+            function.args.defaults,
+        )
+        if function.args.defaults
+        else ()
+    )
+    default_bindings = [
+        *positional_defaults,
+        *(
+            (parameter, default)
+            for parameter, default in zip(
+                function.args.kwonlyargs,
+                function.args.kw_defaults,
+            )
+            if default is not None
+        ),
+    ]
+    for parameter, default in default_bindings:
+        assignments.extend(
+            (parameter.arg.casefold(), source)
+            for source in _control_reference_sources(default)
+        )
+
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.Call):
+            mutation = _mutable_container_write(node)
+            if mutation is not None:
+                target_names, value = mutation
+                target_names = expand_container_aliases(target_names)
+                sources = _control_reference_sources(value)
+                assignments.extend(
+                    (target_name, source)
+                    for target_name in target_names
+                    for source in sources
+                )
+            continue
         if value is None:
             continue
         sources = _control_reference_sources(value)
         if not sources:
             continue
         for target in targets:
-            target_name = (
-                target.id.casefold()
-                if isinstance(target, ast.Name)
-                else target.attr.casefold()
-                if isinstance(target, ast.Attribute)
-                else ""
+            target_names = expand_container_aliases(
+                _reference_binding_names(target)
             )
-            if target_name:
-                assignments.extend((target_name, source) for source in sources)
+            assignments.extend(
+                (target_name, source)
+                for target_name in target_names
+                for source in sources
+            )
 
     aliases: set[str] = set(control_helpers or ())
     changed = True
@@ -4207,11 +4445,24 @@ def _is_cross_agent_control_call(
     callable_tokens = set(_control_reference_sources(node.func))
     if isinstance(node.func, ast.Subscript):
         callable_tokens.update(_identifier_tokens(node.func.slice))
-    higher_order_sources = (
-        _control_reference_sources(node.args[0])
-        if call_name in {"filter", "map"} and node.args
-        else set()
-    )
+    higher_order_callable_indexes = {
+        "apply_async": (0,),
+        "call_at": (1,),
+        "call_later": (1,),
+        "call_soon": (0,),
+        "call_soon_threadsafe": (0,),
+        "filter": (0,),
+        "map": (0,),
+        "run_in_executor": (1,),
+        "submit": (0,),
+        "to_thread": (0,),
+    }
+    higher_order_sources = {
+        source
+        for index in higher_order_callable_indexes.get(call_name, ())
+        if index < len(node.args)
+        for source in _control_reference_sources(node.args[index])
+    }
     return (
         _is_cross_agent_control_name(call_name)
         or call_name in (control_aliases or set())
@@ -4401,6 +4652,14 @@ def _provenance_aliases(
         else set()
     )
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
+    container_aliases = _mutable_container_alias_groups(function)
+
+    def expand_container_aliases(names: set[str]) -> set[str]:
+        expanded = set(names)
+        for name in names:
+            expanded.update(container_aliases.get(name, ()))
+        return expanded
+
     for node in scope_nodes:
         targets: list[ast.AST] = []
         value: ast.AST | None = None
@@ -4416,13 +4675,25 @@ def _provenance_aliases(
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             targets = [node.target]
             value = node.iter
+        elif isinstance(node, ast.Call):
+            mutation = _mutable_container_write(node)
+            if mutation is not None:
+                names, value = mutation
+                assignments.append(
+                    (expand_container_aliases(names), value, node)
+                )
+            continue
         if value is None:
             continue
-        names = {
+        names = expand_container_aliases({
             name
             for target in targets
             for name in _binding_target_names(target)
-        }
+        })
+        for target in targets:
+            names.update(
+                expand_container_aliases(_reference_binding_names(target))
+            )
         # A provenance-selected member of a container passed to a control call
         # can choose the target through ``**kwargs`` or a structured argument.
         # Taint that container only when it is actually an argument at this
@@ -6351,6 +6622,122 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
 
     assert _authority_provenance_lines(parameter_callback) == {5}
     assert _authority_provenance_lines(keyword_callback) == {5}
+
+
+def test_provenance_scanner_follows_mutable_container_writes() -> None:
+    append_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decisions = []\n"
+        "    decisions.append(bool(request.causation_chain))\n"
+        "    if any(decisions):\n"
+        "        terminate_child(target)\n"
+    )
+    update_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decisions = {}\n"
+        "    decisions.update(\n"
+        "        {'allowed': bool(request.causation_chain)}\n"
+        "    )\n"
+        "    if decisions['allowed']:\n"
+        "        terminate_child(target)\n"
+    )
+    setitem_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decisions = {}\n"
+        "    decisions.__setitem__(\n"
+        "        'allowed', bool(request.causation_chain)\n"
+        "    )\n"
+        "    if decisions['allowed']:\n"
+        "        terminate_child(target)\n"
+    )
+    setattr_decision = ast.parse(
+        "def dispatch(request, target, decisions):\n"
+        "    setattr(\n"
+        "        decisions, 'allowed', bool(request.causation_chain)\n"
+        "    )\n"
+        "    if decisions.allowed:\n"
+        "        terminate_child(target)\n"
+    )
+    aliased_decision = ast.parse(
+        "def dispatch(request, target):\n"
+        "    decisions = []\n"
+        "    alias = decisions\n"
+        "    alias.append(bool(request.causation_chain))\n"
+        "    if any(decisions):\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(append_decision) == {4}
+    assert _authority_provenance_lines(update_decision) == {6}
+    assert _authority_provenance_lines(setitem_decision) == {6}
+    assert _authority_provenance_lines(setattr_decision) == {5}
+    assert _authority_provenance_lines(aliased_decision) == {5}
+
+
+def test_provenance_scanner_follows_higher_order_control_dispatch() -> None:
+    callbacks = ast.parse(
+        "def dispatch(request, executor, loop, target):\n"
+        "    if request.causation_chain:\n"
+        "        executor.submit(terminate_child, target)\n"
+        "    if request.orchestrator:\n"
+        "        loop.call_soon(stop_peer, target)\n"
+    )
+    delayed_callbacks = ast.parse(
+        "def dispatch(request, loop, target):\n"
+        "    if request.causation_chain:\n"
+        "        loop.call_later(0, terminate_child, target)\n"
+        "    if request.orchestrator:\n"
+        "        loop.run_in_executor(None, stop_peer, target)\n"
+    )
+
+    assert _authority_provenance_lines(callbacks) == {2, 4}
+    assert _authority_provenance_lines(delayed_callbacks) == {2, 4}
+
+
+def test_provenance_scanner_follows_controls_stored_in_containers() -> None:
+    subscript_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {}\n"
+        "    callbacks['run'] = terminate_child\n"
+        "    if request.causation_chain:\n"
+        "        callbacks['run'](target)\n"
+    )
+    updated_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {}\n"
+        "    callbacks.update({'run': terminate_child})\n"
+        "    if request.causation_chain:\n"
+        "        callbacks['run'](target)\n"
+    )
+    default_callbacks = ast.parse(
+        "def dispatch(\n"
+        "    request, target, callback=terminate_child, *, fallback=stop_peer\n"
+        "):\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+        "    if request.orchestrator:\n"
+        "        fallback(target)\n"
+    )
+    aliased_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {}\n"
+        "    alias = callbacks\n"
+        "    alias['run'] = terminate_child\n"
+        "    if request.causation_chain:\n"
+        "        callbacks['run'](target)\n"
+    )
+    attribute_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    self.callbacks.run = terminate_child\n"
+        "    if request.causation_chain:\n"
+        "        self.callbacks.run(target)\n"
+    )
+
+    assert _authority_provenance_lines(subscript_callback) == {4}
+    assert _authority_provenance_lines(updated_callback) == {4}
+    assert _authority_provenance_lines(default_callbacks) == {4, 6}
+    assert _authority_provenance_lines(aliased_callback) == {5}
+    assert _authority_provenance_lines(attribute_callback) == {3}
 
 
 def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> None:
