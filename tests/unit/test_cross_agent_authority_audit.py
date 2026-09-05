@@ -243,6 +243,19 @@ def _module_constant_bindings(
 
     strings: dict[str, str] = {}
     collections: dict[str, tuple[str, ...]] = {}
+    collection_alias_groups: dict[str, set[str]] = {}
+
+    def detach_collection_alias(name: str) -> None:
+        group = collection_alias_groups.pop(name, None)
+        if group is not None:
+            group.discard(name)
+
+    def invalidate_collection(name: str) -> None:
+        group = set(collection_alias_groups.get(name, {name}))
+        for alias in group:
+            collections.pop(alias, None)
+            collection_alias_groups.pop(alias, None)
+
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and source_path is not None:
             imported_path = _imported_module_path(node, source_path)
@@ -302,7 +315,7 @@ def _module_constant_bindings(
         if mutated_names:
             for name in mutated_names:
                 strings.pop(name, None)
-                collections.pop(name, None)
+                invalidate_collection(name)
             continue
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -316,6 +329,7 @@ def _module_constant_bindings(
             _resolved_string(value, strings) if value is not None else None
         )
         resolved_collection: tuple[str, ...] | None = None
+        collection_source: str | None = None
         if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
             elements = tuple(
                 _resolved_string(element, strings) for element in value.elts
@@ -324,17 +338,34 @@ def _module_constant_bindings(
                 resolved_collection = tuple(
                     element for element in elements if element is not None
                 )
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
+        elif isinstance(value, ast.Name) and value.id in collections:
+            resolved_collection = collections[value.id]
+            collection_source = value.id
+        target_names = [
+            target.id for target in targets if isinstance(target, ast.Name)
+        ]
+        for target_name in target_names:
+            if target_name != collection_source:
+                detach_collection_alias(target_name)
             if resolved_string is None:
-                strings.pop(target.id, None)
+                strings.pop(target_name, None)
             else:
-                strings[target.id] = resolved_string
+                strings[target_name] = resolved_string
             if resolved_collection is None:
-                collections.pop(target.id, None)
+                collections.pop(target_name, None)
             else:
-                collections[target.id] = resolved_collection
+                collections[target_name] = resolved_collection
+        if resolved_collection is not None and target_names:
+            if collection_source is not None:
+                group = collection_alias_groups.get(collection_source)
+                if group is None:
+                    group = {collection_source}
+                    collection_alias_groups[collection_source] = group
+                group.update(target_names)
+            else:
+                group = set(target_names)
+            for target_name in target_names:
+                collection_alias_groups[target_name] = group
     return strings, collections
 
 
@@ -381,6 +412,29 @@ def _cached_local_string_constants(source_path: Path) -> dict[str, str]:
     return _module_string_constants(_parsed_module(source_path))
 
 
+def _imported_module_attribute_name(
+    tree: ast.Module,
+    value: ast.AST,
+) -> str | None:
+    """Return an attribute selected through a statically imported module."""
+
+    if not isinstance(value, ast.Attribute):
+        return None
+    module_aliases = {
+        (imported.asname or imported.name.split(".", 1)[0])
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for imported in node.names
+    }
+    expression = ast.unparse(value)
+    if any(
+        expression == alias or expression.startswith(f"{alias}.")
+        for alias in module_aliases
+    ):
+        return value.attr
+    return None
+
+
 def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
     """Resolve direct import aliases for the SDK's ``tool`` decorator."""
 
@@ -395,9 +449,14 @@ def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Name)
         ):
-            assignments.append((node.targets[0].id, node.value.id))
+            source = (
+                node.value.id
+                if isinstance(node.value, ast.Name)
+                else _imported_module_attribute_name(tree, node.value)
+            )
+            if source is not None:
+                assignments.append((node.targets[0].id, source))
     changed = True
     while changed:
         changed = False
@@ -434,6 +493,29 @@ def test_module_string_constants_follow_source_order_on_reassignment() -> None:
     )
     assert "PATH" not in _module_string_constants(mutated)
     assert "METHODS" not in _module_string_collections(mutated)
+
+    mutated_alias = ast.parse(
+        'METHODS = ["GET"]\n'
+        "ALIAS = METHODS\n"
+        'ALIAS.append("DELETE")\n'
+    )
+    aliased_collections = _module_string_collections(mutated_alias)
+    assert "METHODS" not in aliased_collections
+    assert "ALIAS" not in aliased_collections
+
+    aliased_route = ast.parse(
+        'METHODS = ["GET"]\n'
+        "ALIAS = METHODS\n"
+        'ALIAS.append("DELETE")\n'
+        '@app.api_route("/api/agents/{name}", methods=METHODS)\n'
+        "def route():\n    pass\n"
+    )
+    with pytest.raises(AssertionError, match="Unresolved api_route methods"):
+        _route_declarations(
+            aliased_route,
+            _module_string_constants(aliased_route),
+            _module_string_collections(aliased_route),
+        )
 
 
 def _public_tool_name(
@@ -733,9 +815,14 @@ def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Name)
         ):
-            assignments.append((node.targets[0].id, node.value.id))
+            source = (
+                node.value.id
+                if isinstance(node.value, ast.Name)
+                else _imported_module_attribute_name(tree, node.value)
+            )
+            if source is not None:
+                assignments.append((node.targets[0].id, source))
     changed = True
     while changed:
         changed = False
@@ -2050,6 +2137,18 @@ def test_signal_source_constructor_import_aliases_are_resolved() -> None:
     assert len(constructors) == 1
     assert _call_name(constructors[0]) == "Registration"
 
+    module_alias = ast.parse(
+        "import kestrel_sdk.signals as signals\n"
+        "Registration = signals.SourceRegistration\n"
+        "Registration(name='module.attribute.source')\n"
+    )
+    assert "Registration" in _source_registration_constructor_aliases(
+        module_alias
+    )
+    module_constructors = _source_registration_constructors(module_alias)
+    assert len(module_constructors) == 1
+    assert _call_name(module_constructors[0]) == "Registration"
+
 
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
     expected = {
@@ -2636,6 +2735,21 @@ def test_tool_import_aliases_and_route_keyword_unpacking_fail_closed() -> None:
         function.name,
         {},
         _tool_decorator_aliases(tree),
+    ) == "terminate_child"
+
+    module_alias = ast.parse(
+        "import kestrel_sdk as sdk\n"
+        "expose = sdk.tool\n"
+        '@expose(name="terminate_child")\n'
+        "def implementation():\n    pass\n"
+    )
+    module_function = module_alias.body[2]
+    assert isinstance(module_function, ast.FunctionDef)
+    assert _public_tool_name(
+        module_function.decorator_list[0],
+        module_function.name,
+        {},
+        _tool_decorator_aliases(module_alias),
     ) == "terminate_child"
 
     route = ast.parse(
@@ -4301,11 +4415,51 @@ def _module_provenance_constant_aliases(
     if not isinstance(tree, ast.Module):
         return set()
     constants = _module_string_constants(tree, source_path)
-    return {
+    aliases = {
         name.casefold()
         for name, value in constants.items()
         if _has_provenance_token(ast.Constant(value=value))
     }
+    if source_path is None:
+        return aliases
+
+    source_path = source_path.resolve()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                imported_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                )
+                if imported_path is None:
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                for name, value in _cached_local_string_constants(
+                    imported_path
+                ).items():
+                    if _has_provenance_token(ast.Constant(value=value)):
+                        aliases.add(f"{qualifier}.{name}".casefold())
+        elif isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                child_module = ".".join(
+                    part
+                    for part in (node.module, imported.name)
+                    if part
+                )
+                imported_path = _resolved_repository_import_path(
+                    source_path,
+                    child_module,
+                    node.level,
+                )
+                if imported_path is None:
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                for name, value in _cached_local_string_constants(
+                    imported_path
+                ).items():
+                    if _has_provenance_token(ast.Constant(value=value)):
+                        aliases.add(f"{qualifier}.{name}".casefold())
+    return aliases
 
 
 def _module_imported_provenance_accessor_aliases(tree: ast.AST) -> set[str]:
@@ -5701,6 +5855,18 @@ def test_provenance_scanner_resolves_module_level_metadata_keys(
         ast.parse(source, filename=str(source_path)), source_path
     ) == {4}
     assert _cached_authority_provenance_lines(source_path) == frozenset({4})
+
+    module_import_path = tmp_path / "module_dispatcher.py"
+    module_source = (
+        "import constants\n\n"
+        "def dispatch(metadata, target):\n"
+        "    if metadata.get(constants.METADATA_KEY):\n"
+        "        terminate_child(target)\n"
+    )
+    module_import_path.write_text(module_source, encoding="utf-8")
+    assert _cached_authority_provenance_lines(
+        module_import_path
+    ) == frozenset({4})
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
