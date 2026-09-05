@@ -367,6 +367,8 @@ invoked handler.
 |---|---|
 | `kestrel_sovereign/features/base.py::Feature._register_signal_sources` | Generic imperative publication boundary for feature-owned runtime signal sources. Registry ownership and source policy constrain publication; the contributed handler must still enforce its exact target authority. |
 | `kestrel_sovereign/features/contribution_runtime.py::FeatureContributionRuntime.activate` | Generic declarative publication boundary for out-of-tree workflow signal sources. Contribution validation and registry claims do not confer peer, host, or fleet authority on the contributed handler. |
+| `kestrel_sovereign/kestrel_agent.py::KestrelAgent._boot_phase_a2a_observability_signals` | Core boot publication boundary for A2A, wallet, wait, and workflow-rescue source registrations. Registration is wiring, not authority; each invoked handler remains bound to its documented target policy. |
+| `kestrel_sovereign/kestrel_agent.py::KestrelAgent._boot_phase_periodic_services_readiness` | Core boot publication boundary for heartbeat and system-resume source registrations. These host-local lifecycle signals do not confer peer or fleet authority on downstream handlers. |
 | `kestrel_sovereign/features/scheduler/feature.py::_handle_backup_snapshot` | Bespoke self-owned backup handler for `cron.backup_snapshot`; no co-hosted-agent target. |
 | `kestrel_sovereign/features/scheduler/feature.py::_handle_sleep` | Bespoke caller-agent memory-maintenance handler for `cron.sleep`; no co-hosted-agent target. |
 | `kestrel_sovereign/features/scheduler/feature.py::_run_bootstrap_timeout_check` | Bespoke caller-agent bootstrap watchdog for `cron.bootstrap_timeout_check`; no peer authority. |
