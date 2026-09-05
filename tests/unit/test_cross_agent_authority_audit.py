@@ -914,6 +914,12 @@ def _discovered_scheduler_surfaces() -> frozenset[str]:
     if task_names is None:
         raise AssertionError("Could not find the CRON_TASKS declaration")
 
+    scheduler_source_names = _scheduler_registration_source_names(
+        source_tree,
+        source_constants,
+        task_names,
+    )
+
     feature_path = REPO_ROOT / "kestrel_sovereign/features/scheduler/feature.py"
     feature_tree = ast.parse(
         feature_path.read_text(encoding="utf-8"), filename=str(feature_path)
@@ -976,14 +982,100 @@ def _discovered_scheduler_surfaces() -> frozenset[str]:
 
     return frozenset({
         *(
-            f"kestrel_sovereign/signals/sources/scheduler.py::cron.{name}"
-            for name in task_names
+            f"kestrel_sovereign/signals/sources/scheduler.py::{name}"
+            for name in scheduler_source_names
         ),
         *(
             f"kestrel_sovereign/features/scheduler/feature.py::{name}"
             for name in builtin_handlers.values()
         ),
     })
+
+
+def _scheduler_registration_source_names(
+    tree: ast.Module,
+    constants: dict[str, str],
+    task_names: set[str],
+) -> set[str]:
+    """Resolve every scheduler registration against its live constructor.
+
+    The scheduler builds one registration per ``CRON_TASKS`` entry, so merely
+    synthesizing ``cron.<task>`` from that table would not prove the
+    ``SourceRegistration`` wiring still consumes it.  Validate that loop edge
+    structurally, inventory additional literal registrations, and reject any
+    constructor whose source name cannot be resolved.
+    """
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    names: set[str] = set()
+    constructors = _source_registration_constructors(tree)
+    if not constructors:
+        raise AssertionError("scheduler.py has no SourceRegistration constructor")
+
+    for constructor in constructors:
+        name_keyword = next(
+            (item for item in constructor.keywords if item.arg == "name"),
+            None,
+        )
+        name_expression = (
+            name_keyword.value
+            if name_keyword is not None
+            else constructor.args[0]
+            if constructor.args
+            else None
+        )
+        if name_expression is None:
+            raise AssertionError("Scheduler SourceRegistration has no name")
+
+        direct_name = _resolved_string(name_expression, constants)
+        if direct_name is not None:
+            names.add(direct_name)
+            continue
+
+        if not (
+            isinstance(name_expression, ast.Call)
+            and _call_name(name_expression) == "cron_source_name"
+            and len(name_expression.args) == 1
+            and not name_expression.keywords
+            and isinstance(name_expression.args[0], ast.Name)
+        ):
+            raise AssertionError(
+                "Unresolved scheduler SourceRegistration name: "
+                f"{ast.unparse(name_expression)}"
+            )
+
+        task_binding = name_expression.args[0].id
+        enclosing: ast.AST | None = constructor
+        while enclosing is not None and not isinstance(
+            enclosing, (ast.For, ast.AsyncFor)
+        ):
+            enclosing = parents.get(enclosing)
+        loop_target_names = (
+            {
+                child.id
+                for child in ast.walk(enclosing.target)
+                if isinstance(child, ast.Name)
+            }
+            if isinstance(enclosing, (ast.For, ast.AsyncFor))
+            else set()
+        )
+        if not (
+            isinstance(enclosing, (ast.For, ast.AsyncFor))
+            and isinstance(enclosing.iter, ast.Name)
+            and enclosing.iter.id == "CRON_TASKS"
+            and task_binding in loop_target_names
+        ):
+            raise AssertionError(
+                "cron_source_name must consume the task binding from the "
+                "CRON_TASKS registration loop"
+            )
+        names.update(f"cron.{task_name}" for task_name in task_names)
+
+    return names
 
 
 def _resolved_source_factory_call_names(
@@ -1618,11 +1710,100 @@ def _scope_router_prefixes(
     return prefixes
 
 
-def _route_receiver_name(decorator: ast.Call) -> str | None:
-    if not isinstance(decorator.func, ast.Attribute):
-        return None
-    receiver = decorator.func.value
-    return receiver.id if isinstance(receiver, ast.Name) else None
+_ROUTE_REGISTRATION_NAMES = {
+    "add_api_route",
+    "add_api_websocket_route",
+    "add_route",
+    "add_websocket_route",
+    "api_route",
+    "delete",
+    "get",
+    "head",
+    "include_router",
+    "mount",
+    "options",
+    "patch",
+    "post",
+    "put",
+    "route",
+    "trace",
+    "websocket",
+    "websocket_route",
+}
+
+
+def _scope_route_callable_aliases(
+    statements: list[ast.stmt],
+    prefixes: dict[str, str],
+) -> dict[str, tuple[str, str]]:
+    """Resolve source-ordered aliases of bound FastAPI registrations."""
+
+    aliases: dict[str, tuple[str, str]] = {}
+    for statement in statements:
+        if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+            for name in _compound_binding_names(statement, set()):
+                aliases.pop(name, None)
+            continue
+
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(statement, ast.Assign):
+            targets = list(statement.targets)
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value = statement.value
+        if not targets:
+            continue
+
+        target_names = {
+            target.id for target in targets if isinstance(target, ast.Name)
+        }
+        for target_name in target_names:
+            aliases.pop(target_name, None)
+        if value is None:
+            continue
+
+        binding: tuple[str, str] | None = None
+        if isinstance(value, ast.Attribute) and isinstance(
+            value.value, ast.Name
+        ):
+            registration = value.attr.casefold()
+            receiver = value.value.id
+            if registration in _ROUTE_REGISTRATION_NAMES and (
+                receiver == "app" or receiver in prefixes
+            ):
+                binding = (receiver, registration)
+        elif isinstance(value, ast.Name):
+            binding = aliases.get(value.id)
+        if binding is not None:
+            aliases.update({target_name: binding for target_name in target_names})
+    return aliases
+
+
+def _route_registration_name(
+    call: ast.Call,
+    aliases: dict[str, tuple[str, str]] | None = None,
+) -> str | None:
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr.casefold()
+    if isinstance(call.func, ast.Name):
+        binding = (aliases or {}).get(call.func.id)
+        return binding[1] if binding is not None else None
+    return None
+
+
+def _route_receiver_name(
+    decorator: ast.Call,
+    aliases: dict[str, tuple[str, str]] | None = None,
+) -> str | None:
+    if isinstance(decorator.func, ast.Attribute):
+        receiver = decorator.func.value
+        return receiver.id if isinstance(receiver, ast.Name) else None
+    if isinstance(decorator.func, ast.Name):
+        binding = (aliases or {}).get(decorator.func.id)
+        return binding[0] if binding is not None else None
+    return None
 
 
 def _programmatic_route_path(
@@ -1799,6 +1980,7 @@ def _route_declarations(
             node: ast.AST,
             active_strings: dict[str, str],
             active_methods: dict[str, tuple[str, ...]],
+            active_route_aliases: dict[str, tuple[str, str]],
         ) -> None:
             if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
                 disturbed = _compound_binding_names(
@@ -1815,16 +1997,27 @@ def _route_declarations(
                     if name not in disturbed
                 }
                 for child in ast.iter_child_nodes(node):
-                    visit(child, nested_strings, nested_methods)
+                    visit(
+                        child,
+                        nested_strings,
+                        nested_methods,
+                        active_route_aliases,
+                    )
                 return
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
                     if not isinstance(decorator, ast.Call):
                         continue
-                    methods = _route_methods(decorator, active_methods)
+                    methods = _route_methods(
+                        decorator,
+                        active_methods,
+                        active_route_aliases,
+                    )
                     if not methods:
                         continue
-                    receiver = _route_receiver_name(decorator)
+                    receiver = _route_receiver_name(
+                        decorator, active_route_aliases
+                    )
                     if receiver == "app":
                         prefix = ""
                     elif receiver is not None and receiver in prefixes:
@@ -1842,10 +2035,14 @@ def _route_declarations(
             if isinstance(node, ast.ClassDef):
                 walk_scope(node.body, prefixes)
                 return
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                registration = node.func.attr.casefold()
+            if isinstance(node, ast.Call):
+                registration = _route_registration_name(
+                    node, active_route_aliases
+                )
                 if registration == "include_router":
-                    receiver = _route_receiver_name(node)
+                    receiver = _route_receiver_name(
+                        node, active_route_aliases
+                    )
                     prefix_keyword = next(
                         (
                             item
@@ -1903,7 +2100,9 @@ def _route_declarations(
                     "add_websocket_route",
                     "mount",
                 }:
-                    receiver = _route_receiver_name(node)
+                    receiver = _route_receiver_name(
+                        node, active_route_aliases
+                    )
                     if receiver == "app":
                         prefix = ""
                     elif receiver is not None and receiver in prefixes:
@@ -1915,13 +2114,22 @@ def _route_declarations(
                         )
                     declarations.append(
                         (
-                            _route_methods(node, active_methods),
+                            _route_methods(
+                                node,
+                                active_methods,
+                                active_route_aliases,
+                            ),
                             prefix
                             + _programmatic_route_path(node, active_strings),
                         )
                     )
             for child in ast.iter_child_nodes(node):
-                visit(child, active_strings, active_methods)
+                visit(
+                    child,
+                    active_strings,
+                    active_methods,
+                    active_route_aliases,
+                )
 
         for index, statement in enumerate(statements):
             active_strings = string_constants
@@ -1953,7 +2161,15 @@ def _route_declarations(
                             f"{receiver!r}: {previous!r} and {prefix!r}"
                         )
                     prefixes[receiver] = prefix
-            visit(statement, active_strings, active_methods)
+            active_route_aliases = _scope_route_callable_aliases(
+                statements[:index], prefixes
+            )
+            visit(
+                statement,
+                active_strings,
+                active_methods,
+                active_route_aliases,
+            )
 
     walk_scope(tree.body, {}, module_scope=True)
     return declarations
@@ -1997,10 +2213,11 @@ def _module_string_collections(
 def _route_methods(
     decorator: ast.Call,
     constants: dict[str, tuple[str, ...]] | None = None,
+    route_aliases: dict[str, tuple[str, str]] | None = None,
 ) -> tuple[str, ...]:
-    if not isinstance(decorator.func, ast.Attribute):
+    method = _route_registration_name(decorator, route_aliases)
+    if method is None:
         return ()
-    method = decorator.func.attr.lower()
     if method in {
         "add_api_websocket_route",
         "add_websocket_route",
@@ -2355,6 +2572,49 @@ def test_signal_source_inventory_scans_beyond_scheduler_module() -> None:
         "kestrel_sovereign/signals/sources/workflow_rescue.py::"
         "fleet_stalled_sweep",
     } <= non_scheduler_sources
+
+
+def test_scheduler_registration_constructors_are_structurally_inventoried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wired = ast.parse(
+        'CRON_TASKS = [("alpha", mode, resources), '
+        '("beta", mode, resources)]\n'
+        'for task_name, mode, resources in CRON_TASKS:\n'
+        '    registrations.append(\n'
+        '        SourceRegistration(name=cron_source_name(task_name))\n'
+        '    )\n'
+        'SourceRegistration(name="manual.source")\n'
+    )
+    assert _scheduler_registration_source_names(
+        wired,
+        _module_string_constants(wired),
+        {"alpha", "beta"},
+    ) == {"cron.alpha", "cron.beta", "manual.source"}
+
+    unwired = ast.parse(
+        'CRON_TASKS = [("alpha", mode, resources)]\n'
+        'SourceRegistration(name=cron_source_name(task_name))\n'
+    )
+    with pytest.raises(AssertionError, match="CRON_TASKS registration loop"):
+        _scheduler_registration_source_names(
+            unwired,
+            _module_string_constants(unwired),
+            {"alpha"},
+        )
+
+    def reject_unvalidated_scheduler(*_args: object) -> set[str]:
+        raise RuntimeError("constructor validator reached")
+
+    _discovered_scheduler_surfaces.cache_clear()
+    monkeypatch.setitem(
+        globals(),
+        "_scheduler_registration_source_names",
+        reject_unvalidated_scheduler,
+    )
+    with pytest.raises(RuntimeError, match="constructor validator reached"):
+        _discovered_scheduler_surfaces()
+    _discovered_scheduler_surfaces.cache_clear()
 
 
 def test_each_source_factory_call_must_resolve_its_own_name() -> None:
@@ -2766,6 +3026,22 @@ def test_route_declarations_resolve_constants_at_decorator_execution() -> None:
     assert _route_declarations(tree, final_strings, final_methods) == [
         (("POST",), "/api/agents/{agent}/terminate")
     ]
+
+
+def test_route_declarations_resolve_bound_registration_aliases() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'publish = router.delete\n'
+        '@publish("/agents/{name}")\n'
+        'def delete_agent():\n'
+        '    pass\n'
+    )
+
+    assert _route_declarations(
+        tree,
+        _module_string_constants(tree),
+        _module_string_collections(tree),
+    ) == [(('DELETE',), '/api/agents/{name}')]
 
 
 def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
@@ -3416,6 +3692,92 @@ def _identifier_tokens(node: ast.AST) -> frozenset[str]:
     return frozenset(tokens)
 
 
+def _binding_target_names(target: ast.AST) -> set[str]:
+    """Return normalized names bound by an assignment or iteration target."""
+
+    if isinstance(target, ast.Name):
+        return {target.id.casefold()}
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {
+            name
+            for element in target.elts
+            for name in _binding_target_names(element)
+        }
+    if isinstance(target, (ast.Attribute, ast.Subscript)):
+        return {ast.unparse(target).casefold()}
+    return set()
+
+
+_CROSS_AGENT_STATE_COLLECTIONS = {
+    "_agents",
+    "agents",
+    "_children",
+    "children",
+    "_descendants",
+    "descendants",
+    "_peers",
+    "peers",
+    "agent_registry",
+    "child_registry",
+    "peer_registry",
+}
+
+
+def _is_cross_agent_state_mutation_target(node: ast.AST) -> bool:
+    """Whether a write directly selects an agent/child/peer registry entry."""
+
+    collection_references = {
+        child.id.casefold()
+        if isinstance(child, ast.Name)
+        else child.attr.casefold()
+        for child in ast.walk(node)
+        if isinstance(child, (ast.Name, ast.Attribute))
+        and (
+            child.id.casefold()
+            if isinstance(child, ast.Name)
+            else child.attr.casefold()
+        )
+        in _CROSS_AGENT_STATE_COLLECTIONS
+    }
+    if not collection_references:
+        return False
+    is_collection = (
+        isinstance(node, ast.Name)
+        and node.id.casefold() in _CROSS_AGENT_STATE_COLLECTIONS
+    ) or (
+        isinstance(node, ast.Attribute)
+        and node.attr.casefold() in _CROSS_AGENT_STATE_COLLECTIONS
+    )
+    return is_collection or any(
+        isinstance(child, ast.Subscript) for child in ast.walk(node)
+    )
+
+
+def _is_cross_agent_state_mutation_call(call: ast.Call) -> bool:
+    """Whether a mutator call writes directly through an agent registry."""
+
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold()
+        in {
+            "__delitem__",
+            "__setitem__",
+            "add",
+            "append",
+            "clear",
+            "discard",
+            "extend",
+            "insert",
+            "pop",
+            "popitem",
+            "remove",
+            "setdefault",
+            "update",
+        }
+        and _is_cross_agent_state_mutation_target(call.func.value)
+    )
+
+
 @lru_cache(maxsize=None)
 def _walk_lexical_scope(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -3484,6 +3846,55 @@ def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
             _block_guaranteed_exits(case.body) for case in terminal.cases
         )
     return False
+
+
+def _contains_current_loop_break(statements: list[ast.stmt]) -> bool:
+    """Whether a block can break its owning loop, excluding nested loops."""
+
+    class BreakVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Break(self, node: ast.Break) -> None:  # noqa: N802
+            self.found = True
+
+        def visit_For(self, node: ast.For) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:  # noqa: N802
+            return
+
+        def visit_While(self, node: ast.While) -> None:  # noqa: N802
+            return
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = BreakVisitor()
+    for statement in statements:
+        visitor.visit(statement)
+    return visitor.found
+
+
+def _loop_else_guards_continuation(
+    statement: ast.For | ast.AsyncFor | ast.While,
+) -> bool:
+    """Whether breaking versus exhausting the loop gates later siblings."""
+
+    return (
+        _block_guaranteed_exits(statement.orelse)
+        and _contains_current_loop_break(statement.body)
+    )
 
 
 def _child_statement_blocks(statement: ast.stmt) -> list[list[ast.stmt]]:
@@ -3796,9 +4207,19 @@ def _is_cross_agent_control_call(
     callable_tokens = set(_control_reference_sources(node.func))
     if isinstance(node.func, ast.Subscript):
         callable_tokens.update(_identifier_tokens(node.func.slice))
+    higher_order_sources = (
+        _control_reference_sources(node.args[0])
+        if call_name in {"filter", "map"} and node.args
+        else set()
+    )
     return (
         _is_cross_agent_control_name(call_name)
         or call_name in (control_aliases or set())
+        or any(
+            _is_cross_agent_control_name(source)
+            or source in (control_aliases or set())
+            for source in higher_order_sources
+        )
         or any(
             _is_cross_agent_control_name(token)
             or token in (control_aliases or set())
@@ -3942,22 +4363,6 @@ def _provenance_aliases(
             return _has_provenance_token(value, aliases) or calls_known_helper
         return False
 
-    def target_names(target: ast.AST) -> set[str]:
-        if isinstance(target, ast.Name):
-            return {target.id.casefold()}
-        if isinstance(target, (ast.List, ast.Tuple)):
-            return {
-                name
-                for element in target.elts
-                for name in target_names(element)
-            }
-        if isinstance(target, (ast.Attribute, ast.Subscript)):
-            # Use the full access path rather than tainting broad bases such as
-            # ``self`` or ``state``. The same normalized path is emitted by
-            # ``_identifier_tokens`` when a later condition reads it.
-            return {ast.unparse(target).casefold()}
-        return set()
-
     aliases: set[str] = set(initial_aliases or ())
     scope_nodes = _walk_lexical_scope(function)
     control_aliases = (
@@ -4013,7 +4418,11 @@ def _provenance_aliases(
             value = node.iter
         if value is None:
             continue
-        names = {name for target in targets for name in target_names(target)}
+        names = {
+            name
+            for target in targets
+            for name in _binding_target_names(target)
+        }
         # A provenance-selected member of a container passed to a control call
         # can choose the target through ``**kwargs`` or a structured argument.
         # Taint that container only when it is actually an argument at this
@@ -4078,15 +4487,15 @@ def _provenance_aliases(
             node,
             (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
         ):
-            conditions = [
-                condition
+            decisions = [
+                expression
                 for generator in node.generators
-                for condition in generator.ifs
+                for expression in [generator.iter, *generator.ifs]
             ]
             guarded = [node]
-            if conditions:
+            if decisions:
                 decision_expression = ast.BoolOp(
-                    op=ast.And(), values=conditions
+                    op=ast.And(), values=decisions
                 )
         if (
             guarded
@@ -4127,6 +4536,17 @@ def _provenance_aliases(
                 ):
                     authority_decision_names.update(
                         _identifier_tokens(statement.test)
+                    )
+                elif isinstance(
+                    statement, (ast.For, ast.AsyncFor, ast.While)
+                ) and _loop_else_guards_continuation(statement):
+                    decision = (
+                        statement.iter
+                        if isinstance(statement, (ast.For, ast.AsyncFor))
+                        else statement.test
+                    )
+                    authority_decision_names.update(
+                        _identifier_tokens(decision)
                     )
             child_continuation_controls = (
                 False
@@ -4507,26 +4927,52 @@ def _cached_contains_cross_agent_control_call(
     class ControlCallVisitor(ast.NodeVisitor):
         found = False
 
+        def has_control_target(self, targets: list[ast.AST]) -> bool:
+            return any(
+                _is_cross_agent_state_mutation_target(target)
+                for target in targets
+            )
+
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast API
-            if _is_cross_agent_control_call(node, control_aliases):
+            if _is_cross_agent_control_call(
+                node, control_aliases
+            ) or _is_cross_agent_state_mutation_call(node):
                 self.found = True
                 return
             self.generic_visit(node)
 
         def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
-            if is_control_reference(node.value):
+            if self.has_control_target(list(node.targets)) or is_control_reference(
+                node.value
+            ):
                 self.found = True
                 return
             self.generic_visit(node)
 
         def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
-            if node.value is not None and is_control_reference(node.value):
+            if self.has_control_target([node.target]) or (
+                node.value is not None and is_control_reference(node.value)
+            ):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:  # noqa: N802
+            if self.has_control_target([node.target]):
+                self.found = True
+                return
+            self.generic_visit(node)
+
+        def visit_Delete(self, node: ast.Delete) -> None:  # noqa: N802
+            if self.has_control_target(list(node.targets)):
                 self.found = True
                 return
             self.generic_visit(node)
 
         def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
-            if is_control_reference(node.value):
+            if self.has_control_target([node.target]) or is_control_reference(
+                node.value
+            ):
                 self.found = True
                 return
             self.generic_visit(node)
@@ -4641,6 +5087,22 @@ def _guard_clause_provenance_lines(
                             provenance_return_helpers,
                         )
                     )
+            elif controls_continuation and isinstance(
+                statement, (ast.For, ast.AsyncFor, ast.While)
+            ):
+                decision = (
+                    statement.iter
+                    if isinstance(statement, (ast.For, ast.AsyncFor))
+                    else statement.test
+                )
+                if _loop_else_guards_continuation(
+                    statement
+                ) and _has_provenance_value(
+                    decision,
+                    provenance_aliases,
+                    provenance_return_helpers,
+                ):
+                    lines.add(statement.lineno)
             # ``break``/``continue`` inside a loop do not prevent statements
             # after the loop from running, so do not inherit that outer
             # continuation into loop bodies. Other compound statements retain
@@ -5369,20 +5831,29 @@ def _authority_provenance_lines(
                 node,
                 (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
             ):
-                conditions = [
-                    condition
-                    for generator in node.generators
-                    for condition in generator.ifs
-                ]
-                if (
-                    any(
+                comprehension_aliases = set(provenance_aliases)
+                provenance_driven = False
+                for generator in node.generators:
+                    if _has_provenance_value(
+                        generator.iter,
+                        comprehension_aliases,
+                        provenance_return_helpers,
+                    ):
+                        provenance_driven = True
+                        comprehension_aliases.update(
+                            _binding_target_names(generator.target)
+                        )
+                    if any(
                         _has_provenance_value(
                             condition,
-                            provenance_aliases,
+                            comprehension_aliases,
                             provenance_return_helpers,
                         )
-                        for condition in conditions
-                    )
+                        for condition in generator.ifs
+                    ):
+                        provenance_driven = True
+                if (
+                    provenance_driven
                     and _contains_cross_agent_control_call(
                         node, control_aliases
                     )
@@ -5631,6 +6102,50 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(stateful_aliases) == {3, 8}
     assert _authority_provenance_lines(loop_aliases) == {2, 3, 7, 8}
     assert _authority_provenance_lines(propagation_only_loop) == set()
+
+
+def test_provenance_scanner_closes_direct_state_loop_and_comprehension_bypasses(
+) -> None:
+    direct_state = ast.parse(
+        "def disable(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        manager._agents[target].enabled = False\n\n"
+        "def remove(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        del manager._agents[target]\n\n"
+        "def pop(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        manager._agents.pop(target)\n"
+    )
+    loop_else = ast.parse(
+        "def dispatch(request, target):\n"
+        "    for _ in request.causation_chain:\n"
+        "        break\n"
+        "    else:\n"
+        "        return\n"
+        "    terminate_child(target)\n"
+    )
+    comprehension = ast.parse(
+        "def dispatch(request):\n"
+        "    return [terminate_child(frame.agent_id) "
+        "for frame in request.causation_chain]\n"
+    )
+    nested_comprehension = ast.parse(
+        "def dispatch(request):\n"
+        "    return [terminate_child(child) "
+        "for frame in request.causation_chain "
+        "for child in frame.children]\n"
+    )
+    mapped_control = ast.parse(
+        "def dispatch(request):\n"
+        "    return list(map(terminate_child, request.causation_chain))\n"
+    )
+
+    assert _authority_provenance_lines(direct_state) == {2, 6, 10}
+    assert _authority_provenance_lines(loop_else) == {2}
+    assert _authority_provenance_lines(comprehension) == {2}
+    assert _authority_provenance_lines(nested_comprehension) == {2}
+    assert _authority_provenance_lines(mapped_control) == {2}
 
 
 def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> None:
