@@ -1035,23 +1035,98 @@ def _unique_module_functions(
     }
 
 
+class _RegistryHelperIndex:
+    """Resolve module helpers and methods from the helper's lexical class."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.module_functions = _unique_module_functions(tree)
+        self.method_functions: dict[
+            tuple[tuple[str, ...], str],
+            ast.FunctionDef | ast.AsyncFunctionDef,
+        ] = {}
+        self.function_owners: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef, tuple[str, ...]
+        ] = {}
+
+        def collect_class(node: ast.ClassDef, owner: tuple[str, ...]) -> None:
+            grouped: dict[
+                str, list[ast.FunctionDef | ast.AsyncFunctionDef]
+            ] = {}
+            for statement in node.body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    grouped.setdefault(statement.name, []).append(statement)
+                    self.function_owners[statement] = owner
+                elif isinstance(statement, ast.ClassDef):
+                    collect_class(statement, (*owner, statement.name))
+            for name, definitions in grouped.items():
+                if len(definitions) == 1:
+                    self.method_functions[(owner, name)] = definitions[0]
+
+        for statement in tree.body:
+            if isinstance(statement, ast.ClassDef):
+                collect_class(statement, (statement.name,))
+
+    def resolve(
+        self,
+        call: ast.Call,
+        caller: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, bool] | None:
+        """Return a helper definition and whether Python binds its receiver."""
+
+        if isinstance(call.func, ast.Name):
+            function = self.module_functions.get(call.func.id)
+            return (function, False) if function is not None else None
+
+        member = _static_member_reference(call.func)
+        if member is None or not isinstance(member[0], ast.Name):
+            return None
+        receiver, method_name = member
+        owner = self.function_owners.get(caller) if caller is not None else None
+        if receiver.id in {"self", "cls"} and owner is not None:
+            function = self.method_functions.get((owner, method_name))
+            if function is None:
+                return None
+            is_static = any(
+                (
+                    decorator.id
+                    if isinstance(decorator, ast.Name)
+                    else decorator.func.id
+                    if isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Name)
+                    else ""
+                )
+                == "staticmethod"
+                for decorator in function.decorator_list
+            )
+            return function, not is_static
+
+        candidates = [
+            function
+            for (candidate_owner, name), function in self.method_functions.items()
+            if candidate_owner[-1] == receiver.id and name == method_name
+        ]
+        return (candidates[0], False) if len(candidates) == 1 else None
+
+
 def _registry_helper_call_bindings(
     call: ast.Call,
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    helpers: _RegistryHelperIndex,
     flow: _StaticBindingFlow,
     registry_binding: _StaticBinding,
+    caller: ast.FunctionDef | ast.AsyncFunctionDef | None,
 ) -> tuple[
     ast.FunctionDef | ast.AsyncFunctionDef,
     dict[str, _StaticBinding],
 ] | None:
     """Bind registry-valued arguments to one local helper's parameters."""
 
-    if not isinstance(call.func, ast.Name):
+    resolved = helpers.resolve(call, caller)
+    if resolved is None:
         return None
-    function = functions.get(call.func.id)
-    if function is None:
-        return None
+    function, receiver_is_bound = resolved
     positional = [*function.args.posonlyargs, *function.args.args]
+    if receiver_is_bound and positional:
+        positional = positional[1:]
     all_parameters = {parameter.arg for parameter in positional}
     all_parameters.update(parameter.arg for parameter in function.args.kwonlyargs)
     bindings = {
@@ -1078,7 +1153,7 @@ def _function_publishes_registry(
     publish_methods: set[str],
     direct_resolver: Callable[[ast.AST], _StaticBinding | None],
     ambiguous: Callable[[list[_StaticBinding]], _StaticBinding],
-    functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    helpers: _RegistryHelperIndex,
     *,
     direct_assignment_member: str | None = None,
     seen: frozenset[ast.AST] = frozenset(),
@@ -1116,9 +1191,10 @@ def _function_publishes_registry(
             return True
         helper = _registry_helper_call_bindings(
             call,
-            functions,
+            helpers,
             flow,
             registry_binding,
+            function,
         )
         return bool(
             helper is not None
@@ -1129,7 +1205,7 @@ def _function_publishes_registry(
                 publish_methods,
                 direct_resolver,
                 ambiguous,
-                functions,
+                helpers,
                 direct_assignment_member=direct_assignment_member,
                 seen=active,
             )
@@ -1543,12 +1619,13 @@ def test_module_method_collections_fail_closed_under_compound_mutation() -> None
         '    def terminate():\n'
         '        pass\n'
     )
-    with pytest.raises(AssertionError, match="Unresolved route path"):
-        _route_declarations(
-            nested_route,
-            _module_string_constants(nested_route),
-            _module_string_collections(nested_route),
-        )
+    # The conditional value is exact within the same branch that publishes
+    # the route, so branch-local source-order replay can inventory it safely.
+    assert _route_declarations(
+        nested_route,
+        _module_string_constants(nested_route),
+        _module_string_collections(nested_route),
+    ) == [(("DELETE",), "/api/agents/{name}/terminate")]
 
 
 def _public_tool_name(
@@ -2161,7 +2238,7 @@ def _runtime_signal_publication_surfaces(
     """Return generic seams that publish runtime-contributed signal sources."""
 
     surfaces: set[str] = set()
-    local_functions = _unique_module_functions(tree)
+    helpers = _RegistryHelperIndex(tree)
 
     class RuntimeSignalPublisherVisitor(ast.NodeVisitor):
         PUBLISH_METHODS = {"register", "register_batch", "register_with_policy"}
@@ -2174,6 +2251,9 @@ def _runtime_signal_publication_surfaces(
         def __init__(self) -> None:
             self.scope: list[str] = []
             self.flows: list[_StaticBindingFlow] = []
+            self.functions: list[
+                ast.FunctionDef | ast.AsyncFunctionDef
+            ] = []
 
         def _ambiguous(
             self, bindings: list[_StaticBinding]
@@ -2304,6 +2384,8 @@ def _runtime_signal_publication_surfaces(
                     inherited_bindings.pop(node.args.kwarg.arg, None)
             self.scope.append(node.name)
             self.flows.append(self._new_flow(inherited_bindings))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.append(node)
             self._visit_block(node.body)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
                 node.name == "_register_signal_sources"
@@ -2317,6 +2399,8 @@ def _runtime_signal_publication_surfaces(
                 )
             ):
                 self._record()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.pop()
             self.flows.pop()
             self.scope.pop()
 
@@ -2346,9 +2430,10 @@ def _runtime_signal_publication_surfaces(
             ) or bound_method in self.PUBLISH_BINDINGS.values()
             helper = _registry_helper_call_bindings(
                 node,
-                local_functions,
+                helpers,
                 self.flows[-1],
                 self.REGISTRY_BINDING,
+                self.functions[-1] if self.functions else None,
             )
             publishes_via_helper = bool(
                 helper is not None
@@ -2359,7 +2444,7 @@ def _runtime_signal_publication_surfaces(
                     self.PUBLISH_METHODS,
                     self._direct_binding,
                     self._ambiguous,
-                    local_functions,
+                    helpers,
                 )
             )
             if publishes_directly or publishes_via_helper:
@@ -2476,7 +2561,7 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
     """Return scopes that can publish values into ``_direct_tools``."""
 
     writers: set[str] = set()
-    local_functions = _unique_module_functions(tree)
+    helpers = _RegistryHelperIndex(tree)
     string_constants = _module_string_constants(tree)
 
     class DirectToolWriterVisitor(ast.NodeVisitor):
@@ -2490,6 +2575,9 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
         def __init__(self) -> None:
             self.scope: list[str] = []
             self.flows: list[_StaticBindingFlow] = []
+            self.functions: list[
+                ast.FunctionDef | ast.AsyncFunctionDef
+            ] = []
 
         def _ambiguous(
             self, bindings: list[_StaticBinding]
@@ -2543,7 +2631,11 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                     inherited_bindings.pop(node.args.kwarg.arg, None)
             self.scope.append(node.name)
             self.flows.append(self._new_flow(inherited_bindings))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.append(node)
             self._visit_block(node.body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.functions.pop()
             self.flows.pop()
             self.scope.pop()
 
@@ -2696,9 +2788,10 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             ) or bound_method in self.PUBLISH_BINDINGS.values()
             helper = _registry_helper_call_bindings(
                 node,
-                local_functions,
+                helpers,
                 self.flows[-1],
                 self.REGISTRY_BINDING,
+                self.functions[-1] if self.functions else None,
             )
             publishes_via_helper = bool(
                 helper is not None
@@ -2709,7 +2802,7 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                     self.PUBLISH_METHODS,
                     self._direct_binding,
                     self._ambiguous,
-                    local_functions,
+                    helpers,
                     direct_assignment_member="_direct_tools",
                 )
             )
@@ -3896,12 +3989,30 @@ def _route_declarations(
                     for name, value in active_methods.items()
                     if name not in disturbed
                 }
-                for child in ast.iter_child_nodes(node):
+                expressions, blocks = _compound_flow_parts(node)
+                for expression in expressions:
                     visit(
-                        child,
+                        expression,
                         nested_strings,
                         nested_methods,
                         active_route_aliases,
+                    )
+                for block in blocks:
+                    # A registration alias can be introduced and consumed in
+                    # the same feature-flagged branch. Replay that branch in
+                    # source order so its decorators are inventoried (or an
+                    # ambiguous alias fails closed) instead of inheriting only
+                    # the pre-branch aliases.
+                    walk_scope(
+                        block,
+                        prefixes,
+                        nested_strings,
+                        nested_methods,
+                        active_route_aliases,
+                        module_scope=module_scope,
+                        class_body_uses_module_globals=(
+                            class_body_uses_module_globals
+                        ),
                     )
                 return
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -4558,8 +4669,12 @@ def test_dynamic_tool_registry_flows_through_helpers_and_loops() -> None:
         "def publish(registry, tools):\n"
         "    registry.update(tools)\n\n"
         "class Publisher:\n"
+        "    def _publish(self, registry, tools):\n"
+        "        registry.update(tools)\n\n"
         "    def helper(self, tools):\n"
         "        publish(self._direct_tools, tools)\n\n"
+        "    def method_helper(self, tools):\n"
+        "        self._publish(self._direct_tools, tools)\n\n"
         "    def loop(self, tools):\n"
         "        for registry in [self._direct_tools]:\n"
         "            registry.update(tools)\n"
@@ -4568,6 +4683,7 @@ def test_dynamic_tool_registry_flows_through_helpers_and_loops() -> None:
     assert _direct_tool_writer_surfaces(tree, "example.py") == {
         "example.py::Publisher.helper",
         "example.py::Publisher.loop",
+        "example.py::Publisher.method_helper",
     }
 
 
@@ -4680,8 +4796,12 @@ def test_runtime_signal_publication_flows_through_helpers_and_loops() -> None:
         "def publish(registry, source):\n"
         "    registry.register(source)\n\n"
         "class Publisher:\n"
+        "    def _publish(self, registry, source):\n"
+        "        registry.register(source)\n\n"
         "    def helper(self, source):\n"
         "        publish(self.source_registry, source)\n\n"
+        "    def method_helper(self, source):\n"
+        "        self._publish(self.source_registry, source)\n\n"
         "    def loop(self, source):\n"
         "        for registry in [self.source_registry]:\n"
         "            registry.register(source)\n"
@@ -4690,6 +4810,7 @@ def test_runtime_signal_publication_flows_through_helpers_and_loops() -> None:
     assert _runtime_signal_publication_surfaces(tree, "example.py") == {
         "example.py::Publisher.helper",
         "example.py::Publisher.loop",
+        "example.py::Publisher.method_helper",
     }
 
 
@@ -5523,6 +5644,21 @@ def test_route_declarations_reject_conditionally_introduced_aliases(
         AssertionError, match="Unresolved route registration alias"
     ):
         _route_declarations(ast.parse(source), {}, {})
+
+
+def test_route_declarations_replay_aliases_inside_compound_blocks() -> None:
+    tree = ast.parse(
+        "router = APIRouter(prefix='/api')\n"
+        "if enabled:\n"
+        "    register = router.post\n"
+        "    @register('/agents/{name}/terminate')\n"
+        "    def terminate():\n"
+        "        pass\n"
+    )
+
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST",), "/api/agents/{name}/terminate")
+    ]
 
 
 @pytest.mark.parametrize(
