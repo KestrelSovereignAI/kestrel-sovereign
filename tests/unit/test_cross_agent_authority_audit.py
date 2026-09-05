@@ -131,6 +131,12 @@ HTTP_EXACT_ROUTES = {
     "/api/keys/user",
     "/api/keys/user/verify",
     "/api/keys/user/{provider}",
+    # These reads cross the selected-agent boundary: IPFS and model discovery
+    # use process-wide state, while available-sources combines agent, user, and
+    # platform principals.
+    "/api/ipfs/status",
+    "/api/keys/available-sources",
+    "/api/models",
     # These handlers read the process-global sovereignty export cache rather
     # than state owned by the selected agent. Keep the canonical doors in the
     # exact inventory alongside their synthesized request-routed aliases.
@@ -2883,15 +2889,60 @@ def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
     assert "sovereign/delegated" in action_row
     assert "[#3226]" in action_row
 
-    row = next(
+    for route in (
+        "/api/ipfs/status",
+        "/api/agents/{selected_agent_name}/api/ipfs/status",
+    ):
+        row = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/models.py::GET {route}`" in line
+        )
+        assert "D-3226" in row
+        assert "shared IPFS daemon" in row
+        assert "recursive pins" in row
+
+
+def test_mixed_model_catalog_and_layered_key_reads_are_recorded() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    key_action = next(
         line
         for line in audit.splitlines()
-        if "endpoints/models.py::GET "
-        "/api/agents/{selected_agent_name}/api/ipfs/status" in line
+        if line.startswith("| Inspect layered key availability |")
     )
-    assert "D-3226" in row
-    assert "shared IPFS daemon" in row
-    assert "recursive pins" in row
+    model_action = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| List available models |")
+    )
+    assert "authenticated user's BYOK" in key_action
+    assert "platform-global" in key_action
+    assert "process-wide shared model catalog" in model_action
+
+    for route in (
+        "/api/keys/available-sources",
+        "/api/agents/{selected_agent_name}/api/keys/available-sources",
+    ):
+        row = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/models.py::GET {route}`" in line
+        )
+        assert "A/U/H" in row
+        assert "authenticated-user" in row
+        assert "platform-global" in row
+
+    for route in (
+        "/api/models",
+        "/api/agents/{selected_agent_name}/api/models",
+    ):
+        row = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/models.py::GET {route}`" in line
+        )
+        assert "A/H" in row
+        assert "process-wide shared model catalog" in row
 
 
 @lru_cache(maxsize=None)
@@ -3046,6 +3097,14 @@ def _is_provenance_accessor_call(node: ast.AST) -> bool:
     )
 
 
+def _is_provenance_accessor_reference(node: ast.AST) -> bool:
+    """Whether a value preserves a canonical chain-accessor callable."""
+
+    return isinstance(node, (ast.Name, ast.Attribute)) and _call_name(
+        ast.Call(func=node, args=[], keywords=[])
+    ).casefold().strip("_").endswith(PROVENANCE_ACCESSOR_SUFFIXES)
+
+
 def _has_provenance_value(
     node: ast.AST,
     aliases: set[str] | None = None,
@@ -3111,6 +3170,77 @@ def _cross_agent_control_aliases(
                 aliases.add(target)
                 changed = True
     return aliases
+
+
+def _invoked_lambda_bodies(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[ast.Lambda, ...]:
+    """Return locally bound or immediate lambdas that this scope invokes."""
+
+    scope_nodes = _walk_lexical_scope(function)
+    invoked_names = {
+        _call_name(node).casefold()
+        for node in scope_nodes
+        if isinstance(node, ast.Call)
+    }
+    invoked: list[ast.Lambda] = [
+        node.func
+        for node in scope_nodes
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Lambda)
+    ]
+    lambda_bindings: dict[str, ast.Lambda] = {}
+    callable_aliases: list[tuple[str, str]] = []
+    for node in scope_nodes:
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        target_names = {
+            target.id.casefold()
+            if isinstance(target, ast.Name)
+            else target.attr.casefold()
+            if isinstance(target, ast.Attribute)
+            else ""
+            for target in targets
+        }
+        target_names.discard("")
+        if isinstance(value, ast.Lambda):
+            for target_name in target_names:
+                lambda_bindings[target_name] = value
+            continue
+        source_name = (
+            value.id.casefold()
+            if isinstance(value, ast.Name)
+            else value.attr.casefold()
+            if isinstance(value, ast.Attribute)
+            else ""
+        )
+        if source_name:
+            callable_aliases.extend(
+                (target_name, source_name) for target_name in target_names
+            )
+    changed = True
+    while changed:
+        changed = False
+        for target_name, source_name in callable_aliases:
+            if target_name in invoked_names and source_name not in invoked_names:
+                invoked_names.add(source_name)
+                changed = True
+    invoked.extend(
+        lambda_node
+        for name, lambda_node in lambda_bindings.items()
+        if name in invoked_names
+    )
+    return tuple(invoked)
 
 
 def _control_reference_sources(node: ast.AST) -> set[str]:
@@ -3309,7 +3439,9 @@ def _provenance_aliases(
                 ast.Dict,
             ),
         ):
-            return _has_provenance_token(value, aliases)
+            return _is_provenance_accessor_reference(
+                value
+            ) or _has_provenance_token(value, aliases)
         if (
             isinstance(value, ast.Call)
             and _call_name(value) in PROVENANCE_TRANSFORM_CALLS
@@ -3979,6 +4111,54 @@ def _module_provenance_constant_aliases(
     }
 
 
+def _module_imported_provenance_accessor_aliases(tree: ast.AST) -> set[str]:
+    """Return module aliases that preserve canonical chain accessors."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+    aliases = {
+        (imported.asname or imported.name).casefold()
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for imported in node.names
+        if imported.name.casefold().strip("_").endswith(
+            PROVENANCE_ACCESSOR_SUFFIXES
+        )
+    }
+    assignments: list[tuple[str, ast.AST]] = []
+    for node in tree.body:
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assignments.append((target.id.casefold(), value))
+    changed = True
+    while changed:
+        changed = False
+        for target, value in assignments:
+            source = (
+                value.id.casefold()
+                if isinstance(value, ast.Name)
+                else value.attr.casefold()
+                if isinstance(value, ast.Attribute)
+                else ""
+            )
+            if (
+                _is_provenance_accessor_reference(value) or source in aliases
+            ) and target not in aliases:
+                aliases.add(target)
+                changed = True
+    return aliases
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -3990,8 +4170,9 @@ def _authority_provenance_lines(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     module_control_aliases = _module_imported_control_aliases(tree)
-    module_provenance_aliases = _module_provenance_constant_aliases(
-        tree, source_path
+    module_provenance_aliases = (
+        _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_accessor_aliases(tree)
     )
     control_helpers = _local_control_helpers(functions, module_control_aliases)
     provenance_return_helpers = _local_provenance_return_helpers(
@@ -4021,6 +4202,15 @@ def _authority_provenance_lines(
             or function_name.startswith(("can_", "may_"))
             or _is_cross_agent_control_name(function_name)
         )
+        for lambda_node in _invoked_lambda_bodies(function):
+            if _has_provenance_value(
+                lambda_node.body,
+                provenance_aliases,
+                provenance_return_helpers,
+            ) and _contains_cross_agent_control_call(
+                lambda_node.body, control_aliases
+            ):
+                lines.add(lambda_node.lineno)
         for node in _walk_lexical_scope(function):
             if isinstance(node, ast.Call):
                 function_tokens = _identifier_tokens(node.func)
@@ -4851,11 +5041,61 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
         "    if request.causation_chain:\n"
         "        apply(manager, target)\n"
     )
+    lambda_authority = ast.parse(
+        "def dispatch(request):\n"
+        "    callback = lambda: terminate_child(\n"
+        "        request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    callback()\n"
+    )
+    conditional_lambda_authority = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = lambda: (\n"
+        "        terminate_child(target) if request.causation_chain else None\n"
+        "    )\n"
+        "    callback()\n"
+    )
+    aliased_lambda_authority = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callback = lambda: terminate_child(\n"
+        "        request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    adapter = callback\n"
+        "    adapter()\n"
+    )
 
     assert _authority_provenance_lines(imported_alias) == {4}
     assert _authority_provenance_lines(imported_remove_alias) == {4}
     assert _authority_provenance_lines(lambda_callback) == {3}
     assert _authority_provenance_lines(neutral_remove_helper) == {5}
+    assert _authority_provenance_lines(lambda_authority) == {2}
+    assert _authority_provenance_lines(conditional_lambda_authority) == {2}
+    assert _authority_provenance_lines(aliased_lambda_authority) == {2}
+
+
+def test_provenance_scanner_resolves_accessor_aliases() -> None:
+    assigned_accessor = ast.parse(
+        "def dispatch(self, target):\n"
+        "    context = self._get_current_chain\n"
+        "    if context():\n"
+        "        terminate_child(target)\n"
+    )
+    imported_accessor = ast.parse(
+        "from context import get_current_chain as context\n\n"
+        "def dispatch(target):\n"
+        "    if context():\n"
+        "        terminate_child(target)\n"
+    )
+    module_accessor = ast.parse(
+        "context = runtime._get_current_chain\n\n"
+        "def dispatch(target):\n"
+        "    if context():\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(assigned_accessor) == {3}
+    assert _authority_provenance_lines(imported_accessor) == {4}
+    assert _authority_provenance_lines(module_accessor) == {4}
 
 
 def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
