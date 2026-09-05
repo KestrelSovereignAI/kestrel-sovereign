@@ -350,17 +350,47 @@ def _module_constant_bindings(
             collections.pop(alias, None)
             collection_alias_groups.pop(alias, None)
 
+    def stored_target_names(target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return {
+                name
+                for element in target.elts
+                for name in stored_target_names(element)
+            }
+        if isinstance(target, ast.Starred):
+            return stored_target_names(target.value)
+        return set()
+
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and source_path is not None:
-            imported_path = _imported_module_path(node, source_path)
-            if imported_path is None:
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                strings.clear()
+                collections.clear()
+                collection_alias_groups.clear()
                 continue
-            imported_constants = _cached_local_string_constants(imported_path)
             for alias in node.names:
-                if alias.name in imported_constants:
-                    strings[alias.asname or alias.name] = imported_constants[
-                        alias.name
-                    ]
+                bound_name = alias.asname or alias.name
+                strings.pop(bound_name, None)
+                invalidate_collection(bound_name)
+            if source_path is not None:
+                imported_path = _imported_module_path(node, source_path)
+                if imported_path is not None:
+                    imported_constants = _cached_local_string_constants(
+                        imported_path
+                    )
+                    for alias in node.names:
+                        if alias.name in imported_constants:
+                            strings[alias.asname or alias.name] = (
+                                imported_constants[alias.name]
+                            )
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_name = alias.asname or alias.name.split(".", 1)[0]
+                strings.pop(bound_name, None)
+                invalidate_collection(bound_name)
             continue
         if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
             for name in _compound_binding_names(node, set(collections)):
@@ -453,9 +483,9 @@ def _module_constant_bindings(
                 # The result of an unmodelled call cannot preserve an older
                 # binding on the assignment target either.
                 mutated_names.update(
-                    target.id
+                    target_name
                     for target in assignment_targets
-                    if isinstance(target, ast.Name)
+                    for target_name in stored_target_names(target)
                 )
         if mutated_names:
             for name in mutated_names:
@@ -487,7 +517,9 @@ def _module_constant_bindings(
             resolved_collection = collections[value.id]
             collection_source = value.id
         target_names = [
-            target.id for target in targets if isinstance(target, ast.Name)
+            target_name
+            for target in targets
+            for target_name in stored_target_names(target)
         ]
         for target_name in target_names:
             if target_name != collection_source:
@@ -717,6 +749,35 @@ def test_module_constants_fail_closed_across_compound_control_flow(
         + compound
         + '@app.get(PATH)\n'
         'def route():\n    pass\n'
+    )
+
+    assert "PATH" not in _module_string_constants(tree)
+    with pytest.raises(AssertionError, match="Unresolved route path"):
+        _route_declarations(
+            tree,
+            _module_string_constants(tree),
+            _module_string_collections(tree),
+        )
+
+
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        'PATH, ignored = ("/api/agents/{name}/terminate", None)\n',
+        "PATH, ignored = runtime_paths()\n",
+        "from extension import PATH\n",
+        "import extension as PATH\n",
+    ],
+    ids=["tuple", "runtime-tuple", "from-import", "import"],
+)
+def test_module_constants_fail_closed_across_non_simple_rebinding(
+    rebind: str,
+) -> None:
+    tree = ast.parse(
+        'PATH = "/health"\n'
+        + rebind
+        + "@app.get(PATH)\n"
+        "def route():\n    pass\n"
     )
 
     assert "PATH" not in _module_string_constants(tree)
@@ -1621,8 +1682,81 @@ def _dynamic_router_publication_surfaces(
             self.scope_counts: list[int] = []
             self.aliases: list[dict[str, tuple[str, str]]] = [{}]
 
+        def _visit_branch(
+            self,
+            statements: list[ast.stmt],
+            inherited: dict[str, tuple[str, str]],
+        ) -> dict[str, tuple[str, str]]:
+            self.aliases[-1] = dict(inherited)
+            self._visit_block(statements)
+            return dict(self.aliases[-1])
+
+        def _visit_compound(self, statement: ast.stmt) -> None:
+            inherited = dict(self.aliases[-1])
+            branches: list[list[ast.stmt]] = []
+            expressions: list[ast.AST] = []
+            if isinstance(statement, ast.If):
+                expressions.append(statement.test)
+                branches.extend((statement.body, statement.orelse))
+            elif isinstance(statement, (ast.For, ast.AsyncFor)):
+                expressions.extend((statement.target, statement.iter))
+                branches.extend((statement.body, statement.orelse))
+            elif isinstance(statement, ast.While):
+                expressions.append(statement.test)
+                branches.extend((statement.body, statement.orelse))
+            elif isinstance(statement, (ast.With, ast.AsyncWith)):
+                expressions.extend(item.context_expr for item in statement.items)
+                expressions.extend(
+                    item.optional_vars
+                    for item in statement.items
+                    if item.optional_vars is not None
+                )
+                branches.append(statement.body)
+            elif isinstance(statement, (ast.Try, ast.TryStar)):
+                branches.extend(
+                    (
+                        statement.body,
+                        statement.orelse,
+                        statement.finalbody,
+                        *(handler.body for handler in statement.handlers),
+                    )
+                )
+                expressions.extend(
+                    handler.type
+                    for handler in statement.handlers
+                    if handler.type is not None
+                )
+            elif isinstance(statement, ast.Match):
+                expressions.append(statement.subject)
+                branches.extend(case.body for case in statement.cases)
+                expressions.extend(
+                    case.guard
+                    for case in statement.cases
+                    if case.guard is not None
+                )
+            else:
+                self.visit(statement)
+                return
+
+            for expression in expressions:
+                self.visit(expression)
+            branch_states = [
+                self._visit_branch(branch, inherited)
+                for branch in branches
+            ]
+            # This inventory asks whether a binding *may* publish a router.
+            # Preserve any include_router binding reachable on any branch;
+            # an exact runtime path proof is not available to a static audit.
+            merged = dict(inherited)
+            for state in branch_states:
+                merged.update(state)
+            self.aliases[-1] = merged
+
         def _visit_block(self, statements: list[ast.stmt]) -> None:
             for statement in statements:
+                if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+                    self._visit_compound(statement)
+                    continue
                 self.visit(statement)
                 targets: list[ast.AST] = []
                 value: ast.AST | None = None
@@ -1806,6 +1940,7 @@ _ROUTE_REGISTRATION_NAMES = {
     "websocket",
     "websocket_route",
 }
+_UNRESOLVED_ROUTE_REGISTRATION = "<unresolved>"
 
 
 def _scope_route_callable_aliases(
@@ -1818,7 +1953,12 @@ def _scope_route_callable_aliases(
     for statement in statements:
         if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
             for name in _compound_binding_names(statement, set()):
-                aliases.pop(name, None)
+                prior = aliases.get(name)
+                if prior is not None:
+                    aliases[name] = (
+                        prior[0],
+                        _UNRESOLVED_ROUTE_REGISTRATION,
+                    )
             continue
 
         targets: list[ast.AST] = []
@@ -1865,6 +2005,14 @@ def _route_registration_name(
         return call.func.attr.casefold()
     if isinstance(call.func, ast.Name):
         binding = (aliases or {}).get(call.func.id)
+        if (
+            binding is not None
+            and binding[1] == _UNRESOLVED_ROUTE_REGISTRATION
+        ):
+            raise AssertionError(
+                "Unresolved route registration alias: "
+                f"{ast.unparse(call.func)}"
+            )
         return binding[1] if binding is not None else None
     return None
 
@@ -2811,6 +2959,27 @@ def test_dynamic_router_publication_resolves_bound_aliases() -> None:
         "example.py::mount.include_router[0]"
     }
 
+    conditional = ast.parse(
+        "def mount(app, router, enabled):\n"
+        "    publish = noop\n"
+        "    if enabled:\n"
+        "        publish = app.include_router\n"
+        "    publish(router)\n"
+    )
+    nested = ast.parse(
+        "def mount(app, router, enabled):\n"
+        "    if enabled:\n"
+        "        publish = app.include_router\n"
+        "        publish(router)\n"
+    )
+
+    assert _dynamic_router_publication_surfaces(
+        conditional, "conditional.py"
+    ) == {"conditional.py::mount.include_router[0]"}
+    assert _dynamic_router_publication_surfaces(nested, "nested.py") == {
+        "nested.py::mount.include_router[0]"
+    }
+
 
 def test_relation_free_control_names_are_still_discovered() -> None:
     """A control door need not say ``agent`` or ``task`` to cross a boundary."""
@@ -3170,6 +3339,23 @@ def test_route_declarations_resolve_bound_registration_aliases() -> None:
         _module_string_constants(tree),
         _module_string_collections(tree),
     ) == [(('DELETE',), '/api/agents/{name}')]
+
+
+def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
+    tree = ast.parse(
+        "router = APIRouter()\n"
+        "register = router.get\n"
+        "if enabled:\n"
+        "    register = router.post\n"
+        "@register('/api/agents/{name}')\n"
+        "def route():\n"
+        "    pass\n"
+    )
+
+    with pytest.raises(
+        AssertionError, match="Unresolved route registration alias"
+    ):
+        _route_declarations(tree, {}, {})
 
 
 def test_route_declarations_replay_nested_lexical_constants() -> None:
@@ -5113,6 +5299,108 @@ def _provenance_aliases(
     return aliases, provenance_selected_targets
 
 
+def _class_provenance_state_aliases(
+    tree: ast.AST,
+    provenance_return_helpers: set[str] | None = None,
+    module_provenance_aliases: set[str] | None = None,
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
+    """Share provenance-bearing ``self``/``cls`` state across class methods."""
+
+    if not isinstance(tree, ast.Module):
+        return {}
+    by_method: dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]] = {}
+    for class_node in (
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    ):
+        methods = [
+            statement
+            for statement in class_node.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        shared: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for method in methods:
+                aliases = set(module_provenance_aliases or ()) | shared
+                method_changed = True
+                while method_changed:
+                    method_changed = False
+                    for statement in _walk_lexical_scope(method):
+                        targets: list[ast.AST] = []
+                        value: ast.AST | None = None
+                        if isinstance(statement, ast.Assign):
+                            targets = list(statement.targets)
+                            value = statement.value
+                        elif isinstance(statement, ast.AnnAssign):
+                            targets = [statement.target]
+                            value = statement.value
+                        elif isinstance(statement, ast.NamedExpr):
+                            targets = [statement.target]
+                            value = statement.value
+                        if value is None:
+                            continue
+                        tokens = set(_identifier_tokens(value))
+                        direct_tokens = {
+                            token
+                            for token in tokens
+                            if token
+                            in {
+                                "causation",
+                                "causation_chain",
+                                "causation_frame",
+                                "causationframe",
+                                "kestrel.orchestrator",
+                                "orchestrator",
+                            }
+                            or token.startswith("orchestrator_")
+                            or (
+                                token.startswith("causation_")
+                                and not token.endswith(
+                                    (
+                                        "_accessor",
+                                        "_callback",
+                                        "_factory",
+                                        "_provider",
+                                    )
+                                )
+                            )
+                        }
+                        calls_helper = any(
+                            isinstance(child, ast.Call)
+                            and _call_name(child).casefold()
+                            in (provenance_return_helpers or set())
+                            for child in ast.walk(value)
+                        )
+                        if not (
+                            direct_tokens
+                            or _is_provenance_accessor_reference(value)
+                            or _is_provenance_accessor_call(value)
+                            or calls_helper
+                            or tokens.intersection(aliases)
+                        ):
+                            continue
+                        target_names = {
+                            name
+                            for target in targets
+                            for name in _binding_target_names(target)
+                        }
+                        new_targets = target_names - aliases
+                        if new_targets:
+                            aliases.update(new_targets)
+                            method_changed = True
+                discovered = {
+                    alias for alias in aliases if alias.startswith(("self.", "cls."))
+                }
+                new_aliases = discovered - shared
+                if new_aliases:
+                    shared.update(new_aliases)
+                    changed = True
+        for method in methods:
+            by_method[method] = set(shared)
+    return by_method
+
+
 def _local_control_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     imported_control_aliases: set[str] | None = None,
@@ -5248,6 +5536,9 @@ def _local_provenance_return_helpers(
     control_helpers: set[str] | None = None,
     module_provenance_aliases: set[str] | None = None,
     imported_provenance_helpers: set[str] | None = None,
+    function_initial_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
 ) -> set[str]:
     """Find visible helpers whose return value is provenance-derived.
 
@@ -5268,7 +5559,8 @@ def _local_provenance_return_helpers(
                 function,
                 helper_names,
                 control_helpers,
-                module_provenance_aliases,
+                set(module_provenance_aliases or ())
+                | set((function_initial_aliases or {}).get(function, ())),
                 authority_analysis=False,
             )
             returns_provenance = False
@@ -6070,11 +6362,29 @@ def _authority_provenance_lines(
         _module_imported_provenance_return_helper_aliases(tree, source_path)
     )
     control_helpers = _local_control_helpers(functions, module_control_aliases)
+    class_provenance_aliases = _class_provenance_state_aliases(
+        tree,
+        imported_provenance_helpers,
+        module_provenance_aliases,
+    )
     provenance_return_helpers = _local_provenance_return_helpers(
         functions,
         control_helpers,
         module_provenance_aliases,
         imported_provenance_helpers,
+        class_provenance_aliases,
+    )
+    class_provenance_aliases = _class_provenance_state_aliases(
+        tree,
+        provenance_return_helpers,
+        module_provenance_aliases,
+    )
+    provenance_return_helpers = _local_provenance_return_helpers(
+        functions,
+        control_helpers,
+        module_provenance_aliases,
+        provenance_return_helpers,
+        class_provenance_aliases,
     )
     for function in functions:
         function_name = function.name.casefold()
@@ -6084,7 +6394,8 @@ def _authority_provenance_lines(
                 function,
                 provenance_return_helpers,
                 control_helpers,
-                module_provenance_aliases,
+                module_provenance_aliases
+                | class_provenance_aliases.get(function, set()),
             )
         )
         lines.update(
@@ -6747,6 +7058,19 @@ def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
 
     assert _authority_provenance_lines(propagation_only_nested_helper) == set()
     assert _authority_provenance_lines(nested_authority) == {3}
+
+
+def test_provenance_scanner_propagates_object_state_across_methods() -> None:
+    tree = ast.parse(
+        "class Gate:\n"
+        "    def capture(self, request):\n"
+        "        self.lineage = request.causation_chain\n\n"
+        "    def terminate_child(self, target):\n"
+        "        if self.lineage:\n"
+        "            target.shutdown()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {6}
 
 
 def test_provenance_scanner_follows_control_callback_aliases() -> None:
