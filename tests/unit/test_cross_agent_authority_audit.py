@@ -18,6 +18,13 @@ from kestrel_sovereign.endpoints.models import require_sovereign_host_lifecycle
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
 AUTH_SURFACE_MATRIX_PATH = REPO_ROOT / "docs/audit/AUTH_SURFACE_MATRIX.md"
+_AUTHORITY_AUDIT_PATHS = tuple(
+    sorted((REPO_ROOT / "kestrel_sovereign").rglob("*.py"))
+)
+_AUTHORITY_AUDIT_CHUNKS = tuple(
+    _AUTHORITY_AUDIT_PATHS[index : index + 24]
+    for index in range(0, len(_AUTHORITY_AUDIT_PATHS), 24)
+)
 CONTROL_NAME_TERMS = (
     "agent",
     "peer",
@@ -1462,6 +1469,12 @@ def _cron_task_names(
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
+        # Replay a compound block before inspecting its descendants.  The
+        # shared may-analysis then exposes aliases introduced on any branch,
+        # so a later mutation in that same branch cannot disappear merely
+        # because its receiver was not bound before the compound statement.
+        if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
+            alias_flow.replay([node])
         if any(
             isinstance(child, ast.Name)
             and child.id == "CRON_TASKS"
@@ -1482,8 +1495,6 @@ def _cron_task_names(
             alias_flow.assign(list(node.targets), node.value)
         elif isinstance(node, ast.AnnAssign):
             alias_flow.assign([node.target], node.value)
-        elif isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
-            alias_flow.replay([node])
 
     if task_names is None:
         raise AssertionError("Could not find the CRON_TASKS declaration")
@@ -3859,6 +3870,21 @@ def test_scheduler_inventory_replays_cron_tasks_mutations(
         )
     finally:
         _discovered_scheduler_surfaces.cache_clear()
+
+
+def test_scheduler_inventory_rejects_compound_alias_mutations() -> None:
+    tree = ast.parse(
+        "CRON_TASKS = [('base', mode, resources)]\n"
+        "if enabled:\n"
+        "    tasks = CRON_TASKS\n"
+        "    tasks.append(('late', mode, resources))\n"
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Conditional or indirect CRON_TASKS mutation",
+    ):
+        _cron_task_names(tree)
 
 
 def test_each_source_factory_call_must_resolve_its_own_name() -> None:
@@ -6503,6 +6529,12 @@ def _provenance_aliases(
             in (provenance_return_helpers or set())
             for node in ast.walk(value)
         )
+        calls_known_accessor = _is_provenance_accessor_call(value) or any(
+            isinstance(node, ast.Call)
+            and _call_name(node).casefold()
+            in (provenance_accessor_aliases or set())
+            for node in ast.walk(value)
+        )
         if isinstance(
             value,
             (
@@ -6523,7 +6555,11 @@ def _provenance_aliases(
             isinstance(value, ast.Call)
             and _call_name(value) in PROVENANCE_TRANSFORM_CALLS
         ):
-            return _has_provenance_token(value, aliases) or calls_known_helper
+            return (
+                _has_provenance_token(value, aliases)
+                or calls_known_helper
+                or calls_known_accessor
+            )
         if isinstance(value, ast.Call):
             call_name = _call_name(value).casefold()
             if _is_provenance_accessor_call(value):
@@ -8405,6 +8441,29 @@ def _authority_provenance_lines(
             or function_name.startswith(("can_", "may_"))
             or _is_unambiguous_control_token(function_name)
         )
+        for decorator in function.decorator_list:
+            if not _has_provenance_value(
+                decorator,
+                provenance_aliases,
+                decision_provenance_helpers,
+            ):
+                continue
+            decorator_tokens = _identifier_tokens(decorator)
+            decorator_is_authority_boundary = any(
+                _is_permission_name(token)
+                or _is_unambiguous_control_token(token)
+                for token in decorator_tokens
+            )
+            if (
+                decorator_is_authority_boundary
+                or function_is_permission_boundary
+                or _contains_cross_agent_control_call(
+                    function.body,
+                    control_aliases,
+                    state_object_aliases,
+                )
+            ):
+                lines.add(decorator.lineno)
         for lambda_node in _invoked_lambda_bodies(function):
             if _has_provenance_value(
                 lambda_node.body,
@@ -9040,6 +9099,12 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
         "    if allowed:\n"
         "        terminate_child(target)\n"
     )
+    transformed_accessor = ast.parse(
+        "def dispatch(target):\n"
+        "    allowed = bool(get_current_chain())\n"
+        "    if allowed:\n"
+        "        terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(authority_vocabulary) == {2, 6}
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
@@ -9055,6 +9120,17 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(loop_guard_clauses) == {3, 9}
     assert _authority_provenance_lines(match_guards) == {3, 9}
     assert _authority_provenance_lines(branch_assigned_decision) == {5}
+    assert _authority_provenance_lines(transformed_accessor) == {2, 3}
+
+
+def test_provenance_scanner_inspects_authorization_decorators() -> None:
+    tree = ast.parse(
+        "@authorized_by(get_current_chain())\n"
+        "def terminate_agent(target):\n"
+        "    target.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {1}
 
 
 def test_provenance_scanner_analyzes_nested_scopes_independently() -> None:
@@ -9104,10 +9180,16 @@ def test_provenance_scanner_carries_outer_aliases_into_closures(
     "signature",
     [
         "target, allowed=bool(causation_chain)",
+        "target, allowed=bool(get_current_chain())",
         "target, provider=_get_current_chain",
         "target, *, allowed=bool(causation_chain)",
     ],
-    ids=["positional-value", "accessor-callable", "keyword-only-value"],
+    ids=[
+        "positional-value",
+        "transformed-accessor-value",
+        "accessor-callable",
+        "keyword-only-value",
+    ],
 )
 def test_provenance_scanner_seeds_parameter_defaults(signature: str) -> None:
     decision = "provider()" if "provider" in signature else "allowed"
@@ -10113,11 +10195,21 @@ def test_provenance_scanner_excludes_benign_task_and_host_calls() -> None:
     assert _authority_provenance_lines(tree) == set()
 
 
-def test_causation_and_orchestrator_metadata_are_not_permission_inputs() -> None:
+@pytest.mark.parametrize(
+    "paths",
+    _AUTHORITY_AUDIT_CHUNKS,
+    ids=lambda paths: (
+        f"{paths[0].relative_to(REPO_ROOT).as_posix()}.."
+        f"{paths[-1].relative_to(REPO_ROOT).as_posix()}"
+    ),
+)
+def test_causation_and_orchestrator_metadata_are_not_permission_inputs(
+    paths: tuple[Path, ...],
+) -> None:
     """Make a direct causation-as-authority condition fail review loudly."""
 
     violations: list[str] = []
-    for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
+    for path in paths:
         for line in _cached_authority_provenance_lines(path):
             violations.append(f"{path.relative_to(REPO_ROOT)}:{line}")
 
