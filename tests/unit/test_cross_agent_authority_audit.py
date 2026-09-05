@@ -230,6 +230,98 @@ def _imported_module_path(node: ast.ImportFrom, source_path: Path) -> Path | Non
     return package_file if package_file.is_file() else None
 
 
+_MODULE_COMPOUND_STATEMENT_TYPES = (
+    ast.AsyncFor,
+    ast.AsyncWith,
+    ast.For,
+    ast.If,
+    ast.Match,
+    ast.Try,
+    ast.TryStar,
+    ast.While,
+    ast.With,
+)
+
+
+def _compound_binding_names(
+    statement: ast.stmt,
+    collection_names: set[str],
+) -> set[str]:
+    """Return bindings a module-level compound statement can disturb.
+
+    The evaluator cannot choose a runtime branch. Any assignment under such
+    control flow therefore makes a previously resolved scalar ambiguous.
+    Mutable collections fail closed on any reference too: a branch may pass or
+    alias the live object before mutating it elsewhere. Nested function and
+    class bodies are different runtime scopes and are deliberately not
+    borrowed into the module-execution replay.
+    """
+
+    names: set[str] = set()
+
+    class BindingVisitor(ast.NodeVisitor):
+        def visit_Name(self, child: ast.Name) -> None:  # noqa: N802
+            if isinstance(child.ctx, (ast.Store, ast.Del)) or (
+                isinstance(child.ctx, ast.Load) and child.id in collection_names
+            ):
+                names.add(child.id)
+
+        def visit_FunctionDef(  # noqa: N802
+            self, child: ast.FunctionDef
+        ) -> None:
+            names.add(child.name)
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, child: ast.AsyncFunctionDef
+        ) -> None:
+            names.add(child.name)
+
+        def visit_ClassDef(self, child: ast.ClassDef) -> None:  # noqa: N802
+            names.add(child.name)
+
+        def visit_Lambda(self, child: ast.Lambda) -> None:  # noqa: N802
+            return
+
+        def visit_Import(self, child: ast.Import) -> None:  # noqa: N802
+            names.update(
+                imported.asname or imported.name.split(".", 1)[0]
+                for imported in child.names
+            )
+
+        def visit_ImportFrom(self, child: ast.ImportFrom) -> None:  # noqa: N802
+            names.update(
+                imported.asname or imported.name
+                for imported in child.names
+                if imported.name != "*"
+            )
+
+        def visit_ExceptHandler(  # noqa: N802
+            self, child: ast.ExceptHandler
+        ) -> None:
+            if child.name:
+                names.add(child.name)
+            self.generic_visit(child)
+
+        def visit_MatchAs(self, child: ast.MatchAs) -> None:  # noqa: N802
+            if child.name:
+                names.add(child.name)
+            self.generic_visit(child)
+
+        def visit_MatchStar(self, child: ast.MatchStar) -> None:  # noqa: N802
+            if child.name:
+                names.add(child.name)
+
+        def visit_MatchMapping(  # noqa: N802
+            self, child: ast.MatchMapping
+        ) -> None:
+            if child.rest:
+                names.add(child.rest)
+            self.generic_visit(child)
+
+    BindingVisitor().visit(statement)
+    return names
+
+
 def _module_constant_bindings(
     tree: ast.Module,
     source_path: Path | None = None,
@@ -267,6 +359,11 @@ def _module_constant_bindings(
                     strings[alias.asname or alias.name] = imported_constants[
                         alias.name
                     ]
+            continue
+        if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
+            for name in _compound_binding_names(node, set(collections)):
+                strings.pop(name, None)
+                invalidate_collection(name)
             continue
         # A statically resolved binding must never survive an operation whose
         # result this small evaluator does not model. Retaining the old value
@@ -596,6 +693,71 @@ def test_module_string_constants_follow_source_order_on_reassignment() -> None:
     assert "METHODS" not in _module_string_collections(
         unknown_method_mutation
     )
+
+
+@pytest.mark.parametrize(
+    "compound",
+    [
+        'if enabled:\n    PATH = "/api/agents/{name}/terminate"\n',
+        'try:\n    PATH = "/api/agents/{name}/terminate"\n'
+        'except RuntimeError:\n    pass\n',
+        'with context():\n    PATH = "/api/agents/{name}/terminate"\n',
+        'for item in items:\n    PATH = "/api/agents/{name}/terminate"\n',
+        'while enabled:\n    PATH = "/api/agents/{name}/terminate"\n',
+    ],
+    ids=["if", "try", "with", "for", "while"],
+)
+def test_module_constants_fail_closed_across_compound_control_flow(
+    compound: str,
+) -> None:
+    tree = ast.parse(
+        'PATH = "/health"\n'
+        + compound
+        + '@app.get(PATH)\n'
+        'def route():\n    pass\n'
+    )
+
+    assert "PATH" not in _module_string_constants(tree)
+    with pytest.raises(AssertionError, match="Unresolved route path"):
+        _route_declarations(
+            tree,
+            _module_string_constants(tree),
+            _module_string_collections(tree),
+        )
+
+
+def test_module_method_collections_fail_closed_under_compound_mutation() -> None:
+    tree = ast.parse(
+        'METHODS = ["GET"]\n'
+        'if enabled:\n'
+        '    METHODS[:] = ["DELETE"]\n'
+        '@app.api_route("/api/agents/{name}", methods=METHODS)\n'
+        'def route():\n    pass\n'
+    )
+
+    assert "METHODS" not in _module_string_collections(tree)
+    with pytest.raises(AssertionError, match="Unresolved api_route methods"):
+        _route_declarations(
+            tree,
+            _module_string_constants(tree),
+            _module_string_collections(tree),
+        )
+
+    nested_route = ast.parse(
+        'PATH = "/health"\n'
+        'router = APIRouter()\n'
+        'if enabled:\n'
+        '    PATH = "/api/agents/{name}/terminate"\n'
+        '    @router.delete(PATH)\n'
+        '    def terminate():\n'
+        '        pass\n'
+    )
+    with pytest.raises(AssertionError, match="Unresolved route path"):
+        _route_declarations(
+            nested_route,
+            _module_string_constants(nested_route),
+            _module_string_collections(nested_route),
+        )
 
 
 def _public_tool_name(
@@ -1638,6 +1800,23 @@ def _route_declarations(
             active_strings: dict[str, str],
             active_methods: dict[str, tuple[str, ...]],
         ) -> None:
+            if isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
+                disturbed = _compound_binding_names(
+                    node, set(active_methods)
+                )
+                nested_strings = {
+                    name: value
+                    for name, value in active_strings.items()
+                    if name not in disturbed
+                }
+                nested_methods = {
+                    name: value
+                    for name, value in active_methods.items()
+                    if name not in disturbed
+                }
+                for child in ast.iter_child_nodes(node):
+                    visit(child, nested_strings, nested_methods)
+                return
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
                     if not isinstance(decorator, ast.Call):
@@ -4444,16 +4623,24 @@ def _guard_clause_provenance_lines(
                 match_can_continue = (
                     not has_catch_all or not all(case_exits)
                 )
-                if (
-                    any(case_exits)
-                    and match_can_continue
-                    and _has_provenance_value(
+                if any(case_exits) and match_can_continue:
+                    if _has_provenance_value(
                         statement.subject,
                         provenance_aliases,
                         provenance_return_helpers,
+                    ):
+                        lines.add(statement.lineno)
+                    lines.update(
+                        case.guard.lineno
+                        for case, exits in zip(statement.cases, case_exits)
+                        if exits
+                        and case.guard is not None
+                        and _has_provenance_value(
+                            case.guard,
+                            provenance_aliases,
+                            provenance_return_helpers,
+                        )
                     )
-                ):
-                    lines.add(statement.lineno)
             # ``break``/``continue`` inside a loop do not prevent statements
             # after the loop from running, so do not inherit that outer
             # continuation into loop bodies. Other compound statements retain
@@ -5676,10 +5863,18 @@ def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> 
         "            return\n"
         "    terminate_child(target)\n"
     )
+    guarded_match_exit = ast.parse(
+        "def dispatch(request, target):\n"
+        "    match target:\n"
+        "        case _ if not request.causation_chain:\n"
+        "            return\n"
+        "    terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(with_guard) == {3}
     assert _authority_provenance_lines(try_guard) == {3}
     assert _authority_provenance_lines(derived_with_guard) == {4}
+    assert _authority_provenance_lines(guarded_match_exit) == {3}
 
 
 def test_provenance_scanner_taints_control_targets_selected_by_provenance() -> None:
