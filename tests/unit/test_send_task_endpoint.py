@@ -639,7 +639,7 @@ def test_hosted_legacy_unsigned_peer_cannot_impersonate_cancellation_actor(
 
     assert response.status_code == 403
     assert response.json()["detail"] == (
-        "A2A cancellation requires a verified sender signature"
+        "A2A principal action requires a verified sender signature"
     )
     assert victim.did == "did:pkh:hosted:victim"
     agent.task_manager.cancel_task.assert_not_awaited()
@@ -1514,6 +1514,23 @@ def test_empty_signature_block_rejected_not_downgraded(app_with_send):
 
 def test_require_signed_rejects_unsigned_403(app_with_send, monkeypatch):
     monkeypatch.setenv("KESTREL_A2A_REQUIRE_SIGNED", "1")
+    agent = _stub_agent()
+    agent.a2a_did_resolver = None
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+
+    assert resp.status_code == 403
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_transport_only_process_rejects_unsigned_without_feature_policy(
+    app_with_send,
+    monkeypatch,
+):
+    """A missing or failed Peers feature cannot reopen unsigned A2A."""
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_ONLY", "true")
     agent = _stub_agent()
     agent.a2a_did_resolver = None
     _attach(app_with_send, agent)

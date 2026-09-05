@@ -42,6 +42,13 @@ from kestrel_sovereign.api_errors import (
     api_unhandled_exception_handler,
     register_api_error_handlers,
 )
+from kestrel_sovereign.a2a.transport_auth import (
+    A2A_TRANSPORT_KEY_HEADER,
+    ensure_a2a_transport_key,
+    is_a2a_transport_path,
+    is_a2a_transport_only_process,
+)
+from kestrel_sovereign.auth import normalize_api_key
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
 from kestrel_sovereign.telemetry import setup_tracing
@@ -518,7 +525,7 @@ def _constitution_safe_mode_records(agent, manager) -> list[dict]:
     return records
 
 
-def _oauth_required() -> bool:
+def _oauth_required(environ: Mapping[str, str] | None = None) -> bool:
     """Return whether OAuth is the required auth mode.
 
     Set KESTREL_REQUIRE_OAUTH=true in Cloud Run deploy scripts to force
@@ -527,28 +534,46 @@ def _oauth_required() -> bool:
 
     This is the single source of truth for auth mode.
     """
-    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+    source = os.environ if environ is None else environ
+    return source.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
         "1", "true", "yes", "on"
     }
 
 
 def _bootstrap_key_enabled() -> bool:
     """Localhost API-key bootstrap is available when OAuth is not required."""
-    return not _oauth_required()
+    return not _oauth_required() and not is_a2a_transport_only_process()
+
+
+def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
+    """Return the out-of-band sovereign credential required by a fleet host.
+
+    A runtime-generated key cannot be handed to local clients safely once
+    managed peers share the host's loopback namespace. Fleet launchers and the
+    server therefore meet on the project-provisioned key. OAuth authenticates
+    an operator account but intentionally does not grant sovereign authority,
+    so it cannot replace this mandate-holder credential. Localhost bootstrap
+    remains a standalone-only compatibility lane.
+    """
+    api_key = normalize_api_key(environ.get("KESTREL_API_KEY")) or ""
+    if api_key.strip():
+        return api_key
+    raise RuntimeError(
+        "Multi-agent hosts require a stable KESTREL_API_KEY for sovereign "
+        "authority, provisioned "
+        "out of band; run `kestrel setup keys` before startup"
+    )
 
 
 def get_api_key():
     """Get or generate the API key."""
-    api_key = os.environ.get("KESTREL_API_KEY")
+    api_key = normalize_api_key(os.environ.get("KESTREL_API_KEY"))
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
-    # Strip surrounding quotes (Docker --env-file includes them literally)
-    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in ('"', "'"):
-        api_key = api_key[1:-1]
     return api_key
 
 
@@ -1293,6 +1318,8 @@ def _hosted_peer_directory_context(
         if not callable(refresh):
             return None, None
         local_cancel = None
+        local_get = None
+        local_subscribe = None
         if manager is not None:
             async def local_cancel(requester, peer, task_id, payload):
                 return await manager.cancel_host_attested_local_a2a_task(
@@ -1303,10 +1330,28 @@ def _hosted_peer_directory_context(
                     payload=payload,
                 )
 
+            async def local_get(requester, peer, task_id):
+                return await manager.get_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
+            def local_subscribe(requester, peer, task_id):
+                return manager.subscribe_host_attested_local_a2a_task(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
+                    task_id=task_id,
+                )
+
         refreshed = refresh(
             host_url=host_url,
-            api_key=get_api_key(),
+            transport_key=ensure_a2a_transport_key(),
             local_cancel=local_cancel,
+            local_get=local_get,
+            local_subscribe=local_subscribe,
         )
         return refreshed if refreshed is not None else (None, None)
     return (
@@ -2285,6 +2330,17 @@ async def _lifespan_startup(app: FastAPI):
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
 
+    # Establish the authentication boundary before launching any host-owned
+    # resources. Direct uvicorn starts must obey the same fail-closed rule as
+    # `kestrel start`; otherwise get_api_key() would mint an undiscoverable key
+    # after the peer-visible bootstrap endpoint has already been disabled.
+    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in (
+        "1", "true", "yes"
+    )
+    multi_agent_path = resolve_multi_agent_path(os.environ)
+    if multi_agent_env or multi_agent_path.exists():
+        _require_multi_agent_host_api_key(os.environ)
+
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
     # in-process agents initialize and when subprocess agents inherit the env
@@ -2394,10 +2450,6 @@ async def _lifespan_startup(app: FastAPI):
         )
         app.state.phoenix = None
         app.state.phoenix_disabled_reason = reason
-
-    # Detect multi-agent mode
-    multi_agent_env = os.environ.get("KESTREL_MULTI_AGENT", "").lower() in ("1", "true", "yes")
-    multi_agent_path = resolve_multi_agent_path(os.environ)
 
     if multi_agent_env or multi_agent_path.exists():
         # --- Multi-agent mode ---
@@ -3147,7 +3199,16 @@ async def auth_middleware(request: Request, call_next):
     # like every other /api/ endpoint.
     static_prefixes = ["/static", "/js/", "/shared/", "/utils/", "/api/ui/"]
 
-    if request.url.path in public_paths or request.url.path in auth_paths:
+    transport_only_process = is_a2a_transport_only_process()
+    if request.url.path in public_paths:
+        return await call_next(request)
+    if request.url.path in auth_paths:
+        if transport_only_process:
+            return api_error_response(
+                status_code=404,
+                code="not_found",
+                message="Not found",
+            )
         return await call_next(request)
     # Webhooks authenticate themselves (HMAC, bearer, etc.) — bypass API key auth.
     # Matches the bare /webhooks/{name} AND the per-agent
@@ -3203,6 +3264,46 @@ async def auth_middleware(request: Request, call_next):
         if verify_embed_cookie(request, _SESSION_SECRET):
             request.state.caller = CallerContext.sovereign(AuthMethod.API_KEY)
             return await call_next(request)
+
+    # Automatic peers authenticate on a separate, route-limited lane. The
+    # discriminator is evaluated before the sovereign key and never falls
+    # through: adding both headers cannot promote peer transport to operator
+    # authority. Signed envelopes inside the admitted task routes establish
+    # the actual creator/recipient principal.
+    transport_credential = request.headers.get(A2A_TRANSPORT_KEY_HEADER)
+    if transport_credential is not None:
+        from kestrel_sovereign.auth import CallerContext
+
+        expected_transport = ensure_a2a_transport_key()
+        if not secrets.compare_digest(
+            transport_credential.encode("utf-8"),
+            expected_transport.encode("utf-8"),
+        ):
+            return api_error_response(
+                status_code=401,
+                code="authentication_required",
+                message="Invalid or missing A2A transport key",
+            )
+        if not is_a2a_transport_path(request.method, request.url.path):
+            return api_error_response(
+                status_code=403,
+                code="a2a_transport_scope_denied",
+                message="A2A transport is not authorized for this route",
+            )
+        request.state.caller = CallerContext.a2a_transport()
+        return await call_next(request)
+
+    # A host-managed child is a peer transport endpoint, never an operator
+    # authority domain. Do not call ``get_api_key`` here: an empty child
+    # sentinel would otherwise mint a fresh sovereign key, and localhost
+    # bootstrap or child code could recover it. Standalone launches set this
+    # marker false and retain their normal API-key/OAuth surfaces.
+    if transport_only_process:
+        return api_error_response(
+            status_code=401,
+            code="authentication_required",
+            message="Managed peer processes accept only A2A transport",
+        )
 
     # Credential evaluation only happens inside this try. Dispatch of an
     # authenticated (or deliberately unauthenticated) request stays OUTSIDE
@@ -3477,7 +3578,15 @@ if SERVE_UI:
 @limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
     """Return API key for initial frontend setup (localhost / Docker gateway only)."""
-    if not _bootstrap_key_enabled():
+    # A same-host managed peer is indistinguishable from a browser by source
+    # address: both reach this endpoint over loopback. Once this process owns a
+    # fleet, localhost therefore is not an authority boundary and the host key
+    # must be provisioned out of band instead of returned by a public route.
+    multi_agent_host = (
+        getattr(request.app.state, "agent_manager", None) is not None
+        or getattr(request.app.state, "multi_agent_config", None) is not None
+    )
+    if not _bootstrap_key_enabled() or multi_agent_host:
         raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
     # Narrowed from the whole 172.16.0.0/12 bridge range to loopback + the

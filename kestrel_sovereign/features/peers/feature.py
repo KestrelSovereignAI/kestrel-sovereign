@@ -32,6 +32,7 @@ import httpx
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.peers.directory import (
     LocalHostPeerDirectory,
@@ -272,7 +273,36 @@ class PeersFeature(Feature):
 
     async def initialize(self):
         self._host_url = _discover_host_url()
-        self._api_key = os.environ.get("KESTREL_API_KEY", "")
+        self._transport_key = ensure_a2a_transport_key()
+        # ProcessManager children boot through the single-agent server branch
+        # and therefore never receive AgentManager's in-memory DID resolver.
+        # Their launcher supplies an authenticated public-material snapshot;
+        # install it before accepting signed peer actions.
+        from kestrel_sovereign.a2a.did_registry import (
+            install_process_a2a_did_resolver,
+        )
+
+        process_resolver = install_process_a2a_did_resolver(self.agent)
+        if process_resolver is None:
+            process_resolver = getattr(
+                self.agent,
+                "_a2a_process_did_resolver",
+                None,
+            )
+        from kestrel_sovereign.a2a.transport_auth import (
+            is_a2a_transport_only_process,
+        )
+
+        managed_subprocess = is_a2a_transport_only_process()
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                mark_a2a_inbound_scoped_policy,
+            )
+
+            # This launch marker is authoritative even if registry or host
+            # wiring is absent. A broken managed child must deny A2A rather
+            # than silently regain standalone unsigned compatibility.
+            mark_a2a_inbound_scoped_policy(self.agent, required=True)
         self._own_name = self._get_own_name()
         # A hosted runtime injects both objects at agent construction.  The
         # requester scope is host-authenticated, opaque to this feature, and
@@ -294,6 +324,27 @@ class PeersFeature(Feature):
                 )
         elif self._host_url:
             self._install_local_host_router()
+
+        if managed_subprocess:
+            from kestrel_sovereign.a2a.inbound_authorization import (
+                install_a2a_inbound_sender_authorizer,
+            )
+
+            # The endpoint reads its immutable policy from the agent, while
+            # the subprocess compatibility router normally belongs to this
+            # feature. Publish the exact pair only for a launcher-marked child.
+            self.agent.peer_directory_router = self._peer_router
+            self.agent.peer_requester = self._peer_requester
+            sender_id_resolver = (
+                process_resolver.directory_agent_id
+                if process_resolver is not None
+                else lambda _signing_did: None
+            )
+            install_a2a_inbound_sender_authorizer(
+                None,
+                recipient=self.agent,
+                sender_id_resolver=sender_id_resolver,
+            )
 
         # #1576: every outbound A2A dispatch writes a sender-side audit
         # row. The receiver-side ``a2a_tasks`` row tells us what the
@@ -385,11 +436,14 @@ class PeersFeature(Feature):
         # the first operation that installed this adapter.
         self._peer_router = LocalHostPeerDirectory(
             host_url,
-            api_key=getattr(self, "_api_key", ""),
+            transport_key=getattr(self, "_transport_key", ""),
             client_factory=lambda *args, **kwargs: httpx.AsyncClient(
                 *args, **kwargs,
             ),
             local_cancel=getattr(self, "_local_host_cancel", None),
+            local_get=getattr(self, "_local_host_get", None),
+            local_subscribe=getattr(self, "_local_host_subscribe", None),
+            principal_payload_factory=self._build_principal_action_payload,
         )
 
     def _peer_directory_context(
@@ -441,12 +495,14 @@ class PeersFeature(Feature):
         self,
         *,
         host_url: str,
-        api_key: str,
+        transport_key: str,
         local_cancel=None,
+        local_get=None,
+        local_subscribe=None,
     ) -> Optional[Tuple[PeerDirectoryRouter, PeerRequester]]:
         """Refresh only the local compatibility adapter for hosted policy.
 
-        Host registration can occur after platform port resolution or API-key
+        Host registration can occur after platform port resolution or peer-key
         generation. Those are host-owned runtime facts, so the local adapter
         must be reconstructed from them before the host freezes its inbound
         policy. An injected scoped router is intentionally never replaced.
@@ -462,8 +518,10 @@ class PeersFeature(Feature):
         if router is not None and not isinstance(router, LocalHostPeerDirectory):
             return self._peer_directory_context()
         self._host_url = host_url.rstrip("/")
-        self._api_key = api_key
+        self._transport_key = transport_key
         self._local_host_cancel = local_cancel
+        self._local_host_get = local_get
+        self._local_host_subscribe = local_subscribe
         self._peer_router = None
         self._peer_requester = None
         self._install_local_host_router()
@@ -755,6 +813,48 @@ class PeersFeature(Feature):
                 type(exc).__name__,
             )
             raise OutboundSigningError("hybrid_signer_error") from exc
+
+    def _build_principal_action_payload(
+        self,
+        task_id: str,
+        verb: str,
+    ) -> Dict[str, Any]:
+        """Build a signed creator-principal envelope for HTTP read/SSE.
+
+        Process-isolated peers cannot carry the host manager's in-memory
+        capability. Binding the action verb, task id, session id, and message
+        into the ordinary replay-protected A2A signature gives the recipient
+        the same durable creator principal without trusting the shared API key.
+        """
+
+        if verb not in {"read_task", "subscribe_task"}:
+            raise OutboundSigningError("unsupported_principal_action")
+        if not isinstance(task_id, str) or not task_id:
+            raise OutboundSigningError("invalid_principal_task_id")
+        session_id = f"a2a-{verb}:{task_id}"
+        message = f"{verb}:{task_id}"
+        payload: Dict[str, Any] = {
+            "id": task_id,
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": message}],
+            },
+            "metadata": {
+                "sender": self._current_legacy_outbound_sender(),
+                "a2a_verb": verb,
+            },
+        }
+        self._maybe_sign_outbound(
+            payload,
+            task_id=task_id,
+            sess_id=session_id,
+            message=message,
+        )
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, Mapping) or not metadata.get("signature"):
+            raise OutboundSigningError("principal_signature_required")
+        return payload
 
     @tool(
         name="list_peers",

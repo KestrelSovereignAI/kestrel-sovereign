@@ -172,7 +172,7 @@ class TestTaskStore:
             creator_agent_id="did:test:creator",
             recipient_agent_id="did:test:recipient",
         )
-        retrieved = await store.get("task-001")
+        retrieved = await store._get_unscoped("task-001")
 
         assert retrieved is not None
         assert retrieved.id == "task-001"
@@ -189,7 +189,7 @@ class TestTaskStore:
         store = track_store(TaskStore(backend))
         await store.initialize()
 
-        result = await store.get("nonexistent")
+        result = await store._get_unscoped("nonexistent")
         assert result is None
 
     @pytest.mark.asyncio
@@ -218,7 +218,7 @@ class TestTaskStore:
             expected_state=TaskState.SUBMITTED,
         )
 
-        retrieved = await store.get("task-002")
+        retrieved = await store._get_unscoped("task-002")
         assert retrieved.status.state == TaskState.WORKING
 
     @pytest.mark.asyncio
@@ -250,7 +250,7 @@ class TestTaskStore:
             recipient_agent_id="did:test:recipient",
         )
 
-        retrieved = await store.get("task-003")
+        retrieved = await store._get_unscoped("task-003")
         assert retrieved.artifacts is not None
         assert len(retrieved.artifacts) == 1
         assert retrieved.artifacts[0].name == "result.txt"
@@ -275,7 +275,9 @@ class TestTaskStore:
                 recipient_agent_id="did:test:recipient",
             )
 
-        pending = await store.get_pending_tasks()
+        pending = await store.get_pending_tasks(
+            recipient_agent_id="did:test:recipient"
+        )
         assert len(pending) == 2
         assert all(t.status.state == TaskState.SUBMITTED for t in pending)
 
@@ -325,7 +327,10 @@ class TestTaskStore:
                 assert canceled is not None
 
         for state in five_states:
-            rows = await store.list_tasks(status=state)
+            rows = await store.list_tasks(
+                recipient_agent_id="did:test:recipient",
+                status=state,
+            )
             assert len(rows) == 1, (
                 f"status={state.value} returned {len(rows)} rows, expected 1"
             )
@@ -333,7 +338,9 @@ class TestTaskStore:
             assert rows[0].status.state == state
 
         # The worker drain path must remain submitted-only and unaffected.
-        pending = await store.get_pending_tasks()
+        pending = await store.get_pending_tasks(
+            recipient_agent_id="did:test:recipient"
+        )
         assert len(pending) == 1
         assert pending[0].status.state == TaskState.SUBMITTED
 
@@ -369,10 +376,16 @@ class TestTaskStore:
                 recipient_agent_id="did:test:recipient",
             )
 
-        session_a_tasks = await store.list_tasks(session_id="session-a")
+        session_a_tasks = await store.list_tasks(
+            recipient_agent_id="did:test:recipient",
+            session_id="session-a",
+        )
         assert len(session_a_tasks) == 3
 
-        session_b_tasks = await store.list_tasks(session_id="session-b")
+        session_b_tasks = await store.list_tasks(
+            recipient_agent_id="did:test:recipient",
+            session_id="session-b",
+        )
         assert len(session_b_tasks) == 2
 
     @pytest.mark.asyncio
@@ -396,7 +409,7 @@ class TestTaskStore:
         result = await store.delete("task-delete")
         assert result is True
 
-        retrieved = await store.get("task-delete")
+        retrieved = await store._get_unscoped("task-delete")
         assert retrieved is None
 
 

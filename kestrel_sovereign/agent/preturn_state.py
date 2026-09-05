@@ -150,7 +150,13 @@ async def _a2a_inbox_section(agent: Any) -> Optional[str]:
         return None
     try:
         from kestrel_sovereign.a2a.types import TaskState
-        tasks = await task_manager.task_store.list_tasks(limit=50)
+        recipient_agent_id = getattr(agent, "did", None)
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+            return None
+        tasks = await task_manager.task_store.list_tasks(
+            recipient_agent_id=recipient_agent_id,
+            limit=50,
+        )
     except Exception:
         return None
     pending = [
