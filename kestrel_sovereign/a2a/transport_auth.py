@@ -181,13 +181,18 @@ def ensure_a2a_transport_key(
 
     ``ProcessManager`` passes its already-resolved child environment so an
     explicit project ``.env`` value retains the launcher's established
-    precedence. When neither source supplies a value, an owner-only project
-    key file keeps independently launched host and child processes on the same
-    credential. The selected value is installed in both mappings without
-    deriving it from the sovereign key.
+    precedence. An explicitly blank project value requests the durable project
+    key rather than falling through to a stale exported value. When neither
+    source supplies a value, an owner-only project key file keeps independently
+    launched host and child processes on the same credential. The selected
+    value is installed in both mappings without deriving it from the sovereign
+    key.
     """
 
     exported = os.environ.get(A2A_TRANSPORT_KEY_ENV)
+    child_declares_value = (
+        environment is not None and A2A_TRANSPORT_KEY_ENV in environment
+    )
     child_value = (
         environment.get(A2A_TRANSPORT_KEY_ENV)
         if environment is not None
@@ -198,7 +203,11 @@ def ensure_a2a_transport_key(
             child_value,
             source=A2A_TRANSPORT_KEY_ENV,
         )
-    elif isinstance(exported, str) and exported.strip():
+    elif (
+        not child_declares_value
+        and isinstance(exported, str)
+        and exported.strip()
+    ):
         selected = _validate_transport_key(
             exported,
             source=A2A_TRANSPORT_KEY_ENV,

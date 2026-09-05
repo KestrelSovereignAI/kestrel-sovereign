@@ -322,3 +322,25 @@ def test_project_key_is_used_when_export_is_blank(monkeypatch, tmp_path):
     assert selected == "project-child-key"
     assert child_environment[transport_auth.A2A_TRANSPORT_KEY_ENV] == selected
     assert os.environ[transport_auth.A2A_TRANSPORT_KEY_ENV] == selected
+
+
+def test_blank_project_value_uses_durable_key_not_stale_export(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        transport_auth.A2A_TRANSPORT_KEY_ENV,
+        "stale-exported-key",
+    )
+    child_environment = {
+        transport_auth.A2A_TRANSPORT_KEY_ENV: "",
+    }
+    key_path = tmp_path / transport_auth.A2A_TRANSPORT_KEY_FILE
+    key_path.write_text("durable-project-key\n", encoding="utf-8")
+    key_path.chmod(0o600)
+
+    selected = transport_auth.ensure_a2a_transport_key(
+        child_environment,
+        project_root=tmp_path,
+    )
+
+    assert selected == "durable-project-key"
+    assert child_environment[transport_auth.A2A_TRANSPORT_KEY_ENV] == selected
+    assert os.environ[transport_auth.A2A_TRANSPORT_KEY_ENV] == selected

@@ -10,7 +10,8 @@
  * Auth is delegated to an `authProvider` so a host can supply its own
  * (e.g. a JWT it minted) without modifying Kestrel. The default provider
  * preserves the standalone Kestrel-server behavior: try /api/auth/key,
- * fall back to /auth/me, redirect to /auth/login if both fail.
+ * fall back to /auth/me, then offer local password-style API-key entry before
+ * redirecting to /auth/login.
  */
 
 const HOST_LEVEL_AGENTS_RE = /^\/api\/agents\/[^/]+\/(start|stop|status|logs)/;
@@ -326,18 +327,147 @@ export function buildHostUrl(endpoint) {
     return endpoint;
 }
 
+export function requestApiKeyFromOperator({ documentRef = globalThis.document } = {}) {
+    const root = documentRef?.body || documentRef?.documentElement;
+    if (!root || typeof documentRef?.createElement !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+        const overlay = documentRef.createElement('div');
+        overlay.id = 'kestrel-api-key-entry';
+        overlay.setAttribute('role', 'presentation');
+        Object.assign(overlay.style, {
+            position: 'fixed',
+            inset: '0',
+            zIndex: '2147483647',
+            display: 'grid',
+            placeItems: 'center',
+            padding: '1.5rem',
+            background: 'rgba(4, 8, 18, 0.82)',
+        });
+
+        const dialog = documentRef.createElement('section');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.setAttribute('aria-labelledby', 'kestrel-api-key-entry-title');
+        Object.assign(dialog.style, {
+            width: 'min(32rem, 100%)',
+            padding: '1.5rem',
+            border: '1px solid rgba(148, 163, 184, 0.35)',
+            borderRadius: '0.9rem',
+            color: '#e2e8f0',
+            background: '#111827',
+            boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55)',
+        });
+
+        const title = documentRef.createElement('h1');
+        title.id = 'kestrel-api-key-entry-title';
+        title.textContent = 'Unlock the Sovereign Console';
+        Object.assign(title.style, { margin: '0 0 0.75rem', fontSize: '1.35rem' });
+
+        const explanation = documentRef.createElement('p');
+        explanation.textContent = (
+            'Enter the KESTREL_API_KEY stored in this Kestrel project’s .env file. '
+            + 'The key stays in this browser tab and is never placed in the URL.'
+        );
+        Object.assign(explanation.style, {
+            margin: '0 0 1rem',
+            color: '#cbd5e1',
+            lineHeight: '1.5',
+        });
+
+        const form = documentRef.createElement('form');
+        Object.assign(form.style, { display: 'grid', gap: '0.75rem' });
+
+        const label = documentRef.createElement('label');
+        label.setAttribute('for', 'kestrel-api-key-input');
+        label.textContent = 'Sovereign API key';
+
+        const input = documentRef.createElement('input');
+        input.id = 'kestrel-api-key-input';
+        input.name = 'kestrel_api_key';
+        input.type = 'password';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.required = true;
+        Object.assign(input.style, {
+            width: '100%',
+            boxSizing: 'border-box',
+            padding: '0.7rem 0.8rem',
+            border: '1px solid #475569',
+            borderRadius: '0.5rem',
+            color: '#f8fafc',
+            background: '#0f172a',
+        });
+
+        const error = documentRef.createElement('p');
+        error.setAttribute('role', 'alert');
+        error.textContent = 'Enter a non-empty KESTREL_API_KEY.';
+        error.hidden = true;
+        Object.assign(error.style, { margin: '0', color: '#fca5a5' });
+
+        const actions = documentRef.createElement('div');
+        Object.assign(actions.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '1rem',
+            flexWrap: 'wrap',
+        });
+
+        const submit = documentRef.createElement('button');
+        submit.type = 'submit';
+        submit.textContent = 'Unlock';
+        Object.assign(submit.style, {
+            padding: '0.65rem 1rem',
+            border: '0',
+            borderRadius: '0.5rem',
+            color: '#020617',
+            background: '#67e8f9',
+            cursor: 'pointer',
+            fontWeight: '700',
+        });
+
+        const oauth = documentRef.createElement('a');
+        oauth.href = '/auth/login';
+        oauth.textContent = 'Sign in with OAuth instead';
+        Object.assign(oauth.style, { color: '#93c5fd' });
+
+        actions.append(submit, oauth);
+        form.append(label, input, error, actions);
+        dialog.append(title, explanation, form);
+        overlay.append(dialog);
+        root.append(overlay);
+
+        form.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const value = typeof input.value === 'string' ? input.value : '';
+            if (!value.trim()) {
+                error.hidden = false;
+                input.focus();
+                return;
+            }
+            overlay.remove();
+            resolve(value);
+        });
+        input.focus();
+    });
+}
+
 export function createKestrelStandaloneAuthProvider({
     fetchFn,
     sessionStorage,
     location,
     history,
     logger,
+    requestApiKey = requestApiKeyFromOperator,
 } = {}) {
     const fetchImpl = getRequiredDependency('fetch', fetchFn);
     const sessionStore = getRequiredDependency('sessionStorage', sessionStorage);
     const locationRef = getRequiredDependency('location', location);
     const historyRef = history || null;
     const log = getRequiredDependency('console', logger);
+    const requestApiKeyFn = typeof requestApiKey === 'function' ? requestApiKey : null;
 
     let apiKey = null;
     let oauthSession = false;
@@ -362,6 +492,16 @@ export function createKestrelStandaloneAuthProvider({
             log.error('Failed to initialize authentication:', error);
             return 'error';
         }
+    }
+
+    async function acceptExplicitApiKey() {
+        if (!requestApiKeyFn) return false;
+        const entered = await requestApiKeyFn();
+        if (typeof entered !== 'string' || !entered.trim()) return false;
+        apiKey = entered;
+        sessionStore.setItem('kestrel_api_key', apiKey);
+        log.log('API key accepted from explicit operator entry');
+        return true;
     }
 
     return {
@@ -413,9 +553,13 @@ export function createKestrelStandaloneAuthProvider({
                 // OAuth session check failed; fall through to redirect/no-auth.
             }
 
+            if (bootstrapDisabled && await acceptExplicitApiKey()) {
+                return;
+            }
+
             if (!apiKey && !oauthSession) {
                 if (bootstrapDisabled) {
-                    log.warn('OAuth required — redirecting to login');
+                    log.warn('Authentication required — redirecting to login');
                     locationRef.href = '/auth/login';
                 } else {
                     log.warn('No authentication available');
@@ -438,6 +582,10 @@ export function createKestrelStandaloneAuthProvider({
             const status = await bootstrapApiKey();
             if (status === 'ok') {
                 log.log('API key refreshed - retrying request');
+                return 'refreshed';
+            }
+
+            if (status === 'disabled' && await acceptExplicitApiKey()) {
                 return 'refreshed';
             }
 
@@ -569,6 +717,7 @@ export function createApiClient({
     location = globalThis.location,
     history = globalThis.history,
     logger = globalThis.console,
+    requestApiKey = requestApiKeyFromOperator,
     AbortControllerCtor = globalThis.AbortController,
     TextDecoderCtor = globalThis.TextDecoder,
     authProvider = null,
@@ -588,6 +737,7 @@ export function createApiClient({
         location: locationRef,
         history,
         logger: log,
+        requestApiKey,
     });
 
     // Capabilities (#879, #2041).  ``capabilities`` carries host overrides
