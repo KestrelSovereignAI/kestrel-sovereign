@@ -10,9 +10,15 @@ Default: 5s -> 25s -> 2m5s -> 10m25s -> 52m5s
 
 Deduplication: content_hash + recipient within a 60-second window prevents
 duplicate enqueues of the same message.
+
+Callers that need durable replay safety can additionally supply an opaque
+idempotency key. Its SHA-256 digest is scoped to the owning agent in a separate
+ledger, so safe replays adopt the canonical queue ID without persisting workflow
+identity. Reusing the key for a different request fails closed.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -42,6 +48,12 @@ DEDUP_WINDOW_SECONDS = 60
 
 # Type alias for the delivery callback
 DeliveryCallback = Callable[[str, str, Dict[str, Any]], Coroutine[Any, Any, DeliveryResult]]
+
+MAX_IDEMPOTENCY_KEY_BYTES = 4096
+
+
+class DeliveryIdempotencyConflict(ValueError):
+    """Raised when an idempotency key is replayed with a different request."""
 
 
 def _compute_backoff(attempt: int) -> float:
@@ -181,6 +193,7 @@ class DeliveryQueue:
         recipient: str,
         content: Dict[str, Any],
         max_retries: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> str:
         """Persist a new message to the queue.
 
@@ -193,13 +206,26 @@ class DeliveryQueue:
             recipient: Target address/identifier.
             content: Message payload (will be JSON-serialized).
             max_retries: Override default max retries for this entry.
+            idempotency_key: Optional opaque, owner-scoped replay key. Only its
+                SHA-256 digest is persisted. A replay with a different delivery
+                request fails closed.
 
         Returns:
             The queue entry ID (existing if deduplicated, new otherwise).
         """
+        retries = max_retries if max_retries is not None else self._max_retries
+
+        if idempotency_key is not None:
+            return await self._enqueue_idempotent(
+                channel_type=channel_type,
+                recipient=recipient,
+                content=content,
+                retries=retries,
+                idempotency_key=idempotency_key,
+            )
+
         content_json = json.dumps(content, default=str)
         content_hash = QueueEntry.compute_content_hash(recipient, content_json)
-        retries = max_retries if max_retries is not None else self._max_retries
 
         # Deduplication check
         dedup_cutoff = (
@@ -248,6 +274,131 @@ class DeliveryQueue:
             entry_id, channel_type, recipient,
         )
         return entry_id
+
+    async def _enqueue_idempotent(
+        self,
+        *,
+        channel_type: str,
+        recipient: str,
+        content: Dict[str, Any],
+        retries: int,
+        idempotency_key: str,
+    ) -> str:
+        """Atomically insert or adopt an owner-scoped logical delivery."""
+        key_bytes = idempotency_key.encode("utf-8")
+        if not key_bytes:
+            raise ValueError("idempotency_key must not be empty")
+        if len(key_bytes) > MAX_IDEMPOTENCY_KEY_BYTES:
+            raise ValueError(
+                f"idempotency_key must be at most {MAX_IDEMPOTENCY_KEY_BYTES} UTF-8 bytes"
+            )
+
+        content_json = json.dumps(
+            content,
+            default=str,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        key_digest = hashlib.sha256(key_bytes).hexdigest()
+        payload_json = json.dumps(
+            {
+                "channel_type": channel_type,
+                "recipient": recipient,
+                "content": json.loads(content_json),
+                "max_retries": retries,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        payload_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        entry_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).isoformat()
+        content_hash = QueueEntry.compute_content_hash(recipient, content_json)
+
+        try:
+            async with self._db.transaction(immediate=True):
+                await self._db.execute(
+                    """
+                    INSERT INTO delivery_idempotency
+                        (agent_id, idempotency_key_digest, entry_id,
+                         payload_digest, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
+                    """,
+                    (
+                        self._agent_id,
+                        key_digest,
+                        entry_id,
+                        payload_digest,
+                        now_iso,
+                    ),
+                )
+                existing = await self._db.fetchone(
+                    """
+                    SELECT entry_id, payload_digest
+                    FROM delivery_idempotency
+                    WHERE agent_id = ? AND idempotency_key_digest = ?
+                    """,
+                    (self._agent_id, key_digest),
+                )
+                if existing is None:
+                    raise RuntimeError("delivery idempotency record was not persisted")
+                if existing[1] != payload_digest:
+                    raise DeliveryIdempotencyConflict(
+                        "idempotency_key was already used for a different delivery request"
+                    )
+                if existing[0] != entry_id:
+                    logger.debug("Adopted idempotent delivery entry: %s", existing[0])
+                    return existing[0]
+
+                await self._db.execute(
+                    """
+                    INSERT INTO delivery_queue
+                        (id, agent_id, channel_type, recipient, content_json,
+                         content_hash, status, attempts, max_retries,
+                         next_retry_at, last_error, created_at, delivered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
+                    """,
+                    (
+                        entry_id,
+                        self._agent_id,
+                        channel_type,
+                        recipient,
+                        content_json,
+                        content_hash,
+                        DeliveryStatus.PENDING.value,
+                        retries,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+        except Exception as error:
+            conflict = self._find_idempotency_conflict(error)
+            if conflict is not None:
+                raise conflict
+            raise
+
+        logger.info(
+            "Enqueued idempotent delivery %s -> %s/%s",
+            entry_id,
+            channel_type,
+            recipient,
+        )
+        return entry_id
+
+    @staticmethod
+    def _find_idempotency_conflict(
+        error: BaseException,
+    ) -> Optional[DeliveryIdempotencyConflict]:
+        """Recover the public conflict from backend transaction wrappers."""
+        seen: set[int] = set()
+        current: Optional[BaseException] = error
+        while current is not None and id(current) not in seen:
+            if isinstance(current, DeliveryIdempotencyConflict):
+                return current
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
+        return None
 
     async def process_pending(self) -> int:
         """Process the next batch of pending/retryable messages.
@@ -761,6 +912,24 @@ class DeliveryQueue:
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_queue_dedup
             ON delivery_queue(agent_id, content_hash, recipient, created_at)
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delivery_idempotency (
+                agent_id TEXT NOT NULL,
+                idempotency_key_digest TEXT NOT NULL,
+                entry_id TEXT NOT NULL,
+                payload_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, idempotency_key_digest)
+            )
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_idempotency_entry
+            ON delivery_idempotency(agent_id, entry_id)
             """
         )
         await self._db.execute(

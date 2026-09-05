@@ -12,6 +12,7 @@ Tests:
 - Error handling for missing DB, unknown entries, etc.
 """
 
+import asyncio
 import json
 import pytest
 import pytest_asyncio
@@ -25,11 +26,13 @@ from kestrel_sovereign.features.delivery.models import (
     QueueEntry,
 )
 from kestrel_sovereign.features.delivery.queue import (
+    DeliveryIdempotencyConflict,
     DeliveryQueue,
     _compute_backoff,
     BASE_DELAY_SECONDS,
     MAX_DELAY_SECONDS,
 )
+from kestrel_sovereign.storage.db.interface import TransactionError
 
 
 # =========================================================================
@@ -538,8 +541,8 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 2 tables + 3 indexes = 5 execute calls
-        assert queue._db.execute.call_count == 5
+        # 3 tables + 4 indexes = 7 execute calls
+        assert queue._db.execute.call_count == 7
 
     @pytest.mark.asyncio
     async def test_ensure_tables_includes_delivery_queue(self, queue):
@@ -598,6 +601,243 @@ class TestQueueEnqueue:
         # Parameters: id, agent_id, channel_type, recipient, content_json,
         #             content_hash, status, max_retries, next_retry_at, created_at
         assert 10 in params
+
+
+class TestQueueIdempotency:
+    @pytest_asyncio.fixture
+    async def real_queue(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "idempotency.db"))
+        deliveries = []
+
+        async def deliver(channel_type, recipient, content):
+            deliveries.append((channel_type, recipient, content))
+            return DeliveryResult(success=True)
+
+        queue = DeliveryQueue(
+            database,
+            "did:test:idempotent-owner",
+            deliver=deliver,
+        )
+        await queue._ensure_tables()
+        yield queue, deliveries
+        await queue.stop()
+        await database.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_replay_creates_one_row_and_one_delivery(
+        self, real_queue
+    ):
+        queue, deliveries = real_queue
+        entry_ids = await asyncio.gather(
+            *(
+                queue.enqueue(
+                    "email",
+                    "person@example.com",
+                    {"subject": "Escalation", "body": "Please check in"},
+                    idempotency_key="workflow/run/stage/attempt",
+                )
+                for _ in range(20)
+            )
+        )
+
+        assert len(set(entry_ids)) == 1
+        row = await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+        assert row == (1,)
+
+        assert await queue.process_pending() == 1
+        assert len(deliveries) == 1
+
+    @pytest.mark.asyncio
+    async def test_replay_returns_canonical_id_after_delivery(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "person@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "stable-stage-key",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue._db.execute(
+            "UPDATE delivery_queue SET status = ? WHERE id = ?",
+            (DeliveryStatus.DELIVERED.value, original_id),
+        )
+
+        assert await queue.enqueue(**request) == original_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            {
+                "channel_type": "webhook",
+                "recipient": "person@example.com",
+                "content": {"body": "original"},
+                "max_retries": None,
+            },
+            {
+                "channel_type": "email",
+                "recipient": "other@example.com",
+                "content": {"body": "original"},
+                "max_retries": None,
+            },
+            {
+                "channel_type": "email",
+                "recipient": "person@example.com",
+                "content": {"body": "changed"},
+                "max_retries": None,
+            },
+            {
+                "channel_type": "email",
+                "recipient": "person@example.com",
+                "content": {"body": "original"},
+                "max_retries": 9,
+            },
+        ],
+    )
+    async def test_changed_request_fails_closed(self, real_queue, changed):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "original"},
+            idempotency_key="one-logical-send",
+        )
+
+        with pytest.raises(DeliveryIdempotencyConflict):
+            await queue.enqueue(
+                changed["channel_type"],
+                changed["recipient"],
+                changed["content"],
+                max_retries=changed["max_retries"],
+                idempotency_key="one-logical-send",
+            )
+
+        rows = await queue._db.fetchall(
+            "SELECT id, content_json FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+        assert rows == [(original_id, '{"body":"original"}')]
+
+    @pytest.mark.asyncio
+    async def test_mapping_order_does_not_change_logical_request(self, real_queue):
+        queue, _ = real_queue
+        first = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"subject": "hello", "body": "world"},
+            idempotency_key="canonical-content",
+        )
+
+        replay = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "world", "subject": "hello"},
+            idempotency_key="canonical-content",
+        )
+
+        assert replay == first
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["", "x" * 4097])
+    async def test_invalid_idempotency_key_is_rejected(self, real_queue, key):
+        queue, _ = real_queue
+
+        with pytest.raises(ValueError):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"body": "hello"},
+                idempotency_key=key,
+            )
+
+    @pytest.mark.asyncio
+    async def test_same_key_is_independent_between_owners(self, real_queue):
+        queue, _ = real_queue
+        other = DeliveryQueue(queue._db, "did:test:other-owner")
+        request = (
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+        )
+
+        mine = await queue.enqueue(*request, idempotency_key="shared-key")
+        theirs = await other.enqueue(*request, idempotency_key="shared-key")
+
+        assert mine != theirs
+
+    @pytest.mark.asyncio
+    async def test_only_key_digest_is_persisted(self, real_queue):
+        queue, _ = real_queue
+        raw_key = "workflow-identity-must-not-be-stored"
+        await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key=raw_key,
+        )
+
+        row = await queue._db.fetchone(
+            """
+            SELECT idempotency_key_digest FROM delivery_idempotency
+            WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        )
+        assert row[0] != raw_key
+        assert len(row[0]) == 64
+
+    @pytest.mark.asyncio
+    async def test_schema_initialization_is_idempotent(self, real_queue):
+        queue, _ = real_queue
+
+        await queue._ensure_tables()
+        await queue._ensure_tables()
+
+        row = await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency",
+        )
+        assert row == (0,)
+
+    @pytest.mark.asyncio
+    async def test_queue_insert_failure_rolls_back_idempotency_claim(self, real_queue):
+        queue, _ = real_queue
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_delivery_insert
+            BEFORE INSERT ON delivery_queue
+            BEGIN
+                SELECT RAISE(ABORT, 'injected queue insert failure');
+            END
+            """
+        )
+
+        with pytest.raises(TransactionError, match="injected queue insert failure"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"body": "hello"},
+                idempotency_key="retry-after-rollback",
+            )
+
+        row = await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+        assert row == (0,)
+
+        await queue._db.execute("DROP TRIGGER reject_delivery_insert")
+        entry_id = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-after-rollback",
+        )
+        assert entry_id
 
 
 # =========================================================================
@@ -956,6 +1196,7 @@ class TestQueueLifecycle:
                 await queue.start()
                 mock_tables.assert_called_once()
                 mock_create.assert_called_once()
+                mock_create.call_args.args[0].close()
                 assert queue._running is True
 
     @pytest.mark.asyncio
@@ -966,7 +1207,6 @@ class TestQueueLifecycle:
         async def noop():
             await asyncio.sleep(3600)
 
-        loop = asyncio.get_event_loop()
         real_task = asyncio.create_task(noop())
         queue._task = real_task
         queue._running = True
@@ -993,6 +1233,34 @@ class TestEnqueueMessage:
             content={"text": "hello"},
         )
         assert entry_id == "new-entry-id"
+        feature._queue.enqueue.assert_awaited_once_with(
+            "webhook",
+            "http://example.com/hook",
+            {"text": "hello"},
+            None,
+            idempotency_key=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_enqueue_via_feature_forwards_idempotency_key(self, feature):
+        feature._queue.enqueue = AsyncMock(return_value="existing-entry-id")
+
+        entry_id = await feature.enqueue_message(
+            channel_type="email",
+            recipient="person@example.com",
+            content={"body": "hello"},
+            max_retries=8,
+            idempotency_key="workflow-stage-key",
+        )
+
+        assert entry_id == "existing-entry-id"
+        feature._queue.enqueue.assert_awaited_once_with(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            8,
+            idempotency_key="workflow-stage-key",
+        )
 
     @pytest.mark.asyncio
     async def test_enqueue_without_queue(self, feature_no_db):
