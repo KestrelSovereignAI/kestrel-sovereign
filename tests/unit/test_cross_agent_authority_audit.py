@@ -2063,10 +2063,76 @@ def _scope_route_callable_aliases(
     """Resolve source-ordered aliases of bound FastAPI registrations."""
 
     aliases = dict(inherited_aliases or {})
+
+    def binding_for(value: ast.AST) -> tuple[str, str] | None:
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            registration = value.attr.casefold()
+            receiver = value.value.id
+            if registration in _ROUTE_REGISTRATION_NAMES and (
+                receiver == "app" or receiver in prefixes
+            ):
+                return receiver, registration
+        if isinstance(value, ast.Name):
+            return aliases.get(value.id)
+        if isinstance(value, ast.IfExp):
+            branch_bindings = [
+                binding for branch in (value.body, value.orelse)
+                if (binding := binding_for(branch)) is not None
+            ]
+            if not branch_bindings:
+                return None
+            if (
+                len(branch_bindings) == 2
+                and branch_bindings[0] == branch_bindings[1]
+            ):
+                return branch_bindings[0]
+            return branch_bindings[0][0], _UNRESOLVED_ROUTE_REGISTRATION
+        return None
+
+    def conditionally_bound_route_aliases(
+        statement: ast.stmt,
+    ) -> dict[str, tuple[str, str]]:
+        bindings: dict[str, tuple[str, str]] = {}
+
+        class RouteBindingVisitor(ast.NodeVisitor):
+            def record(self, targets: list[ast.AST], value: ast.AST | None) -> None:
+                if value is None or (binding := binding_for(value)) is None:
+                    return
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        bindings[target.id] = binding
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.record(list(node.targets), node.value)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                self.record([node.target], node.value)
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                self.record([node.target], node.value)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(
+                self, node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        RouteBindingVisitor().visit(statement)
+        return bindings
+
     for statement in statements:
         if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+            conditional_bindings = conditionally_bound_route_aliases(statement)
             for name in _compound_binding_names(statement, set()):
-                prior = aliases.get(name)
+                prior = aliases.get(name) or conditional_bindings.get(name)
                 if prior is not None:
                     aliases[name] = (
                         prior[0],
@@ -2093,18 +2159,7 @@ def _scope_route_callable_aliases(
         if value is None:
             continue
 
-        binding: tuple[str, str] | None = None
-        if isinstance(value, ast.Attribute) and isinstance(
-            value.value, ast.Name
-        ):
-            registration = value.attr.casefold()
-            receiver = value.value.id
-            if registration in _ROUTE_REGISTRATION_NAMES and (
-                receiver == "app" or receiver in prefixes
-            ):
-                binding = (receiver, registration)
-        elif isinstance(value, ast.Name):
-            binding = aliases.get(value.id)
+        binding = binding_for(value)
         if binding is not None:
             aliases.update({target_name: binding for target_name in target_names})
     return aliases
@@ -3590,6 +3645,36 @@ def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
     [
         (
             "router = APIRouter()\n"
+            "if enabled:\n"
+            "    register = router.post\n"
+            "@register('/api/agents/{name}')\n"
+            "def route():\n"
+            "    pass\n"
+        ),
+        (
+            "router = APIRouter()\n"
+            "register = router.post if enabled else noop\n"
+            "@register('/api/agents/{name}')\n"
+            "def route():\n"
+            "    pass\n"
+        ),
+    ],
+    ids=["compound-binding", "conditional-expression"],
+)
+def test_route_declarations_reject_conditionally_introduced_aliases(
+    source: str,
+) -> None:
+    with pytest.raises(
+        AssertionError, match="Unresolved route registration alias"
+    ):
+        _route_declarations(ast.parse(source), {}, {})
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "router = APIRouter()\n"
             "register = router.delete\n"
             "def build_router():\n"
             "    @register('/api/agents/{name}')\n"
@@ -4411,12 +4496,64 @@ _CROSS_AGENT_STATE_COLLECTIONS = {
 }
 
 
+def _is_cross_agent_state_collection_name(name: str) -> bool:
+    """Recognize qualified agent registries without matching every registry."""
+
+    normalized = name.casefold().strip("_")
+    if normalized in _CROSS_AGENT_STATE_COLLECTIONS:
+        return True
+    words = set(normalized.split("_"))
+    plural_subjects = {"agents", "children", "descendants", "peers"}
+    singular_subjects = {"agent", "child", "descendant", "peer"}
+    collection_labels = {
+        "by",
+        "collection",
+        "index",
+        "map",
+        "mapping",
+        "pool",
+        "registries",
+        "registry",
+        "store",
+    }
+    return bool(words.intersection(plural_subjects)) or bool(
+        words.intersection(singular_subjects)
+        and words.intersection(collection_labels)
+    )
+
+
 _CROSS_AGENT_STATE_OBJECT_LABELS = {
     "agent",
     "child",
     "descendant",
     "peer",
 }
+
+
+_CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
+    {
+        "cancel",
+        "close",
+        "delete",
+        "destroy",
+        "disable",
+        "enable",
+        "hold",
+        "interrupt",
+        "kill",
+        "offboard",
+        "pause",
+        "remove",
+        "reset",
+        "restart",
+        "resume",
+        "shutdown",
+        "start",
+        "stop",
+        "terminate",
+        "withdraw",
+    }
+)
 
 
 def _cross_agent_state_object_aliases(
@@ -4508,10 +4645,9 @@ def _cross_agent_state_object_aliases(
     while changed:
         changed = False
         for targets, sources in assignments:
-            selects_agent_object = bool(
-                sources.intersection(aliases | _CROSS_AGENT_STATE_COLLECTIONS)
-            ) or any(
-                semantic_name(source)
+            selects_agent_object = bool(sources.intersection(aliases)) or any(
+                _is_cross_agent_state_collection_name(source)
+                or semantic_name(source)
                 or source.startswith(("get_agent", "resolve_agent", "select_agent"))
                 for source in sources
             )
@@ -4535,19 +4671,16 @@ def _is_cross_agent_state_mutation_target(
         else child.attr.casefold()
         for child in ast.walk(node)
         if isinstance(child, (ast.Name, ast.Attribute))
-        and (
-            child.id.casefold()
-            if isinstance(child, ast.Name)
-            else child.attr.casefold()
+        and _is_cross_agent_state_collection_name(
+            child.id if isinstance(child, ast.Name) else child.attr
         )
-        in _CROSS_AGENT_STATE_COLLECTIONS
     }
     is_collection = (
         isinstance(node, ast.Name)
-        and node.id.casefold() in _CROSS_AGENT_STATE_COLLECTIONS
+        and _is_cross_agent_state_collection_name(node.id)
     ) or (
         isinstance(node, ast.Attribute)
-        and node.attr.casefold() in _CROSS_AGENT_STATE_COLLECTIONS
+        and _is_cross_agent_state_collection_name(node.attr)
     )
     if collection_references and (
         is_collection
@@ -4609,28 +4742,7 @@ def _is_cross_agent_state_mutation_call(
     lifecycle_mutation = (
         isinstance(call.func, ast.Attribute)
         and call.func.attr.casefold()
-        in {
-            "cancel",
-            "close",
-            "delete",
-            "destroy",
-            "disable",
-            "enable",
-            "hold",
-            "interrupt",
-            "kill",
-            "offboard",
-            "pause",
-            "remove",
-            "reset",
-            "restart",
-            "resume",
-            "shutdown",
-            "start",
-            "stop",
-            "terminate",
-            "withdraw",
-        }
+        in _CROSS_AGENT_LIFECYCLE_ACTIONS
         and _is_cross_agent_state_object_reference(
             call.func.value, state_object_aliases
         )
@@ -4856,6 +4968,81 @@ def _is_provenance_accessor_reference(node: ast.AST) -> bool:
     return isinstance(node, (ast.Name, ast.Attribute)) and _call_name(
         ast.Call(func=node, args=[], keywords=[])
     ).casefold().strip("_").endswith(PROVENANCE_ACCESSOR_SUFFIXES)
+
+
+def _is_provenance_accessor_getattr_reference(node: ast.AST) -> bool:
+    """Whether a static ``getattr`` retrieves a canonical chain accessor."""
+
+    if not isinstance(node, ast.Call) or _call_name(node).casefold() != "getattr":
+        return False
+    attribute = (
+        node.args[1]
+        if len(node.args) > 1
+        else next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg in {"attr", "name"}
+            ),
+            None,
+        )
+    )
+    resolved = _resolved_string(attribute) if attribute is not None else None
+    return resolved is not None and resolved.casefold().strip("_").endswith(
+        PROVENANCE_ACCESSOR_SUFFIXES
+    )
+
+
+def _function_provenance_accessor_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    inherited_aliases: set[str] | None = None,
+) -> set[str]:
+    """Return callable aliases whose invocation reads provenance metadata."""
+
+    aliases = set(inherited_aliases or ())
+    bindings: list[tuple[set[str], ast.AST]] = []
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        target_names = {
+            name
+            for target in targets
+            for name in _binding_target_names(target)
+        }
+        target_names.update(
+            target.attr.casefold()
+            for target in targets
+            if isinstance(target, ast.Attribute)
+        )
+        if target_names:
+            bindings.append((target_names, value))
+
+    changed = True
+    while changed:
+        changed = False
+        for target_names, value in bindings:
+            preserves_accessor = (
+                _is_provenance_accessor_reference(value)
+                or _is_provenance_accessor_getattr_reference(value)
+                or (
+                    isinstance(value, (ast.Name, ast.Attribute))
+                    and bool(_identifier_tokens(value).intersection(aliases))
+                )
+            )
+            if preserves_accessor:
+                new_aliases = target_names - aliases
+                if new_aliases:
+                    aliases.update(new_aliases)
+                    changed = True
+    return aliases
 
 
 def _has_provenance_value(
@@ -5361,30 +5548,19 @@ def _is_unambiguous_control_token(token: str) -> bool:
     """Recognize authority sinks without broad inventory-only vocabulary."""
 
     token = token.casefold()
-    control_actions = (
-        "cancel",
+    control_actions = _CROSS_AGENT_LIFECYCLE_ACTIONS | {
         "create",
         "delegate",
         "deploy",
-        "hold",
-        "interrupt",
         "invoke",
-        "kill",
         "list",
-        "offboard",
         "read",
-        "remove",
-        "restart",
         "send",
-        "shutdown",
         "spawn",
-        "stop",
         "subscribe",
         "teardown",
-        "terminate",
         "verify",
-        "withdraw",
-    )
+    }
     agent_subjects = (
         "a2a",
         "agent",
@@ -5443,6 +5619,7 @@ def _provenance_aliases(
     *,
     authority_analysis: bool = True,
     state_object_aliases: set[str] | None = None,
+    provenance_accessor_aliases: set[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -5537,6 +5714,9 @@ def _provenance_aliases(
         if is_provenance_derived(default, aliases):
             aliases.add(parameter.arg.casefold())
     scope_nodes = _walk_lexical_scope(function)
+    decision_provenance_helpers = set(provenance_return_helpers or ()) | set(
+        provenance_accessor_aliases or ()
+    )
     control_aliases = (
         _cross_agent_control_aliases(function, control_helpers)
         if authority_analysis
@@ -5757,6 +5937,24 @@ def _provenance_aliases(
     if authority_analysis:
         collect_guard_decisions(function.body)
 
+    # Keep control-gate dependencies separate from values that merely flow into
+    # a control call. A chain accessor carried inside an A2A payload is
+    # propagation; the same accessor feeding an ``if`` that gates lifecycle
+    # control is authority. Walking those two dependency graphs together would
+    # turn ordinary lineage transport into a false permission finding.
+    guard_dependency_names = authority_decision_names - authority_target_names
+    changed = authority_analysis
+    while changed:
+        changed = False
+        for names, value, _node in assignments:
+            if not names.intersection(guard_dependency_names):
+                continue
+            dependencies = _identifier_tokens(value).intersection(assignment_names)
+            new_dependencies = dependencies - guard_dependency_names
+            if new_dependencies:
+                guard_dependency_names.update(new_dependencies)
+                changed = True
+
     changed = authority_analysis
     while changed:
         changed = False
@@ -5786,7 +5984,7 @@ def _provenance_aliases(
 
             if isinstance(statement, (ast.If, ast.While)):
                 branch_selection = inherited_selection or _has_provenance_value(
-                    statement.test, aliases, provenance_return_helpers
+                    statement.test, aliases, decision_provenance_helpers
                 )
                 selected.update(
                     provenance_selected_decisions(
@@ -5801,13 +5999,13 @@ def _provenance_aliases(
                 continue
             if isinstance(statement, ast.Match):
                 subject_selection = inherited_selection or _has_provenance_value(
-                    statement.subject, aliases, provenance_return_helpers
+                    statement.subject, aliases, decision_provenance_helpers
                 )
                 for case in statement.cases:
                     case_selection = subject_selection or (
                         case.guard is not None
                         and _has_provenance_value(
-                            case.guard, aliases, provenance_return_helpers
+                            case.guard, aliases, decision_provenance_helpers
                         )
                     )
                     selected.update(
@@ -5863,16 +6061,14 @@ def _provenance_aliases(
                     ]
                 )
             )
-            guard_decision_names = names.intersection(
-                authority_decision_names - authority_target_names
-            )
+            guard_decision_names = names.intersection(guard_dependency_names)
             derived = is_provenance_derived(value, aliases) or (
                 (
                     permission_shaped_target
                     or bool(guard_decision_names)
                 )
                 and _has_provenance_value(
-                    value, aliases, provenance_return_helpers
+                    value, aliases, decision_provenance_helpers
                 )
             )
             if target_derived:
@@ -7079,31 +7275,52 @@ def _authority_provenance_lines(
         _module_imported_provenance_return_helper_aliases(tree, source_path)
     )
     control_helpers = _local_control_helpers(functions, module_control_aliases)
-    class_provenance_aliases = _class_provenance_state_aliases(
-        tree,
-        imported_provenance_helpers,
-        module_provenance_aliases,
-    )
-    provenance_return_helpers = _local_provenance_return_helpers(
-        functions,
-        control_helpers,
-        module_provenance_aliases,
-        imported_provenance_helpers,
-        class_provenance_aliases,
-    )
-    class_provenance_aliases = _class_provenance_state_aliases(
-        tree,
-        provenance_return_helpers,
-        module_provenance_aliases,
-    )
-    provenance_return_helpers = _local_provenance_return_helpers(
-        functions,
-        control_helpers,
-        module_provenance_aliases,
-        provenance_return_helpers,
-        class_provenance_aliases,
-    )
     function_parents = _nested_function_parents(tree)
+    function_accessor_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {}
+
+    def analyze_function_accessors(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        cached = function_accessor_aliases.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = (
+            analyze_function_accessors(parent) if parent is not None else set()
+        )
+        resolved = _function_provenance_accessor_aliases(function, inherited)
+        function_accessor_aliases[function] = resolved
+        return resolved
+
+    for function in functions:
+        analyze_function_accessors(function)
+
+    class_provenance_aliases = _class_provenance_state_aliases(
+        tree,
+        imported_provenance_helpers,
+        module_provenance_aliases,
+    )
+    provenance_return_helpers = _local_provenance_return_helpers(
+        functions,
+        control_helpers,
+        module_provenance_aliases,
+        imported_provenance_helpers,
+        class_provenance_aliases,
+    )
+    class_provenance_aliases = _class_provenance_state_aliases(
+        tree,
+        provenance_return_helpers,
+        module_provenance_aliases,
+    )
+    provenance_return_helpers = _local_provenance_return_helpers(
+        functions,
+        control_helpers,
+        module_provenance_aliases,
+        provenance_return_helpers,
+        class_provenance_aliases,
+    )
     function_state_objects: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
@@ -7151,6 +7368,7 @@ def _authority_provenance_lines(
             | class_provenance_aliases.get(function, set())
             | inherited,
             state_object_aliases=function_state_objects[function],
+            provenance_accessor_aliases=function_accessor_aliases[function],
         )
         function_provenance[function] = resolved
         return resolved
@@ -7159,6 +7377,9 @@ def _authority_provenance_lines(
         analyze_function_provenance(function)
     for function in functions:
         function_name = function.name.casefold()
+        decision_provenance_helpers = (
+            provenance_return_helpers | function_accessor_aliases[function]
+        )
         control_aliases = _cross_agent_control_aliases(function, control_helpers)
         state_object_aliases = function_state_objects[function]
         provenance_aliases, provenance_selected_targets = (
@@ -7169,7 +7390,7 @@ def _authority_provenance_lines(
                 function,
                 provenance_aliases,
                 control_aliases,
-                provenance_return_helpers,
+                decision_provenance_helpers,
                 state_object_aliases,
             )
         )
@@ -7182,7 +7403,7 @@ def _authority_provenance_lines(
             if _has_provenance_value(
                 lambda_node.body,
                 provenance_aliases,
-                provenance_return_helpers,
+                decision_provenance_helpers,
             ) and _contains_cross_agent_control_call(
                 lambda_node.body, control_aliases, state_object_aliases
             ):
@@ -7198,7 +7419,7 @@ def _authority_provenance_lines(
                     _has_provenance_value(
                         argument,
                         provenance_aliases,
-                        provenance_return_helpers,
+                        decision_provenance_helpers,
                     )
                     for argument in arguments
                 ):
@@ -7255,7 +7476,7 @@ def _authority_provenance_lines(
                     and _has_provenance_value(
                         assignment_value,
                         provenance_aliases,
-                        provenance_return_helpers,
+                        decision_provenance_helpers,
                     )
                 ):
                     lines.add(node.lineno)
@@ -7265,7 +7486,7 @@ def _authority_provenance_lines(
                     and _has_provenance_value(
                         node.value,
                         provenance_aliases,
-                        provenance_return_helpers,
+                        decision_provenance_helpers,
                     )
                     and (
                         function_is_permission_boundary
@@ -7281,7 +7502,7 @@ def _authority_provenance_lines(
                 if _has_provenance_value(
                     node.subject,
                     provenance_aliases,
-                    provenance_return_helpers,
+                    decision_provenance_helpers,
                 ) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
@@ -7297,7 +7518,7 @@ def _authority_provenance_lines(
                         and _has_provenance_value(
                             case.guard,
                             provenance_aliases,
-                            provenance_return_helpers,
+                            decision_provenance_helpers,
                         )
                         and (
                             function_is_permission_boundary
@@ -7312,7 +7533,7 @@ def _authority_provenance_lines(
                 if _has_provenance_value(
                     node.iter,
                     provenance_aliases,
-                    provenance_return_helpers,
+                    decision_provenance_helpers,
                 ) and (
                     function_is_permission_boundary
                     or _contains_cross_agent_control_call(
@@ -7330,7 +7551,7 @@ def _authority_provenance_lines(
                         and _has_provenance_value(
                             item.context_expr,
                             provenance_aliases,
-                            provenance_return_helpers,
+                            decision_provenance_helpers,
                         )
                     )
                     for item in node.items
@@ -7347,7 +7568,7 @@ def _authority_provenance_lines(
                     _has_provenance_value(
                         node,
                         provenance_aliases,
-                        provenance_return_helpers,
+                        decision_provenance_helpers,
                     )
                     and _contains_cross_agent_control_call(
                         node.values, control_aliases, state_object_aliases
@@ -7365,7 +7586,7 @@ def _authority_provenance_lines(
                     if _has_provenance_value(
                         generator.iter,
                         comprehension_aliases,
-                        provenance_return_helpers,
+                        decision_provenance_helpers,
                     ):
                         provenance_driven = True
                         comprehension_aliases.update(
@@ -7375,7 +7596,7 @@ def _authority_provenance_lines(
                         _has_provenance_value(
                             condition,
                             comprehension_aliases,
-                            provenance_return_helpers,
+                            decision_provenance_helpers,
                         )
                         for condition in generator.ifs
                     ):
@@ -7394,7 +7615,7 @@ def _authority_provenance_lines(
             has_provenance = _has_provenance_value(
                 node.test,
                 provenance_aliases,
-                provenance_return_helpers,
+                decision_provenance_helpers,
             )
             has_permission = any(_is_permission_name(token) for token in tokens)
             guarded_nodes: list[ast.AST] = [node.test]
@@ -8455,6 +8676,25 @@ def test_provenance_scanner_resolves_accessor_aliases() -> None:
     assert _authority_provenance_lines(module_accessor) == {4}
 
 
+def test_provenance_scanner_tracks_getattr_accessor_invocations() -> None:
+    assigned_result = ast.parse(
+        "def dispatch(self, target):\n"
+        "    provider = getattr(self.agent, '_provide_causation_chain', None)\n"
+        "    chain = provider()\n"
+        "    if chain:\n"
+        "        terminate_child(target)\n"
+    )
+    direct_guard = ast.parse(
+        "def dispatch(self, target):\n"
+        "    provider = getattr(self.agent, '_get_current_chain', None)\n"
+        "    if provider():\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(assigned_result) == {4}
+    assert _authority_provenance_lines(direct_guard) == {3}
+
+
 def test_provenance_scanner_follows_repository_local_imported_helpers(
     tmp_path: Path,
 ) -> None:
@@ -8599,6 +8839,12 @@ def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -
         "    if callable(provider):\n"
         "        self.send_a2a_task()\n"
     )
+    accessor_transport = ast.parse(
+        "def dispatch(self, manager, target):\n"
+        "    provider = getattr(self.agent, '_provide_causation_chain', None)\n"
+        "    chain = provider()\n"
+        "    manager.send_a2a_task(target, causation_chain=chain)\n"
+    )
     local_task_plumbing = ast.parse(
         "def schedule(work):\n"
         "    asyncio.create_task(work())\n\n"
@@ -8611,6 +8857,7 @@ def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -
     )
 
     assert _authority_provenance_lines(accessor_reference) == set()
+    assert _authority_provenance_lines(accessor_transport) == set()
     assert _authority_provenance_lines(local_task_plumbing) == set()
 
 
@@ -8632,6 +8879,22 @@ def test_provenance_scanner_tracks_direct_agent_object_mutations_and_aliases() -
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 11}
+
+
+def test_provenance_scanner_tracks_qualified_agent_registry_mutations() -> None:
+    tree = ast.parse(
+        "def hosted(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        manager.hosted_agents[target].enabled = False\n\n"
+        "def indexed(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        manager.agents_by_id[target].enabled = False\n\n"
+        "def benign(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        manager.metric_registry[target].enabled = False\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6}
 
 
 def test_provenance_scanner_recognizes_qualified_provenance_names() -> None:
@@ -8670,6 +8933,32 @@ def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
 
     assert _authority_provenance_lines(controlled) == {2}
     assert _authority_provenance_lines(benign) == set()
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "close_agent",
+        "delete_agent",
+        "destroy_child",
+        "disable_agent",
+        "enable_peer",
+        "pause_agent",
+        "reset_child",
+        "resume_child",
+        "start_peer",
+    ],
+)
+def test_provenance_scanner_classifies_manager_lifecycle_methods(
+    method: str,
+) -> None:
+    controlled = ast.parse(
+        "def dispatch(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        f"        manager.{method}(target)\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {2}
 
 
 def test_provenance_scanner_follows_imported_class_control_helpers(
