@@ -1039,6 +1039,7 @@ class _RegistryHelperIndex:
     """Resolve module helpers and methods from the helper's lexical class."""
 
     def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
         self.module_functions = _unique_module_functions(tree)
         self.method_functions: dict[
             tuple[tuple[str, ...], str],
@@ -1066,6 +1067,85 @@ class _RegistryHelperIndex:
             if isinstance(statement, ast.ClassDef):
                 collect_class(statement, (statement.name,))
 
+        self._alias_cache: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef | None,
+            dict[str, set[ast.FunctionDef | ast.AsyncFunctionDef]],
+        ] = {}
+
+    def _method_reference(
+        self,
+        value: ast.AST,
+        caller: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        member = _static_member_reference(value)
+        if member is None or not isinstance(member[0], ast.Name):
+            return None
+        receiver, method_name = member
+        owner = self.function_owners.get(caller) if caller is not None else None
+        if receiver.id in {"self", "cls"} and owner is not None:
+            return self.method_functions.get((owner, method_name))
+        candidates = [
+            function
+            for (candidate_owner, name), function in self.method_functions.items()
+            if candidate_owner[-1] == receiver.id and name == method_name
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _aliases(
+        self,
+        caller: ast.FunctionDef | ast.AsyncFunctionDef | None,
+    ) -> dict[str, set[ast.FunctionDef | ast.AsyncFunctionDef]]:
+        """Return conservative helper aliases in one lexical call scope."""
+
+        cached = self._alias_cache.get(caller)
+        if cached is not None:
+            return cached
+        aliases = {
+            name: {function}
+            for name, function in self.module_functions.items()
+        }
+        nodes: tuple[ast.AST, ...] | list[ast.stmt] = (
+            self.tree.body if caller is None else _walk_lexical_scope(caller)
+        )
+        assignments: list[tuple[str, ast.AST]] = []
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                pairs = [
+                    pair
+                    for target in node.targets
+                    for pair in _static_assignment_pairs(target, node.value)
+                ]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                pairs = _static_assignment_pairs(node.target, node.value)
+            elif isinstance(node, ast.NamedExpr):
+                pairs = _static_assignment_pairs(node.target, node.value)
+            else:
+                pairs = []
+            assignments.extend(pairs)
+
+        def candidates(value: ast.AST) -> set[
+            ast.FunctionDef | ast.AsyncFunctionDef
+        ]:
+            if isinstance(value, ast.Name):
+                return set(aliases.get(value.id, ()))
+            if isinstance(value, ast.IfExp):
+                return candidates(value.body) | candidates(value.orelse)
+            method = self._method_reference(value, caller)
+            return {method} if method is not None else set()
+
+        changed = True
+        while changed:
+            changed = False
+            for target, value in assignments:
+                resolved = candidates(value)
+                if not resolved:
+                    continue
+                before = len(aliases.setdefault(target, set()))
+                aliases[target].update(resolved)
+                changed = changed or len(aliases[target]) != before
+        self._alias_cache[caller] = aliases
+        return aliases
+
     def resolve(
         self,
         call: ast.Call,
@@ -1075,17 +1155,21 @@ class _RegistryHelperIndex:
 
         if isinstance(call.func, ast.Name):
             function = self.module_functions.get(call.func.id)
-            return (function, False) if function is not None else None
+            if function is not None:
+                return function, False
+            candidates = self._aliases(caller).get(call.func.id, set())
+            return (next(iter(candidates)), False) if len(candidates) == 1 else None
 
+        function = self._method_reference(call.func, caller)
         member = _static_member_reference(call.func)
-        if member is None or not isinstance(member[0], ast.Name):
+        if (
+            function is None
+            or member is None
+            or not isinstance(member[0], ast.Name)
+        ):
             return None
-        receiver, method_name = member
-        owner = self.function_owners.get(caller) if caller is not None else None
-        if receiver.id in {"self", "cls"} and owner is not None:
-            function = self.method_functions.get((owner, method_name))
-            if function is None:
-                return None
+        receiver = member[0]
+        if receiver.id in {"self", "cls"}:
             is_static = any(
                 (
                     decorator.id
@@ -1099,13 +1183,7 @@ class _RegistryHelperIndex:
                 for decorator in function.decorator_list
             )
             return function, not is_static
-
-        candidates = [
-            function
-            for (candidate_owner, name), function in self.method_functions.items()
-            if candidate_owner[-1] == receiver.id and name == method_name
-        ]
-        return (candidates[0], False) if len(candidates) == 1 else None
+        return function, False
 
 
 def _registry_helper_call_bindings(
@@ -3899,6 +3977,102 @@ def _route_declarations(
         tree.body, module_runtime_prefixes
     )
 
+    def route_collection_receiver(expression: ast.AST) -> str | None:
+        if not isinstance(expression, ast.Attribute) or expression.attr != "routes":
+            return None
+        owner = expression.value
+        if isinstance(owner, ast.Name):
+            return owner.id
+        if (
+            isinstance(owner, ast.Attribute)
+            and owner.attr == "router"
+            and isinstance(owner.value, ast.Name)
+        ):
+            return owner.value.id
+        return None
+
+    def route_object_declaration(
+        route_object: ast.AST,
+        collection: ast.AST,
+        active_strings: dict[str, str],
+        active_methods: dict[str, tuple[str, ...]],
+        prefixes: dict[str, str],
+    ) -> tuple[tuple[str, ...], str]:
+        if not isinstance(route_object, ast.Call):
+            raise AssertionError(
+                "Unresolved route object publication: "
+                f"{ast.unparse(route_object)}"
+            )
+        constructor = _call_name(route_object)
+        if constructor in {"APIWebSocketRoute", "StarletteWebSocketRoute", "WebSocketRoute"}:
+            methods = ("WEBSOCKET",)
+        elif constructor == "Mount":
+            methods = ("MOUNT",)
+        elif constructor in {"APIRoute", "Route", "StarletteRoute"}:
+            method_expression = next(
+                (
+                    keyword.value
+                    for keyword in route_object.keywords
+                    if keyword.arg == "methods"
+                ),
+                None,
+            )
+            if method_expression is None and len(route_object.args) >= 3:
+                method_expression = route_object.args[2]
+            registration = "api_route" if constructor == "APIRoute" else "route"
+            synthetic = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="router", ctx=ast.Load()),
+                    attr=registration,
+                    ctx=ast.Load(),
+                ),
+                args=[route_object.args[0]] if route_object.args else [],
+                keywords=(
+                    [ast.keyword(arg="methods", value=method_expression)]
+                    if method_expression is not None
+                    else []
+                ),
+            )
+            methods = _route_methods(synthetic, active_methods)
+        else:
+            raise AssertionError(
+                "Unsupported route object publication: "
+                f"{ast.unparse(route_object)}"
+            )
+
+        receiver = route_collection_receiver(collection)
+        if receiver == "app":
+            prefix = ""
+        elif receiver is not None and receiver in prefixes:
+            prefix = prefixes[receiver]
+        else:
+            raise AssertionError(
+                "Unresolved route object collection: "
+                f"{ast.unparse(collection)}"
+            )
+        return (
+            methods,
+            prefix + _programmatic_route_path(route_object, active_strings),
+        )
+
+    def appended_route_objects(call: ast.Call) -> tuple[ast.AST, list[ast.AST]] | None:
+        member = _static_member_reference(call.func)
+        if member is None or route_collection_receiver(member[0]) is None:
+            return None
+        collection, operation = member
+        if operation == "append" and len(call.args) == 1 and not call.keywords:
+            return collection, [call.args[0]]
+        if operation == "extend" and len(call.args) == 1 and not call.keywords:
+            values = call.args[0]
+            if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+                return collection, list(values.elts)
+        if operation in {"append", "extend"}:
+            raise AssertionError(
+                "Unresolved route collection publication: "
+                f"{ast.unparse(call)}"
+            )
+        return None
+
     def module_router_reference_is_static(
         expression: ast.AST | None,
         call: ast.Call,
@@ -4086,7 +4260,41 @@ def _route_declarations(
                     ),
                 )
                 return
+            if isinstance(node, ast.AugAssign):
+                receiver = route_collection_receiver(node.target)
+                if receiver is not None:
+                    if not isinstance(node.op, ast.Add) or not isinstance(
+                        node.value, (ast.List, ast.Tuple, ast.Set)
+                    ):
+                        raise AssertionError(
+                            "Unresolved augmented route collection publication: "
+                            f"{ast.unparse(node)}"
+                        )
+                    declarations.extend(
+                        route_object_declaration(
+                            route_object,
+                            node.target,
+                            active_strings,
+                            active_methods,
+                            prefixes,
+                        )
+                        for route_object in node.value.elts
+                    )
+                    return
             if isinstance(node, ast.Call):
+                publication = appended_route_objects(node)
+                if publication is not None:
+                    collection, route_objects = publication
+                    declarations.extend(
+                        route_object_declaration(
+                            route_object,
+                            collection,
+                            active_strings,
+                            active_methods,
+                            prefixes,
+                        )
+                        for route_object in route_objects
+                    )
                 decorator_factory = (
                     node.func if isinstance(node.func, ast.Call) else None
                 )
@@ -4673,6 +4881,9 @@ def test_dynamic_tool_registry_flows_through_helpers_and_loops() -> None:
         "        registry.update(tools)\n\n"
         "    def helper(self, tools):\n"
         "        publish(self._direct_tools, tools)\n\n"
+        "    def aliased_helper(self, tools):\n"
+        "        helper = publish\n"
+        "        helper(self._direct_tools, tools)\n\n"
         "    def method_helper(self, tools):\n"
         "        self._publish(self._direct_tools, tools)\n\n"
         "    def loop(self, tools):\n"
@@ -4681,6 +4892,7 @@ def test_dynamic_tool_registry_flows_through_helpers_and_loops() -> None:
     )
 
     assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.aliased_helper",
         "example.py::Publisher.helper",
         "example.py::Publisher.loop",
         "example.py::Publisher.method_helper",
@@ -4800,6 +5012,9 @@ def test_runtime_signal_publication_flows_through_helpers_and_loops() -> None:
         "        registry.register(source)\n\n"
         "    def helper(self, source):\n"
         "        publish(self.source_registry, source)\n\n"
+        "    def aliased_helper(self, source):\n"
+        "        helper = publish\n"
+        "        helper(self.source_registry, source)\n\n"
         "    def method_helper(self, source):\n"
         "        self._publish(self.source_registry, source)\n\n"
         "    def loop(self, source):\n"
@@ -4808,6 +5023,7 @@ def test_runtime_signal_publication_flows_through_helpers_and_loops() -> None:
     )
 
     assert _runtime_signal_publication_surfaces(tree, "example.py") == {
+        "example.py::Publisher.aliased_helper",
         "example.py::Publisher.helper",
         "example.py::Publisher.loop",
         "example.py::Publisher.method_helper",
@@ -5803,6 +6019,25 @@ def test_programmatic_route_registrations_and_mounts_are_inventoried() -> None:
         (("WEBSOCKET",), "/api-events"),
         (("PATCH",), "/host/mutate"),
         (("MOUNT",), "<dynamic:mount_path>"),
+    ]
+
+
+def test_route_objects_appended_to_route_collections_are_inventoried() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'router.routes.append(APIRoute(\n'
+        '    "/agents/{name}/terminate", endpoint, methods=["DELETE"]\n'
+        '))\n'
+        'app.router.routes.extend([\n'
+        '    Route("/host/restart", endpoint, methods=["POST"]),\n'
+        '    WebSocketRoute("/agents/{name}/events", socket_endpoint),\n'
+        '])\n'
+    )
+
+    assert _route_declarations(tree, {}, {}) == [
+        (("DELETE",), "/api/agents/{name}/terminate"),
+        (("POST",), "/host/restart"),
+        (("WEBSOCKET",), "/agents/{name}/events"),
     ]
 
 
@@ -6912,8 +7147,18 @@ def _is_cross_agent_state_mutation_target(
     ):
         return True
     aliases = set(state_object_aliases or ())
-    return isinstance(node, (ast.Attribute, ast.Subscript)) and bool(
-        _identifier_tokens(node.value).intersection(aliases)
+    resolved_inline = any(
+        isinstance(child, ast.Call)
+        and any(
+            _call_name(child).casefold().startswith(f"{action}_{subject}")
+            for action in ("find", "get", "lookup", "resolve", "select")
+            for subject in ("agent", "child", "descendant", "peer")
+        )
+        for child in ast.walk(node.value)
+    ) if isinstance(node, (ast.Attribute, ast.Subscript)) else False
+    return isinstance(node, (ast.Attribute, ast.Subscript)) and (
+        bool(_identifier_tokens(node.value).intersection(aliases))
+        or resolved_inline
     )
 
 
@@ -7703,6 +7948,10 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             if element is not None
             for source in _control_reference_sources(element)
         }
+    if isinstance(node, ast.IfExp):
+        return _control_reference_sources(node.body) | _control_reference_sources(
+            node.orelse
+        )
     if isinstance(node, ast.Lambda):
         return (
             {"lambda_control"}
@@ -11117,7 +11366,7 @@ def test_provenance_scanner_covers_parent_controls_and_boolean_reducers() -> Non
     assert _authority_provenance_lines(boolean_reducers) == {6, 11}
     assert _authority_provenance_lines(neutral_predicate) == {3}
     assert _authority_provenance_lines(chained_neutral_predicate) == {4}
-    assert _authority_provenance_lines(selected_callback) == {3}
+    assert _authority_provenance_lines(selected_callback) == {3, 5}
     assert _authority_provenance_lines(short_circuit_controls) == {2, 5}
     assert _authority_provenance_lines(comprehension_control) == {2}
     assert _authority_provenance_lines(propagation_only_helper) == set()
@@ -11356,6 +11605,17 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
 
     assert _authority_provenance_lines(parameter_callback) == {5}
     assert _authority_provenance_lines(keyword_callback) == {5}
+
+
+def test_provenance_scanner_follows_conditionally_selected_controls() -> None:
+    tree = ast.parse(
+        "def dispatch(request, target, enabled):\n"
+        "    callback = terminate_child if enabled else noop\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {3}
 
 
 def test_provenance_scanner_follows_mutable_container_writes() -> None:
@@ -12146,6 +12406,22 @@ def test_provenance_scanner_tracks_direct_agent_object_mutations_and_aliases() -
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 11}
+
+
+def test_provenance_scanner_tracks_inline_resolved_agent_mutations() -> None:
+    tree = ast.parse(
+        "def assign(request, manager, name):\n"
+        "    if request.causation_chain:\n"
+        "        manager.get_agent(name).enabled = False\n\n"
+        "def mutate(request, manager, name):\n"
+        "    if request.orchestrator:\n"
+        "        manager.resolve_child(name).permissions.clear()\n\n"
+        "def benign(request, manager, name):\n"
+        "    if request.causation_chain:\n"
+        "        manager.get_feature(name).enabled = False\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6}
 
 
 def test_provenance_scanner_tracks_direct_provenance_state_mutations() -> None:
