@@ -327,15 +327,19 @@ async def build_host_context(
     hold_store = None
     hold_db = None
     hold_evidence_db = None
+    postgres_pair_id = None
     hold_boot_state: tuple[Any, ...] = ()
     backend_error = ""
     try:
         from kestrel_sovereign.hold import HoldStore
         from kestrel_sovereign.hold.state import (
             claim_hold_backend_custody,
+            commit_postgres_hold_pair_custody,
+            configured_postgres_hold_pair_id,
             hold_history_anchor_path,
             hold_initialization_witness_path,
             initialize_postgres_hold_databases,
+            validate_hold_backend_custody,
         )
         from kestrel_sovereign.host_features.storage import (
             prepare_host_database,
@@ -389,7 +393,16 @@ async def build_host_context(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL must identify an "
                     "independent rollback domain"
                 )
-            claim_hold_backend_custody(resolved, hold_backend)
+            external_pair_id = configured_postgres_hold_pair_id(
+                os.environ,
+                required=(
+                    os.environ.get("KESTREL_DEPLOYMENT_PERSISTENCE", "")
+                    .strip()
+                    .lower()
+                    == "durable_sovereign"
+                ),
+            )
+            validate_hold_backend_custody(resolved, hold_backend)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding
             # useful concurrency. The paired initializer keeps both pools
@@ -397,9 +410,17 @@ async def build_host_context(
             # same connected backends whose cluster identity and custody roles
             # it inspected. Reopening by DSN here would create a failover/
             # load-balancer window between validation and the first write.
-            hold_db, hold_evidence_db = await initialize_postgres_hold_databases(
+            initializer_kwargs = {"control_db_path": resolved}
+            if external_pair_id is not None:
+                initializer_kwargs["expected_external_pair_id"] = external_pair_id
+            (
+                hold_db,
+                hold_evidence_db,
+                postgres_pair_id,
+            ) = await initialize_postgres_hold_databases(
                 dsn,
                 evidence_dsn,
+                **initializer_kwargs,
             )
             hold_location = "configured PostgreSQL database"
             initialization_witness_path = None
@@ -417,8 +438,13 @@ async def build_host_context(
             initialization_witness_path=initialization_witness_path,
             history_anchor_path=history_anchor_path,
             evidence_db=hold_evidence_db,
+            expected_postgres_pair_id=(
+                postgres_pair_id if hold_backend == "postgres" else None
+            ),
         )
         await hold_store.ensure_schema()
+        if hold_backend == "postgres":
+            commit_postgres_hold_pair_custody(resolved, postgres_pair_id)
         hold_boot_state = await hold_store.read_boot_state()
         logger.info(
             "Host backend opened at %s (fleet tenant=%s); Hold backend=%s",

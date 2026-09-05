@@ -2889,20 +2889,24 @@ async def _lifespan_startup(app: FastAPI):
                 runtime_base=multi_agent_runtime_base,
             )
             _apply_platform_host_port(config, os.environ)
-            await _build_host_control_context(app, config)
-            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             manager = AgentManager(
                 base_data_dir=multi_agent_runtime_base,
                 startup_config_path=(
                     multi_agent_path if multi_agent_path.exists() else None
                 ),
-                shared_postgres_backend=shared_postgres_backend,
+                startup_runtime_env=multi_agent_runtime_env,
             )
             # Registry persistence is deliberately ordered before roster
-            # persistence during spawn. Repair that crash window before shared
-            # PostgreSQL scheduler bootstrap discovers its tenant authority;
-            # doing this inside load_from_config is too late for the preflight.
+            # persistence during spawn. Repair and contextually validate that
+            # crash window before creating Hold custody: a registry-only child
+            # is part of the effective writable roster even when TOML has not
+            # caught up yet. Doing this inside load_from_config is too late for
+            # both custody creation and scheduler preflight.
             config = manager.reconcile_spawn_authority_restart_roster(config)
+            await _build_host_control_context(app, config)
+            shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
+            if shared_postgres_backend is not None:
+                manager.bind_shared_postgres_backend(shared_postgres_backend)
             app.state.agent_manager = manager
             host_context_publication_gate = asyncio.Event()
             app.state.host_context_publication_gate = host_context_publication_gate

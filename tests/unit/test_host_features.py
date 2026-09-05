@@ -529,10 +529,19 @@ async def test_server_retains_control_context_after_optional_mount_failure(
     class FakeManager:
         init_failures = []
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, _config):
+        async def load_from_config(
+            self,
+            _config,
+            *,
+            restart_roster_reconciled,
+        ):
+            assert restart_roster_reconciled is True
             return 1
 
         def list_agents(self):

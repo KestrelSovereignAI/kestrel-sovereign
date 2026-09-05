@@ -121,6 +121,11 @@ import asyncio
 import os
 
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.hold import HoldStore
+from kestrel_sovereign.hold.state import (
+    commit_postgres_hold_pair_custody,
+    initialize_postgres_hold_databases,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 async def provision():
@@ -136,12 +141,39 @@ async def provision():
     finally:
         await db.close()
 
+    hold_db, evidence_db, pair_id = await initialize_postgres_hold_databases(
+        os.environ["KESTREL_DATABASE_URL"],
+        os.environ["KESTREL_HOLD_EVIDENCE_DATABASE_URL"],
+        control_db_path=os.path.join(
+            os.environ["KESTREL_CEREMONY_DIR"], "host-features.db"
+        ),
+    )
+    try:
+        hold = HoldStore(
+            hold_db,
+            evidence_db=evidence_db,
+            expected_postgres_pair_id=pair_id,
+        )
+        await hold.ensure_schema()
+        commit_postgres_hold_pair_custody(
+            os.path.join(
+                os.environ["KESTREL_CEREMONY_DIR"], "host-features.db"
+            ),
+            pair_id,
+        )
+        print(f"KESTREL_HOLD_PAIR_ID={pair_id}")
+    finally:
+        await hold_db.close()
+        await evidence_db.close()
+
 asyncio.run(provision())
 PY
 
 # Set this to the DID printed above. The bundle command verifies the encrypted
 # private keys against that DID before exporting anything.
 export KESTREL_PROD_EXPECTED_DID='did:web:agents.kestrelsovereign.com:kestrel'
+# Set this to the canonical UUID printed as KESTREL_HOLD_PAIR_ID above.
+export KESTREL_HOLD_PAIR_ID='00000000-0000-0000-0000-000000000000'
 uv run python -m kestrel_sovereign.identity.custody_bundle create \
   --agent-dir "$KESTREL_CEREMONY_DIR" \
   --expected-did "$KESTREL_PROD_EXPECTED_DID" \
@@ -176,15 +208,23 @@ Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
 `roles/secretmanager.secretAccessor` only on those required secrets. Secret
 Manager access is visible in Cloud Audit Logs; never print the bundle/data key
-or bake either into an image. The four custody references in
+or bake either into an image. Upload the exact `KESTREL_HOLD_PAIR_ID` UUID as
+its own secret as well. Unlike the encrypted credentials it need not be
+confidential, but its immutability is load-bearing: Cloud Run's local pair
+marker disappears at cold start, and the pinned UUID is what prevents two
+fresh databases from being accepted as a new Hold installation. The five
+custody references in
 `deploy_config.toml` must use immutable numeric versions such as `:7`, never
 `:latest`: two instances in one revision must not resolve different keys or
 bundles. Cloud Run environment values have a 32 KiB limit, which the bundle
 export enforces.
 
-After adding a new secret version, update all four numeric references and
+After adding a new secret version, update all five numeric references and
 deploy a new immutable image tag. A revision whose database, data key, bundle,
-or expected DID is missing/mismatched fails startup and never re-incepts.
+pair UUID, or expected DID is missing/mismatched fails startup and never
+re-incepts. Provisioning the pair is part of the ceremony above; a durable
+Cloud Run runtime will not initialize two databases that lack its externally
+committed pair UUID.
 
 ### Continuity and recovery check
 
@@ -400,6 +440,7 @@ creates / updates secret versions per the `[profiles.*.secrets]` map in
 | `kestrel-anthropic-key` | Anthropic API key |
 | `kestrel-api-key` | Internal Kestrel API key |
 | `kestrel-data-key` | Encryption key for agent data |
+| `kestrel-prod-hold-pair-id` | Pinned UUID of the pre-provisioned PostgreSQL Hold pair |
 | `kestrel-session-secret` | Session cookie signing |
 | `kestrel-google-client-id` / `-secret` | Google OAuth |
 | `kestrel-lighthouse-key` | Lighthouse pricing/oversight feed |

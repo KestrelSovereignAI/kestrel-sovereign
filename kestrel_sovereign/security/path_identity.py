@@ -30,8 +30,13 @@ def _alternate_case(name: str) -> str | None:
     return None
 
 
-def _filesystem_is_case_insensitive(path: Path) -> bool:
-    """Probe existing ancestors without creating filesystem state."""
+def _filesystem_is_case_insensitive(path: Path) -> bool | None:
+    """Probe existing ancestors without creating filesystem state.
+
+    ``None`` means no existing ancestor supplied a case-bearing component that
+    could prove the volume's behavior.  Custody comparisons preserve that
+    uncertainty and treat a case-folded match as a possible alias.
+    """
 
     if os.name == "nt":
         return True
@@ -42,17 +47,85 @@ def _filesystem_is_case_insensitive(path: Path) -> bool:
             continue
         alternate = candidate.with_name(alternate_name)
         try:
-            if alternate.exists() and candidate.samefile(alternate):
-                return True
+            return candidate.samefile(alternate)
+        except FileNotFoundError:
+            # The candidate itself exists.  A differently-cased spelling that
+            # does not resolve therefore proves this volume is case-sensitive.
+            return False
         except OSError:
             continue
-    return False
+    return None
 
 
-def _casefolded_parts(path: Path) -> tuple[str, ...]:
-    # APFS/HFS aliases may differ by both case and Unicode normalization.
-    return tuple(
-        unicodedata.normalize("NFD", part).casefold() for part in path.parts
+def _combined_case_insensitivity(*results: bool | None) -> bool | None:
+    """Combine probes without converting an unknown result to permission."""
+
+    if any(result is True for result in results):
+        return True
+    if all(result is False for result in results):
+        return False
+    return None
+
+
+def _normalized_parts(parts: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize names independently of the volume's case behavior."""
+
+    return tuple(unicodedata.normalize("NFD", part) for part in parts)
+
+
+def _parts_overlap(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+    *,
+    case_insensitive: bool | None,
+) -> bool:
+    """Compare two unresolved suffixes using conservative file identity."""
+
+    first_normalized = _normalized_parts(first)
+    second_normalized = _normalized_parts(second)
+    shorter = min(len(first_normalized), len(second_normalized))
+    if first_normalized[:shorter] == second_normalized[:shorter]:
+        return True
+    if case_insensitive is False:
+        return False
+    return tuple(part.casefold() for part in first_normalized[:shorter]) == tuple(
+        part.casefold() for part in second_normalized[:shorter]
+    )
+
+
+def _parts_equal(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+    *,
+    case_insensitive: bool | None,
+) -> bool:
+    if len(first) != len(second):
+        return False
+    return _parts_overlap(first, second, case_insensitive=case_insensitive)
+
+
+def _same_existing_path(first: Path, second: Path) -> bool:
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _aliased_ancestor_suffixes(
+    first: Path,
+    second: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...], Path, Path] | None:
+    """Return suffixes below physically identical existing ancestors."""
+
+    first_ancestor = _nearest_existing_path(first)
+    second_ancestor = _nearest_existing_path(second)
+    if not _same_existing_path(first_ancestor, second_ancestor):
+        return None
+    return (
+        first.relative_to(first_ancestor).parts,
+        second.relative_to(second_ancestor).parts,
+        first_ancestor,
+        second_ancestor,
     )
 
 
@@ -69,20 +142,28 @@ def paths_overlap_by_filesystem_identity(first: Path, second: Path) -> bool:
     second = second.resolve(strict=False)
     if first == second or first in second.parents or second in first.parents:
         return True
-    try:
-        if first.exists() and second.exists() and first.samefile(second):
+    if first.exists() and second.exists() and _same_existing_path(first, second):
+        return True
+    aliased = _aliased_ancestor_suffixes(first, second)
+    if aliased is not None:
+        first_suffix, second_suffix, first_ancestor, second_ancestor = aliased
+        if _parts_overlap(
+            first_suffix,
+            second_suffix,
+            case_insensitive=_combined_case_insensitivity(
+                _filesystem_is_case_insensitive(first_ancestor),
+                _filesystem_is_case_insensitive(second_ancestor),
+            ),
+        ):
             return True
-    except OSError:
-        pass
-    if not (
-        _filesystem_is_case_insensitive(first)
-        or _filesystem_is_case_insensitive(second)
-    ):
-        return False
-    first_parts = _casefolded_parts(first)
-    second_parts = _casefolded_parts(second)
-    shorter = min(len(first_parts), len(second_parts))
-    return first_parts[:shorter] == second_parts[:shorter]
+    return _parts_overlap(
+        first.parts,
+        second.parts,
+        case_insensitive=_combined_case_insensitivity(
+            _filesystem_is_case_insensitive(first),
+            _filesystem_is_case_insensitive(second),
+        ),
+    )
 
 
 def paths_equal_by_filesystem_identity(first: Path, second: Path) -> bool:
@@ -92,17 +173,28 @@ def paths_equal_by_filesystem_identity(first: Path, second: Path) -> bool:
     second = second.resolve(strict=False)
     if first == second:
         return True
-    try:
-        if first.exists() and second.exists() and first.samefile(second):
+    if first.exists() and second.exists() and _same_existing_path(first, second):
+        return True
+    aliased = _aliased_ancestor_suffixes(first, second)
+    if aliased is not None:
+        first_suffix, second_suffix, first_ancestor, second_ancestor = aliased
+        if _parts_equal(
+            first_suffix,
+            second_suffix,
+            case_insensitive=_combined_case_insensitivity(
+                _filesystem_is_case_insensitive(first_ancestor),
+                _filesystem_is_case_insensitive(second_ancestor),
+            ),
+        ):
             return True
-    except OSError:
-        pass
-    if not (
-        _filesystem_is_case_insensitive(first)
-        or _filesystem_is_case_insensitive(second)
-    ):
-        return False
-    return _casefolded_parts(first) == _casefolded_parts(second)
+    return _parts_equal(
+        first.parts,
+        second.parts,
+        case_insensitive=_combined_case_insensitivity(
+            _filesystem_is_case_insensitive(first),
+            _filesystem_is_case_insensitive(second),
+        ),
+    )
 
 
 def is_multiply_linked_regular_file(path: Path) -> bool:

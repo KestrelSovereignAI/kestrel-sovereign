@@ -359,6 +359,10 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             events.append("reconcile")
             return effective_config
 
+        def bind_shared_postgres_backend(self, backend) -> None:
+            assert backend is shared_backend
+            events.append("backend-bind")
+
         async def load_from_config(
             self,
             config,
@@ -390,16 +394,18 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
     async def _build_host_context(*, config):
         assert isinstance(config, dict)
+        assert config["agents"] == ["RecoveredChild"]
         events.append("context-build")
         return host_context
 
     shared_backend = object()
 
     async def _shared_backend(_app):
+        events.append("backend-start")
         return shared_backend
 
     def _manager_factory(**kwargs):
-        assert kwargs["shared_postgres_backend"] is shared_backend
+        assert "shared_postgres_backend" not in kwargs
         assert kwargs["base_data_dir"] == runtime_base
         return manager
 
@@ -437,7 +443,15 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     async with server._lifespan_startup(app):
         pass
 
-    assert events == ["context-build", "reconcile", "preflight", "load", "host-start"]
+    assert events == [
+        "reconcile",
+        "context-build",
+        "backend-start",
+        "backend-bind",
+        "preflight",
+        "load",
+        "host-start",
+    ]
     assert app.state.host_context is host_context
     assert app.state.host_context.hold_store is hold_store
     assert app.state.multi_agent_runtime_base == runtime_base

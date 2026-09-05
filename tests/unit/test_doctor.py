@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 import toml
 from cryptography.fernet import Fernet
@@ -163,6 +164,44 @@ def test_doctor_blocks_when_agent_db_missing(tmp_path):
     report = diagnose(tmp_path)
     assert not report.ready
     assert any("kestrel_prime.db" in m for m in report.fail)
+
+
+def test_doctor_reports_host_custody_overlap_without_reloading_config(
+    tmp_path,
+    monkeypatch,
+):
+    """An invalid custody graph is one finding, not an escaping traceback."""
+
+    _seed_ready(tmp_path)
+    write_env(
+        tmp_path / ".env",
+        {
+            "KESTREL_DATA_KEY": Fernet.generate_key().decode("ascii"),
+            "OPENAI_API_KEY": "sk-x",
+            "KESTREL_HOST_DB_PATH": str(
+                tmp_path / "agent_data" / "test" / "host-features.db"
+            ),
+        },
+    )
+    original_load = MultiAgentConfig.load.__func__
+    calls = 0
+
+    def counted_load(cls, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_load(cls, *args, **kwargs)
+
+    monkeypatch.setattr(MultiAgentConfig, "load", classmethod(counted_load))
+
+    report = diagnose(tmp_path)
+
+    assert not report.ready
+    assert any(
+        "multi-agent configuration is invalid" in item
+        and "overlaps host Hold custody" in item
+        for item in report.fail
+    )
+    assert calls == 1
 
 
 def test_format_report_renders_lines(tmp_path):
@@ -2505,34 +2544,92 @@ def test_postgres_doctor_still_validates_mandatory_host_sqlite(
     tmp_path,
     monkeypatch,
 ):
-    """PostgreSQL carries Hold, but host features still require SQLite."""
+    """PostgreSQL Hold checks only generic local host SQLite readiness."""
 
     from kestrel_sovereign import doctor
     from kestrel_sovereign.hold import state
 
     database = tmp_path / "host-data" / "host-features.db"
-    calls = []
+    database.parent.mkdir(mode=0o700)
+    live = sqlite3.connect(database)
+    live.execute("PRAGMA journal_mode = WAL")
+    live.execute("CREATE TABLE ordinary_host_state(value TEXT)")
+    live.commit()
+    if os.name != "nt":
+        for member in (
+            database,
+            Path(f"{database}-wal"),
+            Path(f"{database}-shm"),
+        ):
+            member.chmod(0o600)
 
-    def reject_host_sqlite(path, **kwargs):
-        calls.append((path, kwargs))
-        raise RuntimeError("host SQLite rejected")
+    def reject_sqlite_hold(*_args, **_kwargs):
+        pytest.fail("PostgreSQL Hold must not demand local SQLite Hold evidence")
 
-    monkeypatch.setattr(state, "validate_sqlite_hold_readiness", reject_host_sqlite)
+    monkeypatch.setattr(state, "validate_sqlite_hold_readiness", reject_sqlite_hold)
+    report = doctor.DoctorReport()
+    try:
+        doctor._check_sqlite_hold_readiness(
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+                "KESTREL_HOLD_BACKEND": "postgres",
+                "KESTREL_HOST_DB_PATH": str(database),
+            },
+            tmp_path,
+            report,
+        )
+    finally:
+        live.close()
+
+    assert report.ready, report.fail
+    assert report.ok == [f"SQLite host state verified at {database}"]
+
+
+def test_postgres_doctor_rejects_incomplete_wal_before_sqlite_open(
+    tmp_path,
+    monkeypatch,
+):
+    """A read-only diagnostic cannot create the missing SHM sidecar."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.storage import async_database
+
+    database = tmp_path / "host-data" / "host-features.db"
+    database.parent.mkdir(mode=0o700)
+    database.write_bytes(b"stopped host state")
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    wal.write_bytes(b"possibly live")
+    if os.name != "nt":
+        database.chmod(0o600)
+        wal.chmod(0o600)
+    opened = False
+
+    def reject_open(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        shm.write_bytes(b"diagnostic mutation")
+        raise AssertionError("SQLite must not be opened for an incomplete WAL pair")
+
+    monkeypatch.setattr(async_database.sqlite3, "connect", reject_open)
     report = doctor.DoctorReport()
 
     doctor._check_sqlite_hold_readiness(
         {
             "KESTREL_DB_BACKEND": "postgres",
             "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_BACKEND": "postgres",
             "KESTREL_HOST_DB_PATH": str(database),
         },
         tmp_path,
         report,
     )
 
-    assert calls == [(database, {"runtime_hardens_parent": False})]
     assert not report.ready
-    assert any("host SQLite rejected" in item for item in report.fail)
+    assert any("incomplete WAL sidecar pair" in item for item in report.fail)
+    assert opened is False
+    assert not shm.exists()
 
 
 def test_postgres_doctor_skips_external_evidence_for_sqlite_hold(
@@ -2581,7 +2678,17 @@ def test_doctor_rejects_hold_backend_switch_before_readiness_probe(
     from kestrel_sovereign.hold.state import claim_hold_backend_custody
 
     database = tmp_path / "host-data" / "host-features.db"
-    claim_hold_backend_custody(database, claimed_backend)
+    claim_hold_backend_custody(
+        database,
+        claimed_backend,
+        postgres_pair_id=uuid4() if claimed_backend == "postgres" else None,
+        postgres_primary_cluster_identity=(
+            "primary-cluster" if claimed_backend == "postgres" else None
+        ),
+        postgres_evidence_cluster_identity=(
+            "evidence-cluster" if claimed_backend == "postgres" else None
+        ),
+    )
     env = {
         "KESTREL_HOST_DB_PATH": str(database),
         "KESTREL_DB_BACKEND": selected_backend,
@@ -2652,6 +2759,30 @@ def test_postgres_doctor_rejects_sqlite_hold_outside_kite(tmp_path):
 
     assert not report.ready
     assert "only inside isolated Kite" in report.fail[0]
+
+
+def test_durable_postgres_doctor_requires_external_pair_identity(tmp_path):
+    """Doctor predicts the cold-start witness required by host startup."""
+
+    from kestrel_sovereign import doctor
+
+    report = doctor.DoctorReport()
+    doctor._check_postgres_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary.example/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence.example/kestrel"
+            ),
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+        },
+        tmp_path,
+        [],
+        report,
+    )
+
+    assert not report.ready
+    assert any("KESTREL_HOLD_PAIR_ID" in item for item in report.fail), report.fail
 
 
 def test_postgres_doctor_rejects_unknown_hold_backend(tmp_path):
@@ -3429,6 +3560,39 @@ def test_sqlite_doctor_rejects_fresh_explicit_target_in_nonprivate_parent(
         assert any("mode 0700" in item for item in report.fail), report.fail
         with pytest.raises(HostStorageError, match="must have mode 0700"):
             prepare_host_database(str(database))
+    assert not database.exists()
+
+
+def test_postgres_hold_doctor_rejects_local_store_in_nonprivate_parent(
+    tmp_path,
+):
+    """PostgreSQL Hold does not remove the mandatory local host store."""
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    if os.name != "nt":
+        parent.chmod(0o755)
+    database = parent / "host-features.db"
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_HOLD_BACKEND": "postgres",
+            "KESTREL_HOST_DB_PATH": str(database),
+        },
+        tmp_path,
+        report,
+    )
+
+    if os.name == "nt":
+        assert report.ready
+    else:
+        assert not report.ready
+        assert any("mode 0700" in item for item in report.fail), report.fail
     assert not database.exists()
 
 

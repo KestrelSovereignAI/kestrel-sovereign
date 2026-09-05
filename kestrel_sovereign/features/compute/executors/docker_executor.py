@@ -188,6 +188,8 @@ class DockerExecutor(BaseExecutor):
                 f"No Docker image configured for language: {script.language}"
             )
 
+        self._validate_additional_mounts(mounts)
+
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
             return await self._execute_script(
@@ -213,6 +215,31 @@ class DockerExecutor(BaseExecutor):
             runner=run,
             cleanup=cleanup,
         )
+
+    def _validate_additional_mounts(
+        self,
+        mounts: Optional[List[Dict[str, str]]],
+    ) -> None:
+        """Reject writable bind paths that can mutate host-owned Hold state."""
+
+        for mount in mounts or []:
+            src = mount.get("src")
+            dst = mount.get("dst")
+            if not src or not dst:
+                continue
+            if dst == _CONTAINER_TRASH_DIR or dst.startswith(
+                f"{_CONTAINER_TRASH_DIR}/"
+            ):
+                raise ExecutionError(
+                    f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
+                )
+            if not mount.get("ro", True) and self._policy.touches_host_hold_custody(
+                src
+            ):
+                raise ExecutionEnvironmentError(
+                    "Refusing writable Docker mount that overlaps host Hold "
+                    f"custody: {src}"
+                )
 
     async def _execute_script(
         self,
@@ -429,12 +456,6 @@ class DockerExecutor(BaseExecutor):
             dst = mount.get("dst")
             read_only = mount.get("ro", True)
             if src and dst:
-                if dst == _CONTAINER_TRASH_DIR or dst.startswith(
-                    f"{_CONTAINER_TRASH_DIR}/"
-                ):
-                    raise ExecutionError(
-                        f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
-                    )
                 ro_flag = ":ro" if read_only else ""
                 cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
 

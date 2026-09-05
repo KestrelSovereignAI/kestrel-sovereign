@@ -6,7 +6,9 @@ import errno
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -18,6 +20,7 @@ from kestrel_sovereign.host_features.storage import (
     HostStorageError,
     host_database_path,
     prepare_host_database,
+    validate_host_database_migration_readiness,
 )
 
 # These tests are *about* default host-database resolution, so they set
@@ -327,6 +330,55 @@ def test_dual_legacy_and_destination_stores_are_contained_and_rejected(
     assert legacy.exists() and destination.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_destination_hold_remnant_refuses_migration_before_source_move(
+    tmp_path,
+    monkeypatch,
+):
+    """A damaged destination cannot consume the only intact prior database."""
+
+    from kestrel_sovereign.hold.state import hold_initialization_witness_path
+
+    home = tmp_path / "kestrel-home"
+    legacy = home / "kestrel_host.db"
+    destination = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(legacy, value="authoritative-source")
+    witness = hold_initialization_witness_path(destination)
+    witness.parent.mkdir(parents=True, mode=0o700)
+    witness.write_text("damaged-destination-custody")
+    legacy.chmod(0o644)
+    witness.chmod(0o600)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+
+    with pytest.raises(HostStorageError, match="destination.*custody remnants"):
+        prepare_host_database()
+
+    assert legacy.exists()
+    assert not destination.exists()
+    assert witness.read_text() == "damaged-destination-custody"
+    assert _mode(legacy) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_migration_skips_source_alias_of_destination(tmp_path):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    source = real_parent / HOST_FEATURE_DB_FILENAME
+    destination = alias_parent / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(source)
+
+    selected = validate_host_database_migration_readiness(
+        destination,
+        (("legacy host database", source),),
+    )
+
+    assert selected is None
+
+
 def test_host_database_path_distinguishes_explicit_override(tmp_path, monkeypatch):
     override = tmp_path / "private" / "custom.db"
     monkeypatch.setenv(HOST_DB_PATH_ENV, str(override))
@@ -375,6 +427,72 @@ def test_agent_data_root_migrates_previous_default_host_database(
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration interleaving")
+def test_concurrent_host_database_migration_adopts_one_completed_move(
+    tmp_path,
+    monkeypatch,
+):
+    """Sibling fleet boots serialize the one-time move instead of aborting."""
+
+    from kestrel_sovereign.host_features import storage as storage_module
+
+    source = tmp_path / "previous" / HOST_FEATURE_DB_FILENAME
+    destination = tmp_path / "current" / HOST_FEATURE_DB_FILENAME
+    destination.parent.mkdir(mode=0o700)
+    _create_legacy_sqlite(source, value="shared-upgrade-history")
+    source.chmod(0o600)
+    first_replace_entered = threading.Event()
+    release_first_replace = threading.Event()
+    replace_calls = 0
+    replace_calls_lock = threading.Lock()
+    outcomes: list[BaseException | None] = []
+    real_replace = storage_module.os.replace
+
+    def pause_first_replace(old, new):
+        nonlocal replace_calls
+        with replace_calls_lock:
+            replace_calls += 1
+            call_number = replace_calls
+        if call_number == 1:
+            first_replace_entered.set()
+            assert release_first_replace.wait(5)
+        return real_replace(old, new)
+
+    monkeypatch.setattr(storage_module.os, "replace", pause_first_replace)
+
+    def migrate() -> None:
+        failure = None
+        try:
+            storage_module._migrate_prior_database(
+                destination,
+                (("previous default host database", source),),
+            )
+        except BaseException as exc:  # captured for the parent test thread
+            failure = exc
+        outcomes.append(failure)
+
+    first = threading.Thread(target=migrate, daemon=True)
+    second = threading.Thread(target=migrate, daemon=True)
+    first.start()
+    assert first_replace_entered.wait(5)
+    second.start()
+    second.join(0.1)
+    assert second.is_alive()
+    release_first_replace.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert outcomes == [None, None]
+    assert replace_calls == 1
+    assert not source.exists()
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
+            "shared-upgrade-history",
+        )
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
 def test_agent_data_root_refuses_migration_with_backend_custody_binding(
     tmp_path,
@@ -392,7 +510,13 @@ def test_agent_data_root_refuses_migration_with_backend_custody_binding(
     data_root = tmp_path / "mounted-data"
     destination = data_root / "host-data" / HOST_FEATURE_DB_FILENAME
     _create_legacy_sqlite(previous, value="postgres-host-features")
-    claim_hold_backend_custody(previous, "postgres")
+    claim_hold_backend_custody(
+        previous,
+        "postgres",
+        postgres_pair_id=uuid4(),
+        postgres_primary_cluster_identity="primary-cluster",
+        postgres_evidence_cluster_identity="evidence-cluster",
+    )
     binding = hold_backend_binding_path(previous)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.setenv("KESTREL_DB_PATH", str(data_root))

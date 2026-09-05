@@ -63,13 +63,30 @@ directory and restore the database family rather than deleting the marker to
 make a failed custody check pass.
 
 The same directory carries an immutable `sqlite` or `postgres` backend binding.
-Kestrel claims it before first Hold initialization and refuses a later backend
-change unless an operator performs a verified state migration. Selecting a
-fresh empty backend is never an implicit release of latches or receipt history.
-Surviving SQLite initialization/history witnesses or Hold schema objects retain
-that authority even if the marker or binding is missing. Automatic host-path
-migration refuses every backend binding with the rest of the Hold evidence;
-operators must relocate the complete custody root as one verified operation.
+PostgreSQL Hold additionally records a local pair UUID bound to the exact
+primary/evidence cluster identities. A second immutable marker is published
+only after both databases carry that UUID in their durable role bindings. This
+two-phase witness lets an interrupted first boot resume while making two fresh
+replacement databases distinguishable from a new installation. A committed
+pair that loses both internal role bindings, or a configuration that names
+different clusters, requires an explicit verified migration.
+
+That local marker is sufficient only when the host-data directory itself is
+durable. A `durable_sovereign` Cloud Run revision additionally receives the
+already-provisioned pair UUID as the pinned `KESTREL_HOLD_PAIR_ID` Secret
+Manager value. Cold start may reconstruct the disposable local marker only
+when both PostgreSQL databases still carry that exact pair UUID. A fresh or
+rolled-back pair is refused before schema mutation, so deleting the container
+filesystem cannot reinterpret replacement databases as a first boot.
+
+Kestrel claims this evidence before first Hold initialization and refuses a
+later backend change unless an operator performs a verified state migration.
+Selecting a fresh empty backend is never an implicit release of latches or
+receipt history. Surviving SQLite initialization/history witnesses or Hold
+schema objects retain that authority even if the marker or binding is missing.
+Automatic host-path migration refuses every backend and PostgreSQL pair binding
+with the rest of the Hold evidence; operators must relocate the complete
+custody root as one verified operation.
 
 ## Secure SQLite creation
 
@@ -95,6 +112,16 @@ Compute mutation guards also refuse multiply-linked regular files because an
 outside pathname cannot prove which protected directory owns the same inode.
 Python hard-link creation is guarded at its source and destination boundary;
 existing aliases remain non-writable even if another process created them.
+The UV executor additionally makes the complete host-control directory
+non-writable at the OS boundary (macOS Seatbelt or Linux bubblewrap). Python API
+patches alone are not a custody boundary because native modules such as
+`sqlite3` can open and mutate files without calling them. Seatbelt denies its
+separate hard-link operation globally; bubblewrap replaces imported host procfs
+with a private proc mount inside a PID namespace. These controls prevent native
+code from creating a writable alias or reaching the parent process's writable
+mount namespace. UV execution therefore fails unavailable when that
+kernel-enforced boundary cannot be established; the Docker executor is the
+fallback.
 
 ## Two host databases, two responsibilities
 

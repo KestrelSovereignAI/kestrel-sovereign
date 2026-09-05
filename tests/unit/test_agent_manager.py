@@ -10200,10 +10200,8 @@ class TestLoadFromConfig:
         mock_get_did.side_effect = ["did:tenant-a", "did:tenant-b"]
         monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
         monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
-        manager = AgentManager(
-            base_data_dir=tmp_path,
-            shared_postgres_backend=host_backend,
-        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager.bind_shared_postgres_backend(host_backend)
         config = LocalAgentConfig(data_dir=Path("agent_data/companion"), port=8801)
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
@@ -10602,6 +10600,36 @@ class TestCreateAgent:
 
         mock_inception.assert_not_awaited()
         assert not (tmp_path / "agent_data" / "host-data").exists()
+
+    @pytest.mark.asyncio
+    async def test_create_agent_reuses_startup_environment_for_custody_guard(
+        self, tmp_path, monkeypatch
+    ):
+        startup_env = {
+            "KESTREL_HOST_DB_PATH": str(
+                tmp_path / "agent_data" / "Candidate" / "host-features.db"
+            )
+        }
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(tmp_path / "ambient" / "host-features.db"),
+        )
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            startup_runtime_env=startup_env,
+        )
+        monkeypatch.setattr(manager, "_data_key_custody_conflict", lambda: None)
+
+        with patch.object(
+            MultiAgentConfig,
+            "validate_local_agent_host_custody",
+            side_effect=RuntimeError("stop after custody guard"),
+        ) as validate, pytest.raises(RuntimeError, match="stop after custody guard"):
+            await manager.create_agent("Candidate")
+
+        assert validate.call_args.kwargs["runtime_env"]["KESTREL_HOST_DB_PATH"] == (
+            startup_env["KESTREL_HOST_DB_PATH"]
+        )
 
     @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
@@ -11412,6 +11440,58 @@ class TestSpawnAgent:
 
         assert reconciled.agents["RecoveredChild"] == local
         assert MultiAgentConfig.from_file(config_path).agents["RecoveredChild"] == local
+
+    def test_host_spawn_witness_repair_validates_effective_hold_custody(
+        self,
+        tmp_path,
+    ):
+        """A registry-only child cannot become the writable parent of Hold."""
+
+        config_path = tmp_path / "multi_agent.toml"
+        MultiAgentConfig(agents={}).save(config_path)
+        child_root = tmp_path / "agent_data" / "RecoveredChild"
+        local = LocalAgentConfig(
+            data_dir=Path("agent_data") / "RecoveredChild",
+            port=8802,
+        )
+        private_key, _ = generate_secp256k1_keypair()
+        mandate = sign_mandate(
+            SpawnMandate(
+                parent_did="did:test:recovery-parent",
+                child_did="did:test:recovery-child",
+            ),
+            private_key,
+        )
+        SpawnAuthorityRegistry(tmp_path).record_active(
+            child_name="RecoveredChild",
+            child_did=mandate.child_did,
+            mandate=mandate,
+            config=local,
+        )
+        runtime_env = {
+            "HOME": str(tmp_path / "operator-home"),
+            # The implicit host control directory is now inside the recovered
+            # child's writable root, exactly the pre-upgrade topology at issue.
+            "KESTREL_DB_PATH": str(child_root),
+        }
+        manager = AgentManager(
+            base_data_dir=tmp_path,
+            startup_config_path=config_path,
+            startup_runtime_env=runtime_env,
+        )
+
+        with pytest.raises(ValueError, match="overlaps host Hold custody"):
+            manager.reconcile_spawn_authority_restart_roster(
+                MultiAgentConfig(agents={})
+            )
+
+        # Validation precedes the crash-window repair write as well as Hold
+        # creation, so the invalid registry row is not copied into policy.
+        assert MultiAgentConfig.from_file(
+            config_path,
+            runtime_base=tmp_path,
+            runtime_env=runtime_env,
+        ).agents == {}
 
     def test_restart_roster_repair_does_not_persist_runtime_host_overrides(
         self,
@@ -13567,3 +13647,45 @@ class TestSpawnAgent:
 
         with pytest.raises(ValueError, match="already exists"):
             await manager.spawn_agent("Existing", parent, mandate)
+
+
+def test_roster_reload_preserves_external_config_runtime_context(
+    tmp_path,
+    monkeypatch,
+):
+    """Manager reloads resolve relative agents exactly as server startup did."""
+
+    runtime_base = tmp_path / "runtime"
+    runtime_base.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    config_path = external / "multi_agent.toml"
+    config_path.write_text(
+        '[agents.Alice]\ndata_dir = "agent_data/alice"\nport = 8801\n',
+        encoding="utf-8",
+    )
+    runtime_env = {
+        "KESTREL_HOST_DB_PATH": str(
+            external / "agent_data" / "alice" / "host-features.db"
+        )
+    }
+    monkeypatch.setenv(
+        "KESTREL_HOST_DB_PATH",
+        runtime_env["KESTREL_HOST_DB_PATH"],
+    )
+    startup = MultiAgentConfig.from_file(
+        config_path,
+        runtime_base=runtime_base,
+        runtime_env=runtime_env,
+    )
+    manager = AgentManager(
+        base_data_dir=runtime_base,
+        startup_config_path=config_path,
+        startup_runtime_env=runtime_env,
+    )
+
+    reconciled = manager.reconcile_spawn_authority_restart_roster(startup)
+
+    assert reconciled.agents["Alice"].resolve_data_dir(runtime_base) == (
+        runtime_base / "agent_data" / "alice"
+    )

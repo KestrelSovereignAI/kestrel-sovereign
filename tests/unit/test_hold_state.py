@@ -5,6 +5,7 @@ import contextlib
 import os
 import shutil
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -1182,9 +1183,19 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         events.append(("hold-boot-read", self._db))
         return ()
 
-    async def _initialize(primary_dsn, evidence_dsn):
+    pair_id = uuid4()
+
+    async def _initialize(
+        primary_dsn,
+        evidence_dsn,
+        *,
+        control_db_path,
+        expected_external_pair_id,
+    ):
+        assert control_db_path == host_path
+        assert expected_external_pair_id == pair_id
         events.append(("custody-initialize", primary_dsn, evidence_dsn))
-        return fake_hold_db, fake_evidence_db
+        return fake_hold_db, fake_evidence_db, pair_id
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://durable/host")
@@ -1192,6 +1203,8 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
         "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
         "postgresql://independent/evidence",
     )
+    monkeypatch.setenv("KESTREL_DEPLOYMENT_PERSISTENCE", "durable_sovereign")
+    monkeypatch.setenv("KESTREL_HOLD_PAIR_ID", str(pair_id))
     monkeypatch.setattr(AsyncDatabase, "sqlite", classmethod(_sqlite))
     monkeypatch.setattr(
         session_module, "make_session_factory", lambda db: _InnerFactory()
@@ -1201,6 +1214,10 @@ async def test_host_context_uses_configured_postgres_for_durable_hold(
     monkeypatch.setattr(
         "kestrel_sovereign.hold.state.initialize_postgres_hold_databases",
         _initialize,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.state.commit_postgres_hold_pair_custody",
+        lambda *_args, **_kwargs: None,
     )
 
     host_path = tmp_path / "existing-host-features.db"
@@ -1282,7 +1299,13 @@ async def test_host_context_refuses_postgres_to_sqlite_hold_backend_switch(
     from kestrel_sovereign.hold.state import claim_hold_backend_custody
 
     database = tmp_path / "host.db"
-    claim_hold_backend_custody(database, "postgres")
+    claim_hold_backend_custody(
+        database,
+        "postgres",
+        postgres_pair_id=uuid4(),
+        postgres_primary_cluster_identity="primary-cluster",
+        postgres_evidence_cluster_identity="evidence-cluster",
+    )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
     monkeypatch.delenv("KESTREL_HOLD_BACKEND", raising=False)
     monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
@@ -1295,6 +1318,73 @@ async def test_host_context_refuses_postgres_to_sqlite_hold_backend_switch(
         assert "verified migration" in switched.backend_error
     finally:
         await close_host_context_resources(switched)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX publication interleaving")
+def test_identical_custody_claim_waits_for_in_progress_publication(
+    monkeypatch,
+    tmp_path,
+):
+    """A sibling boot must not classify its peer's partial write as corrupt."""
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    path = tmp_path / "shared-custody-witness"
+    expected = b"shared-custody-payload\n"
+    first_write_entered = threading.Event()
+    release_first_write = threading.Event()
+    second_started = threading.Event()
+    second_done = threading.Event()
+    first_thread_id: list[int] = []
+    outcomes: list[tuple[str, BaseException | None]] = []
+    real_write = hold_state.os.write
+
+    def pause_first_write(descriptor, payload):
+        if (
+            first_thread_id
+            and threading.get_ident() == first_thread_id[0]
+            and not first_write_entered.is_set()
+        ):
+            first_write_entered.set()
+            assert release_first_write.wait(5)
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(hold_state.os, "write", pause_first_write)
+
+    def claim(label: str) -> None:
+        if label == "first":
+            first_thread_id.append(threading.get_ident())
+        else:
+            second_started.set()
+        failure = None
+        try:
+            hold_state._claim_exact_hold_custody_file(
+                path,
+                expected,
+                label="shared Hold custody witness",
+                max_bytes=128,
+            )
+        except BaseException as exc:  # captured for the parent test thread
+            failure = exc
+        outcomes.append((label, failure))
+        if label == "second":
+            second_done.set()
+
+    first = threading.Thread(target=claim, args=("first",), daemon=True)
+    second = threading.Thread(target=claim, args=("second",), daemon=True)
+    first.start()
+    assert first_write_entered.wait(5)
+    second.start()
+    assert second_started.wait(5)
+    assert not second_done.wait(0.1)
+    release_first_write.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert dict(outcomes) == {"first": None, "second": None}
+    assert path.read_bytes() == expected
 
 
 @pytest.mark.asyncio
@@ -1336,9 +1426,58 @@ async def test_postgres_claim_refuses_surviving_sqlite_custody_evidence(
         database.unlink()
 
     with pytest.raises(HoldCorruptStateError, match="existing SQLite custody"):
-        claim_hold_backend_custody(database, "postgres")
+        claim_hold_backend_custody(
+            database,
+            "postgres",
+            postgres_pair_id=uuid4(),
+            postgres_primary_cluster_identity="primary-cluster",
+            postgres_evidence_cluster_identity="evidence-cluster",
+        )
 
     assert not binding.exists()
+
+
+def test_backend_validation_does_not_create_stopped_wal_sidecars(tmp_path):
+    """A read-only backend probe cannot make a stopped database look live."""
+
+    from kestrel_sovereign.hold.state import validate_hold_backend_custody
+
+    database = tmp_path / "stopped-wal.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE ordinary_host_state(value TEXT)")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    sidecars = (Path(f"{database}-wal"), Path(f"{database}-shm"))
+    for sidecar in sidecars:
+        sidecar.unlink(missing_ok=True)
+
+    assert validate_hold_backend_custody(database, "postgres") is False
+    assert not any(sidecar.exists() for sidecar in sidecars)
+
+
+def test_backend_validation_rejects_insecure_binding_without_hardening_it(
+    tmp_path,
+):
+    """Doctor-style validation reports insecure custody and changes no mode."""
+
+    from kestrel_sovereign.hold.state import (
+        claim_hold_backend_custody,
+        hold_backend_binding_path,
+        validate_hold_backend_custody,
+    )
+
+    database = tmp_path / "host.db"
+    claim_hold_backend_custody(database, "sqlite")
+    binding = hold_backend_binding_path(database)
+    if os.name != "nt":
+        binding.chmod(0o644)
+
+        with pytest.raises(HoldCorruptStateError, match="mode 0600"):
+            validate_hold_backend_custody(database, "sqlite")
+
+        assert binding.stat().st_mode & 0o777 == 0o644
+    else:
+        assert validate_hold_backend_custody(database, "sqlite") is True
 
 
 @pytest.mark.asyncio
@@ -1371,7 +1510,12 @@ async def test_postgres_without_dsn_uses_runtime_sqlite_fallback(
         events.append(("sqlite", path))
         return fake_db
 
-    async def _postgres_hold_initializer(_primary_dsn, _evidence_dsn):
+    async def _postgres_hold_initializer(
+        _primary_dsn,
+        _evidence_dsn,
+        *,
+        control_db_path,
+    ):
         raise AssertionError("runtime fallback must not open PostgreSQL")
 
     async def _ensure_schema(self):
@@ -1432,7 +1576,12 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
     async def _sqlite(_cls, _path):
         return _DB()
 
-    async def _postgres_hold_initializer(_primary_dsn, _evidence_dsn):
+    async def _postgres_hold_initializer(
+        _primary_dsn,
+        _evidence_dsn,
+        *,
+        control_db_path,
+    ):
         raise AssertionError("missing evidence config must fail before PG opens")
 
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -1483,7 +1632,12 @@ async def test_postgres_custody_preflight_failure_precedes_schema_initialization
     async def _sqlite(_cls, _path):
         return _DB()
 
-    async def _reject_custody(_primary_dsn, _evidence_dsn):
+    async def _reject_custody(
+        _primary_dsn,
+        _evidence_dsn,
+        *,
+        control_db_path,
+    ):
         events.append("custody-preflight")
         raise HoldStateError("wrong durable custody role")
 
@@ -1749,8 +1903,13 @@ async def test_cancelled_host_context_bootstrap_closes_partial_resources(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _initialize(_primary_dsn, _evidence_dsn):
-        return fake_hold_db, fake_evidence_db
+    async def _initialize(
+        _primary_dsn,
+        _evidence_dsn,
+        *,
+        control_db_path,
+    ):
+        return fake_hold_db, fake_evidence_db, uuid4()
 
     async def _ensure_schema(_self):
         schema_entered.set()
@@ -1829,8 +1988,13 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
     async def _sqlite(_cls, _path):
         return fake_host_db
 
-    async def _initialize(_primary_dsn, _evidence_dsn):
-        return fake_hold_db, fake_evidence_db
+    async def _initialize(
+        _primary_dsn,
+        _evidence_dsn,
+        *,
+        control_db_path,
+    ):
+        return fake_hold_db, fake_evidence_db, uuid4()
 
     async def _fail_schema(_self):
         raise RuntimeError("schema opening failed")
@@ -3858,6 +4022,7 @@ async def test_postgres_custody_preflight_waits_out_partial_role_publication(
 @pytest.mark.asyncio
 async def test_postgres_hold_schema_initializes_preflight_validated_backends(
     monkeypatch,
+    tmp_path,
 ):
     """Custody proof and schema writes retain one connected-pool identity."""
 
@@ -3935,9 +4100,10 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
         classmethod(_reopen_by_dsn),
     )
 
-    primary, evidence = await initialize_postgres_hold_databases(
+    primary, evidence, _pair_id = await initialize_postgres_hold_databases(
         "postgresql://primary/db",
         "postgresql://evidence/db",
+        control_db_path=tmp_path / "host.db",
     )
 
     assert len(backends) == 2
@@ -3955,8 +4121,165 @@ async def test_postgres_hold_schema_initializes_preflight_validated_backends(
 
 
 @pytest.mark.asyncio
+async def test_postgres_pair_repoint_is_refused_before_schema_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    """Two fresh replacement clusters cannot impersonate a first boot."""
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    control = tmp_path / "host.db"
+    established_pair = uuid4()
+    hold_state.claim_hold_backend_custody(
+        control,
+        "postgres",
+        postgres_pair_id=established_pair,
+        postgres_primary_cluster_identity="established-primary",
+        postgres_evidence_cluster_identity="established-evidence",
+    )
+    hold_state.commit_postgres_hold_pair_custody(control, established_pair)
+
+    class _Backend:
+        def __init__(self):
+            self.close_count = 0
+
+        async def close(self):
+            self.close_count += 1
+
+    primary_backend = _Backend()
+    evidence_backend = _Backend()
+
+    async def replacement_pair(*_args, **_kwargs):
+        return (
+            primary_backend,
+            evidence_backend,
+            "replacement-primary",
+            "replacement-evidence",
+            None,
+        )
+
+    async def forbidden_schema(*_args, **_kwargs):
+        pytest.fail("replacement pair reached schema initialization")
+
+    monkeypatch.setattr(
+        hold_state,
+        "_connect_postgres_hold_custody_backends",
+        replacement_pair,
+    )
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "from_connected_backend",
+        classmethod(forbidden_schema),
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="external pair identity"):
+        await initialize_postgres_hold_databases(
+            "postgresql://replacement/primary",
+            "postgresql://replacement/evidence",
+            control_db_path=control,
+        )
+
+    assert primary_backend.close_count == 1
+    assert evidence_backend.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_external_pair_witness_refuses_fresh_databases_before_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    """A disposable local filesystem cannot turn replacement DBs into boot one."""
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    class _Backend:
+        def __init__(self):
+            self.close_count = 0
+
+        async def close(self):
+            self.close_count += 1
+
+    primary_backend = _Backend()
+    evidence_backend = _Backend()
+
+    async def fresh_pair(*_args, **_kwargs):
+        return (
+            primary_backend,
+            evidence_backend,
+            "replacement-primary",
+            "replacement-evidence",
+            None,
+        )
+
+    async def forbidden_schema(*_args, **_kwargs):
+        pytest.fail("replacement pair reached schema initialization")
+
+    monkeypatch.setattr(
+        hold_state,
+        "_connect_postgres_hold_custody_backends",
+        fresh_pair,
+    )
+    monkeypatch.setattr(
+        AsyncDatabase,
+        "from_connected_backend",
+        classmethod(forbidden_schema),
+    )
+    control = tmp_path / "disposable" / "host.db"
+
+    with pytest.raises(HoldCorruptStateError, match="replacement first boot"):
+        await initialize_postgres_hold_databases(
+            "postgresql://replacement/primary",
+            "postgresql://replacement/evidence",
+            control_db_path=control,
+            expected_external_pair_id=uuid4(),
+        )
+
+    assert not hold_state.hold_backend_binding_path(control).exists()
+    assert primary_backend.close_count == 1
+    assert evidence_backend.close_count == 1
+
+
+def test_external_pair_witness_must_match_established_databases():
+    """The pinned witness cannot be silently rebound to another pair UUID."""
+
+    from kestrel_sovereign.hold.state import (
+        validate_external_postgres_hold_pair_id,
+    )
+
+    with pytest.raises(HoldCorruptStateError, match="verified migration"):
+        validate_external_postgres_hold_pair_id(uuid4(), uuid4())
+
+
+def test_committed_postgres_pair_refuses_missing_internal_identity(tmp_path):
+    """A same-cluster rollback cannot erase both internal role bindings."""
+
+    from kestrel_sovereign.hold import state as hold_state
+
+    control = tmp_path / "host.db"
+    pair_id = uuid4()
+    hold_state.claim_hold_backend_custody(
+        control,
+        "postgres",
+        postgres_pair_id=pair_id,
+        postgres_primary_cluster_identity="primary-cluster",
+        postgres_evidence_cluster_identity="evidence-cluster",
+    )
+    hold_state.commit_postgres_hold_pair_custody(control, pair_id)
+
+    with pytest.raises(HoldCorruptStateError, match="lost a committed pair"):
+        hold_state.validate_postgres_hold_pair_custody(
+            control,
+            internal_pair_id=None,
+            primary_cluster_identity="primary-cluster",
+            evidence_cluster_identity="evidence-cluster",
+        )
+
+
+@pytest.mark.asyncio
 async def test_postgres_hold_pair_initializer_does_not_create_unrelated_core_schema(
     monkeypatch,
+    tmp_path,
 ):
     """The Hold-only databases need no authority over unrelated core tables."""
 
@@ -4007,9 +4330,10 @@ async def test_postgres_hold_pair_initializer_does_not_create_unrelated_core_sch
     monkeypatch.setattr(postgres_module, "PostgresBackend", _Backend)
     monkeypatch.setattr(AsyncDatabase, "_init_schema", _full_core_initializer)
 
-    primary, evidence = await initialize_postgres_hold_databases(
+    primary, evidence, _pair_id = await initialize_postgres_hold_databases(
         "postgresql://primary/db",
         "postgresql://evidence/db",
+        control_db_path=tmp_path / "host.db",
     )
     try:
         assert len(backends) == 2
@@ -4027,6 +4351,7 @@ async def test_postgres_hold_pair_initializer_does_not_create_unrelated_core_sch
 @pytest.mark.asyncio
 async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
     monkeypatch,
+    tmp_path,
 ):
     """Concurrent blank-pair starts cannot race PostgreSQL catalog creation."""
 
@@ -4110,10 +4435,12 @@ async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
         initialize_postgres_hold_databases(
             "postgresql://primary/db",
             "postgresql://evidence/db",
+            control_db_path=tmp_path / "host.db",
         ),
         initialize_postgres_hold_databases(
             "postgresql://primary/db",
             "postgresql://evidence/db",
+            control_db_path=tmp_path / "host.db",
         ),
     )
 
@@ -4127,6 +4454,7 @@ async def test_postgres_hold_pair_cold_starts_serialize_schema_per_database(
 @pytest.mark.asyncio
 async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
     monkeypatch,
+    tmp_path,
 ):
     """A failed second schema cannot strand either validated backend."""
 
@@ -4177,6 +4505,7 @@ async def test_postgres_hold_pair_initializer_closes_partial_schema_open(
         await initialize_postgres_hold_databases(
             "postgresql://primary/db",
             "postgresql://evidence/db",
+            control_db_path=tmp_path / "host.db",
         )
 
     assert len(backends) == 2
@@ -5386,6 +5715,60 @@ def test_postgres_portability_harness_provides_disposable_evidence(tmp_path):
     assert store._initialization_witness_path == (
         tmp_path / "backend-parity.hold-initialized-v1"
     )
+
+
+def test_postgres_file_evidence_publishes_without_sqlite_custody_marker(tmp_path):
+    """The accepted portability topology must not enter SQLite-only logic."""
+
+    _db, store = _portable_hold_store(
+        SimpleNamespace(backend_type="postgres"),
+        tmp_path,
+    )
+    stable = store._history_anchor_payload_from_rows([])
+    next_payload = (
+        b"kestrel-hold-history-v1\n1\n"
+        + (b"1" * 64)
+        + b"\n"
+    )
+    store._write_file_evidence(
+        store._history_anchor_path,
+        stable,
+        label="test Hold history anchor",
+    )
+    store._stage_history_candidate(next_payload)
+
+    store._finish_history_publication(next_payload)
+
+    assert store._history_anchor_path.read_bytes() == next_payload
+    assert store._read_history_candidate() is None
+    assert store._custody_control_path is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_file_evidence_recovers_without_sqlite_custody_marker(
+    tmp_path,
+    monkeypatch,
+):
+    """Interrupted portable publication uses its file anchor on restart."""
+
+    _db, store = _portable_hold_store(
+        SimpleNamespace(backend_type="postgres"),
+        tmp_path,
+    )
+    payload = store._history_anchor_payload_from_rows([])
+    store._write_file_evidence(
+        store._history_anchor_path,
+        payload,
+        label="test Hold history anchor",
+    )
+    store._stage_history_candidate(payload)
+    monkeypatch.setattr(store._db, "fetchall", AsyncMock(return_value=[]))
+
+    await store._recover_history_publication()
+
+    assert store._history_anchor_path.read_bytes() == payload
+    assert store._read_history_candidate() is None
+    assert store._custody_control_path is None
 
 
 @pytest.mark.asyncio

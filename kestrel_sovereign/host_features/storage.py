@@ -18,9 +18,13 @@ from kestrel_sovereign.private_storage import (
     absolute_without_following_leaf,
     ensure_private_directory,
     ensure_private_file,
+    exclusive_private_file_lock,
     open_private_file,
     path_exists,
     require_private_directory,
+)
+from kestrel_sovereign.security.path_identity import (
+    paths_equal_by_filesystem_identity,
 )
 
 HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
@@ -154,6 +158,79 @@ def validate_sqlite_family_private(path: Path, *, label: str = "host database") 
             )
 
 
+def validate_host_database_parent_readiness(
+    database: Path,
+    *,
+    runtime_hardens_parent: bool,
+) -> None:
+    """Predict host-database parent creation without mutating diagnostics.
+
+    The host SQLite store exists even when PostgreSQL carries Hold authority.
+    Doctor uses this read-only mirror of :func:`prepare_host_database` so it
+    cannot certify a parent that startup will immediately reject.
+    """
+
+    parent = absolute_without_following_leaf(database).parent
+    if path_exists(parent):
+        runtime_will_harden_parent = False
+        if not runtime_hardens_parent:
+            require_private_directory(parent, label="host database")
+        else:
+            try:
+                parent_stat = parent.lstat()
+            except OSError as exc:
+                raise HostStorageError(
+                    f"cannot inspect host database directory {parent}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise HostStorageError(
+                    "host database custody path must be a real directory, "
+                    f"not a link or special file: {parent}"
+                )
+            if os.name != "nt" and stat.S_IMODE(parent_stat.st_mode) != 0o700:
+                effective_uid = getattr(os, "geteuid", lambda: parent_stat.st_uid)()
+                if effective_uid not in (0, parent_stat.st_uid):
+                    raise HostStorageError(
+                        "host database directory cannot be restricted to mode "
+                        f"0700 by this runtime: {parent}"
+                    )
+                runtime_will_harden_parent = True
+        if (
+            not runtime_will_harden_parent
+            and not os.access(parent, os.W_OK | os.X_OK)
+        ):
+            raise HostStorageError(
+                f"host database directory is not writable by this runtime: {parent}"
+            )
+        return
+
+    ancestor = parent
+    while not path_exists(ancestor):
+        next_ancestor = ancestor.parent
+        if next_ancestor == ancestor:
+            raise HostStorageError(
+                f"host database directory has no existing ancestor: {parent}"
+            )
+        ancestor = next_ancestor
+    try:
+        ancestor_stat = ancestor.lstat()
+    except OSError as exc:
+        raise HostStorageError(
+            f"cannot inspect host database parent {ancestor}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(ancestor_stat.st_mode) or not stat.S_ISDIR(ancestor_stat.st_mode):
+        raise HostStorageError(
+            "host database parent must be a real directory, not a link or "
+            f"special file: {ancestor}"
+        )
+    if not os.access(ancestor, os.W_OK | os.X_OK):
+        raise HostStorageError(
+            f"host database parent is not writable by this runtime: {ancestor}"
+        )
+
+
 def _copy_database_across_filesystems(source: Path, destination: Path) -> None:
     """Publish a stopped database through a private, fsynced staging file."""
     staging_fd = -1
@@ -241,6 +318,8 @@ def _hold_evidence_family(path: Path) -> tuple[Path, ...]:
         hold_backend_binding_path,
         hold_history_anchor_path,
         hold_initialization_witness_path,
+        hold_postgres_pair_binding_path,
+        hold_postgres_pair_commit_path,
         hold_sqlite_custody_marker_path,
     )
 
@@ -253,6 +332,8 @@ def _hold_evidence_family(path: Path) -> tuple[Path, ...]:
         Path(f"{history}.lock"),
         hold_sqlite_custody_marker_path(path),
         hold_backend_binding_path(path),
+        hold_postgres_pair_binding_path(path),
+        hold_postgres_pair_commit_path(path),
     )
 
 
@@ -269,10 +350,30 @@ def validate_host_database_migration_readiness(
     """
 
     destination = absolute_without_following_leaf(destination)
+    destination_family = tuple(
+        member for member in sqlite_family(destination) if path_exists(member)
+    )
+    destination_evidence = tuple(
+        member
+        for member in _hold_evidence_family(destination)
+        if path_exists(member)
+    )
+    if destination not in destination_family and (
+        destination_family or destination_evidence
+    ):
+        remnants = ", ".join(
+            member.name for member in (*destination_family, *destination_evidence)
+        )
+        raise HostStorageError(
+            f"host database destination {destination} is missing while custody "
+            f"remnants remain ({remnants}); the host store is disabled rather "
+            "than overwriting ambiguous prior state"
+        )
+
     occupied: list[tuple[str, Path]] = []
     for label, raw_source in sources:
         source = absolute_without_following_leaf(raw_source)
-        if source == destination:
+        if paths_equal_by_filesystem_identity(source, destination):
             continue
         family = tuple(
             member for member in sqlite_family(source) if path_exists(member)
@@ -325,7 +426,7 @@ def validate_host_database_migration_readiness(
             f"({locations}); the host store is disabled rather than guessing "
             "which history is authoritative"
         )
-    if occupied and _family_exists(destination):
+    if occupied and (destination_family or destination_evidence):
         label, source = occupied[0]
         raise HostStorageError(
             f"both {label} {source} and destination {destination} contain state; "
@@ -340,42 +441,49 @@ def _migrate_prior_database(
     destination: Path,
     sources: tuple[tuple[str, Path], ...],
 ) -> None:
-    # Contain historical disclosures before reporting why migration cannot
-    # continue. This preserves the existing runtime contract: a stopped 0644
-    # legacy family is restricted even when live sidecars or a second history
-    # make automatic migration unsafe.
-    for label, source in sources:
-        if absolute_without_following_leaf(source) != destination and _family_exists(
-            source
-        ):
-            _harden_existing_family(source, label=label)
-    if _family_exists(destination):
-        _harden_existing_family(destination, label="host database destination")
+    lock_path = destination.parent / f".{destination.name}.migration.lock"
+    with exclusive_private_file_lock(
+        lock_path,
+        label="host database migration",
+    ):
+        # Contain historical disclosures before reporting why migration cannot
+        # continue. This preserves the existing runtime contract: a stopped 0644
+        # legacy family is restricted even when live sidecars or a second history
+        # make automatic migration unsafe.
+        for label, source in sources:
+            if (
+                absolute_without_following_leaf(source) != destination
+                and _family_exists(source)
+            ):
+                _harden_existing_family(source, label=label)
+        if _family_exists(destination):
+            _harden_existing_family(destination, label="host database destination")
 
-    selected = validate_host_database_migration_readiness(destination, sources)
-    if selected is None:
-        return
-    label, source = selected
+        selected = validate_host_database_migration_readiness(destination, sources)
+        if selected is None:
+            return
+        label, source = selected
 
-    try:
-        os.replace(source, destination)
-        validate_sqlite_family_private(destination)
-        _fsync_directory(destination.parent)
-        if source.parent != destination.parent:
-            _fsync_directory(source.parent)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise HostStorageError(
-                f"cannot migrate host database from {source} to {destination}: {exc}"
-            ) from exc
-        _copy_database_across_filesystems(source, destination)
+        try:
+            os.replace(source, destination)
+            validate_sqlite_family_private(destination)
+            _fsync_directory(destination.parent)
+            if source.parent != destination.parent:
+                _fsync_directory(source.parent)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise HostStorageError(
+                    f"cannot migrate host database from {source} to "
+                    f"{destination}: {exc}"
+                ) from exc
+            _copy_database_across_filesystems(source, destination)
 
-    logger.warning(
-        "Migrated prior host-feature database from %s to private host-data "
-        "location %s.",
-        source,
-        destination,
-    )
+        logger.warning(
+            "Migrated prior host-feature database from %s to private host-data "
+            "location %s.",
+            source,
+            destination,
+        )
 
 
 def prepare_host_database(db_path: Optional[str] = None) -> Path:
@@ -436,6 +544,7 @@ __all__ = [
     "legacy_host_database_path",
     "prepare_host_database",
     "sqlite_family",
+    "validate_host_database_parent_readiness",
     "validate_host_database_migration_readiness",
     "validate_sqlite_family_private",
 ]

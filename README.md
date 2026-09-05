@@ -181,12 +181,19 @@ The default uv compute executor requires the Kestrel process itself to run
 inside a Python `venv` or `virtualenv`. This lets it pin an interpreter outside
 Kestrel's runtime while `uv run --isolated --no-project` creates a fresh,
 project-free script environment, so scripts cannot inherit Kestrel's installed
-packages. `uv tool install` and the source checkout's `uv sync` satisfy this
-automatically. For a plain pip installation, create and activate a Python
-virtual environment first. A system or `--user` install can run Kestrel, but
-the uv compute executor deliberately reports unavailable. A Conda environment
-alone is also insufficient because it does not provide the distinct
-`sys.prefix`/`sys.base_prefix` boundary this executor validates.
+packages. It also requires an OS filesystem sandbox: macOS `sandbox-exec`, or
+Linux `bwrap` (bubblewrap). The sandbox denies every write below host Hold
+custody, including writes issued by native extensions rather than Python file
+APIs. It also denies hard-link aliases on macOS and gives Linux compute a
+private PID/proc namespace so host process paths cannot bypass the read-only
+custody mount. `uv tool install` and the source checkout's `uv sync` satisfy the
+virtual environment requirement automatically. For a plain pip installation,
+create and activate a Python virtual environment first. A system or `--user`
+install, a Linux host without bubblewrap, or an unsupported OS can run Kestrel,
+but the uv compute executor deliberately reports unavailable; use the Docker
+executor there. A Conda environment alone is also insufficient because it does
+not provide the distinct `sys.prefix`/`sys.base_prefix` boundary this executor
+validates.
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 

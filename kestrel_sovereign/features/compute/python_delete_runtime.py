@@ -43,7 +43,7 @@ def _alternate_case(name: str) -> str | None:
     return None
 
 
-def _filesystem_is_case_insensitive(path: _Path) -> bool:
+def _filesystem_is_case_insensitive(path: _Path) -> bool | None:
     if _os.name == "nt":
         return True
     existing = _nearest_existing_path(path)
@@ -53,16 +53,64 @@ def _filesystem_is_case_insensitive(path: _Path) -> bool:
             continue
         alternate = candidate.with_name(alternate_name)
         try:
-            if alternate.exists() and candidate.samefile(alternate):
-                return True
+            return candidate.samefile(alternate)
+        except FileNotFoundError:
+            return False
         except OSError:
             continue
-    return False
+    return None
 
 
-def _casefolded_parts(path: _Path) -> tuple[str, ...]:
-    return tuple(
-        _unicodedata.normalize("NFD", part).casefold() for part in path.parts
+def _combined_case_insensitivity(*results: bool | None) -> bool | None:
+    if any(result is True for result in results):
+        return True
+    if all(result is False for result in results):
+        return False
+    return None
+
+
+def _normalized_parts(parts: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_unicodedata.normalize("NFD", part) for part in parts)
+
+
+def _parts_overlap(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+    *,
+    case_insensitive: bool | None,
+) -> bool:
+    first_normalized = _normalized_parts(first)
+    second_normalized = _normalized_parts(second)
+    shorter = min(len(first_normalized), len(second_normalized))
+    if first_normalized[:shorter] == second_normalized[:shorter]:
+        return True
+    if case_insensitive is False:
+        return False
+    return tuple(part.casefold() for part in first_normalized[:shorter]) == tuple(
+        part.casefold() for part in second_normalized[:shorter]
+    )
+
+
+def _same_existing_path(first: _Path, second: _Path) -> bool:
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _aliased_ancestor_suffixes(
+    first: _Path,
+    second: _Path,
+) -> tuple[tuple[str, ...], tuple[str, ...], _Path, _Path] | None:
+    first_ancestor = _nearest_existing_path(first)
+    second_ancestor = _nearest_existing_path(second)
+    if not _same_existing_path(first_ancestor, second_ancestor):
+        return None
+    return (
+        first.relative_to(first_ancestor).parts,
+        second.relative_to(second_ancestor).parts,
+        first_ancestor,
+        second_ancestor,
     )
 
 
@@ -71,20 +119,28 @@ def _paths_overlap_by_filesystem_identity(first: _Path, second: _Path) -> bool:
     second = second.resolve(strict=False)
     if _is_relative_to(first, second) or _is_relative_to(second, first):
         return True
-    try:
-        if first.exists() and second.exists() and first.samefile(second):
+    if first.exists() and second.exists() and _same_existing_path(first, second):
+        return True
+    aliased = _aliased_ancestor_suffixes(first, second)
+    if aliased is not None:
+        first_suffix, second_suffix, first_ancestor, second_ancestor = aliased
+        if _parts_overlap(
+            first_suffix,
+            second_suffix,
+            case_insensitive=_combined_case_insensitivity(
+                _filesystem_is_case_insensitive(first_ancestor),
+                _filesystem_is_case_insensitive(second_ancestor),
+            ),
+        ):
             return True
-    except OSError:
-        pass
-    if not (
-        _filesystem_is_case_insensitive(first)
-        or _filesystem_is_case_insensitive(second)
-    ):
-        return False
-    first_parts = _casefolded_parts(first)
-    second_parts = _casefolded_parts(second)
-    shorter = min(len(first_parts), len(second_parts))
-    return first_parts[:shorter] == second_parts[:shorter]
+    return _parts_overlap(
+        first.parts,
+        second.parts,
+        case_insensitive=_combined_case_insensitivity(
+            _filesystem_is_case_insensitive(first),
+            _filesystem_is_case_insensitive(second),
+        ),
+    )
 
 
 def _is_agent_data_path(path: _Path) -> bool:

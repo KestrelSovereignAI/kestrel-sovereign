@@ -990,14 +990,17 @@ def validate_sqlite_core_schema_readiness(db_path: str | Path) -> None:
     database = Path(db_path).expanduser().resolve(strict=False)
     if not database.exists():
         return
-    # Match Hold's diagnostic-open contract. A WAL-mode database with no live
-    # sidecars must be opened immutable or SQLite creates fresh ``-wal``/``-shm``
-    # files merely by inspecting it, violating Doctor's read-only guarantee.
-    flags = (
-        "mode=ro"
-        if Path(f"{database}-wal").exists()
-        else "mode=ro&immutable=1"
-    )
+    # Match Hold's diagnostic-open contract.  Opening a lone WAL in read-only
+    # mode can still create the missing shared-memory sidecar.  Reject the
+    # incomplete pair before SQLite is called so Doctor remains non-mutating.
+    wal_present = Path(f"{database}-wal").exists()
+    shm_present = Path(f"{database}-shm").exists()
+    if wal_present != shm_present:
+        raise ValueError(
+            "SQLite core host schema cannot be inspected with an incomplete "
+            "WAL sidecar pair"
+        )
+    flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
     try:
         with closing(
             sqlite3.connect(f"{database.as_uri()}?{flags}", uri=True)

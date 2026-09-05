@@ -1353,6 +1353,29 @@ class TestTrashManager:
         assert deleted == 0
         assert old_subdir.exists()
         assert (agent_dir / "kestrel_prime.db").exists()
+
+    def test_empty_refuses_host_hold_custody_inside_trash_root(
+        self,
+        temp_trash_dir,
+        monkeypatch,
+    ):
+        """Trash retention cannot purge an overlapping host-control root."""
+
+        old_timestamp = (datetime.now() - timedelta(days=40)).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        old_subdir = temp_trash_dir / old_timestamp
+        old_subdir.mkdir(parents=True)
+        host_db = old_subdir / "host-features.db"
+        host_db.write_text("durable Hold control")
+        monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(host_db))
+        manager = TrashManager(temp_trash_dir)
+
+        deleted = manager.empty(older_than_days=30)
+
+        assert deleted == 0
+        assert old_subdir.exists()
+        assert host_db.exists()
     
     def test_get_stats(self, temp_trash_dir):
         """Test getting trash statistics."""

@@ -115,7 +115,12 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
-    _check_multi_agent(multi_agent_path, project_dir, resolved, report)
+    multi_agent = _check_multi_agent(
+        multi_agent_path,
+        project_dir,
+        resolved,
+        report,
+    )
 
     # Read each agent's governance ONCE and give the same reading to both
     # checks. They used to resolve and read independently, which on an
@@ -123,7 +128,11 @@ def diagnose(project_dir: Path) -> DoctorReport:
     # agent — a ten-agent fleet waiting 100s to be told the database is down,
     # from a tool whose bound is five seconds and whose whole purpose is to
     # answer quickly when the database is down.
-    readings = _read_agent_governance(multi_agent_path, project_dir, resolved)
+    readings = (
+        _read_agent_governance(multi_agent, project_dir, resolved)
+        if multi_agent is not None
+        else []
+    )
 
     _check_constitution_drift(readings, report)
     _check_anchor_consistency(readings, report)
@@ -257,18 +266,22 @@ def _check_multi_agent(
     project_dir: Path,
     env: dict,
     report: DoctorReport,
-) -> None:
-    multi_agent = MultiAgentConfig.load(
-        multi_agent_path,
-        auto_discover_fallback=False,
-        runtime_env=env,
-    )
+) -> MultiAgentConfig | None:
+    try:
+        multi_agent = MultiAgentConfig.load(
+            multi_agent_path,
+            auto_discover_fallback=False,
+            runtime_env=env,
+        )
+    except (OSError, ValueError) as exc:
+        report.fail.append(f"multi-agent configuration is invalid: {exc}")
+        return None
     agents = multi_agent.get_local_agents()
     if not agents:
         report.fail.append(
             f"No local agents in {multi_agent_path} — run `kestrel setup agent`"
         )
-        return
+        return multi_agent
 
     report.ok.append(f"{len(agents)} agent(s) registered: {', '.join(agents.keys())}")
     for name, cfg in agents.items():
@@ -279,6 +292,7 @@ def _check_multi_agent(
             report.fail.append(
                 f"{name}: kestrel_prime.db missing at {db_path} — re-run inception"
             )
+    return multi_agent
 
 
 def runtime_env(project_dir: Path) -> dict:
@@ -910,6 +924,17 @@ def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
     return _sqlite_default_host_database_path(env, project_dir)
 
 
+def _selected_hold_backend(env: dict[str, str]) -> str:
+    """Resolve the configured Hold backend exactly as host startup does."""
+
+    configured = env.get("KESTREL_HOLD_BACKEND")
+    if configured is not None:
+        return configured.lower()
+    backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+    primary_dsn = env.get("KESTREL_DATABASE_URL")
+    return "postgres" if backend == "postgres" and primary_dsn else "sqlite"
+
+
 def _check_sqlite_hold_readiness(
     env: dict[str, str],
     project_dir: Path,
@@ -921,8 +946,12 @@ def _check_sqlite_hold_readiness(
     from kestrel_sovereign.host_features.storage import (
         DERIVED_HOST_DB_PATH_ENV,
         HOST_DB_PATH_ENV,
+        sqlite_family,
+        validate_host_database_parent_readiness,
         validate_host_database_migration_readiness,
+        validate_sqlite_family_private,
     )
+    from kestrel_sovereign.private_storage import path_exists
     from kestrel_sovereign.storage.async_database import (
         validate_sqlite_core_schema_readiness,
     )
@@ -945,17 +974,33 @@ def _check_sqlite_hold_readiness(
                 )
             sources.append(("legacy host database", project_dir / "kestrel_host.db"))
             validate_host_database_migration_readiness(database, tuple(sources))
-        validate_sqlite_hold_readiness(
-            database,
-            runtime_hardens_parent=not bool(
-                env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
-            ),
-        )
+        if _selected_hold_backend(env) == "sqlite":
+            validate_sqlite_hold_readiness(
+                database,
+                runtime_hardens_parent=not bool(
+                    env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
+                ),
+            )
+        else:
+            validate_host_database_parent_readiness(
+                database,
+                runtime_hardens_parent=not bool(
+                    env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
+                ),
+            )
+        if _selected_hold_backend(env) != "sqlite" and any(
+            path_exists(member) for member in sqlite_family(database)
+        ):
+            # PostgreSQL carries Hold authority, but the host feature runtime
+            # still owns this local SQLite database. Validate its generic
+            # private-family and schema contracts without demanding SQLite-only
+            # Hold evidence beside a live WAL family.
+            validate_sqlite_family_private(database)
         validate_sqlite_core_schema_readiness(database)
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
-        report.fail.append(f"SQLite Hold readiness NOT verified: {exc}")
+        report.fail.append(f"SQLite host readiness NOT verified: {exc}")
         return
-    report.ok.append(f"SQLite Hold state verified at {database}")
+    report.ok.append(f"SQLite host state verified at {database}")
 
 
 def _check_postgres_hold_readiness(
@@ -969,12 +1014,8 @@ def _check_postgres_hold_readiness(
     backend = env.get("KESTREL_DB_BACKEND", "sqlite").lower()
     primary_dsn = env.get("KESTREL_DATABASE_URL")
     configured_hold_backend = env.get("KESTREL_HOLD_BACKEND")
-    if configured_hold_backend is None:
-        hold_backend = (
-            "postgres" if backend == "postgres" and primary_dsn else "sqlite"
-        )
-    else:
-        hold_backend = configured_hold_backend.lower()
+    hold_backend = _selected_hold_backend(env)
+    if configured_hold_backend is not None:
         if hold_backend not in {"postgres", "sqlite"}:
             report.fail.append(
                 "KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'"
@@ -993,9 +1034,10 @@ def _check_postgres_hold_readiness(
             return
     from kestrel_sovereign.hold.state import validate_hold_backend_custody
 
+    hold_control_db = _sqlite_hold_database_path(env, project_dir)
     try:
         validate_hold_backend_custody(
-            _sqlite_hold_database_path(env, project_dir),
+            hold_control_db,
             hold_backend,
         )
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
@@ -1007,6 +1049,19 @@ def _check_postgres_hold_readiness(
         report.fail.append(
             "KESTREL_DATABASE_URL is required for PostgreSQL Hold state"
         )
+        return
+    from kestrel_sovereign.hold.state import configured_postgres_hold_pair_id
+
+    try:
+        expected_external_pair_id = configured_postgres_hold_pair_id(
+            env,
+            required=(
+                env.get("KESTREL_DEPLOYMENT_PERSISTENCE", "").strip().lower()
+                == "durable_sovereign"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
+        report.fail.append(f"PostgreSQL Hold pair identity NOT verified: {exc}")
         return
     try:
         _doctor_postgres_timeout_seconds(env)
@@ -1104,11 +1159,26 @@ def _check_postgres_hold_readiness(
     evidence_snapshot, evidence_metadata_exists = evidence_reading
     try:
         from kestrel_sovereign.hold.state import (
+            validate_external_postgres_hold_pair_id,
             validate_postgres_hold_custody,
+            validate_postgres_hold_pair_custody,
             validate_postgres_hold_readiness_snapshot,
         )
 
-        validate_postgres_hold_custody(primary_snapshot, evidence_snapshot)
+        pair_id = validate_postgres_hold_custody(
+            primary_snapshot,
+            evidence_snapshot,
+        )
+        validate_external_postgres_hold_pair_id(
+            pair_id,
+            expected_external_pair_id,
+        )
+        validate_postgres_hold_pair_custody(
+            hold_control_db,
+            internal_pair_id=pair_id,
+            primary_cluster_identity=primary_identity,
+            evidence_cluster_identity=evidence_identity,
+        )
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
         report.fail.append(
             f"PostgreSQL Hold custody NOT verified: {exc}"
@@ -1204,7 +1274,20 @@ def _check_postgres_hold_readiness(
             raise RuntimeError(
                 "Hold custody roles changed during the diagnostic snapshot"
             )
-        validate_postgres_hold_custody(primary_after[0], evidence_custody_after[0])
+        pair_id = validate_postgres_hold_custody(
+            primary_after[0],
+            evidence_custody_after[0],
+        )
+        validate_external_postgres_hold_pair_id(
+            pair_id,
+            expected_external_pair_id,
+        )
+        validate_postgres_hold_pair_custody(
+            hold_control_db,
+            internal_pair_id=pair_id,
+            primary_cluster_identity=final_primary_identity,
+            evidence_cluster_identity=final_evidence_identity,
+        )
         validate_postgres_hold_readiness_snapshot(
             snapshot=primary_state,
             evidence_rows=evidence_after,
@@ -2101,7 +2184,7 @@ def _row_physically_exists(source: _GovernanceSource) -> bool:
 
 
 def _read_agent_governance(
-    multi_agent_path: Path, project_dir: Path, env: dict
+    multi_agent: MultiAgentConfig, project_dir: Path, env: dict
 ) -> list[_AgentGovernance]:
     """Resolve and read every registered local agent's governance, once each.
 
@@ -2115,11 +2198,6 @@ def _read_agent_governance(
     ten-agent fleet waiting fifty seconds under a five-second bound. The
     schema question is a property of the database, not of the tenant asking.
     """
-    multi_agent = MultiAgentConfig.load(
-        multi_agent_path,
-        auto_discover_fallback=False,
-        runtime_env=env,
-    )
     ledger_by_dsn: dict = {}
     readings: list[_AgentGovernance] = []
     for name, cfg in multi_agent.get_local_agents().items():

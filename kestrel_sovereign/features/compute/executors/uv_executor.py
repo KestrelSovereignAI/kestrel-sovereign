@@ -5,12 +5,16 @@ Execute Python scripts in project-free environments using `uv run`.
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
 from .base import (
     BaseExecutor,
@@ -25,6 +29,21 @@ from ..destructive_policy import DestructiveOperationPolicy
 from ..models import ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
+
+# These variables are consumed by an operating-system dynamic loader before
+# the sandbox executable reaches ``main``. Applying a caller value to bwrap or
+# sandbox-exec would therefore run caller-controlled code outside the custody
+# boundary. They are not forwarded at all; the UV executor's security contract
+# takes precedence over scripts that deliberately depend on loader injection.
+_DYNAMIC_LOADER_ENV_PREFIXES = ("LD_", "DYLD_")
+_DYNAMIC_LOADER_ENV_NAMES = frozenset({"LIBPATH", "SHLIB_PATH"})
+
+
+def _is_dynamic_loader_environment_variable(name: str) -> bool:
+    normalized = name.upper()
+    return normalized in _DYNAMIC_LOADER_ENV_NAMES or normalized.startswith(
+        _DYNAMIC_LOADER_ENV_PREFIXES
+    )
 
 
 class UvExecutor(BaseExecutor):
@@ -76,15 +95,23 @@ class UvExecutor(BaseExecutor):
     
     @property
     def is_available(self) -> bool:
-        """Check that uv and a safe base interpreter are available."""
+        """Check uv, an isolated interpreter, and a usable OS sandbox."""
         try:
             path = self._get_uv_path()
-            return path is not None and bool(self._get_base_python_path())
+            if path is None:
+                return False
+            base_python_path = self._get_base_python_path()
+            sandbox_prefix = self._get_filesystem_sandbox_prefix()
+            return self._filesystem_sandbox_is_operational(
+                sandbox_prefix,
+                base_python_path,
+            )
         except (
             ExecutionEnvironmentError,
             FileNotFoundError,
             OSError,
             PermissionError,
+            subprocess.SubprocessError,
         ):
             return False
     
@@ -161,6 +188,105 @@ class UvExecutor(BaseExecutor):
         raise ExecutionEnvironmentError(
             "UvExecutor could not resolve an executable base Python interpreter"
         )
+
+    def _get_filesystem_sandbox_prefix(self) -> list[str]:
+        """Build a fail-closed OS boundary around host Hold custody.
+
+        Python-level ``open`` patches cannot mediate C extensions such as
+        ``sqlite3`` or a dependency that issues raw syscalls. The UV executor
+        therefore runs only when the platform can make the entire host-control
+        directory non-writable for the child process.
+        """
+
+        protected = self._policy.host_control_data_path.resolve(strict=False)
+        if not protected.is_dir():
+            raise ExecutionEnvironmentError(
+                "UvExecutor requires an existing host Hold custody directory "
+                f"before compute can run: {protected}"
+            )
+
+        if sys.platform == "darwin":
+            sandbox_exec = shutil.which("sandbox-exec")
+            if not sandbox_exec:
+                raise ExecutionEnvironmentError(
+                    "UvExecutor requires sandbox-exec on macOS to protect host "
+                    "Hold custody; use the Docker executor when it is unavailable"
+                )
+            # The path is already canonical. JSON string quoting is also valid
+            # Seatbelt string syntax and prevents path characters from changing
+            # the policy expression.
+            profile = (
+                "(version 1)\n"
+                "(allow default)\n"
+                # Seatbelt models hard-link creation as ``file-link``, not as
+                # ``file-write*``. Deny it globally so caller code cannot give
+                # a protected inode an attacker-writable alias outside the
+                # custody subpath.
+                "(deny file-link)\n"
+                f"(deny file-write* (subpath {json.dumps(str(protected))}))\n"
+            )
+            return [sandbox_exec, "-p", profile]
+
+        if sys.platform.startswith("linux"):
+            bubblewrap = shutil.which("bwrap")
+            if not bubblewrap:
+                raise ExecutionEnvironmentError(
+                    "UvExecutor requires bubblewrap on Linux to protect host "
+                    "Hold custody; install bwrap or use the Docker executor"
+                )
+            # Explicitly discard capabilities even when Kestrel itself runs as
+            # UID 0 in a service container; otherwise CAP_SYS_ADMIN could
+            # remount a read-only bind inside the new namespace.
+            return [
+                bubblewrap,
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-user",
+                # Do not import host procfs through the root bind. A private
+                # PID namespace and proc mount prevent caller code from
+                # resolving the parent Kestrel process's root or descriptors
+                # back into its writable mount namespace.
+                "--unshare-pid",
+                "--cap-drop",
+                "ALL",
+                "--bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--ro-bind",
+                str(protected),
+                str(protected),
+                "--",
+            ]
+
+        raise ExecutionEnvironmentError(
+            "UvExecutor has no verified host Hold filesystem sandbox on this "
+            "platform; use the Docker executor"
+        )
+
+    @staticmethod
+    def _filesystem_sandbox_is_operational(
+        prefix: list[str],
+        base_python_path: str,
+    ) -> bool:
+        """Prove this process may enter the sandbox before advertising UV.
+
+        The sandbox executable can exist while a parent macOS sandbox forbids
+        nested profiles or a Linux host disables unprivileged user namespaces.
+        A no-op isolated interpreter launch exercises sandbox creation without
+        running caller code or writing to the filesystem.
+        """
+
+        result = subprocess.run(
+            [*prefix, base_python_path, "-I", "-S", "-c", "pass"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=SUBPROCESS_TIMEOUT_SHORT,
+            check=False,
+        )
+        return result.returncode == 0
     
     def supports_language(self, language: str) -> bool:
         """UV executor only supports Python."""
@@ -238,8 +364,15 @@ class UvExecutor(BaseExecutor):
         env.update(script.environment)
         # PYTHONPATH bypasses uv's interpreter/environment boundary entirely.
         env.pop("PYTHONPATH", None)
+        # The subprocess environment is installed on the sandbox process
+        # itself. A dynamic loader acts on these keys before bwrap/Seatbelt can
+        # establish the read-only Hold mount, so strip every platform spelling
+        # rather than trying to sanitize individual values.
+        for key in tuple(env):
+            if _is_dynamic_loader_environment_variable(key):
+                del env[key]
 
-        cmd = [
+        uv_cmd = [
             uv_path,
             "run",
             "--isolated",
@@ -248,8 +381,9 @@ class UvExecutor(BaseExecutor):
             base_python_path,
         ]
         for requirement in script.requirements:
-            cmd.extend(["--with", requirement])
-        cmd.append(str(script_path))
+            uv_cmd.extend(["--with", requirement])
+        uv_cmd.append(str(script_path))
+        cmd = [*self._get_filesystem_sandbox_prefix(), *uv_cmd]
 
         logger.info("Executing script %s... with uv", script.id[:8])
         logger.debug("Command: %s", " ".join(cmd))

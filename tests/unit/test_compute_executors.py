@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import venv
@@ -235,6 +236,11 @@ def _make_executor(monkeypatch: pytest.MonkeyPatch, name: str, max_bytes: int = 
             "_get_base_python_path",
             lambda: "/fake/base/python",
         )
+        monkeypatch.setattr(
+            executor,
+            "_get_filesystem_sandbox_prefix",
+            lambda: ["/fake/filesystem-sandbox", "--"],
+        )
         return executor
     if name == "docker":
         executor = DockerExecutor(max_output_bytes=max_bytes)
@@ -401,6 +407,123 @@ def test_uv_base_python_fails_closed_outside_supported_virtual_environment(
     assert "Conda environment alone is not sufficient" in str(exc_info.value)
 
 
+def test_uv_macos_sandbox_denies_writes_below_host_custody(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / 'host data "quoted"'
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    monkeypatch.setattr(uv_executor_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        uv_executor_module.shutil,
+        "which",
+        lambda command: "/usr/bin/sandbox-exec" if command == "sandbox-exec" else None,
+    )
+
+    prefix = UvExecutor()._get_filesystem_sandbox_prefix()
+
+    assert prefix[:2] == ["/usr/bin/sandbox-exec", "-p"]
+    assert "(allow default)" in prefix[2]
+    assert "(deny file-link)" in prefix[2]
+    assert "(deny file-write*" in prefix[2]
+    assert json.dumps(str(custody.resolve())) in prefix[2]
+
+
+def test_uv_linux_sandbox_remounts_host_custody_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    monkeypatch.setattr(uv_executor_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        uv_executor_module.shutil,
+        "which",
+        lambda command: "/usr/bin/bwrap" if command == "bwrap" else None,
+    )
+
+    assert UvExecutor()._get_filesystem_sandbox_prefix() == [
+        "/usr/bin/bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--cap-drop",
+        "ALL",
+        "--bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--ro-bind",
+        str(custody.resolve()),
+        str(custody.resolve()),
+        "--",
+    ]
+
+
+def test_uv_sandbox_fails_closed_without_platform_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    monkeypatch.setattr(uv_executor_module.sys, "platform", "linux")
+    monkeypatch.setattr(uv_executor_module.shutil, "which", lambda _command: None)
+    executor = UvExecutor()
+    monkeypatch.setattr(executor, "_get_uv_path", lambda: "/fake/uv")
+    monkeypatch.setattr(executor, "_get_base_python_path", lambda: "/fake/python")
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="requires bubblewrap",
+    ):
+        executor._get_filesystem_sandbox_prefix()
+    assert executor.is_available is False
+
+
+def test_uv_sandbox_fails_closed_when_present_but_forbidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Availability must exercise sandbox creation, not just find its binary."""
+
+    executor = UvExecutor()
+    monkeypatch.setattr(executor, "_get_uv_path", lambda: "/fake/uv")
+    monkeypatch.setattr(
+        executor,
+        "_get_base_python_path",
+        lambda: "/fake/base/python",
+    )
+    monkeypatch.setattr(
+        executor,
+        "_get_filesystem_sandbox_prefix",
+        lambda: ["/fake/sandbox-exec", "--"],
+    )
+    commands: list[list[str]] = []
+
+    def reject_nested_sandbox(command: list[str], **_kwargs: object):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 71)
+
+    monkeypatch.setattr(uv_executor_module.subprocess, "run", reject_nested_sandbox)
+
+    assert executor.is_available is False
+    assert commands == [
+        [
+            "/fake/sandbox-exec",
+            "--",
+            "/fake/base/python",
+            "-I",
+            "-S",
+            "-c",
+            "pass",
+        ]
+    ]
+
+
 @pytest.mark.asyncio
 async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requirements(
     monkeypatch: pytest.MonkeyPatch,
@@ -433,6 +556,8 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
 
     script_path = str(created[0] / "script.py")
     assert command == (
+        "/fake/filesystem-sandbox",
+        "--",
         "/fake/uv",
         "run",
         "--isolated",
@@ -457,10 +582,146 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
 
 
 @pytest.mark.asyncio
+async def test_uv_strips_dynamic_loader_environment_before_sandbox_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Caller code cannot run in the loader before bwrap/Seatbelt starts."""
+
+    executor = _make_executor(monkeypatch, "uv", max_bytes=128)
+    _track_temp_dirs(monkeypatch, tmp_path)
+    process = _SuccessfulProcess(b"ok", b"")
+    subprocess_options: dict[str, object] = {}
+
+    async def create_subprocess(*_args: object, **kwargs: object):
+        subprocess_options.update(kwargs)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    script = _script(
+        environment={
+            "LD_PRELOAD": "/caller/preload.so",
+            "LD_AUDIT": "/caller/audit.so",
+            "LD_LIBRARY_PATH": "/caller/lib",
+            "DYLD_INSERT_LIBRARIES": "/caller/preload.dylib",
+            "DYLD_LIBRARY_PATH": "/caller/dylibs",
+            "LIBPATH": "/caller/aix",
+            "SHLIB_PATH": "/caller/hpux",
+            "COMPUTE_SAFE_VALUE": "preserved",
+        }
+    )
+
+    record = await executor.execute(script)
+
+    child_env = subprocess_options["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["COMPUTE_SAFE_VALUE"] == "preserved"
+    assert not {
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "LIBPATH",
+        "SHLIB_PATH",
+    }.intersection(child_env)
+    assert record.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_uv_real_process_cannot_mutate_host_hold_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir(mode=0o700)
+    database = custody / "host-features.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE hold_latches(value TEXT)")
+        connection.execute("INSERT INTO hold_latches VALUES ('intact')")
+    database.chmod(0o600)
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(database))
+    executor = UvExecutor(max_output_bytes=64 * 1024)
+    if not executor.is_available:
+        pytest.skip("uv executor requires a verified OS filesystem sandbox")
+
+    script = ComputeScript(
+        id="uv-host-hold-custody",
+        name="attempt direct SQLite Hold mutation",
+        language="python",
+        content=(
+            "import sqlite3\n"
+            f"with sqlite3.connect({str(database)!r}) as connection:\n"
+            "    connection.execute('DELETE FROM hold_latches')\n"
+        ),
+        purpose="prove C-extension writes cannot bypass host Hold custody",
+    )
+
+    record = await executor.execute(script)
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute("SELECT value FROM hold_latches").fetchall()
+    assert record.exit_code != 0
+    assert rows == [("intact",)]
+
+
+@pytest.mark.asyncio
+async def test_docker_rejects_writable_alias_of_host_hold_custody_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    custody_alias = tmp_path / "custody-alias"
+    custody_alias.symlink_to(custody, target_is_directory=True)
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    executor = DockerExecutor()
+    monkeypatch.setattr(executor, "_get_docker_path", lambda: "/fake/docker")
+    launched = False
+
+    async def reject_launch(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("unsafe Docker command reached process launch")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_launch)
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="writable Docker mount.*host Hold custody",
+    ):
+        await executor.execute(
+            _script(),
+            mounts=[
+                {"src": str(custody_alias), "dst": "/data", "ro": False}
+            ],
+        )
+
+    assert launched is False
+
+
+def test_docker_allows_read_only_host_hold_custody_mount(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    executor = DockerExecutor()
+
+    executor._validate_additional_mounts(
+        [{"src": str(custody), "dst": "/data", "ro": True}]
+    )
+
+
+@pytest.mark.asyncio
 async def test_uv_real_process_isolated_from_nested_host_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
     executor = UvExecutor(max_output_bytes=64 * 1024)
     if not executor.is_available:
         pytest.skip("uv executor requires uv and a virtualized Kestrel runtime")

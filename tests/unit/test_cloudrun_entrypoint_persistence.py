@@ -19,6 +19,7 @@ def test_single_agent_entrypoint_never_incepts_durable_identity():
     assert "KESTREL_EXPECTED_DID" in durable
     assert "KESTREL_DATABASE_URL" in durable
     assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL" in durable
+    assert "KESTREL_HOLD_PAIR_ID" in durable
     assert "unset KESTREL_IDENTITY_BUNDLE" in durable
     assert "create_kestrel_identity" not in durable
 

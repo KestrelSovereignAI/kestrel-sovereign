@@ -171,6 +171,7 @@ def test_prod_profile_has_bash_parity_secrets(live_config):
         "KESTREL_API_KEY",
         "KESTREL_DATABASE_URL",
         "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "KESTREL_HOLD_PAIR_ID",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
         "GOOGLE_CLIENT_ID",
@@ -297,6 +298,7 @@ def test_cloudrun_profiles_declare_honest_persistence(live_config):
     for key in (
         "KESTREL_DATABASE_URL",
         "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "KESTREL_HOLD_PAIR_ID",
         "KESTREL_DATA_KEY",
         "KESTREL_IDENTITY_BUNDLE",
     ):
@@ -337,6 +339,33 @@ def test_durable_cloudrun_rejects_identical_hold_database_secret_refs(live_confi
     )
 
     with pytest.raises(DeployManagerError, match="independent primary and evidence"):
+        validate_cloudrun_persistence(unsafe)
+
+
+def test_durable_cloudrun_requires_pinned_external_hold_pair(live_config):
+    """Disposable local pair markers require a restart-surviving witness."""
+
+    from dataclasses import replace
+
+    from kestrel_sovereign.features.deploy.models import DeployManagerError
+    from kestrel_sovereign.features.deploy.persistence import (
+        validate_cloudrun_persistence,
+    )
+
+    manager = DeployManager(config=live_config)
+    prod = manager.get_profile("prod")
+    secrets = dict(prod.secrets)
+    secrets.pop("KESTREL_HOLD_PAIR_ID")
+    unsafe = replace(
+        prod,
+        env_vars={
+            **prod.env_vars,
+            "KESTREL_EXPECTED_DID": "did:web:agents.example.com:kestrel",
+        },
+        secrets=secrets,
+    )
+
+    with pytest.raises(DeployManagerError, match="KESTREL_HOLD_PAIR_ID"):
         validate_cloudrun_persistence(unsafe)
 
 

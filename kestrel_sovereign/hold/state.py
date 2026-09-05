@@ -37,10 +37,10 @@ from kestrel_sovereign.private_storage import (
     PrivateStorageError,
     absolute_without_following_leaf,
     ensure_private_directory,
+    exclusive_private_file_lock,
     open_private_file,
     open_private_file_for_validation,
     path_exists,
-    require_private_directory,
 )
 from kestrel_sovereign.storage.database_clock import database_now_sql
 
@@ -72,6 +72,13 @@ _POSTGRES_EVIDENCE_BINDING_KEY = "hold_evidence_custody_binding_v1"
 _POSTGRES_CUSTODY_BINDING_PREFIX = "kestrel-hold-custody-binding-v1:"
 _HOLD_BACKEND_BINDING_HEADER = b"kestrel-hold-backend-v1\n"
 _HOLD_BACKEND_BINDING_MAX_BYTES = len(_HOLD_BACKEND_BINDING_HEADER) + 16
+_POSTGRES_PAIR_BINDING_HEADER = b"kestrel-hold-postgres-pair-v1\n"
+_POSTGRES_PAIR_BINDING_MAX_BYTES = (
+    len(_POSTGRES_PAIR_BINDING_HEADER) + 36 + 1 + 64 + 1 + 64 + 1
+)
+_POSTGRES_PAIR_COMMIT_HEADER = b"kestrel-hold-postgres-pair-committed-v1\n"
+_POSTGRES_PAIR_COMMIT_MAX_BYTES = len(_POSTGRES_PAIR_COMMIT_HEADER) + 36 + 1
+POSTGRES_HOLD_PAIR_ID_ENV = "KESTREL_HOLD_PAIR_ID"
 # Serialize the first Hold metadata publication independently on each
 # PostgreSQL database. PostgreSQL's CREATE TABLE IF NOT EXISTS catalogue probe
 # can race a peer cold start, so the lock must precede that first DDL statement.
@@ -340,7 +347,7 @@ def _validate_postgres_custody_binding(
 def validate_postgres_hold_custody(
     primary: PostgresHoldCustodySnapshot,
     evidence: PostgresHoldCustodySnapshot,
-) -> None:
+) -> UUID | None:
     """Fail closed on a read-only snapshot before either schema is mutated.
 
     A brand-new pair has no metadata table yet and is valid to initialize. Once
@@ -400,23 +407,27 @@ def validate_postgres_hold_custody(
         if binding is not None
     )
     if not expected:
-        return
+        return None
     if primary.domain_identity is None or evidence.domain_identity is None:
         raise HoldStateError(
             "PostgreSQL Hold custody binding lacks a durable rollback domain"
         )
+    pair_ids = []
     for binding in expected:
         if not isinstance(binding, str):
             raise HoldStateError("PostgreSQL Hold custody binding is invalid")
-        _validate_postgres_custody_binding(
-            binding,
-            primary_identity=primary.domain_identity,
-            evidence_identity=evidence.domain_identity,
+        pair_ids.append(
+            _validate_postgres_custody_binding(
+                binding,
+                primary_identity=primary.domain_identity,
+                evidence_identity=evidence.domain_identity,
+            )
         )
     if len(expected) == 2 and expected[0] != expected[1]:
         raise HoldStateError(
             "PostgreSQL Hold custody binding disagrees between databases"
         )
+    return pair_ids[0]
 
 
 def postgres_hold_custody_snapshot_from_rows(
@@ -709,7 +720,13 @@ async def preflight_postgres_hold_custody(
 ) -> None:
     """Verify existing custody roles through raw, read-only PostgreSQL pools."""
 
-    primary_backend, evidence_backend, _primary_cluster, _evidence_cluster = (
+    (
+        primary_backend,
+        evidence_backend,
+        _primary_cluster,
+        _evidence_cluster,
+        _pair_id,
+    ) = (
         await _connect_postgres_hold_custody_backends(
             primary_dsn,
             evidence_dsn,
@@ -728,7 +745,7 @@ async def preflight_postgres_hold_custody(
 async def _connect_postgres_hold_custody_backends(
     primary_dsn: str,
     evidence_dsn: str,
-) -> tuple[Any, Any, str, str]:
+) -> tuple[Any, Any, str, str, UUID | None]:
     """Return the exact connected pools whose custody roles were validated."""
 
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
@@ -786,7 +803,7 @@ async def _connect_postgres_hold_custody_backends(
                     "PostgreSQL Hold cluster identity changed while acquiring "
                     "custody locks"
                 )
-            validate_postgres_hold_custody(primary, evidence)
+            pair_id = validate_postgres_hold_custody(primary, evidence)
     except BaseException as failure:
         close_errors: tuple[BaseException, ...] = ()
         try:
@@ -802,18 +819,33 @@ async def _connect_postgres_hold_custody_backends(
                 f"{close_error!r}"
             )
         raise failure.with_traceback(failure.__traceback__)
-    return primary_backend, evidence_backend, primary_cluster, evidence_cluster
+    return (
+        primary_backend,
+        evidence_backend,
+        primary_cluster,
+        evidence_cluster,
+        pair_id,
+    )
 
 
 async def initialize_postgres_hold_databases(
     primary_dsn: str,
     evidence_dsn: str,
-) -> tuple[Any, Any]:
+    *,
+    control_db_path: str | Path,
+    expected_external_pair_id: UUID | None = None,
+) -> tuple[Any, Any, UUID]:
     """Validate, then initialize Hold prerequisites on those connected pools."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    primary_backend, evidence_backend, primary_cluster, evidence_cluster = (
+    (
+        primary_backend,
+        evidence_backend,
+        primary_cluster,
+        evidence_cluster,
+        internal_pair_id,
+    ) = (
         await _connect_postgres_hold_custody_backends(
             primary_dsn,
             evidence_dsn,
@@ -824,6 +856,20 @@ async def initialize_postgres_hold_databases(
     primary_backend_consumed = False
     evidence_backend_consumed = False
     try:
+        validate_external_postgres_hold_pair_id(
+            internal_pair_id,
+            expected_external_pair_id,
+        )
+        # Publish an external, cluster-bound pair identity before either
+        # configurable database is mutated.  A committed local witness then
+        # distinguishes a recoverable interrupted first boot from two freshly
+        # repointed databases that would otherwise look like a new install.
+        pair_id = claim_postgres_hold_pair_custody(
+            control_db_path,
+            internal_pair_id=internal_pair_id,
+            primary_cluster_identity=primary_cluster,
+            evidence_cluster_identity=evidence_cluster,
+        )
         # Hold's two custody services are deliberately narrower than Kestrel's
         # agent database. Running the full core initializer here made a valid
         # Hold deployment depend on write authority over every unrelated core
@@ -869,7 +915,7 @@ async def initialize_postgres_hold_databases(
             ),
             schema_initializer=initialize_hold_metadata,
         )
-        return primary_db, evidence_db
+        return primary_db, evidence_db, pair_id
     except BaseException as failure:
         close_errors: tuple[BaseException, ...] = ()
         try:
@@ -1000,6 +1046,93 @@ def hold_backend_binding_path(control_db_path: str | Path) -> Path:
     path = absolute_without_following_leaf(Path(control_db_path))
     identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
     return path.parent / ".hold-custody" / f"{identity}.backend-v1"
+
+
+def hold_postgres_pair_binding_path(control_db_path: str | Path) -> Path:
+    """Return the external identity witness for one PostgreSQL Hold pair."""
+
+    path = absolute_without_following_leaf(Path(control_db_path))
+    identity = hashlib.sha256(os.fsencode(path.name)).hexdigest()
+    return path.parent / ".hold-custody" / f"{identity}.postgres-pair-v1"
+
+
+def hold_postgres_pair_commit_path(control_db_path: str | Path) -> Path:
+    """Return the witness that marks a PostgreSQL pair as initialized."""
+
+    return Path(f"{hold_postgres_pair_binding_path(control_db_path)}.committed")
+
+
+def _postgres_pair_binding_payload(
+    pair_id: UUID,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> bytes:
+    """Bind a pair UUID to the exact two configured cluster identities."""
+
+    primary_digest = hashlib.sha256(
+        primary_cluster_identity.encode("utf-8")
+    ).hexdigest()
+    evidence_digest = hashlib.sha256(
+        evidence_cluster_identity.encode("utf-8")
+    ).hexdigest()
+    return (
+        _POSTGRES_PAIR_BINDING_HEADER
+        + str(pair_id).encode("ascii")
+        + b"\n"
+        + primary_digest.encode("ascii")
+        + b"\n"
+        + evidence_digest.encode("ascii")
+        + b"\n"
+    )
+
+
+def configured_postgres_hold_pair_id(
+    env: Mapping[str, str],
+    *,
+    required: bool,
+) -> UUID | None:
+    """Read the restart-surviving PostgreSQL pair identity from runtime env."""
+
+    value = env.get(POSTGRES_HOLD_PAIR_ID_ENV)
+    if value is None or not value.strip():
+        if required:
+            raise HoldStateError(
+                f"{POSTGRES_HOLD_PAIR_ID_ENV} is required for disposable-filesystem "
+                "PostgreSQL Hold custody"
+            )
+        return None
+    canonical = value.strip()
+    try:
+        pair_id = UUID(canonical)
+    except ValueError as exc:
+        raise HoldStateError(
+            f"{POSTGRES_HOLD_PAIR_ID_ENV} must be a canonical UUID"
+        ) from exc
+    if str(pair_id) != canonical:
+        raise HoldStateError(
+            f"{POSTGRES_HOLD_PAIR_ID_ENV} must be a canonical UUID"
+        )
+    return pair_id
+
+
+def validate_external_postgres_hold_pair_id(
+    internal_pair_id: UUID | None,
+    expected_external_pair_id: UUID | None,
+) -> None:
+    """Require a provisioned DB pair to match its external durable witness."""
+
+    if expected_external_pair_id is None:
+        return
+    if internal_pair_id is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases lack the pair identity committed by "
+            f"{POSTGRES_HOLD_PAIR_ID_ENV}; refusing a replacement first boot"
+        )
+    if internal_pair_id != expected_external_pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases conflict with the pair identity committed "
+            f"by {POSTGRES_HOLD_PAIR_ID_ENV}; a verified migration is required"
+        )
 
 
 def _sqlite_custody_marker_payload(
@@ -1891,9 +2024,15 @@ class HoldStore:
         initialization_witness_path: str | Path | None = None,
         history_anchor_path: str | Path | None = None,
         evidence_db: Any = None,
+        expected_postgres_pair_id: UUID | None = None,
     ):
         self._db = db
         self._evidence_db = evidence_db
+        if expected_postgres_pair_id is not None and not isinstance(
+            expected_postgres_pair_id, UUID
+        ):
+            raise TypeError("expected_postgres_pair_id must be a UUID")
+        self._expected_postgres_pair_id = expected_postgres_pair_id
         is_postgres = getattr(db, "backend_type", "") == "postgres"
         explicit_file_evidence = (
             initialization_witness_path is not None
@@ -1916,6 +2055,10 @@ class HoldStore:
                 raise HoldStateError(
                     "PostgreSQL Hold evidence requires a PostgreSQL database"
                 )
+        elif expected_postgres_pair_id is not None:
+            raise HoldStateError(
+                "a PostgreSQL Hold pair identity requires an evidence database"
+            )
         if initialization_witness_path is not None:
             self._initialization_witness_path = absolute_without_following_leaf(
                 Path(initialization_witness_path)
@@ -2247,16 +2390,26 @@ class HoldStore:
                 "PostgreSQL Hold database has the wrong durable custody role"
             )
 
+        expected_pair_id = self._expected_postgres_pair_id
         if primary_binding is None and evidence_binding is None:
-            binding = self._custody_binding_payload(uuid4(), primary, evidence)
+            binding = self._custody_binding_payload(
+                expected_pair_id or uuid4(),
+                primary,
+                evidence,
+            )
         else:
             binding = primary_binding or evidence_binding
             assert binding is not None
-            self._validate_custody_binding(
+            actual_pair_id = self._validate_custody_binding(
                 binding,
                 primary_identity=primary,
                 evidence_identity=evidence,
             )
+            if expected_pair_id is not None and actual_pair_id != expected_pair_id:
+                raise HoldStateError(
+                    "PostgreSQL Hold custody binding conflicts with the external "
+                    "pair identity"
+                )
             if (
                 primary_binding is not None
                 and evidence_binding is not None
@@ -2323,11 +2476,16 @@ class HoldStore:
             raise HoldStateError(
                 "PostgreSQL Hold custody binding was not durably published"
             )
-        self._validate_custody_binding(
+        actual_pair_id = self._validate_custody_binding(
             primary_binding,
             primary_identity=primary,
             evidence_identity=evidence,
         )
+        if expected_pair_id is not None and actual_pair_id != expected_pair_id:
+            raise HoldStateError(
+                "PostgreSQL Hold custody binding conflicts with the external pair "
+                "identity"
+            )
 
     @asynccontextmanager
     async def _postgres_evidence_lock(self):
@@ -2892,31 +3050,31 @@ class HoldStore:
                 )
             if self._history_anchor_path is not None:
                 control_path = self._custody_control_path
-                assert control_path is not None
-                marker = self._read_sqlite_custody_marker()
-                if marker is None:
-                    raise HoldCorruptStateError(
-                        "SQLite Hold custody marker is missing for an "
-                        "initialized database"
-                    )
-                marker_history = _sqlite_custody_marker_history(
-                    control_path,
-                    marker,
-                )
-                if stable != candidate:
-                    marker_valid = marker_history == stable
-                else:
-                    marker_valid = marker_history == candidate or (
-                        self._is_immediate_history_predecessor(
-                            marker_history,
-                            current_rows,
+                if control_path is not None:
+                    marker = self._read_sqlite_custody_marker()
+                    if marker is None:
+                        raise HoldCorruptStateError(
+                            "SQLite Hold custody marker is missing for an "
+                            "initialized database"
                         )
+                    marker_history = _sqlite_custody_marker_history(
+                        control_path,
+                        marker,
                     )
-                if not marker_valid:
-                    raise HoldCorruptStateError(
-                        "SQLite Hold custody marker conflicts with staged "
-                        "receipt history"
-                    )
+                    if stable != candidate:
+                        marker_valid = marker_history == stable
+                    else:
+                        marker_valid = marker_history == candidate or (
+                            self._is_immediate_history_predecessor(
+                                marker_history,
+                                current_rows,
+                            )
+                        )
+                    if not marker_valid:
+                        raise HoldCorruptStateError(
+                            "SQLite Hold custody marker conflicts with staged "
+                            "receipt history"
+                        )
                 self._write_file_evidence(
                     self._history_anchor_path,
                     candidate,
@@ -3018,7 +3176,6 @@ class HoldStore:
         path = self._history_anchor_path
         assert path is not None
         control_path = self._custody_control_path
-        assert control_path is not None
         stable = self._read_file_evidence(
             path,
             label="Hold history anchor",
@@ -3027,12 +3184,13 @@ class HoldStore:
         if stable is None:
             raise HoldCorruptStateError("Hold history anchor is missing")
         stable = self._validate_history_anchor_payload(stable)
-        _validate_sqlite_custody_evidence(
-            marker_payload=self._read_sqlite_custody_marker(),
-            expected_payload=_sqlite_custody_marker_payload(control_path, stable),
-            initialized=True,
-            bootstrap_pending=False,
-        )
+        if control_path is not None:
+            _validate_sqlite_custody_evidence(
+                marker_payload=self._read_sqlite_custody_marker(),
+                expected_payload=_sqlite_custody_marker_payload(control_path, stable),
+                initialized=True,
+                bootstrap_pending=False,
+            )
         self._write_file_evidence(path, payload, label="Hold history anchor")
         self._write_sqlite_custody_marker(payload)
         self._remove_history_candidate()
@@ -4396,7 +4554,7 @@ def _sqlite_database_has_hold_schema(database: Path) -> bool:
     try:
         with closing(
             sqlite3.connect(
-                f"{database.as_uri()}?mode=ro",
+                f"{database.as_uri()}?mode=ro&immutable=1",
                 uri=True,
             )
         ) as connection:
@@ -4439,11 +4597,30 @@ def validate_hold_backend_custody(
             "Hold backend switch would abandon existing SQLite custody state; "
             "a verified migration is required"
         )
+    pair_path = hold_postgres_pair_binding_path(database)
+    pair_commit_path = hold_postgres_pair_commit_path(database)
+    pair_binding = _read_postgres_pair_binding(database, harden_custody=False)
+    pair_commit = _read_postgres_pair_commit(database, harden_custody=False)
+    if pair_commit is not None and pair_binding is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair commit exists without its external binding"
+        )
+    if selected != "postgres" and (
+        pair_binding is not None
+        or pair_commit is not None
+        or path_exists(pair_path)
+        or path_exists(pair_commit_path)
+    ):
+        raise HoldCorruptStateError(
+            "Hold backend switch would abandon existing PostgreSQL custody state; "
+            "a verified migration is required"
+        )
     binding_path = hold_backend_binding_path(database)
     existing = HoldStore._read_file_evidence(
         binding_path,
         label="Hold backend custody binding",
         max_bytes=_HOLD_BACKEND_BINDING_MAX_BYTES,
+        harden_custody=False,
     )
     if existing is None:
         return False
@@ -4453,12 +4630,201 @@ def validate_hold_backend_custody(
             "Hold backend switch conflicts with durable custody binding; "
             "a verified migration is required"
         )
+    if selected == "postgres" and pair_binding is None:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold backend custody lacks its external pair identity; "
+            "a verified migration is required"
+        )
     return True
+
+
+def _read_postgres_pair_binding(
+    control_db_path: str | Path,
+    *,
+    harden_custody: bool,
+) -> tuple[UUID, bytes] | None:
+    """Read and strictly parse the external cluster-bound pair identity."""
+
+    path = hold_postgres_pair_binding_path(control_db_path)
+    payload = HoldStore._read_file_evidence(
+        path,
+        label="PostgreSQL Hold external pair binding",
+        max_bytes=_POSTGRES_PAIR_BINDING_MAX_BYTES,
+        harden_custody=harden_custody,
+    )
+    if payload is None:
+        return None
+    lines = payload.splitlines()
+    if len(lines) != 4 or lines[0] != _POSTGRES_PAIR_BINDING_HEADER.rstrip(b"\n"):
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    try:
+        pair_id = UUID(lines[1].decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        ) from exc
+    if str(pair_id).encode("ascii") != lines[1]:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    for digest in lines[2:]:
+        if len(digest) != 64 or any(
+            byte not in b"0123456789abcdef" for byte in digest
+        ):
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold external pair binding is invalid"
+            )
+    if payload != b"\n".join(lines) + b"\n":
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair binding is invalid"
+        )
+    return pair_id, payload
+
+
+def _read_postgres_pair_commit(
+    control_db_path: str | Path,
+    *,
+    harden_custody: bool,
+) -> UUID | None:
+    """Read the immutable marker that distinguishes initialized pair state."""
+
+    payload = HoldStore._read_file_evidence(
+        hold_postgres_pair_commit_path(control_db_path),
+        label="PostgreSQL Hold external pair commit",
+        max_bytes=_POSTGRES_PAIR_COMMIT_MAX_BYTES,
+        harden_custody=harden_custody,
+    )
+    if payload is None:
+        return None
+    if not payload.startswith(_POSTGRES_PAIR_COMMIT_HEADER):
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    encoded = payload.removeprefix(_POSTGRES_PAIR_COMMIT_HEADER)
+    if not encoded.endswith(b"\n") or b"\n" in encoded[:-1]:
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    try:
+        pair_id = UUID(encoded[:-1].decode("ascii"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold external pair commit is invalid"
+        ) from exc
+    if encoded != str(pair_id).encode("ascii") + b"\n":
+        raise HoldCorruptStateError("PostgreSQL Hold external pair commit is invalid")
+    return pair_id
+
+
+def validate_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    *,
+    internal_pair_id: UUID | None,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> bool:
+    """Compare configurable PostgreSQL state with its local custody witness."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    validate_hold_backend_custody(database, "postgres")
+    binding = _read_postgres_pair_binding(database, harden_custody=False)
+    committed_pair_id = _read_postgres_pair_commit(
+        database,
+        harden_custody=False,
+    )
+    if binding is None:
+        return False
+    external_pair_id, payload = binding
+    expected = _postgres_pair_binding_payload(
+        external_pair_id,
+        primary_cluster_identity,
+        evidence_cluster_identity,
+    )
+    if payload != expected:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold configuration conflicts with the external pair "
+            "identity; a verified migration is required"
+        )
+    if internal_pair_id is not None and internal_pair_id != external_pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold databases conflict with the external pair identity; "
+            "a verified migration is required"
+        )
+    if committed_pair_id is not None:
+        if committed_pair_id != external_pair_id:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold external pair commit conflicts with its binding"
+            )
+        if internal_pair_id is None:
+            raise HoldCorruptStateError(
+                "PostgreSQL Hold databases lost a committed pair identity; a "
+                "verified migration is required"
+            )
+    return True
+
+
+def _claim_exact_hold_custody_file(
+    path: Path,
+    expected: bytes,
+    *,
+    label: str,
+    max_bytes: int,
+) -> None:
+    """Create one immutable custody witness or accept an identical winner."""
+
+    def read_existing() -> bytes | None:
+        return HoldStore._read_file_evidence(
+            path,
+            label=label,
+            max_bytes=max_bytes,
+        )
+
+    lock_path = Path(f"{path}.publication.lock")
+    try:
+        with exclusive_private_file_lock(
+            lock_path,
+            label="Hold custody publication",
+        ):
+            try:
+                descriptor = open_private_file(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    label=label,
+                )
+            except PrivateStorageError as exc:
+                if path_exists(path):
+                    if read_existing() == expected:
+                        return
+                    raise HoldCorruptStateError(
+                        f"{label} conflicts with durable custody; a verified "
+                        "migration is required"
+                    ) from exc
+                raise HoldStateError(f"could not claim {label}: {exc}") from exc
+
+            try:
+                view = memoryview(expected)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(f"short write while claiming {label}")
+                    view = view[written:]
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise HoldStateError(f"could not claim {label}: {exc}") from exc
+            finally:
+                os.close(descriptor)
+            HoldStore._fsync_witness_directory(path)
+            if read_existing() != expected:
+                raise HoldStateError(f"could not persist {label}")
+    except PrivateStorageError as exc:
+        raise HoldStateError(f"could not serialize {label}: {exc}") from exc
 
 
 def claim_hold_backend_custody(
     control_db_path: str | Path,
     backend: str,
+    *,
+    postgres_pair_id: UUID | None = None,
+    postgres_primary_cluster_identity: str | None = None,
+    postgres_evidence_cluster_identity: str | None = None,
 ) -> Path:
     """Immutably bind an installation to one Hold storage backend.
 
@@ -4475,56 +4841,127 @@ def claim_hold_backend_custody(
     database = absolute_without_following_leaf(Path(control_db_path))
     binding_path = hold_backend_binding_path(database)
     expected = _HOLD_BACKEND_BINDING_HEADER + selected.encode("ascii") + b"\n"
-
-    def read_binding() -> bytes | None:
-        return HoldStore._read_file_evidence(
-            binding_path,
-            label="Hold backend custody binding",
-            max_bytes=_HOLD_BACKEND_BINDING_MAX_BYTES,
+    validate_hold_backend_custody(database, selected)
+    if selected == "postgres":
+        if (
+            not isinstance(postgres_pair_id, UUID)
+            or not isinstance(postgres_primary_cluster_identity, str)
+            or not isinstance(postgres_evidence_cluster_identity, str)
+        ):
+            raise HoldStateError(
+                "PostgreSQL Hold backend custody requires a cluster-bound pair "
+                "identity"
+            )
+        pair_path = hold_postgres_pair_binding_path(database)
+        _claim_exact_hold_custody_file(
+            pair_path,
+            _postgres_pair_binding_payload(
+                postgres_pair_id,
+                postgres_primary_cluster_identity,
+                postgres_evidence_cluster_identity,
+            ),
+            label="PostgreSQL Hold external pair binding",
+            max_bytes=_POSTGRES_PAIR_BINDING_MAX_BYTES,
         )
-
-    if validate_hold_backend_custody(database, selected):
-        return binding_path
-
-    try:
-        ensure_private_directory(
-            binding_path.parent,
-            label="Hold custody evidence",
+    elif any(
+        value is not None
+        for value in (
+            postgres_pair_id,
+            postgres_primary_cluster_identity,
+            postgres_evidence_cluster_identity,
         )
-        descriptor = open_private_file(
-            binding_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            label="Hold backend custody binding",
+    ):
+        raise HoldStateError(
+            "a PostgreSQL pair identity is invalid for SQLite Hold custody"
         )
-    except PrivateStorageError as exc:
-        # A peer may have won the immutable create.  Re-read its complete claim
-        # and accept only the identical backend.
-        if path_exists(binding_path):
-            existing = read_binding()
-            if existing == expected:
-                return binding_path
-            raise HoldCorruptStateError(
-                "Hold backend switch conflicts with durable custody binding; "
-                "a verified migration is required"
-            ) from exc
-        raise HoldStateError(f"could not claim Hold backend custody: {exc}") from exc
-
-    try:
-        view = memoryview(expected)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write while claiming Hold backend custody")
-            view = view[written:]
-        os.fsync(descriptor)
-    except OSError as exc:
-        raise HoldStateError(f"could not claim Hold backend custody: {exc}") from exc
-    finally:
-        os.close(descriptor)
-    HoldStore._fsync_witness_directory(binding_path)
-    if read_binding() != expected:
-        raise HoldStateError("could not persist Hold backend custody binding")
+    _claim_exact_hold_custody_file(
+        binding_path,
+        expected,
+        label="Hold backend custody binding",
+        max_bytes=_HOLD_BACKEND_BINDING_MAX_BYTES,
+    )
+    validate_hold_backend_custody(database, selected)
     return binding_path
+
+
+def claim_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    *,
+    internal_pair_id: UUID | None,
+    primary_cluster_identity: str,
+    evidence_cluster_identity: str,
+) -> UUID:
+    """Claim or recover one external PostgreSQL pair before database writes."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    if validate_postgres_hold_pair_custody(
+        database,
+        internal_pair_id=internal_pair_id,
+        primary_cluster_identity=primary_cluster_identity,
+        evidence_cluster_identity=evidence_cluster_identity,
+    ):
+        existing = _read_postgres_pair_binding(database, harden_custody=True)
+        assert existing is not None
+        pair_id = existing[0]
+    else:
+        pair_id = internal_pair_id or uuid4()
+    try:
+        claim_hold_backend_custody(
+            database,
+            "postgres",
+            postgres_pair_id=pair_id,
+            postgres_primary_cluster_identity=primary_cluster_identity,
+            postgres_evidence_cluster_identity=evidence_cluster_identity,
+        )
+    except HoldCorruptStateError:
+        # A same-host peer can win the first immutable create after our
+        # read-only probe. Adopt it only when it names these exact clusters and
+        # remains compatible with any already-published database pair UUID.
+        if not validate_postgres_hold_pair_custody(
+            database,
+            internal_pair_id=internal_pair_id,
+            primary_cluster_identity=primary_cluster_identity,
+            evidence_cluster_identity=evidence_cluster_identity,
+        ):
+            raise
+        winner = _read_postgres_pair_binding(database, harden_custody=True)
+        assert winner is not None
+        pair_id = winner[0]
+        claim_hold_backend_custody(
+            database,
+            "postgres",
+            postgres_pair_id=pair_id,
+            postgres_primary_cluster_identity=primary_cluster_identity,
+            postgres_evidence_cluster_identity=evidence_cluster_identity,
+        )
+    return pair_id
+
+
+def commit_postgres_hold_pair_custody(
+    control_db_path: str | Path,
+    pair_id: UUID,
+) -> Path:
+    """Mark a pair committed only after both internal roles are durable."""
+
+    database = absolute_without_following_leaf(Path(control_db_path))
+    binding = _read_postgres_pair_binding(database, harden_custody=True)
+    if binding is None or binding[0] != pair_id:
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair cannot commit without its matching external "
+            "binding"
+        )
+    if not validate_hold_backend_custody(database, "postgres"):
+        raise HoldCorruptStateError(
+            "PostgreSQL Hold pair cannot commit without backend custody"
+        )
+    path = hold_postgres_pair_commit_path(database)
+    _claim_exact_hold_custody_file(
+        path,
+        _POSTGRES_PAIR_COMMIT_HEADER + str(pair_id).encode("ascii") + b"\n",
+        label="PostgreSQL Hold external pair commit",
+        max_bytes=_POSTGRES_PAIR_COMMIT_MAX_BYTES,
+    )
+    return path
 
 
 @contextmanager
@@ -4699,70 +5136,14 @@ def _validate_sqlite_creation_parent(
 ) -> None:
     """Predict whether runtime can create a fresh private control database."""
 
-    parent = database.parent
-    if path_exists(parent):
-        runtime_will_harden_parent = False
-        if not runtime_hardens_parent:
-            require_private_directory(parent, label="host database")
-        else:
-            try:
-                parent_stat = parent.lstat()
-            except OSError as exc:
-                raise HoldStateError(
-                    f"cannot inspect host database directory {parent}: {exc}"
-                ) from exc
-            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
-                parent_stat.st_mode
-            ):
-                raise HoldStateError(
-                    "host database custody path must be a real directory, "
-                    f"not a link or special file: {parent}"
-                )
-            if os.name != "nt" and stat.S_IMODE(parent_stat.st_mode) != 0o700:
-                effective_uid = getattr(os, "geteuid", lambda: parent_stat.st_uid)()
-                if effective_uid not in (0, parent_stat.st_uid):
-                    raise HoldStateError(
-                        "host database directory cannot be restricted to mode "
-                        f"0700 by this runtime: {parent}"
-                    )
-                runtime_will_harden_parent = True
-        if (
-            not runtime_will_harden_parent
-            and not os.access(parent, os.W_OK | os.X_OK)
-        ):
-            raise HoldStateError(
-                f"host database directory is not writable by this runtime: {parent}"
-            )
-        return
+    from kestrel_sovereign.host_features.storage import (
+        validate_host_database_parent_readiness,
+    )
 
-    # Runtime creates a missing suffix one private directory at a time. Doctor
-    # stays read-only, so prove that the nearest existing ancestor can admit
-    # that creation without touching it.
-    ancestor = parent
-    while not path_exists(ancestor):
-        next_ancestor = ancestor.parent
-        if next_ancestor == ancestor:
-            raise HoldStateError(
-                f"host database directory has no existing ancestor: {parent}"
-            )
-        ancestor = next_ancestor
-    try:
-        ancestor_stat = ancestor.lstat()
-    except OSError as exc:
-        raise HoldStateError(
-            f"cannot inspect host database parent {ancestor}: {exc}"
-        ) from exc
-    if stat.S_ISLNK(ancestor_stat.st_mode) or not stat.S_ISDIR(
-        ancestor_stat.st_mode
-    ):
-        raise HoldStateError(
-            "host database parent must be a real directory, not a link or "
-            f"special file: {ancestor}"
-        )
-    if not os.access(ancestor, os.W_OK | os.X_OK):
-        raise HoldStateError(
-            f"host database parent is not writable by this runtime: {ancestor}"
-        )
+    validate_host_database_parent_readiness(
+        database,
+        runtime_hardens_parent=runtime_hardens_parent,
+    )
 
 
 def _validate_sqlite_custody_readiness(
@@ -5024,6 +5405,7 @@ def validate_sqlite_hold_readiness(
 
 __all__ = [
     "HOST_HOLD_TARGET",
+    "POSTGRES_HOLD_PAIR_ID_ENV",
     "EffectiveHoldState",
     "HoldAction",
     "HoldCorruptStateError",
@@ -5037,11 +5419,13 @@ __all__ = [
     "HoldStateError",
     "HoldStore",
     "claim_hold_backend_custody",
+    "configured_postgres_hold_pair_id",
     "hold_backend_binding_path",
     "hold_sqlite_custody_marker_path",
     "validate_hold_database_snapshot",
     "validate_hold_backend_custody",
     "validate_hold_readiness_snapshot",
+    "validate_external_postgres_hold_pair_id",
     "validate_postgres_hold_readiness_snapshot",
     "validate_sqlite_hold_readiness",
 ]

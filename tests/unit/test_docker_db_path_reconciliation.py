@@ -10,10 +10,28 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CANONICAL_AGENT_DATA_DIR = "/app/agent_data"
+UV_RUNTIME_DOCKERFILES = (
+    "Dockerfile",
+    "Dockerfile.agent.remote",
+    "docker/Dockerfile.cloudrun",
+    "docker/Dockerfile.gpu",
+    "docker/Dockerfile.multi_agent",
+    "docker/Dockerfile.remote",
+    "docker/Dockerfile.sovereign",
+    "docker/Dockerfile.standalone",
+)
 
 
 def _read(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def test_runtime_images_install_uv_hold_filesystem_sandbox():
+    """Every Linux runtime that exposes UV compute carries bubblewrap."""
+
+    for dockerfile in UV_RUNTIME_DOCKERFILES:
+        lines = {line.strip() for line in _read(dockerfile).splitlines()}
+        assert "bubblewrap \\" in lines, dockerfile
 
 
 def test_single_agent_dockerfiles_use_agent_data_dir_for_db_path():
