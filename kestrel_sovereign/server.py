@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.api_errors import (
     api_error_response,
     api_unhandled_exception_handler,
@@ -571,6 +572,7 @@ def get_api_key():
     if not api_key:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
+        mark_ephemeral_sovereign_key(generated_key)
         logger.warning("⚠️  NO KESTREL_API_KEY SET. A temporary key has been generated.")
         logger.warning("Please set KESTREL_API_KEY in your environment for persistence.")
         return generated_key
