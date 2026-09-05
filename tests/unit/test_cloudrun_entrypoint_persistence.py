@@ -108,6 +108,52 @@ printf '%s\0%s\0%s\0' "$AGENT_DATA_DIR" "$HOST_CONTROL_DIR" "$decision"
     assert decision == b"excluded"
 
 
+def test_multi_agent_entrypoint_marks_only_fallback_host_path_as_derived(
+    tmp_path,
+):
+    """Launcher defaults migrate prior state; operator overrides remain explicit."""
+
+    script = (REPO_ROOT / "docker/multi_agent_entrypoint.sh").read_text()
+    setup = script.split(
+        'if [ "$PERSISTENCE_MODE" = "durable_sovereign" ]',
+        1,
+    )[0]
+    setup = setup.replace("/app/.venv/bin/python", shlex.quote(sys.executable))
+    agent_data_dir = tmp_path / "agent_data"
+
+    def resolved_paths(host_path=None):
+        env = os.environ.copy()
+        env["KESTREL_AGENT_DATA_DIR"] = str(agent_data_dir)
+        if host_path is None:
+            env.pop("KESTREL_HOST_DB_PATH", None)
+        else:
+            env["KESTREL_HOST_DB_PATH"] = str(host_path)
+        env["KESTREL_DERIVED_HOST_DB_PATH"] = "stale-inherited-marker"
+        probe = setup + r'''
+printf '%s\0%s\0' "$KESTREL_HOST_DB_PATH" "${KESTREL_DERIVED_HOST_DB_PATH:-}"
+'''
+        result = subprocess.run(
+            ["bash", "-c", probe],
+            cwd=tmp_path,
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        selected, derived, _ = result.stdout.split(b"\0")
+        return selected.decode(), derived.decode()
+
+    fallback, fallback_marker = resolved_paths()
+    assert fallback == str(
+        (agent_data_dir / "host-data" / "host-features.db").resolve()
+    )
+    assert fallback_marker == fallback
+
+    explicit = tmp_path / "operator-host" / "host.db"
+    selected, explicit_marker = resolved_paths(explicit)
+    assert selected == str(explicit)
+    assert explicit_marker == ""
+
+
 def test_multi_agent_entrypoint_refuses_existing_agent_at_host_control_root(
     tmp_path,
 ):

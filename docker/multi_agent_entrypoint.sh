@@ -48,7 +48,16 @@ paths_overlap() {
     return 1
 }
 AGENT_DATA_DIR="$(canonicalize_path "$AGENT_DATA_DIR")"
-export KESTREL_HOST_DB_PATH="${KESTREL_HOST_DB_PATH:-$AGENT_DATA_DIR/host-data/host-features.db}"
+if [ -n "${KESTREL_HOST_DB_PATH:-}" ]; then
+    # An operator-selected path owns its migration policy. Never let an
+    # inherited internal marker make that explicit override look derived.
+    unset KESTREL_DERIVED_HOST_DB_PATH
+else
+    export KESTREL_HOST_DB_PATH="$AGENT_DATA_DIR/host-data/host-features.db"
+    # The entrypoint selected this from the persistent data-root default.
+    # Preserve implicit upgrade migration from the previous host-data path.
+    export KESTREL_DERIVED_HOST_DB_PATH="$KESTREL_HOST_DB_PATH"
+fi
 HOST_CONTROL_DIR="$(dirname -- "$KESTREL_HOST_DB_PATH")"
 HOST_CONTROL_DIR="$(canonicalize_path "$HOST_CONTROL_DIR")"
 

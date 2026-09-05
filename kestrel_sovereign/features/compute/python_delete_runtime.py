@@ -69,6 +69,7 @@ def install_safe_delete_runtime(
     original_rename = _os.rename
     original_replace = _os.replace
     original_truncate = _os.truncate
+    original_os_open = _os.open
     original_open = _builtins.open
     original_rmtree = _shutil.rmtree
     original_path_open = _Path.open
@@ -251,6 +252,29 @@ def install_safe_delete_runtime(
             return original_open(resolved, mode, *args, **kwargs)
         return original_open(file, mode, *args, **kwargs)
 
+    def safe_os_open(file, flags, mode=0o777, *, dir_fd=None):
+        mutation_flags = (
+            _os.O_WRONLY
+            | _os.O_RDWR
+            | _os.O_APPEND
+            | _os.O_CREAT
+            | _os.O_TRUNC
+            | getattr(_os, "O_TMPFILE", 0)
+        )
+        if isinstance(flags, int) and flags & mutation_flags:
+            try:
+                lexical = _Path(file).expanduser()
+            except TypeError:
+                return original_os_open(file, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None and not lexical.is_absolute():
+                raise ValueError(
+                    "Safe write open does not support relative paths with dir_fd"
+                )
+            resolved = lexical.resolve(strict=False)
+            assert_agent_data_allowed(resolved, "os_open_write")
+            return original_os_open(resolved, flags, mode, dir_fd=dir_fd)
+        return original_os_open(file, flags, mode, dir_fd=dir_fd)
+
     def path_safe_open(self, mode="r", *args, **kwargs):
         if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
             resolved = _Path(self).expanduser().resolve(strict=False)
@@ -282,6 +306,7 @@ def install_safe_delete_runtime(
     _os.rename = safe_rename
     _os.replace = safe_replace
     _os.truncate = safe_truncate
+    _os.open = safe_os_open
     _builtins.open = safe_open
     _shutil.rmtree = safe_rmtree
 

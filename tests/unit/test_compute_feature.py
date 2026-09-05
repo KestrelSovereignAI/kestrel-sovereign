@@ -747,6 +747,61 @@ class TestDestructivePolicy:
         else:
             assert target.read_bytes() == b"sovereign state"
 
+    @pytest.mark.parametrize(
+        ("flags", "target_exists"),
+        [
+            ("os.O_WRONLY", True),
+            ("os.O_RDWR", True),
+            ("os.O_WRONLY | os.O_APPEND", True),
+            ("os.O_WRONLY | os.O_TRUNC", True),
+            ("os.O_RDONLY | os.O_CREAT", False),
+        ],
+    )
+    def test_python_wrapper_blocks_mutating_os_open_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        flags,
+        target_exists,
+    ):
+        """Low-level descriptor opens cannot bypass the Host/Hold boundary."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        if target_exists:
+            target.write_bytes(b"sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "os-open.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"descriptor = os.open({str(target)!r}, {flags})\n"
+                "os.close(descriptor)\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        if target_exists:
+            assert target.read_bytes() == b"sovereign state"
+        else:
+            assert not target.exists()
+
     def test_rewrite_bash_blocks_mv_of_other_agent_data(self, temp_trash_dir, tmp_path):
         """Test shell mv cannot relocate another agent's data directory."""
         current = tmp_path / "agent_data" / "emma"

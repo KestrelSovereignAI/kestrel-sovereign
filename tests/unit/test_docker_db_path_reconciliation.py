@@ -39,10 +39,16 @@ def test_multi_agent_image_persists_host_control_database_on_agent_volume():
     entrypoint = _read("docker/multi_agent_entrypoint.sh")
 
     assert "ENV KESTREL_HOST_DB_PATH=" not in text
+    assert 'if [ -n "${KESTREL_HOST_DB_PATH:-}" ]; then' in entrypoint
+    assert "unset KESTREL_DERIVED_HOST_DB_PATH" in entrypoint
     assert (
-        'export KESTREL_HOST_DB_PATH="${KESTREL_HOST_DB_PATH:-'
-        '$AGENT_DATA_DIR/host-data/host-features.db}"'
-    ) in entrypoint
+        'export KESTREL_HOST_DB_PATH="$AGENT_DATA_DIR/host-data/host-features.db"'
+        in entrypoint
+    )
+    assert (
+        'export KESTREL_DERIVED_HOST_DB_PATH="$KESTREL_HOST_DB_PATH"'
+        in entrypoint
+    )
 
 
 def test_compose_mount_and_env_point_to_same_agent_data_dir():
