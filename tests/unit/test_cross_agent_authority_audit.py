@@ -2243,6 +2243,28 @@ def _route_declarations(
 
     declarations: list[tuple[tuple[str, ...], str]] = []
 
+    # Function and top-level class-method bodies execute after module setup and
+    # therefore resolve global router objects and bound registration callables
+    # from the module's final state. Decorators still execute at definition
+    # time and are handled from their source-ordered snapshots below.
+    module_runtime_prefixes: dict[str, str] = {}
+    for index, statement in enumerate(tree.body):
+        preceding = ast.Module(body=tree.body[:index], type_ignores=[])
+        active_strings = _module_string_constants(preceding, source_path)
+        for receiver, prefix in _scope_router_prefixes(
+            [statement], active_strings
+        ).items():
+            previous = module_runtime_prefixes.get(receiver)
+            if previous is not None and previous != prefix:
+                raise AssertionError(
+                    "Ambiguous APIRouter prefix for "
+                    f"{receiver!r}: {previous!r} and {prefix!r}"
+                )
+            module_runtime_prefixes[receiver] = prefix
+    module_runtime_route_aliases = _scope_route_callable_aliases(
+        tree.body, module_runtime_prefixes
+    )
+
     def module_router_reference_is_static(
         expression: ast.AST | None,
         call: ast.Call,
@@ -2309,6 +2331,7 @@ def _route_declarations(
         inherited_route_aliases: dict[str, tuple[str, str]],
         *,
         module_scope: bool = False,
+        class_body_uses_module_globals: bool = False,
     ) -> None:
         prefixes = dict(inherited_prefixes)
 
@@ -2367,21 +2390,36 @@ def _route_declarations(
                         (methods, prefix + _route_path(decorator, active_strings))
                     )
                 # Top-level function bodies run after module initialization,
-                # while nested bodies close over the bindings visible in
-                # their containing execution scope. In both cases replay the
-                # body's own assignments from that correct lexical floor.
+                # as do methods defined in a top-level class. Nested functions
+                # instead close over the bindings visible in their containing
+                # execution scope. Replay the body's own assignments from that
+                # correct lexical floor in every case.
                 child_strings = (
-                    string_constants if module_scope else active_strings
+                    string_constants
+                    if module_scope or class_body_uses_module_globals
+                    else active_strings
                 )
                 child_methods = (
-                    method_constants if module_scope else active_methods
+                    method_constants
+                    if module_scope or class_body_uses_module_globals
+                    else active_methods
+                )
+                child_prefixes = (
+                    module_runtime_prefixes
+                    if module_scope or class_body_uses_module_globals
+                    else prefixes
+                )
+                child_route_aliases = (
+                    module_runtime_route_aliases
+                    if module_scope or class_body_uses_module_globals
+                    else active_route_aliases
                 )
                 walk_scope(
                     node.body,
-                    prefixes,
+                    child_prefixes,
                     child_strings,
                     child_methods,
-                    active_route_aliases,
+                    child_route_aliases,
                 )
                 return
             if isinstance(node, ast.ClassDef):
@@ -2391,9 +2429,59 @@ def _route_declarations(
                     active_strings,
                     active_methods,
                     active_route_aliases,
+                    class_body_uses_module_globals=(
+                        module_scope or class_body_uses_module_globals
+                    ),
                 )
                 return
             if isinstance(node, ast.Call):
+                decorator_factory = (
+                    node.func if isinstance(node.func, ast.Call) else None
+                )
+                factory_registration = (
+                    _route_registration_name(
+                        decorator_factory, active_route_aliases
+                    )
+                    if decorator_factory is not None
+                    else None
+                )
+                if factory_registration in {
+                    "api_route",
+                    "delete",
+                    "get",
+                    "head",
+                    "options",
+                    "patch",
+                    "post",
+                    "put",
+                    "route",
+                    "trace",
+                    "websocket",
+                    "websocket_route",
+                }:
+                    receiver = _route_receiver_name(
+                        decorator_factory, active_route_aliases
+                    )
+                    if receiver == "app":
+                        prefix = ""
+                    elif receiver is not None and receiver in prefixes:
+                        prefix = prefixes[receiver]
+                    else:
+                        raise AssertionError(
+                            "Unresolved route decorator-factory receiver: "
+                            f"{ast.unparse(decorator_factory.func)}"
+                        )
+                    declarations.append(
+                        (
+                            _route_methods(
+                                decorator_factory,
+                                active_methods,
+                                active_route_aliases,
+                            ),
+                            prefix
+                            + _route_path(decorator_factory, active_strings),
+                        )
+                    )
                 registration = _route_registration_name(
                     node, active_route_aliases
                 )
@@ -3553,6 +3641,37 @@ def test_route_declarations_replay_nested_lexical_constants() -> None:
     ]
 
 
+def test_class_method_route_registrations_use_final_module_globals() -> None:
+    tree = ast.parse(
+        'PATH = "/health"\n'
+        'METHODS = ["GET"]\n'
+        'ALIAS_PATH = "/health"\n'
+        'publish = noop\n'
+        'class Routes:\n'
+        '    @app.get(PATH)\n'
+        '    def static_decorator(self):\n'
+        '        pass\n\n'
+        '    def mount(self, app):\n'
+        '        app.add_api_route(PATH, endpoint, methods=METHODS)\n\n'
+        '    def mount_alias(self):\n'
+        '        publish(ALIAS_PATH)(endpoint)\n\n'
+        'PATH = "/api/agents/{name}/terminate"\n'
+        'METHODS = ["POST", "DELETE"]\n'
+        'ALIAS_PATH = "/api/agents/{name}/restart"\n'
+        'publish = app.patch\n'
+    )
+
+    assert _route_declarations(
+        tree,
+        _module_string_constants(tree),
+        _module_string_collections(tree),
+    ) == [
+        (("GET",), "/health"),
+        (("POST", "DELETE"), "/api/agents/{name}/terminate"),
+        (("PATCH",), "/api/agents/{name}/restart"),
+    ]
+
+
 def test_route_decorator_resolves_positional_methods_and_fails_closed() -> None:
     tree = ast.parse(
         '_MUTATIONS = ["POST", "DELETE"]\n'
@@ -3608,6 +3727,26 @@ def test_programmatic_route_registrations_and_mounts_are_inventoried() -> None:
         (("WEBSOCKET",), "/api-events"),
         (("PATCH",), "/host/mutate"),
         (("MOUNT",), "<dynamic:mount_path>"),
+    ]
+
+
+def test_decorator_factory_route_registrations_are_inventoried() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'app.post("/api/agents/{agent}/stop")(handler)\n'
+        'router.api_route(\n'
+        '    "/agents/{agent}/hold", methods=["POST", "DELETE"]\n'
+        ')(handler)\n'
+        'router.websocket("/agents/{agent}/events")(socket_handler)\n'
+        'publish = app.patch\n'
+        'publish("/api/agents/{agent}/restart")(handler)\n'
+    )
+
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST",), "/api/agents/{agent}/stop"),
+        (("POST", "DELETE"), "/api/agents/{agent}/hold"),
+        (("WEBSOCKET",), "/api/agents/{agent}/events"),
+        (("PATCH",), "/api/agents/{agent}/restart"),
     ]
 
 
@@ -5152,6 +5291,18 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             if resolved is not None
             else {"dynamic_control_attribute"}
         )
+    if factory_name == "get" and isinstance(node.func, ast.Attribute):
+        sources = _control_reference_sources(node.func.value)
+        if node.args:
+            key = _resolved_string(node.args[0])
+            if key is not None:
+                sources.add(key.casefold())
+        for default in [
+            *node.args[1:],
+            *(keyword.value for keyword in node.keywords),
+        ]:
+            sources.update(_control_reference_sources(default))
+        return sources
     if factory_name in {"partial", "partialmethod"} and node.args:
         return _control_reference_sources(node.args[0])
     return set()
@@ -7950,6 +8101,40 @@ def test_provenance_scanner_follows_controls_stored_in_containers() -> None:
     assert _authority_provenance_lines(aliased_callback) == {5}
     assert _authority_provenance_lines(attribute_callback) == {3}
     assert _authority_provenance_lines(rebound_alias_callback) == {6}
+
+
+def test_provenance_scanner_follows_controls_selected_with_mapping_get() -> None:
+    assigned_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {'run': terminate_child}\n"
+        "    callback = callbacks.get('run')\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    direct_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {'run': stop_peer}\n"
+        "    if request.orchestrator:\n"
+        "        callbacks.get('run')(target)\n"
+    )
+    benign_callback = ast.parse(
+        "def dispatch(request, target):\n"
+        "    callbacks = {'run': record_metric}\n"
+        "    callback = callbacks.get('run')\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+    fallback_callback = ast.parse(
+        "def dispatch(request, callbacks, target):\n"
+        "    callback = callbacks.get('run', terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n"
+    )
+
+    assert _authority_provenance_lines(assigned_callback) == {4}
+    assert _authority_provenance_lines(direct_callback) == {3}
+    assert _authority_provenance_lines(benign_callback) == set()
+    assert _authority_provenance_lines(fallback_callback) == {3}
 
 
 def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> None:
