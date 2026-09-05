@@ -221,6 +221,7 @@ class DeliveryQueue:
                 recipient=recipient,
                 content=content,
                 retries=retries,
+                requested_max_retries=max_retries,
                 idempotency_key=idempotency_key,
             )
 
@@ -282,6 +283,7 @@ class DeliveryQueue:
         recipient: str,
         content: Dict[str, Any],
         retries: int,
+        requested_max_retries: Optional[int],
         idempotency_key: str,
     ) -> str:
         """Atomically insert or adopt an owner-scoped logical delivery."""
@@ -305,7 +307,9 @@ class DeliveryQueue:
                 "channel_type": channel_type,
                 "recipient": recipient,
                 "content": json.loads(content_json),
-                "max_retries": retries,
+                # Preserve the caller's request identity across restarts even
+                # if this queue instance's configured default has changed.
+                "max_retries": requested_max_retries,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -378,6 +382,13 @@ class DeliveryQueue:
                     # instead of opening a savepoint. Compensate the claim here
                     # so a caller that catches this failure and commits its
                     # outer transaction cannot poison the replay key.
+                    await self._db.execute(
+                        """
+                        DELETE FROM delivery_queue
+                        WHERE id = ? AND agent_id = ?
+                        """,
+                        (entry_id, self._agent_id),
+                    )
                     await self._db.execute(
                         """
                         DELETE FROM delivery_idempotency

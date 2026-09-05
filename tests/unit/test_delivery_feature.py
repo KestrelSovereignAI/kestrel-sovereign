@@ -766,6 +766,32 @@ class TestQueueIdempotency:
         assert replay == first
 
     @pytest.mark.asyncio
+    async def test_omitted_retry_default_remains_stable_after_restart(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        first = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="stable-omitted-default",
+        )
+
+        restarted = DeliveryQueue(
+            queue._db,
+            queue._agent_id,
+            max_retries=99,
+        )
+        replay = await restarted.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="stable-omitted-default",
+        )
+
+        assert replay == first
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["", "x" * 4097])
     async def test_invalid_idempotency_key_is_rejected(self, real_queue, key):
         queue, _ = real_queue
@@ -898,6 +924,48 @@ class TestQueueIdempotency:
             "person@example.com",
             {"body": "hello"},
             idempotency_key="retry-after-nested-failure",
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_cancel_compensates_queue_row_and_claim(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+        inserted_then_cancelled = False
+
+        async def ambiguous_execute(sql, params=()):
+            nonlocal inserted_then_cancelled
+            result = await original_execute(sql, params)
+            if "INSERT INTO delivery_queue" in sql and not inserted_then_cancelled:
+                inserted_then_cancelled = True
+                raise asyncio.CancelledError
+            return result
+
+        async with queue._db.transaction(immediate=True):
+            with patch.object(queue._db, "execute", side_effect=ambiguous_execute):
+                with pytest.raises(asyncio.CancelledError):
+                    await queue.enqueue(
+                        "email",
+                        "person@example.com",
+                        {"body": "hello"},
+                        idempotency_key="retry-after-ambiguous-cancel",
+                    )
+
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+
+        assert await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-after-ambiguous-cancel",
         )
 
 
