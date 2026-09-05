@@ -444,7 +444,8 @@ def _is_indirect_tool_dispatcher(
     )
 
 
-def _discovered_tool_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_tool_surfaces() -> frozenset[str]:
     """Return every core feature tool, including generated dispatch boundaries.
 
     Cross-agent capability is a property of implementation and deployment,
@@ -473,10 +474,11 @@ def _discovered_tool_surfaces() -> set[str]:
                     continue
                 relative = path.relative_to(REPO_ROOT).as_posix()
                 surfaces.add(f"{relative}::{public_name}")
-    return surfaces | _discovered_runtime_generated_tool_surfaces()
+    return frozenset(surfaces | _discovered_runtime_generated_tool_surfaces())
 
 
-def _discovered_scheduler_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_scheduler_surfaces() -> frozenset[str]:
     """Inventory every cron target and every bespoke handler wired to it."""
 
     source_path = REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
@@ -576,7 +578,7 @@ def _discovered_scheduler_surfaces() -> set[str]:
             + ", ".join(sorted(missing_functions))
         )
 
-    return {
+    return frozenset({
         *(
             f"kestrel_sovereign/signals/sources/scheduler.py::cron.{name}"
             for name in task_names
@@ -585,7 +587,7 @@ def _discovered_scheduler_surfaces() -> set[str]:
             f"kestrel_sovereign/features/scheduler/feature.py::{name}"
             for name in builtin_handlers.values()
         ),
-    }
+    })
 
 
 def _resolved_source_factory_call_names(
@@ -645,7 +647,50 @@ def _resolved_source_factory_call_names(
     return names
 
 
-def _discovered_core_signal_source_surfaces() -> set[str]:
+def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
+    """Resolve import and assignment aliases for source constructors."""
+
+    aliases = {"SourceRegistration"}
+    assignments: list[tuple[str, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            for imported in node.names:
+                if imported.name == "SourceRegistration":
+                    aliases.add(imported.asname or imported.name)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Name)
+        ):
+            assignments.append((node.targets[0].id, node.value.id))
+    changed = True
+    while changed:
+        changed = False
+        for target, source in assignments:
+            if source in aliases and target not in aliases:
+                aliases.add(target)
+                changed = True
+    return aliases
+
+
+def _source_registration_constructors(tree: ast.Module) -> list[ast.Call]:
+    """Return source constructors, including neutrally named local aliases."""
+
+    aliases = _source_registration_constructor_aliases(tree)
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            _call_name(node).endswith("SourceRegistration")
+            or _call_name(node) in aliases
+        )
+    ]
+
+
+@lru_cache(maxsize=None)
+def _discovered_core_signal_source_surfaces() -> frozenset[str]:
     """Inventory every core ``SourceRegistration`` plus cron handlers.
 
     Source registrations are execution boundaries even when they are neither
@@ -656,18 +701,13 @@ def _discovered_core_signal_source_surfaces() -> set[str]:
     contract rather than disappearing from the audit.
     """
 
-    surfaces = _discovered_scheduler_surfaces()
+    surfaces = set(_discovered_scheduler_surfaces())
     scheduler_path = (
         REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
     )
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        constructors = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and _call_name(node).endswith("SourceRegistration")
-        ]
+        constructors = _source_registration_constructors(tree)
         if not constructors:
             continue
         if path == scheduler_path:
@@ -731,7 +771,7 @@ def _discovered_core_signal_source_surfaces() -> set[str]:
                     f"{relative}: {ast.unparse(name_expression)}"
                 )
             surfaces.update(f"{relative}::{name}" for name in names)
-    return surfaces
+    return frozenset(surfaces)
 
 
 def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
@@ -852,7 +892,8 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
     return writers
 
 
-def _discovered_runtime_generated_tool_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
     """Find core execution boundaries whose public names are runtime data.
 
     ``Feature.get_tools`` creates ``DynamicTool`` wrappers for the statically
@@ -976,10 +1017,11 @@ def _discovered_runtime_generated_tool_surfaces() -> set[str]:
             "kestrel_sovereign/kestrel_agent.py::"
             "KestrelAgent._handle_constitution_receipt_tool"
         )
-    return surfaces
+    return frozenset(surfaces)
 
 
-def _discovered_builtin_command_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_builtin_command_surfaces() -> frozenset[str]:
     """Return every built-in command, including apparently local commands.
 
     Built-in commands bypass feature ``@tool`` discovery.  They therefore need
@@ -993,7 +1035,7 @@ def _discovered_builtin_command_surfaces() -> set[str]:
         if not isinstance(command, str):
             continue
         surfaces.add(f"kestrel_sovereign/command_handler.py::{command}")
-    return surfaces
+    return frozenset(surfaces)
 
 
 def _core_cli_command_names(
@@ -1029,7 +1071,8 @@ def _core_cli_command_names(
     raise AssertionError("Could not find the core CLI command dispatch dictionary")
 
 
-def _discovered_core_cli_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_core_cli_surfaces() -> frozenset[str]:
     """Return every command dispatched by the canonical core CLI.
 
     The complete dispatch dictionary is intentionally inventoried, including
@@ -1043,13 +1086,14 @@ def _discovered_core_cli_surfaces() -> set[str]:
     cli_path = REPO_ROOT / "kestrel_sovereign/cli.py"
     tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
     string_constants = _module_string_constants(tree, cli_path)
-    return {
+    return frozenset({
         f"kestrel_sovereign/cli.py::kestrel {command}"
         for command in _core_cli_command_names(tree, string_constants)
-    }
+    })
 
 
-def _discovered_dynamic_router_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_dynamic_router_surfaces() -> frozenset[str]:
     """Return every function-scoped ``include_router`` extension boundary.
 
     Decorators in out-of-tree agent and host features are unavailable to a
@@ -1104,7 +1148,7 @@ def _discovered_dynamic_router_surfaces() -> set[str]:
     for path in (REPO_ROOT / "kestrel_sovereign").rglob("*.py"):
         tree = _parsed_module(path)
         IncludeRouterVisitor(path.relative_to(REPO_ROOT).as_posix()).visit(tree)
-    return surfaces
+    return frozenset(surfaces)
 
 
 def _router_prefix(
@@ -1586,7 +1630,8 @@ def _deprecated_agent_alias(route: str) -> str | None:
     return None
 
 
-def _discovered_http_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_http_surfaces() -> frozenset[str]:
     surfaces: set[str] = set()
     roots = (
         REPO_ROOT / "kestrel_sovereign/endpoints",
@@ -1617,7 +1662,7 @@ def _discovered_http_surfaces() -> set[str]:
                 deprecated_alias = _deprecated_agent_alias(route)
                 if deprecated_alias is not None:
                     surfaces.add(f"{relative}::{method} {deprecated_alias}")
-    return surfaces
+    return frozenset(surfaces)
 
 
 def _agent_alias(route: str) -> str:
@@ -1626,7 +1671,8 @@ def _agent_alias(route: str) -> str:
     return f"/api/agents/{{selected_agent_name}}/{route.lstrip('/')}"
 
 
-def _discovered_request_routed_alias_surfaces() -> set[str]:
+@lru_cache(maxsize=None)
+def _discovered_request_routed_alias_surfaces() -> frozenset[str]:
     """Synthesize the host alias for every declared core HTTP route.
 
     The routing middleware accepts ``/api/agents/{name}/{remaining_path}`` and
@@ -1663,7 +1709,7 @@ def _discovered_request_routed_alias_surfaces() -> set[str]:
                 surfaces.add(
                     f"{relative}::{method} {_agent_alias(canonical_route)}"
                 )
-    return surfaces
+    return frozenset(surfaces)
 
 
 def _documented_surfaces(section: str) -> set[str]:
@@ -1857,6 +1903,21 @@ def test_each_source_factory_call_must_resolve_its_own_name() -> None:
             _module_string_constants(tree),
             "example.py",
         )
+
+
+def test_signal_source_constructor_import_aliases_are_resolved() -> None:
+    tree = ast.parse(
+        "from kestrel_sdk.signals import SourceRegistration as Registration\n"
+        "Registration(name='aliased.source')\n"
+    )
+
+    assert _source_registration_constructor_aliases(tree) == {
+        "SourceRegistration",
+        "Registration",
+    }
+    constructors = _source_registration_constructors(tree)
+    assert len(constructors) == 1
+    assert _call_name(constructors[0]) == "Registration"
 
 
 def test_every_dynamic_router_publication_boundary_is_classified() -> None:
@@ -2476,6 +2537,27 @@ def test_repository_scans_reuse_parsed_trees_and_analysis_summaries() -> None:
     assert _identifier_tokens(function) is _identifier_tokens(function)
 
 
+def test_repository_discovery_results_are_cached_and_immutable() -> None:
+    discoveries = (
+        _discovered_tool_surfaces,
+        _discovered_scheduler_surfaces,
+        _discovered_core_signal_source_surfaces,
+        _discovered_runtime_generated_tool_surfaces,
+        _discovered_builtin_command_surfaces,
+        _discovered_core_cli_surfaces,
+        _discovered_dynamic_router_surfaces,
+        _discovered_http_surfaces,
+        _discovered_request_routed_alias_surfaces,
+    )
+    for discover in discoveries:
+        first = discover()
+        before_second = discover.cache_info()
+        second = discover()
+        assert isinstance(first, frozenset)
+        assert second is first
+        assert discover.cache_info().hits == before_second.hits + 1
+
+
 def test_provenance_return_summaries_skip_authority_body_scans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2992,6 +3074,16 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             if element is not None
             for source in _control_reference_sources(element)
         }
+    if isinstance(node, ast.Lambda):
+        return (
+            {"lambda_control"}
+            if any(
+                isinstance(child, ast.Call)
+                and _is_unambiguous_control_sink(child)
+                for child in ast.walk(node.body)
+            )
+            else set()
+        )
     if not isinstance(node, ast.Call):
         return set()
 
@@ -3104,6 +3196,7 @@ def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_return_helpers: set[str] | None = None,
     control_helpers: set[str] | None = None,
+    initial_aliases: set[str] | None = None,
     *,
     authority_analysis: bool = True,
 ) -> tuple[set[str], set[str]]:
@@ -3191,7 +3284,7 @@ def _provenance_aliases(
             return {ast.unparse(target).casefold()}
         return set()
 
-    aliases: set[str] = set()
+    aliases: set[str] = set(initial_aliases or ())
     scope_nodes = _walk_lexical_scope(function)
     control_aliases = (
         _cross_agent_control_aliases(function, control_helpers)
@@ -3500,10 +3593,11 @@ def _provenance_aliases(
 
 def _local_control_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    imported_control_aliases: set[str] | None = None,
 ) -> set[str]:
     """Find local helpers that eventually invoke a control sink."""
 
-    helper_names: set[str] = set()
+    helper_names: set[str] = set(imported_control_aliases or ())
 
     changed = True
     while changed:
@@ -3525,6 +3619,7 @@ def _local_control_helpers(
 def _local_provenance_return_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     control_helpers: set[str] | None = None,
+    module_provenance_aliases: set[str] | None = None,
 ) -> set[str]:
     """Find local helpers whose return value is provenance-derived.
 
@@ -3545,6 +3640,7 @@ def _local_provenance_return_helpers(
                 function,
                 helper_names,
                 control_helpers,
+                module_provenance_aliases,
                 authority_analysis=False,
             )
             returns_provenance = False
@@ -3750,23 +3846,89 @@ def _guard_clause_provenance_lines(
     return lines
 
 
-def _authority_provenance_lines(tree: ast.AST) -> set[int]:
+def _module_imported_control_aliases(tree: ast.AST) -> set[str]:
+    """Return neutral local names imported from control-shaped callables."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+
+    def is_control_callable(name: str) -> bool:
+        lowered = name.casefold()
+        actions = (
+            "cancel",
+            "delegate",
+            "hold",
+            "interrupt",
+            "kill",
+            "offboard",
+            "restart",
+            "shutdown",
+            "spawn",
+            "stop",
+            "terminate",
+            "withdraw",
+        )
+        subjects = ("a2a", "agent", "child", "descendant", "fleet", "host", "peer")
+        words = set(lowered.split("_"))
+        return (
+            lowered == "kill_process"
+            or bool(words.intersection(actions))
+            or any(action in lowered for action in actions)
+            and any(subject in lowered for subject in subjects)
+        )
+
+    return {
+        (imported.asname or imported.name).casefold()
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for imported in node.names
+        if is_control_callable(imported.name)
+    }
+
+
+def _module_provenance_constant_aliases(
+    tree: ast.AST,
+    source_path: Path | None = None,
+) -> set[str]:
+    """Return names bound to static causation/display-provenance keys."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+    constants = _module_string_constants(tree, source_path)
+    return {
+        name.casefold()
+        for name, value in constants.items()
+        if _has_provenance_token(ast.Constant(value=value))
+    }
+
+
+def _authority_provenance_lines(
+    tree: ast.AST,
+    source_path: Path | None = None,
+) -> set[int]:
     lines: set[int] = set()
     functions = [
         node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    control_helpers = _local_control_helpers(functions)
+    module_control_aliases = _module_imported_control_aliases(tree)
+    module_provenance_aliases = _module_provenance_constant_aliases(
+        tree, source_path
+    )
+    control_helpers = _local_control_helpers(functions, module_control_aliases)
     provenance_return_helpers = _local_provenance_return_helpers(
-        functions, control_helpers
+        functions, control_helpers, module_provenance_aliases
     )
     for function in functions:
         function_name = function.name.casefold()
         control_aliases = _cross_agent_control_aliases(function, control_helpers)
         provenance_aliases, provenance_selected_targets = (
             _provenance_aliases(
-                function, provenance_return_helpers, control_helpers
+                function,
+                provenance_return_helpers,
+                control_helpers,
+                module_provenance_aliases,
             )
         )
         lines.update(
@@ -4004,7 +4166,9 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
         for marker in ("causation", "orchestrator", "current_chain")
     ):
         return frozenset()
-    return frozenset(_authority_provenance_lines(_parsed_module(source_path)))
+    return frozenset(
+        _authority_provenance_lines(_parsed_module(source_path), source_path)
+    )
 
 
 def test_direct_provenance_authority_patterns_are_detected() -> None:
@@ -4578,6 +4742,51 @@ def test_provenance_scanner_follows_callable_control_factories() -> None:
     assert _authority_provenance_lines(getattr_callback) == {3}
     assert _authority_provenance_lines(partial_callback) == {5}
     assert _authority_provenance_lines(direct_getattr) == {2}
+
+
+def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> None:
+    imported_alias = ast.parse(
+        "from lifecycle import terminate_child as apply\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n"
+    )
+    lambda_callback = ast.parse(
+        "def dispatch(request, manager, target):\n"
+        "    callback = lambda: manager.terminate_child(target)\n"
+        "    if request.causation_chain:\n"
+        "        callback()\n"
+    )
+
+    assert _authority_provenance_lines(imported_alias) == {4}
+    assert _authority_provenance_lines(lambda_callback) == {3}
+
+
+def test_provenance_scanner_resolves_module_level_metadata_keys(
+    tmp_path: Path,
+) -> None:
+    module_key = ast.parse(
+        'METADATA_KEY = "causation_chain"\n\n'
+        "def dispatch(metadata, target):\n"
+        "    if metadata.get(METADATA_KEY):\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(module_key) == {4}
+
+    constants_path = tmp_path / "constants.py"
+    constants_path.write_text('METADATA_KEY = "causation_chain"\n', encoding="utf-8")
+    source_path = tmp_path / "dispatcher.py"
+    source = (
+        "from .constants import METADATA_KEY\n\n"
+        "def dispatch(metadata, target):\n"
+        "    if metadata.get(METADATA_KEY):\n"
+        "        terminate_child(target)\n"
+    )
+    source_path.write_text(source, encoding="utf-8")
+    assert _authority_provenance_lines(
+        ast.parse(source, filename=str(source_path)), source_path
+    ) == {4}
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
