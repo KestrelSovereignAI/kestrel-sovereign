@@ -16,6 +16,8 @@ import re
 import shlex
 from typing import Optional
 
+from kestrel_sovereign.host_features.storage import host_database_path
+
 from . import python_delete_runtime
 from .shell_rewriter import ShellRewriteError, ShellScriptRewriter
 
@@ -83,6 +85,14 @@ class DestructiveOperationPolicy:
         self.current_agent_data_path = (
             _resolve_path(current_agent_data_path) if current_agent_data_path else None
         )
+        # Direct single-agent mode deliberately places agent state below
+        # KESTREL_DB_PATH.  The host feature default may place sovereign Hold
+        # custody below that same persistent volume at ``host-data/``.  It is
+        # host-owned even when it is lexically inside this agent's writable
+        # root, so reserve the complete directory (DB, SQLite sidecars, Hold
+        # history, and custody marker) at the canonical destructive boundary.
+        host_db_path, _uses_default = host_database_path()
+        self.host_control_data_path = _resolve_path(host_db_path.parent)
         self.agent_data_audit_log = self.trash_dir / "agent_data_access_audit.jsonl"
 
     def audit_agent_data_access(
@@ -145,11 +155,35 @@ class DestructiveOperationPolicy:
             resolved = Path(str(path))
         return _contains_agent_data_segment(resolved)
 
+    def touches_host_hold_custody(self, path: str | Path) -> bool:
+        """Return whether mutating ``path`` could mutate host-owned custody."""
+
+        try:
+            resolved = _resolve_path(path)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        protected = self.host_control_data_path
+        return (
+            resolved == protected
+            or resolved.is_relative_to(protected)
+            or protected.is_relative_to(resolved)
+        )
+
     def assert_agent_data_deletion_allowed(
         self,
         path: str | Path,
         action: str = "delete",
     ) -> None:
+        if self.touches_host_hold_custody(path):
+            self.audit_agent_data_access(
+                path,
+                action,
+                "blocked",
+                "host_hold_custody",
+            )
+            raise AgentDataProtectionError(
+                f"Refusing to {action} host Hold custody: {_resolve_path(path)}"
+            )
         if not self.is_agent_data_path(path):
             return
         if self.is_own_agent_data_path(path):
@@ -177,6 +211,9 @@ class DestructiveOperationPolicy:
         try:
             resolved_path = _resolve_path(path)
         except (OSError, RuntimeError, ValueError):
+            return None
+
+        if self.touches_host_hold_custody(resolved_path):
             return None
 
         for configured_prefix in self.deletable_prefixes:
@@ -337,6 +374,7 @@ class DestructiveOperationPolicy:
             "_kestrel_runtime_namespace['install_safe_delete_runtime'](\n"
             f"    {trash_dir!r},\n"
             f"    {current_agent_data!r},\n"
+            f"    {str(self.host_control_data_path)!r},\n"
             f"    {self.deletable_prefixes!r},\n"
             f"    {runtime_workdir!r},\n"
             ")\n"

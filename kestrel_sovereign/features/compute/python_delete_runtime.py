@@ -39,6 +39,7 @@ def _unique_trash_subdir(trash_root: _Path) -> _Path:
 def install_safe_delete_runtime(
     trash_dir: str,
     current_agent_data_path: str | None,
+    host_control_data_path: str,
     deletable_prefixes: list[str],
     workdir: str | None,
 ) -> None:
@@ -54,6 +55,9 @@ def install_safe_delete_runtime(
         _Path(current_agent_data_path).expanduser().resolve(strict=False)
         if current_agent_data_path
         else None
+    )
+    host_control_data = (
+        _Path(host_control_data_path).expanduser().resolve(strict=False)
     )
     authorized_workdir = _Path(workdir) if workdir else None
     configured_prefixes = tuple(
@@ -96,6 +100,13 @@ def install_safe_delete_runtime(
             pass
 
     def assert_agent_data_allowed(path: _Path, action: str) -> None:
+        if _is_relative_to(path, host_control_data) or _is_relative_to(
+            host_control_data, path
+        ):
+            audit_agent_data(path, action, "blocked", "host_hold_custody")
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} host Hold custody: {path}"
+            )
         if not _is_agent_data_path(path):
             return
         if current_agent_data is not None and _is_relative_to(path, current_agent_data):
@@ -108,6 +119,10 @@ def install_safe_delete_runtime(
 
     def direct_delete_root(path: _Path) -> _Path | None:
         """Return the concrete root that owns ``path`` at operation time."""
+        if _is_relative_to(path, host_control_data) or _is_relative_to(
+            host_control_data, path
+        ):
+            return None
         for configured_prefix in configured_prefixes:
             prefix_parent = configured_prefix.parent.resolve(strict=False)
             try:

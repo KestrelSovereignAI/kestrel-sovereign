@@ -431,21 +431,54 @@ class MultiAgentConfig(BaseModel):
         for name, agent in self.agents.items():
             if not isinstance(agent, LocalAgentConfig):
                 continue
-            agent_owned_paths = [
-                ("data directory", agent.resolve_data_dir(target_base)),
-            ]
-            identity_export_dir = agent.resolve_identity_export_dir(target_base)
-            if identity_export_dir is not None:
-                agent_owned_paths.append(
-                    ("identity export directory", identity_export_dir)
+            self.validate_local_agent_host_custody(
+                name,
+                agent,
+                base_dir=target_base,
+                runtime_env=target_env,
+            )
+
+    @staticmethod
+    def validate_local_agent_host_custody(
+        name: str,
+        agent: LocalAgentConfig,
+        *,
+        base_dir: Path,
+        runtime_env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Reject one candidate before an agent-owned path can be created.
+
+        Full configuration loading uses this same boundary, but dynamic and
+        setup creation must invoke it *before* inception creates the candidate
+        directory. Pydantic field validation alone has no target-runtime path
+        context and therefore cannot enforce this custody relation.
+        """
+
+        target_base = base_dir.resolve(strict=False)
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
+        agent_owned_paths = [
+            ("data directory", agent.resolve_data_dir(target_base)),
+        ]
+        identity_export_dir = agent.resolve_identity_export_dir(target_base)
+        if identity_export_dir is not None:
+            agent_owned_paths.append(
+                ("identity export directory", identity_export_dir)
+            )
+        for label, agent_owned_path in agent_owned_paths:
+            if _paths_overlap(agent_owned_path, host_control_dir):
+                raise ValueError(
+                    f"Agent '{name}' {label} {agent_owned_path} overlaps host "
+                    f"Hold custody at {host_control_dir}. Move the agent or set "
+                    "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
                 )
-            for label, agent_owned_path in agent_owned_paths:
-                if _paths_overlap(agent_owned_path, host_control_dir):
-                    raise ValueError(
-                        f"Agent '{name}' {label} {agent_owned_path} overlaps host "
-                        f"Hold custody at {host_control_dir}. Move the agent or set "
-                        "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
-                    )
 
     @classmethod
     def auto_discover(

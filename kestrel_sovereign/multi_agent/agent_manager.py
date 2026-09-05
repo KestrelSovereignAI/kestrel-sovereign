@@ -8901,6 +8901,19 @@ class AgentManager:
                 autostart=True,
                 features=features,
             )
+            try:
+                # Endpoint model validation has no target-runtime path context.
+                # Guard this exact candidate before mkdir/inception can write
+                # agent-owned state over the host's sovereign Hold custody.
+                MultiAgentConfig.validate_local_agent_host_custody(
+                    name,
+                    config,
+                    base_dir=self._base_data_dir,
+                    runtime_env=os.environ,
+                )
+            except Exception:
+                self._reserved_ports.discard(port)
+                raise
             admission.spawn_candidate_config = config.model_copy(deep=True)
             agent_dir = self._base_data_dir / "agent_data" / name
 

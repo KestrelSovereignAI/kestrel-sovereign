@@ -921,6 +921,9 @@ def _check_sqlite_hold_readiness(
     from kestrel_sovereign.host_features.storage import (
         validate_host_database_migration_readiness,
     )
+    from kestrel_sovereign.storage.async_database import (
+        validate_sqlite_core_schema_readiness,
+    )
 
     database = _sqlite_hold_database_path(env, project_dir)
     try:
@@ -941,6 +944,7 @@ def _check_sqlite_hold_readiness(
                 env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
             ),
         )
+        validate_sqlite_core_schema_readiness(database)
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
         report.fail.append(f"SQLite Hold readiness NOT verified: {exc}")
         return

@@ -3402,6 +3402,35 @@ def test_sqlite_doctor_rejects_fresh_explicit_target_in_nonprivate_parent(
     assert not database.exists()
 
 
+def test_sqlite_doctor_rejects_core_schema_startup_incompatibility(tmp_path):
+    """Readiness cannot approve a database mandatory host startup cannot open."""
+    import os
+    import sqlite3
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    parent = tmp_path / "host-data"
+    parent.mkdir(mode=0o700)
+    database = parent / "host-features.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE agent_metadata(foo TEXT)")
+    if os.name != "nt":
+        database.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {"KESTREL_HOST_DB_PATH": str(database)},
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any(
+        "core host schema cannot initialize" in item for item in report.fail
+    ), report.fail
+
+
 @pytest.mark.asyncio
 async def test_sqlite_doctor_rejects_existing_store_in_nonprivate_parent(
     tmp_path,

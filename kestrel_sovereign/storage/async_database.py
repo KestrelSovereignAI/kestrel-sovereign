@@ -8,7 +8,9 @@ import asyncio
 import hashlib
 import logging
 import re
-from contextlib import asynccontextmanager
+import sqlite3
+from contextlib import asynccontextmanager, closing
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from .db import (
@@ -973,6 +975,41 @@ def core_schema_sql(backend_type: str) -> str:
         + ";\n"
         + normalize_schema(CORE_SCHEMA, backend_type)
     )
+
+
+def validate_sqlite_core_schema_readiness(db_path: str | Path) -> None:
+    """Prove core host schema DDL can initialize without mutating the store.
+
+    ``CREATE TABLE IF NOT EXISTS`` accepts an existing table without checking
+    its columns; a later mandatory index statement then fails startup. Clone a
+    consistent read-only snapshot into memory and run the same core DDL there,
+    so Doctor detects that incompatibility while leaving live custody bytes
+    untouched. An absent database remains a valid first-boot target.
+    """
+
+    database = Path(db_path).expanduser().resolve(strict=False)
+    if not database.exists():
+        return
+    # Match Hold's diagnostic-open contract. A WAL-mode database with no live
+    # sidecars must be opened immutable or SQLite creates fresh ``-wal``/``-shm``
+    # files merely by inspecting it, violating Doctor's read-only guarantee.
+    flags = (
+        "mode=ro"
+        if Path(f"{database}-wal").exists()
+        else "mode=ro&immutable=1"
+    )
+    try:
+        with closing(
+            sqlite3.connect(f"{database.as_uri()}?{flags}", uri=True)
+        ) as source, closing(sqlite3.connect(":memory:")) as snapshot:
+            source.execute("PRAGMA query_only = ON")
+            source.backup(snapshot)
+            snapshot.executescript(core_schema_sql("sqlite"))
+            snapshot.executescript(_SQLITE_JSON_INDEXES)
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"SQLite core host schema cannot initialize: {exc}"
+        ) from exc
 
 
 class AsyncDatabase:

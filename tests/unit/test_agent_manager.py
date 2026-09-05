@@ -10534,6 +10534,26 @@ class TestCreateAgent:
             await manager.create_agent("claw")
 
     @pytest.mark.asyncio
+    async def test_create_agent_rejects_host_custody_before_inception(
+        self, tmp_path, monkeypatch
+    ):
+        """Runtime creation cannot claim the derived host-data directory."""
+        monkeypatch.setenv("KESTREL_DB_PATH", "./agent_data")
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        with patch(
+            "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+            new_callable=AsyncMock,
+        ) as mock_inception, pytest.raises(
+            ValueError, match="overlaps host Hold custody"
+        ):
+            await manager.create_agent("host-data")
+
+        mock_inception.assert_not_awaited()
+        assert not (tmp_path / "agent_data" / "host-data").exists()
+
+    @pytest.mark.asyncio
     @patch("kestrel_sovereign.inception_service.create_kestrel_identity_async", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did", new_callable=AsyncMock)
     @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")

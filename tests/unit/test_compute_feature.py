@@ -656,6 +656,45 @@ class TestDestructivePolicy:
         assert entries[-1]["decision"] == "allowed"
         assert entries[-1]["reason"] == "own_agent_data"
 
+    def test_hold_custody_is_reserved_below_single_agent_data_root(
+        self, temp_trash_dir, tmp_path, monkeypatch
+    ):
+        """An agent cannot erase the host Hold store nested in its own root."""
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        host_db = host_data / "host-features.db"
+        host_db.write_text("sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        for target in (host_db, host_data, current):
+            with pytest.raises(AgentDataProtectionError, match="host Hold custody"):
+                policy.assert_agent_data_deletion_allowed(target)
+            assert policy.is_deletable_path(str(target)) is False
+
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "from pathlib import Path\n"
+                f"Path({str(host_db)!r}).write_text('gone')\n"
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert host_db.read_text() == "sovereign state"
+
     def test_rewrite_bash_blocks_mv_of_other_agent_data(self, temp_trash_dir, tmp_path):
         """Test shell mv cannot relocate another agent's data directory."""
         current = tmp_path / "agent_data" / "emma"
