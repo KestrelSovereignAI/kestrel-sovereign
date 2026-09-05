@@ -49,10 +49,24 @@ class SharedReplayNonceStore:
                     "PRAGMA table_info(a2a_replay_nonces)"
                 )
                 if "envelope_digest" not in {str(row[1]) for row in columns}:
-                    await self._db.execute(
-                        "ALTER TABLE a2a_replay_nonces ADD COLUMN "
-                        "envelope_digest TEXT NOT NULL DEFAULT ''"
-                    )
+                    try:
+                        await self._db.execute(
+                            "ALTER TABLE a2a_replay_nonces ADD COLUMN "
+                            "envelope_digest TEXT NOT NULL DEFAULT ''"
+                        )
+                    except Exception:
+                        # Two first-use workers can both observe the legacy
+                        # shape before either ALTER commits. SQLite has no ADD
+                        # COLUMN IF NOT EXISTS, so accept the losing worker's
+                        # duplicate-column error only after re-reading the
+                        # schema and proving that the migration landed.
+                        migrated = await self._db.fetchall(
+                            "PRAGMA table_info(a2a_replay_nonces)"
+                        )
+                        if "envelope_digest" not in {
+                            str(row[1]) for row in migrated
+                        }:
+                            raise
             await self._db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_a2a_replay_nonces_expires
@@ -68,7 +82,42 @@ class SharedReplayNonceStore:
         *,
         now_ts: float,
         ttl_seconds: int,
-        envelope_digest: str = "",
+    ) -> bool:
+        """Reserve a nonce through the stable, pre-digest store protocol."""
+        return await self._reserve(
+            sender,
+            nonce,
+            now_ts=now_ts,
+            ttl_seconds=ttl_seconds,
+            envelope_digest="",
+        )
+
+    async def reserve_envelope(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        now_ts: float,
+        ttl_seconds: int,
+        envelope_digest: str,
+    ) -> bool:
+        """Reserve a nonce and bind it to the canonical signed envelope."""
+        return await self._reserve(
+            sender,
+            nonce,
+            now_ts=now_ts,
+            ttl_seconds=ttl_seconds,
+            envelope_digest=envelope_digest,
+        )
+
+    async def _reserve(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        now_ts: float,
+        ttl_seconds: int,
+        envelope_digest: str,
     ) -> bool:
         """Atomically reserve ``(sender, nonce)`` across workers.
 
@@ -106,7 +155,7 @@ class SharedReplayNonceStore:
         )
         return int(affected or 0) > 0
 
-    async def matches(
+    async def matches_envelope(
         self,
         sender: str,
         nonce: str,

@@ -101,6 +101,16 @@ async def test_peer_stop_dispatch_reaches_handler_while_turn_holds_privacy_lock(
     peer_dispatcher,
 ) -> None:
     c = peer_dispatcher
+    private_chain = [
+        CausationFrame(
+            agent_id="did:test:private-ancestor",
+            source="private.webhook",
+            signal_id="private-signal-id",
+            turn_id="private-turn-id",
+            depth=1,
+            emitted_at=datetime.now(timezone.utc),
+        )
+    ]
     signal = build_peer_stop_signal(
         agent=c.agent,
         actor_id="did:test:peer",
@@ -111,6 +121,7 @@ async def test_peer_stop_dispatch_reaches_handler_while_turn_holds_privacy_lock(
             "cascade": True,
             "correlation_id": "peer-stop-live-stream",
         },
+        causation_chain=private_chain,
     )
 
     blocked = False
@@ -135,13 +146,17 @@ async def test_peer_stop_dispatch_reaches_handler_while_turn_holds_privacy_lock(
     assert result.status is Status.OK
     c.agent.cancel_current_request.assert_called_once()
     durable_row = await c.backend.fetch_one(
-        "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+        "SELECT payload, causation_chain FROM durable_signal_events "
+        "WHERE agent_id = ?",
         (c.agent.did,),
     )
     assert durable_row is not None
     assert json.loads(durable_row[0]) == {"_privacy_gated": "source_policy"}
     assert "stop wedged stream" not in durable_row[0]
     assert "did:test:peer" not in durable_row[0]
+    assert json.loads(durable_row[1]) == []
+    assert "private-signal-id" not in durable_row[1]
+    assert "private-turn-id" not in durable_row[1]
 
 
 @pytest.mark.asyncio

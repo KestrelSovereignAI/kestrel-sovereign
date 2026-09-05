@@ -60,7 +60,12 @@ Resolver = Callable[[str], Union[Optional[Mapping[str, Any]], Awaitable[Optional
 
 
 class ReplayNonceStore(Protocol):
-    """Shared replay-nonce reservation backend."""
+    """Original shared replay-nonce reservation backend contract.
+
+    Third-party stores implemented this interface before exact-envelope replay
+    admission existed. Keep its method shape stable; digest-aware stores opt in
+    through :class:`DigestBoundReplayNonceStore` instead.
+    """
 
     async def reserve(
         self,
@@ -69,12 +74,27 @@ class ReplayNonceStore(Protocol):
         *,
         now_ts: float,
         ttl_seconds: int,
-        envelope_digest: str,
     ) -> bool:
         """Reserve ``(sender, nonce)``. Return False when already consumed."""
         ...
 
-    async def matches(
+
+class DigestBoundReplayNonceStore(ReplayNonceStore, Protocol):
+    """Optional extension that can prove an exact replay across workers."""
+
+    async def reserve_envelope(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        now_ts: float,
+        ttl_seconds: int,
+        envelope_digest: str,
+    ) -> bool:
+        """Reserve a nonce and bind it to the exact canonical envelope."""
+        ...
+
+    async def matches_envelope(
         self,
         sender: str,
         nonce: str,
@@ -692,22 +712,49 @@ async def verify_inbound_envelope(
                 )
         if replay_store is not None:
             try:
-                reserved = await replay_store.reserve(
-                    sender,
-                    nonce,
-                    now_ts=now_ts,
-                    ttl_seconds=2 * max_age_seconds,
-                    envelope_digest=envelope_digest,
+                reserve_envelope = getattr(
+                    replay_store,
+                    "reserve_envelope",
+                    None,
                 )
-                exact_shared_replay = (
-                    not reserved
-                    and allow_verified_replay
-                    and await replay_store.matches(
+                matches_envelope = getattr(
+                    replay_store,
+                    "matches_envelope",
+                    None,
+                )
+                if callable(reserve_envelope) and callable(matches_envelope):
+                    reserved = await reserve_envelope(
                         sender,
                         nonce,
+                        now_ts=now_ts,
+                        ttl_seconds=2 * max_age_seconds,
                         envelope_digest=envelope_digest,
                     )
-                )
+                    exact_shared_replay = (
+                        not reserved
+                        and allow_verified_replay
+                        and await matches_envelope(
+                            sender,
+                            nonce,
+                            envelope_digest=envelope_digest,
+                        )
+                    )
+                else:
+                    # Legacy stores can still reject a nonce across workers,
+                    # but they cannot prove that the bytes match there. Admit
+                    # an idempotent retry only when this process's digest-bound
+                    # guard independently proves the exact envelope.
+                    reserved = await replay_store.reserve(
+                        sender,
+                        nonce,
+                        now_ts=now_ts,
+                        ttl_seconds=2 * max_age_seconds,
+                    )
+                    exact_shared_replay = (
+                        not reserved
+                        and allow_verified_replay
+                        and exact_local_replay
+                    )
             except Exception:  # noqa: BLE001 - local guard is the fallback path
                 logger.warning(
                     "A2A: shared replay nonce store unavailable; using in-process guard only.",

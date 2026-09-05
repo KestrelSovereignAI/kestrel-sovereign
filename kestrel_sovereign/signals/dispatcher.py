@@ -2231,6 +2231,7 @@ class SignalDispatcher:
                     signal,
                     payload={_DURABLE_PRIVACY_GATED_MARKER: "source_policy"},
                     caller=None,
+                    causation_chain=[],
                 ),
             )
 

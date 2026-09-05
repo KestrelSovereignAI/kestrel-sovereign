@@ -441,6 +441,70 @@ def test_shared_replay_store_rejects_replay_across_process_guards(tmp_path):
     asyncio.run(run())
 
 
+def test_legacy_replay_store_keeps_cross_worker_replay_protection():
+    """Third-party stores implementing the pre-digest protocol stay usable.
+
+    An exact retry can be admitted only where the local guard proves its bytes;
+    a fresh worker's guard cannot turn the legacy store's duplicate into an
+    idempotent cross-worker replay.
+    """
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    class LegacyReplayStore:
+        def __init__(self) -> None:
+            self.seen: set[tuple[str, str]] = set()
+            self.calls = 0
+
+        async def reserve(
+            self,
+            sender: str,
+            nonce: str,
+            *,
+            now_ts: float,
+            ttl_seconds: int,
+        ) -> bool:
+            del now_ts, ttl_seconds
+            self.calls += 1
+            key = (sender, nonce)
+            if key in self.seen:
+                return False
+            self.seen.add(key)
+            return True
+
+    async def run():
+        store = LegacyReplayStore()
+        guard = ReplayGuard()
+        kp, doc = _keypair_and_doc()
+        meta = _signed_metadata(kp)
+        kwargs = {
+            "task_id": "t",
+            "message": "m",
+            "resolver": lambda _did: doc,
+            "replay_store": store,
+            "allow_verified_replay": True,
+        }
+
+        first = await verify_inbound_envelope(meta, replay_guard=guard, **kwargs)
+        same_worker_retry = await verify_inbound_envelope(
+            meta,
+            replay_guard=guard,
+            **kwargs,
+        )
+        other_worker_retry = await verify_inbound_envelope(
+            meta,
+            replay_guard=ReplayGuard(),
+            **kwargs,
+        )
+
+        assert first.ok is True and first.replayed is False
+        assert same_worker_retry.ok is True and same_worker_retry.replayed is True
+        assert other_worker_retry.ok is False
+        assert "shared window" in other_worker_retry.reason
+        assert store.calls == 3
+
+    asyncio.run(run())
+
+
 def test_idempotent_action_may_admit_verified_replay_across_workers(tmp_path):
     from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
     from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
@@ -541,13 +605,67 @@ def test_shared_replay_store_migrates_existing_nonce_rows_fail_closed(tmp_path):
 
             columns = await db.fetchall("PRAGMA table_info(a2a_replay_nonces)")
             assert "envelope_digest" in {str(row[1]) for row in columns}
-            assert not await store.matches(
+            assert not await store.matches_envelope(
                 "sender",
                 "legacy-nonce",
                 envelope_digest="a" * 64,
             )
         finally:
             await db.close()
+
+    asyncio.run(run())
+
+
+def test_shared_replay_store_sqlite_migration_is_concurrent(tmp_path):
+    """Two first-use workers may both observe the pre-digest table shape."""
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def run():
+        path = str(tmp_path / "legacy-race.db")
+        db_one = await AsyncDatabase.sqlite(path)
+        db_two = await AsyncDatabase.sqlite(path)
+        try:
+            await db_one.execute("DROP TABLE IF EXISTS a2a_replay_nonces")
+            await db_one.execute(
+                """
+                CREATE TABLE a2a_replay_nonces (
+                    sender TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    seen_at DOUBLE PRECISION NOT NULL,
+                    expires_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (sender, nonce)
+                )
+                """
+            )
+
+            ready = asyncio.Event()
+            arrivals = 0
+
+            def gated_fetchall(original):
+                async def fetchall(sql: str, params: tuple = ()):
+                    nonlocal arrivals
+                    rows = await original(sql, params)
+                    if sql.startswith("PRAGMA table_info"):
+                        arrivals += 1
+                        if arrivals == 2:
+                            ready.set()
+                        await asyncio.wait_for(ready.wait(), timeout=2.0)
+                    return rows
+
+                return fetchall
+
+            db_one.fetchall = gated_fetchall(db_one.fetchall)
+            db_two.fetchall = gated_fetchall(db_two.fetchall)
+
+            stores = (SharedReplayNonceStore(db_one), SharedReplayNonceStore(db_two))
+            await asyncio.gather(*(store.ensure_table() for store in stores))
+
+            columns = await db_one.fetchall("PRAGMA table_info(a2a_replay_nonces)")
+            assert "envelope_digest" in {str(row[1]) for row in columns}
+        finally:
+            await db_one.close()
+            await db_two.close()
 
     asyncio.run(run())
 
