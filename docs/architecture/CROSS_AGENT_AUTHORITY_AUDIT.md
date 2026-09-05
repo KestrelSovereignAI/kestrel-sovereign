@@ -607,6 +607,8 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/server.py::GET /api/host/ui/contributions` | Host-authenticated read of the shared UI manifest. |
 | `kestrel_sovereign/server.py::GET /api/host/csrf` | Host-authenticated issuance of a double-submit CSRF token; the token is not standalone authority. |
 | `kestrel_sovereign/server.py::POST /api/host/phoenix/session` | Host-authenticated minting of a short-lived, path-scoped Phoenix embed cookie. |
+| `kestrel_sovereign/server.py::GET /assets/{path:path}` | Public redirect into the authenticated, host-wide Phoenix asset proxy; it serves no data and grants no agent relation authority. |
+| `kestrel_sovereign/server.py::HEAD /assets/{path:path}` | Public redirect metadata for the authenticated, host-wide Phoenix asset proxy; it grants no agent relation authority. |
 | `kestrel_sovereign/server.py::GET /docs` | FastAPI-generated host API documentation; publication grants no agent relation authority. |
 | `kestrel_sovereign/server.py::GET /docs/oauth2-redirect` | FastAPI-generated documentation OAuth redirect; publication grants no agent relation authority. |
 | `kestrel_sovereign/server.py::HEAD /docs` | FastAPI-generated host API documentation metadata; publication grants no agent relation authority. |

@@ -143,6 +143,8 @@ HTTP_EXACT_ROUTES = {
     "/api/sovereignty/files",
     "/api/sovereignty/files/{filename}",
     "/api/sovereignty/files/{filename}/preview",
+    # Canonical auth-exempt redirects into the host-wide Phoenix asset tree.
+    "/assets/{path:path}",
     "/v1/chat/completions",
 }
 INDIRECT_DISPATCH_CALLS = {
@@ -1394,6 +1396,64 @@ def _route_declarations(
 
     declarations: list[tuple[tuple[str, ...], str]] = []
 
+    def module_router_reference_is_static(
+        expression: ast.AST | None,
+        call: ast.Call,
+    ) -> bool:
+        if not isinstance(expression, ast.Name):
+            return False
+
+        # Imported router names are backed by separately scanned in-tree
+        # modules.  A name assigned in this module is safe only when it is the
+        # local APIRouter declaration whose decorators this tree exposes.
+        for statement in tree.body:
+            if getattr(statement, "lineno", 0) >= call.lineno:
+                break
+            targets: list[ast.AST] = []
+            value: ast.AST | None = None
+            if isinstance(statement, ast.Assign):
+                targets = list(statement.targets)
+                value = statement.value
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+                value = statement.value
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == expression.id
+                for target in targets
+            ):
+                return (
+                    isinstance(value, ast.Call)
+                    and _call_name(value) == "APIRouter"
+                )
+
+        if source_path is None:
+            return False
+        for statement in tree.body:
+            if getattr(statement, "lineno", 0) >= call.lineno:
+                break
+            if not isinstance(statement, ast.ImportFrom):
+                continue
+            if not any(
+                (imported.asname or imported.name) == expression.id
+                for imported in statement.names
+            ):
+                continue
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                statement.module,
+                statement.level,
+            )
+            if imported_path is None:
+                return False
+            return any(
+                imported_path.is_relative_to(
+                    REPO_ROOT / "kestrel_sovereign" / root
+                )
+                for root in ("endpoints", "features", "host_features")
+            )
+        return False
+
     def walk_scope(
         statements: list[ast.stmt],
         inherited_prefixes: dict[str, str],
@@ -1482,8 +1542,9 @@ def _route_declarations(
                             None,
                         )
                     )
-                    if module_scope and not isinstance(
-                        router_expression, (ast.Name, ast.Attribute)
+                    if module_scope and not module_router_reference_is_static(
+                        router_expression,
+                        node,
                     ):
                         raise AssertionError(
                             "Unresolved module-level include_router publication: "
@@ -2433,6 +2494,13 @@ def test_router_composition_cannot_leave_uncomposed_paths_green() -> None:
     with pytest.raises(AssertionError, match="module-level include_router"):
         _route_declarations(dynamic_module_publication, {}, {})
 
+    named_dynamic_module_publication = ast.parse(
+        "plugin_router = load_plugin_router()\n"
+        "app.include_router(plugin_router)\n"
+    )
+    with pytest.raises(AssertionError, match="module-level include_router"):
+        _route_declarations(named_dynamic_module_publication, {}, {})
+
 
 def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
     defaults = ast.parse("app = FastAPI()\n")
@@ -2903,6 +2971,20 @@ def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
         assert "recursive pins" in row
 
 
+def test_canonical_phoenix_asset_redirects_are_inventoried() -> None:
+    audit = AUDIT_PATH.read_text(encoding="utf-8")
+    for method in ("GET", "HEAD"):
+        row = next(
+            line
+            for line in audit.splitlines()
+            if line.startswith(
+                f"| `kestrel_sovereign/server.py::{method} /assets/{{path:path}}`"
+            )
+        )
+        assert "host-wide Phoenix asset proxy" in row
+        assert "no agent relation authority" in row
+
+
 def test_mixed_model_catalog_and_layered_key_reads_are_recorded() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     key_action = next(
@@ -3017,6 +3099,16 @@ def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
         return normal_path_exits and all(
             _block_guaranteed_exits(handler.body)
             for handler in terminal.handlers
+        )
+    if isinstance(terminal, ast.Match):
+        has_catch_all = any(
+            case.guard is None
+            and isinstance(case.pattern, ast.MatchAs)
+            and case.pattern.pattern is None
+            for case in terminal.cases
+        )
+        return has_catch_all and all(
+            _block_guaranteed_exits(case.body) for case in terminal.cases
         )
     return False
 
@@ -4039,6 +4131,30 @@ def _guard_clause_provenance_lines(
                     )
                 ):
                     lines.add(statement.lineno)
+            elif controls_continuation and isinstance(statement, ast.Match):
+                case_exits = [
+                    _block_guaranteed_exits(case.body)
+                    for case in statement.cases
+                ]
+                has_catch_all = any(
+                    case.guard is None
+                    and isinstance(case.pattern, ast.MatchAs)
+                    and case.pattern.pattern is None
+                    for case in statement.cases
+                )
+                match_can_continue = (
+                    not has_catch_all or not all(case_exits)
+                )
+                if (
+                    any(case_exits)
+                    and match_can_continue
+                    and _has_provenance_value(
+                        statement.subject,
+                        provenance_aliases,
+                        provenance_return_helpers,
+                    )
+                ):
+                    lines.add(statement.lineno)
             # ``break``/``continue`` inside a loop do not prevent statements
             # after the loop from running, so do not inherit that outer
             # continuation into loop bodies. Other compound statements retain
@@ -4056,7 +4172,11 @@ def _guard_clause_provenance_lines(
     return lines
 
 
-def _module_imported_control_aliases(tree: ast.AST) -> set[str]:
+def _module_imported_control_aliases(
+    tree: ast.AST,
+    source_path: Path | None = None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+) -> set[str]:
     """Return neutral local names imported from control-shaped callables."""
 
     if not isinstance(tree, ast.Module):
@@ -4087,13 +4207,89 @@ def _module_imported_control_aliases(tree: ast.AST) -> set[str]:
             and any(subject in lowered for subject in subjects)
         )
 
-    return {
+    aliases = {
         (imported.asname or imported.name).casefold()
         for node in tree.body
         if isinstance(node, ast.ImportFrom)
         for imported in node.names
         if is_control_callable(imported.name)
     }
+    if source_path is None:
+        return aliases
+
+    source_path = source_path.resolve()
+    seen = seen or frozenset()
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    called_names = {_call_name(call).casefold() for call in calls}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            if node.module is None:
+                for imported in node.names:
+                    child_path = _resolved_repository_import_path(
+                        source_path,
+                        imported.name,
+                        node.level,
+                    )
+                    if child_path is None:
+                        continue
+                    module_calls = _module_attribute_call_names(
+                        calls,
+                        (imported.asname or imported.name).casefold(),
+                    )
+                    aliases.update(
+                        _repository_control_helper_names(
+                            child_path,
+                            module_calls,
+                            seen,
+                        )
+                    )
+                continue
+
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            bindings = {
+                (imported.asname or imported.name).casefold(): imported.name.casefold()
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold() in called_names
+            }
+            star_names = called_names if any(
+                imported.name == "*" for imported in node.names
+            ) else set()
+            resolved = _repository_control_helper_names(
+                imported_path,
+                set(bindings.values()) | star_names,
+                seen,
+            )
+            aliases.update(
+                local_name
+                for local_name, remote_name in bindings.items()
+                if remote_name in resolved
+            )
+            aliases.update(star_names.intersection(resolved))
+        elif isinstance(node, ast.Import):
+            for imported in node.names:
+                imported_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                )
+                if imported_path is None:
+                    continue
+                bound_name = (imported.asname or imported.name).casefold()
+                module_calls = _module_attribute_call_names(calls, bound_name)
+                aliases.update(
+                    _repository_control_helper_names(
+                        imported_path,
+                        module_calls,
+                        seen,
+                    )
+                )
+    return aliases
 
 
 def _module_provenance_constant_aliases(
@@ -4188,6 +4384,79 @@ def _resolved_repository_import_path(
         if package_file.is_file():
             return package_file.resolve()
     return None
+
+
+def _module_attribute_call_names(
+    calls: list[ast.Call],
+    bound_name: str,
+) -> set[str]:
+    """Return terminal call names invoked through one imported module binding."""
+
+    prefix = f"{bound_name.casefold()}."
+    return {
+        _call_name(call).casefold()
+        for call in calls
+        if ast.unparse(call.func).casefold().startswith(prefix)
+    }
+
+
+@lru_cache(maxsize=None)
+def _direct_control_helper_names(source_path: Path) -> frozenset[str]:
+    """Summarize control helpers defined within one repository module."""
+
+    tree = _parsed_module(source_path.resolve())
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    return frozenset(
+        _local_control_helpers(
+            functions,
+            _module_imported_control_aliases(tree),
+        )
+    )
+
+
+def _repository_control_helper_names(
+    source_path: Path,
+    requested_names: set[str],
+    seen: frozenset[tuple[Path, str]],
+) -> set[str]:
+    """Resolve requested control-helper summaries across local import edges."""
+
+    source_path = source_path.resolve()
+    requested_names = {
+        name.casefold()
+        for name in requested_names
+        if (source_path, name.casefold()) not in seen
+    }
+    if not requested_names:
+        return set()
+
+    direct_helpers = set(_direct_control_helper_names(source_path))
+    resolved = requested_names.intersection(direct_helpers)
+    if resolved == requested_names:
+        return resolved
+
+    active = seen | {
+        (source_path, name) for name in requested_names - resolved
+    }
+    tree = _parsed_module(source_path)
+    imported_helpers = _module_imported_control_aliases(
+        tree,
+        source_path,
+        active,
+    )
+    if not imported_helpers:
+        return resolved
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    all_helpers = _local_control_helpers(functions, imported_helpers)
+    return requested_names.intersection(all_helpers)
 
 
 @lru_cache(maxsize=None)
@@ -4303,14 +4572,10 @@ def _module_imported_provenance_return_helper_aliases(
                         node.level,
                     )
                     if child_path is not None:
-                        module_calls = {
-                            call.func.attr.casefold()
-                            for call in calls
-                            if isinstance(call.func, ast.Attribute)
-                            and isinstance(call.func.value, ast.Name)
-                            and call.func.value.id.casefold()
-                            == (imported.asname or imported.name).casefold()
-                        }
+                        module_calls = _module_attribute_call_names(
+                            calls,
+                            (imported.asname or imported.name).casefold(),
+                        )
                         aliases.update(
                             _repository_provenance_helper_names(
                                 child_path,
@@ -4355,16 +4620,8 @@ def _module_imported_provenance_return_helper_aliases(
                     imported.name,
                 )
                 if imported_path is not None:
-                    bound_name = (
-                        imported.asname or imported.name.split(".", 1)[0]
-                    ).casefold()
-                    module_calls = {
-                        call.func.attr.casefold()
-                        for call in calls
-                        if isinstance(call.func, ast.Attribute)
-                        and isinstance(call.func.value, ast.Name)
-                        and call.func.value.id.casefold() == bound_name
-                    }
+                    bound_name = (imported.asname or imported.name).casefold()
+                    module_calls = _module_attribute_call_names(calls, bound_name)
                     aliases.update(
                         _repository_provenance_helper_names(
                             imported_path,
@@ -4385,7 +4642,10 @@ def _authority_provenance_lines(
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    module_control_aliases = _module_imported_control_aliases(tree)
+    module_control_aliases = _module_imported_control_aliases(
+        tree,
+        source_path,
+    )
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
@@ -5345,6 +5605,46 @@ def test_provenance_scanner_follows_repository_local_imported_helpers(
 
     assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
+    package_path = tmp_path / "pkg"
+    package_path.mkdir()
+    (package_path / "__init__.py").write_text("", encoding="utf-8")
+    (package_path / "lineage.py").write_text(
+        "def derive(request):\n"
+        "    return bool(request.causation_chain)\n",
+        encoding="utf-8",
+    )
+    dotted_path = tmp_path / "dotted_controller.py"
+    dotted_path.write_text(
+        "import pkg.lineage\n\n"
+        "def dispatch(request, target):\n"
+        "    if pkg.lineage.derive(request):\n"
+        "        terminate_child(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(dotted_path) == frozenset({4})
+
+
+def test_provenance_scanner_follows_repository_local_control_helpers(
+    tmp_path: Path,
+) -> None:
+    controls_path = tmp_path / "controls.py"
+    controls_path.write_text(
+        "def apply(manager, target):\n"
+        "    manager.terminate_child(target)\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from controls import apply\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(manager, target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
+
 
 def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
     wrapped_exits = ast.parse(
@@ -5361,8 +5661,18 @@ def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
         "            record_denial()\n"
         "    terminate_child(target)\n"
     )
+    match_exit = ast.parse(
+        "def dispatch(request, target):\n"
+        "    match request.causation_chain:\n"
+        "        case []:\n"
+        "            return None\n"
+        "        case _:\n"
+        "            pass\n"
+        "    terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(wrapped_exits) == {2, 8}
+    assert _authority_provenance_lines(match_exit) == {2}
 
 
 def test_provenance_scanner_resolves_module_level_metadata_keys(
