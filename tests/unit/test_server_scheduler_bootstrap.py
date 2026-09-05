@@ -324,7 +324,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     from kestrel_sovereign import phoenix_supervisor as phoenix_module
     from kestrel_sovereign.security import demo_isolation
 
-    config_path = tmp_path / "multi_agent.toml"
+    runtime_base = tmp_path / "runtime-project"
+    runtime_base.mkdir()
+    config_dir = tmp_path / "external-config"
+    config_dir.mkdir()
+    config_path = config_dir / "multi_agent.toml"
     config_path.write_text("[host]\nport = 8888\n")
     fake_config = SimpleNamespace(
         host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
@@ -395,15 +399,21 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
     def _manager_factory(**kwargs):
         assert kwargs["shared_postgres_backend"] is shared_backend
+        assert kwargs["base_data_dir"] == runtime_base
         return manager
 
+    def _load_config(*_args, **kwargs):
+        assert kwargs["runtime_base"] == runtime_base
+        return fake_config
+
+    monkeypatch.chdir(runtime_base)
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
     monkeypatch.setenv("KESTREL_API_KEY", "scheduler-host-test-key")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
-    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", _load_config)
     monkeypatch.setattr(agent_manager, "AgentManager", _manager_factory)
     monkeypatch.setattr(
         server, "_prepare_shared_postgres_scheduler_protocol", _preflight

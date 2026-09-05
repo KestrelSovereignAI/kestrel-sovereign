@@ -564,6 +564,73 @@ class TestMultiAgentConfigLoading:
         with pytest.raises(ValueError, match="overlaps host Hold custody"):
             MultiAgentConfig.from_file(config_path)
 
+    def test_external_config_validates_relative_agents_from_runtime_base(
+        self,
+        tmp_path,
+    ):
+        """Server validation resolves agents from the same base as AgentManager."""
+
+        runtime_base = tmp_path / "runtime-project"
+        runtime_base.mkdir()
+        config_dir = tmp_path / "external-config"
+        config_dir.mkdir()
+        config_path = config_dir / "multi_agent.toml"
+        config_path.write_text(
+            '[agents.alice]\ndata_dir = "agent_data/alice"\nport = 8801\n',
+            encoding="utf-8",
+        )
+        host_dir = runtime_base / "agent_data" / "alice"
+        runtime_env = {
+            "KESTREL_HOST_DB_PATH": str(host_dir / "host-features.db"),
+        }
+
+        with pytest.raises(ValueError, match="overlaps host Hold custody"):
+            MultiAgentConfig.from_file(
+                config_path,
+                runtime_env=runtime_env,
+                runtime_base=runtime_base,
+            )
+
+    @pytest.mark.parametrize(
+        "relation",
+        ("same", "host-child", "export-child"),
+    )
+    def test_identity_export_dir_cannot_overlap_host_custody(
+        self,
+        tmp_path,
+        relation,
+    ):
+        """Agent-writable export roots cannot contain or enter host custody."""
+
+        project = tmp_path / "project"
+        project.mkdir()
+        root = tmp_path / "roots"
+        if relation == "same":
+            export_dir = host_dir = root
+        elif relation == "host-child":
+            export_dir = root
+            host_dir = root / "host-control"
+        else:
+            host_dir = root
+            export_dir = root / "agent-exports"
+        config_path = project / "multi_agent.toml"
+        config_path.write_text(
+            "[agents.alice]\n"
+            'data_dir = "agent_data/alice"\n'
+            f'identity_export_dir = "{export_dir}"\n'
+            "port = 8801\n",
+            encoding="utf-8",
+        )
+        runtime_env = {
+            "KESTREL_HOST_DB_PATH": str(host_dir / "host-features.db"),
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="identity export directory .* overlaps host Hold custody",
+        ):
+            MultiAgentConfig.from_file(config_path, runtime_env=runtime_env)
+
 
 class TestAutoDiscovery:
     """Tests for auto-discovery of agents."""

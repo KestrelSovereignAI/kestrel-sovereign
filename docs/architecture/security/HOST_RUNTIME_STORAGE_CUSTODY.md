@@ -35,6 +35,12 @@ will not chmod a shared operator directory such as `/data` or `/tmp`. The
 database leaf and SQLite auxiliaries must be regular single-link files; symbolic
 links, hard links, and special files fail closed.
 
+Multi-agent configuration refuses that boundary at, above, or below any local
+agent's writable `data_dir` or explicit `identity_export_dir`. When an operator
+supplies `KESTREL_MULTI_AGENT_CONFIG` outside the project, relative agent paths
+are still checked against the live server's project base—the same base used by
+`AgentManager`—rather than against the config file's storage directory.
+
 The supported SQLite Docker images derive this path beneath the effective
 `KESTREL_DB_PATH` (`<agent-data>/host-data/host-features.db`). Recreating a
 container therefore preserves the active Hold database and its adjacent

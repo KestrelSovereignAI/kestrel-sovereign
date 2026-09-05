@@ -2880,16 +2880,18 @@ async def _lifespan_startup(app: FastAPI):
             from kestrel_sovereign.multi_agent.agent_manager import AgentManager
             from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
+            multi_agent_runtime_base = Path.cwd()
             config = MultiAgentConfig.load(
                 str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
                 runtime_env=os.environ,
+                runtime_base=multi_agent_runtime_base,
             )
             _apply_platform_host_port(config, os.environ)
             await _build_host_control_context(app, config)
             shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             manager = AgentManager(
-                base_data_dir=Path.cwd(),
+                base_data_dir=multi_agent_runtime_base,
                 startup_config_path=(
                     multi_agent_path if multi_agent_path.exists() else None
                 ),
