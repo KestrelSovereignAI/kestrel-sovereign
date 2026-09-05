@@ -6421,6 +6421,18 @@ def test_provenance_return_summaries_skip_authority_body_scans(
     assert _local_provenance_return_helpers(functions) == {"derive"}
 
 
+def test_provenance_summaries_follow_generator_yields() -> None:
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    yield from request.causation_chain\n\n"
+        "def dispatch(request, target):\n"
+        "    if any(derive(request)):\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {5}
+
+
 def test_repository_scan_prefilters_modules_without_provenance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -7647,6 +7659,12 @@ def _has_provenance_value(
             in (provenance_return_helpers or set())
             for child in ast.walk(node)
         )
+        or any(
+            isinstance(child, ast.Attribute)
+            and child.attr.casefold()
+            in (provenance_return_helpers or set())
+            for child in ast.walk(node)
+        )
     )
 
 
@@ -7925,7 +7943,7 @@ def _cross_agent_control_aliases(
 def _invoked_lambda_bodies(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> tuple[ast.Lambda, ...]:
-    """Return locally bound or immediate lambdas that this scope invokes."""
+    """Return lambdas invoked locally or allowed to escape this scope."""
 
     scope_nodes = _walk_lexical_scope(function)
     invoked_names = {
@@ -7938,6 +7956,19 @@ def _invoked_lambda_bodies(
         for node in scope_nodes
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Lambda)
     ]
+    escaping_names: set[str] = set()
+    for node in scope_nodes:
+        escaping_values: list[ast.AST] = []
+        if isinstance(node, ast.Return) and node.value is not None:
+            escaping_values.append(node.value)
+        elif isinstance(node, ast.Call):
+            escaping_values.extend(node.args)
+            escaping_values.extend(keyword.value for keyword in node.keywords)
+        for value in escaping_values:
+            invoked.extend(
+                child for child in ast.walk(value) if isinstance(child, ast.Lambda)
+            )
+            escaping_names.update(_reference_binding_names(value))
     lambda_bindings: dict[str, ast.Lambda] = {}
     callable_aliases: list[tuple[str, str]] = []
     for node in scope_nodes:
@@ -7979,6 +8010,7 @@ def _invoked_lambda_bodies(
                 (target_name, source_name) for target_name in target_names
             )
     changed = True
+    invoked_names.update(escaping_names)
     while changed:
         changed = False
         for target_name, source_name in callable_aliases:
@@ -9048,7 +9080,7 @@ def _local_provenance_return_helpers(
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] | None = None,
 ) -> set[str]:
-    """Find visible helpers whose return value is provenance-derived.
+    """Find visible helpers whose returned or yielded value is provenance-derived.
 
     Seed the fixed point with repository-local imported helper summaries so a
     neutral refactor such as ``derive(request)`` does not erase the fact that
@@ -9078,7 +9110,10 @@ def _local_provenance_return_helpers(
             )
             returns_provenance = False
             for node in _walk_lexical_scope(function):
-                if not isinstance(node, ast.Return) or node.value is None:
+                if not isinstance(
+                    node,
+                    (ast.Return, ast.Yield, ast.YieldFrom),
+                ) or node.value is None:
                     continue
                 value = node.value
                 while isinstance(value, ast.Await):
@@ -9248,6 +9283,43 @@ def _is_cross_agent_control_reference(node: ast.AST) -> bool:
     return any(
         _is_unambiguous_control_token(source)
         for source in _control_reference_sources(node)
+    )
+
+
+def _try_flow_uses_provenance_as_control(
+    statement: ast.Try | ast.TryStar,
+    provenance_aliases: set[str],
+    control_aliases: set[str],
+    provenance_return_helpers: set[str] | None = None,
+    state_object_aliases: set[str] | None = None,
+) -> bool:
+    """Whether try success/failure selects a control using provenance."""
+
+    branch_controls = _contains_cross_agent_control_call(
+        [
+            *statement.orelse,
+            *(child for handler in statement.handlers for child in handler.body),
+        ],
+        control_aliases,
+        state_object_aliases,
+    )
+    suffix_controls = [False] * (len(statement.body) + 1)
+    for index in range(len(statement.body) - 1, -1, -1):
+        suffix_controls[index] = suffix_controls[index + 1] or (
+            _contains_cross_agent_control_call(
+                statement.body[index],
+                control_aliases,
+                state_object_aliases,
+            )
+        )
+    return any(
+        (suffix_controls[index] or branch_controls)
+        and _has_provenance_value(
+            body_statement,
+            provenance_aliases,
+            provenance_return_helpers,
+        )
+        for index, body_statement in enumerate(statement.body)
     )
 
 
@@ -10812,6 +10884,29 @@ def _function_provenance_helper_import_aliases(
     )
 
 
+def _executable_body_functions(
+    tree: ast.AST,
+) -> list[ast.FunctionDef]:
+    """Wrap import-time module/class bodies for the function-scope analyzers."""
+
+    bodies: list[tuple[str, ast.AST, list[ast.stmt]]] = []
+    if isinstance(tree, ast.Module):
+        bodies.append(("module", tree, tree.body))
+    bodies.extend(
+        (f"class_{node.name}", node, node.body)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+    )
+    scopes: list[ast.FunctionDef] = []
+    for name, owner, body in bodies:
+        scope = ast.parse(f"def __audit_{name}_body__():\n    pass\n").body[0]
+        assert isinstance(scope, ast.FunctionDef)
+        scope.body = body
+        ast.copy_location(scope, owner)
+        scopes.append(scope)
+    return scopes
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -10822,6 +10917,7 @@ def _authority_provenance_lines(
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
+    functions.extend(_executable_body_functions(tree))
     module_control_aliases = _module_imported_control_aliases(tree)
     function_parents = _nested_function_parents(tree)
     module_provenance_aliases = (
@@ -11062,6 +11158,16 @@ def _authority_provenance_lines(
             ):
                 lines.add(lambda_node.lineno)
         for node in _walk_lexical_scope(function):
+            if isinstance(node, (ast.Try, ast.TryStar)) and (
+                _try_flow_uses_provenance_as_control(
+                    node,
+                    provenance_aliases,
+                    control_aliases,
+                    decision_provenance_helpers,
+                    state_object_aliases,
+                )
+            ):
+                lines.add(node.lineno)
             if isinstance(node, ast.Call):
                 function_tokens = _identifier_tokens(node.func)
                 is_permission_call = any(
@@ -11554,6 +11660,18 @@ def test_direct_provenance_authority_patterns_are_detected() -> None:
     assert _authority_provenance_lines(stateful_aliases) == {3, 8}
     assert _authority_provenance_lines(loop_aliases) == {2, 3, 7, 8}
     assert _authority_provenance_lines(propagation_only_loop) == set()
+
+
+def test_provenance_scanner_covers_module_and_class_body_decisions() -> None:
+    tree = ast.parse(
+        "if get_current_chain():\n"
+        "    terminate_agent(target)\n\n"
+        "class Bootstrap:\n"
+        "    if get_current_chain():\n"
+        "        stop_peer(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {1, 5}
 
 
 def test_provenance_scanner_closes_direct_state_loop_and_comprehension_bypasses(
@@ -12488,6 +12606,21 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
     assert _authority_provenance_lines(aliased_lambda_authority) == {2}
 
 
+def test_provenance_scanner_analyzes_escaping_control_lambdas() -> None:
+    tree = ast.parse(
+        "def returned(request, target):\n"
+        "    return lambda: (\n"
+        "        terminate_child(target) if request.causation_chain else None\n"
+        "    )\n\n"
+        "def registered(request, target):\n"
+        "    register(\n"
+        "        lambda: stop_peer(target) if request.orchestrator else None\n"
+        "    )\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 8}
+
+
 def test_provenance_scanner_resolves_accessor_aliases() -> None:
     assigned_accessor = ast.parse(
         "def dispatch(self, target):\n"
@@ -12779,6 +12912,38 @@ def test_provenance_scanner_follows_exception_guard_clause_exits() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {2}
+
+
+def test_provenance_scanner_detects_try_selected_controls() -> None:
+    tree = ast.parse(
+        "def success(request, target):\n"
+        "    try:\n"
+        "        request.causation_chain[-1]\n"
+        "        terminate_child(target)\n"
+        "    except IndexError:\n"
+        "        pass\n\n"
+        "def failure(request, target):\n"
+        "    try:\n"
+        "        request.causation_chain[-1]\n"
+        "    except IndexError:\n"
+        "        stop_peer(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 9}
+
+
+def test_provenance_scanner_recognizes_provenance_properties() -> None:
+    tree = ast.parse(
+        "class Context:\n"
+        "    @property\n"
+        "    def lineage(self):\n"
+        "        return self.request.causation_chain\n\n"
+        "def dispatch(context, target):\n"
+        "    if context.lineage:\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {7}
 
 
 def test_provenance_scanner_resolves_module_level_metadata_keys(
