@@ -596,20 +596,22 @@ def _imported_module_attribute_name(
 ) -> str | None:
     """Return an attribute selected through a statically imported module."""
 
-    if not isinstance(value, ast.Attribute):
+    member_reference = _static_member_reference(value)
+    if member_reference is None:
         return None
+    receiver, member = member_reference
     module_aliases = {
         (imported.asname or imported.name.split(".", 1)[0])
         for node in tree.body
         if isinstance(node, ast.Import)
         for imported in node.names
     }
-    expression = ast.unparse(value)
+    expression = ast.unparse(receiver)
     if any(
         expression == alias or expression.startswith(f"{alias}.")
         for alias in module_aliases
     ):
-        return value.attr
+        return member
     return None
 
 
@@ -656,45 +658,373 @@ def _assignment_target_names(target: ast.AST) -> set[str]:
     return set()
 
 
+_StaticBinding = tuple[str, str]
+
+
+def _static_member_reference(
+    value: ast.AST,
+    constants: dict[str, str] | None = None,
+) -> tuple[ast.AST, str] | None:
+    """Resolve ``obj.member`` and literal ``getattr(obj, member)`` alike."""
+
+    if isinstance(value, ast.Attribute):
+        return value.value, value.attr
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "getattr"
+        and len(value.args) >= 2
+    ):
+        member = _resolved_string(value.args[1], constants or {})
+        if member is not None:
+            return value.args[0], member
+    return None
+
+
+def _compound_flow_parts(
+    statement: ast.stmt,
+) -> tuple[list[ast.AST], list[list[ast.stmt]]]:
+    """Return eagerly evaluated expressions and possible statement branches."""
+
+    expressions: list[ast.AST] = []
+    branches: list[list[ast.stmt]] = []
+    if isinstance(statement, ast.If):
+        expressions.append(statement.test)
+        branches.extend((statement.body, statement.orelse))
+    elif isinstance(statement, (ast.For, ast.AsyncFor)):
+        expressions.extend((statement.target, statement.iter))
+        branches.extend((statement.body, statement.orelse))
+    elif isinstance(statement, ast.While):
+        expressions.append(statement.test)
+        branches.extend((statement.body, statement.orelse))
+    elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        expressions.extend(item.context_expr for item in statement.items)
+        expressions.extend(
+            item.optional_vars
+            for item in statement.items
+            if item.optional_vars is not None
+        )
+        branches.append(statement.body)
+    elif isinstance(statement, (ast.Try, ast.TryStar)):
+        branches.extend(
+            (
+                statement.body,
+                statement.orelse,
+                statement.finalbody,
+                *(handler.body for handler in statement.handlers),
+            )
+        )
+        expressions.extend(
+            handler.type
+            for handler in statement.handlers
+            if handler.type is not None
+        )
+    elif isinstance(statement, ast.Match):
+        expressions.append(statement.subject)
+        branches.extend(case.body for case in statement.cases)
+        expressions.extend(
+            case.guard
+            for case in statement.cases
+            if case.guard is not None
+        )
+    return expressions, branches
+
+
+class _StaticBindingFlow:
+    """Bounded may-analysis for authority inventory aliases.
+
+    The scanner does not try to execute Python. It resolves exact assignment
+    shapes and static member references, follows aliases as statements are
+    replayed, and joins control-flow branches conservatively.
+    Domain-specific resolvers identify the authority-bearing root and decide
+    how an ambiguous binding must fail closed.
+    """
+
+    def __init__(
+        self,
+        direct_resolver: Callable[[ast.AST], _StaticBinding | None],
+        ambiguous: Callable[[list[_StaticBinding]], _StaticBinding],
+        bindings: dict[str, _StaticBinding] | None = None,
+    ) -> None:
+        self.direct_resolver = direct_resolver
+        self.ambiguous = ambiguous
+        self.bindings = dict(bindings or {})
+
+    def fork(self) -> _StaticBindingFlow:
+        return _StaticBindingFlow(
+            self.direct_resolver,
+            self.ambiguous,
+            self.bindings,
+        )
+
+    def resolve(self, value: ast.AST) -> _StaticBinding | None:
+        direct = self.direct_resolver(value)
+        if direct is not None:
+            return direct
+        if isinstance(value, ast.Name):
+            return self.bindings.get(value.id)
+        if isinstance(value, ast.IfExp):
+            return self._merge_values([
+                self.resolve(value.body),
+                self.resolve(value.orelse),
+            ])
+        return None
+
+    def _merge_values(
+        self, values: list[_StaticBinding | None]
+    ) -> _StaticBinding | None:
+        present = [value for value in values if value is not None]
+        if not present:
+            return None
+        if len(present) == len(values) and all(
+            value == present[0] for value in present[1:]
+        ):
+            return present[0]
+        return self.ambiguous(present)
+
+    def assignment_bindings(
+        self,
+        targets: list[ast.AST],
+        value: ast.AST,
+    ) -> dict[str, _StaticBinding]:
+        pairs = [
+            pair
+            for target in targets
+            for pair in _static_assignment_pairs(target, value)
+        ]
+        if pairs:
+            return {
+                name: binding
+                for name, paired_value in pairs
+                if (binding := self.resolve(paired_value)) is not None
+            }
+
+        nested = [
+            binding
+            for child in ast.walk(value)
+            if (binding := self.resolve(child)) is not None
+        ]
+        if not nested:
+            return {}
+        unresolved = self.ambiguous(nested)
+        return {
+            name: unresolved
+            for target in targets
+            for name in _assignment_target_names(target)
+        }
+
+    def assign(self, targets: list[ast.AST], value: ast.AST | None) -> None:
+        rebound = {
+            name
+            for target in targets
+            for name in _assignment_target_names(target)
+        }
+        for name in rebound:
+            self.bindings.pop(name, None)
+        if value is not None:
+            self.bindings.update(self.assignment_bindings(targets, value))
+
+    def replay_expression_bindings(self, expression: ast.AST) -> None:
+        """Replay walrus bindings without descending into nested scopes."""
+
+        flow = self
+
+        class NamedExpressionVisitor(ast.NodeVisitor):
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
+                self.visit(node.value)
+                flow.assign([node.target], node.value)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+                return
+
+            def visit_AsyncFunctionDef(  # noqa: N802
+                self, node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+                return
+
+        NamedExpressionVisitor().visit(expression)
+
+    def disturbed_fork(self, statement: ast.stmt) -> _StaticBindingFlow:
+        """Model a path where a compound binding receives unknown data."""
+
+        branch = self.fork()
+        for name in _compound_binding_names(statement, set()):
+            branch.bindings.pop(name, None)
+        return branch
+
+    def join(self, branches: list[_StaticBindingFlow]) -> None:
+        states = [self.bindings, *(branch.bindings for branch in branches)]
+        names = {name for state in states for name in state}
+        self.bindings = {
+            name: merged
+            for name in names
+            if (
+                merged := self._merge_values(
+                    [state.get(name) for state in states]
+                )
+            )
+            is not None
+        }
+
+    def replay(self, statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+                expressions, blocks = _compound_flow_parts(statement)
+                for expression in expressions:
+                    self.replay_expression_bindings(expression)
+                branches = []
+                for block in blocks:
+                    branch = self.fork()
+                    branch.replay(block)
+                    branches.append(branch)
+                branches.append(self.disturbed_fork(statement))
+                self.join(branches)
+                continue
+            if isinstance(statement, ast.Assign):
+                self.assign(list(statement.targets), statement.value)
+            elif isinstance(statement, ast.AnnAssign):
+                self.assign([statement.target], statement.value)
+            elif isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                self.bindings.pop(statement.name, None)
+            else:
+                self.replay_expression_bindings(statement)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("alias = root.publish", {"alias": ("root", "publish")}),
+        ("alias: object = root.publish", {"alias": ("root", "publish")}),
+        (
+            "left = right = root.publish",
+            {
+                "left": ("root", "publish"),
+                "right": ("root", "publish"),
+            },
+        ),
+        (
+            "left, ignored = root.publish, noop",
+            {"left": ("root", "publish")},
+        ),
+        (
+            "alias = root.publish\ncopy = alias",
+            {
+                "alias": ("root", "publish"),
+                "copy": ("root", "publish"),
+            },
+        ),
+        (
+            'alias = getattr(root, "publish")',
+            {"alias": ("root", "publish")},
+        ),
+        (
+            "(alias := root.publish)",
+            {"alias": ("root", "publish")},
+        ),
+        (
+            "alias = root.publish\nif disabled:\n    alias = noop",
+            {"alias": ("root", "<ambiguous>")},
+        ),
+        (
+            "alias = root.publish\nfor alias in values:\n    pass",
+            {"alias": ("root", "<ambiguous>")},
+        ),
+    ],
+    ids=[
+        "simple",
+        "annotated",
+        "chained",
+        "destructured",
+        "alias-chain",
+        "static-getattr",
+        "named-expression",
+        "branch-join",
+        "loop-target",
+    ],
+)
+def test_static_binding_flow_adversarial_matrix(
+    source: str,
+    expected: dict[str, _StaticBinding],
+) -> None:
+    def direct(value: ast.AST) -> _StaticBinding | None:
+        member_reference = _static_member_reference(value)
+        if member_reference is None:
+            return None
+        receiver, member = member_reference
+        if isinstance(receiver, ast.Name) and receiver.id == "root":
+            return receiver.id, member
+        return None
+
+    flow = _StaticBindingFlow(
+        direct,
+        lambda bindings: (bindings[0][0], "<ambiguous>"),
+    )
+    flow.replay(ast.parse(source).body)
+
+    assert flow.bindings == expected
+
+
+def _static_alias_edges(tree: ast.Module) -> list[tuple[str, set[str]]]:
+    """Collect exact assignment edges for monotone discovery inventories."""
+
+    edges: list[tuple[str, set[str]]] = []
+    for node in ast.walk(tree):
+        assignment_pairs: list[tuple[str, ast.AST]] = []
+        if isinstance(node, ast.Assign):
+            assignment_pairs = [
+                pair
+                for target in node.targets
+                for pair in _static_assignment_pairs(target, node.value)
+            ]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignment_pairs = _static_assignment_pairs(node.target, node.value)
+        for target, value in assignment_pairs:
+            source = (
+                value.id
+                if isinstance(value, ast.Name)
+                else _imported_module_attribute_name(tree, value)
+            )
+            if source is not None:
+                edges.append((target, {source}))
+    return edges
+
+
+def _static_alias_closure(
+    seeds: set[str],
+    edges: list[tuple[str, set[str]]],
+) -> set[str]:
+    """Reach a bounded fixed point across statically resolved alias edges."""
+
+    aliases = set(seeds)
+    changed = True
+    while changed:
+        changed = False
+        for target, sources in edges:
+            if sources.intersection(aliases) and target not in aliases:
+                aliases.add(target)
+                changed = True
+    return aliases
+
+
 def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
     """Resolve import and lexical-scope aliases for the ``tool`` decorator."""
 
     aliases = {"tool"}
-    assignments: list[tuple[str, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for imported in node.names:
                 if imported.name == "tool":
                     aliases.add(imported.asname or imported.name)
-        else:
-            assignment_pairs: list[tuple[str, ast.AST]] = []
-            if isinstance(node, ast.Assign):
-                assignment_pairs = [
-                    pair
-                    for target in node.targets
-                    for pair in _static_assignment_pairs(target, node.value)
-                ]
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                assignment_pairs = _static_assignment_pairs(
-                    node.target,
-                    node.value,
-                )
-            for target, value in assignment_pairs:
-                source = (
-                    value.id
-                    if isinstance(value, ast.Name)
-                    else _imported_module_attribute_name(tree, value)
-                )
-                if source is not None:
-                    assignments.append((target, source))
-    changed = True
-    while changed:
-        changed = False
-        for target, source in assignments:
-            if source in aliases and target not in aliases:
-                aliases.add(target)
-                changed = True
-    return aliases
+    return _static_alias_closure(aliases, _static_alias_edges(tree))
 
 
 def test_module_string_constants_follow_source_order_on_reassignment() -> None:
@@ -1044,6 +1374,11 @@ def _cron_task_names(
     """Replay statically knowable module-level ``CRON_TASKS`` mutations."""
 
     task_names: set[str] | None = None
+    cron_binding = ("CRON_TASKS", "mutable-collection")
+    alias_flow = _StaticBindingFlow(
+        lambda _value: None,
+        lambda bindings: bindings[0],
+    )
     for index, node in enumerate(tree.body):
         prefix = ast.Module(body=tree.body[:index], type_ignores=[])
         constants = _module_string_constants(prefix, source_path)
@@ -1084,12 +1419,12 @@ def _cron_task_names(
                 constants,
                 task_names,
             )
+            alias_flow.bindings["CRON_TASKS"] = cron_binding
             continue
 
         if (
             isinstance(node, ast.AugAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "CRON_TASKS"
+            and alias_flow.resolve(node.target) == cron_binding
         ):
             if task_names is None or not isinstance(node.op, ast.Add):
                 raise AssertionError("Unsupported augmented CRON_TASKS mutation")
@@ -1101,18 +1436,17 @@ def _cron_task_names(
         direct_call = node.value if isinstance(node, ast.Expr) else None
         if (
             isinstance(direct_call, ast.Call)
-            and isinstance(direct_call.func, ast.Attribute)
-            and isinstance(direct_call.func.value, ast.Name)
-            and direct_call.func.value.id == "CRON_TASKS"
+            and (member := _static_member_reference(direct_call.func)) is not None
+            and alias_flow.resolve(member[0]) == cron_binding
         ):
             if task_names is None or direct_call.keywords:
                 raise AssertionError("Unsupported CRON_TASKS method mutation")
-            if direct_call.func.attr == "append" and len(direct_call.args) == 1:
+            if member[1] == "append" and len(direct_call.args) == 1:
                 task_names.add(
                     _cron_task_entry_name(direct_call.args[0], constants)
                 )
                 continue
-            if direct_call.func.attr == "extend" and len(direct_call.args) == 1:
+            if member[1] == "extend" and len(direct_call.args) == 1:
                 task_names.update(
                     _cron_task_collection_names(
                         direct_call.args[0],
@@ -1135,15 +1469,21 @@ def _cron_task_names(
             for child in ast.walk(node)
         ) or any(
             isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and isinstance(child.func.value, ast.Name)
-            and child.func.value.id == "CRON_TASKS"
+            and (child_member := _static_member_reference(child.func)) is not None
+            and alias_flow.resolve(child_member[0]) == cron_binding
             for child in ast.walk(node)
         ):
             raise AssertionError(
                 "Conditional or indirect CRON_TASKS mutation is not statically "
                 f"resolvable: {ast.unparse(node)}"
             )
+
+        if isinstance(node, ast.Assign):
+            alias_flow.assign(list(node.targets), node.value)
+        elif isinstance(node, ast.AnnAssign):
+            alias_flow.assign([node.target], node.value)
+        elif isinstance(node, _MODULE_COMPOUND_STATEMENT_TYPES):
+            alias_flow.replay([node])
 
     if task_names is None:
         raise AssertionError("Could not find the CRON_TASKS declaration")
@@ -1386,15 +1726,14 @@ def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
     """Resolve base, subclass, import, and assignment constructor aliases."""
 
     aliases = {"SourceRegistration"}
-    assignments: list[tuple[str, str]] = []
-    class_bases: list[tuple[str, set[str]]] = []
+    edges = _static_alias_edges(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             for imported in node.names:
                 if "SourceRegistration" in imported.name:
                     aliases.add(imported.asname or imported.name)
         elif isinstance(node, ast.ClassDef):
-            class_bases.append(
+            edges.append(
                 (
                     node.name,
                     {
@@ -1407,39 +1746,7 @@ def _source_registration_constructor_aliases(tree: ast.Module) -> set[str]:
                     },
                 )
             )
-        else:
-            assignment_pairs: list[tuple[str, ast.AST]] = []
-            if isinstance(node, ast.Assign):
-                assignment_pairs = [
-                    pair
-                    for target in node.targets
-                    for pair in _static_assignment_pairs(target, node.value)
-                ]
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                assignment_pairs = _static_assignment_pairs(
-                    node.target,
-                    node.value,
-                )
-            for target, value in assignment_pairs:
-                source = (
-                    value.id
-                    if isinstance(value, ast.Name)
-                    else _imported_module_attribute_name(tree, value)
-                )
-                if source is not None:
-                    assignments.append((target, source))
-    changed = True
-    while changed:
-        changed = False
-        for target, source in assignments:
-            if source in aliases and target not in aliases:
-                aliases.add(target)
-                changed = True
-        for class_name, bases in class_bases:
-            if bases.intersection(aliases) and class_name not in aliases:
-                aliases.add(class_name)
-                changed = True
-    return aliases
+    return _static_alias_closure(aliases, edges)
 
 
 def _source_registration_constructors(tree: ast.Module) -> list[ast.Call]:
@@ -1661,20 +1968,43 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
 
     class DirectToolWriterVisitor(ast.NodeVisitor):
         PUBLISH_METHODS = {"__setitem__", "setdefault", "update"}
+        REGISTRY_BINDING = ("_direct_tools", "mutable-registry")
 
         def __init__(self) -> None:
             self.scope: list[str] = []
-            self.aliases: list[set[str]] = []
+            self.flows: list[_StaticBindingFlow] = []
+
+        @staticmethod
+        def _ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+            return bindings[0]
+
+        def _direct_binding(self, node: ast.AST) -> _StaticBinding | None:
+            member_reference = _static_member_reference(node)
+            if (
+                member_reference is not None
+                and member_reference[1] == "_direct_tools"
+            ):
+                return self.REGISTRY_BINDING
+            return None
+
+        def _new_flow(
+            self, bindings: dict[str, _StaticBinding] | None = None
+        ) -> _StaticBindingFlow:
+            return _StaticBindingFlow(
+                self._direct_binding,
+                self._ambiguous,
+                bindings,
+            )
 
         def _visit_definition(
             self,
             node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
         ) -> None:
-            inherited_aliases = (
-                set(self.aliases[-1])
-                if self.aliases
+            inherited_bindings = (
+                dict(self.flows[-1].bindings)
+                if self.flows
                 and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                else set()
+                else {}
             )
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 parameters = [
@@ -1682,28 +2012,51 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                     *node.args.args,
                     *node.args.kwonlyargs,
                 ]
-                inherited_aliases.difference_update(
-                    parameter.arg for parameter in parameters
-                )
+                for parameter in parameters:
+                    inherited_bindings.pop(parameter.arg, None)
                 if node.args.vararg is not None:
-                    inherited_aliases.discard(node.args.vararg.arg)
+                    inherited_bindings.pop(node.args.vararg.arg, None)
                 if node.args.kwarg is not None:
-                    inherited_aliases.discard(node.args.kwarg.arg)
+                    inherited_bindings.pop(node.args.kwarg.arg, None)
             self.scope.append(node.name)
-            self.aliases.append(inherited_aliases)
-            self.generic_visit(node)
-            self.aliases.pop()
+            self.flows.append(self._new_flow(inherited_bindings))
+            self._visit_block(node.body)
+            self.flows.pop()
             self.scope.pop()
 
         def _is_registry(self, node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Attribute)
-                and node.attr == "_direct_tools"
-            ) or (
-                isinstance(node, ast.Name)
-                and bool(self.aliases)
-                and node.id in self.aliases[-1]
+            return bool(self.flows) and (
+                self.flows[-1].resolve(node) == self.REGISTRY_BINDING
             )
+
+        def _visit_block(self, statements: list[ast.stmt]) -> None:
+            for statement in statements:
+                if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+                    expressions, blocks = _compound_flow_parts(statement)
+                    for expression in expressions:
+                        self.visit(expression)
+                    inherited = self.flows[-1]
+                    for expression in expressions:
+                        inherited.replay_expression_bindings(expression)
+                    branches: list[_StaticBindingFlow] = []
+                    for block in blocks:
+                        branch = inherited.fork()
+                        self.flows[-1] = branch
+                        self._visit_block(block)
+                        branches.append(branch)
+                    branches.append(inherited.disturbed_fork(statement))
+                    self.flows[-1] = inherited
+                    inherited.join(branches)
+                    continue
+                self.visit(statement)
+                if isinstance(statement, ast.Assign):
+                    self.flows[-1].assign(
+                        list(statement.targets), statement.value
+                    )
+                elif isinstance(statement, ast.AnnAssign):
+                    self.flows[-1].assign([statement.target], statement.value)
+                else:
+                    self.flows[-1].replay_expression_bindings(statement)
 
         def _record(self) -> None:
             if not self.scope:
@@ -1725,23 +2078,6 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self._visit_definition(node)
 
         def visit_Assign(self, node: ast.Assign) -> None:  # noqa: N802
-            assignment_pairs = [
-                pair
-                for target in node.targets
-                for pair in _static_assignment_pairs(target, node.value)
-            ]
-            if self.aliases:
-                rebound_names = {
-                    name
-                    for target in node.targets
-                    for name in _assignment_target_names(target)
-                }
-                self.aliases[-1].difference_update(rebound_names)
-                self.aliases[-1].update(
-                    target
-                    for target, value in assignment_pairs
-                    if self._is_registry(value)
-                )
             if any(
                 isinstance(target, ast.Subscript)
                 and self._is_registry(target.value)
@@ -1749,8 +2085,8 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             ):
                 self._record()
             if any(
-                isinstance(target, ast.Attribute)
-                and target.attr == "_direct_tools"
+                (member := _static_member_reference(target)) is not None
+                and member[1] == "_direct_tools"
                 for target in node.targets
             ) and not (
                 isinstance(node.value, ast.Dict)
@@ -1760,19 +2096,6 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self.generic_visit(node)
 
         def visit_AnnAssign(self, node: ast.AnnAssign) -> None:  # noqa: N802
-            if self.aliases:
-                self.aliases[-1].difference_update(
-                    _assignment_target_names(node.target)
-                )
-                if node.value is not None:
-                    self.aliases[-1].update(
-                        target
-                        for target, value in _static_assignment_pairs(
-                            node.target,
-                            node.value,
-                        )
-                        if self._is_registry(value)
-                    )
             if (
                 isinstance(node.target, ast.Subscript)
                 and self._is_registry(node.target.value)
@@ -1780,8 +2103,8 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                 self._record()
             if (
                 node.value is not None
-                and isinstance(node.target, ast.Attribute)
-                and node.target.attr == "_direct_tools"
+                and (member := _static_member_reference(node.target)) is not None
+                and member[1] == "_direct_tools"
                 and not (
                     isinstance(node.value, ast.Dict)
                     and not node.value.keys
@@ -1804,7 +2127,9 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
                 self._record()
             self.generic_visit(node)
 
-    DirectToolWriterVisitor().visit(tree)
+    visitor = DirectToolWriterVisitor()
+    visitor.flows.append(visitor._new_flow())
+    visitor._visit_block(tree.body)
     return writers
 
 
@@ -2058,6 +2383,11 @@ def _core_cli_command_names(
         return resolved
 
     command_names: set[str] | None = None
+    command_binding = ("commands", "mutable-map")
+    alias_flow = _StaticBindingFlow(
+        lambda _value: None,
+        lambda bindings: bindings[0],
+    )
     for statement in scope.body:
         if any(is_dispatch_lookup(node) for node in ast.walk(statement)):
             if command_names is None:
@@ -2071,13 +2401,15 @@ def _core_cli_command_names(
                 for target in statement.targets
             ):
                 command_names = dictionary_keys(statement.value)
+                for target in statement.targets:
+                    if isinstance(target, ast.Name):
+                        alias_flow.bindings[target.id] = command_binding
                 continue
             command_keys = [
                 target.slice
                 for target in statement.targets
                 if isinstance(target, ast.Subscript)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "commands"
+                and alias_flow.resolve(target.value) == command_binding
             ]
             if command_keys:
                 if command_names is None:
@@ -2094,9 +2426,20 @@ def _core_cli_command_names(
                     command_names.add(command)
                 continue
         if (
-            isinstance(statement, ast.AugAssign)
+            isinstance(statement, ast.AnnAssign)
             and isinstance(statement.target, ast.Name)
             and statement.target.id == "commands"
+        ):
+            if statement.value is None:
+                raise AssertionError(
+                    "Core CLI command dispatch has no initialized value"
+                )
+            command_names = dictionary_keys(statement.value)
+            alias_flow.bindings["commands"] = command_binding
+            continue
+        if (
+            isinstance(statement, ast.AugAssign)
+            and alias_flow.resolve(statement.target) == command_binding
         ):
             if command_names is None:
                 raise AssertionError(
@@ -2109,16 +2452,17 @@ def _core_cli_command_names(
         if (
             isinstance(statement, ast.Expr)
             and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Attribute)
-            and isinstance(statement.value.func.value, ast.Name)
-            and statement.value.func.value.id == "commands"
+            and (
+                member := _static_member_reference(statement.value.func)
+            ) is not None
+            and alias_flow.resolve(member[0]) == command_binding
         ):
             call = statement.value
             if command_names is None:
                 raise AssertionError(
                     "Core CLI command dispatch is mutated before initialization"
                 )
-            if call.func.attr != "update" or len(call.args) > 1:
+            if member[1] != "update" or len(call.args) > 1:
                 raise AssertionError("Unresolved core CLI command-map mutation")
             if call.args:
                 command_names.update(dictionary_keys(call.args[0]))
@@ -2128,8 +2472,30 @@ def _core_cli_command_names(
                 keyword.arg for keyword in call.keywords if keyword.arg is not None
             )
             continue
+        assignment_targets: list[ast.AST] = []
+        assignment_value: ast.AST | None = None
+        if isinstance(statement, ast.Assign):
+            assignment_targets = list(statement.targets)
+            assignment_value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            assignment_targets = [statement.target]
+            assignment_value = statement.value
+        if assignment_targets:
+            if assignment_value is not None and any(
+                isinstance(node, ast.Call)
+                and any(
+                    isinstance(argument, ast.Name)
+                    and alias_flow.resolve(argument) == command_binding
+                    for argument in ast.walk(node)
+                )
+                for node in ast.walk(assignment_value)
+            ):
+                raise AssertionError("Unresolved core CLI command-map mutation")
+            alias_flow.assign(assignment_targets, assignment_value)
+            continue
         if command_names is not None and any(
-            isinstance(node, ast.Name) and node.id == "commands"
+            isinstance(node, ast.Name)
+            and alias_flow.resolve(node) == command_binding
             for node in ast.walk(statement)
         ):
             raise AssertionError("Unresolved core CLI command-map mutation")
@@ -2173,133 +2539,50 @@ def _dynamic_router_publication_surfaces(
             self.relative = relative
             self.scope: list[str] = []
             self.scope_counts: list[int] = []
-            self.aliases: list[dict[str, tuple[str, str]]] = [{}]
+            self.flows: list[_StaticBindingFlow] = [self._new_flow()]
 
-        def _visit_branch(
-            self,
-            statements: list[ast.stmt],
-            inherited: dict[str, tuple[str, str]],
-        ) -> dict[str, tuple[str, str]]:
-            self.aliases[-1] = dict(inherited)
-            self._visit_block(statements)
-            return dict(self.aliases[-1])
+        @staticmethod
+        def _direct_binding(value: ast.AST) -> _StaticBinding | None:
+            member_reference = _static_member_reference(value)
+            if (
+                member_reference is not None
+                and member_reference[1].casefold() == "include_router"
+            ):
+                return ast.unparse(member_reference[0]), "include_router"
+            return None
+
+        @staticmethod
+        def _ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+            # This inventory asks whether a binding *may* publish a router.
+            # Preserve include_router when any reachable branch retains it.
+            return bindings[0]
+
+        @classmethod
+        def _new_flow(
+            cls, bindings: dict[str, _StaticBinding] | None = None
+        ) -> _StaticBindingFlow:
+            return _StaticBindingFlow(
+                cls._direct_binding,
+                cls._ambiguous,
+                bindings,
+            )
 
         def _visit_compound(self, statement: ast.stmt) -> None:
-            inherited = dict(self.aliases[-1])
-            branches: list[list[ast.stmt]] = []
-            expressions: list[ast.AST] = []
-            if isinstance(statement, ast.If):
-                expressions.append(statement.test)
-                branches.extend((statement.body, statement.orelse))
-            elif isinstance(statement, (ast.For, ast.AsyncFor)):
-                expressions.extend((statement.target, statement.iter))
-                branches.extend((statement.body, statement.orelse))
-            elif isinstance(statement, ast.While):
-                expressions.append(statement.test)
-                branches.extend((statement.body, statement.orelse))
-            elif isinstance(statement, (ast.With, ast.AsyncWith)):
-                expressions.extend(item.context_expr for item in statement.items)
-                expressions.extend(
-                    item.optional_vars
-                    for item in statement.items
-                    if item.optional_vars is not None
-                )
-                branches.append(statement.body)
-            elif isinstance(statement, (ast.Try, ast.TryStar)):
-                branches.extend(
-                    (
-                        statement.body,
-                        statement.orelse,
-                        statement.finalbody,
-                        *(handler.body for handler in statement.handlers),
-                    )
-                )
-                expressions.extend(
-                    handler.type
-                    for handler in statement.handlers
-                    if handler.type is not None
-                )
-            elif isinstance(statement, ast.Match):
-                expressions.append(statement.subject)
-                branches.extend(case.body for case in statement.cases)
-                expressions.extend(
-                    case.guard
-                    for case in statement.cases
-                    if case.guard is not None
-                )
-            else:
-                self.visit(statement)
-                return
+            inherited = self.flows[-1]
+            expressions, blocks = _compound_flow_parts(statement)
 
             for expression in expressions:
                 self.visit(expression)
-            branch_states = [
-                self._visit_branch(branch, inherited)
-                for branch in branches
-            ]
-            # This inventory asks whether a binding *may* publish a router.
-            # Preserve any include_router binding reachable on any branch;
-            # an exact runtime path proof is not available to a static audit.
-            merged = dict(inherited)
-            for state in branch_states:
-                merged.update(state)
-            self.aliases[-1] = merged
-
-        def _binding_for(self, value: ast.AST) -> tuple[str, str] | None:
-            if isinstance(value, ast.Attribute):
-                if value.attr.casefold() == "include_router":
-                    return ast.unparse(value.value), "include_router"
-                return None
-            if isinstance(value, ast.Name):
-                return self.aliases[-1].get(value.id)
-            if isinstance(value, ast.IfExp):
-                branch_bindings = [
-                    binding
-                    for branch in (value.body, value.orelse)
-                    if (binding := self._binding_for(branch)) is not None
-                ]
-                if not branch_bindings:
-                    return None
-                if (
-                    len(branch_bindings) == 2
-                    and branch_bindings[0] == branch_bindings[1]
-                ):
-                    return branch_bindings[0]
-                return (
-                    branch_bindings[0][0],
-                    _UNRESOLVED_ROUTE_REGISTRATION,
-                )
-            return None
-
-        def _assignment_bindings(
-            self,
-            targets: list[ast.AST],
-            value: ast.AST,
-        ) -> dict[str, tuple[str, str]]:
-            pairs = [
-                pair
-                for target in targets
-                for pair in _static_assignment_pairs(target, value)
-            ]
-            if pairs:
-                return {
-                    name: binding
-                    for name, paired_value in pairs
-                    if (binding := self._binding_for(paired_value)) is not None
-                }
-            nested_bindings = [
-                binding
-                for child in ast.walk(value)
-                if (binding := self._binding_for(child)) is not None
-            ]
-            if not nested_bindings:
-                return {}
-            receiver = nested_bindings[0][0]
-            return {
-                name: (receiver, _UNRESOLVED_ROUTE_REGISTRATION)
-                for target in targets
-                for name in _assignment_target_names(target)
-            }
+                inherited.replay_expression_bindings(expression)
+            branch_flows: list[_StaticBindingFlow] = []
+            for block in blocks:
+                branch = inherited.fork()
+                self.flows[-1] = branch
+                self._visit_block(block)
+                branch_flows.append(branch)
+            branch_flows.append(inherited.disturbed_fork(statement))
+            self.flows[-1] = inherited
+            inherited.join(branch_flows)
 
         def _visit_block(self, statements: list[ast.stmt]) -> None:
             for statement in statements:
@@ -2307,26 +2590,14 @@ def _dynamic_router_publication_surfaces(
                     self._visit_compound(statement)
                     continue
                 self.visit(statement)
-                targets: list[ast.AST] = []
-                value: ast.AST | None = None
                 if isinstance(statement, ast.Assign):
-                    targets = list(statement.targets)
-                    value = statement.value
+                    self.flows[-1].assign(
+                        list(statement.targets), statement.value
+                    )
                 elif isinstance(statement, ast.AnnAssign):
-                    targets = [statement.target]
-                    value = statement.value
-                target_names = {
-                    name
-                    for target in targets
-                    for name in _assignment_target_names(target)
-                }
-                for target_name in target_names:
-                    self.aliases[-1].pop(target_name, None)
-                if value is None:
-                    continue
-                self.aliases[-1].update(
-                    self._assignment_bindings(targets, value)
-                )
+                    self.flows[-1].assign([statement.target], statement.value)
+                else:
+                    self.flows[-1].replay_expression_bindings(statement)
 
         def visit_Module(self, node: ast.Module) -> None:  # noqa: N802
             self._visit_block(node.body)
@@ -2336,9 +2607,9 @@ def _dynamic_router_publication_surfaces(
         ) -> None:
             self.scope.append(node.name)
             self.scope_counts.append(0)
-            self.aliases.append(dict(self.aliases[-1]))
+            self.flows.append(self.flows[-1].fork())
             self._visit_block(node.body)
-            self.aliases.pop()
+            self.flows.pop()
             self.scope_counts.pop()
             self.scope.pop()
 
@@ -2352,14 +2623,14 @@ def _dynamic_router_publication_surfaces(
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
             self.scope.append(node.name)
-            self.aliases.append(dict(self.aliases[-1]))
+            self.flows.append(self.flows[-1].fork())
             self._visit_block(node.body)
-            self.aliases.pop()
+            self.flows.pop()
             self.scope.pop()
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
             registration = _route_registration_name(
-                node, self.aliases[-1]
+                node, self.flows[-1].bindings
             )
             if self.scope_counts and registration == "include_router":
                 ordinal = self.scope_counts[-1]
@@ -2492,146 +2763,53 @@ def _scope_route_callable_aliases(
 ) -> dict[str, tuple[str, str]]:
     """Resolve source-ordered aliases of bound FastAPI registrations."""
 
-    aliases = dict(inherited_aliases or {})
-
-    def binding_for(value: ast.AST) -> tuple[str, str] | None:
-        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
-            registration = value.attr.casefold()
-            receiver = value.value.id
+    def direct_binding(value: ast.AST) -> _StaticBinding | None:
+        member_reference = _static_member_reference(value)
+        if member_reference is not None:
+            receiver_expression, member = member_reference
+            registration = member.casefold()
+            receiver = (
+                receiver_expression.id
+                if isinstance(receiver_expression, ast.Name)
+                else None
+            )
             if registration in _ROUTE_REGISTRATION_NAMES and (
                 receiver == "app" or receiver in prefixes
             ):
                 return receiver, registration
-        if isinstance(value, ast.Name):
-            return aliases.get(value.id)
-        if isinstance(value, ast.IfExp):
-            branch_bindings = [
-                binding for branch in (value.body, value.orelse)
-                if (binding := binding_for(branch)) is not None
-            ]
-            if not branch_bindings:
-                return None
-            if (
-                len(branch_bindings) == 2
-                and branch_bindings[0] == branch_bindings[1]
-            ):
-                return branch_bindings[0]
-            return branch_bindings[0][0], _UNRESOLVED_ROUTE_REGISTRATION
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "getattr"
+            and value.args
+            and isinstance(value.args[0], ast.Name)
+            and (
+                value.args[0].id == "app"
+                or value.args[0].id in prefixes
+            )
+        ):
+            return value.args[0].id, _UNRESOLVED_ROUTE_REGISTRATION
         return None
 
-    def assignment_bindings(
-        targets: list[ast.AST],
-        value: ast.AST,
-    ) -> dict[str, tuple[str, str]]:
-        pairs = [
-            pair
-            for target in targets
-            for pair in _static_assignment_pairs(target, value)
-        ]
-        if pairs:
-            return {
-                name: binding
-                for name, paired_value in pairs
-                if (binding := binding_for(paired_value)) is not None
-            }
+    def ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+        return bindings[0][0], _UNRESOLVED_ROUTE_REGISTRATION
 
-        # Starred or shape-mismatched destructuring cannot be paired exactly.
-        # If any value is a route registration, retain every bound name as an
-        # unresolved alias so later use fails closed instead of disappearing.
-        nested_bindings = [
-            binding
-            for child in ast.walk(value)
-            if (binding := binding_for(child)) is not None
-        ]
-        if not nested_bindings:
-            return {}
-        receiver = nested_bindings[0][0]
-        return {
-            name: (receiver, _UNRESOLVED_ROUTE_REGISTRATION)
-            for target in targets
-            for name in _assignment_target_names(target)
-        }
-
-    def conditionally_bound_route_aliases(
-        statement: ast.stmt,
-    ) -> dict[str, tuple[str, str]]:
-        bindings: dict[str, tuple[str, str]] = {}
-
-        class RouteBindingVisitor(ast.NodeVisitor):
-            def record(self, targets: list[ast.AST], value: ast.AST | None) -> None:
-                if value is None:
-                    return
-                bindings.update(assignment_bindings(targets, value))
-
-            def visit_Assign(self, node: ast.Assign) -> None:
-                self.record(list(node.targets), node.value)
-
-            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-                self.record([node.target], node.value)
-
-            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
-                self.record([node.target], node.value)
-
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-                return
-
-            def visit_AsyncFunctionDef(
-                self, node: ast.AsyncFunctionDef
-            ) -> None:
-                return
-
-            def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                return
-
-            def visit_Lambda(self, node: ast.Lambda) -> None:
-                return
-
-        RouteBindingVisitor().visit(statement)
-        return bindings
-
-    for statement in statements:
-        if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
-            conditional_bindings = conditionally_bound_route_aliases(statement)
-            for name in _compound_binding_names(statement, set()):
-                prior = aliases.get(name) or conditional_bindings.get(name)
-                if prior is not None:
-                    aliases[name] = (
-                        prior[0],
-                        _UNRESOLVED_ROUTE_REGISTRATION,
-                    )
-            continue
-
-        targets: list[ast.AST] = []
-        value: ast.AST | None = None
-        if isinstance(statement, ast.Assign):
-            targets = list(statement.targets)
-            value = statement.value
-        elif isinstance(statement, ast.AnnAssign):
-            targets = [statement.target]
-            value = statement.value
-        if not targets:
-            continue
-
-        target_names = {
-            name
-            for target in targets
-            for name in _assignment_target_names(target)
-        }
-        for target_name in target_names:
-            aliases.pop(target_name, None)
-        if value is None:
-            continue
-
-        aliases.update(assignment_bindings(targets, value))
-    return aliases
+    flow = _StaticBindingFlow(
+        direct_binding,
+        ambiguous,
+        inherited_aliases,
+    )
+    flow.replay(statements)
+    return flow.bindings
 
 
 def _route_registration_name(
     call: ast.Call,
     aliases: dict[str, tuple[str, str]] | None = None,
 ) -> str | None:
-    if isinstance(call.func, ast.Attribute):
-        return call.func.attr.casefold()
+    member_reference = _static_member_reference(call.func)
+    if member_reference is not None:
+        return member_reference[1].casefold()
     if isinstance(call.func, ast.Name):
         binding = (aliases or {}).get(call.func.id)
         if (
@@ -2650,8 +2828,9 @@ def _route_receiver_name(
     decorator: ast.Call,
     aliases: dict[str, tuple[str, str]] | None = None,
 ) -> str | None:
-    if isinstance(decorator.func, ast.Attribute):
-        receiver = decorator.func.value
+    member_reference = _static_member_reference(decorator.func)
+    if member_reference is not None:
+        receiver = member_reference[0]
         return receiver.id if isinstance(receiver, ast.Name) else None
     if isinstance(decorator.func, ast.Name):
         binding = (aliases or {}).get(decorator.func.id)
@@ -3519,6 +3698,21 @@ def test_dynamic_tool_registry_resolves_destructured_aliases() -> None:
     }
 
 
+def test_dynamic_tool_registry_preserves_maybe_live_branch_aliases() -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def publish(self, tool, disabled):\n"
+        "        registry = self._direct_tools\n"
+        "        if disabled:\n"
+        "            registry = {}\n"
+        "        registry['x'] = tool\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.publish"
+    }
+
+
 def test_every_core_signal_source_and_builtin_handler_is_classified() -> None:
     discovered = _discovered_core_signal_source_surfaces()
     assert discovered == _documented_surfaces(
@@ -3636,8 +3830,10 @@ def test_scheduler_registration_constructors_are_structurally_inventoried(
         'CRON_TASKS.append(("late", SignalMode.ACTION, frozenset()))',
         'CRON_TASKS += [("late", SignalMode.ACTION, frozenset())]',
         'CRON_TASKS = [*CRON_TASKS, ("late", SignalMode.ACTION, frozenset())]',
+        'tasks = CRON_TASKS\ntasks.append('
+        '("late", SignalMode.ACTION, frozenset()))',
     ],
-    ids=["append", "augmented-assignment", "reassignment"],
+    ids=["append", "augmented-assignment", "reassignment", "alias-append"],
 )
 def test_scheduler_inventory_replays_cron_tasks_mutations(
     mutation: str,
@@ -3885,6 +4081,8 @@ def test_core_cli_command_inventory_replays_dispatch_map_mutations() -> None:
         "    commands = {'start': start}\n"
         "    commands['terminate'] = terminate\n"
         "    commands.update({'restart': restart})\n"
+        "    registry = commands\n"
+        "    registry.update({'create': create})\n"
         "    handler = commands.get(args.command)\n"
     )
 
@@ -3892,6 +4090,7 @@ def test_core_cli_command_inventory_replays_dispatch_map_mutations() -> None:
         "start",
         "terminate",
         "restart",
+        "create",
     }
 
 
@@ -4211,6 +4410,37 @@ def test_route_declarations_resolve_destructured_registration_aliases() -> None:
         (("GET",), "/api/agents/{name}"),
         (("POST",), "/api/agents/{name}"),
     ]
+
+
+def test_route_declarations_resolve_static_getattr_registration_aliases() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'publish = getattr(router, "delete")\n'
+        '@publish("/agents/{name}")\n'
+        'def delete_agent():\n'
+        '    pass\n'
+    )
+
+    assert _route_declarations(
+        tree,
+        _module_string_constants(tree),
+        _module_string_collections(tree),
+    ) == [(("DELETE",), "/api/agents/{name}")]
+
+
+def test_route_declarations_reject_dynamic_getattr_registration_aliases() -> None:
+    source = (
+        "router = APIRouter()\n"
+        "publish = getattr(router, method_name)\n"
+        "@publish('/api/agents/{name}')\n"
+        "def route():\n"
+        "    pass\n"
+    )
+
+    with pytest.raises(
+        AssertionError, match="Unresolved route registration alias"
+    ):
+        _route_declarations(ast.parse(source), {}, {})
 
 
 def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
@@ -4832,6 +5062,7 @@ def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None
 
     for surface in (
         "features/computer_use/feature.py::shell`",
+        "cli.py::kestrel create`",
         "cli.py::kestrel start`",
         "cli.py::kestrel terminate`",
         "cli.py::kestrel restart`",
@@ -7422,6 +7653,7 @@ def _module_imported_control_aliases(
                     module_calls = _module_attribute_call_names(
                         calls,
                         (imported.asname or imported.name).casefold(),
+                        tree,
                     )
                     aliases.update(
                         _repository_control_helper_names(
@@ -7463,7 +7695,9 @@ def _module_imported_control_aliases(
                 if imported.name == "*":
                     continue
                 qualifier = (imported.asname or imported.name).casefold()
-                member_calls = _module_attribute_call_names(calls, qualifier)
+                member_calls = _module_attribute_call_names(
+                    calls, qualifier, tree
+                )
                 aliases.update(
                     _repository_control_helper_names(
                         imported_path,
@@ -7480,7 +7714,9 @@ def _module_imported_control_aliases(
                 if imported_path is None:
                     continue
                 bound_name = (imported.asname or imported.name).casefold()
-                module_calls = _module_attribute_call_names(calls, bound_name)
+                module_calls = _module_attribute_call_names(
+                    calls, bound_name, tree
+                )
                 aliases.update(
                     _repository_control_helper_names(
                         imported_path,
@@ -7692,15 +7928,37 @@ def _resolved_repository_import_path(
 def _module_attribute_call_names(
     calls: list[ast.Call],
     bound_name: str,
+    tree: ast.Module | None = None,
 ) -> set[str]:
     """Return terminal call names invoked through one imported module binding."""
 
-    prefix = f"{bound_name.casefold()}."
-    return {
-        _call_name(call).casefold()
-        for call in calls
-        if ast.unparse(call.func).casefold().startswith(prefix)
-    }
+    bound_name = bound_name.casefold()
+    qualifiers = {bound_name}
+    if tree is not None:
+        qualifiers = _static_alias_closure(
+            qualifiers,
+            [
+                (
+                    target.casefold(),
+                    {source.casefold() for source in sources},
+                )
+                for target, sources in _static_alias_edges(tree)
+            ],
+        )
+    names: set[str] = set()
+    for call in calls:
+        member_reference = _static_member_reference(call.func)
+        if member_reference is None:
+            continue
+        receiver, member = member_reference
+        receiver_name = ast.unparse(receiver).casefold()
+        if any(
+            receiver_name == qualifier
+            or receiver_name.startswith(f"{qualifier}.")
+            for qualifier in qualifiers
+        ):
+            names.add(member.casefold())
+    return names
 
 
 @lru_cache(maxsize=None)
@@ -7878,6 +8136,7 @@ def _module_imported_provenance_return_helper_aliases(
                         module_calls = _module_attribute_call_names(
                             calls,
                             (imported.asname or imported.name).casefold(),
+                            tree,
                         )
                         aliases.update(
                             _repository_provenance_helper_names(
@@ -7916,6 +8175,20 @@ def _module_imported_provenance_return_helper_aliases(
                 if remote_name in resolved
             )
             aliases.update(star_names.intersection(resolved))
+            for imported in node.names:
+                if imported.name == "*":
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                member_calls = _module_attribute_call_names(
+                    calls, qualifier, tree
+                )
+                aliases.update(
+                    _repository_provenance_helper_names(
+                        imported_path,
+                        member_calls,
+                        seen,
+                    )
+                )
         elif isinstance(node, ast.Import):
             for imported in node.names:
                 imported_path = _resolved_repository_import_path(
@@ -7924,7 +8197,9 @@ def _module_imported_provenance_return_helper_aliases(
                 )
                 if imported_path is not None:
                     bound_name = (imported.asname or imported.name).casefold()
-                    module_calls = _module_attribute_call_names(calls, bound_name)
+                    module_calls = _module_attribute_call_names(
+                        calls, bound_name, tree
+                    )
                     aliases.update(
                         _repository_provenance_helper_names(
                             imported_path,
@@ -9524,6 +9799,41 @@ def test_provenance_scanner_follows_repository_local_imported_helpers(
     )
 
     assert _cached_authority_provenance_lines(dotted_path) == frozenset({4})
+
+
+def test_provenance_scanner_follows_imported_class_provenance_helpers(
+    tmp_path: Path,
+) -> None:
+    lineage_path = tmp_path / "lineage.py"
+    lineage_path.write_text(
+        "class Context:\n"
+        "    @staticmethod\n"
+        "    def derive(request):\n"
+        "        return bool(request.causation_chain)\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from .lineage import Context\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    if Context.derive(request):\n"
+        "        manager.kill_process(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
+
+    aliased_path = tmp_path / "aliased_controller.py"
+    aliased_path.write_text(
+        "from .lineage import Context\n"
+        "LineageContext = Context\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    if LineageContext.derive(request):\n"
+        "        manager.kill_process(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(aliased_path) == frozenset({5})
 
 
 def test_provenance_scanner_follows_repository_local_control_helpers(
