@@ -64,7 +64,7 @@ def read_anchor_agent_did_sync(
     *,
     mode: AgentDIDLookupMode = AgentDIDLookupMode.COLD_READ_ONLY,
 ) -> str:
-    """Read a local agent DID with an explicit cold-vs-startup safety mode.
+    """Synchronously read a local DID with explicit cold-vs-startup safety.
 
     ``AsyncStorage.initialize()`` is deliberately write-capable: on a missing
     SQLite path it creates the database, WAL, audit tables, and schema.  Cold
@@ -86,94 +86,91 @@ def read_anchor_agent_did_sync(
     # would pick the immutable path and ignore committed WAL data.
     db_path = (Path(storage_dir) / "kestrel_prime.db").resolve()
 
-    def _lookup() -> str:
-        if not db_path.is_file():
-            raise AnchorAbsent(
-                f"No agent found in {storage_dir}. "
-                "Run inception first: kestrel create <name>"
-            )
-
-        sidecars = (
-            Path(f"{db_path}-wal"),
-            Path(f"{db_path}-shm"),
+    if not db_path.is_file():
+        raise AnchorAbsent(
+            f"No agent found in {storage_dir}. "
+            "Run inception first: kestrel create <name>"
         )
-        cold_read_only = mode is AgentDIDLookupMode.COLD_READ_ONLY
-        inspection = mode is AgentDIDLookupMode.INSPECTION
-        # An inspection reads the WAL rather than ignoring or replaying it, so
-        # it only takes the immutable path when there is no WAL to miss. Either
-        # way it writes nothing and leaves no file that was not already there.
-        inspection_ignores_wal = inspection and not any(
-            sidecar.exists() for sidecar in sidecars
+
+    sidecars = (
+        Path(f"{db_path}-wal"),
+        Path(f"{db_path}-shm"),
+    )
+    cold_read_only = mode is AgentDIDLookupMode.COLD_READ_ONLY
+    inspection = mode is AgentDIDLookupMode.INSPECTION
+    # An inspection reads the WAL rather than ignoring or replaying it, so
+    # it only takes the immutable path when there is no WAL to miss. Either
+    # way it writes nothing and leaves no file that was not already there.
+    inspection_ignores_wal = inspection and not any(
+        sidecar.exists() for sidecar in sidecars
+    )
+    # A normal ``mode=ro`` connection can still create SQLite's shared
+    # memory and WAL sidecars when it opens a WAL-mode database.  Besides
+    # violating a cold lookup's read-only contract, ``immutable=1`` would
+    # ignore a pre-existing WAL and could authorize an old identity.
+    # Startup intentionally takes the opposite path: it must let SQLite
+    # recover a real WAL after a crash before the agent opens its storage.
+    if cold_read_only and any(sidecar.exists() for sidecar in sidecars):
+        raise ValueError(
+            f"Could not safely read local agent identity from {storage_dir}: "
+            "SQLite WAL state is present"
         )
-        # A normal ``mode=ro`` connection can still create SQLite's shared
-        # memory and WAL sidecars when it opens a WAL-mode database.  Besides
-        # violating a cold lookup's read-only contract, ``immutable=1`` would
-        # ignore a pre-existing WAL and could authorize an old identity.
-        # Startup intentionally takes the opposite path: it must let SQLite
-        # recover a real WAL after a crash before the agent opens its storage.
-        if cold_read_only and any(sidecar.exists() for sidecar in sidecars):
-            raise ValueError(
-                f"Could not safely read local agent identity from {storage_dir}: "
-                "SQLite WAL state is present"
-            )
 
-        connection = None
-        try:
-            # ``Path.as_uri`` handles spaces and platform path escaping. Cold
-            # discovery accepts only a checkpointed identity and cannot create
-            # sidecars; normal initialization opens an existing DB read/write
-            # so SQLite can recover its own WAL state. ``mode=rw`` still
-            # refuses an unincepted/missing database.
-            if cold_read_only or inspection_ignores_wal:
-                uri_flags = "mode=ro&immutable=1"
-            elif inspection:
-                uri_flags = "mode=ro"
-            else:
-                uri_flags = "mode=rw"
-            connection = sqlite3.connect(
-                f"{db_path.as_uri()}?{uri_flags}",
-                uri=True,
-            )
-            rows = connection.execute(
-                "SELECT node_id FROM graph_nodes "
-                "WHERE node_type = ? ORDER BY node_id",
-                ("agent",),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise ValueError(
-                f"Could not read local agent identity from {storage_dir}"
-            ) from exc
-        finally:
-            if connection is not None:
-                connection.close()
+    connection = None
+    try:
+        # ``Path.as_uri`` handles spaces and platform path escaping. Cold
+        # discovery accepts only a checkpointed identity and cannot create
+        # sidecars; normal initialization opens an existing DB read/write
+        # so SQLite can recover a real WAL after a crash before the real agent
+        # storage opens. ``mode=rw`` still refuses an unincepted/missing DB.
+        if cold_read_only or inspection_ignores_wal:
+            uri_flags = "mode=ro&immutable=1"
+        elif inspection:
+            uri_flags = "mode=ro"
+        else:
+            uri_flags = "mode=rw"
+        connection = sqlite3.connect(
+            f"{db_path.as_uri()}?{uri_flags}",
+            uri=True,
+        )
+        rows = connection.execute(
+            "SELECT node_id FROM graph_nodes "
+            "WHERE node_type = ? ORDER BY node_id",
+            ("agent",),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"Could not read local agent identity from {storage_dir}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
 
-        # Catch a writer that raced the pre-open cold sidecar check. An
-        # immutable reader deliberately ignores WAL data, so returning a DID
-        # after this transition would be a stale-identity authorization
-        # decision. Startup has deliberately consumed the normal SQLite path.
-        if (cold_read_only or inspection_ignores_wal) and any(
-            sidecar.exists() for sidecar in sidecars
-        ):
-            raise ValueError(
-                f"Could not safely read local agent identity from {storage_dir}: "
-                "SQLite WAL state appeared during lookup"
-            )
+    # Catch a writer that raced the pre-open cold sidecar check. An
+    # immutable reader deliberately ignores WAL data, so returning a DID
+    # after this transition would be a stale-identity authorization
+    # decision. Startup has deliberately consumed the normal SQLite path.
+    if (cold_read_only or inspection_ignores_wal) and any(
+        sidecar.exists() for sidecar in sidecars
+    ):
+        raise ValueError(
+            f"Could not safely read local agent identity from {storage_dir}: "
+            "SQLite WAL state appeared during lookup"
+        )
 
-        if not rows:
-            raise AnchorAbsent(
-                f"No agent found in {storage_dir}. "
-                "Run inception first: kestrel create <name>"
-            )
-        if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
-            # Multiple roots are an identity-integrity failure.  Picking one by
-            # incidental SQLite order would authorize the wrong tenant.
-            raise ValueError(
-                f"Local identity database in {storage_dir} has an invalid "
-                "agent root set"
-            )
-        return rows[0][0]
-
-    return _lookup()
+    if not rows:
+        raise AnchorAbsent(
+            f"No agent found in {storage_dir}. "
+            "Run inception first: kestrel create <name>"
+        )
+    if len(rows) != 1 or not isinstance(rows[0][0], str) or not rows[0][0]:
+        # Multiple roots are an identity-integrity failure.  Picking one by
+        # incidental SQLite order would authorize the wrong tenant.
+        raise ValueError(
+            f"Local identity database in {storage_dir} has an invalid "
+            "agent root set"
+        )
+    return rows[0][0]
 
 
 async def read_anchor_agent_did(
@@ -181,7 +178,7 @@ async def read_anchor_agent_did(
     *,
     mode: AgentDIDLookupMode = AgentDIDLookupMode.COLD_READ_ONLY,
 ) -> str:
-    """Read a local anchor without blocking the caller's event loop."""
+    """Read a local agent DID without blocking the event loop."""
 
     return await asyncio.to_thread(
         read_anchor_agent_did_sync,
