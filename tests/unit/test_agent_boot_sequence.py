@@ -24,6 +24,7 @@ from kestrel_sovereign.agent.boot import (
     BootPhaseState,
     run_boot_sequence,
 )
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
 class _Recorder:
@@ -34,6 +35,36 @@ class _Recorder:
 
     def __call__(self, state: BootPhaseState) -> None:
         self.states.append(state)
+
+
+@pytest.mark.asyncio
+async def test_successful_hosted_boot_retains_watchdog_until_manager_handoff(
+    monkeypatch,
+):
+    """Active services cannot create an unowned TTL gap after initialize()."""
+
+    agent = object.__new__(KestrelAgent)
+    agent._boot_state = BootPhaseState.NOT_STARTED
+    agent._boot_context = None
+    agent._host_authority_boot_expired = False
+    handle = asyncio.get_running_loop().call_later(60, lambda: None)
+    agent._host_authority_boot_deadline_handle = handle
+
+    async def successful_boot(_phases, _ctx, set_state):
+        set_state(BootPhaseState.IN_PROGRESS)
+        set_state(BootPhaseState.READY)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.kestrel_agent.run_boot_sequence",
+        successful_boot,
+    )
+
+    await agent.initialize()
+
+    assert handle.cancelled() is False
+    assert agent._host_authority_boot_deadline_handle is handle
+    agent._disarm_host_authority_boot_deadline()
+    assert handle.cancelled() is True
 
 
 # ---------------------------------------------------------------------------

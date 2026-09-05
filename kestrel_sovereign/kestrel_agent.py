@@ -71,6 +71,11 @@ from kestrel_sovereign.agent.boot import (
     BootPhaseState,
     run_boot_sequence,
 )
+from kestrel_sovereign.spawn.mandate import (
+    PersistedSpawnMandateExpiredError,
+    SpawnMandate,
+    remaining_spawn_ttl_seconds,
+)
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.constitution import (
     ConstitutionMixin,
@@ -360,6 +365,111 @@ async def await_agent_shutdown_completion(agent: object) -> bool:
     if failure is not None:
         raise failure
     return cancelled
+
+
+def _host_authority_deadline_identity(mandate: SpawnMandate) -> tuple[object, ...]:
+    """Return the immutable signed fields that identify one expiry owner."""
+
+    return (
+        mandate.parent_did,
+        mandate.child_did,
+        mandate.parent_signature,
+        mandate.created_at,
+        mandate.ttl_seconds,
+    )
+
+
+def arm_host_authority_deadline(
+    agent: object,
+    mandate: SpawnMandate,
+) -> Optional[float]:
+    """Arm one exact signed TTL before boot/admission can await more work.
+
+    The host owns this watchdog from the instant an ephemeral receipt is
+    adopted or signed until ``SpawnedAgentLifecycle`` adopts the same signed
+    ``created_at`` at governance commit.  It deliberately operates on the
+    concrete candidate object rather than requiring a fully initialized
+    ``KestrelAgent`` so crash repair can establish custody inside the early
+    host-authority preflight.
+    """
+
+    if not isinstance(mandate, SpawnMandate) or not mandate.parent_signature:
+        return None
+    if mandate.ttl_seconds <= 0:
+        return None
+
+    identity = _host_authority_deadline_identity(mandate)
+    state = vars(agent)
+    if state.get("_host_authority_boot_expired") is True:
+        raise PersistedSpawnMandateExpiredError(
+            "Persisted spawn mandate expired during active host admission"
+        )
+    existing = state.get("_host_authority_boot_deadline_handle")
+    if isinstance(existing, asyncio.TimerHandle):
+        if state.get("_host_authority_deadline_identity") != identity:
+            raise RuntimeError(
+                "Refusing to replace an active host-authority deadline"
+            )
+        if existing.cancelled():
+            raise RuntimeError(
+                "Host-authority deadline was cancelled without custody transfer"
+            )
+        return existing.when()
+
+    remaining = remaining_spawn_ttl_seconds(
+        mandate.created_at,
+        mandate.ttl_seconds,
+    )
+    owner_task = asyncio.current_task()
+    state["_host_authority_active_boot_task"] = owner_task
+    state["_host_authority_deadline_identity"] = identity
+    state["_host_authority_boot_expired"] = False
+
+    def expire_active_authority(*, cancel_owner: bool = True) -> None:
+        state["_host_authority_boot_expired"] = True
+        expiry_callback = state.get("_host_authority_expiry_callback")
+        if callable(expiry_callback):
+            expiry_callback(agent)
+        if (
+            cancel_owner
+            and owner_task is not None
+            and state.get("_host_authority_active_boot_task") is owner_task
+            and not owner_task.done()
+        ):
+            owner_task.cancel()
+
+    if remaining <= 0:
+        # This synchronous caller already owns the expiry exception and its
+        # rollback. Cancelling it as well would leave a latent cancellation
+        # that escapes at an unrelated later await after the caller catches the
+        # precise expiry error.
+        expire_active_authority(cancel_owner=False)
+        raise PersistedSpawnMandateExpiredError(
+            "Persisted spawn mandate expired before active host admission"
+        )
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + remaining
+    state["_host_authority_boot_deadline_handle"] = loop.call_at(
+        deadline,
+        expire_active_authority,
+    )
+    state["_host_authority_deadline_monotonic"] = deadline
+    return deadline
+
+
+def disarm_host_authority_deadline(agent: object) -> None:
+    """Retire the temporary watchdog after lifecycle or rollback takes custody."""
+
+    state = vars(agent)
+    deadline_handle = state.get("_host_authority_boot_deadline_handle")
+    if isinstance(deadline_handle, asyncio.TimerHandle):
+        deadline_handle.cancel()
+    state["_host_authority_boot_deadline_handle"] = None
+    state.pop("_host_authority_deadline_identity", None)
+    state.pop("_host_authority_deadline_monotonic", None)
+    state.pop("_host_authority_expiry_callback", None)
+    state.pop("_host_authority_active_boot_task", None)
 
 
 def _resolve_shutdown_budget(
@@ -1303,6 +1413,11 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        # Set only from the durable spawned_by edge during initialize().
+        # AgentManager consumes this private projection when rebuilding its
+        # runtime authority indexes; it must never trust an arbitrary in-memory
+        # ``spawn_mandate`` supplied by a caller for that purpose.
+        self._persisted_spawn_mandate = None
 
         # Explicit boot state (#2522). Replaces the old ``_raw_storage is None``
         # proxy that let a second initialize() skip the body and run only the
@@ -1311,6 +1426,15 @@ class KestrelAgent(
         # on any phase failure. Readiness may only fire in READY.
         self._boot_state: BootPhaseState = BootPhaseState.NOT_STARTED
         self._boot_context: Optional[BootContext] = None
+        # AgentManager installs this private hosted-boot boundary before
+        # initialize().  It runs immediately after storage is available and
+        # before providers, signals, or features can acquire active authority.
+        # Standalone/direct boots have no host authority to validate.
+        self._host_authority_preflight = None
+        self._host_authority_boot_deadline_handle: Optional[
+            asyncio.TimerHandle
+        ] = None
+        self._host_authority_boot_expired = False
 
         self.llm_service = llm_service or LLMService()
         from kestrel_sovereign.agent.operator_signals import OperatorSignalProducer
@@ -1956,7 +2080,37 @@ class KestrelAgent(
         def _set_state(new_state: BootPhaseState) -> None:
             self._boot_state = new_state
 
-        await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+        try:
+            await run_boot_sequence(self._boot_phases(), ctx, _set_state)
+        except asyncio.CancelledError as exc:
+            if self._host_authority_boot_expired:
+                raise PersistedSpawnMandateExpiredError(
+                    "Persisted spawn mandate expired during active agent boot"
+                ) from exc
+            raise
+        finally:
+            # The watchdog remains armed until AgentManager transfers expiry
+            # custody, but it may cancel this task only while boot phases are
+            # actually running.  The same task continues through manager-side
+            # publication; cancelling it in that admission gap turns mandate
+            # expiry into an unrelated caller/fleet cancellation.
+            if vars(self).get("_host_authority_active_boot_task") is (
+                asyncio.current_task()
+            ):
+                vars(self).pop("_host_authority_active_boot_task", None)
+            # A successful hosted boot has active providers, signal sources,
+            # heartbeat, and feature workers, but it does not yet have a
+            # committed manager/lifecycle TTL owner.  Keep the exact signed
+            # deadline armed across that admission gap.  AgentManager retires
+            # it only after transferring expiry custody to SpawnedAgentLifecycle
+            # (or while rolling the private candidate back).
+            if self._boot_state is not BootPhaseState.READY:
+                self._disarm_host_authority_boot_deadline()
+
+    def _disarm_host_authority_boot_deadline(self) -> None:
+        """Retire the pre-publication mandate watchdog after a safe handoff."""
+
+        disarm_host_authority_deadline(self)
 
     def _boot_phases(self) -> list[BootPhase]:
         """The ordered boot phases — this order IS the dependency contract.
@@ -1967,6 +2121,10 @@ class KestrelAgent(
         """
         return [
             BootPhase("storage_privacy", self._boot_phase_storage_privacy),
+            BootPhase(
+                "host_authority_preflight",
+                self._boot_phase_host_authority_preflight,
+            ),
             BootPhase(
                 "a2a_observability_signals",
                 self._boot_phase_a2a_observability_signals,
@@ -1989,7 +2147,128 @@ class KestrelAgent(
                 "periodic_services_readiness",
                 self._boot_phase_periodic_services_readiness,
             ),
+            BootPhase(
+                "host_authority_deadline",
+                self._boot_phase_host_authority_deadline,
+            ),
         ]
+
+    async def _boot_phase_host_authority_preflight(
+        self,
+        _ctx: BootContext,
+    ) -> None:
+        """Freeze durable lineage and let a host verify it before active boot.
+
+        Storage is the first phase dependency needed to read ``spawned_by``.
+        Running this as the next phase keeps a rejected signed child from
+        initializing providers, signal sources, features, workers, or child
+        processes before AgentManager verifies its live parent and signature.
+        The same immutable projection is then used for feature ceilings and
+        runtime restriction hooks later in boot; it is never re-read across an
+        authority-check-to-feature-use race.
+        """
+
+        if self.did and self.storage is not None:
+            from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
+
+            self._persisted_spawn_mandate = await read_spawn_mandate(
+                self.storage,
+                self.did,
+            )
+        preflight = self._host_authority_preflight
+        mandate = self._persisted_spawn_mandate
+        signed_spawn_authority = (
+            isinstance(mandate, SpawnMandate)
+            and bool(mandate.parent_signature)
+        )
+        if preflight is None and self.did:
+            # The host witness is deliberately independent of the child's
+            # mutable storage.  Consult it even when ``spawned_by`` is absent:
+            # deleting a child-owned receipt must never promote a delegated
+            # identity into an unrestricted standalone root. Hosted boots skip
+            # this standalone-manager lookup because their injected preflight
+            # owns the manager's exact base directory and performs the full
+            # check.
+            from kestrel_sovereign.spawn.authority_registry import (
+                SpawnAuthorityRegistry,
+                spawn_authority_host_base_dir,
+            )
+            from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+            registry = SpawnAuthorityRegistry(
+                spawn_authority_host_base_dir(self.storage_path)
+            )
+            host_witness = registry.get(self.did)
+            pending_slot = None
+            authoritative_slot = None
+            if self.storage_path is not None:
+                storage_dir = Path(self.storage_path).expanduser().resolve().parent
+                # Only ``data_dir`` participates in slot identity.  The port is
+                # an operational field required by LocalAgentConfig but cannot
+                # widen or narrow this authority lookup.
+                slot_config = LocalAgentConfig(data_dir=storage_dir, port=1024)
+                pending_slot = registry.pending_for_slot(
+                    child_name=storage_dir.name,
+                    config=slot_config,
+                )
+                authoritative_slot = registry.authoritative_for_slot(
+                    child_name=storage_dir.name,
+                    config=slot_config,
+                )
+            if pending_slot is not None:
+                raise RuntimeError(
+                    "Refusing direct boot for a data slot with pending spawn "
+                    "authority; the producing host must settle inception"
+                )
+            if host_witness is not None or authoritative_slot is not None:
+                raise RuntimeError(
+                    "Refusing direct boot for a DID or data slot governed by a "
+                    "host spawn witness; managed parent authority and its "
+                    "matching local receipt are required"
+                )
+        if signed_spawn_authority and preflight is None:
+            raise RuntimeError(
+                "Refusing signed spawned-child boot without a host authority "
+                "verifier"
+            )
+        if preflight is not None:
+            if not callable(preflight):
+                raise TypeError("host authority preflight must be callable")
+            await preflight(self)
+            # The host may have repaired an unsigned edge during preflight.
+            # Re-read the adopted projection instead of classifying authority
+            # from the stale pre-callback snapshot.
+            mandate = self._persisted_spawn_mandate
+            if (
+                isinstance(mandate, SpawnMandate)
+                and mandate.parent_signature
+                and mandate.ttl_seconds > 0
+            ):
+                arm_host_authority_deadline(self, mandate)
+
+    async def _boot_phase_host_authority_deadline(
+        self,
+        _ctx: BootContext,
+    ) -> None:
+        """Refuse a boot that suppressed cancellation past signed expiry."""
+
+        mandate = self._persisted_spawn_mandate
+        if (
+            self._host_authority_boot_expired
+            or (
+                self._host_authority_preflight is not None
+                and isinstance(mandate, SpawnMandate)
+                and mandate.parent_signature
+                and mandate.ttl_seconds > 0
+                and remaining_spawn_ttl_seconds(
+                    mandate.created_at,
+                    mandate.ttl_seconds,
+                ) <= 0
+            )
+        ):
+            raise PersistedSpawnMandateExpiredError(
+                "Persisted spawn mandate expired during active agent boot"
+            )
 
     async def _boot_phase_storage_privacy(self, ctx: BootContext) -> None:
         """Phase 1 — storage + privacy. Cold-restore, raw/privacy storage, constitution runtime state, embedding-pin hydration, privacy agent, and the force-local-only embedding gate. Owns the primary DB connection."""
@@ -3025,12 +3304,11 @@ class KestrelAgent(
         # MANDATORY_FEATURES regardless, so this can't drop constitution/
         # security. Fail-closed: a read error propagates (see mandate_reload).
         if self.did and self.storage is not None:
-            from kestrel_sovereign.spawn.mandate_reload import (
-                read_spawn_features_allowed,
-            )
-
-            mandate_features = await read_spawn_features_allowed(
-                self.storage, self.did
+            durable_mandate = self._persisted_spawn_mandate
+            mandate_features = (
+                list(durable_mandate.features_allowed)
+                if durable_mandate is not None
+                else None
             )
             # A recorded ceiling is always a non-empty list; None/empty means
             # "no explicit ceiling" (root, legacy, or inherit-from-degenerate-
@@ -3511,22 +3789,30 @@ class KestrelAgent(
             except Exception as e:
                 logging.warning(f"failed to start salvage worker: {e}")
 
-        # Reattach spawn-mandate enforcement (#2137). initialize() is the single
-        # boot path shared by single-agent, multi-agent (AgentManager), and
-        # direct-test starts, so registering here — not in AgentManager — means a
-        # spawned child's restricted_tools are hard-denied whenever the child
-        # runs, reconstructed from the durable spawned_by delegation edge
-        # (survives restart). No-op for root agents / spawns with no constraints.
+        # Reattach the complete spawn mandate and its enforcement (#2137,
+        # #3133). initialize() is the single boot path shared by single-agent,
+        # multi-agent (AgentManager), and direct-test starts. Keeping the full
+        # projection on the child lets AgentManager rebuild parent authority at
+        # publication after a restart; registering the restriction hook here
+        # still protects every non-manager boot path. Root agents remain a
+        # no-op, while an unconstrained child retains its lineage mandate.
         if self.did and self.storage is not None and self.hooks_manager is not None:
-            from kestrel_sovereign.spawn.mandate_reload import (
-                read_spawn_mandate,
-                register_restriction_hook,
-            )
+            from kestrel_sovereign.spawn.mandate_reload import register_restriction_hook
 
-            _spawn_mandate = await read_spawn_mandate(self.storage, self.did)
+            _spawn_mandate = self._persisted_spawn_mandate
             if _spawn_mandate is not None:
-                if getattr(self, "spawn_mandate", None) is None:
-                    self.spawn_mandate = _spawn_mandate
+                # Feature discovery already enforced the durable ceiling above.
+                # The constitutional verifier's ``parent_features`` input is
+                # this child's *currently loaded* set, so replaying the original
+                # ceiling there would classify a legitimately removed optional
+                # feature as a new grant and drive the child into Safe Mode.
+                # Preserve the complete projection privately for manager
+                # authority restoration while exposing the prior audit-safe
+                # restriction projection to the runtime verifier/renderer.
+                self.spawn_mandate = _replace_dataclass(
+                    _spawn_mandate,
+                    features_allowed=[],
+                )
                 register_restriction_hook(self.hooks_manager, _spawn_mandate)
 
         # Lifecycle hardening (#377): refuse to declare initialization

@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -695,6 +695,55 @@ def _current_feature_router_route(feature, selector: tuple):
     return current
 
 
+def _resolve_live_route_agent(
+    app: FastAPI,
+    scope,
+    mount_agent,
+    feature_name: str,
+    selector: tuple,
+):
+    """Resolve a live owner for one physically shared feature route.
+
+    Request-scoped routing is authoritative.  For unprefixed routes, retain
+    the original mount owner while it is managed; if readiness rollback or
+    DELETE withdrew that owner while another agent shares the physical route,
+    rebind to the first currently managed compatible feature instead of
+    leaving the preserved route closed over a dead owner.
+    """
+
+    state = scope.get("state") or {}
+    scoped_agent = state.get("agent")
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is None:
+        return scoped_agent if scoped_agent is not None else mount_agent
+    managed = manager.list_agents()
+    managed_agents = tuple(
+        managed.values() if hasattr(managed, "values") else (managed or ())
+    )
+    if scoped_agent is not None:
+        # The routing middleware resolved this object before Starlette matched
+        # the preserved dynamic route. DELETE or an authority-expiry fence can
+        # win in between; the request prefix remains authoritative, so close
+        # the route instead of invoking that stale object or rebinding to a peer.
+        return (
+            scoped_agent
+            if any(current is scoped_agent for current in managed_agents)
+            else None
+        )
+    if any(current is mount_agent for current in managed_agents):
+        return mount_agent
+    for candidate in managed_agents:
+        features = getattr(candidate, "features", None) or {}
+        feature = features.get(feature_name) if hasattr(features, "get") else None
+        if (
+            feature is not None
+            and bool(getattr(feature, "enabled", True))
+            and _current_feature_router_route(feature, selector) is not None
+        ):
+            return candidate
+    return None
+
+
 async def _feature_route_gone_response(scope, receive, send) -> None:
     """Emit the protocol-correct no-route response for a reload race."""
 
@@ -838,21 +887,17 @@ def _gate_feature_route(
     host_dependencies = _feature_route_host_dependencies(route, initial_current)
 
     def _gated_matches(scope):
-        agent = _resolve_route_agent(scope, mount_agent)
+        agent = _resolve_live_route_agent(
+            app, scope, mount_agent, feature_name, selector
+        )
         # Dynamic feature routes stay physically mounted so a live feature can
         # be disabled/re-enabled without route churn.  When their mount owner
         # has been DELETEd, however, an unprefixed request must not keep using
         # that stale captured object while a scheduler races to cold-wake it.
         # Request-scoped routes still work for another currently managed agent
         # that exposes the same feature.
-        manager = getattr(app.state, "agent_manager", None)
-        if manager is not None and agent is mount_agent:
-            managed = manager.list_agents()
-            managed_agents = (
-                managed.values() if hasattr(managed, "values") else (managed or ())
-            )
-            if not any(current is mount_agent for current in managed_agents):
-                return Match.NONE, {}
+        if agent is None:
+            return Match.NONE, {}
         features = getattr(agent, "features", None) or {}
         feature = features.get(feature_name) if hasattr(features, "get") else None
         if (
@@ -869,7 +914,12 @@ def _gate_feature_route(
     # child bypasses the app's dependency overrides and host dependencies.
     # Rebind the current endpoint through a fresh app-owned FastAPI route.
     async def _dispatch_current_feature_route(scope, receive, send):
-        agent = _resolve_route_agent(scope, mount_agent)
+        agent = _resolve_live_route_agent(
+            app, scope, mount_agent, feature_name, selector
+        )
+        if agent is None:
+            await _feature_route_gone_response(scope, receive, send)
+            return
         features = getattr(agent, "features", None) or {}
         feature = features.get(feature_name) if hasattr(features, "get") else None
         if feature is None or not bool(getattr(feature, "enabled", True)):
@@ -1020,9 +1070,16 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
     # every agent (#2522). Mounted when at least one enabled webhook receiver
     # exists at startup; the provider itself stays live thereafter.
-    if _live_webhook_receivers(app) and not getattr(
-        app.state, "_feature_webhook_dispatch_mounted", False
-    ):
+    candidate_webhook_receivers = []
+    if agents is not None:
+        for candidate in agents:
+            if candidate is not None:
+                candidate_webhook_receivers.extend(
+                    _agent_webhook_receivers(candidate)
+                )
+    if (
+        _live_webhook_receivers(app) or candidate_webhook_receivers
+    ) and not getattr(app.state, "_feature_webhook_dispatch_mounted", False):
         try:
             from kestrel_sovereign.features.webhooks.receiver import (
                 build_webhook_dispatch_router,
@@ -1362,22 +1419,235 @@ def _hosted_peer_directory_context(
     )
 
 
-async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent) -> None:
-    """Apply host-owned integration to every newly registered agent.
+async def _onboard_host_registered_agent(
+    app: FastAPI,
+    manager,
+    name: str,
+    agent,
+) -> Callable[[], Awaitable[None]]:
+    """Apply host-owned integration to a private, verified agent candidate.
 
     Initial fleet startup and scheduler cold wakes share ``AgentManager``'s
-    registration seam.  Keeping this work in the app (rather than the
+    prepublication seam.  Keeping this work in the app (rather than the
     scheduler) makes a dynamically loaded tenant indistinguishable from an
     autostart tenant for same-host A2A verification and feature HTTP/UI
     exposure.  Failure is intentionally propagated to the manager, which
-    unpublishes the partially onboarded agent instead of dispatching work to
-    an incompletely integrated tenant.
+    discards the partially onboarded agent instead of dispatching work to an
+    incompletely integrated tenant. Feature-route gates resolve through the
+    manager and therefore remain closed until the later registration commit.
     """
     from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
     from kestrel_sovereign.a2a.inbound_authorization import (
         install_a2a_inbound_sender_authorizer,
         mark_a2a_inbound_scoped_policy,
     )
+
+    missing = object()
+    rollback_state_fields = (
+        "_feature_routes",
+        "_feature_route_count",
+        "_feature_router_keys",
+        "_feature_webhook_dispatch_mounted",
+        "_feature_ui_mounts",
+        "_feature_ui_mount_paths",
+    )
+    initially_missing_state_fields = {
+        field
+        for field in rollback_state_fields
+        if getattr(app.state, field, missing) is missing
+    }
+    prior_route_ids = {id(route) for route in app.routes}
+    prior_openapi_schema = app.openapi_schema
+    prior_feature_route_ids = {
+        id(route) for route in getattr(app.state, "_feature_routes", ())
+    }
+    prior_router_keys = set(
+        getattr(app.state, "_feature_router_keys", ())
+    )
+    prior_ui_mount_ids = {
+        id(route) for route in getattr(app.state, "_feature_ui_mounts", ())
+    }
+    prior_ui_mount_paths = set(
+        getattr(app.state, "_feature_ui_mount_paths", ())
+    )
+    prior_webhook_mounted = bool(
+        getattr(app.state, "_feature_webhook_dispatch_mounted", False)
+    )
+    prior_demo_mode = getattr(app.state, "demo_mode", missing)
+    prior_managed_agent_ids = {
+        id(current) for current in manager.list_agents().values()
+    }
+    owned_route_ids: set[int] = set()
+    owned_feature_route_ids: set[int] = set()
+    owned_router_keys: set[tuple] = set()
+    owned_router_route_ids: dict[tuple, set[int]] = {}
+    owned_ui_mount_ids: set[int] = set()
+    owned_ui_mount_paths: set[str] = set()
+    owned_ui_mount_route_ids: dict[str, set[int]] = {}
+    owns_webhook_dispatch = False
+    agent_fields = (
+        "_scoped_policy_required",
+        "_a2a_host_manager",
+        "a2a_did_resolver",
+        "a2a_inbound_sender_authorizer",
+    )
+    prior_agent_state = {
+        field: vars(agent).get(field, missing)
+        for field in agent_fields
+    }
+
+    async def rollback_host_onboarding() -> None:
+        """Remove only app/agent state introduced by this private candidate."""
+
+        current_agents = dict(manager.list_agents())
+        other_agent_map = {
+            current_name: current
+            for current_name, current in current_agents.items()
+            if current is not agent
+        }
+        other_agents = list(other_agent_map.values())
+
+        # A later agent can reuse a router/static/webhook mount first created
+        # by this candidate. Transfer that shared physical mount instead of
+        # deleting it; gates and live receiver lookup already resolve the
+        # request to the current owning agent.
+        shared_router_keys: set[tuple] = set()
+        for current in other_agents:
+            for feature_name, feature in (
+                getattr(current, "features", {}) or {}
+            ).items():
+                if _is_webhook_receiver(getattr(feature, "receiver", None)):
+                    continue
+                try:
+                    router = feature.get_router()
+                except Exception:
+                    continue
+                if router is not None:
+                    key = _feature_router_signature(feature_name, router)
+                    if key in owned_router_keys:
+                        shared_router_keys.add(key)
+        shared_ui_paths: set[str] = set()
+        if owned_ui_mount_paths:
+            from kestrel_sovereign.ui_contributions import feature_static_mounts
+
+            for current in other_agents:
+                for mount_path, _directory in feature_static_mounts(
+                    current,
+                    include_disabled=True,
+                ):
+                    if mount_path in owned_ui_mount_paths:
+                        shared_ui_paths.add(mount_path)
+        preserve_webhook = owns_webhook_dispatch and any(
+            _agent_webhook_receivers(current) for current in other_agents
+        )
+        preserved_route_ids: set[int] = set()
+        for key in shared_router_keys:
+            preserved_route_ids.update(owned_router_route_ids.get(key, ()))
+        for mount_path in shared_ui_paths:
+            preserved_route_ids.update(
+                owned_ui_mount_route_ids.get(mount_path, ())
+            )
+        if preserve_webhook:
+            preserved_route_ids.update(
+                id(route)
+                for route in app.routes
+                if id(route) in owned_feature_route_ids
+                and "webhook" in str(getattr(route, "path", "")).lower()
+            )
+
+        removable_route_ids = owned_route_ids - preserved_route_ids
+        app.routes[:] = [
+            route for route in app.routes if id(route) not in removable_route_ids
+        ]
+
+        tracked_routes = [
+            route
+            for route in getattr(app.state, "_feature_routes", ())
+            if id(route) not in (
+                owned_feature_route_ids - preserved_route_ids
+            )
+        ]
+        app.state._feature_routes = tracked_routes
+        app.state._feature_route_count = len(tracked_routes)
+        current_router_keys = set(
+            getattr(app.state, "_feature_router_keys", ())
+        )
+        current_router_keys.difference_update(
+            owned_router_keys - shared_router_keys
+        )
+        app.state._feature_router_keys = current_router_keys
+
+        current_ui_mounts = [
+            route
+            for route in getattr(app.state, "_feature_ui_mounts", ())
+            if id(route) not in (owned_ui_mount_ids - preserved_route_ids)
+        ]
+        app.state._feature_ui_mounts = current_ui_mounts
+        current_ui_paths = set(
+            getattr(app.state, "_feature_ui_mount_paths", ())
+        )
+        current_ui_paths.difference_update(
+            owned_ui_mount_paths - shared_ui_paths
+        )
+        app.state._feature_ui_mount_paths = current_ui_paths
+        if owns_webhook_dispatch and not preserve_webhook:
+            app.state._feature_webhook_dispatch_mounted = prior_webhook_mounted
+
+        empty_state_fields = {
+            "_feature_routes": not tracked_routes,
+            "_feature_route_count": not tracked_routes,
+            "_feature_router_keys": not current_router_keys,
+            "_feature_webhook_dispatch_mounted": not bool(
+                getattr(
+                    app.state,
+                    "_feature_webhook_dispatch_mounted",
+                    False,
+                )
+            ),
+            "_feature_ui_mounts": not current_ui_mounts,
+            "_feature_ui_mount_paths": not current_ui_paths,
+        }
+        for field in initially_missing_state_fields:
+            if empty_state_fields[field]:
+                try:
+                    delattr(app.state, field)
+                except (AttributeError, KeyError):
+                    pass
+
+        remaining_route_ids = {id(route) for route in app.routes}
+        app.openapi_schema = (
+            prior_openapi_schema
+            if remaining_route_ids == prior_route_ids
+            else None
+        )
+
+        later_agents = [
+            current
+            for current in other_agents
+            if id(current) not in prior_managed_agent_ids
+        ]
+        if later_agents:
+            from kestrel_sovereign.security.demo_isolation import (
+                classify_server_mode,
+            )
+
+            app.state.demo_mode = classify_server_mode(other_agent_map)
+        elif prior_demo_mode is missing:
+            try:
+                delattr(app.state, "demo_mode")
+            except (AttributeError, KeyError):
+                pass
+        else:
+            app.state.demo_mode = prior_demo_mode
+        for field, value in prior_agent_state.items():
+            if value is missing:
+                vars(agent).pop(field, None)
+            else:
+                setattr(agent, field, value)
+
+    # Seed rollback custody before the first mutation so a hook exception is
+    # cleaned by AgentManager even though this coroutine cannot return it.
+    agent._host_onboarding_rollback = rollback_host_onboarding
 
     federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
         "1", "true", "yes",
@@ -1413,14 +1683,75 @@ async def _onboard_host_registered_agent(app: FastAPI, manager, name: str, agent
     )
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
+    owned_route_ids.update(
+        id(route) for route in app.routes if id(route) not in prior_route_ids
+    )
+    owned_feature_route_ids.update(
+        id(route)
+        for route in getattr(app.state, "_feature_routes", ())
+        if id(route) not in prior_feature_route_ids
+    )
+    owned_router_keys.update(
+        set(getattr(app.state, "_feature_router_keys", ())) - prior_router_keys
+    )
+    owned_feature_routes = [
+        route
+        for route in getattr(app.state, "_feature_routes", ())
+        if id(route) in owned_feature_route_ids
+    ]
+    for key in owned_router_keys:
+        _feature_name, _prefix, route_shapes = key
+        # APIRouter stores its prefix in every child route's ``path`` already;
+        # ``include_router`` copies that exact path into the app.  The stable
+        # signature is therefore also the physical mounted shape.
+        expected_shapes = set(route_shapes)
+        owned_router_route_ids[key] = {
+            id(route)
+            for route in owned_feature_routes
+            if (
+                type(route).__name__,
+                getattr(route, "path", None),
+                tuple(sorted(getattr(route, "methods", ()) or ())),
+            )
+            in expected_shapes
+        }
+    owned_ui_mount_ids.update(
+        id(route)
+        for route in getattr(app.state, "_feature_ui_mounts", ())
+        if id(route) not in prior_ui_mount_ids
+    )
+    owned_ui_mount_paths.update(
+        set(getattr(app.state, "_feature_ui_mount_paths", ()))
+        - prior_ui_mount_paths
+    )
+    owned_ui_mounts = [
+        route
+        for route in getattr(app.state, "_feature_ui_mounts", ())
+        if id(route) in owned_ui_mount_ids
+    ]
+    for mount_path in owned_ui_mount_paths:
+        owned_ui_mount_route_ids[mount_path] = {
+            id(route)
+            for route in owned_ui_mounts
+            if getattr(route, "path", None) == mount_path
+        }
+    owns_webhook_dispatch = (
+        not prior_webhook_mounted
+        and bool(
+            getattr(app.state, "_feature_webhook_dispatch_mounted", False)
+        )
+    )
 
     # The host-level demo classification is a live fleet property.  Refresh it
     # on dynamic registration rather than leaving a cold-woken demo tenant
     # classified from the startup snapshot.
     from kestrel_sovereign.security.demo_isolation import classify_server_mode
 
-    app.state.demo_mode = classify_server_mode(manager.list_agents())
+    visible_after_commit = dict(manager.list_agents())
+    visible_after_commit[name] = agent
+    app.state.demo_mode = classify_server_mode(visible_after_commit)
     logger.info("Completed host onboarding for dynamically registered agent %r", name)
+    return rollback_host_onboarding
 
 
 def _host_config_mapping(config) -> dict:
@@ -2468,8 +2799,16 @@ async def _lifespan_startup(app: FastAPI):
             shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             manager = AgentManager(
                 base_data_dir=Path.cwd(),
+                startup_config_path=(
+                    multi_agent_path if multi_agent_path.exists() else None
+                ),
                 shared_postgres_backend=shared_postgres_backend,
             )
+            # Registry persistence is deliberately ordered before roster
+            # persistence during spawn. Repair that crash window before shared
+            # PostgreSQL scheduler bootstrap discovers its tenant authority;
+            # doing this inside load_from_config is too late for the preflight.
+            config = manager.reconcile_spawn_authority_restart_roster(config)
             app.state.agent_manager = manager
             host_context_publication_gate = asyncio.Event()
             app.state.host_context_publication_gate = host_context_publication_gate
@@ -2501,7 +2840,14 @@ async def _lifespan_startup(app: FastAPI):
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
-            loaded = await manager.load_from_config(config)
+            # Scheduler preflight seeded authority from this exact reconciled
+            # roster. Do not let load_from_config re-read multi_agent.toml after
+            # that await and switch runtime tenants without re-seeding the
+            # scheduler's authorization map.
+            loaded = await manager.load_from_config(
+                config,
+                restart_roster_reconciled=True,
+            )
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 
             # Fleet-idleness (#F235) is wired at the AgentManager's single

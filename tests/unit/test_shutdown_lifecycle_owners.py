@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.routing import Mount, Route
 
 from kestrel_sovereign import cli, main, server
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
@@ -32,6 +33,7 @@ from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetExceededError,
     DelegatedWallet,
 )
+from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
 from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
@@ -705,11 +707,20 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     class _CancelledManager:
         init_failures = []
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config) -> int:
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ) -> int:
             assert config is fake_config
+            assert restart_roster_reconciled is True
             return 0
 
         def list_agents(self):
@@ -769,11 +780,20 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
             self._agents = {"already-loaded": loaded_agent}
             self.shutdown_calls = 0
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config) -> int:
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ) -> int:
             assert config is fake_config
+            assert restart_roster_reconciled is True
             return 1
 
         def list_agents(self):
@@ -1985,6 +2005,158 @@ async def test_manager_shutdown_all_drains_quarantined_reaper_before_returning(
         not item["pending"] for item in manager.quarantined_shutdowns().values()
     )
     manager._offboard_agent_runtime_namespace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ttl_retirement_completes_after_quarantined_shutdown(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """The reaper completion owns deferred TTL authority retirement."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.SHUTDOWN_TIMEOUT",
+        0.01,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    agent = _CancellationHostileShutdownAgent()
+    child_name = "ExpiringChild"
+    parent_did = "did:test:ttl-parent"
+    manager._agents[child_name] = agent
+    manager._agent_names[agent.agent_id] = child_name
+    manager._parent_children[parent_did] = [child_name]
+    manager._child_mandates[child_name] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=agent.agent_id,
+    )
+    data_dir = tmp_path / "agent_data" / child_name
+    data_dir.mkdir(parents=True)
+    (data_dir / "kestrel_prime.db").touch()
+
+    await lifecycle.register(
+        child_name=child_name,
+        child_did=agent.agent_id,
+        parent_did=parent_did,
+        ttl_seconds=0.01,
+    )
+    await asyncio.wait_for(agent.shutdown_entered.wait(), timeout=1.0)
+    for _ in range(100):
+        if manager._quarantined_shutdown_reapers:
+            break
+        await asyncio.sleep(0.01)
+    assert manager._quarantined_shutdown_reapers
+    reaper = next(iter(manager._quarantined_shutdown_reapers.values())).task
+
+    try:
+        agent.allow_shutdown_finish.set()
+        await asyncio.wait_for(asyncio.shield(reaper), timeout=1.0)
+        for _ in range(100):
+            if (
+                not lifecycle.is_tracked(child_name)
+                and (data_dir / ".kestrel-spawn-retired").is_file()
+            ):
+                break
+            await asyncio.sleep(0.01)
+        snapshot = {
+            "children": manager.get_children(parent_did),
+            "mandate": manager.get_mandate(child_name),
+            "lifecycle_tracked": lifecycle.is_tracked(child_name),
+            "retirement_marker": (
+                data_dir / ".kestrel-spawn-retired"
+            ).is_file(),
+        }
+    finally:
+        agent.allow_shutdown_finish.set()
+        if manager._quarantined_shutdown_reapers:
+            await asyncio.wait_for(
+                manager.drain_quarantined_shutdowns(),
+                timeout=1.0,
+            )
+
+    assert snapshot == {
+        "children": [],
+        "mandate": None,
+        "lifecycle_tracked": False,
+        "retirement_marker": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ttl_retirement_completes_after_quarantined_refund(tmp_path) -> None:
+    """TTL retirement also joins the child's delegated-refund owner."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    child_name = "RefundingExpiredChild"
+    child_did = "did:test:refunding-expired-child"
+    parent_did = "did:test:refunding-expired-parent"
+    child = SimpleNamespace(agent_id=child_did)
+    budget_entry = (object(), object())
+    manager._agents[child_name] = child
+    manager._agent_names[child_did] = child_name
+    manager._parent_children[parent_did] = [child_name]
+    manager._child_mandates[child_name] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+    )
+    manager._child_budgets[child_name] = budget_entry
+    data_dir = tmp_path / "agent_data" / child_name
+    data_dir.mkdir(parents=True)
+    (data_dir / "kestrel_prime.db").touch()
+    refund_started = asyncio.Event()
+    allow_refund = asyncio.Event()
+
+    async def hand_off_refund(
+        requested_parent: str,
+        requested_child: str,
+        *,
+        offboard_runtime: bool = False,
+    ) -> bool:
+        assert requested_parent == parent_did
+        assert requested_child == child_name
+        assert offboard_runtime is False
+        manager._agents.pop(child_name)
+        manager._agent_names.pop(child_did)
+        assert manager._child_budgets.pop(child_name) is budget_entry
+
+        async def finish_refund() -> None:
+            refund_started.set()
+            await allow_refund.wait()
+
+        manager._retain_quarantined_cleanup(
+            name=child_name,
+            agent_id=child_did,
+            task=asyncio.create_task(finish_refund()),
+        )
+        return True
+
+    manager.terminate_child = hand_off_refund
+    await lifecycle.register(
+        child_name=child_name,
+        child_did=child_did,
+        parent_did=parent_did,
+        ttl_seconds=0.01,
+    )
+    await asyncio.wait_for(refund_started.wait(), timeout=1.0)
+    assert lifecycle.is_tracked(child_name)
+    assert not (data_dir / ".kestrel-spawn-retired").exists()
+
+    allow_refund.set()
+    for _ in range(100):
+        if (
+            not lifecycle.is_tracked(child_name)
+            and (data_dir / ".kestrel-spawn-retired").is_file()
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert manager.get_children(parent_did) == []
+    assert manager.get_mandate(child_name) is None
+    assert lifecycle.get_result(child_name).status.value == "timed_out"
+    assert (data_dir / ".kestrel-spawn-retired").read_text() == f"{child_did}\n"
 
 
 @pytest.mark.asyncio
@@ -3200,7 +3372,9 @@ async def test_shutdown_all_sweeps_after_joined_spawn_cancellation_rollback_grou
 
 
 @pytest.mark.asyncio
-async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit() -> None:
+async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit(
+    tmp_path,
+) -> None:
     """A fenced spawn cannot return a dead child or add state after shutdown."""
 
     class Child:
@@ -3212,11 +3386,11 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
         async def shutdown(self) -> None:
             self.shutdown_calls += 1
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     child = Child()
     parent = SimpleNamespace(
         agent_id="did:test:spawn-fenced-parent",
-        _private_key=None,
+        _private_key=generate_secp256k1_keypair()[0],
         identity=None,
         features={},
         wallet=None,
@@ -3224,7 +3398,24 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit()
     budget_entered = asyncio.Event()
     allow_budget = asyncio.Event()
 
-    async def create_child(name, **_kwargs):
+    async def create_child(name, **kwargs):
+        child._raw_storage = SimpleNamespace(
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        )
+        admission = manager._agent_operations[manager._canonical_agent_name(name)]
+        assert admission.before_publish is not None
+        admission.spawn_candidate_config = LocalAgentConfig(
+            data_dir=Path("agent_data") / name,
+            port=8802,
+        )
+        pending = manager._spawn_authority_registry.reserve_pending(
+            child_name=name,
+            parent_did=kwargs["parent_did"],
+            mandate=kwargs["mandate"],
+            config=admission.spawn_candidate_config,
+        )
+        admission.spawn_authority_pending_id = pending.reservation_id
+        await admission.before_publish(child)
         manager._agents[name] = child
         manager._agent_names[child.agent_id] = name
         return child

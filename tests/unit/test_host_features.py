@@ -331,11 +331,20 @@ async def test_server_lifespan_wires_and_closes_host_features(
         def set_host_context_publication_gate(self, gate) -> None:
             self.host_context_publication_gate = gate
 
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config):
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ):
             assert config is fake_config
+            assert restart_roster_reconciled is True
             assert not self.host_context_publication_gate.is_set()
             events.append("agents-load")
             return 1

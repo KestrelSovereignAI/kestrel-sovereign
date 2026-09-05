@@ -1010,22 +1010,17 @@ async def create_kestrel_identity_async(
 
     # 6b. If spawned by a parent, record the delegation relationship
     if parent_did:
-        edge_properties = {}
-        if spawn_mandate:
-            edge_properties["purpose"] = spawn_mandate.purpose
-            edge_properties["ttl_seconds"] = spawn_mandate.ttl_seconds
-            edge_properties["max_child_depth"] = spawn_mandate.max_child_depth
-            edge_properties["created_at"] = spawn_mandate.created_at
-            # Durable record of the enforcement constraints (#2137): the anchored
-            # constitution carries them for soft/system-prompt enforcement, and
-            # the delegation edge records the machine-readable form for audit and
-            # a future load-time re-attach of the runtime restricted_tools hook.
-            edge_properties["additional_constraints"] = (
-                getattr(spawn_mandate, "additional_constraints", {}) or {}
-            )
-            edge_properties["features_allowed"] = list(
-                getattr(spawn_mandate, "features_allowed", []) or []
-            )
+        edge_properties = (
+            spawn_mandate.to_edge_properties() if spawn_mandate else {}
+        )
+        # Inception generates the child's DID, so a caller normally cannot
+        # sign a mandate that is already bound to that final identity.  Keep
+        # the initial edge useful for restrictions and attribution, but never
+        # persist a signature over ``child_did=None`` (or another child) as if
+        # it were an authority receipt.  AgentManager replaces this edge with
+        # the parent-signed, final-DID-bound receipt before publishing a spawn.
+        if spawn_mandate is not None and spawn_mandate.child_did != agent_did:
+            edge_properties["parent_signature"] = None
         await graph.add_trusted_cross_agent_edge(
             agent_did,
             parent_did,

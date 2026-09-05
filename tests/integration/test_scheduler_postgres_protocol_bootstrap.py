@@ -29,6 +29,7 @@ from kestrel_sovereign.features.scheduler.runner import (
 from kestrel_sovereign.features.scheduler.status import (
     ensure_runtime_status_table,
 )
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
 from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -1413,6 +1414,20 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             async def close(self):
                 return None
 
+        class RecordingSpawnGraph:
+            def __init__(self):
+                self.edges = []
+
+            async def add_trusted_cross_agent_edge(
+                self,
+                source_id,
+                target_id,
+                label,
+                *,
+                properties,
+            ):
+                self.edges.append((source_id, target_id, label, properties))
+
         class HostedTestAgent:
             def __init__(self, *, did, **_kwargs):
                 self.did = did
@@ -1423,6 +1438,12 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
                 self._private_key = None
                 self.identity = None
                 self.wallet = None
+                # The real hosted agent creates durable storage during
+                # initialize().  This scheduler-focused double must preserve
+                # the same prepublication receipt boundary so a spawn cannot
+                # bypass signed lineage merely because the test replaces the
+                # production agent class.
+                self._raw_storage = SimpleNamespace(graph=RecordingSpawnGraph())
 
             def _set_display_name(self, _name):
                 return None
@@ -1454,6 +1475,7 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
 
         parent_id = f"did:scheduler:dynamic-parent:{uuid4()}"
         parent = HostedTestAgent(did=parent_id)
+        parent._private_key, _ = generate_secp256k1_keypair()
         parent.features = {"SchedulerFeature": SimpleNamespace()}
         manager._agents["Parent"] = parent
         manager._agent_names[parent_id] = "Parent"
@@ -1521,6 +1543,17 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
             spawned = await manager.spawn_agent("Spawned", parent, mandate)
             spawned_id = spawned.agent_id
             assert spawned_id in manager.scheduler_authorized_agent_ids()
+            assert len(spawned._raw_storage.graph.edges) == 1
+            receipt_source, receipt_target, receipt_label, receipt = (
+                spawned._raw_storage.graph.edges[0]
+            )
+            assert (receipt_source, receipt_target, receipt_label) == (
+                spawned_id,
+                parent_id,
+                "spawned_by",
+            )
+            assert receipt["parent_signature"]
+            assert receipt == spawned._persisted_spawn_mandate.to_edge_properties()
 
             assert await db.fetchall(
                 """
