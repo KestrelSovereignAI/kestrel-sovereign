@@ -586,6 +586,9 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/endpoints/observability.py::GET /api/observability/metrics/{metric_name}` | Shared PostgreSQL read accepts an untrusted optional agent filter; defect #3215. |
 | `kestrel_sovereign/endpoints/restart_events.py::GET /api/restart/status-events` | Requester/explicit host-coordination read; #3146. |
 | `kestrel_sovereign/endpoints/rasa_shim.py::POST /webhooks/rest/webhook` | Sovereign-configured, authenticated ingress to the host-bound agent; payload sender is not authority. |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files` | D-3225 — shared host export-cache listing lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files/{filename}` | D-3225 — shared host export-cache download lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
+| `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files/{filename}/preview` | D-3225 — shared host export-cache preview lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
 | `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from unverified process-local relationships; defects #3133/#3142. |
 | `kestrel_sovereign/features/bridge/router.py::POST /api/bridge/invoke` | Host-authenticated external invocation of the request-routed agent; gateway metadata is not authority. |
 | `kestrel_sovereign/features/bridge/router.py::POST /api/bridge/stream` | Host-authenticated external streaming invocation of the request-routed agent; gateway metadata is not authority. |

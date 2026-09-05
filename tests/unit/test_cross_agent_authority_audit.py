@@ -131,6 +131,12 @@ HTTP_EXACT_ROUTES = {
     "/api/keys/user",
     "/api/keys/user/verify",
     "/api/keys/user/{provider}",
+    # These handlers read the process-global sovereignty export cache rather
+    # than state owned by the selected agent. Keep the canonical doors in the
+    # exact inventory alongside their synthesized request-routed aliases.
+    "/api/sovereignty/files",
+    "/api/sovereignty/files/{filename}",
+    "/api/sovereignty/files/{filename}/preview",
     "/v1/chat/completions",
 }
 INDIRECT_DISPATCH_CALLS = {
@@ -240,6 +246,55 @@ def _module_constant_bindings(
                     strings[alias.asname or alias.name] = imported_constants[
                         alias.name
                     ]
+            continue
+        # A statically resolved binding must never survive an operation whose
+        # result this small evaluator does not model. Retaining the old value
+        # would make an exact route inventory silently describe a different
+        # decorator than Python executes.
+        mutated_names: set[str] = set()
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            mutated_names.add(node.target.id)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            function = node.value.func
+            if (
+                isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.attr
+                in {
+                    "add",
+                    "append",
+                    "clear",
+                    "extend",
+                    "insert",
+                    "pop",
+                    "remove",
+                    "reverse",
+                    "sort",
+                    "update",
+                }
+            ):
+                mutated_names.add(function.value.id)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    mutated_names.add(target.id)
+                elif isinstance(target, ast.Subscript) and isinstance(
+                    target.value, ast.Name
+                ):
+                    mutated_names.add(target.value.id)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assignment_targets = (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            for target in assignment_targets:
+                if isinstance(target, ast.Subscript) and isinstance(
+                    target.value, ast.Name
+                ):
+                    mutated_names.add(target.value.id)
+        if mutated_names:
+            for name in mutated_names:
+                strings.pop(name, None)
+                collections.pop(name, None)
             continue
         if isinstance(node, ast.Assign):
             targets = node.targets
@@ -362,6 +417,15 @@ def test_module_string_constants_follow_source_order_on_reassignment() -> None:
         "PATH = runtime_path()\n"
     )
     assert "PATH" not in _module_string_constants(invalidated)
+
+    mutated = ast.parse(
+        'PATH = "/api"\n'
+        'PATH += "/agents/{agent}/terminate"\n'
+        'METHODS = ["GET"]\n'
+        'METHODS.append("DELETE")\n'
+    )
+    assert "PATH" not in _module_string_constants(mutated)
+    assert "METHODS" not in _module_string_collections(mutated)
 
 
 def _public_tool_name(
@@ -2891,6 +2955,18 @@ def _block_guaranteed_exits(statements: list[ast.stmt]) -> bool:
         return _block_guaranteed_exits(
             terminal.body
         ) and _block_guaranteed_exits(terminal.orelse)
+    if isinstance(terminal, (ast.With, ast.AsyncWith)):
+        return _block_guaranteed_exits(terminal.body)
+    if isinstance(terminal, (ast.Try, ast.TryStar)):
+        if _block_guaranteed_exits(terminal.finalbody):
+            return True
+        normal_path_exits = _block_guaranteed_exits(
+            terminal.body
+        ) or _block_guaranteed_exits(terminal.orelse)
+        return normal_path_exits and all(
+            _block_guaranteed_exits(handler.body)
+            for handler in terminal.handlers
+        )
     return False
 
 
@@ -3163,6 +3239,7 @@ def _is_unambiguous_control_sink(
         "list",
         "offboard",
         "read",
+        "remove",
         "restart",
         "send",
         "shutdown",
@@ -3873,7 +3950,7 @@ def _module_imported_control_aliases(tree: ast.AST) -> set[str]:
         return (
             lowered == "kill_process"
             or bool(words.intersection(actions))
-            or any(action in lowered for action in actions)
+            or any(action in lowered for action in (*actions, "remove"))
             and any(subject in lowered for subject in subjects)
         )
 
@@ -4161,13 +4238,17 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     """Reuse one module's parsed tree and complete authority summary."""
 
     source = _source_text(source_path).casefold()
+    tree = _parsed_module(source_path)
+    imported_or_local_provenance = _module_provenance_constant_aliases(
+        tree, source_path
+    )
     if not any(
         marker in source
         for marker in ("causation", "orchestrator", "current_chain")
-    ):
+    ) and not imported_or_local_provenance:
         return frozenset()
     return frozenset(
-        _authority_provenance_lines(_parsed_module(source_path), source_path)
+        _authority_provenance_lines(tree, source_path)
     )
 
 
@@ -4751,15 +4832,49 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
         "    if request.causation_chain:\n"
         "        apply(target)\n"
     )
+    imported_remove_alias = ast.parse(
+        "from lifecycle import remove_agent as apply\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n"
+    )
     lambda_callback = ast.parse(
         "def dispatch(request, manager, target):\n"
         "    callback = lambda: manager.terminate_child(target)\n"
         "    if request.causation_chain:\n"
         "        callback()\n"
     )
+    neutral_remove_helper = ast.parse(
+        "def apply(manager, target):\n"
+        "    manager.remove_agent(target)\n\n"
+        "def dispatch(request, manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(manager, target)\n"
+    )
 
     assert _authority_provenance_lines(imported_alias) == {4}
+    assert _authority_provenance_lines(imported_remove_alias) == {4}
     assert _authority_provenance_lines(lambda_callback) == {3}
+    assert _authority_provenance_lines(neutral_remove_helper) == {5}
+
+
+def test_provenance_scanner_follows_wrapped_guard_clause_exits() -> None:
+    wrapped_exits = ast.parse(
+        "def with_guard(request, target, lock):\n"
+        "    if not request.causation_chain:\n"
+        "        with lock:\n"
+        "            return None\n"
+        "    terminate_child(target)\n\n"
+        "def try_guard(request, target):\n"
+        "    if not request.causation_chain:\n"
+        "        try:\n"
+        "            raise PermissionError\n"
+        "        finally:\n"
+        "            record_denial()\n"
+        "    terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(wrapped_exits) == {2, 8}
 
 
 def test_provenance_scanner_resolves_module_level_metadata_keys(
@@ -4787,6 +4902,7 @@ def test_provenance_scanner_resolves_module_level_metadata_keys(
     assert _authority_provenance_lines(
         ast.parse(source, filename=str(source_path)), source_path
     ) == {4}
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
