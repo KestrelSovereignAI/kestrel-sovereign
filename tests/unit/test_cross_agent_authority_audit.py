@@ -1946,10 +1946,11 @@ _UNRESOLVED_ROUTE_REGISTRATION = "<unresolved>"
 def _scope_route_callable_aliases(
     statements: list[ast.stmt],
     prefixes: dict[str, str],
+    inherited_aliases: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, tuple[str, str]]:
     """Resolve source-ordered aliases of bound FastAPI registrations."""
 
-    aliases: dict[str, tuple[str, str]] = {}
+    aliases = dict(inherited_aliases or {})
     for statement in statements:
         if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
             for name in _compound_binding_names(statement, set()):
@@ -2193,6 +2194,7 @@ def _route_declarations(
         inherited_prefixes: dict[str, str],
         inherited_strings: dict[str, str],
         inherited_methods: dict[str, tuple[str, ...]],
+        inherited_route_aliases: dict[str, tuple[str, str]],
         *,
         module_scope: bool = False,
     ) -> None:
@@ -2267,6 +2269,7 @@ def _route_declarations(
                     prefixes,
                     child_strings,
                     child_methods,
+                    active_route_aliases,
                 )
                 return
             if isinstance(node, ast.ClassDef):
@@ -2275,6 +2278,7 @@ def _route_declarations(
                     prefixes,
                     active_strings,
                     active_methods,
+                    active_route_aliases,
                 )
                 return
             if isinstance(node, ast.Call):
@@ -2402,7 +2406,7 @@ def _route_declarations(
                     )
                 prefixes[receiver] = prefix
             active_route_aliases = _scope_route_callable_aliases(
-                statements[:index], prefixes
+                statements[:index], prefixes, inherited_route_aliases
             )
             visit(
                 statement,
@@ -2411,7 +2415,7 @@ def _route_declarations(
                 active_route_aliases,
             )
 
-    walk_scope(tree.body, {}, {}, {}, module_scope=True)
+    walk_scope(tree.body, {}, {}, {}, {}, module_scope=True)
     return declarations
 
 
@@ -3356,6 +3360,39 @@ def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
         AssertionError, match="Unresolved route registration alias"
     ):
         _route_declarations(tree, {}, {})
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "router = APIRouter()\n"
+            "register = router.delete\n"
+            "def build_router():\n"
+            "    @register('/api/agents/{name}')\n"
+            "    def terminate():\n"
+            "        pass\n"
+            "    return router\n"
+        ),
+        (
+            "def build_router():\n"
+            "    router = APIRouter()\n"
+            "    register = router.delete\n"
+            "    def declare_routes():\n"
+            "        @register('/api/agents/{name}')\n"
+            "        def terminate():\n"
+            "            pass\n"
+            "    return router\n"
+        ),
+    ],
+    ids=["module-alias", "nested-alias"],
+)
+def test_route_declarations_inherit_bound_aliases_into_nested_scopes(
+    source: str,
+) -> None:
+    assert _route_declarations(ast.parse(source), {}, {}) == [
+        (("DELETE",), "/api/agents/{name}")
+    ]
 
 
 def test_route_declarations_replay_nested_lexical_constants() -> None:
@@ -4368,6 +4405,19 @@ def _has_provenance_value(
             in (provenance_return_helpers or set())
             for child in ast.walk(node)
         )
+    )
+
+
+def _is_non_authority_context_manager(expression: ast.AST) -> bool:
+    """Return bounded contexts that cannot grant permission to their body."""
+
+    if not isinstance(expression, ast.Call):
+        return False
+    return (
+        isinstance(expression.func, ast.Attribute)
+        and isinstance(expression.func.value, ast.Name)
+        and expression.func.value.id == "asyncio"
+        and expression.func.attr in {"timeout", "timeout_at"}
     )
 
 
@@ -6553,6 +6603,25 @@ def _authority_provenance_lines(
                 ):
                     lines.add(node.lineno)
                 continue
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                if any(
+                    (
+                        not _is_non_authority_context_manager(item.context_expr)
+                        and _has_provenance_value(
+                            item.context_expr,
+                            provenance_aliases,
+                            provenance_return_helpers,
+                        )
+                    )
+                    for item in node.items
+                ) and (
+                    function_is_permission_boundary
+                    or _contains_cross_agent_control_call(
+                        node.body, control_aliases
+                    )
+                ):
+                    lines.add(node.lineno)
+                continue
             if isinstance(node, ast.BoolOp):
                 if (
                     _has_provenance_value(
@@ -7071,6 +7140,32 @@ def test_provenance_scanner_propagates_object_state_across_methods() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {6}
+
+
+@pytest.mark.parametrize("keyword", ["with", "async with"])
+def test_provenance_scanner_inspects_context_manager_guards(
+    keyword: str,
+) -> None:
+    function_prefix = "async " if keyword.startswith("async") else ""
+    tree = ast.parse(
+        f"{function_prefix}def handle(request, target):\n"
+        f"    {keyword} scope(request.causation_chain):\n"
+        "        target.shutdown()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+def test_provenance_scanner_does_not_treat_timeout_as_authority_context() -> None:
+    tree = ast.parse(
+        "ORCHESTRATOR_TURN_TIMEOUT_SECS = 30\n"
+        "async def handle(target):\n"
+        "    call_timeout = ORCHESTRATOR_TURN_TIMEOUT_SECS\n"
+        "    async with asyncio.timeout(call_timeout):\n"
+        "        target.shutdown()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == set()
 
 
 def test_provenance_scanner_follows_control_callback_aliases() -> None:
