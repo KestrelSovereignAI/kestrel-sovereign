@@ -1007,6 +1007,32 @@ class ProcessManager:
             A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
         ):
             env.pop(inherited_registry_key, None)
+        # Host-feature state is fleet-scoped, while the KESTREL_DB_PATH below
+        # is deliberately replaced with this one agent's root. Resolve the
+        # host path first and publish that exact answer to every child; letting
+        # each child derive it after the override partitions Hold latches and
+        # every other host feature by agent.
+        from kestrel_sovereign.host_features.storage import (
+            DERIVED_HOST_DB_PATH_ENV,
+            HOST_DB_PATH_ENV,
+            host_database_path,
+        )
+
+        configured_host_path = env.get(HOST_DB_PATH_ENV)
+        if not configured_host_path:
+            fleet_host_path, _uses_default = host_database_path(
+                env=env,
+                base_dir=self.project_dir,
+            )
+            env[HOST_DB_PATH_ENV] = str(fleet_host_path)
+            # Preserve implicit-path migration semantics in the child. Merely
+            # spelling the derived answer as KESTREL_HOST_DB_PATH must not turn
+            # an upgrade into an operator override that strands legacy state.
+            env[DERIVED_HOST_DB_PATH_ENV] = str(fleet_host_path)
+        elif env.get(DERIVED_HOST_DB_PATH_ENV) != configured_host_path:
+            # A real operator override owns its migration policy. Never let a
+            # stale internal marker weaken that explicit boundary.
+            env.pop(DERIVED_HOST_DB_PATH_ENV, None)
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

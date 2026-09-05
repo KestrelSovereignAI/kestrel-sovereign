@@ -38,6 +38,11 @@ from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
     SEMANTIC_INFERENCE_CONFIG_ENV,
 )
+from kestrel_sovereign.host_features.storage import (
+    DERIVED_HOST_DB_PATH_ENV,
+    HOST_DB_PATH_ENV,
+    HOST_FEATURE_DB_FILENAME,
+)
 
 
 # -----------------------------------------------------------------------
@@ -535,6 +540,50 @@ class TestStartAgent:
         assert env["KESTREL_API_KEY"] == "test-key"
         assert env["KESTREL_A2A_TRANSPORT_ONLY"] == "false"
         assert env["KESTREL_SERVE_UI"] == "true"
+
+    def test_named_agents_share_host_database_resolved_before_agent_override(
+        self,
+        pm,
+        project_dir,
+    ):
+        """Per-agent primary roots cannot partition fleet Hold state."""
+
+        fleet_root = project_dir / "fleet-data"
+        captured = []
+
+        def capture_spawn(_cmd, env, *_args, **_kwargs):
+            captured.append(dict(env))
+            return 12345 + len(captured)
+
+        configs = {
+            "claw": LocalAgentConfig(data_dir="agent_data/claw", port=8801),
+            "testbot": LocalAgentConfig(
+                data_dir="agent_data/testbot",
+                port=8802,
+            ),
+        }
+        with (
+            patch.object(
+                pm,
+                "_load_env",
+                return_value={"KESTREL_DB_PATH": str(fleet_root)},
+            ),
+            patch.object(pm, "_spawn", side_effect=capture_spawn),
+        ):
+            for name, config in configs.items():
+                pm.start_agent(name, config)
+
+        expected_host = str(
+            fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
+        )
+        assert {env[HOST_DB_PATH_ENV] for env in captured} == {expected_host}
+        assert {
+            env[DERIVED_HOST_DB_PATH_ENV] for env in captured
+        } == {expected_host}
+        assert [env["KESTREL_DB_PATH"] for env in captured] == [
+            str((project_dir / config.data_dir).resolve())
+            for config in configs.values()
+        ]
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,

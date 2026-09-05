@@ -505,6 +505,65 @@ class TestMultiAgentConfigLoading:
         with pytest.raises(ValueError, match="overlaps host Hold custody"):
             MultiAgentConfig.from_file(config_path)
 
+    def test_from_file_uses_target_project_env_over_ambient_shell(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Offline validation describes the launch target, not the caller."""
+
+        project = tmp_path / "target-project"
+        agent_dir = project / "agent_data" / "alice"
+        agent_dir.mkdir(parents=True)
+        config_path = project / "multi_agent.toml"
+        config_path.write_text(
+            f'[agents.alice]\ndata_dir = "{agent_dir}"\nport = 8801\n',
+            encoding="utf-8",
+        )
+        target_host = project / "fleet-control" / "host-features.db"
+        (project / ".env").write_text(
+            f"KESTREL_HOST_DB_PATH={target_host}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(agent_dir / "ambient-shell.db"),
+        )
+
+        config = MultiAgentConfig.from_file(config_path)
+
+        assert list(config.agents) == ["alice"]
+
+    def test_from_file_resolves_relative_target_custody_from_project(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Target-relative custody cannot be resolved from an unrelated CWD."""
+
+        project = tmp_path / "target-project"
+        agent_dir = project / "agent_data" / "alice"
+        agent_dir.mkdir(parents=True)
+        config_path = project / "multi_agent.toml"
+        config_path.write_text(
+            f'[agents.alice]\ndata_dir = "{agent_dir}"\nport = 8801\n',
+            encoding="utf-8",
+        )
+        (project / ".env").write_text(
+            "KESTREL_HOST_DB_PATH=agent_data/alice/host-features.db\n",
+            encoding="utf-8",
+        )
+        unrelated = tmp_path / "unrelated-cwd"
+        unrelated.mkdir()
+        monkeypatch.chdir(unrelated)
+        monkeypatch.setenv(
+            "KESTREL_HOST_DB_PATH",
+            str(tmp_path / "ambient-safe" / "host-features.db"),
+        )
+
+        with pytest.raises(ValueError, match="overlaps host Hold custody"):
+            MultiAgentConfig.from_file(config_path)
+
 
 class TestAutoDiscovery:
     """Tests for auto-discovery of agents."""

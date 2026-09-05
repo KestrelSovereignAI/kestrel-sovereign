@@ -2883,6 +2883,7 @@ async def _lifespan_startup(app: FastAPI):
             config = MultiAgentConfig.load(
                 str(multi_agent_path) if multi_agent_path.exists() else None,
                 auto_discover_fallback=True,
+                runtime_env=os.environ,
             )
             _apply_platform_host_port(config, os.environ)
             await _build_host_control_context(app, config)

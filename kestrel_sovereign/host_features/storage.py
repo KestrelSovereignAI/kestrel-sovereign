@@ -9,7 +9,7 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from kestrel_sovereign.paths import host_data_dir, project_dir
 from kestrel_sovereign.private_storage import (
@@ -24,6 +24,7 @@ from kestrel_sovereign.private_storage import (
 )
 
 HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
+DERIVED_HOST_DB_PATH_ENV = "KESTREL_DERIVED_HOST_DB_PATH"
 AGENT_DB_PATH_ENV = "KESTREL_DB_PATH"
 HOST_FEATURE_DB_FILENAME = "host-features.db"
 LEGACY_HOST_DB_FILENAME = "kestrel_host.db"
@@ -36,20 +37,66 @@ HostStorageError = PrivateStorageError
 logger = logging.getLogger(__name__)
 
 
-def host_database_path(db_path: Optional[str] = None) -> tuple[Path, bool]:
-    """Return ``(absolute path, uses implicit default)`` without filesystem I/O."""
-    explicit = db_path or os.environ.get(HOST_DB_PATH_ENV)
+def _runtime_path(value: str, env: Mapping[str, str], base_dir: Path) -> Path:
+    """Resolve one path using the target runtime's home and working directory."""
+
+    runtime_home = env.get("HOME") or env.get("USERPROFILE")
+    if runtime_home and value == "~":
+        candidate = Path(runtime_home)
+    elif runtime_home and value.startswith(("~/", "~\\")):
+        candidate = Path(runtime_home) / value[2:]
+    else:
+        candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return absolute_without_following_leaf(candidate)
+
+
+def _default_host_database_path(
+    env: Mapping[str, str], base_dir: Path
+) -> Path:
+    """Resolve the private default from a described runtime, without mutating it."""
+
+    configured_home = env.get("KESTREL_HOME")
+    if configured_home:
+        root = _runtime_path(configured_home, env, base_dir)
+    else:
+        runtime_home = env.get("HOME") or env.get("USERPROFILE")
+        root = (
+            _runtime_path(runtime_home, env, base_dir) / ".kestrel"
+            if runtime_home
+            else absolute_without_following_leaf(Path.home() / ".kestrel")
+        )
+    return root / "host-data" / HOST_FEATURE_DB_FILENAME
+
+
+def host_database_path(
+    db_path: Optional[str] = None,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> tuple[Path, bool]:
+    """Return ``(absolute path, uses implicit default)`` without filesystem I/O.
+
+    ``env`` and ``base_dir`` let launchers and offline validation resolve the
+    path for the runtime they are describing.  Omitting them preserves the
+    live-process contract: ``os.environ`` plus the current working directory.
+    """
+
+    runtime_env = os.environ if env is None else env
+    runtime_base = absolute_without_following_leaf(base_dir or Path.cwd())
+    explicit = db_path or runtime_env.get(HOST_DB_PATH_ENV)
     if explicit:
-        return absolute_without_following_leaf(Path(explicit)), False
-    agent_data_root = os.environ.get(AGENT_DB_PATH_ENV)
+        return _runtime_path(explicit, runtime_env, runtime_base), False
+    agent_data_root = runtime_env.get(AGENT_DB_PATH_ENV)
     if agent_data_root:
         return (
-            absolute_without_following_leaf(Path(agent_data_root))
+            _runtime_path(agent_data_root, runtime_env, runtime_base)
             / "host-data"
             / HOST_FEATURE_DB_FILENAME,
             False,
         )
-    return host_data_dir() / HOST_FEATURE_DB_FILENAME, True
+    return _default_host_database_path(runtime_env, runtime_base), True
 
 
 def legacy_host_database_path() -> Path:
@@ -337,10 +384,18 @@ def prepare_host_database(db_path: Optional[str] = None) -> Path:
     with the main database's exact mode, independent of the process umask.
     """
     destination, uses_default = host_database_path(db_path)
-    explicit_override = bool(db_path or os.environ.get(HOST_DB_PATH_ENV))
-    follows_agent_data_root = bool(
-        not explicit_override and os.environ.get(AGENT_DB_PATH_ENV)
+    configured_host_path = os.environ.get(HOST_DB_PATH_ENV)
+    derived_host_path = os.environ.get(DERIVED_HOST_DB_PATH_ENV)
+    launcher_derived_override = bool(
+        not db_path
+        and configured_host_path
+        and derived_host_path == configured_host_path
     )
+    explicit_override = bool(
+        db_path or (configured_host_path and not launcher_derived_override)
+    )
+    previous_default = host_data_dir() / HOST_FEATURE_DB_FILENAME
+    follows_agent_data_root = not explicit_override and destination != previous_default
     parent = destination.parent
     if uses_default:
         ensure_private_directory(parent, label="host data")
@@ -356,7 +411,7 @@ def prepare_host_database(db_path: Optional[str] = None) -> Path:
             sources.append(
                 (
                     "previous default host database",
-                    host_data_dir() / HOST_FEATURE_DB_FILENAME,
+                    previous_default,
                 )
             )
         sources.append(("legacy host database", legacy_host_database_path()))
@@ -370,6 +425,7 @@ def prepare_host_database(db_path: Optional[str] = None) -> Path:
 
 __all__ = [
     "AGENT_DB_PATH_ENV",
+    "DERIVED_HOST_DB_PATH_ENV",
     "HOST_DB_PATH_ENV",
     "HOST_FEATURE_DB_FILENAME",
     "LEGACY_HOST_DB_FILENAME",

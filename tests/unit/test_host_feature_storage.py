@@ -12,6 +12,7 @@ import pytest
 
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.host_features.storage import (
+    DERIVED_HOST_DB_PATH_ENV,
     HOST_DB_PATH_ENV,
     HOST_FEATURE_DB_FILENAME,
     HostStorageError,
@@ -371,6 +372,32 @@ def test_agent_data_root_migrates_previous_default_host_database(
     with sqlite3.connect(destination) as connection:
         assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
             "pre-upgrade",
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_launcher_derived_host_path_keeps_implicit_migration_semantics(
+    tmp_path,
+    monkeypatch,
+):
+    """Publishing one fleet path to a child must not strand prior state."""
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    fleet_root = tmp_path / "mounted-data"
+    destination = fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="pre-launcher-upgrade")
+    previous.chmod(0o644)
+    monkeypatch.setenv("KESTREL_HOME", str(home))
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "agent_data" / "alice"))
+    monkeypatch.setenv(HOST_DB_PATH_ENV, str(destination))
+    monkeypatch.setenv(DERIVED_HOST_DB_PATH_ENV, str(destination))
+
+    assert prepare_host_database() == destination
+    assert not previous.exists()
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
+            "pre-launcher-upgrade",
         )
 
 

@@ -12,7 +12,7 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 
 import logging
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, List, Mapping, Optional, Union
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -22,6 +22,7 @@ from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did_sync,
 )
+from kestrel_sovereign.paths import spawned_agent_env
 from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
@@ -69,10 +70,15 @@ def spawn_retirement_denies_startup(data_dir: Path) -> bool:
     )
     return False
 
-def _host_control_directory() -> Path:
-    """Resolve the host custody root using the runtime's path precedence."""
 
-    database_path, _uses_default = host_database_path()
+def _host_control_directory(
+    *,
+    env: Mapping[str, str],
+    base_dir: Path,
+) -> Path:
+    """Resolve host custody for the target runtime, not this Python process."""
+
+    database_path, _uses_default = host_database_path(env=env, base_dir=base_dir)
     return database_path.parent.resolve(strict=False)
 
 
@@ -334,7 +340,12 @@ class MultiAgentConfig(BaseModel):
         return self
 
     @classmethod
-    def from_file(cls, config_path: Union[str, Path]) -> "MultiAgentConfig":
+    def from_file(
+        cls,
+        config_path: Union[str, Path],
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
+    ) -> "MultiAgentConfig":
         """
         Load multi_agent config from a TOML file.
 
@@ -379,13 +390,36 @@ class MultiAgentConfig(BaseModel):
                 )
 
         config = cls(host=host, agents=agents)
-        config.validate_host_custody_paths(base_dir=path.parent)
+        target_base = path.parent.resolve(strict=False)
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        config.validate_host_custody_paths(
+            base_dir=target_base,
+            runtime_env=target_env,
+        )
         return config
 
-    def validate_host_custody_paths(self, *, base_dir: Path) -> None:
+    def validate_host_custody_paths(
+        self,
+        *,
+        base_dir: Path,
+        runtime_env: Optional[Mapping[str, str]] = None,
+    ) -> None:
         """Reject explicit local agent roots overlapping host-owned Hold state."""
 
-        host_control_dir = _host_control_directory()
+        target_base = base_dir.resolve(strict=False)
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
         for name, agent in self.agents.items():
             if not isinstance(agent, LocalAgentConfig):
                 continue
@@ -402,6 +436,9 @@ class MultiAgentConfig(BaseModel):
         cls,
         base_dir: Union[str, Path] = AGENT_DATA_DIR,
         include_empty: bool = False,
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
+        project_base: Optional[Path] = None,
     ) -> "MultiAgentConfig":
         """
         Auto-discover agents from agent_data/* subdirectories.
@@ -418,7 +455,20 @@ class MultiAgentConfig(BaseModel):
             MultiAgentConfig with auto-discovered agents
         """
         base_path = Path(base_dir)
-        host_control_dir = _host_control_directory()
+        target_base = (
+            project_base.resolve(strict=False)
+            if project_base is not None
+            else base_path.parent.resolve(strict=False)
+        )
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
         agents: dict[str, LocalAgentConfig] = {}
         next_port = DEFAULT_AGENT_START_PORT
 
@@ -484,6 +534,8 @@ class MultiAgentConfig(BaseModel):
         cls,
         config_path: Optional[Union[str, Path]] = None,
         auto_discover_fallback: bool = True,
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
     ) -> "MultiAgentConfig":
         """
         Load multi_agent config with auto-discovery fallback.
@@ -502,13 +554,17 @@ class MultiAgentConfig(BaseModel):
 
         if path.exists():
             logger.info(f"Loading multi_agent config from {path}")
-            return cls.from_file(path)
+            return cls.from_file(path, runtime_env=runtime_env)
 
         if auto_discover_fallback:
             # Scan for agents relative to the config file's parent directory
             base_dir = path.parent / AGENT_DATA_DIR
             logger.info(f"No multi_agent config found at {path}, auto-discovering agents in {base_dir}...")
-            return cls.auto_discover(base_dir)
+            return cls.auto_discover(
+                base_dir,
+                runtime_env=runtime_env,
+                project_base=path.parent,
+            )
 
         # No config and no auto-discovery
         logger.warning(f"No multi_agent config found at {path}")

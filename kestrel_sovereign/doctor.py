@@ -115,7 +115,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
-    _check_multi_agent(multi_agent_path, project_dir, report)
+    _check_multi_agent(multi_agent_path, project_dir, resolved, report)
 
     # Read each agent's governance ONCE and give the same reading to both
     # checks. They used to resolve and read independently, which on an
@@ -253,9 +253,16 @@ def _check_llm(config: dict, env: dict, toml_path: Path, report: DoctorReport) -
 
 
 def _check_multi_agent(
-    multi_agent_path: Path, project_dir: Path, report: DoctorReport
+    multi_agent_path: Path,
+    project_dir: Path,
+    env: dict,
+    report: DoctorReport,
 ) -> None:
-    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    multi_agent = MultiAgentConfig.load(
+        multi_agent_path,
+        auto_discover_fallback=False,
+        runtime_env=env,
+    )
     agents = multi_agent.get_local_agents()
     if not agents:
         report.fail.append(
@@ -2087,7 +2094,11 @@ def _read_agent_governance(
     ten-agent fleet waiting fifty seconds under a five-second bound. The
     schema question is a property of the database, not of the tenant asking.
     """
-    multi_agent = MultiAgentConfig.load(multi_agent_path, auto_discover_fallback=False)
+    multi_agent = MultiAgentConfig.load(
+        multi_agent_path,
+        auto_discover_fallback=False,
+        runtime_env=env,
+    )
     ledger_by_dsn: dict = {}
     readings: list[_AgentGovernance] = []
     for name, cfg in multi_agent.get_local_agents().items():
