@@ -4467,7 +4467,36 @@ def _is_cross_agent_state_mutation_call(
             call.args[0], state_object_aliases
         )
     )
-    return attribute_mutation or named_mutation
+    lifecycle_mutation = (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold()
+        in {
+            "cancel",
+            "close",
+            "delete",
+            "destroy",
+            "disable",
+            "enable",
+            "hold",
+            "interrupt",
+            "kill",
+            "offboard",
+            "pause",
+            "remove",
+            "reset",
+            "restart",
+            "resume",
+            "shutdown",
+            "start",
+            "stop",
+            "terminate",
+            "withdraw",
+        }
+        and _is_cross_agent_state_object_reference(
+            call.func.value, state_object_aliases
+        )
+    )
+    return attribute_mutation or named_mutation or lifecycle_mutation
 
 
 @lru_cache(maxsize=None)
@@ -4641,12 +4670,29 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
         )
         if not semantic_orchestrator:
             tokens.discard("orchestrator")
+    # Merely retrieving a chain-provider callable is transport wiring, not a
+    # provenance value. The callable becomes provenance-bearing only when it
+    # is invoked (handled by ``_is_provenance_accessor_call``). Keep ordinary
+    # ``getattr(request, "parent_causation_chain")`` value reads tainted.
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Call)
+            and _call_name(child).casefold() == "getattr"
+            and len(child.args) > 1
+        ):
+            attribute = _resolved_string(child.args[1])
+            if attribute is not None and "provide" in attribute.casefold().split("_"):
+                tokens.discard(attribute.casefold())
     provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
     return any(
         token in provenance_tokens
-        or token.startswith("orchestrator_")
-        or token == "causation"
-        or token.startswith("causation_")
+        or (
+            "orchestrator" in token.split("_")
+            and not set(token.split("_")).intersection(
+                {"feature", "model", "name", "prompt", "role", "slug", "tool"}
+            )
+        )
+        or "causation" in token.split("_")
         or token == "causationframe"
         or token in (aliases or set())
         for token in tokens
@@ -6412,6 +6458,18 @@ def _module_imported_control_aliases(
                 if remote_name in resolved
             )
             aliases.update(star_names.intersection(resolved))
+            for imported in node.names:
+                if imported.name == "*":
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                member_calls = _module_attribute_call_names(calls, qualifier)
+                aliases.update(
+                    _repository_control_helper_names(
+                        imported_path,
+                        member_calls,
+                        seen,
+                    )
+                )
         elif isinstance(node, ast.Import):
             for imported in node.names:
                 imported_path = _resolved_repository_import_path(
@@ -8389,6 +8447,67 @@ def test_provenance_scanner_tracks_direct_agent_object_mutations_and_aliases() -
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 11}
+
+
+def test_provenance_scanner_recognizes_qualified_provenance_names() -> None:
+    tree = ast.parse(
+        "def causation(request, parent_causation_chain, target):\n"
+        "    if parent_causation_chain:\n"
+        "        terminate_child(target)\n\n"
+        "def orchestrator(request, is_orchestrator, target):\n"
+        "    if is_orchestrator:\n"
+        "        stop_peer(target)\n\n"
+        "def benign(request, collaboration, target):\n"
+        "    if collaboration:\n"
+        "        terminate_child(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6}
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["start", "pause", "resume", "disable", "enable", "delete"],
+)
+def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
+    method: str,
+) -> None:
+    controlled = ast.parse(
+        "def dispatch(request, child):\n"
+        "    if request.causation_chain:\n"
+        f"        child.{method}()\n"
+    )
+    benign = ast.parse(
+        "def dispatch(request, metrics):\n"
+        "    if request.causation_chain:\n"
+        f"        metrics.{method}()\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {2}
+    assert _authority_provenance_lines(benign) == set()
+
+
+def test_provenance_scanner_follows_imported_class_control_helpers(
+    tmp_path: Path,
+) -> None:
+    helper_path = tmp_path / "lifecycle.py"
+    helper_path.write_text(
+        "class Lifecycle:\n"
+        "    @staticmethod\n"
+        "    def apply(target):\n"
+        "        terminate_child(target)\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from .lifecycle import Lifecycle\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        Lifecycle.apply(target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
 
 def test_provenance_scanner_follows_module_control_aliases_and_factories(
