@@ -276,7 +276,8 @@ def _module_constant_bindings(
         if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
             mutated_names.add(node.target.id)
         elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            function = node.value.func
+            call = node.value
+            function = call.func
             if (
                 isinstance(function, ast.Attribute)
                 and isinstance(function.value, ast.Name)
@@ -295,6 +296,28 @@ def _module_constant_bindings(
                 }
             ):
                 mutated_names.add(function.value.id)
+            else:
+                # Passing a mutable methods collection across an unmodelled
+                # call boundary can change it just as surely as a direct
+                # ``METHODS.append(...)``.  The exact route inventory cannot
+                # prove that an arbitrary helper is pure, so discard every
+                # live collection binding reachable through its arguments and
+                # make a later decorator fail closed.
+                mutated_names.update(
+                    child.id
+                    for argument in [
+                        *call.args,
+                        *(keyword.value for keyword in call.keywords),
+                    ]
+                    for child in ast.walk(argument)
+                    if isinstance(child, ast.Name) and child.id in collections
+                )
+                if (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id in collections
+                ):
+                    mutated_names.add(function.value.id)
         elif isinstance(node, ast.Delete):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -312,6 +335,29 @@ def _module_constant_bindings(
                     target.value, ast.Name
                 ):
                     mutated_names.add(target.value.id)
+            if isinstance(node.value, ast.Call):
+                mutated_names.update(
+                    child.id
+                    for argument in [
+                        *node.value.args,
+                        *(keyword.value for keyword in node.value.keywords),
+                    ]
+                    for child in ast.walk(argument)
+                    if isinstance(child, ast.Name) and child.id in collections
+                )
+                if (
+                    isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id in collections
+                ):
+                    mutated_names.add(node.value.func.value.id)
+                # The result of an unmodelled call cannot preserve an older
+                # binding on the assignment target either.
+                mutated_names.update(
+                    target.id
+                    for target in assignment_targets
+                    if isinstance(target, ast.Name)
+                )
         if mutated_names:
             for name in mutated_names:
                 strings.pop(name, None)
@@ -516,6 +562,40 @@ def test_module_string_constants_follow_source_order_on_reassignment() -> None:
             _module_string_constants(aliased_route),
             _module_string_collections(aliased_route),
         )
+
+    helper_mutated = ast.parse(
+        'METHODS = ["GET"]\n'
+        'mutate(METHODS)\n'
+        '@app.api_route("/api/agents/{name}", methods=METHODS)\n'
+        'def route():\n    pass\n'
+    )
+    assert "METHODS" not in _module_string_collections(helper_mutated)
+    with pytest.raises(AssertionError, match="Unresolved api_route methods"):
+        _route_declarations(
+            helper_mutated,
+            _module_string_constants(helper_mutated),
+            _module_string_collections(helper_mutated),
+        )
+
+    assigned_helper_mutation = ast.parse(
+        'METHODS = ["GET"]\n'
+        'result = mutate(METHODS)\n'
+        '@app.api_route("/api/agents/{name}", methods=METHODS)\n'
+        'def route():\n    pass\n'
+    )
+    assert "METHODS" not in _module_string_collections(
+        assigned_helper_mutation
+    )
+
+    unknown_method_mutation = ast.parse(
+        'METHODS = ["GET"]\n'
+        'METHODS.rewrite_in_place()\n'
+        '@app.api_route("/api/agents/{name}", methods=METHODS)\n'
+        'def route():\n    pass\n'
+    )
+    assert "METHODS" not in _module_string_collections(
+        unknown_method_mutation
+    )
 
 
 def _public_tool_name(
@@ -4010,9 +4090,94 @@ def _local_control_helpers(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     imported_control_aliases: set[str] | None = None,
 ) -> set[str]:
-    """Find local helpers that eventually invoke a control sink."""
+    """Find local helpers that eventually invoke a control sink.
+
+    A neutral helper name is still a control boundary when it invokes a
+    callback parameter and a caller supplies ``terminate_child`` (or another
+    known control callable) for that parameter.  Track that higher-order edge
+    explicitly so moving a control behind ``apply(callback, target)`` cannot
+    erase it from the causation-as-authority audit.
+    """
 
     helper_names: set[str] = set(imported_control_aliases or ())
+    invoked_parameters: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {}
+    for function in functions:
+        parameter_names = {
+            argument.arg.casefold()
+            for argument in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            ]
+        }
+        invoked_parameters[function] = {
+            node.func.id.casefold()
+            for node in _walk_lexical_scope(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.casefold() in parameter_names
+        }
+
+    call_sites = [
+        (caller, node)
+        for caller in functions
+        for node in _walk_lexical_scope(caller)
+        if isinstance(node, ast.Call)
+    ]
+
+    def callback_arguments(
+        call: ast.Call,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        callback_parameters: set[str],
+    ) -> list[ast.AST]:
+        positional_parameters = [
+            *callee.args.posonlyargs,
+            *callee.args.args,
+        ]
+        # ``obj.method(...)`` does not supply the conventional self/cls
+        # parameter explicitly.  Free functions and static methods retain the
+        # ordinary zero offset.
+        if (
+            isinstance(call.func, ast.Attribute)
+            and positional_parameters
+            and positional_parameters[0].arg.casefold() in {"self", "cls"}
+        ):
+            positional_parameters = positional_parameters[1:]
+        values = [
+            value
+            for parameter, value in zip(positional_parameters, call.args)
+            if parameter.arg.casefold() in callback_parameters
+        ]
+        values.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+            and keyword.arg.casefold() in callback_parameters
+        )
+        # A starred call prevents an exact position proof.  If this helper
+        # invokes any callback parameter, conservatively inspect the expanded
+        # value rather than treating the ambiguity as evidence of safety.
+        if callback_parameters:
+            values.extend(
+                argument.value
+                for argument in call.args
+                if isinstance(argument, ast.Starred)
+            )
+            values.extend(
+                keyword.value for keyword in call.keywords if keyword.arg is None
+            )
+        return values
+
+    def is_control_reference(node: ast.AST, aliases: set[str]) -> bool:
+        sources = set(_control_reference_sources(node))
+        if isinstance(node, ast.Subscript):
+            sources.update(_identifier_tokens(node.slice))
+        return any(
+            _is_cross_agent_control_name(source) or source in aliases
+            for source in sources
+        )
 
     changed = True
     while changed:
@@ -4028,6 +4193,26 @@ def _local_control_helpers(
             ):
                 helper_names.add(function_name)
                 changed = True
+                continue
+
+            callback_parameters = invoked_parameters.get(function, set())
+            if not callback_parameters:
+                continue
+            for caller, call in call_sites:
+                if _call_name(call).casefold() != function_name:
+                    continue
+                caller_aliases = _cross_agent_control_aliases(
+                    caller, helper_names
+                )
+                if any(
+                    is_control_reference(argument, caller_aliases)
+                    for argument in callback_arguments(
+                        call, function, callback_parameters
+                    )
+                ):
+                    helper_names.add(function_name)
+                    changed = True
+                    break
     return helper_names
 
 
@@ -5446,6 +5631,24 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
     )
 
     assert _authority_provenance_lines(callbacks) == {3, 7}
+
+    parameter_callback = ast.parse(
+        "def apply(callback, target):\n"
+        "    callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(terminate_child, target)\n"
+    )
+    keyword_callback = ast.parse(
+        "def apply(*, callback, target):\n"
+        "    callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.orchestrator:\n"
+        "        apply(callback=stop_peer, target=target)\n"
+    )
+
+    assert _authority_provenance_lines(parameter_callback) == {5}
+    assert _authority_provenance_lines(keyword_callback) == {5}
 
 
 def test_provenance_scanner_carries_outer_continuations_into_nested_guards() -> None:
