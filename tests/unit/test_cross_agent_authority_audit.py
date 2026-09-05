@@ -612,6 +612,49 @@ def _imported_module_attribute_name(
     return None
 
 
+def _static_assignment_pairs(
+    target: ast.AST,
+    value: ast.AST,
+) -> list[tuple[str, ast.AST]]:
+    """Pair statically aligned assignment targets and values.
+
+    Python permits aliases to be introduced by annotated, chained, and
+    destructuring assignments. Exact tuple/list shapes can be replayed without
+    execution; starred or mismatched shapes remain deliberately unresolved.
+    """
+
+    if isinstance(target, ast.Name):
+        return [(target.id, value)]
+    if (
+        isinstance(target, (ast.List, ast.Tuple))
+        and isinstance(value, (ast.List, ast.Tuple))
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(element, ast.Starred) for element in target.elts)
+    ):
+        return [
+            pair
+            for target_element, value_element in zip(target.elts, value.elts)
+            for pair in _static_assignment_pairs(target_element, value_element)
+        ]
+    return []
+
+
+def _assignment_target_names(target: ast.AST) -> set[str]:
+    """Return case-preserving names bound anywhere in one target."""
+
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {
+            name
+            for element in target.elts
+            for name in _assignment_target_names(element)
+        }
+    return set()
+
+
 def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
     """Resolve import and lexical-scope aliases for the ``tool`` decorator."""
 
@@ -622,18 +665,27 @@ def _tool_decorator_aliases(tree: ast.Module) -> set[str]:
             for imported in node.names:
                 if imported.name == "tool":
                     aliases.add(imported.asname or imported.name)
-        elif (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            source = (
-                node.value.id
-                if isinstance(node.value, ast.Name)
-                else _imported_module_attribute_name(tree, node.value)
-            )
-            if source is not None:
-                assignments.append((node.targets[0].id, source))
+        else:
+            assignment_pairs: list[tuple[str, ast.AST]] = []
+            if isinstance(node, ast.Assign):
+                assignment_pairs = [
+                    pair
+                    for target in node.targets
+                    for pair in _static_assignment_pairs(target, node.value)
+                ]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                assignment_pairs = _static_assignment_pairs(
+                    node.target,
+                    node.value,
+                )
+            for target, value in assignment_pairs:
+                source = (
+                    value.id
+                    if isinstance(value, ast.Name)
+                    else _imported_module_attribute_name(tree, value)
+                )
+                if source is not None:
+                    assignments.append((target, source))
     changed = True
     while changed:
         changed = False
@@ -936,6 +988,167 @@ def _discovered_tool_surfaces() -> frozenset[str]:
     return frozenset(surfaces | _discovered_runtime_generated_tool_surfaces())
 
 
+def _cron_task_entry_name(
+    item: ast.AST,
+    constants: dict[str, str],
+) -> str:
+    if not isinstance(item, (ast.List, ast.Tuple)) or not item.elts:
+        raise AssertionError("CRON_TASKS contains an unsupported entry")
+    name = _resolved_string(item.elts[0], constants)
+    if name is None:
+        raise AssertionError(
+            "Unresolved CRON_TASKS name expression: "
+            f"{ast.unparse(item.elts[0])}"
+        )
+    return name
+
+
+def _cron_task_collection_names(
+    value: ast.AST,
+    constants: dict[str, str],
+    current: set[str] | None,
+) -> set[str]:
+    if isinstance(value, ast.Name) and value.id == "CRON_TASKS":
+        if current is None:
+            raise AssertionError("CRON_TASKS referenced before its declaration")
+        return set(current)
+    if not isinstance(value, (ast.List, ast.Tuple)):
+        raise AssertionError(
+            "CRON_TASKS must remain a statically resolvable list or tuple: "
+            f"{ast.unparse(value)}"
+        )
+
+    names: set[str] = set()
+    for item in value.elts:
+        if isinstance(item, ast.Starred):
+            if not (
+                isinstance(item.value, ast.Name)
+                and item.value.id == "CRON_TASKS"
+                and current is not None
+            ):
+                raise AssertionError(
+                    "Unresolved CRON_TASKS collection unpacking: "
+                    f"{ast.unparse(item)}"
+                )
+            names.update(current)
+            continue
+        names.add(_cron_task_entry_name(item, constants))
+    return names
+
+
+def _cron_task_names(
+    tree: ast.Module,
+    source_path: Path | None = None,
+) -> set[str]:
+    """Replay statically knowable module-level ``CRON_TASKS`` mutations."""
+
+    task_names: set[str] | None = None
+    for index, node in enumerate(tree.body):
+        prefix = ast.Module(body=tree.body[:index], type_ignores=[])
+        constants = _module_string_constants(prefix, source_path)
+
+        assignment_target: ast.AST | None = None
+        assignment_value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            bound_names = {
+                name
+                for target in node.targets
+                for name in _assignment_target_names(target)
+            }
+            if "CRON_TASKS" in bound_names:
+                if not (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "CRON_TASKS"
+                ):
+                    raise AssertionError(
+                        "Unsupported destructuring assignment to CRON_TASKS"
+                    )
+                assignment_target = node.targets[0]
+                assignment_value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if "CRON_TASKS" in _assignment_target_names(node.target):
+                if not (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id == "CRON_TASKS"
+                    and node.value is not None
+                ):
+                    raise AssertionError("Unsupported annotated CRON_TASKS assignment")
+                assignment_target = node.target
+                assignment_value = node.value
+
+        if assignment_target is not None and assignment_value is not None:
+            task_names = _cron_task_collection_names(
+                assignment_value,
+                constants,
+                task_names,
+            )
+            continue
+
+        if (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "CRON_TASKS"
+        ):
+            if task_names is None or not isinstance(node.op, ast.Add):
+                raise AssertionError("Unsupported augmented CRON_TASKS mutation")
+            task_names.update(
+                _cron_task_collection_names(node.value, constants, task_names)
+            )
+            continue
+
+        direct_call = node.value if isinstance(node, ast.Expr) else None
+        if (
+            isinstance(direct_call, ast.Call)
+            and isinstance(direct_call.func, ast.Attribute)
+            and isinstance(direct_call.func.value, ast.Name)
+            and direct_call.func.value.id == "CRON_TASKS"
+        ):
+            if task_names is None or direct_call.keywords:
+                raise AssertionError("Unsupported CRON_TASKS method mutation")
+            if direct_call.func.attr == "append" and len(direct_call.args) == 1:
+                task_names.add(
+                    _cron_task_entry_name(direct_call.args[0], constants)
+                )
+                continue
+            if direct_call.func.attr == "extend" and len(direct_call.args) == 1:
+                task_names.update(
+                    _cron_task_collection_names(
+                        direct_call.args[0],
+                        constants,
+                        task_names,
+                    )
+                )
+                continue
+            raise AssertionError(
+                "Unsupported CRON_TASKS method mutation: "
+                f"{ast.unparse(direct_call)}"
+            )
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if any(
+            isinstance(child, ast.Name)
+            and child.id == "CRON_TASKS"
+            and isinstance(child.ctx, (ast.Store, ast.Del))
+            for child in ast.walk(node)
+        ) or any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == "CRON_TASKS"
+            for child in ast.walk(node)
+        ):
+            raise AssertionError(
+                "Conditional or indirect CRON_TASKS mutation is not statically "
+                f"resolvable: {ast.unparse(node)}"
+            )
+
+    if task_names is None:
+        raise AssertionError("Could not find the CRON_TASKS declaration")
+    return task_names
+
+
 @lru_cache(maxsize=None)
 def _discovered_scheduler_surfaces() -> frozenset[str]:
     """Inventory every cron target and every bespoke handler wired to it."""
@@ -945,37 +1158,7 @@ def _discovered_scheduler_surfaces() -> frozenset[str]:
         source_path.read_text(encoding="utf-8"), filename=str(source_path)
     )
     source_constants = _module_string_constants(source_tree, source_path)
-    task_names: set[str] | None = None
-    for node in source_tree.body:
-        target: ast.expr | None = None
-        value: ast.expr | None = None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-            value = node.value
-        elif isinstance(node, ast.AnnAssign):
-            target = node.target
-            value = node.value
-        if not (
-            isinstance(target, ast.Name)
-            and target.id == "CRON_TASKS"
-            and isinstance(value, (ast.List, ast.Tuple))
-        ):
-            continue
-        resolved: set[str] = set()
-        for item in value.elts:
-            if not isinstance(item, (ast.List, ast.Tuple)) or not item.elts:
-                raise AssertionError("CRON_TASKS contains an unsupported entry")
-            name = _resolved_string(item.elts[0], source_constants)
-            if name is None:
-                raise AssertionError(
-                    "Unresolved CRON_TASKS name expression: "
-                    f"{ast.unparse(item.elts[0])}"
-                )
-            resolved.add(name)
-        task_names = resolved
-        break
-    if task_names is None:
-        raise AssertionError("Could not find the CRON_TASKS declaration")
+    task_names = _cron_task_names(source_tree, source_path)
 
     scheduler_source_names = _scheduler_registration_source_names(
         source_tree,
@@ -2108,6 +2291,39 @@ def _scope_route_callable_aliases(
             return branch_bindings[0][0], _UNRESOLVED_ROUTE_REGISTRATION
         return None
 
+    def assignment_bindings(
+        targets: list[ast.AST],
+        value: ast.AST,
+    ) -> dict[str, tuple[str, str]]:
+        pairs = [
+            pair
+            for target in targets
+            for pair in _static_assignment_pairs(target, value)
+        ]
+        if pairs:
+            return {
+                name: binding
+                for name, paired_value in pairs
+                if (binding := binding_for(paired_value)) is not None
+            }
+
+        # Starred or shape-mismatched destructuring cannot be paired exactly.
+        # If any value is a route registration, retain every bound name as an
+        # unresolved alias so later use fails closed instead of disappearing.
+        nested_bindings = [
+            binding
+            for child in ast.walk(value)
+            if (binding := binding_for(child)) is not None
+        ]
+        if not nested_bindings:
+            return {}
+        receiver = nested_bindings[0][0]
+        return {
+            name: (receiver, _UNRESOLVED_ROUTE_REGISTRATION)
+            for target in targets
+            for name in _assignment_target_names(target)
+        }
+
     def conditionally_bound_route_aliases(
         statement: ast.stmt,
     ) -> dict[str, tuple[str, str]]:
@@ -2115,11 +2331,9 @@ def _scope_route_callable_aliases(
 
         class RouteBindingVisitor(ast.NodeVisitor):
             def record(self, targets: list[ast.AST], value: ast.AST | None) -> None:
-                if value is None or (binding := binding_for(value)) is None:
+                if value is None:
                     return
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        bindings[target.id] = binding
+                bindings.update(assignment_bindings(targets, value))
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 self.record(list(node.targets), node.value)
@@ -2171,16 +2385,16 @@ def _scope_route_callable_aliases(
             continue
 
         target_names = {
-            target.id for target in targets if isinstance(target, ast.Name)
+            name
+            for target in targets
+            for name in _assignment_target_names(target)
         }
         for target_name in target_names:
             aliases.pop(target_name, None)
         if value is None:
             continue
 
-        binding = binding_for(value)
-        if binding is not None:
-            aliases.update({target_name: binding for target_name in target_names})
+        aliases.update(assignment_bindings(targets, value))
     return aliases
 
 
@@ -3175,6 +3389,41 @@ def test_scheduler_registration_constructors_are_structurally_inventoried(
     _discovered_scheduler_surfaces.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        'CRON_TASKS.append(("late", SignalMode.ACTION, frozenset()))',
+        'CRON_TASKS += [("late", SignalMode.ACTION, frozenset())]',
+        'CRON_TASKS = [*CRON_TASKS, ("late", SignalMode.ACTION, frozenset())]',
+    ],
+    ids=["append", "augmented-assignment", "reassignment"],
+)
+def test_scheduler_inventory_replays_cron_tasks_mutations(
+    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = REPO_ROOT / "kestrel_sovereign/signals/sources/scheduler.py"
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        source = original_read_text(path, *args, **kwargs)
+        if path != source_path:
+            return source
+        marker = "\n\n\ndef cron_source_name(task_name: str) -> str:"
+        assert source.count(marker) == 1
+        return source.replace(marker, f"\n{mutation}{marker}")
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    _discovered_scheduler_surfaces.cache_clear()
+    try:
+        assert (
+            "kestrel_sovereign/signals/sources/scheduler.py::cron.late"
+            in _discovered_scheduler_surfaces()
+        )
+    finally:
+        _discovered_scheduler_surfaces.cache_clear()
+
+
 def test_each_source_factory_call_must_resolve_its_own_name() -> None:
     tree = ast.parse(
         "STATIC_NAME = 'static.source'\n"
@@ -3659,6 +3908,28 @@ def test_route_declarations_resolve_bound_registration_aliases() -> None:
     ) == [(('DELETE',), '/api/agents/{name}')]
 
 
+def test_route_declarations_resolve_destructured_registration_aliases() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'read_route, write_route = router.get, router.post\n'
+        '@read_route("/agents/{name}")\n'
+        'def read_agent():\n'
+        '    pass\n'
+        '@write_route("/agents/{name}")\n'
+        'def write_agent():\n'
+        '    pass\n'
+    )
+
+    assert _route_declarations(
+        tree,
+        _module_string_constants(tree),
+        _module_string_collections(tree),
+    ) == [
+        (("GET",), "/api/agents/{name}"),
+        (("POST",), "/api/agents/{name}"),
+    ]
+
+
 def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
     tree = ast.parse(
         "router = APIRouter()\n"
@@ -4104,6 +4375,25 @@ def test_tool_decorator_aliases_include_class_and_factory_scopes() -> None:
     }
 
 
+def test_tool_decorator_aliases_include_annotated_bindings() -> None:
+    tree = ast.parse(
+        "from collections.abc import Callable\n"
+        "expose: Callable = tool\n"
+        "@expose(name='annotated_tool')\n"
+        "def implementation():\n"
+        "    pass\n"
+    )
+    function = tree.body[2]
+    assert isinstance(function, ast.FunctionDef)
+
+    assert _public_tool_name(
+        function.decorator_list[0],
+        function.name,
+        {},
+        _tool_decorator_aliases(tree),
+    ) == "annotated_tool"
+
+
 def test_repository_scans_reuse_parsed_trees_and_analysis_summaries() -> None:
     source_path = REPO_ROOT / "kestrel_sovereign/server.py"
     assert _parsed_module(source_path) is _parsed_module(source_path)
@@ -4259,7 +4549,10 @@ def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None
 
     for surface in (
         "features/computer_use/feature.py::shell`",
+        "cli.py::kestrel start`",
         "cli.py::kestrel terminate`",
+        "cli.py::kestrel restart`",
+        "cli.py::kestrel update`",
     ):
         tool_row = next(line for line in audit.splitlines() if surface in line)
         assert "D-3233" in tool_row

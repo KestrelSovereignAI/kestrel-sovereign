@@ -96,7 +96,7 @@ narrow, revocable, signed delegation.
 | Read/cancel/ack restart request | `list_restart_requests`, `list_restart_status_events`, `cancel_restart_request`, `acknowledge_restart_escalation`; restart status endpoint | A durable restart request/event | Self for requester reads/cancel; sovereign for authority acknowledgement; explicitly public host-coordination fields may be universal read-only | Enforced by [#3146](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3146): list/event reads bind the requesting agent and cancel includes `requested_by_agent` in the durable predicate. #3148 additionally requires live sovereign-key authority before acknowledgement can reissue authority for a requester-owned row. |
 | Scheduler watcher wake | `github_pr_watch`/`ecosystem_discovery_watch` arguments executed through schedules | Owning agent only | Self | Enforced by [#3147](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3147): the runtime binds the scheduler owner's DID and ignores legacy caller-provided `notify` as a routing or causation identity. |
 | Host agent create/withdraw/offboard | `POST /api/agents`, `DELETE /api/agents/{agent_name}`, `!create-agent` | Host registry, peer runtime, hosted namespace, trusted identity directory | Sovereign/delegated | Enforced by [#3149](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3149): every host lifecycle/provisioning door requires a live sovereign caller context at the handler boundary; ordinary OAuth/JWT authentication is insufficient. |
-| Core operator CLI | Every command in the canonical `kestrel` dispatch table, including `ask`, `create`, `start`, `terminate`, `restart`, and `update` | A named agent, the local fleet/host, agent data, or external infrastructure according to the command | Intended outside agent hierarchy; local sovereign/operator process authority | Direct CLI process access is intended as an operator boundary, not agent causation or peer authority. The complete dispatch table is classified below rather than filtered by names. Agent-invoked local host shell can currently re-enter unguarded lifecycle handlers, however, so the `terminate` path is recorded as D-3233 rather than inheriting operator authority. Remote API calls still pass the destination host's authentication checks. |
+| Core operator CLI | Every command in the canonical `kestrel` dispatch table, including `ask`, `create`, `start`, `terminate`, `restart`, and `update` | A named agent, the local fleet/host, agent data, or external infrastructure according to the command | Intended outside agent hierarchy; local sovereign/operator process authority | Direct CLI process access is intended as an operator boundary, not agent causation or peer authority. The complete dispatch table is classified below rather than filtered by names. Agent-invoked local host shell can currently re-enter the unguarded `start`, `terminate`, `restart`, and `update` lifecycle handlers, however, so those paths are recorded as D-3233 rather than inheriting operator authority. Remote API calls still pass the destination host's authentication checks. |
 | Talon coding/repository orchestration | External `kestrel-feature-talon`/`kestrel-talon` process | Repository work, issues, PRs | Outside agent hierarchy | Talon is an operator-enabled external feature/process. Its coordinator state, reviewer state, and worktree lineage are not Kestrel agent authority or causation relations. |
 
 `OrchestrationStore` is currently a backend library with no core agent-facing
@@ -492,19 +492,19 @@ outside core and must define their own operator policy.
 | `kestrel_sovereign/cli.py::kestrel migrate-encryption` | Local operator mutation of selected agent storage. |
 | `kestrel_sovereign/cli.py::kestrel migrate-llm-config` | Local operator host model-configuration migration. |
 | `kestrel_sovereign/cli.py::kestrel release` | Local operator release-evidence/repository operation; no agent grant. |
-| `kestrel_sovereign/cli.py::kestrel restart` | Local operator restart of a named agent or the host/fleet. |
+| `kestrel_sovereign/cli.py::kestrel restart` | D-3233 — intended local operator restart of a named agent or host/fleet, but it first invokes the same unguarded termination handler reachable from agent-invoked local host shell. |
 | `kestrel_sovereign/cli.py::kestrel runpod` | Local operator control of external RunPod infrastructure. |
 | `kestrel_sovereign/cli.py::kestrel serve` | Local operator control of the shared local model server. |
 | `kestrel_sovereign/cli.py::kestrel setup` | Local operator host/agent bootstrap and recovery. |
 | `kestrel_sovereign/cli.py::kestrel shell` | Local operator interactive invocation of a named agent. |
 | `kestrel_sovereign/cli.py::kestrel skills` | Local operator read/install of feature skills. |
-| `kestrel_sovereign/cli.py::kestrel start` | Local operator start of a named agent or the host/fleet. |
+| `kestrel_sovereign/cli.py::kestrel start` | D-3233 — intended local operator start of a named agent or host/fleet, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel status` | Local operator host/fleet process-status read. |
 | `kestrel_sovereign/cli.py::kestrel storage` | Local operator storage diagnostics or migrations, optionally fleet-wide. |
 | `kestrel_sovereign/cli.py::kestrel terminate` | D-3233 — intended local operator termination of a named agent or host/fleet, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel tool-dispatches` | Local operator read of a selected agent's tool-dispatch log. |
 | `kestrel_sovereign/cli.py::kestrel tool-log` | Alias for the local operator tool-dispatch log read. |
-| `kestrel_sovereign/cli.py::kestrel update` | Local operator source/install/feature reconciliation followed by named-agent or fleet restart. |
+| `kestrel_sovereign/cli.py::kestrel update` | D-3233 — intended local operator source/install/feature reconciliation followed by named-agent or fleet restart, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel verify-install` | Local operator installation integrity check. |
 
 ## Machine-checked HTTP inventory
