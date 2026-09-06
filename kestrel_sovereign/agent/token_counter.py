@@ -186,9 +186,9 @@ class TokenCounter:
 
         return total
 
-    def get_context_limit(self) -> int:
+    def resolved_context_limit(self) -> Optional[int]:
         """
-        Get the context window limit for the current model.
+        The context window limit KNOWN for the current model, or None.
 
         Sources (in order of priority):
         1. Discovered limits (from API discovery this session)
@@ -205,7 +205,8 @@ class TokenCounter:
         what discovery records and what catalog lookups expect.
 
         Returns:
-            Maximum tokens allowed in context
+            Maximum tokens allowed in context, or ``None`` when no discovery
+            source, cache or catalog knows this model.
         """
         # Build candidate keys for discovered/cache/catalog lookup.
         # Route-qualified ``"<vendor>:<route>/<model_name>"`` splits on
@@ -267,8 +268,26 @@ class TokenCounter:
                 if limit is not None:
                     return limit
 
-        logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")
-        return DEFAULT_CONTEXT_LIMIT
+        return None
+
+    def get_context_limit(self) -> int:
+        """The context limit to USE — the resolved one, or the default.
+
+        Split from :meth:`resolved_context_limit` so callers who must not act
+        on a guess can tell "we know this model's window" from "nothing knows
+        it, here is 32768". Budget enforcement is such a caller: refusing a
+        subagent at the 32768 default when it is actually running on a
+        1,000,000-token model would kill working work. Delegating rather than
+        re-implementing the lookup keeps the two answers from drifting.
+        """
+        limit = self.resolved_context_limit()
+        if limit is None:
+            logger.warning(
+                f"Unknown model {self.model}, using default context limit "
+                f"{DEFAULT_CONTEXT_LIMIT}"
+            )
+            return DEFAULT_CONTEXT_LIMIT
+        return limit
 
     def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
         """

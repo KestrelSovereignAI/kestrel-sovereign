@@ -46,6 +46,20 @@ logger = logging.getLogger(__name__)
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
+
+class SubagentContextBudgetExceeded(RuntimeError):
+    """A subagent's accumulated messages no longer fit its model's window.
+
+    Raised rather than returned as a string so the failure reaches the
+    envelope honestly. ``execute_as_subagent``'s boundary turns an exception
+    into ``{"success": False, "error": ...}``; a returned ``"Error: ..."``
+    string would have been wrapped as ``{"success": True}``, which
+    ``infer_tool_result_status`` reads as a successful dispatch and
+    ``_result_indicates_failure`` reads as no failure -- so an outage-class
+    event would be invisible on both the dispatch log and the narration
+    audit, the two surfaces an operator would check.
+    """
+
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
     r"let me|i(?:'ll| will| am going to)|"
@@ -1726,49 +1740,6 @@ class Feature(_SdkFeature):
                     parts_sink.extend(envelope_parts)
             return _shape(effective_args, serialized)
 
-    # Framework-owned tools lent to EVERY subagent for the duration of one
-    # invocation. Deliberately NOT part of any feature's ``get_tools()``: that
-    # method answers "what is this feature", and feeds ``get_agent_card()`` and
-    # the A2A skill list, so adding these there would make every feature
-    # advertise capabilities it does not own. This table answers the different
-    # question "what is this turn given to work with".
-    #
-    # They exist so a subagent whose context is compacted can read back what
-    # was moved out (see ``salvage.py``: "No model-visible pruning without a
-    # synchronous durable artifact or lossless pointer"). Without retrieval, a
-    # trimmed subagent silently forgets and redoes work.
-    _SUBAGENT_BORROWED_TOOLS = (
-        ("ContextFeature", "recursive_query"),
-        ("AttachmentsFeature", "read_attachment"),
-    )
-
-    def _borrowed_subagent_tools(self) -> List[Any]:
-        """Context-retrieval tools lent from other features, if present.
-
-        Absence is normal, not an error: a host may not have the Context or
-        Attachments feature enabled, and a subagent simply goes without.
-        """
-        borrowed: List[Any] = []
-        agent = getattr(self, "agent", None)
-        getter = getattr(agent, "get_feature", None)
-        if not callable(getter):
-            return borrowed
-        for feature_name, tool_name in self._SUBAGENT_BORROWED_TOOLS:
-            try:
-                feature = getter(feature_name)
-                if feature is None or feature is self:
-                    continue
-                for tool in feature.get_tools():
-                    if tool.name == tool_name:
-                        borrowed.append(tool)
-                        break
-            except Exception as e:  # never let lending break a subagent
-                logger.debug(
-                    f"{self.name}: could not borrow {tool_name} from "
-                    f"{feature_name}: {e}"
-                )
-        return borrowed
-
     def _compose_subagent_runtime_tools(
         self, denied_tools: Optional[Any] = None
     ) -> List[Any]:
@@ -1792,14 +1763,7 @@ class Feature(_SdkFeature):
         again.
         """
         denied = set(denied_tools or ())
-        tools = [t for t in self.get_tools() if t.name not in denied]
-        for tool in self._borrowed_subagent_tools():
-            if tool.name in denied:
-                continue
-            if any(existing.name == tool.name for existing in tools):
-                continue  # the feature's own tool wins over a borrowed one
-            tools.append(tool)
-        return tools
+        return [t for t in self.get_tools() if t.name not in denied]
 
     def _get_subagent_prompt(self, runtime_tools: Optional[List[Any]] = None) -> str:
         """
@@ -1850,15 +1814,21 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
     _SUBAGENT_CONTEXT_FRACTION = 0.85
 
     def _subagent_context_budget(self, model: Optional[str]) -> Optional[int]:
-        """Token ceiling for one subagent's message array, or None if unknown.
+        """Token ceiling for one subagent's message array, or None to skip.
 
-        None means "do not enforce": an unknown model is not a reason to kill
-        a working subagent, and the provider's own limit still backstops it.
+        Uses ``resolved_context_limit`` -- the limit actually KNOWN for this
+        model -- not ``get_context_limit``, which substitutes a 32768 default
+        for anything it cannot resolve. Enforcing against that default would
+        refuse a subagent at ~28k while it is really running on a
+        1,000,000-token window. None means "do not enforce"; the provider's
+        own limit still backstops.
         """
+        if not model:
+            return None
         try:
             from kestrel_sovereign.agent.token_counter import get_token_counter
 
-            limit = get_token_counter(model or "auto").get_context_limit()
+            limit = get_token_counter(model).resolved_context_limit()
         except Exception as e:
             logger.debug(f"{self.name}: no context limit for {model!r}: {e}")
             return None
@@ -1866,28 +1836,45 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             return None
         return int(limit * self._SUBAGENT_CONTEXT_FRACTION)
 
+    @staticmethod
+    def _subagent_wire_chars(messages: List[Dict[str, Any]]) -> str:
+        """The array serialised the way it goes on the wire.
+
+        ``count_messages`` reads only ``content``, so it cannot see a tool
+        call's ``arguments`` or an assistant turn's ``reasoning_content`` --
+        both of which are resent every iteration and, on a thinking model,
+        can be the larger share. Serialising the whole message measures what
+        is actually sent.
+        """
+        import json as _json
+
+        try:
+            return _json.dumps(messages, default=str)
+        except (TypeError, ValueError):
+            return "".join(str(m) for m in messages)
+
     def _subagent_context_overflow(
-        self, messages: List[Dict[str, Any]], model: Optional[str]
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """Return an operator-facing reason when ``messages`` will not fit.
 
         Why this refuses instead of trimming. Trimming is model-visible
         pruning, and salvage.py's invariant forbids that without "a
         synchronous durable artifact or lossless pointer". For conversation
-        history that machinery exists (``salvage_messages`` marks persisted
-        rows and links a salvage marker). For TOOL RESULTS it does not:
-        they are never written to ``conversation_history``, so they have no
-        row id to salvage, and ``_log_tool_dispatch`` records only
-        ``result_status`` and ``result_size_bytes`` -- never the content.
-        The orchestrator's own cap calls ``_build_persisted_preview``, which
-        despite its name persists nothing: it keeps a head and a tail and
-        discards the middle irrecoverably.
+        history that machinery exists. For TOOL RESULTS it does not: they are
+        never written to ``conversation_history``, so they have no row id to
+        salvage; ``_log_tool_dispatch`` records only ``result_status`` and
+        ``result_size_bytes``; and the orchestrator's own cap calls
+        ``_build_persisted_preview``, which despite its name persists nothing
+        -- it keeps a head and a tail and discards the middle irrecoverably.
 
-        So there is currently nowhere to put what trimming would drop.
-        Refusing loudly is the only behaviour here that neither loses data
-        nor sends a request the provider will certainly reject. Once tool
-        results have a durable home, this is the seam that becomes a
-        microcompact-and-salvage step.
+        So there is nowhere to put what trimming would drop. Refusing loudly
+        is the only behaviour that neither loses data nor sends a request the
+        provider will certainly reject. Once tool results have a durable home,
+        this is the seam that becomes a microcompact-and-salvage step.
         """
         budget = self._subagent_context_budget(model)
         if budget is None:
@@ -1895,7 +1882,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         try:
             from kestrel_sovereign.agent.token_counter import get_token_counter
 
-            used = get_token_counter(model or "auto").count_messages(messages)
+            counter = get_token_counter(model)
+            # Count the SERIALISED payload, not `count_messages`: that helper
+            # reads only `content`, missing tool-call `arguments` and
+            # `reasoning_content`, and never sees the tool schemas that are
+            # resent with every request. See _subagent_wire_chars.
+            payload = self._subagent_wire_chars(messages)
+            if tools:
+                payload += self._subagent_wire_chars(tools)
+            used = counter.count(payload)
         except Exception as e:
             logger.debug(f"{self.name}: could not measure subagent context: {e}")
             return None
@@ -1903,12 +1898,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             return None
         return (
             f"Subagent {self.name!r} exceeded its context budget: {used:,} tokens "
-            f"against a {budget:,} ceiling for model {model or 'default'!r}. The "
-            f"tool-call loop accumulates every tool result and resends them, and "
-            f"tool results have no durable store to be salvaged into, so the loop "
-            f"stops here rather than dropping them silently or sending a request "
-            f"the provider will reject. Narrow the task, or have the tool return "
-            f"less."
+            f"against a {budget:,} ceiling for model {model!r}. The tool-call "
+            f"loop accumulates every tool result and resends them, and tool "
+            f"results have no durable store to be salvaged into, so the loop "
+            f"stops here rather than dropping them silently or sending a "
+            f"request the provider will reject. Narrow the task, or have the "
+            f"tool return less."
         )
 
     async def _handle_feature_tool_calls(
@@ -1963,6 +1958,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         # If response is just a string, return it directly
         if isinstance(response, str):
             return response
+
+        # The model this subagent is ACTUALLY running on. Neither
+        # execute_as_subagent call site passes ``model_override``
+        # (orchestrator_engine.py:1299 and :1891), so relying on it would
+        # leave the budget resolving "auto" -> the 32768 default and refusing
+        # a subagent on a 1,000,000-token window at ~28k. ``LLMResponse``
+        # carries the model the provider actually served, so the loop learns
+        # it from the response it already has.
+        effective_model = model_override or getattr(response, "model", None)
 
         # Build message history for multi-turn tool calling
         messages = [
@@ -2042,10 +2046,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # whole, so this is where an unbounded run is caught -- see
             # ``_subagent_context_overflow`` for why it refuses instead of
             # trimming.
-            overflow = self._subagent_context_overflow(messages, model_override)
+            overflow = self._subagent_context_overflow(
+                messages, effective_model, tools
+            )
             if overflow is not None:
                 logger.error(f"[SUBAGENT {self.name}] {overflow}")
-                return f"Error: {overflow}"
+                raise SubagentContextBudgetExceeded(overflow)
 
             # Continue conversation with tool results — thread the
             # ``tool_executor`` through so codex-routed continuation
@@ -2063,11 +2069,21 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 invocation_context=_subagent_turn_identity(session_id),
             )
 
+            effective_model = (
+                model_override or getattr(response, "model", None) or effective_model
+            )
+
             # If response is string or has no more tool calls, we're done
             if isinstance(response, str):
                 return response
 
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
+                overflow = self._subagent_context_overflow(
+                    messages, effective_model, tools
+                )
+                if overflow is not None:
+                    logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                    raise SubagentContextBudgetExceeded(overflow)
                 response = await self._repair_subagent_premature_yield(
                     response,
                     messages,

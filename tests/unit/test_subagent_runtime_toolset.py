@@ -71,70 +71,10 @@ def feature():
         [_tool("own_a"), _tool("own_b")],
         agent=_agent_with([_tool("recursive_query")], [_tool("read_attachment")]),
     )
-
-
-def test_runtime_toolset_keeps_the_features_own_tools(feature):
-    names = [t.name for t in feature._compose_subagent_runtime_tools()]
-    assert "own_a" in names and "own_b" in names
-
-
-def test_runtime_toolset_lends_context_retrieval(feature):
-    names = [t.name for t in feature._compose_subagent_runtime_tools()]
-    assert "recursive_query" in names
-    assert "read_attachment" in names
-
-
-def test_denied_tools_are_absent_from_the_runtime_toolset(feature):
-    names = [t.name for t in feature._compose_subagent_runtime_tools({"own_a"})]
-    assert "own_a" not in names
-    assert "own_b" in names
-
-
-def test_a_denied_borrowed_tool_is_also_withheld(feature):
-    """Security policy outranks lending."""
-    names = [
-        t.name for t in feature._compose_subagent_runtime_tools({"recursive_query"})
-    ]
-    assert "recursive_query" not in names
-
-
-def test_borrowing_does_not_touch_feature_identity(feature):
-    """THE cleanliness guarantee: get_tools() feeds get_agent_card() and the
-    A2A skill list, so a lent tool must never appear there."""
-    identity = [t.name for t in feature.get_tools()]
-    assert identity == ["own_a", "own_b"]
-    assert "recursive_query" not in identity
-    assert "read_attachment" not in identity
-
-
-def test_missing_context_features_are_not_an_error():
-    """A host may not have Context/Attachments enabled."""
-    bare = _StubFeature([_tool("own_a")], agent=MagicMock(get_feature=lambda n: None))
-    assert [t.name for t in bare._compose_subagent_runtime_tools()] == ["own_a"]
-
-
-def test_no_agent_at_all_is_not_an_error():
-    orphan = _StubFeature([_tool("own_a")], agent=None)
-    assert [t.name for t in orphan._compose_subagent_runtime_tools()] == ["own_a"]
-
-
-def test_a_feature_owning_the_same_name_wins_over_the_lent_one():
-    """The Context feature dispatching its own subagent must execute its own
-    recursive_query, not a borrowed duplicate."""
-    f = _StubFeature(
-        [_tool("recursive_query")],
-        agent=_agent_with([_tool("recursive_query")]),
-    )
-    tools = f._compose_subagent_runtime_tools()
-    assert [t.name for t in tools].count("recursive_query") == 1
-    assert tools[0] is f._own[0]
-
-
 def test_prompt_names_exactly_the_runtime_toolset(feature):
     runtime = feature._compose_subagent_runtime_tools({"own_a"})
     prompt = feature._get_subagent_prompt(runtime)
     assert "own_b" in prompt
-    assert "recursive_query" in prompt      # lent tools are named
     assert "own_a" not in prompt            # denied tools are not
 
 
@@ -188,7 +128,6 @@ async def test_loop_hands_the_executor_a_map_without_denied_tools(feature):
     assert seen, "executor was never reached — the assertion below would be vacuous"
     assert "own_a" not in seen, "a security-denied tool reached the executable map"
     assert "own_b" in seen
-    assert "recursive_query" in seen, "lent tools must be executable, not just advertised"
 
 
 @pytest.mark.asyncio
@@ -228,3 +167,31 @@ def test_inline_executor_uses_the_runtime_toolset(feature):
     asyncio.get_event_loop().run_until_complete(executor("own_b", {}))
     assert "own_a" not in seen
     assert "own_b" in seen
+
+
+@pytest.mark.asyncio
+async def test_all_tools_denied_still_refuses_through_the_real_path(feature):
+    """The "all tools blocked" guard, exercised through execute_as_subagent.
+
+    The existing coverage in test_denied_tools_dispatch.py reimplements this
+    guard inside the test body and asserts against its own local dict, so it
+    stays green no matter what the real path does. A change that made
+    `available_tools` non-empty for a fully-denied feature would therefore
+    run a whole subagent LLM loop unnoticed.
+    """
+    called = {"llm": 0}
+
+    async def _never(*a, **k):
+        called["llm"] += 1
+        return _Resp(content="should not run")
+
+    feature.agent.llm_service.generate = _never
+    feature.agent.llm_service.generate_with_messages = _never
+
+    result = await feature.execute_as_subagent(
+        task="anything", denied_tools={"own_a", "own_b"}
+    )
+
+    assert result["success"] is False
+    assert "blocked by security policy" in result["error"]
+    assert called["llm"] == 0, "a fully-denied feature reached the model"
