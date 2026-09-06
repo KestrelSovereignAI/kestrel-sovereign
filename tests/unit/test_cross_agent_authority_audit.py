@@ -8,6 +8,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 
@@ -9478,36 +9479,200 @@ def _local_control_helpers(
     return helper_names
 
 
-def _local_provenance_return_helpers(
-    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
-    control_helpers: set[str] | None = None,
-    module_provenance_aliases: set[str] | None = None,
-    imported_provenance_helpers: set[str] | None = None,
-    function_initial_aliases: dict[
-        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
-    ] | None = None,
-    function_imported_provenance_helpers: dict[
-        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
-    ] | None = None,
-) -> set[str]:
-    """Find visible helpers whose returned or yielded value is provenance-derived.
+class _ParameterReturnFlow(NamedTuple):
+    """Call-shape summary for formal parameters that influence a return."""
 
-    Seed the fixed point with repository-local imported helper summaries so a
-    neutral refactor such as ``derive(request)`` does not erase the fact that
-    its result came from ``request.causation_chain``.  Local helpers may then
-    wrap either imported or local helpers without escaping the contract.
-    """
+    positional: frozenset[int]
+    keywords: frozenset[str]
+    vararg_from: int | None
+    kwarg: bool
+    accepted_keywords: frozenset[str]
+    implicit_receiver: bool
+
+
+def _parameter_return_flow(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    flowed_parameters: set[str],
+) -> _ParameterReturnFlow:
+    """Convert flowed formal names into a caller-facing immutable summary."""
+
+    positional = [*function.args.posonlyargs, *function.args.args]
+    implicit_receiver = bool(
+        positional and positional[0].arg.casefold() in {"self", "cls"}
+    )
+    positional_only = {
+        parameter.arg.casefold() for parameter in function.args.posonlyargs
+    }
+    keyword_parameters = [
+        *function.args.args,
+        *function.args.kwonlyargs,
+    ]
+    accepted_keywords = {
+        parameter.arg.casefold() for parameter in keyword_parameters
+    }
+    return _ParameterReturnFlow(
+        positional=frozenset(
+            index
+            for index, parameter in enumerate(positional)
+            if parameter.arg.casefold() in flowed_parameters
+        ),
+        keywords=frozenset(accepted_keywords.intersection(flowed_parameters)),
+        vararg_from=(
+            len(positional)
+            if function.args.vararg is not None
+            and function.args.vararg.arg.casefold() in flowed_parameters
+            else None
+        ),
+        kwarg=(
+            function.args.kwarg is not None
+            and function.args.kwarg.arg.casefold() in flowed_parameters
+        ),
+        accepted_keywords=frozenset(accepted_keywords - positional_only),
+        implicit_receiver=implicit_receiver,
+    )
+
+
+def _bound_parameter_flow_arguments(
+    call: ast.Call,
+    flow: _ParameterReturnFlow,
+) -> list[ast.AST]:
+    """Return actual values bound to return-influencing formal parameters."""
+
+    positional_indexes = set(flow.positional)
+    if flow.implicit_receiver:
+        positional_indexes.update(
+            index - 1 for index in flow.positional if index > 0
+        )
+        if 0 in flow.positional and isinstance(call.func, ast.Attribute):
+            positional_indexes.add(-1)
+    values = [
+        call.func.value
+        if index == -1 and isinstance(call.func, ast.Attribute)
+        else call.args[index].value
+        if isinstance(call.args[index], ast.Starred)
+        else call.args[index]
+        for index in positional_indexes
+        if index == -1 and isinstance(call.func, ast.Attribute)
+        or 0 <= index < len(call.args)
+    ]
+    values.extend(
+        keyword.value
+        for keyword in call.keywords
+        if keyword.arg is not None
+        and keyword.arg.casefold() in flow.keywords
+    )
+    if flow.positional:
+        values.extend(
+            argument.value
+            for argument in call.args
+            if isinstance(argument, ast.Starred)
+        )
+    if flow.keywords:
+        values.extend(
+            keyword.value for keyword in call.keywords if keyword.arg is None
+        )
+    if flow.vararg_from is not None:
+        vararg_from = (
+            max(0, flow.vararg_from - 1)
+            if flow.implicit_receiver
+            else flow.vararg_from
+        )
+        values.extend(
+            argument.value if isinstance(argument, ast.Starred) else argument
+            for argument in call.args[vararg_from:]
+        )
+        values.extend(
+            argument.value
+            for argument in call.args[:vararg_from]
+            if isinstance(argument, ast.Starred)
+        )
+    if flow.kwarg:
+        values.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg is None
+            or keyword.arg.casefold() not in flow.accepted_keywords
+        )
+    return values
+
+
+def _scope_callable_alias_edges(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[tuple[str, set[str]]]:
+    """Collect same-scope aliases that can rename a called local/imported helper."""
+
+    edges: list[tuple[str, set[str]]] = []
+    nodes = (
+        ast.walk(scope)
+        if isinstance(scope, ast.Module)
+        else _walk_lexical_scope(scope)
+    )
+    for node in nodes:
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        sources = (
+            {value.id.casefold()}
+            if isinstance(value, ast.Name)
+            else {
+                value.attr.casefold(),
+                ast.unparse(value).casefold(),
+            }
+            if isinstance(value, ast.Attribute)
+            else set()
+        )
+        if sources:
+            edges.extend(
+                (target_name, sources)
+                for target in targets
+                for target_name in _binding_target_names(target)
+            )
+    return edges
+
+
+def _expanded_callable_sources(
+    name: str,
+    edges: list[tuple[str, set[str]]],
+) -> set[str]:
+    """Walk a bounded alias chain backwards from the invoked local name."""
+
+    sources = {name.casefold()}
+    changed = True
+    while changed:
+        changed = False
+        for target, candidates in edges:
+            if target in sources:
+                new_sources = candidates - sources
+                if new_sources:
+                    sources.update(new_sources)
+                    changed = True
+    return sources
+
+
+def _local_parameter_return_flows(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    function_imported_flows: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ] | None = None,
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, _ParameterReturnFlow]:
+    """Summarize local parameter-to-return flow, including assignment aliases."""
 
     functions_by_name: dict[
         str, list[ast.FunctionDef | ast.AsyncFunctionDef]
     ] = {}
     for function in functions:
         functions_by_name.setdefault(function.name.casefold(), []).append(function)
-
-    def parameter_names(
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
-    ) -> set[str]:
-        return {
+    all_parameter_names = {
+        function: {
             parameter.arg.casefold()
             for parameter in [
                 *function.args.posonlyargs,
@@ -9525,67 +9690,56 @@ def _local_provenance_return_helpers(
                 ),
             ]
         }
+        for function in functions
+    }
+    flowed_names = {function: set() for function in functions}
+    summaries = {
+        function: _parameter_return_flow(function, set()) for function in functions
+    }
+    callable_alias_edges = {
+        function: _scope_callable_alias_edges(function)
+        for function in functions
+    }
 
-    def bound_arguments(
+    def call_flows(
         call: ast.Call,
-        callee: ast.FunctionDef | ast.AsyncFunctionDef,
-        selected_parameters: set[str],
-    ) -> list[ast.AST]:
-        positional = [*callee.args.posonlyargs, *callee.args.args]
-        if (
-            isinstance(call.func, ast.Attribute)
-            and positional
-            and positional[0].arg.casefold() in {"self", "cls"}
-        ):
-            positional = positional[1:]
-        values = [
-            value
-            for parameter, value in zip(positional, call.args)
-            if parameter.arg.casefold() in selected_parameters
-        ]
-        values.extend(
-            keyword.value
-            for keyword in call.keywords
-            if keyword.arg is not None
-            and keyword.arg.casefold() in selected_parameters
+        caller: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> list[_ParameterReturnFlow]:
+        call_name = _call_name(call).casefold()
+        source_names = _expanded_callable_sources(
+            call_name,
+            callable_alias_edges[caller],
         )
-        if selected_parameters:
-            values.extend(
-                argument.value
-                for argument in call.args
-                if isinstance(argument, ast.Starred)
-            )
-            values.extend(
-                keyword.value for keyword in call.keywords if keyword.arg is None
-            )
-        return values
+        flows = [
+            summaries[callee]
+            for source_name in source_names
+            for callee in functions_by_name.get(source_name, ())
+        ]
+        imported_flows = (function_imported_flows or {}).get(caller, {})
+        flows.extend(
+            imported_flows[source_name]
+            for source_name in source_names.intersection(imported_flows)
+        )
+        return flows
 
-    parameter_return_flows: dict[
-        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
-    ] = {function: set() for function in functions}
-
-    def expression_flows_from_parameter(
+    def expression_flows_from_aliases(
         value: ast.AST,
-        parameter: str,
+        aliases: set[str],
+        caller: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> bool:
         while isinstance(value, (ast.Await, ast.Expr)):
             value = value.value
         if isinstance(value, ast.Name):
-            return value.id.casefold() == parameter
+            return value.id.casefold() in aliases
         if isinstance(value, ast.Constant):
             return False
         if isinstance(value, ast.Call):
-            for callee in functions_by_name.get(_call_name(value).casefold(), ()):
-                flowed_parameters = parameter_return_flows[callee]
-                if any(
-                    expression_flows_from_parameter(argument, parameter)
-                    for argument in bound_arguments(
-                        value,
-                        callee,
-                        flowed_parameters,
-                    )
-                ):
-                    return True
+            if any(
+                expression_flows_from_aliases(argument, aliases, caller)
+                for flow in call_flows(value, caller)
+                for argument in _bound_parameter_flow_arguments(value, flow)
+            ):
+                return True
             if not (
                 _is_provenance_transform_call(value)
                 or _is_provenance_accessor_call(value)
@@ -9598,50 +9752,142 @@ def _local_provenance_return_helpers(
             if isinstance(value.func, ast.Attribute):
                 inputs.append(value.func.value)
             return any(
-                expression_flows_from_parameter(argument, parameter)
+                expression_flows_from_aliases(argument, aliases, caller)
                 for argument in inputs
             )
         return any(
-            expression_flows_from_parameter(child, parameter)
+            expression_flows_from_aliases(child, aliases, caller)
             for child in ast.iter_child_nodes(value)
         )
 
-    flow_changed = True
-    while flow_changed:
-        flow_changed = False
+    changed = True
+    while changed:
+        changed = False
         for function in functions:
-            returned_values = [
-                node.value
-                for node in _walk_lexical_scope(function)
-                if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
-                and node.value is not None
-            ]
-            discovered = {
-                parameter
-                for parameter in parameter_names(function)
+            assignments: list[tuple[set[str], ast.AST]] = []
+            returned_values: list[ast.AST] = []
+            for node in _walk_lexical_scope(function):
+                targets: list[ast.AST] = []
+                value: ast.AST | None = None
+                if isinstance(node, ast.Assign):
+                    targets = list(node.targets)
+                    value = node.value
+                elif isinstance(node, ast.AnnAssign):
+                    targets = [node.target]
+                    value = node.value
+                elif isinstance(node, ast.NamedExpr):
+                    targets = [node.target]
+                    value = node.value
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    targets = [node.target]
+                    value = node.iter
+                elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+                    if node.value is not None:
+                        returned_values.append(node.value)
+                if value is not None:
+                    assignments.append(
+                        (
+                            {
+                                name
+                                for target in targets
+                                for name in _binding_target_names(target)
+                            },
+                            value,
+                        )
+                    )
+
+            discovered: set[str] = set()
+            for parameter in all_parameter_names[function]:
+                aliases = {parameter}
+                alias_changed = True
+                while alias_changed:
+                    alias_changed = False
+                    for targets, value in assignments:
+                        if expression_flows_from_aliases(value, aliases, function):
+                            new_aliases = targets - aliases
+                            if new_aliases:
+                                aliases.update(new_aliases)
+                                alias_changed = True
                 if any(
-                    expression_flows_from_parameter(value, parameter)
+                    expression_flows_from_aliases(value, aliases, function)
                     for value in returned_values
+                ):
+                    discovered.add(parameter)
+            new_names = discovered - flowed_names[function]
+            if new_names:
+                flowed_names[function].update(new_names)
+                summaries[function] = _parameter_return_flow(
+                    function,
+                    flowed_names[function],
                 )
-            }
-            new_parameters = discovered - parameter_return_flows[function]
-            if new_parameters:
-                parameter_return_flows[function].update(new_parameters)
-                flow_changed = True
+                changed = True
+    return summaries
+
+
+def _local_provenance_return_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    control_helpers: set[str] | None = None,
+    module_provenance_aliases: set[str] | None = None,
+    imported_provenance_helpers: set[str] | None = None,
+    function_initial_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
+    function_imported_parameter_return_flows: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ] | None = None,
+) -> set[str]:
+    """Find visible helpers whose returned or yielded value is provenance-derived.
+
+    Seed the fixed point with repository-local imported helper summaries so a
+    neutral refactor such as ``derive(request)`` does not erase the fact that
+    its result came from ``request.causation_chain``.  Local helpers may then
+    wrap either imported or local helpers without escaping the contract.
+    """
+
+    functions_by_name: dict[
+        str, list[ast.FunctionDef | ast.AsyncFunctionDef]
+    ] = {}
+    for function in functions:
+        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+    callable_alias_edges = {
+        function: _scope_callable_alias_edges(function)
+        for function in functions
+    }
+    parameter_return_flows = _local_parameter_return_flows(
+        functions,
+        function_imported_parameter_return_flows,
+    )
 
     def call_returns_supplied_provenance(
         call: ast.Call,
         aliases: set[str],
         visible_helpers: set[str],
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> bool:
+        source_names = _expanded_callable_sources(
+            _call_name(call),
+            callable_alias_edges[function],
+        )
+        flows = [
+            parameter_return_flows[callee]
+            for source_name in source_names
+            for callee in functions_by_name.get(source_name, ())
+        ]
+        imported_flows = (function_imported_parameter_return_flows or {}).get(
+            function, {}
+        )
+        flows.extend(
+            imported_flows[source_name]
+            for source_name in source_names.intersection(imported_flows)
+        )
         return any(
             _has_provenance_value(argument, aliases, visible_helpers)
-            for callee in functions_by_name.get(_call_name(call).casefold(), ())
-            for argument in bound_arguments(
-                call,
-                callee,
-                parameter_return_flows[callee],
-            )
+            for flow in flows
+            for argument in _bound_parameter_flow_arguments(call, flow)
         )
 
     helper_names: set[str] = set(imported_provenance_helpers or ())
@@ -9688,6 +9934,7 @@ def _local_provenance_return_helpers(
                             value,
                             aliases,
                             visible_helpers,
+                            function,
                         )
                         or _is_provenance_transform_call(value)
                         and (
@@ -11126,6 +11373,20 @@ def _repository_provenance_helper_names(
             eligible_functions=relevant_functions,
         ),
     )
+    module_parameter_flows = _scope_imported_parameter_return_flows(
+        tree,
+        source_path,
+        active,
+        relevant_calls,
+    )
+    function_parameter_flows = _function_parameter_return_flow_imports(
+        tree,
+        functions,
+        module_parameter_flows,
+        source_path,
+        seen=active,
+        eligible_functions=relevant_functions,
+    )
     all_helpers = _local_provenance_return_helpers(
         functions,
         control_helpers,
@@ -11141,8 +11402,263 @@ def _repository_provenance_helper_names(
                 eligible_functions=relevant_functions,
             )
         ),
+        function_imported_parameter_return_flows=function_parameter_flows,
     )
     return requested_names.intersection(all_helpers)
+
+
+def _merge_parameter_return_flows(
+    flows: list[_ParameterReturnFlow],
+) -> _ParameterReturnFlow:
+    """Conservatively combine same-name summaries from ambiguous definitions."""
+
+    vararg_starts = [
+        flow.vararg_from for flow in flows if flow.vararg_from is not None
+    ]
+    accepted = (
+        set.intersection(*(set(flow.accepted_keywords) for flow in flows))
+        if flows
+        else set()
+    )
+    return _ParameterReturnFlow(
+        positional=frozenset(
+            index for flow in flows for index in flow.positional
+        ),
+        keywords=frozenset(name for flow in flows for name in flow.keywords),
+        vararg_from=min(vararg_starts) if vararg_starts else None,
+        kwarg=any(flow.kwarg for flow in flows),
+        accepted_keywords=frozenset(accepted),
+        implicit_receiver=any(flow.implicit_receiver for flow in flows),
+    )
+
+
+def _merged_parameter_flow_map(
+    entries: list[tuple[str, _ParameterReturnFlow]],
+) -> dict[str, _ParameterReturnFlow]:
+    grouped: dict[str, list[_ParameterReturnFlow]] = {}
+    for name, flow in entries:
+        grouped.setdefault(name.casefold(), []).append(flow)
+    merged = {
+        name: _merge_parameter_return_flows(flows)
+        for name, flows in grouped.items()
+    }
+    return {
+        name: flow
+        for name, flow in merged.items()
+        if flow.positional
+        or flow.keywords
+        or flow.vararg_from is not None
+        or flow.kwarg
+    }
+
+
+@lru_cache(maxsize=None)
+def _direct_parameter_return_flow_summaries(
+    source_path: Path,
+) -> tuple[tuple[str, _ParameterReturnFlow], ...]:
+    """Summarize direct parameter-to-return flow without traversing imports."""
+
+    tree = _parsed_module(source_path.resolve())
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    flows = _local_parameter_return_flows(functions)
+    merged = _merged_parameter_flow_map(
+        [(function.name, flows[function]) for function in functions]
+    )
+    return tuple(sorted(merged.items()))
+
+
+def _repository_parameter_return_flows(
+    source_path: Path,
+    requested_names: set[str],
+    seen: frozenset[tuple[Path, str]],
+) -> dict[str, _ParameterReturnFlow]:
+    """Resolve parameter-return summaries through repository-local imports."""
+
+    source_path = source_path.resolve()
+    requested = {
+        name.casefold()
+        for name in requested_names
+        if (source_path, name.casefold()) not in seen
+    }
+    if not requested:
+        return {}
+    direct = dict(_direct_parameter_return_flow_summaries(source_path))
+    resolved = {name: direct[name] for name in requested.intersection(direct)}
+    active = seen | {(source_path, name) for name in requested - set(resolved)}
+
+    for local_name, imported_path, remote_name in _repository_reexport_bindings(
+        source_path,
+        requested - set(resolved),
+    ):
+        imported = _repository_parameter_return_flows(
+            imported_path,
+            {remote_name},
+            active,
+        )
+        if remote_name in imported:
+            resolved[local_name] = imported[remote_name]
+    if requested <= set(resolved):
+        return resolved
+
+    tree = _parsed_module(source_path)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    relevant_functions = _functions_reachable_by_local_calls(
+        functions,
+        requested - set(resolved),
+    )
+    relevant_calls = [
+        call
+        for function in relevant_functions
+        for call in _lexical_scope_calls(function)
+    ]
+    module_imports = _scope_imported_parameter_return_flows(
+        tree,
+        source_path,
+        active,
+        relevant_calls,
+    )
+    function_imports = _function_parameter_return_flow_imports(
+        tree,
+        functions,
+        module_imports,
+        source_path,
+        seen=active,
+        eligible_functions=relevant_functions,
+    )
+    local_flows = _local_parameter_return_flows(functions, function_imports)
+    local_by_name = _merged_parameter_flow_map(
+        [
+            (function.name, local_flows[function])
+            for function in relevant_functions
+        ]
+    )
+    resolved.update(
+        {
+            name: local_by_name[name]
+            for name in requested.intersection(local_by_name)
+        }
+    )
+    return resolved
+
+
+def _scope_imported_parameter_return_flows(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
+) -> dict[str, _ParameterReturnFlow]:
+    """Return called repository-local parameter-flow imports in one scope."""
+
+    if source_path is None:
+        return {}
+    source_path = source_path.resolve()
+    seen = seen or frozenset()
+    visible_calls = calls if calls is not None else _lexical_scope_calls(scope)
+    callable_alias_edges = _scope_callable_alias_edges(scope)
+    called_names = {
+        source_name
+        for call in visible_calls
+        for source_name in _expanded_callable_sources(
+            _call_name(call),
+            callable_alias_edges,
+        )
+    }
+    entries: list[tuple[str, _ParameterReturnFlow]] = []
+
+    def aliased_module_members(qualifier: str) -> set[str]:
+        prefix = f"{qualifier.casefold()}."
+        return {
+            source_name.rsplit(".", 1)[-1]
+            for source_name in called_names
+            if source_name.startswith(prefix)
+        }
+
+    for node in _lexical_scope_imports(scope):
+        if isinstance(node, ast.ImportFrom) and node.module is None:
+            for imported in node.names:
+                child_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                    node.level,
+                )
+                if child_path is None:
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                member_calls = _module_attribute_call_names(
+                    visible_calls,
+                    qualifier,
+                    scope if isinstance(scope, ast.Module) else None,
+                ) | aliased_module_members(qualifier)
+                entries.extend(
+                    _repository_parameter_return_flows(
+                        child_path,
+                        member_calls,
+                        seen,
+                    ).items()
+                )
+            continue
+        if isinstance(node, ast.ImportFrom):
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            bindings = {
+                (imported.asname or imported.name).casefold(): imported.name.casefold()
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold() in called_names
+            }
+            star_names = called_names if any(
+                imported.name == "*" for imported in node.names
+            ) else set()
+            remote = _repository_parameter_return_flows(
+                imported_path,
+                set(bindings.values()) | star_names,
+                seen,
+            )
+            entries.extend(
+                (local_name, remote[remote_name])
+                for local_name, remote_name in bindings.items()
+                if remote_name in remote
+            )
+            entries.extend(
+                (name, remote[name]) for name in star_names.intersection(remote)
+            )
+            continue
+        if not isinstance(node, ast.Import):
+            continue
+        for imported in node.names:
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                imported.name,
+            )
+            if imported_path is None:
+                continue
+            qualifier = (imported.asname or imported.name).casefold()
+            member_calls = _module_attribute_call_names(
+                visible_calls,
+                qualifier,
+                scope if isinstance(scope, ast.Module) else None,
+            ) | aliased_module_members(qualifier)
+            entries.extend(
+                _repository_parameter_return_flows(
+                    imported_path,
+                    member_calls,
+                    seen,
+                ).items()
+            )
+    return _merged_parameter_flow_map(entries)
 
 
 def _scope_imported_provenance_return_helper_aliases(
@@ -11426,6 +11942,57 @@ def _function_provenance_helper_import_aliases(
     )
 
 
+def _function_parameter_return_flow_imports(
+    tree: ast.AST,
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    module_flows: dict[str, _ParameterReturnFlow],
+    source_path: Path | None,
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ] | None = None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    eligible_functions: set[
+        ast.FunctionDef | ast.AsyncFunctionDef
+    ] | None = None,
+) -> dict[
+    ast.FunctionDef | ast.AsyncFunctionDef,
+    dict[str, _ParameterReturnFlow],
+]:
+    """Resolve module, local, and enclosing parameter-flow imports per function."""
+
+    parents = function_parents or _nested_function_parents(tree)
+    visible: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ] = {}
+
+    def analyze(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, _ParameterReturnFlow]:
+        cached = visible.get(function)
+        if cached is not None:
+            return cached
+        parent = parents.get(function)
+        inherited = analyze(parent) if parent is not None else module_flows
+        resolved = dict(inherited)
+        if eligible_functions is None or function in eligible_functions:
+            local = _scope_imported_parameter_return_flows(
+                function,
+                source_path,
+                seen,
+            )
+            resolved = _merged_parameter_flow_map(
+                [*resolved.items(), *local.items()]
+            )
+        visible[function] = resolved
+        return resolved
+
+    for function in functions:
+        analyze(function)
+    return visible
+
+
 def _executable_body_functions(
     tree: ast.AST,
 ) -> list[ast.FunctionDef]:
@@ -11462,6 +12029,40 @@ def _authority_provenance_lines(
     functions.extend(_executable_body_functions(tree))
     module_control_aliases = _module_imported_control_aliases(tree)
     function_parents = _nested_function_parents(tree)
+    parameter_flow_functions = {
+        function
+        for function in functions
+        if _scope_contains_provenance_marker(function)
+    }
+    parameter_flow_functions.update(
+        _functions_reachable_by_local_calls(
+            functions,
+            {function.name.casefold() for function in parameter_flow_functions},
+        )
+    )
+    for function in tuple(parameter_flow_functions):
+        parent = function_parents.get(function)
+        while parent is not None:
+            parameter_flow_functions.add(parent)
+            parent = function_parents.get(parent)
+    parameter_flow_calls = [
+        call
+        for function in parameter_flow_functions
+        for call in _lexical_scope_calls(function)
+    ]
+    module_parameter_return_flows = _scope_imported_parameter_return_flows(
+        tree,
+        source_path,
+        calls=parameter_flow_calls,
+    )
+    function_parameter_return_flows = _function_parameter_return_flow_imports(
+        tree,
+        functions,
+        module_parameter_return_flows,
+        source_path,
+        function_parents,
+        eligible_functions=parameter_flow_functions,
+    )
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
@@ -11568,6 +12169,7 @@ def _authority_provenance_lines(
             provenance_return_helpers,
             class_provenance_aliases,
             function_imported_provenance_helpers,
+            function_parameter_return_flows,
         )
         module_provenance_aliases = _module_provenance_state_aliases(
             functions,
@@ -13099,6 +13701,175 @@ def test_provenance_scanner_follows_neutral_parameter_return_wrappers() -> None:
 
     assert _authority_provenance_lines(wrapped_parameter) == {8}
     assert _authority_provenance_lines(ordinary_parameter) == set()
+
+
+def test_provenance_scanner_follows_assignment_inside_return_wrapper() -> None:
+    tree = ast.parse(
+        "def wrap(value):\n"
+        "    result = bool(value)\n"
+        "    return result\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {9}
+
+
+def test_provenance_scanner_binds_variadic_return_wrapper_arguments() -> None:
+    positional = ast.parse(
+        "def wrap(*values):\n"
+        "    return bool(values)\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    keyword = ast.parse(
+        "def wrap(**values):\n"
+        "    return bool(values)\n\n"
+        "def derive(request):\n"
+        "    return wrap(value=request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(positional) == {8}
+    assert _authority_provenance_lines(keyword) == {8}
+
+
+def test_provenance_scanner_binds_unpacked_fixed_wrapper_arguments() -> None:
+    positional = ast.parse(
+        "def wrap(prefix, value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request):\n"
+        "    return wrap(*[None, request.causation_chain])\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    keyword = ast.parse(
+        "def wrap(*, value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request):\n"
+        "    return wrap(**{'value': request.causation_chain})\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(positional) == {8}
+    assert _authority_provenance_lines(keyword) == {8}
+
+
+def test_provenance_scanner_binds_explicit_and_implicit_wrapper_receivers() -> None:
+    explicit_receiver = ast.parse(
+        "def wrap(self, value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request, wrapper):\n"
+        "    return wrap(wrapper, request.causation_chain)\n\n"
+        "def dispatch(request, child, wrapper):\n"
+        "    if derive(request, wrapper):\n"
+        "        child.stop()\n"
+    )
+    implicit_receiver = ast.parse(
+        "def wrap(self, value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request, wrapper):\n"
+        "    return wrapper.wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child, wrapper):\n"
+        "    if derive(request, wrapper):\n"
+        "        child.stop()\n"
+    )
+    static_receiver_name = ast.parse(
+        "class Wrapper:\n"
+        "    @staticmethod\n"
+        "    def wrap(self):\n"
+        "        return bool(self)\n\n"
+        "def derive(request):\n"
+        "    return Wrapper.wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(explicit_receiver) == {8}
+    assert _authority_provenance_lines(implicit_receiver) == {8}
+    assert _authority_provenance_lines(static_receiver_name) == {10}
+
+
+def test_provenance_scanner_follows_imported_parameter_return_wrappers(
+    tmp_path: Path,
+) -> None:
+    helper_path = tmp_path / "helper.py"
+    helper_path.write_text(
+        "def wrap(value):\n"
+        "    return bool(value)\n",
+        encoding="utf-8",
+    )
+    controller_path = tmp_path / "controller.py"
+    controller_path.write_text(
+        "from .helper import wrap\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(controller_path) == frozenset({7})
+
+
+def test_provenance_scanner_resolves_parameter_return_wrapper_call_aliases(
+    tmp_path: Path,
+) -> None:
+    local_alias = ast.parse(
+        "def wrap(value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request):\n"
+        "    project = wrap\n"
+        "    return project(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    helper_path = tmp_path / "helper.py"
+    helper_path.write_text(
+        "def wrap(value):\n"
+        "    return bool(value)\n",
+        encoding="utf-8",
+    )
+    controller_path = tmp_path / "controller.py"
+    controller_path.write_text(
+        "from .helper import wrap\n\n"
+        "def derive(request):\n"
+        "    project = wrap\n"
+        "    return project(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n",
+        encoding="utf-8",
+    )
+    module_controller_path = tmp_path / "module_controller.py"
+    module_controller_path.write_text(
+        "from . import helper\n\n"
+        "def derive(request):\n"
+        "    project = helper.wrap\n"
+        "    return project(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n",
+        encoding="utf-8",
+    )
+
+    assert _authority_provenance_lines(local_alias) == {9}
+    assert _cached_authority_provenance_lines(controller_path) == frozenset({8})
+    assert _cached_authority_provenance_lines(module_controller_path) == frozenset({8})
 
 
 def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers() -> None:
