@@ -23,6 +23,7 @@ from kestrel_sovereign.signals import (
     SourceRegistry,
 )
 from kestrel_sovereign.signals.context import reset_current_signal, set_current_signal
+from kestrel_sovereign.signals.durable import DurableConsumerRegistration
 from kestrel_sovereign.signals.durable_payload_policy import (
     AlwaysElidedActionSourceRegistration,
 )
@@ -687,6 +688,103 @@ async def test_peer_stop_rate_limit_survives_dispatcher_restart(tmp_path) -> Non
             (second_agent.did, SOURCE_NAME),
         )
         assert admitted == PEER_STOP_RATE_LIMIT_PER_MINUTE
+    finally:
+        if second is not None:
+            await second.shutdown_durable_delivery()
+        elif not first._durable_shutdown:
+            await first.shutdown_durable_delivery()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_peer_stop_never_backfills_as_durable_work(
+    tmp_path,
+) -> None:
+    """A retained refusal stays non-deliverable across replay and restart."""
+
+    backend = SQLiteBackend(str(tmp_path / "durable-peer-refusal.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+
+    def build_dispatcher():
+        agent = _Agent()
+        registry = SourceRegistry()
+        registry.register(build_peer_stop_registration(agent))
+        return agent, SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=store,
+        )
+
+    async def dispatch(agent, dispatcher, correlation_id):
+        signal = build_peer_stop_signal(
+            agent=agent,
+            actor_id="did:test:peer",
+            intent={
+                "scope": "agent",
+                "target": None,
+                "reason": "durable refusal backfill test",
+                "cascade": True,
+                "correlation_id": correlation_id,
+            },
+        )
+        result = await dispatcher.dispatch_signal(
+            signal,
+            source_event_id=signal.dedupe_key,
+        )
+        return signal, result
+
+    first_agent, first = build_dispatcher()
+    second = None
+    try:
+        accepted = [
+            await dispatch(first_agent, first, f"accepted-{index}")
+            for index in range(PEER_STOP_RATE_LIMIT_PER_MINUTE)
+        ]
+        refused_signal, refused = await dispatch(
+            first_agent,
+            first,
+            "retained-refusal",
+        )
+        _replay_signal, replay = await dispatch(
+            first_agent,
+            first,
+            "retained-refusal",
+        )
+
+        assert all(result.status is Status.OK for _signal, result in accepted)
+        assert refused.status is Status.DROPPED_RATE_LIMIT
+        assert replay.status is Status.COALESCED
+        assert first_agent.cancel_current_request.call_count == (
+            PEER_STOP_RATE_LIMIT_PER_MINUTE
+        )
+        refusal_rows = await backend.fetch_all(
+            "SELECT event_id, agent_id, source "
+            "FROM durable_signal_rate_refusals"
+        )
+        assert refusal_rows == [
+            (refused_signal.id, first_agent.did, SOURCE_NAME)
+        ]
+        await first.shutdown_durable_delivery()
+
+        _second_agent, second = build_dispatcher()
+        await second.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="late-peer-stop-consumer",
+                source=SOURCE_NAME,
+                agent_id=first_agent.did,
+            )
+        )
+        deliveries = await second.list_durable_deliveries(
+            consumer_id="late-peer-stop-consumer"
+        )
+
+        assert len(deliveries) == PEER_STOP_RATE_LIMIT_PER_MINUTE
+        assert refused_signal.id not in {
+            delivery.event.event_id for delivery in deliveries
+        }
     finally:
         if second is not None:
             await second.shutdown_durable_delivery()

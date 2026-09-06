@@ -1195,6 +1195,11 @@ class DurableSignalStore(UnifiedStoreBase):
     # across restarts.  This is deliberately separate from event retention:
     # deleting a zero-retention event must not replenish an hourly allowance.
     RATE_ADMISSIONS = "durable_signal_rate_admissions"
+    # A durable refusal is retained separately from admitted quota timestamps.
+    # The marker is load-bearing for every later delivery-materialization path:
+    # a consumer registered after the original transaction must not turn an
+    # authority-bearing rate-limit refusal back into executable work.
+    RATE_REFUSALS = "durable_signal_rate_refusals"
 
     def __init__(self, backend: DatabaseBackend):
         # ``SignalLogStore`` historically accepts the ``AsyncDatabase``
@@ -1405,6 +1410,16 @@ class DurableSignalStore(UnifiedStoreBase):
                 agent_id TEXT NOT NULL,
                 source TEXT NOT NULL,
                 admitted_at {ts_type} NOT NULL
+            )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.RATE_REFUSALS} (
+                event_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                refused_at {ts_type} NOT NULL,
+                FOREIGN KEY (event_id) REFERENCES {self.EVENTS}(event_id)
+                    ON DELETE CASCADE
             )
             """,
         )
@@ -3756,11 +3771,15 @@ class DurableSignalStore(UnifiedStoreBase):
                         (signal.id, integrity_binding),
                     )
 
-                if durable_rate_limit is not None and not rate_limited:
+                if durable_rate_limit is not None:
+                    rate_table = (
+                        self.RATE_REFUSALS if rate_limited else self.RATE_ADMISSIONS
+                    )
+                    timestamp_column = "refused_at" if rate_limited else "admitted_at"
                     await self._backend.execute(
                         f"""
-                        INSERT INTO {self.RATE_ADMISSIONS} (
-                            event_id, agent_id, source, admitted_at
+                        INSERT INTO {rate_table} (
+                            event_id, agent_id, source, {timestamp_column}
                         ) VALUES (?, ?, ?, ?)
                         """,
                         (
@@ -3941,8 +3960,14 @@ class DurableSignalStore(UnifiedStoreBase):
                        session_id, caller_identity, visibility, urgency, dedupe_key,
                        causation_chain, arrived_at, committed_at, retention_until,
                        source_sequence
-                FROM {self.EVENTS}
-                WHERE event_id = ? AND agent_id = ? AND source = ?
+                FROM {self.EVENTS} event
+                WHERE event.event_id = ?
+                  AND event.agent_id = ?
+                  AND event.source = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {self.RATE_REFUSALS} refusal
+                      WHERE refusal.event_id = event.event_id
+                  )
                 """,
                 (event_id, agent_id, expected_signal.source),
             )
@@ -5790,8 +5815,14 @@ class DurableSignalStore(UnifiedStoreBase):
                    session_id, caller_identity, visibility, urgency, dedupe_key,
                    causation_chain, arrived_at, committed_at, retention_until,
                    source_sequence
-            FROM {self.EVENTS}
-            WHERE agent_id = ? AND source = ? AND retention_until >= ?
+            FROM {self.EVENTS} event
+            WHERE event.agent_id = ?
+              AND event.source = ?
+              AND event.retention_until >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM {self.RATE_REFUSALS} refusal
+                  WHERE refusal.event_id = event.event_id
+              )
             """,
             (
                 registration.agent_id,
