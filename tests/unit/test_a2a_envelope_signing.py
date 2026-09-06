@@ -441,6 +441,84 @@ def test_shared_replay_store_rejects_replay_across_process_guards(tmp_path):
     asyncio.run(run())
 
 
+def test_idempotent_action_rejects_shared_collision_when_digest_lookup_fails():
+    """A consumed shared nonce is not fresh merely because proof lookup failed."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    class CollisionWithFailedLookupStore:
+        async def reserve_envelope(self, *args, **kwargs):
+            return False
+
+        async def matches_envelope(self, *args, **kwargs):
+            raise RuntimeError("digest lookup unavailable")
+
+    async def run():
+        keypair, document = _keypair_and_doc()
+        metadata = _signed_metadata(
+            keypair,
+            task_id="peer-stop-collision",
+            message="signed peer Stop",
+        )
+
+        verdict = await verify_inbound_envelope(
+            metadata,
+            task_id="peer-stop-collision",
+            message="signed peer Stop",
+            resolver=lambda _did: document,
+            replay_guard=ReplayGuard(),
+            replay_store=CollisionWithFailedLookupStore(),
+            allow_verified_replay=True,
+        )
+
+        assert verdict.ok is False
+        assert verdict.replayed is False
+        assert "shared window" in verdict.reason
+
+    asyncio.run(run())
+
+
+def test_idempotent_action_uses_exact_local_proof_when_shared_lookup_fails():
+    """The degraded store may not erase an exact same-worker byte binding."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    class StoreFailingAfterFirstReservation:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def reserve_envelope(self, *args, **kwargs):
+            self.calls += 1
+            return self.calls == 1
+
+        async def matches_envelope(self, *args, **kwargs):
+            raise RuntimeError("digest lookup unavailable")
+
+    async def run():
+        keypair, document = _keypair_and_doc()
+        metadata = _signed_metadata(
+            keypair,
+            task_id="peer-stop-local-proof",
+            message="signed peer Stop",
+        )
+        guard = ReplayGuard()
+        store = StoreFailingAfterFirstReservation()
+        kwargs = {
+            "task_id": "peer-stop-local-proof",
+            "message": "signed peer Stop",
+            "resolver": lambda _did: document,
+            "replay_guard": guard,
+            "replay_store": store,
+            "allow_verified_replay": True,
+        }
+
+        first = await verify_inbound_envelope(metadata, **kwargs)
+        replay = await verify_inbound_envelope(metadata, **kwargs)
+
+        assert first.ok is True and first.replayed is False
+        assert replay.ok is True and replay.replayed is True
+
+    asyncio.run(run())
+
+
 def test_legacy_replay_store_keeps_cross_worker_replay_protection():
     """Third-party stores implementing the pre-digest protocol stay usable.
 

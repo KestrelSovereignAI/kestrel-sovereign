@@ -711,6 +711,7 @@ async def verify_inbound_envelope(
                     ),
                 )
         if replay_store is not None:
+            reserved: bool | None = None
             try:
                 reserve_envelope = getattr(
                     replay_store,
@@ -760,6 +761,20 @@ async def verify_inbound_envelope(
                     "A2A: shared replay nonce store unavailable; using in-process guard only.",
                     exc_info=True,
                 )
+                if reserved is False and not (
+                    allow_verified_replay and exact_local_replay
+                ):
+                    # The shared authority already proved this nonce was
+                    # consumed. A failed digest read cannot erase that fact;
+                    # only this process's exact-byte binding is sufficient to
+                    # admit an idempotent retry while the store is degraded.
+                    return EnvelopeVerification(
+                        ok=False,
+                        reason=(
+                            "replayed envelope (nonce already seen in shared "
+                            "window; exact envelope could not be verified)"
+                        ),
+                    )
             else:
                 if not reserved:
                     if exact_shared_replay:
