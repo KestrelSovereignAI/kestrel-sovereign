@@ -28,7 +28,16 @@ from kestrel_sovereign.endpoints.observability import router
 
 @pytest.fixture
 def identities():
-    """Two agent names unique to this test.
+    """Two agent DIDs unique to this test.
+
+    DIDs, not display names: `a2a_observability.agent_name` holds the
+    DID despite its column name — every live recorder writes
+    `agent_name=self.did`. The first version of this fixture seeded the
+    display name and the endpoint read the display name, so the two
+    agreed with each other and disagreed with production; a fix that
+    scoped by `agent.agent_name` passed 4/4 while returning zero rows on
+    a real deployment. The stub below therefore carries a `did` and a
+    DIFFERENT `agent_name`, so reading the wrong one cannot pass.
 
     A shared PostgreSQL database is not torn down between tests, so fixed
     names accumulate rows from every earlier run and every earlier
@@ -38,7 +47,10 @@ def identities():
     fixture does not own.
     """
     unique = uuid4().hex[:12]
-    return f"mine-{unique}", f"theirs-{unique}"
+    return (
+        f"did:pkh:eip155:1:0xMINE{unique}",
+        f"did:pkh:eip155:1:0xTHEIRS{unique}",
+    )
 
 
 @pytest.fixture
@@ -62,7 +74,7 @@ async def shared_store(db_backend, identities):
     return store
 
 
-def _client(store, agent_name: str) -> httpx.AsyncClient:
+def _client(store, agent_did: str) -> httpx.AsyncClient:
     """An in-loop ASGI client.
 
     Not `TestClient`: it drives the app on its own event loop in another
@@ -75,7 +87,15 @@ def _client(store, agent_name: str) -> httpx.AsyncClient:
     app = FastAPI()
     app.include_router(router)
     app.state.agent = type(
-        "Agent", (), {"observability_store": store, "agent_name": agent_name}
+        "Agent",
+        (),
+        {
+            "observability_store": store,
+            "did": agent_did,
+            # Deliberately different from the DID. Rows are written under
+            # the DID, so an endpoint that scopes by this reads nothing.
+            "agent_name": f"display-name-for-{agent_did[-8:]}",
+        },
     )()
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -157,3 +177,28 @@ def test_the_metrics_route_no_longer_accepts_an_agent_name_parameter():
     from kestrel_sovereign.endpoints.observability import get_metric_summary
 
     assert "agent_name" not in inspect.signature(get_metric_summary).parameters
+
+
+@pytest.mark.asyncio
+async def test_an_agent_without_a_resolvable_identity_is_refused(shared_store):
+    """No identity means no read — never an unscoped one.
+
+    The failure mode this guards is the one the fix exists to prevent:
+    if the scope cannot be determined, the tempting fallback is to pass
+    `None`, and `None` means "every agent" to the store. Refusing is the
+    only answer that cannot become the original defect.
+    """
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = type(
+        "Agent", (), {"observability_store": shared_store, "agent_name": "display"}
+    )()  # no `did` attribute at all
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        summary = await client.get("/api/observability/summary?minutes=60")
+        metric = await client.get("/api/observability/metrics/turns")
+
+    assert summary.status_code == 503, summary.text
+    assert metric.status_code == 503, metric.text

@@ -10,6 +10,35 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["observability"])
 
+
+def _scope_did(agent) -> str:
+    """The value `a2a_observability.agent_name` actually holds: the DID.
+
+    Despite the column's name it is not the display name. Every live
+    recorder writes `agent_name=self.did` — ten call sites across
+    `agent/streaming.py`, `agent/orchestrator_engine.py` and
+    `kestrel_agent.py` — and `a2a/task_manager.py` documents its
+    parameter as "Durable DID". `kestrel_agent.py` says so itself where
+    it wires the ephemeral purge: "Tool-call args in a2a_observability
+    use the agent DID as agent_name ... so scope by DID on both
+    columns".
+
+    Scoping by `agent.agent_name` instead is not a narrower read, it is
+    an empty one: no row carries that value, so every panel would go
+    blank and the #969 forensic metric would answer "never happened".
+
+    Missing identity refuses rather than falls back. An unscoped query
+    is the defect this function exists to prevent, so it must not be
+    what happens when the identity cannot be resolved.
+    """
+    did = getattr(agent, "did", None)
+    if not did:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent identity unavailable; cannot scope observability.",
+        )
+    return did
+
 @router.get("/api/observability/summary")
 async def get_observability_summary(
     request: Request,
@@ -29,6 +58,12 @@ async def get_observability_summary(
     if not obs_store:
         raise HTTPException(status_code=503, detail="Observability store not available")
 
+    # Resolved BEFORE the try below, which turns every exception into a
+    # generic 500 — a refusal that says "identity unavailable" is not the
+    # same answer as "the query blew up", and only the first tells the
+    # caller the read was declined rather than attempted.
+    scope_did = _scope_did(agent)
+
     try:
         from datetime import timedelta
         from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
@@ -43,7 +78,7 @@ async def get_observability_summary(
         # The identity comes from the resolved agent, never from the
         # request. Routing to an agent is not authority over it.
         events = await obs_store.query_events(
-            agent_name=agent.agent_name,
+            agent_name=scope_did,
             since=since,
             limit=DEFAULT_OBSERVABILITY_LIMIT,
         )
@@ -162,11 +197,13 @@ async def get_metric_summary(
     if not obs_store:
         raise HTTPException(status_code=503, detail="Observability store not available")
 
+    scope_did = _scope_did(agent)
+
     try:
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         summary = await obs_store.get_metric_summary(
             metric_name,
-            agent_name=agent.agent_name,
+            agent_name=scope_did,
             since=since,
         )
         summary["time_window_minutes"] = minutes
