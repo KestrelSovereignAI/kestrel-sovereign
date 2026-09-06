@@ -830,6 +830,23 @@ def test_one_receiver_reachable_through_two_agents_is_one_owner():
     finally:
         restore()
 
+    # The per-agent scan dedupes too (round 7 coverage gap): one agent whose
+    # two feature entries share one receiver object is one owner on the
+    # agent-prefixed form, which is the only path where the per-agent scan's
+    # result reaches dispatch without the aggregate's own dedupe.
+    shared_hook.receiver.event_log.clear()
+    agents = {
+        "a": _make_agent({"FirstFeature": shared_hook, "SecondFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()
+
 
 @contextmanager
 def _receiver_log():
