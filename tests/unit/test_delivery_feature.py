@@ -927,6 +927,59 @@ class TestQueueIdempotency:
         )
 
     @pytest.mark.asyncio
+    async def test_failure_after_claim_before_queue_insert_compensates_claim(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_fetchone = queue._db.fetchone
+
+        async def fail_claim_read(sql, params=()):
+            if "SELECT entry_id, payload_digest" in sql:
+                raise QueryError("injected claim read failure")
+            return await original_fetchone(sql, params)
+
+        async with queue._db.transaction(immediate=True):
+            with patch.object(queue._db, "fetchone", side_effect=fail_claim_read):
+                with pytest.raises(QueryError, match="injected claim read failure"):
+                    await queue.enqueue(
+                        "email",
+                        "person@example.com",
+                        {"body": "hello"},
+                        idempotency_key="retry-after-claim-read-failure",
+                    )
+
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+
+    @pytest.mark.asyncio
+    async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
+        queue._db.backend_type = "postgres"
+
+        @asynccontextmanager
+        async def transaction(*, immediate=False):
+            assert immediate
+            yield
+
+        queue._db.transaction = transaction
+        queue._db.fetchone = AsyncMock(
+            side_effect=QueryError("injected aborted transaction")
+        )
+
+        with pytest.raises(QueryError, match="injected aborted transaction"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"body": "hello"},
+                idempotency_key="postgres-rollback-only",
+            )
+
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "INSERT INTO delivery_idempotency" in sql
+        assert "DELETE FROM delivery_" not in sql
+
+    @pytest.mark.asyncio
     async def test_ambiguous_cancel_compensates_queue_row_and_claim(
         self, real_queue
     ):

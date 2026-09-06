@@ -321,41 +321,46 @@ class DeliveryQueue:
 
         try:
             async with self._db.transaction(immediate=True):
-                await self._db.execute(
-                    """
-                    INSERT INTO delivery_idempotency
-                        (agent_id, idempotency_key_digest, entry_id,
-                         payload_digest, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
-                    """,
-                    (
-                        self._agent_id,
-                        key_digest,
-                        entry_id,
-                        payload_digest,
-                        now_iso,
-                    ),
-                )
-                existing = await self._db.fetchone(
-                    """
-                    SELECT entry_id, payload_digest
-                    FROM delivery_idempotency
-                    WHERE agent_id = ? AND idempotency_key_digest = ?
-                    """,
-                    (self._agent_id, key_digest),
-                )
-                if existing is None:
-                    raise RuntimeError("delivery idempotency record was not persisted")
-                if existing[1] != payload_digest:
-                    raise DeliveryIdempotencyConflict(
-                        "idempotency_key was already used for a different delivery request"
-                    )
-                if existing[0] != entry_id:
-                    logger.debug("Adopted idempotent delivery entry: %s", existing[0])
-                    return existing[0]
-
                 try:
+                    await self._db.execute(
+                        """
+                        INSERT INTO delivery_idempotency
+                            (agent_id, idempotency_key_digest, entry_id,
+                             payload_digest, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
+                        """,
+                        (
+                            self._agent_id,
+                            key_digest,
+                            entry_id,
+                            payload_digest,
+                            now_iso,
+                        ),
+                    )
+                    existing = await self._db.fetchone(
+                        """
+                        SELECT entry_id, payload_digest
+                        FROM delivery_idempotency
+                        WHERE agent_id = ? AND idempotency_key_digest = ?
+                        """,
+                        (self._agent_id, key_digest),
+                    )
+                    if existing is None:
+                        raise RuntimeError(
+                            "delivery idempotency record was not persisted"
+                        )
+                    if existing[1] != payload_digest:
+                        raise DeliveryIdempotencyConflict(
+                            "idempotency_key was already used for a different "
+                            "delivery request"
+                        )
+                    if existing[0] != entry_id:
+                        logger.debug(
+                            "Adopted idempotent delivery entry: %s", existing[0]
+                        )
+                        return existing[0]
+
                     await self._db.execute(
                         """
                         INSERT INTO delivery_queue
@@ -378,25 +383,27 @@ class DeliveryQueue:
                         ),
                     )
                 except BaseException:
-                    # SQLite intentionally joins a same-task outer transaction
-                    # instead of opening a savepoint. Compensate the claim here
-                    # so a caller that catches this failure and commits its
-                    # outer transaction cannot poison the replay key.
-                    await self._db.execute(
-                        """
-                        DELETE FROM delivery_queue
-                        WHERE id = ? AND agent_id = ?
-                        """,
-                        (entry_id, self._agent_id),
-                    )
-                    await self._db.execute(
-                        """
-                        DELETE FROM delivery_idempotency
-                        WHERE agent_id = ? AND idempotency_key_digest = ?
-                              AND entry_id = ?
-                        """,
-                        (self._agent_id, key_digest, entry_id),
-                    )
+                    if self._db.backend_type == "sqlite":
+                        # SQLite joins a same-task outer transaction without a
+                        # savepoint. Remove either ambiguously completed write
+                        # before a caller can catch this and commit the outer
+                        # scope. PostgreSQL uses a real savepoint and cleanup
+                        # DML would be invalid once that savepoint is aborted.
+                        await self._db.execute(
+                            """
+                            DELETE FROM delivery_queue
+                            WHERE id = ? AND agent_id = ?
+                            """,
+                            (entry_id, self._agent_id),
+                        )
+                        await self._db.execute(
+                            """
+                            DELETE FROM delivery_idempotency
+                            WHERE agent_id = ? AND idempotency_key_digest = ?
+                                  AND entry_id = ?
+                            """,
+                            (self._agent_id, key_digest, entry_id),
+                        )
                     raise
         except Exception as error:
             conflict = self._find_idempotency_conflict(error)
