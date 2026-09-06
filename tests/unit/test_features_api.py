@@ -1554,6 +1554,50 @@ class TestDisableFeature:
             assert baseline.enabled is False
 
     @pytest.mark.asyncio
+    async def test_boot_replay_of_disabled_deltas_reads_the_same_rule(self):
+        """#3234 round 2: the rule guarded the WRITER of the enablement delta;
+        the two boot-time READERS still filtered on the mandatory set only,
+        so a persisted ``disabled`` row for a host-scope class (one that
+        predates the rule, or is written by any future door) would drop the
+        class from the load loop at every boot with nothing left to refuse
+        it. Both readers now apply the rule; an ordinary core class is still
+        honoured.
+        """
+        agent = _lifecycle_agent()
+        agent._allowed_features = {
+            "RestartCoordinatorFeature", "SchedulerFeature", "WebSearchFeature", "TodoFeature",
+        }
+        store = MagicMock()
+        store.get_deltas = AsyncMock(return_value=[
+            {"name": "RestartCoordinatorFeature", "state": "disabled"},
+            {"name": "SchedulerFeature", "state": "disabled"},
+            {"name": "IdentityFeature", "state": "disabled"},
+            {"name": "WebSearchFeature", "state": "disabled"},
+            {"name": "VoiceFeature", "state": "enabled"},
+        ])
+        agent._feature_enablement_store = store
+
+        assert await agent._disabled_feature_names() == {"WebSearchFeature"}
+        effective = await agent._effective_allowed_features()
+        assert effective == {
+            "RestartCoordinatorFeature", "SchedulerFeature", "TodoFeature", "VoiceFeature",
+        }
+
+    def test_scheduler_is_host_scope_because_it_ticks_the_restart_cron(self):
+        """#3234 round 2: the host-wide half of the restart protocol is the
+        ACTION cron the scheduler ticks; disabling the scheduler on one agent
+        degrades the host exactly as disabling the coordinator would.
+        """
+        scheduler = _make_feature(name="SchedulerFeature")
+        agent = _lifecycle_agent(features={"SchedulerFeature": scheduler})
+        app = _make_app(agent)
+        with TestClient(app) as client:
+            resp = client.post("/api/features/SchedulerFeature/disable")
+        assert resp.status_code == 409, resp.text
+        assert "SchedulerFeature" in resp.json()["detail"]
+        scheduler.on_disable.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_the_agents_own_disable_doors_read_the_same_rule(self):
         """#3234 round 1 (P1): the HTTP route was one door of two. The
         tool-driven ``feature_remove`` reaches ``KestrelAgent._disable_feature``
@@ -4288,6 +4332,39 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
                 resp = client.get(path)
                 assert resp.status_code == 200, (path, resp.text)
                 assert resp.json()["can_manage_features"] is expected, path
+
+    def test_catalog_and_detail_publish_the_servers_own_disable_answer(self):
+        """#3234 round 2: the console gated Disable on ``host_scope`` alone
+        while the server refuses two classes (mandatory too), so the modal
+        offered Disable on ``identity`` and got a 409. Every row and every
+        detail — registry branch and loaded branch — now carries
+        ``disable_refusal``, the exact string the 409 would say, or ``None``.
+        Real registry.
+        """
+        loaded_core = _make_feature(name="WebSearchFeature")
+        loaded_host = _make_feature(name="RestartCoordinatorFeature")
+        loaded_private = _make_feature(name="NotInAnyRegistryFeature")
+        agent = _lifecycle_agent(features={
+            "WebSearchFeature": loaded_core,
+            "RestartCoordinatorFeature": loaded_host,
+            "NotInAnyRegistryFeature": loaded_private,
+        })
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+        with TestClient(app) as client:
+            rows = {r["name"]: r for r in client.get("/api/features").json()["features"]}
+            assert "Mandatory" in rows["identity"]["disable_refusal"]
+            assert "Host-scope" in rows["restart_coordinator"]["disable_refusal"]
+            assert "Host-scope" in rows["scheduler"]["disable_refusal"]
+            assert rows["web_search"]["disable_refusal"] is None
+
+            # Loaded branch (the modal's source for a loaded feature).
+            assert "Host-scope" in client.get(
+                "/api/features/RestartCoordinatorFeature"
+            ).json()["disable_refusal"]
+            assert client.get("/api/features/WebSearchFeature").json()["disable_refusal"] is None
+            assert client.get("/api/features/NotInAnyRegistryFeature").json()["disable_refusal"] is None
+            # Registry branch (not loaded).
+            assert "Mandatory" in client.get("/api/features/identity").json()["disable_refusal"]
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_the_gate_is_not_on_the_reads(self, mock_registry):

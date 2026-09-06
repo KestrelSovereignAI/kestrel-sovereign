@@ -4686,13 +4686,16 @@ class KestrelAgent(
         except Exception as e:  # noqa: BLE001 - never block init on this
             logging.warning("Could not read feature enablement deltas: %s", e)
             return set(bootstrap)
-        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-        mandatory = set(MANDATORY_FEATURES)
+        # The same rule the writer enforces (kestrel-sovereign#3234): a
+        # persisted "disabled" row for a mandatory or host-scope class is
+        # never replayed, so a row that predates the rule cannot drop the
+        # class from the load loop for good.
+        from kestrel_sovereign.feature_registry import feature_disable_refusal
         effective = set(bootstrap)
         for d in deltas:
             if d["state"] == "enabled":
                 effective.add(d["name"])
-            elif d["state"] == "disabled" and d["name"] not in mandatory:
+            elif d["state"] == "disabled" and feature_disable_refusal(d["name"]) is None:
                 effective.discard(d["name"])
         return effective
 
@@ -4709,11 +4712,10 @@ class KestrelAgent(
         except Exception as e:  # noqa: BLE001 - never block init on this
             logging.warning("Could not read disabled feature deltas: %s", e)
             return set()
-        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-        mandatory = set(MANDATORY_FEATURES)
+        from kestrel_sovereign.feature_registry import feature_disable_refusal
         return {
             d["name"] for d in deltas
-            if d["state"] == "disabled" and d["name"] not in mandatory
+            if d["state"] == "disabled" and feature_disable_refusal(d["name"]) is None
         }
 
     async def persist_feature_enablement(

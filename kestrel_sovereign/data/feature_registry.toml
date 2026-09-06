@@ -524,6 +524,13 @@ description = "Cron-style task scheduling and recurring jobs"
 tags = ["automation", "scheduling", "cron"]
 icon = "clock"
 core = true
+# The scheduler is what ticks the ACTION cron `restart_coordinator` (the
+# host-wide half of the restart protocol): disabling it on one agent stops
+# that agent scanning and executing whole-host restart requests — the same
+# degradation the restart_coordinator refusal exists to prevent, one door
+# over (kestrel-sovereign#3234). The marker is declared per package and names
+# the mechanism it stands for.
+host_scope = true
 
 [scheduler.skills]
 schedule_task = { description = "Schedule a recurring task", category = "utility", tags = ["scheduler", "cron"] }

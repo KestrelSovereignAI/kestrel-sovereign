@@ -260,10 +260,11 @@ export function renderActionButton(feature, canManage = canManageFeatures) {
     // control that would only 403.
     if (!canManage) return '';
 
-    if (status === 'enabled' && feature.host_scope) {
-        // A host-scope package (whole-host restart coordination) cannot be
-        // disabled per agent — the server answers 409 for every caller
-        // (#3234). Ordinary core packages remain per-agent toggles.
+    if (status === 'enabled' && feature.disable_refusal) {
+        // The server's own answer: this package cannot be disabled per agent
+        // (mandatory sovereignty features, host-scope features) and would
+        // 409 for every caller (#3234). Ordinary core packages remain
+        // per-agent toggles.
         return '';
     }
 
@@ -421,7 +422,7 @@ async function showDetail(name) {
     }
 }
 
-function renderDetailModal(detail, owner) {
+export function renderDetailModal(detail, owner) {
     const name = detail.name || 'Unknown';
     const iconHtml = renderFeatureIcon(detail.icon, '1.25rem');
     const description = detail.description || detail.tool_description || 'No description';
@@ -547,11 +548,12 @@ function renderDetailModal(detail, owner) {
     // configuration dialog.
     let detailModal;
     const buttons = [];
-    const isHostScope = detail.host_scope || false;
+    // The server's own disable answer (mandatory or host-scope → a reason).
+    const disableRefused = Boolean(detail.disable_refusal);
     if (!canManageFeatures) {
         // No mutation control for a caller the server would 403 (#3234).
     } else if (status === 'enabled') {
-        if (!isHostScope) {
+        if (!disableRefused) {
             buttons.push({
                 label: 'Disable',
                 type: 'secondary',

@@ -156,6 +156,21 @@ class ConfigUpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _package_disable_refusal(info: FeaturePackageInfo) -> Optional[str]:
+    """Why this package cannot be disabled per agent, or ``None``.
+
+    The server's own answer (``feature_disable_refusal``), published so the
+    console draws no Disable that would only 409 — for mandatory and
+    host-scope classes alike, rather than a client-side proxy that knows one
+    of the two (kestrel-sovereign#3234).
+    """
+    for class_name in info.features:
+        reason = feature_disable_refusal(class_name)
+        if reason is not None:
+            return reason
+    return None
+
+
 def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
     """Serialize a FeaturePackageInfo to a JSON-safe dict."""
     d = asdict(info)
@@ -163,6 +178,7 @@ def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
     d["boundary"] = info.boundary.value
     d["installable"] = info.installable
     d["skills"] = [asdict(s) for s in info.skills]
+    d["disable_refusal"] = _package_disable_refusal(info)
     return d
 
 
@@ -380,12 +396,17 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
             "hooks": [{"name": h.name, "events": [e.value for e in h.events]} for h in hooks] if hooks else [],
             "config_schema": feature.config_schema,
         }
+        # The server's own disable answer for this loaded class, published
+        # for every loaded feature (registry-known or not) so the console
+        # never draws a Disable that would only 409 (#3234).
+        detail["disable_refusal"] = feature_disable_refusal(name)
         if pkg:
             detail["package"] = pkg.package
             detail["git"] = pkg.git
             detail["tags"] = pkg.tags
             detail["icon"] = pkg.icon
             detail["core"] = pkg.core
+            detail["host_scope"] = pkg.host_scope
             detail["boundary"] = pkg.boundary.value
             detail["installable"] = pkg.installable
             detail["skills"] = [asdict(s) for s in pkg.skills]
