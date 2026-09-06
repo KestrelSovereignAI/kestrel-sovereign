@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -858,6 +858,174 @@ async def test_peer_stop_replay_survives_transport_rotation_and_restart(
             await second.shutdown_durable_delivery()
         elif not first._durable_shutdown:
             await first.shutdown_durable_delivery()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_stop_refreshes_stale_executing_runtime_owner(
+    tmp_path, monkeypatch
+) -> None:
+    """A resumed dispatcher stays live across admission and action fencing."""
+
+    backend = SQLiteBackend(str(tmp_path / "peer-stop-stale-self.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _Agent()
+    registry = SourceRegistry()
+    registry.register(build_peer_stop_registration(agent))
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    try:
+        await dispatcher.initialize_durable_delivery()
+        stale_heartbeat = (
+            datetime.now(timezone.utc)
+            - dispatcher._runtime_owner_stale_after
+            - timedelta(seconds=1)
+        )
+        await backend.execute(
+            "UPDATE durable_signal_runtime_owners "
+            "SET heartbeat_at = ?, updated_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                stale_heartbeat.isoformat(),
+                stale_heartbeat.isoformat(),
+                agent.did,
+                dispatcher._durable_delivery_owner,
+            ),
+        )
+        original_persist = dispatcher._durable_store.persist_signal
+
+        async def persist_then_age_owner_again(*args, **kwargs):
+            persisted = await original_persist(*args, **kwargs)
+            # Model another long scheduling/suspend gap between durable
+            # admission and the last-moment runtime-local action fence.
+            await backend.execute(
+                "UPDATE durable_signal_runtime_owners "
+                "SET heartbeat_at = ?, updated_at = ? "
+                "WHERE agent_id = ? AND owner_id = ?",
+                (
+                    stale_heartbeat.isoformat(),
+                    stale_heartbeat.isoformat(),
+                    agent.did,
+                    dispatcher._durable_delivery_owner,
+                ),
+            )
+            return persisted
+
+        monkeypatch.setattr(
+            dispatcher._durable_store,
+            "persist_signal",
+            persist_then_age_owner_again,
+        )
+        signal = build_peer_stop_signal(
+            agent=agent,
+            actor_id="did:test:peer",
+            intent={
+                "scope": "agent",
+                "target": None,
+                "reason": "stop immediately after resume",
+                "cascade": True,
+                "correlation_id": "stale-self-refresh",
+            },
+        )
+
+        result = await dispatcher.dispatch_signal(
+            signal,
+            source_event_id=signal.dedupe_key,
+        )
+
+        assert result.status is Status.OK
+        agent.cancel_current_request.assert_called_once()
+        refreshed = await backend.fetch_val(
+            "SELECT heartbeat_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (agent.did, dispatcher._durable_delivery_owner),
+        )
+        assert datetime.fromisoformat(str(refreshed)) > stale_heartbeat
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_self_refresh_does_not_bypass_foreign_live_owner(tmp_path) -> None:
+    """Refreshing the executor remains atomic with split-inventory refusal."""
+
+    backend = SQLiteBackend(str(tmp_path / "peer-stop-stale-self-foreign.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+
+    def build_dispatcher():
+        agent = _Agent()
+        registry = SourceRegistry()
+        registry.register(build_peer_stop_registration(agent))
+        return agent, SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=store,
+        )
+
+    first_agent, first = build_dispatcher()
+    second_agent, second = build_dispatcher()
+    try:
+        await first.initialize_durable_delivery()
+        await second.initialize_durable_delivery()
+        stale_heartbeat = (
+            datetime.now(timezone.utc)
+            - first._runtime_owner_stale_after
+            - timedelta(seconds=1)
+        )
+        await backend.execute(
+            "UPDATE durable_signal_runtime_owners "
+            "SET heartbeat_at = ?, updated_at = ? "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (
+                stale_heartbeat.isoformat(),
+                stale_heartbeat.isoformat(),
+                first_agent.did,
+                first._durable_delivery_owner,
+            ),
+        )
+        signal = build_peer_stop_signal(
+            agent=first_agent,
+            actor_id="did:test:peer",
+            intent={
+                "scope": "agent",
+                "target": None,
+                "reason": "do not select one replica",
+                "cascade": True,
+                "correlation_id": "stale-self-foreign-live",
+            },
+        )
+
+        result = await first.dispatch_signal(
+            signal,
+            source_event_id=signal.dedupe_key,
+        )
+
+        assert result.status is Status.FAILED
+        assert "exactly one live runtime owner" in (result.error or "")
+        first_agent.cancel_current_request.assert_not_called()
+        second_agent.cancel_current_request.assert_not_called()
+        assert await backend.fetch_val(
+            "SELECT heartbeat_at FROM durable_signal_runtime_owners "
+            "WHERE agent_id = ? AND owner_id = ?",
+            (first_agent.did, first._durable_delivery_owner),
+        ) == stale_heartbeat.isoformat()
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events WHERE source = ?",
+            (SOURCE_NAME,),
+        ) == 0
+    finally:
+        await first.shutdown_durable_delivery()
+        await second.shutdown_durable_delivery()
         await backend.close()
 
 

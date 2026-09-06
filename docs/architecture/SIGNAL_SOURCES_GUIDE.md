@@ -449,6 +449,10 @@ contexts and only then build a `Signal`:
   runtime-owner registration fence through completion of the bounded action;
   a replica appearing after event commit therefore either blocks until the
   action is complete or makes the action abort before cancellation.
+  The executing dispatcher refreshes its own liveness inside each exclusivity
+  transaction before testing for foreign live owners. A suspend or event-loop
+  stall therefore cannot create a false zero-owner refusal, while a real
+  second inventory still fails closed and rolls that refresh back.
   Active-work inventory is runtime-local, and guessing which replica owns the
   work would make an idle replica's no-op receipt lie.
   Supported cloud deployment therefore remains capped at one instance until a

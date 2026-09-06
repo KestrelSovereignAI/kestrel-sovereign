@@ -3687,10 +3687,11 @@ class DurableSignalStore(UnifiedStoreBase):
                 # contention has cleared, never from method entry.
                 now = self.now_utc()
                 if exclusive_runtime_owner_id is not None:
-                    await self._require_exclusive_runtime_owner_locked(
+                    await self._refresh_and_require_exclusive_runtime_owner_locked(
                         agent_id=agent_id,
                         owner_id=exclusive_runtime_owner_id,
-                        stale_before=now - runtime_owner_stale_after,
+                        now=now,
+                        stale_after=runtime_owner_stale_after,
                     )
                 rate_limited = False
                 if durable_rate_limit is not None:
@@ -4553,10 +4554,11 @@ class DurableSignalStore(UnifiedStoreBase):
         ) as transaction_open:
             if transaction_open:
                 now = self.now_utc()
-                await self._require_exclusive_runtime_owner_locked(
+                await self._refresh_and_require_exclusive_runtime_owner_locked(
                     agent_id=agent_id,
                     owner_id=owner_id,
-                    stale_before=now - stale_after,
+                    now=now,
+                    stale_after=stale_after,
                 )
                 yield
             else:
@@ -4566,10 +4568,11 @@ class DurableSignalStore(UnifiedStoreBase):
                 async with self._backend.transaction():
                     await self._lock_runtime_owner_scope(agent_id=agent_id)
                     now = self.now_utc()
-                    await self._require_exclusive_runtime_owner_locked(
+                    await self._refresh_and_require_exclusive_runtime_owner_locked(
                         agent_id=agent_id,
                         owner_id=owner_id,
-                        stale_before=now - stale_after,
+                        now=now,
+                        stale_after=stale_after,
                     )
                 yield
 
@@ -5733,6 +5736,34 @@ class DurableSignalStore(UnifiedStoreBase):
             raise RuntimeError(
                 "durable action requires exactly one live runtime owner"
             )
+
+    async def _refresh_and_require_exclusive_runtime_owner_locked(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        now: datetime,
+        stale_after: timedelta,
+    ) -> None:
+        """Refresh the executing owner, then reject every foreign live owner.
+
+        A dispatcher reaching this boundary is itself current liveness
+        evidence even when suspend or an event-loop stall delayed its periodic
+        heartbeat.  Both writes and the exclusivity read share the caller's
+        transaction, so a foreign live owner rolls the refresh back instead of
+        weakening the single-runtime invariant.
+        """
+
+        await self._touch_runtime_owner_locked(
+            agent_id=agent_id,
+            owner_id=owner_id,
+            now=now,
+        )
+        await self._require_exclusive_runtime_owner_locked(
+            agent_id=agent_id,
+            owner_id=owner_id,
+            stale_before=now - stale_after,
+        )
 
     async def _recover_expired_leases(
         self,
