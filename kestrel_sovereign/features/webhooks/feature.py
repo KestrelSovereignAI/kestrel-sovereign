@@ -493,10 +493,19 @@ class WebhookFeature(Feature):
         # each agent owns its own database — so it cannot detect the
         # collision here; what it CAN do is hand the caller the address that
         # always dispatches to this agent. That is the agent-prefixed form,
-        # keyed by the routing name the host registered this agent under.
-        agent_name = getattr(self.agent, "agent_name", None)
-        if isinstance(agent_name, str) and agent_name:
-            agent_endpoint = f"/api/agents/{agent_name}/webhooks/{name}"
+        # keyed by the ROUTING name the host's AgentManager registered this
+        # agent under — not ``agent_name``, which is a display name that
+        # equals the routing key only for a published hosted agent. Only a
+        # hosted agent carries ``_agent_manager``; a single-agent boot has no
+        # manager and serves no ``/api/agents/*`` route at all, and a fenced
+        # spawn route resolves to ``None``. In both cases no address is
+        # invented.
+        manager = getattr(self.agent, "_agent_manager", None)
+        routing_name = (
+            manager.get_agent_name(self._agent_id) if manager is not None else None
+        )
+        if isinstance(routing_name, str) and routing_name:
+            agent_endpoint = f"/api/agents/{routing_name}/webhooks/{name}"
             data["agent_endpoint"] = agent_endpoint
             confirmation += (
                 f" On a host running more than one agent, point the sender at "

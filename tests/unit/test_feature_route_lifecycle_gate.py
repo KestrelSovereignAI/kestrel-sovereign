@@ -803,3 +803,29 @@ def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
             assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
     finally:
         restore()
+
+
+def test_one_receiver_reachable_through_two_agents_is_one_owner():
+    """#3216: dedupe-by-identity is now load-bearing for correctness.
+
+    The aggregate provider dedupes receivers by identity because one
+    receiver can be reached through more than one agent. Before the
+    ambiguity rule that only saved a redundant scan; now a duplicate entry
+    would count as two owners and falsely refuse a single-owner name. The
+    same feature instance mounted on two fleet entries must still dispatch
+    exactly once.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    shared_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    agents = {
+        "a": _make_agent({"WebhookFeature": shared_hook}),
+        "b": _make_agent({"WebhookFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()

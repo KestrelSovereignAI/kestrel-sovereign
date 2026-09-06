@@ -19,7 +19,7 @@ import hashlib
 import hmac as hmac_mod
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sovereign.features.webhooks.models import (
     WebhookAuthType,
@@ -1449,47 +1449,139 @@ class TestWebhookMultiAgentDispatch:
 
 
     @pytest.mark.asyncio
-    async def test_register_hands_back_the_agent_prefixed_address_that_always_dispatches(
+    async def test_register_hands_back_the_agent_prefixed_address_and_it_dispatches_here(
         self, tmp_path, sqlite_database_factory
     ):
         """#3216, registration side: the tool cannot see its peers, so it
         cannot refuse a colliding name — but it must not hand back
         ``/webhooks/{name}`` as though the host will honour it.
 
-        With a routing name the reply carries ``agent_endpoint`` (the form
-        the shared router never refuses) and says in words when the
-        unprefixed form stops dispatching. Without a routing name (a mock
-        agent, or a legacy single-agent boot that never registered one)
-        the reply is unchanged: no invented address.
+        On a hosted agent the reply carries ``agent_endpoint``, keyed by the
+        ROUTING name the AgentManager registered the agent under (not the
+        display name), and the test then POSTs to exactly that address on
+        the real app with the real routing middleware: it dispatches to this
+        agent's receiver and to nobody else's, even while a peer owns the
+        same name and the unprefixed form is refused.
         """
-        db = await sqlite_database_factory(tmp_path / "named.db")
-        agent = _make_agent(db=db, agent_id="did:test:agent-emma")
-        agent.agent_name = "emma"
+        from contextlib import asynccontextmanager
+
+        from fastapi.testclient import TestClient
+        from server import app
+        from kestrel_sovereign.server import (
+            _mount_feature_routers,
+            _unmount_feature_routers,
+        )
+
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
+        agent_a = _make_agent(db=db_a, agent_id="did:test:agent-emma")
+        agent_a.agent_name = "Emma (display name, not the routing key)"
+        feat_a = WebhookFeature(agent_a)
+        await feat_a.initialize()
+        agent_a.features = {"WebhookFeature": feat_a}
+
+        db_b = await sqlite_database_factory(tmp_path / "b.db")
+        agent_b = _make_agent(db=db_b, agent_id="did:test:agent-nellie")
+        feat_b = WebhookFeature(agent_b)
+        await feat_b.initialize()
+        agent_b.features = {"WebhookFeature": feat_b}
+
+        fleet = {"emma": agent_a, "nellie": agent_b}
+        by_did = {agent.did: name for name, agent in fleet.items()}
+        manager = MagicMock()
+        manager.list_agents = MagicMock(side_effect=lambda: dict(fleet))
+        manager.get_agent = MagicMock(side_effect=lambda name: fleet.get(name))
+        manager.get_agent_name = MagicMock(side_effect=lambda did: by_did.get(did))
+        agent_a._agent_manager = manager
+        agent_b._agent_manager = manager
+
+        await feat_b.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        reg = await feat_a.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        assert reg.data["endpoint"] == "/webhooks/deposit"
+        assert reg.data["agent_endpoint"] == "/api/agents/emma/webhooks/deposit"
+        manager.get_agent_name.assert_any_call("did:test:agent-emma")
+        assert "/api/agents/emma/webhooks/deposit" in reg.confirmation
+        assert "refused" in reg.confirmation
+        assert "/webhooks/deposit" in reg.confirmation
+
+        @asynccontextmanager
+        async def noop_lifespan(_app):
+            yield
+
+        original = (
+            app.router.lifespan_context,
+            getattr(app.state, "agent", None),
+            getattr(app.state, "agent_manager", None),
+        )
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        _mount_feature_routers(app)
+        try:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    # The unprefixed form is contested → refused.
+                    refused = client.post("/webhooks/deposit", content=b"{}")
+                    assert refused.status_code == 404, refused.text
+                    # The address the tool handed back dispatches HERE.
+                    resp = client.post(reg.data["agent_endpoint"], content=b"{}")
+                    assert resp.status_code == 200, resp.text
+                    assert resp.json()["webhook"] == "deposit"
+        finally:
+            _unmount_feature_routers(app)
+            app.router.lifespan_context = original[0]
+            app.state.agent = original[1]
+            app.state.agent_manager = original[2]
+
+        rows_a = await db_a.fetchall(
+            "SELECT status_code FROM webhook_log ORDER BY rowid"
+        )
+        rows_b = await db_b.fetchall(
+            "SELECT status_code FROM webhook_log ORDER BY rowid"
+        )
+        assert [r[0] for r in rows_a] == [404, 200]
+        assert [r[0] for r in rows_b] == [404]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "manager_factory,label",
+        [
+            (lambda: None, "single-agent boot: no manager, no /api/agents/* route"),
+            (
+                lambda: MagicMock(get_agent_name=MagicMock(return_value=None)),
+                "fenced or unknown route: the registry resolves no name",
+            ),
+            (
+                lambda: MagicMock(),
+                "registry answers with a non-string (a mock leak)",
+            ),
+        ],
+    )
+    async def test_register_invents_no_prefixed_address_without_a_routing_name(
+        self, tmp_path, sqlite_database_factory, manager_factory, label
+    ):
+        """Where the host serves no ``/api/agents/{name}`` route for this
+        agent, the reply must not point the sender at one. ``agent_name``
+        (a display name every agent carries from birth, floor "Unnamed
+        Agent") is deliberately NOT consulted — on a single-agent host it
+        would yield a URL that 404s forever.
+        """
+        db = await sqlite_database_factory(tmp_path / "solo.db")
+        agent = _make_agent(db=db, agent_id="did:test:agent-solo")
+        agent.agent_name = "Unnamed Agent"
+        agent._agent_manager = manager_factory()
         feat = WebhookFeature(agent)
         await feat.initialize()
         reg = await feat.webhooks_register(
             name="deposit", auth_type="bearer_token",
             auth_config_json='{"token": "sekret"}',
         )
-        assert reg.data["endpoint"] == "/webhooks/deposit"
-        assert reg.data["agent_endpoint"] == "/api/agents/emma/webhooks/deposit"
-        assert "/api/agents/emma/webhooks/deposit" in reg.confirmation
-        assert "refused" in reg.confirmation
-        assert "/webhooks/deposit" in reg.confirmation
-
-        db_anon = await sqlite_database_factory(tmp_path / "anon.db")
-        unnamed = _make_agent(db=db_anon, agent_id="did:test:agent-unnamed")
-        # A MagicMock attribute is truthy but not a name; a real agent that
-        # never had a routing key registered exposes no usable string either.
-        assert not isinstance(unnamed.agent_name, str)
-        feat_unnamed = WebhookFeature(unnamed)
-        await feat_unnamed.initialize()
-        reg = await feat_unnamed.webhooks_register(
-            name="deposit", auth_type="bearer_token",
-            auth_config_json='{"token": "sekret"}',
-        )
-        assert "agent_endpoint" not in reg.data
-        assert "/api/agents/" not in reg.confirmation
+        assert reg.data["endpoint"] == "/webhooks/deposit", label
+        assert "agent_endpoint" not in reg.data, label
+        assert "/api/agents/" not in reg.confirmation, label
 
 
 # The legacy multi-agent host's ``/webhooks/{name}`` PROXY (which forwarded to a
