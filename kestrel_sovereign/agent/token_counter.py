@@ -135,18 +135,41 @@ class TokenCounter:
         if not self._use_tiktoken:
             logger.debug(f"Using character estimation for model: {model}")
 
-    def count(self, text: str) -> int:
+    def count(self, text: Any) -> int:
         """
-        Count tokens in text.
+        Count tokens in text, or in structured message content.
+
+        Structured content — an Anthropic block array (``text`` /
+        ``tool_use`` / ``tool_result``), or any nested payload — reaches the
+        provider as JSON, so it is measured the way it is actually sent.
+        This mirrors ``_count_tool_schema_tokens``, which already serialises
+        tool schemas before counting them.
+
+        Without this, a non-string fell through to the character estimate
+        below and was measured as ``len(obj) // 4`` — the number of BLOCKS,
+        not their size. A single ``tool_result`` block holding 400 KB counted
+        as 7 tokens, so any budget fed block-form content was blind to
+        essentially all of it.
 
         Args:
-            text: The text to count tokens for
+            text: Text, or structured content, to count tokens for
 
         Returns:
             Number of tokens
         """
         if not text:
             return 0
+
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(
+                    text, sort_keys=True, separators=(",", ":"), default=str
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    f"content serialisation failed during measurement: {e}"
+                )
+                text = str(text)
 
         if self._use_tiktoken and self.encoder:
             try:
