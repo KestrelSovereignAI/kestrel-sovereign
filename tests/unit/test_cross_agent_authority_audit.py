@@ -7263,6 +7263,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "kill",
         "offboard",
         "pause",
+        "register",
         "remove",
         "reset",
         "restart",
@@ -7271,6 +7272,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "start",
         "stop",
         "terminate",
+        "unregister",
         "withdraw",
     }
 )
@@ -7478,6 +7480,28 @@ def _is_cross_agent_state_mutation_call(
         )
     )
     return attribute_mutation or named_mutation or lifecycle_mutation
+
+
+def _is_cross_agent_state_mutation_node(
+    node: ast.AST,
+    state_object_aliases: frozenset[str] | set[str] | None = None,
+) -> bool:
+    """Apply the central registry/object mutation matchers to one AST node."""
+
+    if isinstance(node, ast.Call):
+        return _is_cross_agent_state_mutation_call(node, state_object_aliases)
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+        targets = [node.target]
+    elif isinstance(node, ast.Delete):
+        targets = list(node.targets)
+    else:
+        return False
+    return any(
+        _is_cross_agent_state_mutation_target(target, state_object_aliases)
+        for target in targets
+    )
 
 
 @lru_cache(maxsize=None)
@@ -8527,6 +8551,27 @@ def _is_unambiguous_control_sink(
     )
 
 
+def _is_provenance_transform_call(call: ast.Call) -> bool:
+    """Whether a call's result retains or serializes its input value."""
+
+    call_name = _call_name(call).casefold()
+    return call_name in PROVENANCE_TRANSFORM_CALLS or call_name in {
+        "join",
+        "repr",
+        "str",
+    } or any(
+        marker in call_name
+        for marker in (
+            "canonical",
+            "dump",
+            "encode",
+            "format",
+            "normaliz",
+            "serializ",
+        )
+    )
+
+
 def _provenance_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_return_helpers: set[str] | None = None,
@@ -8580,7 +8625,7 @@ def _provenance_aliases(
             ) or _has_provenance_token(value, aliases)
         if (
             isinstance(value, ast.Call)
-            and _call_name(value) in PROVENANCE_TRANSFORM_CALLS
+            and _is_provenance_transform_call(value)
         ):
             return (
                 _has_provenance_token(value, aliases)
@@ -9314,7 +9359,9 @@ def _local_control_helpers(
             visible_control_aliases = helper_names | set(
                 (function_imported_control_aliases or {}).get(function, ())
             )
-            if any(
+            scope_nodes = _walk_lexical_scope(function)
+            state_object_aliases = _cross_agent_state_object_aliases(function)
+            invokes_control = any(
                 isinstance(node, ast.Call)
                 and _is_unambiguous_control_sink(node, visible_control_aliases)
                 # An unresolved immediately-invoked ``getattr`` fails closed
@@ -9324,8 +9371,16 @@ def _local_control_helpers(
                 # ``getattr(config, name)()`` are not authority sinks.
                 and _control_reference_sources(node.func)
                 != {"dynamic_control_attribute"}
-                for node in _walk_lexical_scope(function)
-            ):
+                for node in scope_nodes
+            )
+            mutates_cross_agent_state = any(
+                _is_cross_agent_state_mutation_node(
+                    node,
+                    state_object_aliases,
+                )
+                for node in scope_nodes
+            )
+            if invokes_control or mutates_cross_agent_state:
                 helper_names.add(function_name)
                 changed = True
                 continue
@@ -9417,7 +9472,7 @@ def _local_provenance_return_helpers(
                     returns_provenance = (
                         _is_provenance_accessor_call(value)
                         or call_name in visible_helpers
-                        or call_name in PROVENANCE_TRANSFORM_CALLS
+                        or _is_provenance_transform_call(value)
                         and (
                             _has_provenance_token(value, aliases)
                             or calls_known_helper
@@ -9876,29 +9931,10 @@ def _scope_imported_control_aliases(
     import_nodes = _lexical_scope_imports(scope)
 
     def is_control_callable(name: str) -> bool:
-        lowered = name.casefold()
-        actions = (
-            "cancel",
-            "delegate",
-            "hold",
-            "interrupt",
-            "kill",
-            "offboard",
-            "restart",
-            "shutdown",
-            "spawn",
-            "stop",
-            "terminate",
-            "withdraw",
-        )
-        subjects = ("a2a", "agent", "child", "descendant", "fleet", "host", "peer")
-        words = set(lowered.split("_"))
-        return (
-            lowered == "kill_process"
-            or bool(words.intersection(actions))
-            or any(action in lowered for action in (*actions, "remove"))
-            and any(subject in lowered for subject in subjects)
-        )
+        # Import aliasing must recognize exactly the same control vocabulary
+        # as direct calls.  A second verb list inevitably lets ``as apply``
+        # erase whichever lifecycle action was added only to the main matcher.
+        return _is_unambiguous_control_token(name)
 
     aliases = {
         (imported.asname or imported.name).casefold()
@@ -12750,11 +12786,29 @@ def test_provenance_scanner_follows_local_helper_return_values() -> None:
         "    if emitted:\n"
         "        state['sent'] = True\n"
     )
+    serialized_helper = ast.parse(
+        "def derive(request):\n"
+        '    return "".join(\n'
+        "        frame.source for frame in request.causation_chain\n"
+        "    )\n\n"
+        "def dispatch(request, target):\n"
+        "    if derive(request):\n"
+        "        terminate_child(target)\n"
+    )
+    normalized_helper = ast.parse(
+        "def derive(request):\n"
+        "    return normalize(request.causation_chain)\n\n"
+        "def dispatch(request, target):\n"
+        "    if derive(request):\n"
+        "        terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(neutral_helper) == {5, 6}
     assert _authority_provenance_lines(wrapped_helper) == {9}
     assert _authority_provenance_lines(direct_helper_guard) == {5}
     assert _authority_provenance_lines(propagation_only_helper) == set()
+    assert _authority_provenance_lines(serialized_helper) == {7}
+    assert _authority_provenance_lines(normalized_helper) == {5}
 
 
 def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers() -> None:
@@ -12914,6 +12968,24 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
     assert _authority_provenance_lines(lambda_authority) == {2}
     assert _authority_provenance_lines(conditional_lambda_authority) == {2}
     assert _authority_provenance_lines(aliased_lambda_authority) == {2}
+
+
+def test_provenance_scanner_reuses_central_lifecycle_for_imports() -> None:
+    imported_disable_alias = ast.parse(
+        "from lifecycle import disable_agent as apply\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n"
+    )
+    imported_create_alias = ast.parse(
+        "from lifecycle import create_agent as apply\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        apply(target)\n"
+    )
+
+    assert _authority_provenance_lines(imported_disable_alias) == {4}
+    assert _authority_provenance_lines(imported_create_alias) == {4}
 
 
 def test_provenance_scanner_analyzes_escaping_control_lambdas() -> None:
@@ -13376,6 +13448,39 @@ def test_provenance_scanner_tracks_direct_provenance_state_mutations() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {2, 5, 8, 11, 14}
+
+
+def test_provenance_scanner_summarizes_registry_mutation_helpers() -> None:
+    tree = ast.parse(
+        "def pop_entry(manager, agent_id):\n"
+        "    manager._agents.pop(agent_id, None)\n\n"
+        "def delete_entry(manager, agent_id):\n"
+        "    del manager._agents[agent_id]\n\n"
+        "def replace_entry(manager, agent_id):\n"
+        "    manager._agents[agent_id] = None\n\n"
+        "def dispatch(request, manager, agent_id):\n"
+        "    if request.causation_chain:\n"
+        "        pop_entry(manager, agent_id)\n"
+        "    if request.orchestrator:\n"
+        "        delete_entry(manager, agent_id)\n"
+        "    if request.causation_chain:\n"
+        "        replace_entry(manager, agent_id)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {11, 13, 15}
+
+
+def test_provenance_scanner_classifies_agent_registration_lifecycle() -> None:
+    tree = ast.parse(
+        "def unregister(request, task_manager, target):\n"
+        "    if request.causation_chain:\n"
+        "        task_manager.unregister_agent(target)\n\n"
+        "def register(request, task_manager, target):\n"
+        "    if request.orchestrator:\n"
+        "        task_manager.register_agent(target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6}
 
 
 def test_provenance_scanner_seeds_causation_typed_parameters() -> None:
