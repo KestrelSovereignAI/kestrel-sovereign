@@ -179,9 +179,9 @@ async def test_peer_stop_dispatch_reaches_handler_while_turn_holds_privacy_lock(
 def test_peer_stop_source_event_id_is_keyed_and_not_roster_enumerable(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "first-private-binding-key")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "first-private-data-binding-key")
     first = peer_stop_source_event_id("did:test:peer", "peer-stop-keyed")
-    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "second-private-binding-key")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "second-private-data-binding-key")
     second = peer_stop_source_event_id("did:test:peer", "peer-stop-keyed")
     enumerable_material = json.dumps(
         ["did:test:peer", "peer-stop-keyed"],
@@ -191,6 +191,43 @@ def test_peer_stop_source_event_id_is_keyed_and_not_roster_enumerable(
 
     assert first != second
     assert first != hashlib.sha256(enumerable_material).hexdigest()
+
+
+def test_peer_stop_source_event_id_survives_transport_key_rotation(
+    monkeypatch,
+) -> None:
+    """Transport credential rotation cannot reopen the durable action lane."""
+
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "first-transport-key")
+    first = peer_stop_source_event_id(
+        "did:test:peer",
+        "peer-stop-restart-stable",
+    )
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "rotated-transport-key")
+    second = peer_stop_source_event_id(
+        "did:test:peer",
+        "peer-stop-restart-stable",
+    )
+
+    assert first == second
+
+
+def test_durable_peer_stop_refuses_a_missing_restart_stable_data_key(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+    monkeypatch.setenv("KESTREL_DEPLOYMENT_PERSISTENCE", "durable_sovereign")
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "disposable-transport-key")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Durable peer Stop replay binding requires KESTREL_DATA_KEY",
+    ):
+        peer_stop_source_event_id(
+            "did:test:peer",
+            "peer-stop-missing-stable-key",
+        )
 
 
 @pytest.mark.asyncio
@@ -650,6 +687,74 @@ async def test_peer_stop_rate_limit_survives_dispatcher_restart(tmp_path) -> Non
             (second_agent.did, SOURCE_NAME),
         )
         assert admitted == PEER_STOP_RATE_LIMIT_PER_MINUTE
+    finally:
+        if second is not None:
+            await second.shutdown_durable_delivery()
+        elif not first._durable_shutdown:
+            await first.shutdown_durable_delivery()
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_stop_replay_survives_transport_rotation_and_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A verified retry cannot cancel replacement work after a cold restart."""
+
+    backend = SQLiteBackend(str(tmp_path / "durable-peer-replay.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+
+    def build_dispatcher():
+        agent = _Agent()
+        registry = SourceRegistry()
+        registry.register(build_peer_stop_registration(agent))
+        return agent, SignalDispatcher(
+            agent=agent,
+            registry=registry,
+            lock_manager=OrderedLockManager(),
+            store=store,
+        )
+
+    async def dispatch(agent, dispatcher):
+        signal = build_peer_stop_signal(
+            agent=agent,
+            actor_id="did:test:peer",
+            intent={
+                "scope": "agent",
+                "target": None,
+                "reason": "restart-stable replay",
+                "cascade": True,
+                "correlation_id": "peer-stop-across-cold-restart",
+            },
+        )
+        return await dispatcher.dispatch_signal(
+            signal,
+            source_event_id=signal.dedupe_key,
+        )
+
+    first_agent, first = build_dispatcher()
+    second = None
+    try:
+        monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "first-transport-key")
+        initial = await dispatch(first_agent, first)
+        await first.shutdown_durable_delivery()
+
+        monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "rotated-transport-key")
+        second_agent, second = build_dispatcher()
+        replay = await dispatch(second_agent, second)
+
+        assert initial.status is Status.OK
+        assert replay.status is Status.COALESCED
+        assert first_agent.cancel_current_request.call_count == 1
+        second_agent.cancel_current_request.assert_not_called()
+        assert await backend.fetch_val(
+            "SELECT COUNT(*) FROM durable_signal_events "
+            "WHERE agent_id = ? AND source = ?",
+            (second_agent.did, SOURCE_NAME),
+        ) == 1
     finally:
         if second is not None:
             await second.shutdown_durable_delivery()

@@ -47,6 +47,9 @@ PEER_STOP_RATE_LIMIT_PER_HOUR = 20
 PEER_STOP_RATE_LIMIT_BURST = 4
 PEER_STOP_COALESCING_WINDOW = timedelta(minutes=5)
 PEER_STOP_RETENTION_DAYS = 14
+_PEER_STOP_BINDING_KEY_CONTEXT = b"kestrel:a2a.peer_stop:binding-key:v1\x00"
+_PEER_STOP_SOURCE_EVENT_CONTEXT = b"kestrel:a2a.peer_stop:source-event:v1\x00"
+_DURABLE_SOVEREIGN_PERSISTENCE = "durable_sovereign"
 MAX_PEER_STOP_REASON_CHARS = 4096
 
 _INTENT_KEYS = frozenset(
@@ -221,7 +224,15 @@ def peer_stop_audience(metadata: Mapping[str, Any]) -> str:
 
 
 def peer_stop_source_event_id(actor_id: str, correlation_id: str) -> str:
-    """Secret-bind replay identity to the actor and signed request id."""
+    """Restart-stably bind replay identity to actor and signed request id.
+
+    Durable deployments already pin ``KESTREL_DATA_KEY`` as custody material.
+    A purpose-separated MAC derived from that key keeps peer identities opaque
+    to a database reader without coupling idempotency to the independently
+    rotatable A2A transport credential.  Keyless local development retains its
+    existing project-persisted transport-key fallback; a runtime that declares
+    durable-sovereign persistence must never take that fallback.
+    """
 
     if not isinstance(actor_id, str) or not actor_id.strip():
         raise ValueError("peer Stop actor must be authenticated")
@@ -234,12 +245,39 @@ def peer_stop_source_event_id(actor_id: str, correlation_id: str) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
+    from kestrel_sovereign.security.encryption import (
+        MasterKeyNotConfiguredError,
+        get_master_key_bytes,
+    )
 
-    binding_key = ensure_a2a_transport_key().encode("utf-8")
+    missing_key_error: Exception | None = None
+    try:
+        master_key = get_master_key_bytes()
+    except MasterKeyNotConfiguredError as error:
+        master_key = None
+        missing_key_error = error
+    if not isinstance(master_key, (bytes, bytearray)) or not master_key:
+        import os
+
+        persistence_mode = os.environ.get(
+            "KESTREL_DEPLOYMENT_PERSISTENCE", ""
+        ).strip().lower()
+        if persistence_mode == _DURABLE_SOVEREIGN_PERSISTENCE:
+            raise RuntimeError(
+                "Durable peer Stop replay binding requires KESTREL_DATA_KEY"
+            ) from missing_key_error
+        from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
+
+        binding_key = ensure_a2a_transport_key().encode("utf-8")
+    else:
+        binding_key = hmac.new(
+            master_key,
+            _PEER_STOP_BINDING_KEY_CONTEXT,
+            hashlib.sha256,
+        ).digest()
     return hmac.new(
         binding_key,
-        b"kestrel:a2a.peer_stop:source-event:v1\x00" + material,
+        _PEER_STOP_SOURCE_EVENT_CONTEXT + material,
         hashlib.sha256,
     ).hexdigest()
 

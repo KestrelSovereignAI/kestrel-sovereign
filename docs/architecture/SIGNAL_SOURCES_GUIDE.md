@@ -426,11 +426,16 @@ contexts and only then build a `Signal`:
   limit would have synthesized Hold.
 - The authenticated sender plus correlation id becomes a secret-keyed durable
   `source_event_id`; neither principal nor correlation is retained in the
-  display redaction. The signed-envelope nonce is separately bound to a digest
-  of the exact canonical signed fields: only a verbatim authenticated retry may
-  enter this idempotent lane, while a different valid Stop reusing the nonce is
-  rejected. A durable replay then returns `COALESCED` without running the
-  cancellation handler or consuming another rate-limit slot.
+  display redaction. Its MAC key is purpose-separated from the pinned
+  `KESTREL_DATA_KEY`, so rotating the A2A transport credential across a cold
+  restart cannot reopen the action lane. Keyless local development may fall
+  back to its project-persisted transport key, but a runtime declaring
+  `durable_sovereign` persistence refuses that fallback. The signed-envelope
+  nonce is separately bound to a digest of the exact canonical signed fields:
+  only a verbatim authenticated retry may enter this idempotent lane, while a
+  different valid Stop reusing the nonce is rejected. A durable replay then
+  returns `COALESCED` without running the cancellation handler or consuming
+  another rate-limit slot.
 - Its typed registration always elides the durable payload and caller,
   retaining only a fixed marker plus the ordinary source-event identity.
   Because that projection is independent of privacy mode, dispatcher admission
