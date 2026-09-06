@@ -562,3 +562,55 @@ def test_a_routed_agent_the_registry_can_no_longer_name_fails_closed():
         ghost.process_input.assert_not_awaited()
     finally:
         _restore_app(app, original)
+
+
+def test_opt_in_list_is_casefolded_on_the_env_side_too():
+    """Round 4 (coverage note): the mixed-case leg above normalises the
+    routing name; this one normalises the operator's list — ``Nellie`` in
+    the env, ``nellie`` as the routing key.
+    """
+    nellie = _rasa_agent("reply from nellie")
+    env = {
+        "KESTREL_API_KEY": "test-key",
+        "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+        "KESTREL_RASA_WEBHOOK_AGENTS": "Nellie",
+    }
+    app, original = _prepare_multi_agent_app({"nellie": nellie})
+    try:
+        with patch.dict("os.environ", env):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/agents/nellie/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p", "message": "hi"},
+                )
+        assert response.status_code == 200, response.text
+        nellie.process_input.assert_awaited_once()
+    finally:
+        _restore_app(app, original)
+
+
+def test_token_check_precedes_the_opt_in_check():
+    """Round 4 (coverage note): the docstring's "token, then opt-in" order
+    was unpinned. An UNLISTED agent with a bad token must answer 401, not
+    the opt-in's 404 — the token gate sees the request first.
+    """
+    emma = _rasa_agent("reply from emma")
+    env = {
+        "KESTREL_API_KEY": "test-key",
+        "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+        "KESTREL_RASA_WEBHOOK_AGENTS": "somebody-else",
+    }
+    app, original = _prepare_multi_agent_app({"emma": emma})
+    try:
+        with patch.dict("os.environ", env):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/agents/emma/webhooks/rest/webhook",
+                    headers={"X-API-Key": "test-key", "X-Webhook-Token": "wrong"},
+                    json={"sender": "p", "message": "hi"},
+                )
+        assert response.status_code == 401, response.text
+        emma.process_input.assert_not_awaited()
+    finally:
+        _restore_app(app, original)

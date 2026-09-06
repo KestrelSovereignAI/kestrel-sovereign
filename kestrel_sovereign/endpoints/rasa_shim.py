@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 # agent was bound only the host default could ever be invoked here, so ten
 # permits belonged to one agent by construction; a single shared gate would
 # now let agent A's slow turns stall agent B with no 429 and no timeout.
+# The trade is stated: there is no host-wide aggregate cap any more — an
+# N-agent fleet can hold 10·N concurrent turns here. N is the operator's
+# opt-in list and arrival stays bounded at 30/minute per (source, agent).
 _AGENT_CONCURRENCY = 10
 _agent_semaphores: dict[str, asyncio.Semaphore] = {}
 
