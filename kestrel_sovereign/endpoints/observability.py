@@ -1,6 +1,6 @@
 """Observability endpoint - query A2A observability events for debugging."""
 from fastapi import APIRouter, Request, Query, HTTPException
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from datetime import datetime, timezone, timedelta
 import logging
 
@@ -34,8 +34,16 @@ async def get_observability_summary(
         from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
-        # Query recent events
+        # Scoped to the routed agent's own rows. Without the predicate
+        # this returned every agent's events whenever the store is
+        # shared — which it is on PostgreSQL, where one table serves the
+        # whole host. SQLite-per-agent masked it: the file boundary was
+        # doing the scoping, so the query never needed to (#3215).
+        #
+        # The identity comes from the resolved agent, never from the
+        # request. Routing to an agent is not authority over it.
         events = await obs_store.query_events(
+            agent_name=agent.agent_name,
             since=since,
             limit=DEFAULT_OBSERVABILITY_LIMIT,
         )
@@ -127,7 +135,6 @@ async def get_metric_summary(
     request: Request,
     metric_name: str,
     minutes: int = Query(1440, ge=1, le=43200, description="Time window in minutes (default 24h)"),
-    agent_name: Optional[str] = Query(None, description="Filter to a single agent"),
 ) -> Dict[str, Any]:
     """Summarize a single named metric over a recent window.
 
@@ -136,6 +143,15 @@ async def get_metric_summary(
     assistant-turn persist falls back to the error path — with count, last_seen,
     per-agent breakdown, and recent samples carrying the metric's metadata
     (e.g. ``error_type``/``session_id``). Generic: works for any metric name.
+
+    Scoped to the routed agent. This used to take ``agent_name`` as a
+    query parameter: omitting it summarised every agent's rows, and
+    supplying it addressed another agent's (#3215). A caller-supplied
+    identity is a request, not an authority, so the parameter is gone
+    rather than validated — validating it would answer "that agent has
+    no such metric" differently from "that agent is not you", which is
+    the same leak one step removed. Fleet-wide observability belongs on
+    an explicit sovereign surface, not on an agent-routed read.
     """
     try:
         agent = get_agent(request)
@@ -150,7 +166,7 @@ async def get_metric_summary(
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         summary = await obs_store.get_metric_summary(
             metric_name,
-            agent_name=agent_name,
+            agent_name=agent.agent_name,
             since=since,
         )
         summary["time_window_minutes"] = minutes
