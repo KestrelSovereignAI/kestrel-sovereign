@@ -120,8 +120,10 @@ class StopRequest:
         if self.scope is StopScope.TURN:
             if self.turn_id is None:
                 object.__setattr__(self, "turn_id", self.target)
-            elif self.turn_id != self.target:
-                raise ValueError("turn Stop identity must match its target")
+            elif self.target_is_turn_id and self.turn_id != self.target:
+                raise ValueError("public turn Stop identity must match its target")
+        elif self.scope is not StopScope.TURN and self.turn_id is not None:
+            raise ValueError("only turn Stop may carry a turn_id")
         if self.turn_id is not None and (
             not isinstance(self.turn_id, str) or not self.turn_id
         ):

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign.storage.database_clock import database_now_sql
 
 from .types import StopOutcome, StopRequest
@@ -141,6 +142,15 @@ def _required_text(value: object, field: str) -> str:
     return value
 
 
+def _required_opaque_identifier(value: object, field: str) -> str:
+    try:
+        return validate_invocation_id(value)
+    except ValueError as error:
+        raise StopReceiptCorruptError(
+            f"Stop receipt {field} is invalid"
+        ) from error
+
+
 class StopReceiptStore:
     """Append-only Stop receipts stored on an ``AsyncDatabase`` backend."""
 
@@ -234,7 +244,7 @@ class StopReceiptStore:
         """
 
         agent_id = _required_text(agent_id, "target agent identity")
-        turn_id = _required_text(turn_id, "turn identity")
+        turn_id = _required_opaque_identifier(turn_id, "turn identity")
         row = await self._db.fetchone(
             "SELECT 1 FROM stop_receipts AS receipt "
             "JOIN stop_receipt_outcomes AS outcome "

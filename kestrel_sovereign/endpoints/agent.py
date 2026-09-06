@@ -1215,26 +1215,45 @@ async def stop_agent_request(request: Request):
             distributed_ticket = None
             if distributed_stop is not None:
                 if stop_request.scope is StopScope.TURN:
-                    distributed_kwargs = {}
-                    if stop_request.request_generation is not None:
-                        distributed_kwargs["request_generation"] = (
-                            stop_request.request_generation
-                        )
-                    distributed_ticket = await distributed_stop.request_turn(
-                        agent_id,
-                        stop_request.target,
-                        **distributed_kwargs,
+                    is_public_turn = (
+                        stop_request.target_is_turn_id
+                        or stop_request.turn_id != stop_request.target
                     )
+                    if is_public_turn:
+                        distributed_ticket = (
+                            await distributed_stop.request_public_turn(
+                                agent_id,
+                                stop_request.turn_id,
+                            )
+                        )
+                    else:
+                        distributed_ticket = await distributed_stop.request_turn(
+                            agent_id,
+                            stop_request.target,
+                        )
                 else:
                     distributed_ticket = await distributed_stop.request_agent(
                         agent_id
                     )
             cancelled_request_ids: list[Optional[str]] = []
             if stop_request.scope is StopScope.TURN:
-                cancel_kwargs = {"request_id": stop_request.target}
-                if stop_request.request_generation is not None:
-                    cancel_kwargs["generation"] = stop_request.request_generation
-                canceled = agent.cancel_current_request(**cancel_kwargs)
+                # A public turn absent from this replica's local index is
+                # resolved exclusively by its shared durable UUID. Treating
+                # that public handle as a private request ID could cancel an
+                # unrelated local collision and install the wrong tombstone.
+                public_turn_is_remote = (
+                    stop_request.target_is_turn_id
+                    and stop_request.turn_id == stop_request.target
+                )
+                if public_turn_is_remote:
+                    canceled = False
+                else:
+                    cancel_kwargs = {"request_id": stop_request.target}
+                    if stop_request.request_generation is not None:
+                        cancel_kwargs["generation"] = (
+                            stop_request.request_generation
+                        )
+                    canceled = agent.cancel_current_request(**cancel_kwargs)
                 if canceled:
                     cancelled_request_ids.append(stop_request.target)
                 else:
@@ -1249,7 +1268,8 @@ async def stop_agent_request(request: Request):
                         None,
                     )
                     if (
-                        stop_request.request_generation is None
+                        not public_turn_is_remote
+                        and stop_request.request_generation is None
                         and callable(reserve)
                     ):
                         reserve(agent, stop_request.target)
@@ -1341,6 +1361,14 @@ async def stop_agent_request(request: Request):
                     turn_ids=frozenset(turn_addresses),
                     turn_request_ids=turn_request_ids,
                     turn_request_generations=turn_request_generations,
+                    resolves_public_turns_durably=(
+                        getattr(
+                            request.app.state,
+                            "distributed_invocation_registry",
+                            None,
+                        )
+                        is not None
+                    ),
                 ),
             ),
             cleanup_registry=cleanup_registry,

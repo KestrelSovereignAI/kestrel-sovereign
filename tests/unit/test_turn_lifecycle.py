@@ -15,11 +15,15 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
-from kestrel_sovereign.agent.invocation import invocation_scope
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    invocation_scope,
+)
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import (
     TurnLifecycleMixin,
@@ -401,6 +405,59 @@ async def test_turn_index_carries_the_exact_request_generation():
             }
 
     assert agent.active_turn_request_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_publishes_and_releases_durable_public_binding():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=True),
+        unbind_public_turn=AsyncMock(return_value=None),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+
+    with invocation_scope("durable-turn-request"):
+        generation = agent.register_active_request("durable-turn-request")
+        async with agent._turn_lifecycle() as turn_id:
+            registry.bind_public_turn.assert_awaited_once_with(
+                agent,
+                turn_id,
+                "durable-turn-request",
+                generation,
+            )
+            registry.unbind_public_turn.assert_not_awaited()
+
+    registry.unbind_public_turn.assert_awaited_once_with(
+        agent,
+        turn_id,
+        "durable-turn-request",
+        generation,
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_refuses_cognition_when_public_binding_is_fenced():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=False),
+        unbind_public_turn=AsyncMock(return_value=None),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+    entered = False
+
+    with invocation_scope("fenced-turn-request"):
+        generation = agent.register_active_request("fenced-turn-request")
+        with pytest.raises(InvocationCancelledError):
+            async with agent._turn_lifecycle():
+                entered = True
+
+    assert entered is False
+    assert ("fenced-turn-request", generation) in (
+        agent._cancelled_request_generations
+    )
+    registry.unbind_public_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

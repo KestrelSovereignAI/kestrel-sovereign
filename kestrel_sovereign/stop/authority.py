@@ -33,6 +33,7 @@ class CooperativeStopTarget:
     tool_call_ids: frozenset[str] = field(default_factory=frozenset)
     turn_request_ids: Mapping[str, str] = field(default_factory=dict)
     turn_request_generations: Mapping[str, int] = field(default_factory=dict)
+    resolves_public_turns_durably: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -95,6 +96,8 @@ class CooperativeStopTarget:
             "turn_request_generations",
             MappingProxyType(turn_request_generations),
         )
+        if not isinstance(self.resolves_public_turns_durably, bool):
+            raise TypeError("durable public-turn resolution flag must be boolean")
 
 
 class StopCleanupRegistry:
@@ -433,6 +436,7 @@ class CancellationAuthority:
                 request_generation=target.turn_request_generations.get(
                     request.target
                 ),
+                turn_id=request.target,
             ),
             request_id,
         )
@@ -526,9 +530,17 @@ class CancellationAuthority:
                 for target in inventory
                 if target.agent_id == request.target_agent_id
                 and (
-                    request.target in target.turn_request_ids
-                    if request.target_is_turn_id
-                    else request.target in target.turn_ids
+                    (
+                        request.target_is_turn_id
+                        and (
+                            target.resolves_public_turns_durably
+                            or request.target in target.turn_request_ids
+                        )
+                    )
+                    or (
+                        not request.target_is_turn_id
+                        and request.target in target.turn_ids
+                    )
                 )
             )
         else:

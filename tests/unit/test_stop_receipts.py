@@ -907,6 +907,31 @@ async def test_cancelled_caller_cannot_split_claim_from_effect(tmp_path):
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_acknowledged_stop_preserves_whitespace_only_request_id(tmp_path):
+    """Receipt admission lookup follows the opaque invocation-ID contract."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "opaque-stop-target.db"))
+    store = StopReceiptStore(db)
+    await store.ensure_schema()
+    request = StopRequest(
+        scope=StopScope.TURN,
+        actor_id="did:test:operator",
+        target=" ",
+        target_agent_id="did:test:opaque-agent",
+        correlation_id="opaque-stop-operation",
+    )
+    try:
+        await store.persist(request, _outcomes(request))
+        assert await store.has_acknowledged_turn_stop(
+            "did:test:opaque-agent", " "
+        )
+    finally:
+        await db.close()
+
+
 def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -965,6 +990,46 @@ def test_live_endpoint_waits_for_remote_owner_before_reporting_stopped():
     remote.wait_for_stop.assert_awaited_once()
 
 
+def test_public_turn_stop_queries_shared_binding_without_local_inventory():
+    """Replica B must resolve a turn running only on replica A durably."""
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    remote = MagicMock()
+    remote.request_public_turn = AsyncMock(
+        return_value=DistributedStopTicket(("remote-generation",))
+    )
+    remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
+    app.state.distributed_invocation_registry = remote
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    # A same-spelled private request on replica B must not capture the typed
+    # public address whose durable UUID belongs to replica A.
+    agent._active_request_ids = {"turn-on-replica-a"}
+    agent.active_turn_request_bindings = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-on-replica-a"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    remote.request_public_turn.assert_awaited_once_with(
+        "did:test:agent", "turn-on-replica-a"
+    )
+    remote.wait_for_stop.assert_awaited_once()
+    agent.cancel_current_request.assert_not_called()
+
+
 def test_public_turn_distributed_stop_preserves_captured_generation():
     """A public turn snapshot must not widen into every reused request ID."""
 
@@ -977,7 +1042,7 @@ def test_public_turn_distributed_stop_preserves_captured_generation():
     app.include_router(router)
     app.state.stop_receipt_store = _EndpointReplayStore()
     remote = MagicMock()
-    remote.request_turn = AsyncMock(
+    remote.request_public_turn = AsyncMock(
         return_value=DistributedStopTicket(("remote-generation",))
     )
     remote.wait_for_stop = AsyncMock(return_value=StopDisposition.STOPPED)
@@ -997,10 +1062,9 @@ def test_public_turn_distributed_stop_preserves_captured_generation():
     )
 
     assert response.status_code == 200, response.text
-    remote.request_turn.assert_awaited_once_with(
+    remote.request_public_turn.assert_awaited_once_with(
         "did:test:agent",
-        "private-request",
-        request_generation=7,
+        "public-turn",
     )
 
 

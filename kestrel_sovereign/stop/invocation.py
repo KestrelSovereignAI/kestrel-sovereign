@@ -22,6 +22,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
+from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type,
     database_now_sql,
@@ -32,6 +33,7 @@ from .types import StopDisposition
 
 _SCHEMA_LOCK = "stop_invocations_v1"
 _TURN_ID_DOMAIN = b"kestrel:distributed-stop-turn:v1\0"
+_PUBLIC_TURN_ID_DOMAIN = b"kestrel:distributed-stop-public-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
 _DEFAULT_WAIT_SECONDS = 4.0
 _DEFAULT_OWNER_LEASE_SECONDS = 2.0
@@ -48,10 +50,29 @@ def _turn_digest(turn_id: str) -> str:
     )
 
 
+def _public_turn_digest(turn_id: str) -> str:
+    encoded = turn_id.encode("utf-8")
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            _PUBLIC_TURN_ID_DOMAIN + len(encoded).to_bytes(4, "big") + encoded
+        ).hexdigest()
+    )
+
+
 def _required_identity(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"distributed Stop {field} must be concrete")
     return value
+
+
+def _required_opaque_identity(value: object, field: str) -> str:
+    try:
+        return validate_invocation_id(value)
+    except ValueError as error:
+        raise ValueError(
+            f"distributed Stop {field} must be a valid opaque identity"
+        ) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +123,7 @@ class DistributedInvocationStore:
                 "generation_id TEXT NOT NULL PRIMARY KEY, "
                 "agent_id TEXT NOT NULL, "
                 "turn_digest TEXT NOT NULL, "
+                "public_turn_digest TEXT, "
                 "request_generation INTEGER NOT NULL, "
                 "owner_id TEXT NOT NULL, "
                 "stop_requested INTEGER NOT NULL DEFAULT 0, "
@@ -122,6 +144,7 @@ class DistributedInvocationStore:
                 "generation_id TEXT NOT NULL PRIMARY KEY, "
                 "agent_id TEXT NOT NULL, "
                 "turn_digest TEXT NOT NULL, "
+                "public_turn_digest TEXT, "
                 "request_generation INTEGER NOT NULL, "
                 "owner_id TEXT NOT NULL, "
                 "expired_at TEXT NOT NULL, "
@@ -143,6 +166,28 @@ class DistributedInvocationStore:
                 "CREATE INDEX IF NOT EXISTS idx_stop_unresolved_owner "
                 "ON stop_unresolved_invocations(owner_id)"
             )
+        await self._db.migrate_columns_once(
+            "stop_active_invocations",
+            (("public_turn_digest", "TEXT"),),
+            lock_name=f"{_SCHEMA_LOCK}:active-public-turn",
+        )
+        await self._db.migrate_columns_once(
+            "stop_unresolved_invocations",
+            (("public_turn_digest", "TEXT"),),
+            lock_name=f"{_SCHEMA_LOCK}:unresolved-public-turn",
+        )
+        await self._db.ensure_index(
+            "idx_stop_active_agent_public_turn",
+            "stop_active_invocations",
+            "agent_id, public_turn_digest",
+            where="public_turn_digest IS NOT NULL",
+        )
+        await self._db.ensure_index(
+            "idx_stop_unresolved_agent_public_turn",
+            "stop_unresolved_invocations",
+            "agent_id, public_turn_digest",
+            where="public_turn_digest IS NOT NULL",
+        )
 
     async def _lock_agent(self, agent_id: str) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
@@ -165,7 +210,7 @@ class DistributedInvocationStore:
 
         generation_id = _required_identity(generation_id, "generation identity")
         agent_id = _required_identity(agent_id, "agent identity")
-        turn_id = _required_identity(turn_id, "turn identity")
+        turn_id = _required_opaque_identity(turn_id, "turn identity")
         owner_id = _required_identity(owner_id, "owner identity")
         if (
             not isinstance(request_generation, int)
@@ -214,6 +259,115 @@ class DistributedInvocationStore:
                 raise RuntimeError("distributed Stop registration was not durable")
         return True
 
+    async def bind_public_turn(
+        self,
+        *,
+        generation_id: str,
+        owner_id: str,
+        agent_id: str,
+        turn_id: str,
+    ) -> bool:
+        """Bind a public turn to one durable generation before cognition."""
+
+        generation_id = _required_identity(generation_id, "generation identity")
+        owner_id = _required_identity(owner_id, "owner identity")
+        agent_id = _required_identity(agent_id, "agent identity")
+        turn_id = _required_opaque_identity(turn_id, "public turn identity")
+        digest = _public_turn_digest(turn_id)
+        async with self._db.transaction(immediate=True):
+            await self._lock_agent(agent_id)
+            row = await self._db.fetchone(
+                "SELECT public_turn_digest FROM stop_active_invocations "
+                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ?",
+                (generation_id, owner_id, agent_id),
+            )
+            if row is None:
+                return False
+            if row[0] is not None:
+                if str(row[0]) != digest:
+                    raise RuntimeError(
+                        "distributed Stop generation already has a public turn"
+                    )
+                return True
+            fenced = await self._db.fetchone(
+                "SELECT 1 FROM stop_invocation_fences "
+                "WHERE agent_id = ? AND turn_digest = ?",
+                (agent_id, digest),
+            )
+            acknowledged = await self._db.fetchone(
+                "SELECT 1 FROM stop_receipts AS receipt "
+                "JOIN stop_receipt_outcomes AS outcome "
+                "ON outcome.receipt_id = receipt.receipt_id "
+                "WHERE receipt.scope = 'turn' "
+                "AND receipt.target_agent_id = ? "
+                "AND receipt.requested_target = ? "
+                "AND outcome.disposition IN ('stopped', 'already_complete') "
+                "LIMIT 1",
+                (
+                    agent_id,
+                    opaque_stop_identifier("public_turn_target", turn_id),
+                ),
+            )
+            if fenced is not None or acknowledged is not None:
+                return False
+            conflict = await self._db.fetchone(
+                "SELECT generation_id FROM stop_active_invocations "
+                "WHERE agent_id = ? AND public_turn_digest = ? "
+                "UNION ALL "
+                "SELECT generation_id FROM stop_unresolved_invocations "
+                "WHERE agent_id = ? AND public_turn_digest = ? LIMIT 1",
+                (agent_id, digest, agent_id, digest),
+            )
+            if conflict is not None and str(conflict[0]) != generation_id:
+                raise RuntimeError(
+                    "distributed Stop public turn has multiple generations"
+                )
+            changed = await self._db.execute(
+                "UPDATE stop_active_invocations SET public_turn_digest = ? "
+                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ? "
+                "AND public_turn_digest IS NULL",
+                (digest, generation_id, owner_id, agent_id),
+            )
+            if changed != 1:
+                raise RuntimeError(
+                    "distributed Stop public-turn binding changed inside its lock"
+                )
+        return True
+
+    async def unbind_public_turn(
+        self,
+        *,
+        generation_id: str,
+        owner_id: str,
+        agent_id: str,
+        turn_id: str,
+    ) -> None:
+        """Release only the exact public-turn binding this owner created."""
+
+        generation_id = _required_identity(generation_id, "generation identity")
+        owner_id = _required_identity(owner_id, "owner identity")
+        agent_id = _required_identity(agent_id, "agent identity")
+        turn_id = _required_opaque_identity(turn_id, "public turn identity")
+        digest = _public_turn_digest(turn_id)
+        async with self._db.transaction(immediate=True):
+            await self._lock_agent(agent_id)
+            changed_active = await self._db.execute(
+                "UPDATE stop_active_invocations SET public_turn_digest = NULL "
+                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ? "
+                "AND public_turn_digest = ?",
+                (generation_id, owner_id, agent_id, digest),
+            )
+            changed_unresolved = await self._db.execute(
+                "UPDATE stop_unresolved_invocations SET public_turn_digest = NULL "
+                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ? "
+                "AND public_turn_digest = ?",
+                (generation_id, owner_id, agent_id, digest),
+            )
+            if changed_active + changed_unresolved > 1:
+                raise RuntimeError(
+                    "distributed Stop public-turn binding exists in multiple states"
+                )
+
     async def complete(self, generation_id: str, owner_id: str) -> None:
         generation_id = _required_identity(generation_id, "generation identity")
         owner_id = _required_identity(owner_id, "owner identity")
@@ -249,80 +403,98 @@ class DistributedInvocationStore:
         self,
         agent_id: str,
         turn_id: str,
-        *,
-        request_generation: int | None = None,
     ) -> DistributedStopTicket:
-        """Fence one exact turn and mark every live generation atomically."""
+        """Fence one request address and mark all of its live deliveries."""
 
         agent_id = _required_identity(agent_id, "agent identity")
-        turn_id = _required_identity(turn_id, "turn identity")
-        if request_generation is not None and (
-            not isinstance(request_generation, int)
-            or isinstance(request_generation, bool)
-            or request_generation <= 0
-        ):
-            raise ValueError(
-                "distributed Stop request generation must be a positive integer"
-            )
+        turn_id = _required_opaque_identity(turn_id, "turn identity")
         digest = _turn_digest(turn_id)
         async with self._db.transaction(immediate=True):
             await self._lock_agent(agent_id)
-            if request_generation is None:
-                now_sql = database_now_sql(self._db)
-                await self._db.execute(
-                    "INSERT INTO stop_invocation_fences "
-                    "(agent_id, turn_digest, created_at) "
-                    f"SELECT ?, ?, {now_sql} WHERE NOT EXISTS ("
-                    "SELECT 1 FROM stop_invocation_fences "
-                    "WHERE agent_id = ? AND turn_digest = ?)",
-                    (agent_id, digest, agent_id, digest),
-                )
-            generation_clause = (
-                " AND request_generation = ?"
-                if request_generation is not None
-                else ""
-            )
-            generation_args = (
-                (request_generation,)
-                if request_generation is not None
-                else ()
+            now_sql = database_now_sql(self._db)
+            await self._db.execute(
+                "INSERT INTO stop_invocation_fences "
+                "(agent_id, turn_digest, created_at) "
+                f"SELECT ?, ?, {now_sql} WHERE NOT EXISTS ("
+                "SELECT 1 FROM stop_invocation_fences "
+                "WHERE agent_id = ? AND turn_digest = ?)",
+                (agent_id, digest, agent_id, digest),
             )
             rows = await self._db.fetchall(
                 "SELECT generation_id FROM stop_active_invocations "
-                "WHERE agent_id = ? AND turn_digest = ?"
-                f"{generation_clause} "
+                "WHERE agent_id = ? AND turn_digest = ? "
                 "UNION ALL "
                 "SELECT generation_id FROM stop_unresolved_invocations "
-                "WHERE agent_id = ? AND turn_digest = ?"
-                f"{generation_clause} "
+                "WHERE agent_id = ? AND turn_digest = ? "
                 "ORDER BY generation_id",
-                (
-                    agent_id,
-                    digest,
-                    *generation_args,
-                    agent_id,
-                    digest,
-                    *generation_args,
-                ),
+                (agent_id, digest, agent_id, digest),
             )
             generation_ids = tuple(str(row[0]) for row in rows)
             if generation_ids:
                 changed = await self._db.execute(
                     "UPDATE stop_active_invocations SET stop_requested = 1 "
-                    "WHERE agent_id = ? AND turn_digest = ?"
-                    f"{generation_clause}",
-                    (agent_id, digest, *generation_args),
+                    "WHERE agent_id = ? AND turn_digest = ?",
+                    (agent_id, digest),
                 )
                 active_count = await self._db.fetchone(
                     "SELECT COUNT(*) FROM stop_active_invocations "
-                    "WHERE agent_id = ? AND turn_digest = ?"
-                    f"{generation_clause}",
-                    (agent_id, digest, *generation_args),
+                    "WHERE agent_id = ? AND turn_digest = ?",
+                    (agent_id, digest),
                 )
                 expected_changed = int(active_count[0]) if active_count else 0
                 if changed != expected_changed:
                     raise RuntimeError(
                         "distributed Stop turn inventory changed inside its lock"
+                    )
+        return DistributedStopTicket(generation_ids)
+
+    async def mark_public_turn(
+        self,
+        agent_id: str,
+        turn_id: str,
+    ) -> DistributedStopTicket:
+        """Fence a public turn and mark its one durable UUID generation."""
+
+        agent_id = _required_identity(agent_id, "agent identity")
+        turn_id = _required_opaque_identity(turn_id, "public turn identity")
+        digest = _public_turn_digest(turn_id)
+        async with self._db.transaction(immediate=True):
+            await self._lock_agent(agent_id)
+            now_sql = database_now_sql(self._db)
+            await self._db.execute(
+                "INSERT INTO stop_invocation_fences "
+                "(agent_id, turn_digest, created_at) "
+                f"SELECT ?, ?, {now_sql} WHERE NOT EXISTS ("
+                "SELECT 1 FROM stop_invocation_fences "
+                "WHERE agent_id = ? AND turn_digest = ?)",
+                (agent_id, digest, agent_id, digest),
+            )
+            rows = await self._db.fetchall(
+                "SELECT generation_id, 1 AS active "
+                "FROM stop_active_invocations "
+                "WHERE agent_id = ? AND public_turn_digest = ? "
+                "UNION ALL "
+                "SELECT generation_id, 0 AS active "
+                "FROM stop_unresolved_invocations "
+                "WHERE agent_id = ? AND public_turn_digest = ? "
+                "ORDER BY generation_id",
+                (agent_id, digest, agent_id, digest),
+            )
+            if len(rows) > 1:
+                raise RuntimeError(
+                    "distributed Stop public turn resolved to multiple generations"
+                )
+            generation_ids = tuple(str(row[0]) for row in rows)
+            if rows and int(rows[0][1]) == 1:
+                changed = await self._db.execute(
+                    "UPDATE stop_active_invocations SET stop_requested = 1 "
+                    "WHERE generation_id = ? AND agent_id = ? "
+                    "AND public_turn_digest = ?",
+                    (generation_ids[0], agent_id, digest),
+                )
+                if changed != 1:
+                    raise RuntimeError(
+                        "distributed Stop public turn changed inside its lock"
                     )
         return DistributedStopTicket(generation_ids)
 
@@ -440,10 +612,10 @@ class DistributedInvocationStore:
                 now_sql = database_now_sql(self._db)
                 changed = await self._db.execute(
                     "INSERT INTO stop_unresolved_invocations ("
-                    "generation_id, agent_id, turn_digest, request_generation, "
-                    "owner_id, expired_at) "
+                    "generation_id, agent_id, turn_digest, public_turn_digest, "
+                    "request_generation, owner_id, expired_at) "
                     "SELECT generation_id, agent_id, turn_digest, "
-                    "request_generation, owner_id, "
+                    "public_turn_digest, request_generation, owner_id, "
                     f"{now_sql} FROM stop_active_invocations "
                     "WHERE generation_id = ? AND heartbeat_at = ? "
                     f"AND heartbeat_at <= {cutoff_sql} "
@@ -630,6 +802,50 @@ class DistributedInvocationRegistry:
             outcome, operation="distributed Stop invocation registration"
         )
 
+    async def bind_public_turn(
+        self,
+        agent: object,
+        turn_id: str,
+        request_id: str,
+        generation: int,
+    ) -> bool:
+        """Publish a public turn against its server-owned durable UUID."""
+
+        if self._closing:
+            raise RuntimeError("distributed Stop registry is closing")
+        if self._lease_lost:
+            return False
+        key = (id(agent), request_id, generation)
+        generation_id = self._by_local_generation.get(key)
+        if generation_id is None:
+            return False
+        return await self._store.bind_public_turn(
+            generation_id=generation_id,
+            owner_id=self._owner_id,
+            agent_id=self._agent_id(agent),
+            turn_id=turn_id,
+        )
+
+    async def unbind_public_turn(
+        self,
+        agent: object,
+        turn_id: str,
+        request_id: str,
+        generation: int,
+    ) -> None:
+        """Release the public address without widening generation cleanup."""
+
+        key = (id(agent), request_id, generation)
+        generation_id = self._by_local_generation.get(key)
+        if generation_id is None:
+            return
+        await self._store.unbind_public_turn(
+            generation_id=generation_id,
+            owner_id=self._owner_id,
+            agent_id=self._agent_id(agent),
+            turn_id=turn_id,
+        )
+
     def complete_soon(self, agent: object, turn_id: str, generation: int) -> None:
         """Own durable cleanup from the mixin's synchronous finally path."""
 
@@ -687,14 +903,15 @@ class DistributedInvocationRegistry:
         self,
         agent_id: str,
         turn_id: str,
-        *,
-        request_generation: int | None = None,
     ) -> DistributedStopTicket:
-        return await self._store.mark_turn(
-            agent_id,
-            turn_id,
-            request_generation=request_generation,
-        )
+        return await self._store.mark_turn(agent_id, turn_id)
+
+    async def request_public_turn(
+        self,
+        agent_id: str,
+        turn_id: str,
+    ) -> DistributedStopTicket:
+        return await self._store.mark_public_turn(agent_id, turn_id)
 
     async def request_agent(self, agent_id: str) -> DistributedStopTicket:
         return await self._store.mark_agent(agent_id)

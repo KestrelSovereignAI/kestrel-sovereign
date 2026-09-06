@@ -63,6 +63,39 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_public_turn_uuid_binding_has_sqlite_postgres_parity(db_backend):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    store = DistributedInvocationStore(AsyncDatabase(db_backend))
+    await store.ensure_schema()
+    suffix = uuid4().hex
+    generation_id = f"public-generation-{suffix}"
+    owner_id = f"public-owner-{suffix}"
+    agent_id = f"did:test:public-agent-{suffix}"
+    public_turn_id = f"public-turn-{suffix}"
+
+    assert await store.register(
+        generation_id=generation_id,
+        agent_id=agent_id,
+        turn_id=f"private-request-{suffix}",
+        owner_id=owner_id,
+        request_generation=1,
+    )
+    assert await store.bind_public_turn(
+        generation_id=generation_id,
+        owner_id=owner_id,
+        agent_id=agent_id,
+        turn_id=public_turn_id,
+    )
+    ticket = await store.mark_public_turn(agent_id, public_turn_id)
+
+    assert ticket.generation_ids == (generation_id,)
+    await store.complete(generation_id, owner_id)
+    assert await store.remaining(ticket.generation_ids) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_owner_lease_expiry_has_sqlite_postgres_parity(db_backend):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -166,6 +199,72 @@ async def test_stop_on_replica_b_cancels_invocation_owned_by_replica_a(tmp_path)
         if not operation.done():
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_on_replica_b_cancels_uuid_bound_on_replica_a(tmp_path):
+    first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:shared-public-agent")
+    agent.cancel_current_request = MagicMock(return_value=True)
+    replica_a.attach(agent)
+    try:
+        assert await replica_a.register(agent, "private-request", 1)
+        assert await replica_a.bind_public_turn(
+            agent,
+            "public-turn",
+            "private-request",
+            1,
+        )
+
+        ticket = await replica_b.request_public_turn(
+            agent.agent_id,
+            "public-turn",
+        )
+        for _ in range(100):
+            if agent.cancel_current_request.called:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(ticket.generation_ids) == 1
+        agent.cancel_current_request.assert_called_once_with(
+            request_id="private-request",
+            generation=1,
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_fence_wins_before_durable_binding(tmp_path):
+    first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:public-bind-race")
+    replica_a.attach(agent)
+    try:
+        assert await replica_a.register(agent, "private-request", 1)
+        ticket = await replica_b.request_public_turn(
+            agent.agent_id,
+            "public-turn-not-bound-yet",
+        )
+
+        assert ticket.generation_ids == ()
+        assert not await replica_a.bind_public_turn(
+            agent,
+            "public-turn-not-bound-yet",
+            "private-request",
+            1,
+        )
+    finally:
         await replica_a.close()
         await replica_b.close()
         await first_db.close()
@@ -567,11 +666,16 @@ async def test_exact_generation_stop_does_not_cancel_or_fence_reused_request(
             request_generation=2,
             **common,
         )
+        assert await store.bind_public_turn(
+            generation_id="generation-one",
+            owner_id=common["owner_id"],
+            agent_id=common["agent_id"],
+            turn_id="public-generation-one",
+        )
 
-        ticket = await store.mark_turn(
+        ticket = await store.mark_public_turn(
             common["agent_id"],
-            common["turn_id"],
-            request_generation=1,
+            "public-generation-one",
         )
         rows = await db.fetchall(
             "SELECT generation_id, stop_requested "
@@ -594,6 +698,130 @@ async def test_exact_generation_stop_does_not_cancel_or_fence_reused_request(
 
 
 @pytest.mark.asyncio
+async def test_public_turn_stop_selects_its_durable_uuid_across_replicas(tmp_path):
+    """Replica-local integer generations cannot identify distributed work."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "public-turn-uuid.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    agent_id = "did:test:public-turn-uuid"
+    try:
+        # Both replicas legitimately start at local generation 1 and receive
+        # the same caller retry ID. Only the server-owned durable UUID can
+        # distinguish the public turns they actually created.
+        assert await store.register(
+            generation_id="durable-generation-a",
+            agent_id=agent_id,
+            turn_id="shared-request-id",
+            owner_id="replica-a",
+            request_generation=1,
+        )
+        assert await store.register(
+            generation_id="durable-generation-b",
+            agent_id=agent_id,
+            turn_id="shared-request-id",
+            owner_id="replica-b",
+            request_generation=1,
+        )
+        assert await store.bind_public_turn(
+            generation_id="durable-generation-a",
+            owner_id="replica-a",
+            agent_id=agent_id,
+            turn_id="public-turn-a",
+        )
+        assert await store.bind_public_turn(
+            generation_id="durable-generation-b",
+            owner_id="replica-b",
+            agent_id=agent_id,
+            turn_id="public-turn-b",
+        )
+
+        ticket = await store.mark_public_turn(agent_id, "public-turn-a")
+        rows = await db.fetchall(
+            "SELECT generation_id, stop_requested "
+            "FROM stop_active_invocations ORDER BY generation_id"
+        )
+
+        assert ticket.generation_ids == ("durable-generation-a",)
+        assert rows == [
+            ("durable-generation-a", 1),
+            ("durable-generation-b", 0),
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_distributed_store_preserves_whitespace_only_request_id(tmp_path):
+    """Durable Stop accepts every opaque ID accepted by invocation entry."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "opaque-request-id.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    try:
+        assert await store.register(
+            generation_id="opaque-request-generation",
+            agent_id="did:test:opaque-request",
+            turn_id=" ",
+            owner_id="opaque-request-owner",
+            request_generation=1,
+        )
+        ticket = await store.mark_turn("did:test:opaque-request", " ")
+        assert ticket.generation_ids == ("opaque-request-generation",)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_existing_distributed_schema_gains_public_turn_binding(tmp_path):
+    """An additive migration upgrades databases created before the binding."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-stop-schema.db"))
+    try:
+        await db.execute(
+            "CREATE TABLE stop_active_invocations ("
+            "generation_id TEXT NOT NULL PRIMARY KEY, "
+            "agent_id TEXT NOT NULL, turn_digest TEXT NOT NULL, "
+            "request_generation INTEGER NOT NULL, owner_id TEXT NOT NULL, "
+            "stop_requested INTEGER NOT NULL DEFAULT 0, "
+            "registered_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL)"
+        )
+        await db.execute(
+            "CREATE TABLE stop_unresolved_invocations ("
+            "generation_id TEXT NOT NULL PRIMARY KEY, "
+            "agent_id TEXT NOT NULL, turn_digest TEXT NOT NULL, "
+            "request_generation INTEGER NOT NULL, owner_id TEXT NOT NULL, "
+            "expired_at TEXT NOT NULL)"
+        )
+
+        store = DistributedInvocationStore(db)
+        await store.ensure_schema()
+        active_columns = {
+            str(row[1])
+            for row in await db.fetchall(
+                "PRAGMA table_info(stop_active_invocations)"
+            )
+        }
+        unresolved_columns = {
+            str(row[1])
+            for row in await db.fetchall(
+                "PRAGMA table_info(stop_unresolved_invocations)"
+            )
+        }
+
+        assert "public_turn_digest" in active_columns
+        assert "public_turn_digest" in unresolved_columns
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_distributed_relay_cancels_only_ticketed_local_generation(tmp_path):
     """Relay delivery must retain the generation selected by mark_turn."""
 
@@ -608,10 +836,15 @@ async def test_distributed_relay_cancels_only_ticketed_local_generation(tmp_path
     try:
         assert await registry.register(agent, "reused-request", 1)
         assert await registry.register(agent, "reused-request", 2)
-        await store.mark_turn(
-            agent.agent_id,
+        assert await registry.bind_public_turn(
+            agent,
+            "public-generation-one",
             "reused-request",
-            request_generation=1,
+            1,
+        )
+        await store.mark_public_turn(
+            agent.agent_id,
+            "public-generation-one",
         )
         registry.start()
         for _ in range(100):

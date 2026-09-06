@@ -30,7 +30,9 @@ from uuid import uuid4
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     current_invocation_id,
+    invocation_log_correlation,
     validate_invocation_id,
 )
 from kestrel_sovereign.signals import OrderedLockManager
@@ -627,6 +629,7 @@ class TurnLifecycleMixin:
         request_id = current_invocation_id()
         request_generation = None
         request_binding_registered = False
+        durable_binding_registered = False
         try:
             if request_id is not None:
                 generation_accessor = getattr(
@@ -642,15 +645,48 @@ class TurnLifecycleMixin:
                     request_generation,
                 )
                 request_binding_registered = True
-            yield
-        finally:
-            try:
-                if request_binding_registered:
-                    self._unregister_turn_request_id(
+                await_turn_admission = getattr(
+                    self,
+                    "await_durable_turn_admission",
+                    None,
+                )
+                if callable(await_turn_admission):
+                    durable_binding_registered = await await_turn_admission(
                         turn_id,
                         request_id,
                         request_generation,
                     )
+                    if not durable_binding_registered:
+                        raise InvocationCancelledError(
+                            "turn was stopped before durable admission "
+                            f"({invocation_log_correlation(turn_id)})"
+                        )
+            yield
+        finally:
+            try:
+                try:
+                    if request_binding_registered:
+                        self._unregister_turn_request_id(
+                            turn_id,
+                            request_id,
+                            request_generation,
+                        )
+                finally:
+                    if durable_binding_registered:
+                        complete_turn_binding = getattr(
+                            self,
+                            "complete_durable_turn_binding",
+                            None,
+                        )
+                        if not callable(complete_turn_binding):
+                            raise TypeError(
+                                "durable turn binding cannot be completed"
+                            )
+                        await complete_turn_binding(
+                            turn_id,
+                            request_id,
+                            request_generation,
+                        )
             finally:
                 _BOUND_TURN_SESSION.reset(bound_token)
                 _CURRENT_TURN_ID.reset(token)
