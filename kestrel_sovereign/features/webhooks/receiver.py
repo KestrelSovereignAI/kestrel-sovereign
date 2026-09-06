@@ -114,7 +114,22 @@ def build_webhook_dispatch_router(
                 webhook_name,
             )
             for owner in owners:
-                await owner.record_refusal(
+                # The host admits any receiver with ``handle_webhook`` +
+                # ``webhooks`` (duck-typed, so an out-of-tree feature can
+                # contribute one); ``record_refusal`` is the optional half of
+                # that contract. A receiver without it still gets the same
+                # 404 — never a 500, which would be the ownership oracle the
+                # shared response exists to deny — and the refusal stays
+                # host-logged.
+                record = getattr(owner, "record_refusal", None)
+                if record is None:
+                    logger.warning(
+                        "Receiver for webhook '%s' cannot audit its own "
+                        "refusal (no record_refusal); host-logged only.",
+                        webhook_name,
+                    )
+                    continue
+                await record(
                     webhook_name,
                     source_ip=source_ip,
                     body=body,

@@ -829,3 +829,67 @@ def test_one_receiver_reachable_through_two_agents_is_one_owner():
             assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
     finally:
         restore()
+
+
+class _MinimalReceiverFeatureStub:
+    """A receiver meeting only the host's duck-typed contract: ``webhooks`` +
+    ``handle_webhook``. No ``record_refusal``, no ring buffer — the shape an
+    out-of-tree feature package can contribute."""
+
+    name = "ThirdPartyWebhookFeature"
+
+    class _Receiver:
+        def __init__(self, webhook_name):
+            self.webhooks = {webhook_name: object()}
+            self.handled = []
+
+        async def handle_webhook(self, name, *, headers, body, source_ip):
+            self.handled.append(name)
+            return {"status_code": 200, "body": {"status": "received", "webhook": name}}
+
+    def __init__(self, webhook_name="deposit"):
+        self.enabled = True
+        self.receiver = self._Receiver(webhook_name)
+
+    def get_router(self):  # pragma: no cover - never mounted per-feature
+        return None
+
+
+def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404(caplog):
+    """#3216 round 3: a receiver that meets only the required contract
+    (no ``record_refusal``) must not turn the refusal into a 500 — that would
+    be the ownership oracle the shared response denies. Same 404, no
+    dispatch to either owner, the core owner still audits, and the host log
+    says the other owner could not audit its own refusal.
+    """
+    import logging
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    minimal = _MinimalReceiverFeatureStub(webhook_name="deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": minimal}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        minimal.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with caplog.at_level(
+                logging.WARNING,
+                logger="kestrel_sovereign.features.webhooks.receiver",
+            ):
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+            assert minimal.receiver.handled == [], order
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], order
+            assert any(
+                "cannot audit its own refusal" in r.getMessage()
+                for r in caplog.records
+            ), order
+        finally:
+            restore()

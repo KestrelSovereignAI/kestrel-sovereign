@@ -616,7 +616,14 @@ async def verify_api_key(
 
 
 def _is_webhook_receiver(receiver) -> bool:
-    """Duck-typed webhook-receiver check (keeps core decoupled from the class)."""
+    """Duck-typed webhook-receiver check (keeps core decoupled from the class).
+
+    ``handle_webhook`` + ``webhooks`` is the whole required contract.
+    ``record_refusal`` (auditing a refused ambiguous-ownership request,
+    #3216) is optional: the dispatch router calls it only when present, so a
+    receiver without it is still dispatched and still refused with the same
+    404, just without an audit row of its own.
+    """
     return (
         receiver is not None
         and hasattr(receiver, "handle_webhook")
