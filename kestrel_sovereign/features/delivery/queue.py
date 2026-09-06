@@ -385,17 +385,12 @@ class DeliveryQueue:
                 except BaseException:
                     if self._db.backend_type == "sqlite":
                         # SQLite joins a same-task outer transaction without a
-                        # savepoint. Remove either ambiguously completed write
-                        # before a caller can catch this and commit the outer
-                        # scope. PostgreSQL uses a real savepoint and cleanup
-                        # DML would be invalid once that savepoint is aborted.
-                        await self._db.execute(
-                            """
-                            DELETE FROM delivery_queue
-                            WHERE id = ? AND agent_id = ?
-                            """,
-                            (entry_id, self._agent_id),
-                        )
+                        # savepoint. The ledger delete trigger removes the queue
+                        # row in this same atomic SQLite statement, so even an
+                        # ambiguously reported cancellation cannot commit only
+                        # half the compensation. PostgreSQL uses a real
+                        # savepoint and cleanup DML would be invalid once that
+                        # savepoint is aborted.
                         await self._db.execute(
                             """
                             DELETE FROM delivery_idempotency
@@ -973,6 +968,17 @@ class DeliveryQueue:
             ON delivery_idempotency(agent_id, entry_id)
             """
         )
+        if self._db.backend_type == "sqlite":
+            await self._db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_delivery_idempotency_delete
+                AFTER DELETE ON delivery_idempotency
+                BEGIN
+                    DELETE FROM delivery_queue
+                    WHERE id = OLD.entry_id AND agent_id = OLD.agent_id;
+                END
+                """
+            )
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS delivery_dead_letter (

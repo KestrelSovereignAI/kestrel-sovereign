@@ -48,6 +48,7 @@ def _make_mock_db():
     db.fetchall = AsyncMock(return_value=[])
     db.fetchone = AsyncMock(return_value=None)
     db.fetchval = AsyncMock(return_value=0)
+    db.backend_type = "sqlite"
 
     @asynccontextmanager
     async def migration_lock(_name):
@@ -547,8 +548,8 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 4 indexes.
-        assert queue._db.execute.call_count == 7
+        # 3 tables + 4 indexes + the SQLite atomic-compensation trigger.
+        assert queue._db.execute.call_count == 8
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1019,6 +1020,52 @@ class TestQueueIdempotency:
             "person@example.com",
             {"body": "hello"},
             idempotency_key="retry-after-ambiguous-cancel",
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_cancellation_cannot_commit_partial_compensation(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+        phase = "queue"
+
+        async def cancel_after_statement(sql, params=()):
+            nonlocal phase
+            result = await original_execute(sql, params)
+            if "INSERT INTO delivery_queue" in sql and phase == "queue":
+                phase = "cleanup"
+                raise asyncio.CancelledError("queue cancellation")
+            if "DELETE FROM delivery_idempotency" in sql and phase == "cleanup":
+                phase = "done"
+                raise asyncio.CancelledError("cleanup cancellation")
+            return result
+
+        async with queue._db.transaction(immediate=True):
+            with patch.object(queue._db, "execute", side_effect=cancel_after_statement):
+                with pytest.raises(asyncio.CancelledError, match="cleanup cancellation"):
+                    await queue.enqueue(
+                        "email",
+                        "person@example.com",
+                        {"body": "hello"},
+                        idempotency_key="cancel-during-compensation",
+                    )
+
+        assert phase == "done"
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+
+        assert await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="cancel-during-compensation",
         )
 
 
