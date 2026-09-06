@@ -98,10 +98,14 @@ PROVENANCE_ACCESSOR_SUFFIXES = (
     "get_current_chain",
 )
 TRACE_PARENT_MARKERS = (
+    "parent_span",
+    "parent-span",
+    "parentspan",
     "trace_parent",
     "trace-parent",
     "traceparent",
     "parent_trace",
+    "span_parent",
 )
 PROVENANCE_SOURCE_MARKERS = (
     "causation",
@@ -7775,7 +7779,11 @@ def _is_trace_parent_token(token: str) -> bool:
     """Recognize common W3C and Python spellings of trace-parent metadata."""
 
     words = set(token.casefold().replace("-", "_").replace(".", "_").split("_"))
-    return "traceparent" in words or {"trace", "parent"} <= words
+    return (
+        bool(words.intersection({"parentspan", "traceparent"}))
+        or {"trace", "parent"} <= words
+        or {"span", "parent"} <= words
+    )
 
 
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
@@ -8461,6 +8469,7 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
 def _is_cross_agent_control_call(
     node: ast.Call,
     control_aliases: set[str] | None = None,
+    state_object_aliases: frozenset[str] | set[str] | None = None,
 ) -> bool:
     """Whether ``node`` invokes a known control or a local alias of one."""
 
@@ -8481,6 +8490,7 @@ def _is_cross_agent_control_call(
         "call_soon_threadsafe": (0,),
         "filter": (0,),
         "map": (0,),
+        "register": (0,),
         "run_in_executor": (1,),
         "submit": (0,),
         "to_thread": (0,),
@@ -8491,8 +8501,16 @@ def _is_cross_agent_control_call(
         if index < len(node.args)
         for source in _control_reference_sources(node.args[index])
     }
+    kills_agent_process = (
+        call_name == "kill"
+        and bool(node.args)
+        and _is_cross_agent_state_object_reference(
+            node.args[0], state_object_aliases
+        )
+    )
     return (
         _is_unambiguous_control_sink(node, control_aliases)
+        or kills_agent_process
         or call_name in (control_aliases or set())
         or any(
             _is_unambiguous_control_token(source)
@@ -8742,7 +8760,9 @@ def _provenance_aliases(
             token
             for node in scope_nodes
             if isinstance(node, ast.Call)
-            and _is_cross_agent_control_call(node, control_aliases)
+            and _is_cross_agent_control_call(
+                node, control_aliases, state_object_aliases
+            )
             for argument in [
                 *node.args,
                 *(keyword.value for keyword in node.keywords),
@@ -9386,7 +9406,11 @@ def _local_control_helpers(
             state_object_aliases = _cross_agent_state_object_aliases(function)
             invokes_control = any(
                 isinstance(node, ast.Call)
-                and _is_unambiguous_control_sink(node, visible_control_aliases)
+                and _is_cross_agent_control_call(
+                    node,
+                    visible_control_aliases,
+                    state_object_aliases,
+                )
                 # An unresolved immediately-invoked ``getattr`` fails closed
                 # when it is itself provenance-guarded. Do not promote every
                 # neutral helper containing one into a repository-wide
@@ -9576,7 +9600,7 @@ def _cached_contains_cross_agent_control_call(
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 - ast API
             if _is_cross_agent_control_call(
-                node, control_aliases
+                node, control_aliases, state_object_aliases
             ) or _is_cross_agent_state_mutation_call(
                 node, state_object_aliases
             ):
@@ -11532,7 +11556,7 @@ def _authority_provenance_lines(
                 ):
                     lines.add(node.lineno)
                 is_control_call = _is_cross_agent_control_call(
-                    node, control_aliases
+                    node, control_aliases, state_object_aliases
                 )
                 is_state_mutation_call = _is_cross_agent_state_mutation_call(
                     node, state_object_aliases
@@ -11542,7 +11566,16 @@ def _authority_provenance_lines(
                     # known control sink may call its target ``candidate``,
                     # ``subject``, or anything else, so inspect every supplied
                     # value rather than maintaining a bypassable name list.
-                    direct_control_inputs = [node.func, *arguments]
+                    evaluated_arguments = [
+                        argument
+                        for argument in arguments
+                        # A lambda body is not evaluated when the callable is
+                        # registered. Escaping lambdas are audited at their
+                        # own execution site above, so counting their body as
+                        # a direct input duplicates and mislocates the finding.
+                        if not isinstance(argument, ast.Lambda)
+                    ]
+                    direct_control_inputs = [node.func, *evaluated_arguments]
                     if (
                         _has_provenance_value(
                             node.func,
@@ -11563,7 +11596,7 @@ def _authority_provenance_lines(
                                     provenance_selected_targets
                                 )
                             )
-                            for argument in arguments
+                            for argument in evaluated_arguments
                         )
                     ):
                         lines.add(node.lineno)
@@ -12455,6 +12488,32 @@ def test_provenance_scanner_follows_control_callback_aliases() -> None:
     assert _authority_provenance_lines(keyword_callback) == {5}
 
 
+def test_provenance_scanner_follows_registered_control_callbacks() -> None:
+    tree = ast.parse(
+        "def named(request, child):\n"
+        "    action = child.stop\n"
+        "    if request.causation_chain:\n"
+        "        register(action)\n\n"
+        "def wrapped(request, child):\n"
+        "    action = partial(child.stop)\n"
+        "    if request.causation_chain:\n"
+        "        register(action)\n\n"
+        "def captured(request, child):\n"
+        "    action = lambda: child.stop()\n"
+        "    if request.causation_chain:\n"
+        "        register(action)\n\n"
+        "def inline(request, child):\n"
+        "    if request.causation_chain:\n"
+        "        register(lambda: child.stop())\n\n"
+        "def benign(request):\n"
+        "    action = lambda: record_metric()\n"
+        "    if request.causation_chain:\n"
+        "        register(action)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {3, 8, 13, 17}
+
+
 def test_provenance_scanner_follows_loop_bound_control_callbacks() -> None:
     tree = ast.parse(
         "def direct(request, target):\n"
@@ -12746,6 +12805,22 @@ def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None
 
     assert _authority_provenance_lines(target_shutdown) == {2}
     assert _authority_provenance_lines(process_kill) == {2}
+
+
+def test_provenance_scanner_recognizes_agent_process_kills() -> None:
+    controlled = ast.parse(
+        "def dispatch(request, child):\n"
+        "    if request.causation_chain:\n"
+        "        os.kill(child.pid, signal.SIGTERM)\n"
+    )
+    benign = ast.parse(
+        "def dispatch(request, pid):\n"
+        "    if request.causation_chain:\n"
+        "        os.kill(pid, signal.SIGTERM)\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {2}
+    assert _authority_provenance_lines(benign) == set()
 
 
 @pytest.mark.parametrize(
@@ -13582,6 +13657,20 @@ def test_provenance_scanner_classifies_trace_parent_metadata(
     assert _cached_authority_provenance_lines(source_path) == frozenset(
         {2, 6, 10}
     )
+
+    parent_span_source = (
+        "def dispatch(request, target):\n"
+        "    if request.parent_span_id:\n"
+        "        target.shutdown()\n"
+    )
+    parent_span_tree = ast.parse(parent_span_source)
+    parent_span_path = tmp_path / "parent_span_controller.py"
+    parent_span_path.write_text(parent_span_source, encoding="utf-8")
+
+    assert _authority_provenance_lines(parent_span_tree) == {2}
+    assert _cached_authority_provenance_lines(
+        parent_span_path
+    ) == frozenset({2})
 
 
 def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> None:
