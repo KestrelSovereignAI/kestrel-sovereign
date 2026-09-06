@@ -1369,6 +1369,58 @@ class TestWebhookMultiAgentDispatch:
         assert rows[0][0] == "ghost"
         assert rows[0][1] == 404
 
+    @pytest.mark.asyncio
+    async def test_duplicate_name_is_refused_in_either_order_and_audited_on_every_owner(
+        self, tmp_path, sqlite_database_factory
+    ):
+        """#3216: two receivers own the same name → refused, not first-wins.
+
+        For BOTH provider orders the unprefixed form answers the unregistered-
+        name 404 and dispatches to neither receiver; each owner's own
+        ``webhook_log`` persists the refusal (404, unauthenticated) and holds
+        no successful receive.
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from kestrel_sovereign.features.webhooks.receiver import (
+            build_webhook_dispatch_router,
+        )
+
+        db_a = await sqlite_database_factory(tmp_path / "a.db")
+        feat_a = WebhookFeature(_make_agent(db=db_a, agent_id="did:test:agent-a"))
+        await feat_a.initialize()
+        await feat_a.webhooks_register(
+            name="alpha", auth_type="none", allow_unauthenticated=True
+        )
+        db_b = await sqlite_database_factory(tmp_path / "b.db")
+        feat_b = WebhookFeature(_make_agent(db=db_b, agent_id="did:test:agent-b"))
+        await feat_b.initialize()
+        await feat_b.webhooks_register(
+            name="alpha", auth_type="none", allow_unauthenticated=True
+        )
+
+        for order in ((feat_a, feat_b), (feat_b, feat_a)):
+            receivers = [feat.receiver for feat in order]
+            app = FastAPI()
+            app.include_router(
+                build_webhook_dispatch_router(
+                    lambda _agent=None, receivers=receivers: receivers
+                )
+            )
+            resp = TestClient(app).post("/webhooks/alpha", content=b"{}")
+            assert resp.status_code == 404, order
+            assert resp.json() == {"error": "Unknown webhook: alpha"}, order
+
+        for db in (db_a, db_b):
+            rows = await db.fetchall(
+                "SELECT webhook_name, status_code, authenticated FROM webhook_log"
+            )
+            # One refusal per order, nothing dispatched.
+            assert [(r[0], r[1], bool(r[2])) for r in rows] == [
+                ("alpha", 404, False),
+                ("alpha", 404, False),
+            ]
+
 
 # The legacy multi-agent host's ``/webhooks/{name}`` PROXY (which forwarded to a
 # backing agent subprocess) was retired with ``kestrel_sovereign.host`` in

@@ -689,3 +689,115 @@ def test_unprefixed_webhook_form_retains_aggregate_lookup():
             assert _event_count(a_hook) == 0
     finally:
         restore()
+
+
+def _post_unprefixed_and_prefixed_ambiguous(agents, a_hook, b_hook):
+    """Boot ``agents`` (an ordered ``{name: agent}`` map whose iteration order
+    IS the fleet order) and exercise the ambiguous unprefixed form plus both
+    explicit agent-prefixed forms. ``a_hook``/``b_hook`` are agent a's and
+    agent b's webhook features, whichever order the fleet lists them in.
+
+    Returns ``(unprefixed_response, unknown_response)`` where the unknown
+    response is for a name nobody owns, taken AFTER every ownership assertion
+    (the unknown-name 404 is audited on the first receiver, which would skew
+    the per-receiver tallies asserted here).
+    """
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            # Refused, not dispatched: neither owner handled it. Each owner
+            # audits exactly one refusal (a 404, unauthenticated) and no
+            # receive succeeded anywhere.
+            assert resp.status_code == 404, resp.text
+            for hook in (a_hook, b_hook):
+                events = list(hook.receiver.event_log)
+                assert [e.status_code for e in events] == [404], events
+                assert not any(e.authenticated for e in events)
+
+            # The explicit agent-prefixed form is unaffected by the
+            # collision: each agent still receives ONLY what is addressed to
+            # it, in the same boot.
+            resp_a = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp_a.status_code == 200, resp_a.text
+            assert resp_a.json()["webhook"] == "deposit"
+            resp_b = client.post("/api/agents/b/webhooks/deposit", content=b"{}")
+            assert resp_b.status_code == 200, resp_b.text
+            assert resp_b.json()["webhook"] == "deposit"
+            assert [e.status_code for e in a_hook.receiver.event_log] == [404, 200]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+
+            unknown = client.post("/webhooks/ghost", content=b"{}")
+            return resp, unknown
+    finally:
+        restore()
+
+
+def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order():
+    """#3216: two enabled agents own ``deposit``; the unprefixed form must not
+    let fleet iteration order choose the target.
+
+    Before the fix the first receiver in ``list_agents()`` order won: fleet
+    order (a, b) dispatched to A and order (b, a) dispatched to B, each a 200
+    with the other agent none the wiser. Now BOTH orders refuse without any
+    dispatch, with the same public 404 an unregistered name gets — so a
+    keyless caller learns nothing about which names collide — while the
+    explicit ``/api/agents/{name}/webhooks/deposit`` form keeps working.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    for order in (("a", "b"), ("b", "a")):
+        a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        by_name = {
+            "a": _make_agent({"WebhookFeature": a_hook}),
+            "b": _make_agent({"WebhookFeature": b_hook}),
+        }
+        agents = {name: by_name[name] for name in order}
+        assert list(agents) == list(order)
+        resp, unknown = _post_unprefixed_and_prefixed_ambiguous(
+            agents, a_hook, b_hook
+        )
+        # Same safe public response as an unregistered name: status and body
+        # shape are identical (only the echoed name differs).
+        assert unknown.status_code == 404
+        assert resp.status_code == unknown.status_code, order
+        assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+        assert unknown.json() == {"error": "Unknown webhook: ghost"}, order
+
+
+def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
+    """#3216: only ENABLED owners count, and the count is read live.
+
+    A enabled + B disabled is one owner → the unprefixed form dispatches to
+    A. Enabling B makes the name ambiguous → refused, A's tally unchanged.
+    Disabling A leaves B the sole owner → dispatches to B. A stale or
+    enabled-blind count would fail one of the three legs.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=False)
+    agents = {
+        "a": _make_agent({"WebhookFeature": a_hook}),
+        "b": _make_agent({"WebhookFeature": b_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200]
+            assert _event_count(b_hook) == 0
+
+            b_hook.enabled = True
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404]
+
+            a_hook.enabled = False
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+    finally:
+        restore()

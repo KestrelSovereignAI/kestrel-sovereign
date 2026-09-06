@@ -1068,8 +1068,10 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # /api/agents/{name}/webhooks/{name} request sees ONLY that agent's enabled
     # receivers (so it can't dispatch to another agent's identically-named
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
-    # every agent (#2522). Mounted when at least one enabled webhook receiver
-    # exists at startup; the provider itself stays live thereafter.
+    # every agent (#2522) and the router refuses a name that more than one of
+    # them owns, so iteration order never picks the target (#3216). Mounted
+    # when at least one enabled webhook receiver exists at startup; the
+    # provider itself stays live thereafter.
     candidate_webhook_receivers = []
     if agents is not None:
         for candidate in agents:
@@ -1164,6 +1166,8 @@ def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
     unprefixed ``/webhooks/{name}`` form, or single-agent mode) the aggregate
     of every current agent's enabled receivers is returned. Deduplicated by
     identity because one receiver can be reached through multiple agents.
+    The dispatch router refuses a name owned by more than one receiver in
+    the returned set (#3216); this provider only decides the scope.
     """
     if agent is not None:
         return _agent_webhook_receivers(agent)
