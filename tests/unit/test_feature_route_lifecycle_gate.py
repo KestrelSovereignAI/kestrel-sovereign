@@ -974,18 +974,22 @@ def test_two_distinct_receivers_that_compare_equal_are_two_owners():
                 r.getMessage() for r in records if "is owned by" in r.getMessage()
             ]
             assert collisions, [r.getMessage() for r in records]
+            # An unscoped refusal cannot know whether the owners span agents,
+            # so its remedy is conditional: try the prefixed form for the
+            # intended agent, and if that refuses too the collision is inside
+            # that agent. It must never present the prefixed form as a bare
+            # "instead", which 404s in the one-agent fleet.
+            unscoped = collisions[0]
+            assert "/api/agents/{agent}/webhooks/deposit for the intended agent" in unscoped, unscoped
+            assert "if that form refuses too" in unscoped, unscoped
+            assert "instead." not in unscoped, unscoped
             if len(agents) == 1:
-                # The unprefixed refusal AND the prefixed refusal both name
-                # the within-agent cause; neither sends the operator to the
-                # prefixed address that also 404s.
+                # The scoped refusal KNOWS it is the within-agent case.
                 assert len(collisions) == 2, collisions
-                assert all("within the addressed agent" in m for m in collisions[1:]), collisions
-                assert all("Address it as" not in m for m in collisions[1:]), collisions
+                assert "within the addressed agent" in collisions[1], collisions
+                assert "Address it as" not in collisions[1], collisions
             else:
-                assert all(
-                    "Address it as /api/agents/{agent}/webhooks/deposit" in m
-                    for m in collisions
-                ), collisions
+                assert len(collisions) == 1, collisions
             assert first.receiver.handled == [] and second.receiver.handled == [], list(agents)
         finally:
             restore()

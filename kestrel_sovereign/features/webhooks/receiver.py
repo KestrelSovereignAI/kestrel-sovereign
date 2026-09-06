@@ -106,7 +106,9 @@ def build_webhook_dispatch_router(
       log names the collision. Addressing one agent with the agent-prefixed
       form resolves a collision *between* agents; a collision *within* one
       agent (two of its receivers owning the name) is refused on that form
-      too, and the log says which case it is;
+      too. The router sees receivers, not their agents, so an unscoped
+      refusal cannot tell the two cases apart and its remedy says so; a
+      scoped refusal knows it is the within-agent case;
     * none owns it → recorded on the first in-scope receiver (so the 404 is
       still audited) or a bare 404 when no in-scope receiver exists.
 
@@ -147,10 +149,16 @@ def build_webhook_dispatch_router(
             # operator can re-address the sender to the agent-prefixed form.
             result = unknown_webhook_result(webhook_name)
             if target_agent is None:
+                # Unscoped: the provider returns receivers with no agent
+                # attribution, so the router cannot tell "two agents own it"
+                # from "one agent's two receivers own it". The remedy is
+                # conditional rather than a proxy for a fact it lacks.
                 logger.warning(
                     "Webhook '%s' is owned by %d enabled receivers; refusing the "
                     "unscoped request from %s without dispatch. Address it as "
-                    "/api/agents/{agent}/webhooks/%s instead.",
+                    "/api/agents/{agent}/webhooks/%s for the intended agent; if "
+                    "that form refuses too, two of that agent's own receivers "
+                    "own the name and one must be unregistered.",
                     webhook_name,
                     len(owners),
                     source_ip,
