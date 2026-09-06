@@ -528,10 +528,13 @@ def test_command_position_grammar_is_named(word, expected):
     grammar rather than a program.
 
     The character allow-list cannot see this — every character in
-    ``eval`` and ``FOO=x`` is inert. It matters because one backend does
-    not exec the argv it is given: DockerSandboxBackend rebuilds a bash
-    script, where a bare word is read as grammar and ``BinaryPolicy``
-    has vetted ``eval`` rather than what eval runs.
+    ``eval`` and ``FOO=x`` is inert. It began as containment for a
+    backend that rebuilt a bash script from the vector it was handed,
+    where such a word ran a program ``BinaryPolicy`` never saw. That
+    backend execs argv now (#3187), so the word fails as a missing
+    executable instead; the rule stays because "run the thing eval
+    would have run" is still not a request this tool can honour, and
+    saying so beats an exit code of 127.
     """
     result = command_word_is_shell_grammar(word)
     if expected is None:

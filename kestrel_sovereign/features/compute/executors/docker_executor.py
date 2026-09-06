@@ -6,6 +6,7 @@ Execute scripts in isolated Docker containers for maximum security.
 
 import asyncio
 import logging
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -23,7 +24,7 @@ from .base import (
     _ExecutionResult,
 )
 from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeScript, ExecutionRecord
+from ..models import ComputeCommand, ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ DEFAULT_IMAGES = {
     "bash": "alpine:3.19",
     "python": "python:3.11-slim",
 }
+
+# Image for argv execution. Keyed by nothing, because an argv vector has
+# no language: element zero names a program, and the image is simply
+# where that program has to exist. Named separately from
+# ``DEFAULT_IMAGES["bash"]`` even though it is the same image today —
+# the script entry means "the image whose shell runs bash scripts", and
+# reusing it here would re-attach a shell to a path that has none.
+DEFAULT_COMMAND_IMAGE = "alpine:3.19"
 _DOCKER_CONTROL_REAP_TIMEOUT_SECONDS = 1.0
 
 _CONTAINER_TRASH_DIR = "/kestrel-trash"
@@ -64,6 +73,12 @@ class DockerExecutor(BaseExecutor):
         default_pids_limit: int = 50,
         max_output_bytes: int = 1024 * 1024,  # 1MB
         current_agent_data_path: Optional[str | Path] = None,
+        # Appended rather than grouped with `images`, which is where it
+        # belongs by meaning: `DockerExecutor` is a package-level export
+        # that already accepted these positions, and inserting a
+        # parameter mid-list silently remaps every caller that passed
+        # one positionally.
+        command_image: Optional[str] = None,
     ):
         """
         Initialize the Docker executor.
@@ -71,6 +86,7 @@ class DockerExecutor(BaseExecutor):
         Args:
             docker_path: Path to docker binary (default: auto-detect)
             images: Docker images by language (default: alpine for bash, python:3.11-slim for python)
+            command_image: Docker image for argv execution (default: alpine)
             default_memory_limit: Memory limit for containers
             default_cpu_quota: CPU quota (microseconds per 100ms)
             default_pids_limit: Maximum number of processes
@@ -80,6 +96,7 @@ class DockerExecutor(BaseExecutor):
         self._docker_path = docker_path
         self._cached_docker_path: Optional[str] = None
         self._images = images or DEFAULT_IMAGES
+        self._command_image = command_image or DEFAULT_COMMAND_IMAGE
         self._memory_limit = default_memory_limit
         self._cpu_quota = default_cpu_quota
         self._pids_limit = default_pids_limit
@@ -208,74 +225,49 @@ class DockerExecutor(BaseExecutor):
         # Container mounts (/scripts, /workspace) are read-only, so no
         # workdir is authorized for direct deletion; every delete moves to
         # the trash bind mount.  The container cwd only resolves relative
-        # operands for policy checks.
+        # operands for policy checks — which is why it is bound once and
+        # passed to both the rewriter and the container: if the two ever
+        # disagreed, the rewriter would vet a different path than the one
+        # the script actually names.
+        container_cwd = "/workspace" if working_dir else "/scripts"
         safe_content = self._policy.rewrite_script(
             script.content,
             script.language,
             None,
             runtime_trash_dir=_CONTAINER_TRASH_DIR,
-            script_cwd="/workspace" if working_dir else "/scripts",
+            script_cwd=container_cwd,
         )
 
-        script_name = "script.py" if script.language == "python" else "script.sh"
+        if script.language == "python":
+            interpreter, script_name = "python", "script.py"
+        else:
+            interpreter, script_name = "sh", "script.sh"
+        script_argument = f"/scripts/{script_name}"
         script_path = Path(context.workdir) / script_name
         script_path.write_text(safe_content)
         script_path.chmod(0o755)
 
-        cmd = [
-            docker_path,
-            "run",
-            "--name",
-            container_name,
-            "--rm",
-            "--read-only",
-            f"--memory={self._memory_limit}",
-            f"--cpu-quota={self._cpu_quota}",
-            f"--pids-limit={self._pids_limit}",
-            "--security-opt=no-new-privileges",
-        ]
-        if not network:
-            cmd.append("--network=none")
-
-        cmd.extend(["-v", f"{context.workdir}:/scripts:ro"])
-
-        # Safe deletions must survive the container.  The rewriter uses the
-        # container path while this dedicated bind mount anchors it to the
-        # host's configured Kestrel trash directory.
-        cmd.extend(["-v", f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw"])
-
-        if working_dir:
-            cmd.extend(["-v", f"{working_dir}:/workspace:ro"])
-        cmd.extend(["--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"])
-
-        for mount in mounts or []:
-            src = mount.get("src")
-            dst = mount.get("dst")
-            read_only = mount.get("ro", True)
-            if src and dst:
-                if dst == _CONTAINER_TRASH_DIR or dst.startswith(
-                    f"{_CONTAINER_TRASH_DIR}/"
-                ):
-                    raise ExecutionError(
-                        f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
-                    )
-                ro_flag = ":ro" if read_only else ""
-                cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
-
-        cmd.extend(["-w", "/workspace" if working_dir else "/scripts"])
-        log_safe_cmd = list(cmd)
-        for key, value in script.environment.items():
-            cmd.extend(["-e", f"{key}={value}"])
-            log_safe_cmd.extend(["-e", f"{key}=<redacted>"])
-
-        cmd.append(image)
-        log_safe_cmd.append(image)
-        if script.language == "python":
-            runtime_command = ["python", "/scripts/script.py"]
-        else:
-            runtime_command = ["sh", "/scripts/script.sh"]
-        cmd.extend(runtime_command)
-        log_safe_cmd.extend(runtime_command)
+        cmd, log_safe_cmd = self._container_invocation(
+            docker_path=docker_path,
+            container_name=container_name,
+            image=image,
+            working_dir=working_dir,
+            container_cwd=container_cwd,
+            network=network,
+            mounts=mounts,
+            environment=script.environment,
+            binds=[
+                f"{context.workdir}:/scripts:ro",
+                # Safe deletions must survive the container.  The rewriter
+                # uses the container path while this dedicated bind mount
+                # anchors it to the host's configured Kestrel trash
+                # directory.
+                f"{staging_dir}:{_CONTAINER_TRASH_DIR}:rw",
+            ],
+            program=interpreter,
+        )
+        cmd.append(script_argument)
+        log_safe_cmd.append(script_argument)
 
         logger.info("Executing script %s... in Docker container", script.id[:8])
         logger.debug("Container command: %s", " ".join(log_safe_cmd))
@@ -301,6 +293,234 @@ class DockerExecutor(BaseExecutor):
             # performed before the interruption already happened, and their
             # trash entries must stay restorable from the real trash root.
             self._promote_staged_trash(staging_dir, host_trash_dir)
+
+        return _ExecutionResult(
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            container_id=container_name,
+        )
+
+    def _container_invocation(
+        self,
+        *,
+        docker_path: str,
+        container_name: str,
+        image: str,
+        working_dir: Optional[str],
+        container_cwd: str,
+        network: bool,
+        mounts: Optional[List[Dict[str, str]]],
+        environment: Dict[str, str],
+        binds: List[str],
+        program: str,
+    ) -> tuple[List[str], List[str]]:
+        """Build ``docker run`` up to and including the image.
+
+        Both execution modes build their container here so the vetted
+        isolation flags (``--read-only``, ``--network=none``,
+        ``--security-opt=no-new-privileges``, memory and pid limits)
+        cannot drift apart between them.
+
+        Returns ``(cmd, log_safe_cmd)``. The second is identical except
+        that environment values are redacted, so a debug log of the
+        container command cannot leak a secret the caller passed in.
+
+        ``program`` is what will run, and it is pinned with
+        ``--entrypoint`` rather than left to position. Words after the
+        image are not the process argv: Docker appends them to whatever
+        ``ENTRYPOINT`` the image declares, so an image with one runs its
+        own program with the caller's first word demoted to an argument.
+        Measured on an image built with
+        ``ENTRYPOINT ["/bin/echo", "ENTRYPOINT-RAN"]``: a vector of
+        ``["printf", "HACKED"]`` printed ``ENTRYPOINT-RAN printf
+        HACKED`` — ``echo`` ran while the policy had vetted ``printf``.
+        That is #3187 again, one layer down, and it is why the program
+        is named to Docker instead of positioned after the image.
+
+        ``--entrypoint`` also clears the image's default ``CMD``
+        (measured, not read: ``docker run --entrypoint printf alpine``
+        runs ``printf`` with no arguments, where the same run without
+        the override starts the image's shell). So a caller appending
+        nothing gets its own program with no arguments, never the
+        image's idea of what to do.
+
+        It is a required parameter for the same reason: the two modes
+        share this builder, and a mode that forgot to pin its program
+        would silently inherit the image's.
+        """
+        cmd = [
+            docker_path,
+            "run",
+            "--name",
+            container_name,
+            "--rm",
+            "--read-only",
+            f"--memory={self._memory_limit}",
+            f"--cpu-quota={self._cpu_quota}",
+            f"--pids-limit={self._pids_limit}",
+            "--security-opt=no-new-privileges",
+        ]
+        if not network:
+            cmd.append("--network=none")
+
+        for bind in binds:
+            cmd.extend(["-v", bind])
+
+        if working_dir:
+            cmd.extend(["-v", f"{working_dir}:/workspace:ro"])
+        cmd.extend(["--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"])
+
+        for mount in mounts or []:
+            src = mount.get("src")
+            dst = mount.get("dst")
+            read_only = mount.get("ro", True)
+            if src and dst:
+                if dst == _CONTAINER_TRASH_DIR or dst.startswith(
+                    f"{_CONTAINER_TRASH_DIR}/"
+                ):
+                    raise ExecutionError(
+                        f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
+                    )
+                ro_flag = ":ro" if read_only else ""
+                cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
+
+        cmd.extend(["-w", container_cwd])
+        log_safe_cmd = list(cmd)
+
+        # The program is the caller's text on the command path. Its name
+        # is worth logging — it is what the policy vetted — but not
+        # raw: a newline in it would forge whole log lines. ``repr``
+        # escapes them, and ``shlex.join`` alone would not (it quotes a
+        # newline, it does not encode it).
+        cmd.extend(["--entrypoint", program])
+        log_safe_cmd.extend(["--entrypoint", repr(program)])
+        for key, value in environment.items():
+            cmd.extend(["-e", f"{key}={value}"])
+            log_safe_cmd.extend(["-e", f"{key}=<redacted>"])
+
+        cmd.append(image)
+        log_safe_cmd.append(image)
+        return cmd, log_safe_cmd
+
+    async def execute_command(
+        self,
+        command: ComputeCommand,
+        working_dir: Optional[str] = None,
+    ) -> ExecutionRecord:
+        """Execute an argv vector in a container. No script, no shell.
+
+        ``command.argv[0]`` is the program and every later element is an
+        argument to it — pinned with ``--entrypoint`` rather than left
+        to position, for the reason :meth:`_container_invocation`
+        records. That is the whole difference from :meth:`execute`: a
+        script's first word is read by a shell's grammar first, which is
+        how a vetted ``eval`` ran an unvetted ``printf`` (#3187).
+
+        No trash mount is created. The rewriter that redirects deletions
+        into it only rewrites script text, and there is no script text
+        here — mounting a writable host directory that nothing can be
+        rewritten to use would be a hole with no purpose. Every other
+        mount is read-only, so the container has nothing of the host's
+        to delete.
+
+        The signature is the base contract exactly: no network, no
+        extra mounts. :meth:`execute` takes both because
+        ``ComputeFeature`` passes them for a reviewed, signed script;
+        nothing asks it of a one-shot vector, and an unused parameter is
+        an untested way to widen a container.
+
+        Args:
+            command: The :class:`ComputeCommand` to execute
+            working_dir: Optional working directory (mounted read-only)
+
+        Returns:
+            ExecutionRecord with execution results
+        """
+        docker_path = self._get_docker_path()
+        if not docker_path:
+            raise ExecutionEnvironmentError("Docker not found")
+
+        async def run(context: _ExecutionContext) -> _ExecutionResult:
+            container_name = self._container_name(context.execution_id)
+            return await self._execute_argv(
+                command,
+                working_dir,
+                docker_path=docker_path,
+                container_name=container_name,
+            )
+
+        async def cleanup(context: _ExecutionContext) -> None:
+            await self._remove_container(
+                docker_path,
+                self._container_name(context.execution_id),
+            )
+
+        return await self._execute_with_lifecycle(
+            command,
+            temp_dir_prefix="kestrel_compute_docker_command_",
+            runner=run,
+            cleanup=cleanup,
+        )
+
+    async def _execute_argv(
+        self,
+        command: ComputeCommand,
+        working_dir: Optional[str],
+        *,
+        docker_path: str,
+        container_name: str,
+    ) -> _ExecutionResult:
+        cmd, log_safe_cmd = self._container_invocation(
+            docker_path=docker_path,
+            container_name=container_name,
+            image=self._command_image,
+            working_dir=working_dir,
+            # With no host directory to mount there is no meaningful
+            # workspace; the image's read-only root is a defined place
+            # to stand rather than an inherited one.
+            container_cwd="/workspace" if working_dir else "/",
+            network=False,
+            mounts=None,
+            environment=command.environment,
+            binds=[],
+            program=command.argv[0],
+        )
+        cmd.extend(command.argv[1:])
+        # Count, not contents. Arguments are where a caller's secrets
+        # live — a bearer token, a `--password` — and the environment
+        # values on this same line are redacted for exactly that
+        # reason. The script path never logged them either: they were
+        # inside a file, and the line ended at `sh /scripts/script.sh`.
+        # Restoring them here would have been a new sink for secrets,
+        # and a way to forge log lines with an embedded newline.
+        log_safe_cmd.append(f"<{len(command.argv) - 1} argument(s) not logged>")
+
+        logger.info("Executing command %s... in Docker container", command.id[:8])
+        # Quoted, unlike the script path's log line: here the reader is
+        # looking at a vector whose word boundaries are the point, and a
+        # space-joined rendering of ["printf", "a b"] reads as three
+        # arguments. `shlex.join` makes the log line reproduce the run.
+        logger.debug("Container command: %s", shlex.join(log_safe_cmd))
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await self._capture_process_output(
+                process,
+                timeout_seconds=command.timeout_seconds,
+                terminate=lambda: self._kill_container(
+                    docker_path,
+                    container_name,
+                ),
+            )
+        except TimeoutError:
+            raise ExecutionTimeoutError(
+                command.id, command.timeout_seconds
+            ) from None
 
         return _ExecutionResult(
             exit_code=process.returncode,

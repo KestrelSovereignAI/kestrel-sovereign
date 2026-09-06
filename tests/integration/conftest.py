@@ -5,8 +5,102 @@ Provides fixtures and utilities specific to integration testing,
 including handling of bootstrap state for test agents.
 """
 import os
+import re
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
+from pytest_timeout import _get_item_settings
+
+
+# The tier's wall clock is budgeted in ci.yml: pytest stops the session at
+# `--session-timeout`, and the runner's `timeout-minutes` is a backstop it
+# must never reach. Between those two sits the longest a single test may
+# still run after the session deadline passes, because the deadline is
+# checked BETWEEN tests (#3212).
+#
+# So a test that claims a larger per-test timeout than the budget allows
+# for does not merely run long — it can push pytest past the runner's
+# backstop, and the runner's kill prints no FAILED line. That makes it a
+# collection-time error here rather than a mystery red later.
+#
+# Asked of pytest rather than parsed out of the source: `pytestmark`,
+# `pytest.param(marks=...)` and `timeout=` are all valid ways to set this
+# marker, and enumerating spellings is writing a parser for someone
+# else's grammar (codex round 2 on #3212).
+_CI_WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+_LONGEST_TEST = re.compile(r"budget-basis:.*?longest-test=(\d+)")
+
+
+def _declared_per_test_ceiling() -> int | None:
+    """The per-test ceiling ci.yml budgeted for, in seconds."""
+    try:
+        match = _LONGEST_TEST.search(_CI_WORKFLOW.read_text())
+    except OSError:
+        return None  # Running outside a checkout; nothing to enforce against.
+    return int(match[1]) if match else None
+
+
+def _unbounded_reason(item: pytest.Item, ceiling: int) -> str | None:
+    """Say how *item* escapes the tier's per-test ceiling, or None.
+
+    The settings come from pytest-timeout itself rather than from
+    reading the marker here. Four review rounds on #3212 each found
+    another rule this file had modelled wrongly — that a marker can be
+    spelled three ways, that `timeout(0)` disables rather than shortens,
+    that `timeout(None)` inherits instead of disabling, that the value
+    is a float — and every one of them was a fact the library already
+    knew. Re-deriving someone else's semantics is the same mistake in a
+    new place each time; asking closes the class.
+    """
+    settings = _get_item_settings(item)
+
+    if settings.timeout is None or settings.timeout <= 0:
+        # No timer is armed at all: neither a marker nor the command
+        # line bounds this test.
+        return "no timeout in effect"
+    if settings.func_only:
+        # The clock covers the test body only, so a hang in a fixture is
+        # unbounded — and the session deadline cannot be checked until
+        # the whole protocol for this item finishes.
+        return f"{settings.timeout:g}s covers the test body only (func_only)"
+    if settings.timeout > ceiling:
+        return f"{settings.timeout:g}s"
+    return None
+
+
+def pytest_collection_modifyitems(config, items):
+    """Refuse a per-test timeout the tier's wall-clock budget cannot hold.
+
+    Only when the run is actually under that budget. The ceiling exists
+    to keep pytest's session deadline ahead of the runner's backstop, so
+    with no `--session-timeout` there is no race to lose and nothing to
+    enforce — a developer running `pytest tests/integration/` with no
+    timeout flags is not violating a CI budget, and refusing them would
+    make this guard the reason the tier cannot be run by hand.
+    """
+    if config.getoption("session_timeout", None) is None:
+        return
+
+    ceiling = _declared_per_test_ceiling()
+    if ceiling is None:
+        return
+
+    refused = [
+        f"{item.nodeid} ({reason})"
+        for item in items
+        if (reason := _unbounded_reason(item, ceiling)) is not None
+    ]
+
+    if refused:
+        raise pytest.UsageError(
+            f"These tests are not bounded by the {ceiling}s per-test ceiling "
+            f"ci.yml budgets for, so the session deadline could overrun the "
+            f"runner's backstop and the failure would print no FAILED line "
+            f"(#3212). Raise `longest-test` in the ci.yml `budget-basis` "
+            f"marker (and the timeout-minutes that depends on it), or bound "
+            f"the test: " + ", ".join(sorted(refused))
+        )
 
 
 @pytest.fixture(autouse=True)
