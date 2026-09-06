@@ -43,6 +43,7 @@ from .context_stages import (
 )
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, create_budget, DegradedModeError
+from .system_prompt_assembler import MandatorySystemPromptBudgetError
 from .conversation_manager import ConversationManager
 from .salvage import (
     SalvageReason,
@@ -181,9 +182,9 @@ class ContextResult:
     # OpenAI prefix cache, Anthropic cache_control) can actually hit.
     # Callers prepend this to the current user message content.
     dynamic_user_context: str = ""
-    # Constitutional-injection tracking — populated only when the
-    # caller supplies `system_prompt_budget_bytes` and the
-    # priority-aware tracking assembler runs (kestrel-sovereign#1137).
+    # Constitutional-injection tracking — populated whenever the
+    # priority-aware assembler runs, including turns with lifecycle-owned
+    # feature context (kestrel-sovereign#1137 and #3025).
     # The dispatcher reads these via `self._agent._last_injection_tracking`
     # after `process_input` returns and threads them into
     # `signal_log.injected_clauses_json` / `dropped_clauses_json`.
@@ -562,20 +563,79 @@ class ContextManager:
             else message_count_override
         )
 
-        # Measure the non-borrowable mandatory governance floor and build the
-        # #1309 elastic budget (Emma 2026-05-20). A floor that cannot fit
-        # raises DegradedModeError → surface a degraded-mode ContextResult so
-        # the caller does not issue the LLM call under a false "normal" status.
-        mandatory_system_tokens = self._measure_mandatory_system_tokens(
-            constitution, prompt_adaptation
+        # Tool schemas share the provider payload window with every context
+        # section. Measure them before admitting optional system clauses so a
+        # large direct-tool surface cannot make an otherwise-valid system
+        # slice overflow the actual request ceiling.
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+
+        # Fund the exact formatter this turn will send. A zero-contribution
+        # legacy render keeps its historical bytes, but when those optional
+        # bytes overflow the legacy-funded system slice the priority assembler
+        # becomes the selected formatter and its (slightly different) mandatory
+        # wrapper must fund the elastic floor too.
+        requires_tracking = self._requires_tracked_system_prompt(
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+            anchored_doctrine=anchored_doctrine,
         )
-        try:
-            budget = create_budget(
+        legacy_system_render = None
+
+        def tool_aware_budget(mandatory_floor: int):
+            candidate = create_budget(
                 self.model,
                 message_count,
                 elastic=True,
-                mandatory_system_tokens=mandatory_system_tokens,
+                mandatory_system_tokens=mandatory_floor,
             )
+            if mandatory_floor + tools_tokens > candidate.total_budget:
+                raise DegradedModeError(
+                    mandatory_floor,
+                    candidate.total_budget,
+                    self.model,
+                    detail=(
+                        "mandatory governance floor and tool schemas do not fit "
+                        f"the model payload budget ({mandatory_floor} + "
+                        f"{tools_tokens} > {candidate.total_budget} tokens)"
+                    ),
+                )
+            candidate.reserve_external(tools_tokens)
+            return candidate
+
+        mandatory_system_tokens = self._measure_mandatory_system_tokens(
+            constitution,
+            prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=system_prompt_addendum,
+            tracked_prompt=requires_tracking,
+        )
+        try:
+            budget = tool_aware_budget(mandatory_system_tokens)
+            if not requires_tracking:
+                legacy_system_render = (
+                    self.context_builder.build_system_prompt_with_subsections(
+                        constitution=constitution,
+                        include_briefing=include_briefing,
+                        prompt_adaptation=prompt_adaptation,
+                        state_of_mind=None,
+                        system_prompt_addendum=system_prompt_addendum,
+                    )
+                )
+                if (
+                    self.counter.count(legacy_system_render[0])
+                    > budget.allocations["system"].budget
+                ):
+                    requires_tracking = True
+                    legacy_system_render = None
+                    mandatory_system_tokens = (
+                        self._measure_mandatory_system_tokens(
+                            constitution,
+                            prompt_adaptation,
+                            anchored_doctrine=anchored_doctrine,
+                            required_suffix=system_prompt_addendum,
+                            tracked_prompt=True,
+                        )
+                    )
+                    budget = tool_aware_budget(mandatory_system_tokens)
         except DegradedModeError as e:
             logger.error(
                 "degraded-mode: %s — returning empty ContextResult; caller "
@@ -583,10 +643,8 @@ class ContextManager:
                 e,
             )
             assembly.warnings.append(
-                f"DEGRADED MODE: mandatory governance floor ({e.mandatory_system_tokens} "
-                f"tokens) does not fit context budget ({e.total_budget} tokens) "
-                f"for model {e.model!r}. The LLM call MUST NOT proceed — surface "
-                "this to the operator."
+                f"DEGRADED MODE: {e}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
             )
             return self._degraded_plan(
                 assembly,
@@ -596,23 +654,47 @@ class ContextManager:
                 mode=mode,
             )
 
+        tool_aware_system_budget = budget.allocations["system"].budget
+
         # 1. Assemble the stable system prefix (constitution/identity/doctrine)
         # and record its usage. Kept separate from the per-turn dynamic user
         # context by construction (ContextAssembly). The tracking assembler is
-        # used when a per-source byte budget is set OR anchored doctrine is
-        # supplied; otherwise the byte-stable legacy assembler.
-        (
-            assembly.system_prompt,
-            assembly.injected_clauses,
-            assembly.dropped_clauses,
-        ) = self._assemble_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            system_prompt_addendum=system_prompt_addendum,
-            system_prompt_budget_bytes=system_prompt_budget_bytes,
-            anchored_doctrine=anchored_doctrine,
-        )
+        # used when a per-source byte budget, anchored doctrine, or lifecycle-
+        # owned context is present; otherwise the byte-stable legacy assembler.
+        try:
+            (
+                assembly.system_prompt,
+                assembly.injected_clauses,
+                assembly.dropped_clauses,
+                system_subsections,
+            ) = self._assemble_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                system_prompt_addendum=system_prompt_addendum,
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
+                system_prompt_budget_tokens=tool_aware_system_budget,
+                anchored_doctrine=anchored_doctrine,
+                requires_tracking=requires_tracking,
+                legacy_render=legacy_system_render,
+            )
+        except MandatorySystemPromptBudgetError as exc:
+            reason = str(exc)
+            logger.error(
+                "degraded-mode: %s — caller MUST refuse the LLM call",
+                reason,
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
         self._record_system_usage(assembly, budget)
 
         # 1b. Reflection guidance (into the system prompt, budget-gated).
@@ -635,6 +717,12 @@ class ContextManager:
             )
         if reflection_included:
             system_provenance.append("reflection_guidance")
+            system_subsections.append(
+                (
+                    "reflection_guidance",
+                    build_reflection_guidance_block(reflection_guidance or []),
+                )
+            )
         system_tokens_before_episodes = self.counter.count(assembly.system_prompt)
         sections["system"] = ContextSectionPlan(
             name="system",
@@ -645,12 +733,9 @@ class ContextManager:
             items=1,
             provenance=tuple(system_provenance),
             details={
-                "subsections": [
-                    {
-                        "name": "assembled_system_prompt",
-                        "tokens": system_tokens_before_episodes,
-                    }
-                ],
+                "subsections": self._measure_system_subsections(
+                    system_subsections
+                ),
                 "injected_clauses": assembly.injected_clauses,
                 "dropped_clauses": assembly.dropped_clauses,
             },
@@ -956,11 +1041,29 @@ class ContextManager:
 
         # 5. Format conversation history with the remaining (elastic) budget,
         # lumpy-anchored for a cache-stable prefix, then reconciled to fit.
-        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
         self._apply_history(assembly, budget, history)
-        self._final_prune_to_payload_budget(
+        rendered_payload_tokens = self._final_prune_to_payload_budget(
             assembly, budget, extra_tokens=tools_tokens
         )
+        if rendered_payload_tokens > budget.total_budget:
+            reason = (
+                "rendered non-history context does not fit the model payload "
+                f"budget ({rendered_payload_tokens} > {budget.total_budget} tokens)"
+            )
+            assembly.warnings.append(
+                f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                "surface this to the operator."
+            )
+            assembly.system_prompt = ""
+            assembly.dynamic_blocks.clear()
+            assembly.formatted_history.clear()
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
 
         raw_history_tokens = sum(
             self.counter.count(m.get("content", "") or "") for m in history
@@ -1060,9 +1163,15 @@ class ContextManager:
             self.counter.count(assembly.system_prompt)
             - (sections["episodes"].tokens or 0),
         )
-        sections["system"].details["subsections"][0]["tokens"] = sections[
-            "system"
-        ].tokens
+        subsection_rows = sections["system"].details["subsections"]
+        attributed = sum(row["tokens"] for row in subsection_rows)
+        if subsection_rows:
+            # Episodes are accounted as their own section. Assign only the
+            # tokenizer boundary delta from their late append to the final
+            # base-system subsection so all attribution remains exact.
+            subsection_rows[-1]["tokens"] += (
+                sections["system"].tokens - attributed
+            )
         total_tokens = (
             self.counter.count(assembly.system_prompt)
             + history_tokens
@@ -1273,7 +1382,13 @@ class ContextManager:
     # ------------------------------------------------------------------
 
     def _measure_mandatory_system_tokens(
-        self, constitution: str, prompt_adaptation: Any
+        self,
+        constitution: str,
+        prompt_adaptation: Any,
+        *,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        required_suffix: Optional[str] = None,
+        tracked_prompt: bool = False,
     ) -> int:
         """Measure the non-borrowable mandatory governance floor (#1309).
 
@@ -1287,6 +1402,9 @@ class ContextManager:
             constitution=constitution,
             state_of_mind=None,
             prompt_adaptation=prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=required_suffix,
+            tracked_prompt=tracked_prompt,
         )
         try:
             return int(raw_mandatory)
@@ -1299,6 +1417,28 @@ class ContextManager:
             )
             return 0
 
+    def _requires_tracked_system_prompt(
+        self,
+        *,
+        system_prompt_budget_bytes: Optional[int],
+        anchored_doctrine: Optional["OrderedDict[str, str]"],
+    ) -> bool:
+        """Return whether policy inputs require the priority-aware formatter."""
+
+        context_clause_probe = getattr(
+            type(self.context_builder), "has_context_clauses", None
+        )
+        has_context_clauses = bool(
+            context_clause_probe(self.context_builder)
+            if callable(context_clause_probe)
+            else False
+        )
+        return bool(
+            system_prompt_budget_bytes is not None
+            or anchored_doctrine
+            or has_context_clauses
+        )
+
     def _assemble_system_prompt(
         self,
         *,
@@ -1307,58 +1447,79 @@ class ContextManager:
         prompt_adaptation: Any,
         system_prompt_addendum: Optional[str],
         system_prompt_budget_bytes: Optional[int],
+        system_prompt_budget_tokens: int,
         anchored_doctrine: Optional["OrderedDict[str, str]"],
-    ) -> Tuple[str, Optional[List[str]], Optional[List[str]]]:
+        requires_tracking: bool,
+        legacy_render: Optional[Tuple[str, List[Tuple[str, str]]]],
+    ) -> Tuple[
+        str,
+        Optional[List[str]],
+        Optional[List[str]],
+        List[Tuple[str, str]],
+    ]:
         """Assemble the stable system prefix and optional injection tracking.
 
         Routes to the priority-aware tracking assembler when the caller sets
-        a per-source byte budget OR supplies anchored doctrine (the legacy
-        ``build_system_prompt`` has no ``anchored_doctrine`` parameter);
-        otherwise uses the byte-stable legacy assembler so the cache prefix
-        stays identical for legacy callers. When budgeting, the addendum's
-        bytes are reserved BEFORE the assembler truncates (codex round-12 P2)
-        so the final ``assembler output + joiner + addendum`` fits the cap.
+        a per-source byte budget, supplies anchored doctrine, or has active
+        lifecycle-owned context. The legacy path remains byte-identical for
+        callers with none of those inputs. Contributed clauses are additionally
+        bounded by the system allocation's exact token ceiling, with the
+        addendum measured as a required non-droppable suffix.
 
-        Returns ``(system_prompt, injected_clauses, dropped_clauses)``; the
-        clause lists are ``None`` for the legacy path.
+        Returns ``(system_prompt, injected_clauses, dropped_clauses,
+        subsections)``; the clause lists are ``None`` for the legacy path.
         """
         injected_clauses: Optional[List[str]] = None
         dropped_clauses: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None or anchored_doctrine:
-            effective_budget: Optional[int]
-            if system_prompt_budget_bytes is None:
-                # anchored_doctrine triggered this path with no budget
-                # (codex round-17 P2): pass None so nothing truncates.
-                effective_budget = None
-            else:
-                reserved = 0
-                if system_prompt_addendum:
-                    reserved = (
-                        len(system_prompt_addendum.encode("utf-8")) + 2
-                    )  # 2 bytes for the "\n\n" joiner
-                effective_budget = max(1, system_prompt_budget_bytes - reserved)
-            tracking_result = self.context_builder.build_system_prompt_with_tracking(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                budget_bytes=effective_budget,
-                anchored_doctrine=anchored_doctrine,
+        subsections: List[Tuple[str, str]]
+        if not requires_tracking:
+            if legacy_render is None:
+                raise RuntimeError("legacy system formatter was not pre-rendered")
+            system_prompt, subsections = legacy_render
+            return (
+                system_prompt,
+                injected_clauses,
+                dropped_clauses,
+                subsections,
             )
-            system_prompt = tracking_result.prompt
-            injected_clauses = list(tracking_result.injected_clauses)
-            dropped_clauses = list(tracking_result.dropped_clauses)
-            if system_prompt_addendum:
-                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
-        else:
-            system_prompt = self.context_builder.build_system_prompt(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                system_prompt_addendum=system_prompt_addendum,
+
+        tracking_result = self.context_builder.build_system_prompt_with_tracking(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=None,
+            budget_bytes=system_prompt_budget_bytes,
+            budget_tokens=system_prompt_budget_tokens,
+            required_suffix=system_prompt_addendum,
+            anchored_doctrine=anchored_doctrine,
+        )
+        system_prompt = tracking_result.prompt
+        injected_clauses = list(tracking_result.injected_clauses)
+        dropped_clauses = list(tracking_result.dropped_clauses)
+        subsections = list(tracking_result.subsections)
+        if system_prompt_addendum:
+            system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+            subsections.append(
+                ("system_prompt_addendum", system_prompt_addendum)
             )
-        return system_prompt, injected_clauses, dropped_clauses
+        return system_prompt, injected_clauses, dropped_clauses, subsections
+
+    def _measure_system_subsections(
+        self, subsections: List[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """Attribute exact prefix-token deltas to ordered subsection bodies."""
+
+        rows: List[Dict[str, Any]] = []
+        prefix = ""
+        prior_tokens = 0
+        for name, body in subsections:
+            prefix = body if not prefix else f"{prefix}\n\n{body}"
+            current_tokens = self.counter.count(prefix)
+            rows.append(
+                {"name": name, "tokens": current_tokens - prior_tokens}
+            )
+            prior_tokens = current_tokens
+        return rows
 
     def _record_system_usage(
         self, assembly: ContextAssembly, budget: TokenBudget
@@ -1423,8 +1584,34 @@ class ContextManager:
                     f"the {system_prompt_budget_bytes}-byte system prompt cap"
                 )
                 return False
-        guidance_tokens = self.counter.count(guidance_text)
-        budget.use("system", guidance_tokens)
+        # Charge the exact tokenizer delta of the bytes we append, including
+        # the ``\n\n`` boundary. Tokenizers may merge across that boundary, so
+        # summing the body and a separately-counted joiner is not exact either.
+        guidance_tokens = max(
+            0,
+            self.counter.count(
+                f"{assembly.system_prompt}\n\n{guidance_text}"
+            )
+            - self.counter.count(assembly.system_prompt),
+        )
+        # Reflection is optional.  It must not consume bytes when the system
+        # slice plus released elastic slack cannot accept the whole block.
+        # Check first because the legacy TokenBudget.use mutates on rejection;
+        # the production ElasticTokenBudget then provides a defensive commit
+        # result as well.
+        if not budget.can_fit("system", guidance_tokens) or not budget.use(
+            "system", guidance_tokens
+        ):
+            logger.warning(
+                "Skipping reflection guidance because %d tokens do not fit "
+                "the remaining system allocation",
+                guidance_tokens,
+            )
+            assembly.warnings.append(
+                "reflection guidance skipped because it would exceed the "
+                "remaining system token budget"
+            )
+            return False
         assembly.system_prompt = f"{assembly.system_prompt}\n\n{guidance_text}"
         logger.info(
             f"Injected {len(reflection_guidance)} reflection guidance items into prompt"
@@ -1729,7 +1916,7 @@ class ContextManager:
         budget: TokenBudget,
         *,
         extra_tokens: int = 0,
-    ) -> None:
+    ) -> int:
         """Enforce the final rendered-byte ceiling after wrapper accounting.
 
         Section budgets charge the historical raw memory/RAG block costs, but
@@ -1749,7 +1936,7 @@ class ContextManager:
 
         before = rendered_tokens()
         if before <= budget.total_budget:
-            return
+            return before
 
         target = int(budget.total_budget * self.PRUNE_TARGET_FRAC)
         dropped_tokens = 0
@@ -1776,6 +1963,7 @@ class ContextManager:
                 f"Rendered non-history context remains over budget "
                 f"({after}/{budget.total_budget} tokens)"
             )
+        return after
 
     def _degraded_result(
         self,
@@ -1872,41 +2060,26 @@ class ContextManager:
         # append below via the ``EPHEMERAL_NOTICE`` constant so the
         # reserved and appended bytes cannot drift.
         ephemeral_notice = EPHEMERAL_NOTICE
+        from .token_budget import RESPONSE_RESERVE
 
-        ephemeral_tracking = None
-        injected_clauses_for_audit: Optional[List[str]] = None
-        dropped_clauses_for_audit: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None or anchored_doctrine:
-            # Reserve addendum + ephemeral notice + their joiners.
-            effective_budget: Optional[int]
-            if system_prompt_budget_bytes is None:
-                effective_budget = None
-            else:
-                reserved = 0
-                if system_prompt_addendum:
-                    reserved += (
-                        len(system_prompt_addendum.encode("utf-8")) + 2
-                    )
-                reserved += len(ephemeral_notice.encode("utf-8")) + 2
-                effective_budget = max(
-                    1, system_prompt_budget_bytes - reserved
-                )
-            ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
-                constitution=constitution,
-                include_briefing=include_briefing,
-                prompt_adaptation=prompt_adaptation,
-                state_of_mind=None,
-                budget_bytes=effective_budget,
-                anchored_doctrine=anchored_doctrine,
-            )
-            system_prompt = ephemeral_tracking.prompt
-            injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
-            dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
-            if system_prompt_addendum:
-                system_prompt = (
-                    f"{system_prompt}\n\n{system_prompt_addendum}"
-                )
-        else:
+        # Resolve the model limit through the canonical catalog instead of
+        # assuming an injected/testing counter implements this optional query.
+        # The counter itself remains the exact tokenizer used below.
+        context_limit = get_token_counter(self.model).get_context_limit()
+        total_budget = max(0, context_limit - RESPONSE_RESERVE)
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+        system_token_budget = max(0, total_budget - tools_tokens)
+        required_suffix = "\n\n".join(
+            part
+            for part in (system_prompt_addendum, ephemeral_notice)
+            if part
+        )
+        use_tracking = self._requires_tracked_system_prompt(
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
+            anchored_doctrine=anchored_doctrine,
+        )
+        system_prompt = ""
+        if not use_tracking:
             system_prompt = self.context_builder.build_system_prompt(
                 constitution=constitution,
                 include_briefing=include_briefing,
@@ -1914,14 +2087,103 @@ class ContextManager:
                 state_of_mind=None,
                 system_prompt_addendum=system_prompt_addendum,
             )
+            system_prompt = f"{system_prompt}\n\n{ephemeral_notice}"
+            # Preserve byte-identical legacy prompt/cache behavior when it fits.
+            # If optional bootstrap or briefing text overflows the real
+            # tool-aware route ceiling, select the priority formatter before
+            # measuring its non-borrowable floor.
+            use_tracking = self.counter.count(system_prompt) > system_token_budget
 
-        # Append the ephemeral notice (already accounted for in the
-        # reserved budget above when budget_bytes was set).
-        system_prompt = f"{system_prompt}\n\n{EPHEMERAL_NOTICE}"
+        mandatory_system_tokens = self._measure_mandatory_system_tokens(
+            constitution,
+            prompt_adaptation,
+            anchored_doctrine=anchored_doctrine,
+            required_suffix=required_suffix,
+            tracked_prompt=use_tracking,
+        )
+        if mandatory_system_tokens + tools_tokens > total_budget:
+            reason = (
+                "mandatory governance floor and tool schemas do not fit "
+                f"the model payload budget ({mandatory_system_tokens} + "
+                f"{tools_tokens} > {total_budget} tokens)"
+            )
+            assembly = ContextAssembly(
+                warnings=[
+                    f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                    "surface this to the operator."
+                ]
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
+
+        ephemeral_tracking = None
+        injected_clauses_for_audit: Optional[List[str]] = None
+        dropped_clauses_for_audit: Optional[List[str]] = None
+        if use_tracking:
+            try:
+                ephemeral_tracking = (
+                    self.context_builder.build_system_prompt_with_tracking(
+                        constitution=constitution,
+                        include_briefing=include_briefing,
+                        prompt_adaptation=prompt_adaptation,
+                        state_of_mind=None,
+                        budget_bytes=system_prompt_budget_bytes,
+                        budget_tokens=system_token_budget,
+                        required_suffix=required_suffix,
+                        anchored_doctrine=anchored_doctrine,
+                    )
+                )
+            except MandatorySystemPromptBudgetError as exc:
+                reason = str(exc)
+                assembly = ContextAssembly(
+                    warnings=[
+                        f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                        "surface this to the operator."
+                    ]
+                )
+                return self._degraded_plan(
+                    assembly,
+                    reason=reason,
+                    mandatory_system_tokens=mandatory_system_tokens,
+                    state_of_mind=state_of_mind,
+                    mode=mode,
+                )
+            system_prompt = ephemeral_tracking.prompt
+            injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
+            dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
+            if required_suffix:
+                system_prompt = (
+                    f"{system_prompt}\n\n{required_suffix}"
+                    if system_prompt
+                    else required_suffix
+                )
 
         tokens = self.counter.count(system_prompt)
-        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
-        from .token_budget import RESPONSE_RESERVE
+
+        if tokens + tools_tokens > total_budget:
+            reason = (
+                "rendered EPHEMERAL system prompt and tool schemas do not fit "
+                f"the model payload budget ({tokens} + {tools_tokens} > "
+                f"{total_budget} tokens)"
+            )
+            assembly = ContextAssembly(
+                warnings=[
+                    f"DEGRADED MODE: {reason}. The LLM call MUST NOT proceed — "
+                    "surface this to the operator."
+                ]
+            )
+            return self._degraded_plan(
+                assembly,
+                reason=reason,
+                mandatory_system_tokens=mandatory_system_tokens,
+                state_of_mind=state_of_mind,
+                mode=mode,
+            )
 
         assembly = ContextAssembly(
             system_prompt=system_prompt,
@@ -2022,7 +2284,6 @@ class ContextManager:
                 },
             ),
         }
-        context_limit = get_token_counter(self.model).get_context_limit()
         return ContextBuildPlan(
             mode=mode,
             model=self.model,
@@ -2031,8 +2292,9 @@ class ContextManager:
             budget_summary={"mode": "ephemeral"},
             context_limit=context_limit,
             response_reserve=RESPONSE_RESERVE,
-            total_budget=max(0, context_limit - RESPONSE_RESERVE),
+            total_budget=total_budget,
             total_tokens=tokens + tools_tokens,
+            mandatory_system_tokens=mandatory_system_tokens,
             state_of_mind=state_of_mind,
         )
 

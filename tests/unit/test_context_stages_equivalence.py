@@ -344,12 +344,21 @@ def _make_cm(
     cm.context_builder = MagicMock()
     cm.context_builder.measure_mandatory_system_tokens = MagicMock(return_value=0)
     cm.context_builder.build_system_prompt = MagicMock(return_value="SYSTEM_PROMPT_BASE")
+    cm.context_builder.build_system_prompt_with_subsections = MagicMock(
+        return_value=(
+            "SYSTEM_PROMPT_BASE",
+            [("assembled_system_prompt", "SYSTEM_PROMPT_BASE")],
+        )
+    )
     if injected_clauses is not None or dropped_clauses is not None:
         cm.context_builder.build_system_prompt_with_tracking = MagicMock(
             return_value=SimpleNamespace(
                 prompt="SYSTEM_PROMPT_TRACKED",
                 injected_clauses=injected_clauses or [],
                 dropped_clauses=dropped_clauses or [],
+                subsections=[
+                    ("assembled_system_prompt", "SYSTEM_PROMPT_TRACKED")
+                ],
             )
         )
     cm.context_builder.retrieve_context = AsyncMock(return_value=rag_result)
@@ -1239,6 +1248,78 @@ async def test_live_dry_plan_equivalence_for_doctrine_addendum_cap_exclusions():
 
 
 @pytest.mark.asyncio
+async def test_reflection_guidance_rejected_by_token_budget_is_not_appended():
+    """Optional guidance rejected by accounting never reaches prompt bytes."""
+
+    from kestrel_sovereign.agent.context_stages import ContextAssembly
+    from kestrel_sovereign.agent.token_budget import ElasticTokenBudget
+
+    cm = _make_cm()
+    assembly = ContextAssembly(system_prompt="BASE-PROMPT")
+    budget = ElasticTokenBudget(
+        "test-model", message_count=0, mandatory_system_tokens=0
+    )
+    system = budget.allocations["system"]
+    system.used = system.budget
+    before = budget.total_used
+
+    included = cm._apply_reflection_guidance(
+        assembly,
+        budget,
+        ["OPTIONAL-GUIDANCE-CANARY"],
+        system_prompt_budget_bytes=None,
+    )
+
+    assert included is False
+    assert assembly.system_prompt == "BASE-PROMPT"
+    assert budget.total_used == before
+    assert any(
+        "reflection guidance skipped" in warning
+        for warning in assembly.warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_reflection_guidance_charges_joiner_token_before_append():
+    """Optional guidance is skipped when only its body, not its joiner, fits."""
+
+    from kestrel_sovereign.agent.context_stages import (
+        ContextAssembly,
+        build_reflection_guidance_block,
+    )
+    from kestrel_sovereign.agent.token_budget import ElasticTokenBudget
+
+    cm = _make_cm()
+    assembly = ContextAssembly(system_prompt="BASE-PROMPT")
+    guidance = ["OPTIONAL-GUIDANCE-CANARY"]
+    guidance_text = build_reflection_guidance_block(guidance)
+    guidance_tokens = cm.counter.count(guidance_text)
+    marginal_tokens = (
+        cm.counter.count(f"{assembly.system_prompt}\n\n{guidance_text}")
+        - cm.counter.count(assembly.system_prompt)
+    )
+    assert marginal_tokens > guidance_tokens
+
+    budget = ElasticTokenBudget(
+        "test-model", message_count=0, mandatory_system_tokens=0
+    )
+    system = budget.allocations["system"]
+    system.used = system.budget - guidance_tokens
+    before = budget.total_used
+
+    included = cm._apply_reflection_guidance(
+        assembly,
+        budget,
+        guidance,
+        system_prompt_budget_bytes=None,
+    )
+
+    assert included is False
+    assert assembly.system_prompt == "BASE-PROMPT"
+    assert budget.total_used == before
+
+
+@pytest.mark.asyncio
 async def test_live_dry_plan_equivalence_under_lumpy_microcompact_pressure():
     history = [
         {
@@ -1294,10 +1375,7 @@ async def test_live_dry_plan_equivalence_for_exact_final_payload_pruning():
 
     assert len(dry.assembly.formatted_history) < len(history)
     assert dry.total_tokens <= dry.total_budget
-    assert any(
-        "Final payload pruning removed" in warning
-        for warning in dry.warnings
-    )
+    assert dry.budget_summary["external_reserved_tokens"] > 0
     assert live.sections["history"].tokens == dry.sections["history"].tokens
 
 

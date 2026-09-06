@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
-
+from kestrel_sdk.features import ContributionContractError
 from kestrel_sdk.features.host_base import HostFeature
 from kestrel_sdk.features.ui import UIContributions
 
@@ -293,8 +293,9 @@ async def test_one_feature_start_failure_does_not_abort_others():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reject_context", [False, True])
 async def test_server_lifespan_wires_and_closes_host_features(
-    monkeypatch, tmp_path: Path,
+    monkeypatch, tmp_path: Path, reject_context: bool,
 ):
     """Exercise the deployed ``server:app`` call site, not runtime helpers.
 
@@ -314,18 +315,44 @@ async def test_server_lifespan_wires_and_closes_host_features(
         host=SimpleNamespace(bind="127.0.0.1", port=8888),
         agents={"Kite": object()},
     )
-    fake_agent = SimpleNamespace(is_test_instance=True)
+    class FakeAgent:
+        is_test_instance = True
+
+        async def complete_deferred_agent_readiness(self):
+            assert fake_manager.host_context_publication_gate.is_set()
+            events.append("agent-ready")
+
+    fake_agent = FakeAgent()
 
     class FakeManager:
         init_failures = []
+        readiness_sweep_calls = 0
+
+        def set_host_context_publication_gate(self, gate) -> None:
+            self.host_context_publication_gate = gate
+
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
 
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config):
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ):
             assert config is fake_config
+            assert restart_roster_reconciled is True
+            assert not self.host_context_publication_gate.is_set()
             events.append("agents-load")
             return 1
+
+        async def complete_deferred_agent_readiness(self):
+            assert self.host_context_publication_gate.is_set()
+            self.readiness_sweep_calls += 1
+            await fake_agent.complete_deferred_agent_readiness()
 
         def list_agents(self):
             return ["Kite"]
@@ -339,6 +366,15 @@ async def test_server_lifespan_wires_and_closes_host_features(
 
     fake_manager = FakeManager()
     feature = _UIHostFeature()
+    host_context_registry = object()
+    host_runtime = SimpleNamespace(
+        operator_registry=object(),
+        wait_registry=object(),
+        source_registry=object(),
+        permission_defaults_registry=object(),
+        setup_step_registry=object(),
+        context_clause_registry=host_context_registry,
+    )
 
     class Closeable:
         def __init__(self, event: str):
@@ -352,6 +388,22 @@ async def test_server_lifespan_wires_and_closes_host_features(
         config={},
         session_factory=Closeable("session-close"),
     )
+    ctx.feature_contribution_runtime = host_runtime
+
+    def validate_host_context(registry):
+        assert registry is host_context_registry
+        events.append("host-context-validate")
+        if reject_context:
+            raise ContributionContractError("host/agent context conflict")
+
+    def bind_host_context(registry):
+        assert registry is host_context_registry
+        assert not fake_manager.host_context_publication_gate.is_set()
+        validate_host_context(registry)
+        events.append("host-context-bind")
+
+    fake_manager.validate_host_context_clause_registry = validate_host_context
+    fake_manager.bind_host_context_clause_registry = bind_host_context
 
     async def build_context(*, config):
         assert config["host_port"] == 9090
@@ -361,6 +413,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
     async def start_features(features, supplied_ctx):
         assert features == [feature]
         assert supplied_ctx is ctx
+        assert not fake_manager.host_context_publication_gate.is_set()
         events.append("host-start")
 
     async def stop_features(features, supplied_ctx):
@@ -398,17 +451,46 @@ async def test_server_lifespan_wires_and_closes_host_features(
     )
 
     test_app = FastAPI()
-    async with server.lifespan(test_app):
-        assert fake_config.host.port == 9090
-        assert test_app.state.host_features == [feature]
-        assert test_app.state.host_context is ctx
+    if reject_context:
+        with pytest.raises(
+            ContributionContractError,
+            match="host/agent context conflict",
+        ):
+            async with server.lifespan(test_app):
+                pass
+
         assert events == [
             "agents-load",
             "context-build",
             "host-start",
+            "host-context-validate",
+            "host-stop",
+            "session-close",
+            "db-close",
+            "host-unmount",
+            "agents-stop",
+        ]
+        assert not fake_manager.host_context_publication_gate.is_set()
+        assert fake_manager.readiness_sweep_calls == 0
+        return
+
+    async with server.lifespan(test_app):
+        assert fake_config.host.port == 9090
+        assert test_app.state.host_features == [feature]
+        assert test_app.state.host_context is ctx
+        assert fake_manager.host_context_publication_gate.is_set()
+        assert events == [
+            "agents-load",
+            "context-build",
+            "host-start",
+            "host-context-validate",
             "host-router-mount",
             "host-ui-mount",
+            "host-context-validate",
+            "host-context-bind",
+            "agent-ready",
         ]
+        assert fake_manager.readiness_sweep_calls == 1
 
     assert events[-5:] == [
         "host-stop",

@@ -1,5 +1,6 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
@@ -2360,6 +2361,19 @@ async def reflection_status(request: Request):
     return result
 
 
+def _task_recipient_principal(agent) -> str:
+    """Return the route-bound durable recipient, never request metadata."""
+
+    for attribute in ("agent_id", "did"):
+        value = getattr(agent, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    raise HTTPException(
+        status_code=503,
+        detail="A2A task reads require a durable recipient identity",
+    )
+
+
 @router.get("/tasks")
 async def list_tasks(
     request: Request,
@@ -2392,11 +2406,11 @@ async def list_tasks(
                 )
 
         # Get tasks from task store
-        tasks = await agent.task_manager.task_store.list_tasks(limit=limit)
-
-        # Filter by status if provided
-        if task_state:
-            tasks = [t for t in tasks if t.status.state == task_state]
+        tasks = await agent.task_manager.task_store.list_tasks(
+            recipient_agent_id=_task_recipient_principal(agent),
+            status=task_state,
+            limit=limit,
+        )
 
         # Convert to response format
         task_list = []
@@ -2496,8 +2510,14 @@ def _a2a_inbound_requires_verified_sender(agent, authorizer) -> bool:
     from kestrel_sovereign.a2a.inbound_authorization import (
         has_a2a_inbound_scoped_policy,
     )
+    from kestrel_sovereign.a2a.transport_auth import (
+        is_a2a_transport_only_process,
+    )
 
-    if has_a2a_inbound_scoped_policy(agent):
+    if (
+        is_a2a_transport_only_process()
+        or has_a2a_inbound_scoped_policy(agent)
+    ):
         return True
     if authorizer is not None:
         try:
@@ -2538,28 +2558,49 @@ async def _authorize_verified_a2a_sender(
     authorizer,
     sender_did: str,
     hosted_policy=None,
-) -> bool:
-    """Invoke the explicit inbound seam, requiring a literal True verdict."""
+) -> Optional[str]:
+    """Authorize a verified DID and return its durable principal identity."""
     if authorizer is None or not callable(
         getattr(authorizer, "authorize", None)
     ):
-        return False
+        return None
     try:
         if hosted_policy is not None:
-            policy_authorize = getattr(
+            policy_authorize_principal = getattr(
                 authorizer,
-                "authorize_with_policy",
+                "authorize_principal_with_policy",
                 None,
             )
-            if not callable(policy_authorize):
-                return False
-            result = policy_authorize(
-                sender_did,
-                router=hosted_policy.router,
-                requester=hosted_policy.requester,
-            )
+            if callable(policy_authorize_principal):
+                result = policy_authorize_principal(
+                    sender_did,
+                    router=hosted_policy.router,
+                    requester=hosted_policy.requester,
+                )
+            else:
+                policy_authorize = getattr(
+                    authorizer,
+                    "authorize_with_policy",
+                    None,
+                )
+                if not callable(policy_authorize):
+                    return None
+                result = policy_authorize(
+                    sender_did,
+                    router=hosted_policy.router,
+                    requester=hosted_policy.requester,
+                )
         else:
-            result = authorizer.authorize(sender_did)
+            authorize_principal = getattr(
+                authorizer,
+                "authorize_principal",
+                None,
+            )
+            result = (
+                authorize_principal(sender_did)
+                if callable(authorize_principal)
+                else authorizer.authorize(sender_did)
+            )
         if inspect.isawaitable(result):
             result = await result
     except Exception:  # noqa: BLE001 - injected host policy boundary
@@ -2567,8 +2608,11 @@ async def _authorize_verified_a2a_sender(
             "Inbound A2A sender authorization provider failed",
             exc_info=True,
         )
-        return False
-    return result is True
+        return None
+    if isinstance(result, str) and result:
+        return result
+    # Preserve third-party authorizers' pre-existing literal-bool contract.
+    return sender_did if result is True else None
 
 
 def _a2a_replay_store(agent):
@@ -2661,13 +2705,13 @@ async def _create_a2a_task_under_lifecycle_lease(
         )
     if callable(commit) and not sender_verdict.verified:
         # Legacy unsigned envelopes are a narrow task-creation compatibility
-        # lane. They cannot authorize a destructive lifecycle transition: the
+        # lane. They cannot authorize a principal-scoped read or mutation: the
         # shared host API key authenticates transport access, not the peer name
         # in caller-controlled metadata. Local Core callers use the separate
-        # host-attested submission/cancellation contract instead.
+        # host-attested process-local contracts instead.
         raise HTTPException(
             status_code=403,
-            detail="A2A cancellation requires a verified sender signature",
+            detail="A2A principal action requires a verified sender signature",
         )
     if hosted_policy is not None:
         if manager.a2a_hosted_policy_for(agent) is not hosted_policy:
@@ -2713,6 +2757,7 @@ async def _create_a2a_task_under_lifecycle_lease(
             inbound_authorizer,
         )
     authorized_legacy_sender_id = None
+    authorized_verified_sender_id = None
     if sender_verdict.verified:
         if inbound_authorizer is not None:
             if (
@@ -2726,12 +2771,12 @@ async def _create_a2a_task_under_lifecycle_lease(
                     status_code=403,
                     detail="A2A sender authorization context is invalid",
                 )
-            authorized = await _authorize_verified_a2a_sender(
+            authorized_verified_sender_id = await _authorize_verified_a2a_sender(
                 inbound_authorizer,
                 sender_verdict.sender,
                 hosted_policy,
             )
-            if not authorized:
+            if authorized_verified_sender_id is None:
                 raise HTTPException(
                     status_code=403,
                     detail="A2A sender authorization failed",
@@ -2830,7 +2875,7 @@ async def _create_a2a_task_under_lifecycle_lease(
 
     params.metadata["sender_verified"] = sender_verdict.verified
     authorized_sender_id = (
-        sender_verdict.sender
+        authorized_verified_sender_id or sender_verdict.sender
         if sender_verdict.verified
         else authorized_legacy_sender_id
     )
@@ -3115,26 +3160,140 @@ async def send_task(request: Request):
     return task.model_dump()
 
 
-@router.get("/tasks/{task_id}")
-async def get_task(request: Request, task_id: str):
-    """
-    Fetch a single background A2A task with its artifacts.
+async def _parse_a2a_principal_action(
+    request: Request,
+    *,
+    task_id: str,
+    expected_verb: str,
+):
+    """Parse the signed read/subscription envelope from an HTTP peer."""
 
-    Used by the Tasks panel to render "Load artifacts" for a given task.
-    """
-    agent = get_agent(request)
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
 
-    if not hasattr(agent, "task_manager") or not agent.task_manager:
-        raise HTTPException(status_code=404, detail="TaskManager not available")
-
+    body = await _parse_json_body(request)
+    if body.get("artifacts") not in (None, []):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal actions cannot carry artifacts",
+        )
+    message_data = body.get("message", {})
+    if message_data is None:
+        message_data = {}
+    if not isinstance(message_data, Mapping):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message must be an object",
+        )
+    parts_data = message_data.get("parts", [])
+    if parts_data is None:
+        parts_data = []
+    if not isinstance(parts_data, list):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message.parts must be a list",
+        )
+    if any(not isinstance(part, Mapping) for part in parts_data):
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action message.parts entries must be objects",
+        )
+    parts = [
+        TextPart(text=str(part.get("text", "")))
+        for part in parts_data
+        if part.get("type") == "text"
+    ]
+    metadata = body.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+    if HOST_ATTESTED_LOCAL_SUBMISSION_METADATA in metadata:
+        raise HTTPException(
+            status_code=400,
+            detail="host-attested local A2A provenance is not accepted over the wire",
+        )
+    if not parts:
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action requires one text part",
+        )
     try:
-        task = await agent.task_manager.task_store.get(task_id)
-    except Exception as e:
-        logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error loading task.")
+        params = TaskSendParams(
+            id=str(body.get("id") or ""),
+            sessionId=str(body.get("sessionId") or ""),
+            message=Message(
+                role=str(message_data.get("role") or "user"),
+                parts=parts,
+            ),
+            metadata=metadata,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid A2A principal action: {exc}",
+        ) from exc
+    if params.id != task_id or not params.sessionId:
+        raise HTTPException(
+            status_code=400,
+            detail="A2A principal action does not match the routed task",
+        )
+    if metadata.get("a2a_verb") != expected_verb:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A2A principal action must bind a2a_verb={expected_verb}",
+        )
+    return params
 
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+async def _authenticate_a2a_creator_action(
+    request: Request,
+    agent,
+    *,
+    task_id: str,
+    expected_verb: str,
+):
+    """Verify a wire principal and return its creator-scoped task snapshot."""
+
+    params = await _parse_a2a_principal_action(
+        request,
+        task_id=task_id,
+        expected_verb=expected_verb,
+    )
+    authorized_sender: dict[str, str] = {}
+    recipient_agent_id = _task_recipient_principal(agent)
+
+    async def _read(sender_agent_id: str):
+        task = await agent.task_manager.get_task_for_creator(
+            task_id,
+            sender_agent_id,
+            recipient_agent_id=recipient_agent_id,
+        )
+        if task is None:
+            # Unknown and cross-principal ids deliberately share one result.
+            raise HTTPException(status_code=404, detail="Task not found")
+        authorized_sender["id"] = sender_agent_id
+        return task
+
+    task = await _create_verified_a2a_task(
+        agent,
+        params,
+        params.message.parts,
+        [],
+        [],
+        commit=_read,
+    )
+    sender_agent_id = authorized_sender.get("id")
+    if not isinstance(sender_agent_id, str) or not sender_agent_id:
+        raise HTTPException(
+            status_code=403,
+            detail="A2A creator authority could not be established",
+        )
+    return task, sender_agent_id
+
+
+def _task_http_payload(task) -> dict[str, object]:
+    """Serialize the stable task result shape shared by UI and peer reads."""
 
     message_text = None
     if task.status.message and task.status.message.parts:
@@ -3157,6 +3316,52 @@ async def get_task(request: Request, task_id: str):
         "artifacts": artifacts_payload,
         "metadata": task.metadata or {},
     }
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(request: Request, task_id: str):
+    """
+    Fetch a single background A2A task with its artifacts.
+
+    Used by the Tasks panel to render "Load artifacts" for a given task.
+    """
+    agent = get_agent(request)
+
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+
+    try:
+        task = await agent.task_manager.get_task_for_recipient(
+            task_id,
+            _task_recipient_principal(agent),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error loading task {task_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error loading task.")
+
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return _task_http_payload(task)
+
+
+@router.post("/tasks/{task_id:path}/read")
+@limiter.limit("120/minute")
+async def read_task_from_peer(request: Request, task_id: str):
+    """Return one task only to its signed, replay-protected creator."""
+
+    agent = get_agent(request)
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+    task, _sender_agent_id = await _authenticate_a2a_creator_action(
+        request,
+        agent,
+        task_id=task_id,
+        expected_verb="read_task",
+    )
+    return _task_http_payload(task)
 
 
 @router.post("/tasks/{task_id:path}/cancel")
@@ -3257,9 +3462,13 @@ async def cancel_task_from_peer(request: Request, task_id: str):
     }
 
 
-@router.get("/tasks/{task_id}/subscribe")
-@limiter.limit("30/minute")
-async def subscribe_task(request: Request, task_id: str):
+async def _task_subscription_response(
+    request: Request,
+    agent,
+    task_id: str,
+    *,
+    creator_agent_id: Optional[str] = None,
+):
     """
     SSE stream of status updates for a single A2A task.
 
@@ -3279,8 +3488,9 @@ async def subscribe_task(request: Request, task_id: str):
     stream in a background-tracked coroutine and turns the terminal
     event into a local ``a2a.question_answered`` cognition signal.
 
-    Auth: same handshake as ``POST /tasks/send`` — the agent-routing
-    middleware applies its API-key check before this handler runs.
+    The caller supplies exactly one already-admitted durable role: the local
+    UI route uses the recipient principal, while peer HTTP uses a verified
+    creator signature before entering this helper.
 
     Connection limits: ``MAX_SSE_CONNECTIONS_PER_CLIENT`` per
     (client_ip, agent_id) pair, same posture as ``/notifications/sse``.
@@ -3291,21 +3501,31 @@ async def subscribe_task(request: Request, task_id: str):
     that already fired. We forward that snapshot as the first SSE
     frame.
     """
-    agent = get_agent(request)
-
-    if not hasattr(agent, "task_manager") or not agent.task_manager:
-        raise HTTPException(
-            status_code=404, detail="TaskManager not available",
-        )
-
     # 404 on unknown task_id rather than holding an SSE connection
     # open against a non-existent subscription target — the sender
     # would otherwise idle forever waiting for terminal events that
     # can never fire.
-    task = await agent.task_manager.task_store.get(task_id)
+    if creator_agent_id is None:
+        recipient_agent_id = _task_recipient_principal(agent)
+        task = await agent.task_manager.get_task_for_recipient(
+            task_id,
+            recipient_agent_id,
+        )
+        subscribe_kwargs = {"recipient_agent_id": recipient_agent_id}
+    else:
+        recipient_agent_id = _task_recipient_principal(agent)
+        task = await agent.task_manager.get_task_for_creator(
+            task_id,
+            creator_agent_id,
+            recipient_agent_id=recipient_agent_id,
+        )
+        subscribe_kwargs = {
+            "creator_agent_id": creator_agent_id,
+            "recipient_agent_id": recipient_agent_id,
+        }
     if task is None:
         raise HTTPException(
-            status_code=404, detail=f"Task '{task_id}' not found",
+            status_code=404, detail="Task not found",
         )
 
     client_ip = request.client.host if request.client else "unknown"
@@ -3333,7 +3553,10 @@ async def subscribe_task(request: Request, task_id: str):
             # on its internal timeout — we forward those as SSE
             # comments-or-pings so the connection stays warm even when
             # the task sits in SUBMITTED for a while.
-            async for ev in agent.task_manager.subscribe(task_id):
+            async for ev in agent.task_manager.subscribe(
+                task_id,
+                **subscribe_kwargs,
+            ):
                 if await request.is_disconnected():
                     logger.debug(
                         "task subscribe client disconnected (task=%s)",
@@ -3384,6 +3607,39 @@ async def subscribe_task(request: Request, task_id: str):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.get("/tasks/{task_id}/subscribe")
+@limiter.limit("30/minute")
+async def subscribe_task(request: Request, task_id: str):
+    """Stream task status through the recipient-owned local UI view."""
+
+    agent = get_agent(request)
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+    return await _task_subscription_response(request, agent, task_id)
+
+
+@router.post("/tasks/{task_id:path}/subscribe")
+@limiter.limit("30/minute")
+async def subscribe_task_from_peer(request: Request, task_id: str):
+    """Stream task status only to its signed, replay-protected creator."""
+
+    agent = get_agent(request)
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(status_code=404, detail="TaskManager not available")
+    _task, sender_agent_id = await _authenticate_a2a_creator_action(
+        request,
+        agent,
+        task_id=task_id,
+        expected_verb="subscribe_task",
+    )
+    return await _task_subscription_response(
+        request,
+        agent,
+        task_id,
+        creator_agent_id=sender_agent_id,
     )
 
 

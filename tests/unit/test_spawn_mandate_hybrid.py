@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta
 import pytest
 
 from kestrel_sovereign.identity.did_web import build_verification_methods
@@ -263,6 +264,24 @@ def test_classical_signature_for_hybrid_parent_rejected(hybrid_parent):
         "classical-only signature accepted for a hybrid parent — "
         "HYBRID_REQUIRED downgrade bypass (#2400)"
     )
+
+
+def test_pre_rotation_classical_mandate_requires_trusted_issuance_witness(
+    hybrid_parent,
+):
+    """A self-asserted timestamp cannot prove a receipt predates rotation."""
+
+    identity, legacy_kp, _ = hybrid_parent
+    cutoff = datetime.fromisoformat(identity.succession_statement.effective_from)
+    mandate = _make_mandate(parent_did=identity.legacy_did)
+    mandate.created_at = (cutoff - timedelta(seconds=1)).isoformat()
+    signed = sign_mandate(mandate, legacy_kp.private_key)
+
+    assert verify_mandate(
+        signed,
+        legacy_kp.public_key,
+        parent_identity=identity,
+    ) is False
 
 
 def test_garbage_signature_format_rejected(hybrid_parent):

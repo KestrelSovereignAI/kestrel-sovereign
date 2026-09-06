@@ -5,16 +5,21 @@ import inspect
 import logging
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
 from kestrel_sovereign.features.config_validation import (
     FeatureConfigInvalid,
     validate_feature_config,
+)
+from kestrel_sovereign.features.isolated_runtime import (
+    IsolatedRuntimeConfigGenerationChanged,
 )
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -50,6 +55,7 @@ router = APIRouter(tags=["features"])
 # (`cli_features._install_commands`). Every path still terminates, which is the
 # property a caller with nobody watching needs; the multiple is the price.
 INSTALL_TIMEOUT_SECONDS = 300
+
 
 def _core_requirement_unsatisfied(package_spec: str) -> Optional[str]:
     """Describe *package_spec*'s unmet requirement on core, or None.
@@ -559,6 +565,22 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     canonical activation used by boot and the disable/enable rails alike.
     """
     agent = get_agent(request)
+    # Config PATCH takes this mutex before its ingress fence and then queues on
+    # CONVERSATION. Enable can reach an isolated setter while it owns that turn
+    # boundary, so it must take the same outer mutex first; otherwise PATCH can
+    # own ingress while enable owns CONVERSATION and both wait forever.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _enable_feature_locked(agent, name),
+            feature_name=name,
+            operation="enable",
+        )
+
+
+async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
+    """Enable a feature group while the agent's turn boundary is held."""
+
     loaded = _get_loaded_features_or_404(agent, name)
 
     to_activate = tuple(
@@ -591,23 +613,56 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
             await agent._activate_feature_runtime(
                 feature,
                 prepared_contributions=prepared_by_feature[id(feature)],
+                notify_ready=False,
             )
             activated.append((class_name, feature))
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         # Group transaction: roll the already-activated members back to the
         # disabled state (soft-toggle) so a partial package-enable never leaves
         # a mix of live and dead members.
+        quarantine_error = None
         for class_name, feature in reversed(activated):
             try:
                 await agent._unregister_feature_runtime(feature, unload=False)
-            except Exception:
-                logger.exception(
-                    "Enable rollback (re-disable) failed for feature '%s'",
+            except (Exception, asyncio.CancelledError) as cleanup_exc:
+                logger.error(
+                    "Enable rollback (re-disable) for feature '%s' reported %s; "
+                    "quarantining surviving contributions",
                     class_name,
+                    type(cleanup_exc).__name__,
                 )
+                quarantine_descriptor = inspect.getattr_static(
+                    agent, "_quarantine_feature_contributions", None
+                )
+                if quarantine_descriptor is None:
+                    quarantine_error = RuntimeError(
+                        "package enable rollback contribution quarantine is unavailable"
+                    )
+                    continue
+                try:
+                    agent._quarantine_feature_contributions(feature)
+                except (Exception, asyncio.CancelledError):
+                    quarantine_error = RuntimeError(
+                        "package enable rollback contributions could not be quarantined"
+                    )
             else:
                 logger.info("Rolled back enable of feature '%s'", class_name)
+        if quarantine_error is not None:
+            await _enter_feature_quarantine_safe_mode(
+                agent,
+                "Package enable rollback contribution quarantine failed; "
+                "cognition is blocked until lifecycle integrity is restored",
+            )
+            # A disabled member must never retain prompt authority. Surface a
+            # fixed error without chaining arbitrary feature cleanup details.
+            raise quarantine_error from None
         raise
+
+    # A ready hook may explicitly enter cognition. Keep that seam closed until
+    # every package member has committed, otherwise the first hook can observe a
+    # partially-enabled package generation while later members are still dead.
+    for _class_name, feature in activated:
+        await agent._notify_feature_runtime_ready(feature)
 
     return {
         "name": name,
@@ -615,6 +670,33 @@ async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
         "status": "enabled",
         "capabilities": compute_feature_capabilities(agent),
     }
+
+
+async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> None:
+    """Latch cognition closed when contribution ownership cannot be repaired."""
+
+    from kestrel_sovereign.agent.constitution import SafeModeCause
+
+    lifecycle_cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
+    setattr(agent, "_feature_lifecycle_integrity_uncertain", True)
+    setattr(agent, "_feature_lifecycle_repair_verified", False)
+    setattr(agent, "_safe_mode_cause", lifecycle_cause)
+    entered = False
+    enter_safe_mode = getattr(agent, "enter_safe_mode", None)
+    if callable(enter_safe_mode):
+        try:
+            result = enter_safe_mode(reason, cause=lifecycle_cause)
+            if inspect.isawaitable(result):
+                await result
+            entered = getattr(agent, "_safe_mode", False) is True
+        except (Exception, asyncio.CancelledError):
+            pass
+    if not entered:
+        # A lightweight compatibility agent may not expose the constitutional
+        # persistence API. The in-memory latch is still the minimum safe state.
+        setattr(agent, "_safe_mode", True)
+        setattr(agent, "_safe_mode_reason", reason)
+        setattr(agent, "_safe_mode_cause", lifecycle_cause)
 
 
 @router.post("/api/features/{name}/disable")
@@ -636,6 +718,21 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     disable also use.
     """
     agent = get_agent(request)
+    # A failed teardown re-activates the previous generation. Serialize that
+    # possible config-bearing rollback with PATCH/enable before taking the turn
+    # boundary so rollback cannot recreate their lock-order inversion.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _disable_feature_locked(agent, name),
+            feature_name=name,
+            operation="disable",
+        )
+
+
+async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
+    """Disable a feature group while the agent's turn boundary is held."""
+
     loaded = _get_loaded_features_or_404(agent, name)
     mandatory = sorted(
         class_name
@@ -664,17 +761,15 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
                 continue
             attempted.append((class_name, feature))
             await agent._unregister_feature_runtime(feature, unload=False)
-    except Exception:
-        for class_name, feature in reversed(attempted):
-            try:
-                await agent._activate_feature_runtime(feature)
-            except Exception:
-                logger.exception(
-                    "Disable rollback (re-enable) failed for feature '%s'",
-                    class_name,
-                )
-            else:
-                logger.info("Rolled back disable of feature '%s'", class_name)
+    except (Exception, asyncio.CancelledError):
+        await _restore_feature_group(
+            agent,
+            tuple(
+                (class_name, feature, True)
+                for class_name, feature in attempted
+            ),
+            operation="Disable",
+        )
         raise
 
     return {
@@ -683,6 +778,115 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
         "status": "disabled",
         "capabilities": compute_feature_capabilities(agent),
     }
+
+
+async def _restore_feature_group(
+    agent: object,
+    attempted: tuple[tuple[str, Any, bool], ...],
+    *,
+    operation: str,
+) -> None:
+    """Best-effort restore of one prevalidated package feature generation."""
+
+    enabled = tuple(
+        feature for _class_name, feature, was_enabled in attempted if was_enabled
+    )
+    quarantine_descriptor = inspect.getattr_static(
+        agent, "_quarantine_feature_contributions", None
+    )
+    if quarantine_descriptor is not None:
+        for class_name, feature, was_enabled in attempted:
+            if not was_enabled:
+                continue
+            try:
+                # A failed exact inverse leaves the retained declarative
+                # generation active while the canonical teardown continues with
+                # imperative cleanup. Withdraw those exact survivors before the
+                # complete package generation is prepared again.
+                agent._quarantine_feature_contributions(feature)
+            except (Exception, asyncio.CancelledError) as quarantine_exc:
+                logger.error(
+                    "%s rollback contribution quarantine for feature '%s' "
+                    "reported %s",
+                    operation,
+                    class_name,
+                    type(quarantine_exc).__name__,
+                )
+
+    prepared_by_feature: Dict[int, Any] = {}
+    if enabled:
+        try:
+            # Cross-feature setup before/after references are valid only as one
+            # prospective set. Collect and preflight the complete rollback
+            # generation once, then retain each exact per-feature item.
+            prepared = agent._prepare_feature_contribution_transition(enabled)
+            prepared_by_feature = {
+                id(feature): item
+                for feature, item in prepared.activatable(enabled)
+            }
+        except (Exception, asyncio.CancelledError) as preparation_exc:
+            logger.error(
+                "%s rollback contribution batch preparation reported %s",
+                operation,
+                type(preparation_exc).__name__,
+            )
+
+    restored: List[tuple[str, Any]] = []
+    restore_complete = len(prepared_by_feature) == len(enabled)
+
+    # Preserve package activation order. Batch preflight already validated
+    # forward references across the full set; passing each retained item keeps
+    # per-feature activation from revalidating against a partial set.
+    for class_name, feature, was_enabled in attempted:
+        try:
+            if not was_enabled:
+                agent.features[class_name] = feature
+                feature.enabled = False
+            elif id(feature) in prepared_by_feature:
+                await agent._activate_feature_runtime(
+                    feature,
+                    prepared_contributions=prepared_by_feature[id(feature)],
+                    notify_ready=False,
+                )
+                restored.append((class_name, feature))
+            else:
+                restore_complete = False
+                logger.error(
+                    "%s rollback could not prepare enabled feature '%s'",
+                    operation,
+                    class_name,
+                )
+        except (Exception, asyncio.CancelledError) as activation_exc:
+            restore_complete = False
+            logger.error(
+                "%s rollback re-activation for feature '%s' reported %s",
+                operation,
+                class_name,
+                type(activation_exc).__name__,
+            )
+        else:
+            logger.info(
+                "Rolled back %s of feature '%s'",
+                operation.lower(),
+                class_name,
+            )
+
+    # Rollback is best-effort. Only open the cognition-capable ready seam when
+    # the complete formerly-enabled generation is live again; a partial restore
+    # must never advertise itself to hooks as an atomic package generation.
+    if restore_complete and len(restored) == len(enabled):
+        for _class_name, feature in restored:
+            await agent._notify_feature_runtime_ready(feature)
+        return
+
+    await _enter_feature_quarantine_safe_mode(
+        agent,
+        f"{operation} rollback could not restore the complete feature "
+        "generation; cognition is blocked until lifecycle integrity is restored",
+    )
+    raise RuntimeError(
+        f"{operation.lower()} rollback could not restore the complete feature generation"
+    ) from None
 
 
 @router.post("/api/features/{name}/remove")
@@ -734,19 +938,58 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
             ),
         )
 
+    # Runtime teardown, stored-data cleanup, and package removal are one owned
+    # mutation.  The owned task acquires the turn boundary itself: hooks it
+    # awaits may enter privacy-governed work without waiting on a lock held by
+    # their HTTP parent.  The settlement helper still cancels a child that was
+    # cancelled while QUEUED, and only shields it after acquisition.
+    async with _feature_config_update_lock(agent):
+        return await _settle_feature_transition(
+            agent,
+            lambda: _remove_feature_locked(agent, pkg_info),
+            feature_name=name,
+            operation="remove",
+        )
+
+
+async def _remove_feature_locked(
+    agent: object,
+    pkg_info: FeaturePackageInfo,
+) -> Dict[str, Any]:
+    """Remove one package while the agent's turn boundary remains held."""
+
     # Check if feature is loaded — drain its full runtime, then on_remove.
     features = getattr(agent, "features", {}) or {}
     loaded = [
-        (class_name, features[class_name])
+        (
+            class_name,
+            features[class_name],
+            bool(getattr(features[class_name], "enabled", True)),
+        )
         for class_name in pkg_info.features
         if class_name in features
     ]
-    for class_name, feature in loaded:
-        # Full canonical runtime teardown BEFORE uninstall — the SAME inverse
-        # boot rollback and /disable use, not a hooks-only subset. ``unload=True``
-        # drops the instance from ``agent.features`` once every registration is
-        # drained (kestrel-sovereign#2522 P1).
-        await agent._unregister_feature_runtime(feature, unload=True)
+    attempted: List[tuple[str, Any, bool]] = []
+    try:
+        for class_name, feature, was_enabled in loaded:
+            # Full canonical runtime teardown BEFORE uninstall — the SAME inverse
+            # boot rollback and /disable use, not a hooks-only subset. ``unload=True``
+            # drops the instance from ``agent.features`` once every registration is
+            # drained (kestrel-sovereign#2522 P1).
+            attempted.append((class_name, feature, was_enabled))
+            await agent._unregister_feature_runtime(feature, unload=True)
+    except (Exception, asyncio.CancelledError):
+        # Package removal has not crossed its irreversible on_remove/pip
+        # boundary yet. Restore the complete group before propagating a hook
+        # failure (including an internally-originated CancelledError).
+        await _restore_feature_group(
+            agent,
+            tuple(attempted),
+            operation="Remove",
+        )
+        raise
+
+    for _class_name, feature, _was_enabled in loaded:
         # ``on_remove`` (stored-data cleanup) runs AFTER the runtime is fully
         # quiesced, but on the SAME still-referenced instance whose ``agent`` /
         # storage / config the teardown never touched — so unloading loses it no
@@ -772,7 +1015,7 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     return {
         "status": "removed",
         "package": package_spec,
-        "features": [class_name for class_name, _ in loaded],
+        "features": [class_name for class_name, _feature, _enabled in loaded],
         "message": f"Package '{package_spec}' uninstalled. Restart the agent to fully unload.",
     }
 
@@ -848,27 +1091,214 @@ async def update_feature_config(
     leave an unchanged secret out of the PATCH without clearing it.
     """
     agent = get_agent(request)
-    feature = _get_feature_or_404(agent, name)
+
+    # Snapshot -> setter -> context publication is serialized per tenant. A
+    # host-wide mutex lets one slow out-of-tree setter block every other agent.
+    # This narrow lock prevents same-agent rollback crossing while the owned
+    # task below owns that agent's cognition boundary.
+    async with _feature_config_update_lock(agent):
+        feature = _get_feature_or_404(agent, name)
+        async with _feature_config_ingress_fence(feature) as ingress_lease:
+            return await _settle_feature_transition(
+                agent,
+                lambda: _update_feature_config_generation(
+                    agent,
+                    feature,
+                    name,
+                    body,
+                    ingress_lease,
+                ),
+                feature_name=name,
+                operation="configuration reconciliation",
+            )
+
+
+def _feature_config_update_lock(agent: object) -> asyncio.Lock:
+    """Return the agent-scoped config reconciliation mutex."""
+
+    lock = inspect.getattr_static(agent, "_feature_config_update_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        setattr(agent, "_feature_config_update_lock", lock)
+    return lock
+
+
+@asynccontextmanager
+async def _feature_config_ingress_fence(feature: object):
+    """Let an isolated feature drain ingress before the agent turn lock."""
+
+    descriptor = inspect.getattr_static(
+        feature, "config_transition_ingress_fence", None
+    )
+    if descriptor is None:
+        yield None
+        return
+    fence = getattr(feature, "config_transition_ingress_fence")
+    async with fence() as lease:
+        yield lease
+
+
+async def _update_feature_config_generation(
+    agent: object,
+    expected_feature: object,
+    name: str,
+    body: ConfigUpdateRequest,
+    ingress_lease: object,
+) -> Dict[str, Any]:
+    """Mutate only the feature generation whose ingress was fenced."""
+
+    current = _get_feature_or_404(agent, name)
+    if current is not expected_feature:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Feature '{name}' changed while configuration was queued; "
+                "retry against the current generation"
+            ),
+        )
+    claim_descriptor = inspect.getattr_static(
+        current, "claim_config_transition_ingress_fence", None
+    )
+    if ingress_lease is not None and claim_descriptor is not None:
+        claim = getattr(current, "claim_config_transition_ingress_fence")
+        if claim(ingress_lease) is not True:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Feature '{name}' changed while configuration was queued; "
+                    "retry against the current generation"
+                ),
+            )
+    try:
+        return await _update_feature_config_locked(agent, current, name, body)
+    except IsolatedRuntimeConfigGenerationChanged:
+        # A reload/recovery owner can move the isolated client after the
+        # endpoint's initial lease claim but before the setter acquires the
+        # lifecycle lock. The setter re-proves that generation under the lock
+        # and raises this narrow retry condition before mutating config.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Feature '{name}' changed while configuration was queued; "
+                "retry against the current generation"
+            ),
+        ) from None
+
+
+@asynccontextmanager
+async def _agent_feature_config_transition(agent: object):
+    """Share the agent's turn lock when that lifecycle surface is available."""
+
+    # ``getattr`` alone fabricates arbitrary attributes on common test doubles.
+    # Static lookup proves this is a surface the concrete agent actually owns.
+    transition_descriptor = inspect.getattr_static(
+        agent, "feature_config_transition", None
+    )
+    if transition_descriptor is None:
+        yield
+        return
+
+    transition = getattr(agent, "feature_config_transition")
+    async with transition():
+        yield
+
+
+async def _settle_feature_transition(
+    agent: object,
+    operation_factory: Callable[[], Awaitable[Any]],
+    *,
+    feature_name: str,
+    operation: str,
+):
+    """Finish one feature-state mutation before propagating cancellation.
+
+    Feature lifecycle hooks and hosted setters may cross awaited boundaries
+    after changing a context/tool generation. The owned child acquires
+    ``CONVERSATION`` itself, so a hook that enters ``privacy_transition`` does
+    not wait on its HTTP parent. Cancellation while the child is still QUEUED
+    cancels it and performs no later mutation; after acquisition, cancellation
+    waits for the child to commit or roll back before escaping.
+    """
+
+    loop = asyncio.get_running_loop()
+    admitted: asyncio.Future[bool] = loop.create_future()
+
+    async def own_transition():
+        async with _agent_feature_config_transition(agent):
+            # No suspension occurs between acquiring the boundary and this
+            # handoff, so the parent cannot misclassify an acquired child as a
+            # cancellable waiter.
+            if not admitted.done():
+                admitted.set_result(True)
+            return await operation_factory()
+
+    task = asyncio.create_task(own_transition())
+
+    def mark_terminal_before_admission(_task):
+        if not admitted.done():
+            admitted.set_result(False)
+
+    task.add_done_callback(mark_terminal_before_admission)
+    pending_cancellation = None
+    try:
+        await asyncio.shield(admitted)
+    except asyncio.CancelledError as cancellation:
+        pending_cancellation = cancellation
+        if not admitted.done() or not admitted.result():
+            task.cancel()
+
+    outcome = await await_owned_task(
+        task,
+        pending_cancellation=pending_cancellation,
+    )
+    task.remove_done_callback(mark_terminal_before_admission)
+    if outcome.cancellation is not None:
+        if outcome.error is not None and not (
+            isinstance(outcome.error, asyncio.CancelledError)
+            and admitted.done()
+            and not admitted.result()
+        ):
+            # Never stringify or chain an out-of-tree renderer/config
+            # exception: it may contain secret config bytes.
+            logger.error(
+                "Feature '%s' %s failed after request cancellation (%s)",
+                feature_name,
+                operation,
+                type(outcome.error).__name__,
+            )
+        raise outcome.cancellation from None
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
+
+
+async def _update_feature_config_locked(
+    agent: object,
+    feature: object,
+    name: str,
+    body: ConfigUpdateRequest,
+) -> Dict[str, Any]:
+    """Commit one config + rendered-context transition, or restore it.
+
+    Feature tools read their live configuration while the prompt consumes a
+    cached immutable context-clause snapshot.  Those two views must never be
+    allowed to diverge merely because rendering the new snapshot failed.
+    """
 
     schema = feature.config_schema
     incoming = dict(body.config)
+    previous = await feature.get_config()
+    previous = dict(previous) if isinstance(previous, dict) else {}
 
     secret_fields = _secret_field_names(schema)
     atomic_secret_update = getattr(feature, "set_config_with_secret_preservation", None)
     has_atomic_secret_update = inspect.iscoroutinefunction(atomic_secret_update)
-    if secret_fields and has_atomic_secret_update:
-        # Isolated hosted features preserve omitted write-only fields from the
-        # same durable snapshot used by their transition CAS.  Reading here and
-        # reinjecting later would let a stale replica overwrite a concurrent
-        # credential rotation.
-        await atomic_secret_update(
-            incoming,
-            secret_fields,
-            lambda effective: _validate_config(effective, schema)
-            if schema is not None
-            else None,
-        )
-    else:
+    commit_receipt = None
+    refresh_context = getattr(agent, "refresh_feature_context_clauses", None)
+    should_refresh = bool(getattr(feature, "enabled", True)) and callable(
+        refresh_context
+    )
+    if not (secret_fields and has_atomic_secret_update):
         if secret_fields:
             current = await feature.get_config()
             if isinstance(current, dict):
@@ -879,7 +1309,72 @@ async def update_feature_config(
         if schema is not None:
             _validate_config(incoming, schema)
 
-        await feature.set_config(incoming)
+    try:
+        if secret_fields and has_atomic_secret_update:
+            # Isolated hosted features preserve omitted write-only fields from the
+            # same durable snapshot used by their transition CAS.  Reading here and
+            # reinjecting later would let a stale replica overwrite a concurrent
+            # credential rotation.
+            commit_receipt = await atomic_secret_update(
+                incoming,
+                secret_fields,
+                lambda effective: _validate_config(effective, schema)
+                if schema is not None
+                else None,
+            )
+        else:
+            commit_receipt = await feature.set_config(incoming)
+    except IsolatedRuntimeConfigGenerationChanged:
+        # The exact generation changed before the setter could mutate it. Do
+        # not run the ambiguous-commit reconciliation path below: this narrow
+        # exception certifies that no stage or live hook was attempted.
+        raise
+    except (Exception, asyncio.CancelledError):
+        # A setter can durably mutate and then surface an internally-originated
+        # CancelledError (or another late error). With no returned receipt its
+        # commit status is ambiguous, so do not issue a blind rollback that may
+        # overwrite a newer hosted generation. Republish from the authoritative
+        # current config before the error leaves the turn boundary instead.
+        if should_refresh:
+            try:
+                await _refresh_feature_context(refresh_context, feature)
+            except (Exception, asyncio.CancelledError):
+                await _disable_feature_after_config_reconciliation_failure(
+                    agent, feature, name
+                )
+                raise RuntimeError(
+                    "feature configuration state could not be reconciled with "
+                    "context; the feature was disabled"
+                ) from None
+        raise
+
+    if should_refresh:
+        try:
+            await _refresh_feature_context(refresh_context, feature)
+        except (Exception, asyncio.CancelledError):
+            try:
+                rollback_descriptor = inspect.getattr_static(
+                    feature, "rollback_config_transition", None
+                )
+                if rollback_descriptor is not None and commit_receipt is not None:
+                    rollback = getattr(feature, "rollback_config_transition")
+                    await rollback(commit_receipt)
+                else:
+                    await feature.set_config(previous)
+                await _refresh_feature_context(refresh_context, feature)
+            except (Exception, asyncio.CancelledError):
+                # The old prompt bytes cannot safely coexist with a config we
+                # failed to restore.  Canonical teardown removes both the
+                # cached clauses and the feature's live tools before the error
+                # leaves this request.
+                await _disable_feature_after_config_reconciliation_failure(
+                    agent, feature, name
+                )
+                raise RuntimeError(
+                    "feature configuration and context refresh could not be "
+                    "reconciled; the feature was disabled"
+                ) from None
+            raise
 
     updated = await feature.get_config()
 
@@ -892,6 +1387,63 @@ async def update_feature_config(
         "config": updated,
         "message": "Configuration updated",
     }
+
+
+async def _refresh_feature_context(refresh_context, feature: object) -> None:
+    """Await either the core synchronous refresh or an async test/host seam."""
+
+    refreshed = refresh_context(feature)
+    if inspect.isawaitable(refreshed):
+        await refreshed
+
+
+async def _disable_feature_after_config_reconciliation_failure(
+    agent: object,
+    feature: object,
+    name: str,
+) -> None:
+    """Fail closed when live config and cached context cannot be reconciled."""
+
+    teardown = getattr(agent, "_unregister_feature_runtime", None)
+    quarantine_error = None
+    if callable(teardown):
+        try:
+            deactivated = teardown(feature, unload=False)
+            if inspect.isawaitable(deactivated):
+                await deactivated
+        except (Exception, asyncio.CancelledError) as teardown_exc:
+            # Out-of-tree teardown errors may contain private config bytes. Log
+            # only their type while preserving the fail-closed disabled state.
+            logger.error(
+                "Feature '%s' teardown reported %s after configuration "
+                "reconciliation failed",
+                name,
+                type(teardown_exc).__name__,
+            )
+            quarantine_descriptor = inspect.getattr_static(
+                agent, "_quarantine_feature_contributions", None
+            )
+            if quarantine_descriptor is None:
+                quarantine_error = RuntimeError(
+                    "feature contribution quarantine is unavailable"
+                )
+            else:
+                try:
+                    agent._quarantine_feature_contributions(feature)
+                except (Exception, asyncio.CancelledError):
+                    quarantine_error = RuntimeError(
+                        "feature contributions could not be quarantined"
+                    )
+    feature.enabled = False
+    if quarantine_error is not None:
+        await _enter_feature_quarantine_safe_mode(
+            agent,
+            "Feature configuration contribution quarantine failed; "
+            "cognition is blocked until lifecycle integrity is restored",
+        )
+        # Raise after leaving the teardown handler so a third-party exception
+        # cannot survive in __context__ and leak private configuration bytes.
+        raise quarantine_error from None
 
 
 def _validate_config(config: Dict[str, Any], schema: Dict[str, Any]) -> None:

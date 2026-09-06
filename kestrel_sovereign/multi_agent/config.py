@@ -17,6 +17,10 @@ from typing import Any, List, Optional, Union
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from kestrel_sovereign.identity.local_anchor import (
+    AgentDIDLookupMode,
+    read_anchor_agent_did_sync,
+)
 from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,44 @@ DEFAULT_HOST_PORT = 8888
 DEFAULT_AGENT_START_PORT = 8801
 MULTI_AGENT_CONFIG_FILENAME = "multi_agent.toml"
 AGENT_DATA_DIR = "agent_data"
+RETIRED_SPAWN_MARKER = ".kestrel-spawn-retired"
+
+
+def spawn_retirement_denies_startup(data_dir: Path) -> bool:
+    """Return whether an identity-bound retirement marker denies this boot."""
+
+    marker = data_dir / RETIRED_SPAWN_MARKER
+    if not marker.is_file():
+        return False
+    try:
+        retired_did = marker.read_text(encoding="utf-8").strip()
+        if not retired_did.startswith("did:"):
+            raise ValueError("retirement marker has no valid DID")
+        current_did = read_anchor_agent_did_sync(
+            str(data_dir),
+            mode=AgentDIDLookupMode.INSPECTION,
+        )
+    except (OSError, ValueError) as exc:
+        # A marker is an authority denial. If its identity binding cannot be
+        # checked safely, keep denying rather than resurrecting ambiguous disk.
+        logger.warning(
+            "Skipping spawned agent with unverifiable retirement marker %s: %s",
+            data_dir,
+            exc,
+        )
+        return True
+    if retired_did == current_did:
+        logger.info("Skipping durably retired spawned agent: %s", data_dir)
+        return True
+    logger.info(
+        "Ignoring stale retirement marker for replaced identity %s "
+        "(retired %s, current %s)",
+        data_dir,
+        retired_did,
+        current_did,
+    )
+    return False
+
 
 # Canonical modules for the features that form every agent's sovereignty
 # foundation. Discovery imports these modules explicitly and fails closed, so
@@ -354,6 +396,11 @@ class MultiAgentConfig(BaseModel):
             logger.warning(f"Agent data directory not found: {base_path}")
             return cls(host=HostConfig(), agents={})
 
+        from kestrel_sovereign.spawn.authority_registry import (
+            SpawnAuthorityRegistry,
+        )
+
+        registry = SpawnAuthorityRegistry(base_path.parent)
         # Scan subdirectories
         for subdir in sorted(base_path.iterdir()):
             if not subdir.is_dir():
@@ -362,14 +409,24 @@ class MultiAgentConfig(BaseModel):
             db_path = subdir / "kestrel_prime.db"
             if not db_path.exists() and not include_empty:
                 continue
-
-            # Found an agent directory
-            name = subdir.name
-            agents[name] = LocalAgentConfig(
+            candidate = LocalAgentConfig(
                 data_dir=subdir,
                 port=next_port,
                 autostart=True,
             )
+            # A spawned identity can reach disk before its final DID exists and
+            # therefore before a signed authority witness can be written. The
+            # host records that slot as pending before inception; auto-discovery
+            # must honor the denial instead of treating its unsigned proposal as
+            # a new root after a crash.
+            if registry.pending_for_slot(child_name=subdir.name, config=candidate):
+                continue
+            if spawn_retirement_denies_startup(subdir):
+                continue
+
+            # Found an agent directory
+            name = subdir.name
+            agents[name] = candidate
             logger.info(f"Auto-discovered agent: {name} at {subdir} (port {next_port})")
             next_port += 1
 

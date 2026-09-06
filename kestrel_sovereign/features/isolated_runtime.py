@@ -600,6 +600,35 @@ _cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
 _telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
     "isolated_telegram_terminal_inbound_disposition", default=None
 )
+@dataclass(slots=True)
+class _ConfigIngressFenceLease:
+    """Mutable authority for one exact proxy lifecycle ingress boundary.
+
+    Context variables are copied into child tasks.  Keeping liveness and exact
+    lifecycle identity on a shared object means a detached copy becomes inert
+    when its owner exits, while the endpoint can explicitly authorize only the
+    child task that acquired the agent's conversation boundary.
+    """
+
+    feature: object
+    lifecycle_generation: int
+    client: object | None
+    traffic_gate: object
+    owner_task: asyncio.Task[Any] | None
+    idle_wake_failed: bool
+    requires_closed_gate: bool
+    active: bool = True
+    authorized_task: asyncio.Task[Any] | None = None
+    transition_started: bool = False
+
+
+# The generic feature-config endpoint owns this task-local lease only after it
+# has paused producers and drained Core admission. Its conversation-bound child
+# inherits the object but must explicitly claim it before ``set_config`` may
+# reuse the fence. Detached ContextVar copies therefore carry no durable bypass.
+_active_config_ingress_fence: ContextVar[
+    _ConfigIngressFenceLease | None
+] = ContextVar("isolated_active_config_ingress_fence", default=None)
 
 # A staged config must survive a short process pause, but it must not turn an
 # interrupted deploy or process death into a permanent write lock.  Readers
@@ -1666,9 +1695,24 @@ class _TrafficGate:
                 self._condition.notify_all()
 
     @asynccontextmanager
-    async def admit(self, *, wait_for_open: bool = True):
+    async def admit(
+        self,
+        *,
+        wait_for_open: bool = True,
+        allow_while_closed: bool | Callable[[], bool] = False,
+    ):
         async with self._condition:
             while self._closed and not self._sealed:
+                # Resolve dynamic authority only after taking the gate lock.
+                # Computing it at the call site would leave a scheduling gap
+                # where a config transition could close admission afterward.
+                may_bypass = (
+                    allow_while_closed()
+                    if callable(allow_while_closed)
+                    else allow_while_closed
+                )
+                if may_bypass:
+                    break
                 if not wait_for_open:
                     raise _TrafficGateClosedError()
                 await self._condition.wait()
@@ -2144,6 +2188,21 @@ class _ConfigTransition:
 
 
 @dataclass(frozen=True)
+class _ConfigCommitReceipt:
+    """Exact durable generation committed by one proxy config update."""
+
+    persistent: bool
+    generation: Optional[str]
+    node_id: Optional[str]
+    config: Dict[str, Any] = field(repr=False)
+    previous_config: Dict[str, Any] = field(repr=False)
+
+
+class _ConfigRevisionSuperseded(RuntimeError):
+    """A conditional rollback's config generation is no longer active."""
+
+
+@dataclass(frozen=True)
 class _ExternalIngressQuiesce:
     """One acknowledged external-producer pause owned by a config transition."""
 
@@ -2557,6 +2616,10 @@ class IsolatedRuntimePreparationError(RuntimeError):
     tenant-boundary violation.  Discovery may therefore mark the optional
     isolated feature unavailable without taking down the rest of the agent.
     """
+
+
+class IsolatedRuntimeConfigGenerationChanged(IsolatedRuntimePreparationError):
+    """A config ingress lease lost its exact client or gate generation."""
 
 
 class _IsolatedRuntimeLaunchTargetPreparationError(
@@ -6340,6 +6403,13 @@ class IsolatedFeatureTool(AgentTool):
 class ProxyFeature(Feature):
     """Feature contract adapter backed by an SDK isolated-feature client."""
 
+    # Runtime re-enable holds the agent's conversation boundary. Persist the
+    # operator-declared config while this proxy is still terminal so initialize
+    # launches the child with that config and opens ingress only afterward.
+    # Applying it after initialize can drain a callback which is itself queued
+    # on the conversation boundary, inverting those two locks.
+    _apply_host_config_before_initialize = True
+
     def __init__(
         self,
         agent: Any,
@@ -6456,6 +6526,13 @@ class ProxyFeature(Feature):
         # explicit later ``initialize()`` begins a fresh cycle.
         self._terminal_lifecycle_latched = False
         self._stopping = False
+        # Volatile privacy deliberately has no graph row from which a later
+        # enable can reload a config written while this proxy is terminal. Keep
+        # only a boolean ownership marker beside the existing in-memory config:
+        # no second secret-bearing copy is created. Initialize clears the marker
+        # only after a child has opened on that exact config, so a failed startup
+        # can retry without silently falling back to an empty generation.
+        self._volatile_terminal_config_pending_initialize = False
         # Every terminal request invalidates an initializer that has not yet
         # acquired ``_reload_lock``.  A re-enable may clear only the terminal
         # cycle it observed *after* cleanup; a shutdown racing in that queue
@@ -6470,6 +6547,13 @@ class ProxyFeature(Feature):
         # detect that a reload cycled the client around its (now-stale) probe and
         # skip restarting the freshly launched one.
         self._reloading = False
+        self._config_ingress_transition_lock = asyncio.Lock()
+        # A config PATCH closes child admission before it queues for the
+        # agent's conversation lock.  The exact live turn that owns that lock
+        # may still reach an isolated tool after the close; let only that turn
+        # finish through this finite fence so the PATCH can acquire the lock.
+        # Terminal/sealed admission remains non-bypassable in _TrafficGate.
+        self._config_ingress_live_turn_bypass_active = False
         self._reload_lock = asyncio.Lock()
         self._reload_gen = 0
         # Resolve at construction, before feature startup/discovery can turn a
@@ -7854,11 +7938,19 @@ class ProxyFeature(Feature):
             self._stopping = False
             self._idle_retired = False
             self._process_identity = None
-            # A previous enable cycle may have left an intentional empty config (or
-            # a stopped client) on this same object. A fresh initialize must never
-            # let that in-memory state stand in for the durable read below.
-            self._host_config = {}
-            self._host_config_loaded = False
+            # A previous enable cycle may have left an intentional empty config
+            # (or a stopped client) on this same object. Ordinarily a fresh
+            # initialize must not let that cache stand in for the durable read
+            # below. Volatile privacy is the one exception: a terminal config
+            # write has no durable row, so its boolean marker binds the existing
+            # in-memory value to this next child startup.
+            preserve_volatile_terminal_config = (
+                self._volatile_terminal_config_pending_initialize
+                and self._host_config_loaded
+            )
+            if not preserve_volatile_terminal_config:
+                self._host_config = {}
+                self._host_config_loaded = False
             self._prepare_runtime_workspace()
             self._venv_path, self._bin_path = self.resolve_runtime_paths()
             if self._bin_path is None:
@@ -7875,6 +7967,7 @@ class ProxyFeature(Feature):
             # A previously quarantined instance is only made reachable after its
             # fresh child was initialized from durable config.
             await self._reset_traffic_gate_after_initialize()
+            self._volatile_terminal_config_pending_initialize = False
             self._assert_child_start_allowed()
             self._supervision_task = self._start_supervision()
             self._last_used_monotonic = asyncio.get_running_loop().time()
@@ -9078,6 +9171,212 @@ class ProxyFeature(Feature):
             capability=ui.get("capability"),
         )
 
+    async def _wake_idle_for_config_transition(self) -> bool:
+        """Wake the child before ingress fencing; report a repairable failure."""
+
+        if not self._idle_retired or self._terminal_lifecycle_latched:
+            return False
+        try:
+            await self._wake_idle_runtime()
+        except (IsolatedRuntimePreparationError, _TerminalLifecyclePermitRevoked):
+            # A bad active config can be the reason the child will not wake.
+            # The config transaction may still repair that state without a
+            # client, exactly as the historical set_config path allowed.
+            return True
+        return False
+
+    def _config_ingress_lease_is_current(
+        self,
+        lease: object,
+        *,
+        require_current_client: bool,
+        require_current_task: bool,
+    ) -> bool:
+        """Whether one lease still owns this exact live ingress generation."""
+
+        if not isinstance(lease, _ConfigIngressFenceLease):
+            return False
+        if (
+            not lease.active
+            or lease.feature is not self
+            or lease.lifecycle_generation != self._terminal_lifecycle_generation
+            or lease.traffic_gate is not self._traffic_gate
+        ):
+            return False
+        if lease.requires_closed_gate and (
+            not self._traffic_gate.closed or self._traffic_gate.sealed
+        ):
+            return False
+        if require_current_client and self._client is not lease.client:
+            return False
+        if require_current_task:
+            current_task = asyncio.current_task()
+            if (
+                current_task is not lease.owner_task
+                and current_task is not lease.authorized_task
+            ):
+                return False
+        return True
+
+    def claim_config_transition_ingress_fence(self, lease: object) -> bool:
+        """Authorize the endpoint's exact conversation-bound transition task."""
+
+        if _active_config_ingress_fence.get() is not lease:
+            return False
+        if not self._config_ingress_lease_is_current(
+            lease,
+            require_current_client=True,
+            require_current_task=False,
+        ):
+            return False
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        if (
+            lease.authorized_task is not None
+            and lease.authorized_task is not current_task
+        ):
+            return False
+        lease.authorized_task = current_task
+        return True
+
+    def _config_fence_allows_live_turn_tool(self) -> bool:
+        """Whether this caller may finish through the finite config fence."""
+
+        if not self._config_ingress_live_turn_bypass_active:
+            return False
+        belongs_to_live_turn = getattr(
+            self.agent, "_caller_belongs_to_live_turn", None
+        )
+        if not callable(belongs_to_live_turn):
+            return False
+        try:
+            return bool(belongs_to_live_turn())
+        except Exception:  # noqa: BLE001 - authorization fails closed
+            return False
+
+    @asynccontextmanager
+    async def config_transition_ingress_fence(self):
+        """Drain isolated ingress before the endpoint takes CONVERSATION.
+
+        The generic endpoint holds this boundary through config persistence,
+        context-clause publication, and any rollback. Its owned transition task
+        inherits and explicitly claims the task-local lease, so
+        :meth:`set_config` reuses this fence instead of attempting a traffic
+        drain while it owns the agent's turn lock.
+        """
+
+        inherited = _active_config_ingress_fence.get()
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                yield inherited
+                return
+            if inherited.active:
+                raise IsolatedRuntimeConfigGenerationChanged(
+                    "Isolated feature changed during config ingress transition."
+                )
+
+        async with self._config_ingress_transition_lock:
+            idle_wake_failed = await self._wake_idle_for_config_transition()
+            if self._terminal_lifecycle_latched or self._stopping:
+                lease = _ConfigIngressFenceLease(
+                    feature=self,
+                    lifecycle_generation=self._terminal_lifecycle_generation,
+                    client=self._client,
+                    traffic_gate=self._traffic_gate,
+                    owner_task=asyncio.current_task(),
+                    idle_wake_failed=idle_wake_failed,
+                    requires_closed_gate=False,
+                )
+                token = _active_config_ingress_fence.set(lease)
+                try:
+                    yield lease
+                finally:
+                    lease.active = False
+                    _active_config_ingress_fence.reset(token)
+                return
+
+            external_ingress_quiesce = self._new_external_ingress_quiesce()
+            gate_closed = False
+            body_error: BaseException | None = None
+            token = None
+            lease = None
+            try:
+                if external_ingress_quiesce is not None:
+                    await self._quiesce_external_ingress(
+                        external_ingress_quiesce
+                    )
+                self._config_ingress_live_turn_bypass_active = True
+                gate_closed = True
+                await self._close_traffic_gate_admission()
+                await self._drain_traffic_gate()
+                lease = _ConfigIngressFenceLease(
+                    feature=self,
+                    lifecycle_generation=self._terminal_lifecycle_generation,
+                    client=self._client,
+                    traffic_gate=self._traffic_gate,
+                    owner_task=asyncio.current_task(),
+                    idle_wake_failed=idle_wake_failed,
+                    requires_closed_gate=True,
+                )
+                token = _active_config_ingress_fence.set(lease)
+                try:
+                    yield lease
+                except BaseException as exc:  # noqa: BLE001 - body outcome wins
+                    body_error = exc
+                    raise
+                finally:
+                    lease.active = False
+                    _active_config_ingress_fence.reset(token)
+                    token = None
+            except BaseException as exc:  # noqa: BLE001 - finalizer still owns gate
+                if body_error is None:
+                    body_error = exc
+                raise
+            finally:
+                if token is not None:
+                    if lease is not None:
+                        lease.active = False
+                    _active_config_ingress_fence.reset(token)
+
+                async def finalize() -> None:
+                    nonlocal gate_closed
+                    try:
+                        if self._fenced_recovery_failed:
+                            await self._quarantine_unreconciled_client(
+                                lifecycle_lock_held=False
+                            )
+                        if (
+                            external_ingress_quiesce is not None
+                            and not gate_closed
+                        ):
+                            gate_closed = True
+                            await self._close_traffic_gate_admission()
+                            await self._drain_traffic_gate()
+                        if gate_closed:
+                            await self._finalize_external_ingress_transition(
+                                external_ingress_quiesce
+                            )
+                    finally:
+                        self._config_ingress_live_turn_bypass_active = False
+
+                finalizer = asyncio.create_task(
+                    finalize(),
+                    name=f"isolated-config-ingress-finalize:{self.name}",
+                )
+                try:
+                    await _await_task_until_complete(
+                        finalizer,
+                        preserve_cancellation=body_error is not None,
+                    )
+                except BaseException:  # noqa: BLE001 - preserve body outcome
+                    if body_error is None:
+                        raise
+
     async def get_config(self) -> Dict:
         """Return the feature's current host config.
 
@@ -9123,7 +9422,59 @@ class ProxyFeature(Feature):
         *,
         _preserve_secret_fields: set[str] | None = None,
         _validate_effective_config: Callable[[Dict[str, Any]], None] | None = None,
-    ) -> None:
+        _expected_commit: _ConfigCommitReceipt | None = None,
+    ) -> _ConfigCommitReceipt:
+        """Serialize direct writers or reuse the endpoint's ingress fence."""
+
+        inherited = _active_config_ingress_fence.get()
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                inherited.transition_started = True
+                try:
+                    return await self._set_config_under_ingress_boundary(
+                        config,
+                        _preserve_secret_fields=_preserve_secret_fields,
+                        _validate_effective_config=_validate_effective_config,
+                        _expected_commit=_expected_commit,
+                        _ingress_fenced=True,
+                        _idle_wake_failed=inherited.idle_wake_failed,
+                    )
+                finally:
+                    # Re-arm exact-client validation for any later operation
+                    # in the same outer fence. During the call, reconciliation
+                    # may legitimately replace the client while the lease owns
+                    # the still-closed gate.
+                    inherited.client = self._client
+                    inherited.transition_started = False
+            if inherited.active:
+                # Waiting for the lock here would deadlock with the outer task
+                # that owns it. Fail closed; the endpoint returns a retryable
+                # generation conflict after the outer boundary unwinds.
+                raise IsolatedRuntimeConfigGenerationChanged(
+                    "Isolated feature changed during config ingress transition."
+                )
+        async with self._config_ingress_transition_lock:
+            return await self._set_config_under_ingress_boundary(
+                config,
+                _preserve_secret_fields=_preserve_secret_fields,
+                _validate_effective_config=_validate_effective_config,
+                _expected_commit=_expected_commit,
+            )
+
+    async def _set_config_under_ingress_boundary(
+        self,
+        config: Dict,
+        *,
+        _preserve_secret_fields: set[str] | None = None,
+        _validate_effective_config: Callable[[Dict[str, Any]], None] | None = None,
+        _expected_commit: _ConfigCommitReceipt | None = None,
+        _ingress_fenced: bool = False,
+        _idle_wake_failed: bool | None = None,
+    ) -> _ConfigCommitReceipt:
         """Persist an effective config and apply it to the running service.
 
         The previous implementation forwarded to ``self._client.set_config`` —
@@ -9159,25 +9510,40 @@ class ProxyFeature(Feature):
         # Idle retirement removes only the process, not the feature's lifecycle
         # contract. Recreate that child before staging so a negotiated
         # transition validator cannot be bypassed by ``_client is None``.
-        idle_wake_failed = False
-        if self._idle_retired and not self._terminal_lifecycle_latched:
-            try:
-                await self._wake_idle_runtime()
-            except (IsolatedRuntimePreparationError, _TerminalLifecyclePermitRevoked):
-                # An unstartable child may be unstartable *because* its active
-                # config is bad. Re-evaluate under the lifecycle lock: terminal
-                # repair remains permitted, and a still-clientless idle feature
-                # can use the existing staged repair path without bypassing a
-                # live negotiated hook.
-                idle_wake_failed = True
+        idle_wake_failed = (
+            await self._wake_idle_for_config_transition()
+            if _idle_wake_failed is None
+            else _idle_wake_failed
+        )
         async with self._reload_lock:
+            if _ingress_fenced:
+                # The endpoint validates its lease before entering this helper,
+                # but reload/recovery owns the same lifecycle lock and may have
+                # replaced the client and reopened the gate while this setter
+                # was queued. Re-prove the exact client/gate generation only
+                # after acquiring the lock that excludes those owners. From
+                # here until transition settlement, no reload can invalidate
+                # that proof underneath the inherited closed-ingress boundary.
+                inherited = _active_config_ingress_fence.get()
+                if (
+                    not isinstance(inherited, _ConfigIngressFenceLease)
+                    or not inherited.transition_started
+                    or not self._config_ingress_lease_is_current(
+                        inherited,
+                        require_current_client=True,
+                        require_current_task=True,
+                    )
+                ):
+                    raise IsolatedRuntimeConfigGenerationChanged(
+                        "Isolated feature changed during config ingress transition."
+                    )
             if self._terminal_lifecycle_latched:
-                await self._persist_terminal_config(
+                return await self._persist_terminal_config(
                     cfg,
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
+                    expected_commit=_expected_commit,
                 )
-                return
             if self._idle_retired and not idle_wake_failed:
                 # A very short idle deadline can retire again between the wake
                 # and this lock acquisition. Refuse this attempt rather than
@@ -9216,6 +9582,7 @@ class ProxyFeature(Feature):
                     cfg,
                     preserve_secret_fields=_preserve_secret_fields,
                     validate_effective_config=_validate_effective_config,
+                    expected_commit=_expected_commit,
                 )
                 # A scoped compare-and-create cannot atomically exclude an old
                 # binary's independent legacy write.  Fence the exact staged
@@ -9251,7 +9618,7 @@ class ProxyFeature(Feature):
                     local_authoritative = True
                     if promotion.error is not None:
                         self._raise_promotion_failure(promotion)
-                    return
+                    return self._config_commit_receipt(transition)
 
                 # Quiesce the exact external producer while Core admission is
                 # still open. A callback already written into the bridge may
@@ -9259,14 +9626,21 @@ class ProxyFeature(Feature):
                 # that callback with the producer quiesce wait. The exact
                 # lifecycle RPC remains identity-fenced and bypasses the
                 # normal data-plane gate, so it cannot admit new work.
-                external_ingress_quiesce = self._new_external_ingress_quiesce()
-                if external_ingress_quiesce is not None:
-                    await self._quiesce_external_ingress(external_ingress_quiesce)
-                # Once the producer has confirmed its pause, close admission
-                # and drain every callback that crossed the prior boundary.
-                gate_closed = True
-                await self._close_traffic_gate_admission()
-                await self._drain_traffic_gate()
+                if not _ingress_fenced:
+                    external_ingress_quiesce = (
+                        self._new_external_ingress_quiesce()
+                    )
+                    if external_ingress_quiesce is not None:
+                        await self._quiesce_external_ingress(
+                            external_ingress_quiesce
+                        )
+                    # Once the producer has confirmed its pause, close
+                    # admission and drain every callback that crossed the prior
+                    # boundary. The endpoint-owned path already completed this
+                    # ordering before taking the agent turn lock.
+                    gate_closed = True
+                    await self._close_traffic_gate_admission()
+                    await self._drain_traffic_gate()
 
                 await self._reconcile_client_to_authoritative_config(
                     transition.active_config,
@@ -9291,7 +9665,7 @@ class ProxyFeature(Feature):
                     local_authoritative = True
                     if promotion.error is not None:
                         self._raise_promotion_failure(promotion)
-                    return
+                    return self._config_commit_receipt(transition)
 
                 if self._supports_config_transition():
                     # Staging precedes local reconciliation so every replica
@@ -9459,6 +9833,22 @@ class ProxyFeature(Feature):
                     self._end_reload()
                 if finalizer_error is not None and body_error is None:
                     raise finalizer_error
+            assert transition is not None
+            return self._config_commit_receipt(transition)
+
+    @staticmethod
+    def _config_commit_receipt(
+        transition: _ConfigTransition,
+    ) -> _ConfigCommitReceipt:
+        """Create the rollback capability for one successfully promoted write."""
+
+        return _ConfigCommitReceipt(
+            persistent=transition.persistent,
+            generation=transition.generation,
+            node_id=transition.config_node_id,
+            config=dict(transition.next_config),
+            previous_config=dict(transition.active_config),
+        )
 
     async def _persist_terminal_config(
         self,
@@ -9466,7 +9856,8 @@ class ProxyFeature(Feature):
         *,
         preserve_secret_fields: set[str] | None,
         validate_effective_config: Callable[[Dict[str, Any]], None] | None,
-    ) -> None:
+        expected_commit: _ConfigCommitReceipt | None,
+    ) -> _ConfigCommitReceipt:
         """Durably repair config without reviving a terminal enable cycle.
 
         A loaded soft-disabled feature retains its proxy so the config API can
@@ -9489,6 +9880,7 @@ class ProxyFeature(Feature):
                 config,
                 preserve_secret_fields=preserve_secret_fields,
                 validate_effective_config=validate_effective_config,
+                expected_commit=expected_commit,
             )
             promotion = await self._promote_config(transition)
             if not promotion.committed:
@@ -9502,11 +9894,18 @@ class ProxyFeature(Feature):
 
             transition_settled = True
             # There is no applied child to keep in sync.  This is the durable
-            # config that a later explicit initialize will load.
+            # config that a later explicit initialize will load. Volatile
+            # privacy has no durable row, so retain a boolean marker telling the
+            # next initialize to use this existing in-memory value instead of
+            # clearing it. The value itself is not duplicated.
             self._host_config = dict(transition.next_config)
             self._host_config_loaded = True
+            self._volatile_terminal_config_pending_initialize = (
+                not transition.persistent
+            )
             if promotion.error is not None:
                 self._raise_promotion_failure(promotion)
+            return self._config_commit_receipt(transition)
         except BaseException:
             if transition is not None and not transition_settled:
                 await self._run_owned_transition_cleanup(
@@ -9521,7 +9920,7 @@ class ProxyFeature(Feature):
         incoming: Dict[str, Any],
         secret_fields: set[str],
         validate: Callable[[Dict[str, Any]], None],
-    ) -> None:
+    ) -> _ConfigCommitReceipt:
         """Atomically preserve omitted write-only fields for the generic API.
 
         The endpoint must not read a secret on one hosted replica and later
@@ -9531,10 +9930,31 @@ class ProxyFeature(Feature):
         value before the lifecycle hook can observe it.
         """
 
-        await self.set_config(
+        return await self.set_config(
             incoming,
             _preserve_secret_fields=set(secret_fields),
             _validate_effective_config=validate,
+        )
+
+    async def rollback_config_transition(
+        self,
+        commit: _ConfigCommitReceipt,
+    ) -> _ConfigCommitReceipt:
+        """Restore this commit's CAS predecessor only while it is still active.
+
+        Another hosted replica may publish a newer config while the endpoint
+        renders context for this one.  Passing the original generation into
+        the stage CAS makes that newer durable winner a hard fence rather than
+        data that an unconditional rollback can overwrite.  The predecessor
+        comes from this transition's fresh stage snapshot, never the endpoint's
+        potentially stale read.
+        """
+
+        if not isinstance(commit, _ConfigCommitReceipt):
+            raise TypeError("isolated config rollback requires a commit receipt")
+        return await self.set_config(
+            commit.previous_config,
+            _expected_commit=commit,
         )
 
     async def _run_owned_transition_cleanup(
@@ -9604,7 +10024,7 @@ class ProxyFeature(Feature):
                     self._host_config = dict(state.config)
                     self._host_config_loaded = True
                     return
-                await self._reconcile_client_to_authoritative_config(
+                await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                     state.config,
                     force=True,
                 )
@@ -9843,6 +10263,7 @@ class ProxyFeature(Feature):
         *,
         preserve_secret_fields: set[str] | None = None,
         validate_effective_config: Callable[[Dict[str, Any]], None] | None = None,
+        expected_commit: _ConfigCommitReceipt | None = None,
     ) -> _ConfigTransition:
         """CAS-stage one candidate from a fresh authoritative graph snapshot.
 
@@ -9870,6 +10291,14 @@ class ProxyFeature(Feature):
                     effective_pending_config[key] = self._host_config[key]
             if validate_effective_config is not None:
                 validate_effective_config(dict(effective_pending_config))
+            if expected_commit is not None and (
+                expected_commit.persistent
+                or self._host_config != expected_commit.config
+            ):
+                raise _ConfigRevisionSuperseded(
+                    f"Cannot roll back config for isolated feature {self.name}: "
+                    "the active config changed"
+                )
             return _ConfigTransition(
                 active_config=dict(self._host_config),
                 next_config=effective_pending_config,
@@ -9891,9 +10320,25 @@ class ProxyFeature(Feature):
                     storage,
                     fence_cached_scoped_authority=True,
                 )
+                if expected_commit is not None and (
+                    not expected_commit.persistent
+                    or state.has_pending
+                    or state.node_id != expected_commit.node_id
+                    or (state.properties or {}).get(_CONFIG_GENERATION_KEY)
+                    != expected_commit.generation
+                    or state.config != expected_commit.config
+                ):
+                    await self._reconcile_client_to_authoritative_config_with_ingress_fence(
+                        state.config,
+                        force=False,
+                    )
+                    raise _ConfigRevisionSuperseded(
+                        f"Cannot roll back config for isolated feature {self.name}: "
+                        "a newer durable config transition is visible"
+                    )
                 if state.has_pending:
                     if not self._pending_lease_is_expired(state):
-                        await self._reconcile_client_to_authoritative_config(
+                        await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                             state.config,
                             force=False,
                         )
@@ -10021,7 +10466,7 @@ class ProxyFeature(Feature):
                     # have no newer readable predicate and must fail closed.
                     continue
 
-                await self._reconcile_client_to_authoritative_config(
+                await self._reconcile_client_to_authoritative_config_with_ingress_fence(
                     observed.config,
                     force=False,
                 )
@@ -10662,6 +11107,89 @@ class ProxyFeature(Feature):
             raise
         self._host_config = authoritative_config
         self._host_config_loaded = True
+
+    async def _reconcile_client_to_authoritative_config_with_ingress_fence(
+        self,
+        config: Dict[str, Any],
+        *,
+        force: bool,
+    ) -> None:
+        """Fence external producers and Core admission around reconciliation.
+
+        A fresh durable read can discover a winner before this replica stages
+        anything (for example, a superseded rollback receipt or another live
+        pending generation).  Replacing the stale child directly from that
+        read would bypass the normal config-transition boundary and let an
+        external producer emit through a child while it is being retired.
+
+        This helper owns the same producer-quiesce -> admission-close -> drain
+        ordering as the ordinary transition body.  The whole boundary runs in
+        a shielded task so caller cancellation cannot release ``_reload_lock``
+        with a paused producer or half-mutated gate left behind.
+        """
+
+        inherited = _active_config_ingress_fence.get()
+        if inherited is not None and inherited.feature is self:
+            if self._config_ingress_lease_is_current(
+                inherited,
+                require_current_client=not inherited.transition_started,
+                require_current_task=True,
+            ):
+                task = asyncio.create_task(
+                    self._reconcile_client_to_authoritative_config(
+                        config,
+                        force=force,
+                    ),
+                    name=f"isolated-config-reconcile-owned:{self.name}",
+                )
+                await _await_task_until_complete(task, preserve_cancellation=False)
+                return
+            if inherited.active:
+                raise IsolatedRuntimePreparationError(
+                    "Isolated feature changed during config ingress transition."
+                )
+
+        async def reconcile() -> None:
+            external_ingress_quiesce = self._new_external_ingress_quiesce()
+            gate_closed = False
+            body_error: BaseException | None = None
+            try:
+                if external_ingress_quiesce is not None:
+                    await self._quiesce_external_ingress(external_ingress_quiesce)
+                gate_closed = True
+                await self._close_traffic_gate_admission()
+                await self._drain_traffic_gate()
+                await self._reconcile_client_to_authoritative_config(
+                    config,
+                    force=force,
+                )
+            except BaseException as exc:  # noqa: BLE001 - body outcome wins below
+                body_error = exc
+                raise
+            finally:
+                finalizer_error: BaseException | None = None
+                try:
+                    # A lifecycle cancellation/error can arrive after the
+                    # producer paused but before the normal gate close. Finish
+                    # the same boundary before resuming or quarantining it.
+                    if external_ingress_quiesce is not None and not gate_closed:
+                        gate_closed = True
+                        await self._close_traffic_gate_admission()
+                        await self._drain_traffic_gate()
+                    if gate_closed:
+                        await self._finalize_external_ingress_transition(
+                            external_ingress_quiesce
+                        )
+                except BaseException as exc:  # noqa: BLE001 - body outcome wins above
+                    finalizer_error = exc
+                if finalizer_error is not None and body_error is None:
+                    raise finalizer_error
+
+        task = asyncio.create_task(
+            reconcile(),
+            name=f"isolated-config-reconcile-fence:{self.name}",
+        )
+        await _await_task_until_complete(task, preserve_cancellation=False)
 
     def _assert_child_start_allowed(self) -> None:
         """Refuse normal child-lifecycle work after terminal cleanup starts."""
@@ -11318,7 +11846,9 @@ class ProxyFeature(Feature):
         try:
             while True:
                 wake_idle = False
-                async with self._traffic_gate.admit():
+                async with self._traffic_gate.admit(
+                    allow_while_closed=self._config_fence_allows_live_turn_tool
+                ):
                     if self._client is None and self._idle_retired:
                         wake_idle = True
                     else:

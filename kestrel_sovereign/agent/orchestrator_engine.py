@@ -682,6 +682,15 @@ class OrchestratorEngineMixin:
         # transport parameter, logging context, or agent-global session. The
         # binding is explicitly empty when this executor was built off-turn.
         turn_session_binding = capture_turn_session_binding(self)
+        # Caller authority follows the same cross-task rule as the turn/session
+        # binding, but its lifetime is endpoint-owned and revocable.  Capture
+        # the binding object rather than the CallerContext value: callbacks on
+        # the long-lived Codex reader may re-present it only while the endpoint
+        # generator remains alive, and an executor built without a caller
+        # explicitly clears whatever authority the reader task inherited.
+        from kestrel_sovereign.auth import capture_caller_context_binding
+
+        turn_caller_binding = capture_caller_context_binding()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -689,9 +698,12 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
+            from kestrel_sovereign.auth import caller_context_binding_scope
+
             with bind_part_collector(turn_part_collector), \
                     bind_transition_lock_reentry(transition_reentry_token), \
-                    bind_turn_session(turn_session_binding):
+                    bind_turn_session(turn_session_binding), \
+                    caller_context_binding_scope(turn_caller_binding):
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,

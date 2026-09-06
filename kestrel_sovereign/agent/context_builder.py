@@ -15,21 +15,25 @@ import json
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from .token_counter import TokenCounter, get_token_counter
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+from .system_prompt_assembler import (
+    LEGACY_MANDATORY_SYSTEM_SUBSECTIONS,
+    legacy_bootstrap_audit_name,
+)
+from .token_counter import TokenCounter, get_token_counter
 
 
 # Per-message overhead used by format_conversation_history and the
 # effective-history estimator.
 _MESSAGE_OVERHEAD = 4
 
-# Subsection names that count as mandatory governance content for the
-# #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). The rest
-# of ``_collect_system_prompt_parts``'s output (session_briefing, style
-# reminder, additional_context, addenda, etc.) is optional and lives
-# under the borrowable system budget.
+# Legacy-renderer subsection names that count as mandatory governance content
+# for the #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). Tracked
+# rendering selects host clauses by canonical audit name instead so feature
+# context cannot acquire authority by copying one of these legacy group names.
 #
 # Bootstrap-file subsections use the ``bootstrap_<stem>`` naming
 # convention from ``_collect_system_prompt_parts``; AGENTS.md is
@@ -37,9 +41,7 @@ _MESSAGE_OVERHEAD = 4
 # ``soul`` subsection). Everything else is optional unless the agent
 # config promotes it later — a follow-up can let the operator declare
 # additional mandatory subsections per-agent.
-MANDATORY_SYSTEM_SUBSECTIONS = frozenset(
-    {"constitution", "soul", "bootstrap_agents", "state_of_mind"}
-)
+MANDATORY_SYSTEM_SUBSECTIONS = LEGACY_MANDATORY_SYSTEM_SUBSECTIONS
 
 
 def _count_tool_schema_tokens(
@@ -130,6 +132,7 @@ class ContextBuilder:
         semantic_inference_limits=None,
         semantic_maintenance_limits=None,
         semantic_answerability_gate=None,
+        context_clause_registry=None,
     ):
         """
         Initialize the context builder.
@@ -161,6 +164,9 @@ class ContextBuilder:
         self._semantic_answerability_gate = semantic_answerability_gate
         self.last_semantic_recall_metadata: Dict[str, Any] = {"status": "disabled"}
         self.agent_data_path = Path(agent_data_path) if agent_data_path else None
+        # This is a core-owned cache of immutable rendered bytes. Reading its
+        # snapshot during a turn never invokes a feature getter or renderer.
+        self._context_clause_registry = context_clause_registry
 
         # Load bootstrap config from kestrel.toml
         max_chars_per_file = DEFAULT_MAX_CHARS_PER_FILE
@@ -190,10 +196,38 @@ class ContextBuilder:
             max_total_chars=max_total_chars,
             db=db,
             agent_id=agent_id,
+            audit_name_validator=self._validate_bootstrap_audit_names,
         )
+
+        bind_reserved_names = getattr(
+            self._context_clause_registry,
+            "bind_reserved_audit_name_provider",
+            None,
+        )
+        if callable(bind_reserved_names):
+            bind_reserved_names(lambda: self._bootstrap_loader.file_order)
+        self._validate_bootstrap_audit_names()
 
         # Load all bootstrap files (includes SOUL.md)
         self._bootstrap_loader.load()
+
+    def _validate_bootstrap_audit_names(
+        self, names=None
+    ) -> None:
+        """Preflight bootstrap names against host and feature audit owners."""
+
+        from kestrel_sovereign.features.contribution_runtime import (
+            validate_bootstrap_audit_namespace,
+        )
+
+        values, _prospective_audit_names = validate_bootstrap_audit_namespace(
+            self._bootstrap_loader.file_order if names is None else names
+        )
+
+        registry = getattr(self, "_context_clause_registry", None)
+        validator = getattr(registry, "validate_reserved_audit_names", None)
+        if callable(validator):
+            validator(values)
 
     async def load_bootstrap_db_config(self) -> None:
         """Merge DB-backed bootstrap config into the loader (#2135, F099).
@@ -207,6 +241,7 @@ class ContextBuilder:
         regression.
         """
         await self._bootstrap_loader.load_db_config()
+        self._validate_bootstrap_audit_names()
         # load_db_config() invalidates the cache; re-read now so the first
         # system-prompt assembly sees the merged file set.
         self._bootstrap_loader.load()
@@ -856,7 +891,9 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 )
             else:
                 label = filename.replace(".md", "").upper()
-                subsection = f"bootstrap_{filename.replace('.md', '').lower()}"
+                subsection = legacy_bootstrap_audit_name(filename)
+                if subsection is None:  # HEARTBEAT.md is excluded above.
+                    continue
                 groups.append(
                     (
                         subsection,
@@ -936,10 +973,87 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 )
             )
 
+        for clause in self._resolved_context_clauses():
+            if clause.body:
+                groups.append((clause.name, [clause.body]))
+
         if system_prompt_addendum:
             groups.append(("system_prompt_addendum", [system_prompt_addendum]))
 
         return groups
+
+    def _resolved_context_clauses(self):
+        registry = getattr(self, "_context_clause_registry", None)
+        if registry is None:
+            return ()
+        return tuple(clause for clause in registry.snapshot() if clause.body)
+
+    def has_context_clauses(self) -> bool:
+        """Whether an immutable contributed-context snapshot is non-empty."""
+
+        return bool(self._resolved_context_clauses())
+
+    @staticmethod
+    def _join_system_prompt_groups(
+        groups: List[Tuple[str, List[str]]],
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        subsections = [
+            (name, "\n\n".join(parts)) for name, parts in groups
+        ]
+        return (
+            "\n\n".join(body for _name, body in subsections),
+            subsections,
+        )
+
+    def build_system_prompt_with_subsections(
+        self,
+        constitution: str,
+        include_briefing: bool = True,
+        additional_context: Optional[str] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional['StateOfMind'] = None,
+        system_prompt_addendum: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        """Build once and retain the exact subsection bodies for accounting."""
+
+        resolved_context_clauses = self._resolved_context_clauses()
+        if resolved_context_clauses:
+            if max_tokens is None:
+                from .token_budget import RESPONSE_RESERVE
+
+                max_tokens = max(
+                    1,
+                    self.counter.get_context_limit() - RESPONSE_RESERVE,
+                )
+            tracked = self.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                additional_context=additional_context,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_tokens=max_tokens,
+                required_suffix=system_prompt_addendum,
+                _resolved_context_clauses=resolved_context_clauses,
+            )
+            prompt = tracked.prompt
+            subsections = list(tracked.subsections)
+            if system_prompt_addendum:
+                prompt = f"{prompt}\n\n{system_prompt_addendum}"
+                subsections.append(
+                    ("system_prompt_addendum", system_prompt_addendum)
+                )
+            return prompt, subsections
+
+        groups = self._collect_system_prompt_parts(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            additional_context=additional_context,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
+        )
+        return self._join_system_prompt_groups(groups)
 
     def measure_mandatory_system_tokens(
         self,
@@ -947,13 +1061,16 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         *,
         state_of_mind: Optional["StateOfMind"] = None,
         prompt_adaptation: Optional["PromptAdaptation"] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        required_suffix: Optional[str] = None,
+        tracked_prompt: bool = False,
     ) -> int:
         """Measured non-borrowable floor for the #1309 elastic budget.
 
-        Sums the tokens of the mandatory subsections — constitution,
+        Sums the tokens of the mandatory host clauses — constitution,
         identity (SOUL.md), operator policy (AGENTS.md), and any
-        active state-of-mind block — as joined by
-        ``_collect_system_prompt_parts``. The result is what the
+        active state-of-mind block — using the same tracked assembler that
+        emits them. The result is what the
         ``ElasticTokenBudget`` carves out as a non-borrowable hard
         floor (Emma's 2026-05-20 hardening). Optional system content
         (session briefing, style reminder, addenda, etc.) is excluded
@@ -965,6 +1082,13 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 floor when present (governance signaling).
             prompt_adaptation: Optional preamble; not currently part
                 of the mandatory floor.
+            anchored_doctrine: Effective per-turn doctrine. An anchored
+                SOUL.md or AGENTS.md replaces its bootstrap counterpart.
+            required_suffix: Non-droppable per-turn suffix whose exact joined
+                cost must also be reserved.
+            tracked_prompt: Force the priority-aware renderer used by callers
+                with an explicit prompt budget. Anchors and active feature
+                context select it automatically.
 
         Returns:
             Token count for the mandatory subsections, including the
@@ -972,18 +1096,49 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             assembled prompt — so the floor reflects what the LLM
             actually receives.
         """
-        groups = self._collect_system_prompt_parts(
-            constitution=constitution,
-            include_briefing=False,  # briefing is optional
-            additional_context=None,  # optional
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind,
-            system_prompt_addendum=None,  # optional
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            AGENTS_FILENAME,
+            CLAUSE_KESTREL_CONSTITUTION,
+            CLAUSE_STATE_OF_MIND,
         )
-        mandatory_parts: List[str] = []
-        for name, parts in groups:
-            if name in MANDATORY_SYSTEM_SUBSECTIONS:
-                mandatory_parts.extend(parts)
+
+        if tracked_prompt or anchored_doctrine or self.has_context_clauses():
+            tracked = self.build_system_prompt_with_tracking(
+                constitution=constitution,
+                anchored_doctrine=anchored_doctrine,
+                include_briefing=False,
+                additional_context=None,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                required_suffix=required_suffix,
+                _resolved_context_clauses=(),
+            )
+            mandatory_names = {
+                CLAUSE_KESTREL_CONSTITUTION,
+                "SOUL.md",
+                AGENTS_FILENAME,
+                CLAUSE_STATE_OF_MIND,
+            }
+            mandatory_parts = [
+                body
+                for name, body in tracked.subsections
+                if name in mandatory_names
+            ]
+        else:
+            groups = self._collect_system_prompt_parts(
+                constitution=constitution,
+                include_briefing=False,
+                additional_context=None,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=None,
+            )
+            mandatory_parts = []
+            for name, parts in groups:
+                if name in MANDATORY_SYSTEM_SUBSECTIONS:
+                    mandatory_parts.extend(parts)
+        if required_suffix:
+            mandatory_parts.append(required_suffix)
         if not mandatory_parts:
             return 0
         return self.counter.count("\n\n".join(mandatory_parts))
@@ -996,6 +1151,7 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         prompt_adaptation: Optional['PromptAdaptation'] = None,
         state_of_mind: Optional['StateOfMind'] = None,
         system_prompt_addendum: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """
         Build the complete system prompt for the LLM.
@@ -1027,16 +1183,16 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         # this method and ``measure_context_breakdown`` read from
         # ``_collect_system_prompt_parts`` so per-subsection attribution
         # cannot drift from the assembled bytes.
-        groups = self._collect_system_prompt_parts(
+        prompt, _subsections = self.build_system_prompt_with_subsections(
             constitution=constitution,
             include_briefing=include_briefing,
             additional_context=additional_context,
             prompt_adaptation=prompt_adaptation,
             state_of_mind=state_of_mind,
             system_prompt_addendum=system_prompt_addendum,
+            max_tokens=max_tokens,
         )
-        flat_parts: List[str] = [p for _, parts in groups for p in parts]
-        return "\n\n".join(flat_parts)
+        return prompt
 
     def build_system_prompt_with_tracking(
         self,
@@ -1048,6 +1204,9 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         prompt_adaptation: Optional['PromptAdaptation'] = None,
         state_of_mind: Optional['StateOfMind'] = None,
         budget_bytes: Optional[int] = None,
+        budget_tokens: Optional[int] = None,
+        required_suffix: Optional[str] = None,
+        _resolved_context_clauses=None,
     ) -> 'SystemPromptResult':
         """Priority-aware variant that returns the prompt + audit trail.
 
@@ -1063,10 +1222,11 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
         `AGENTS.md`, etc.). When present, AGENTS.md is excluded from
         bootstrap iteration to avoid duplication.
 
-        `budget_bytes` enforces priority-ordered truncation. The
-        constitution is never droppable; everything else is dropped
-        highest-priority-number first until the assembled UTF-8 byte
-        length fits.
+        ``budget_bytes`` and ``budget_tokens`` enforce priority-ordered
+        truncation. Mandatory governance clauses are never droppable; optional
+        clauses are dropped highest-priority-number first until every supplied
+        ceiling fits. ``required_suffix`` reserves an exact non-droppable tail
+        such as a signal canary without adding it to the clause audit trail.
 
         See `kestrel_sovereign/agent/system_prompt_assembler.py` for
         the priority table (mirrors CONSTITUTION_INJECTION.md §7).
@@ -1109,6 +1269,11 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
                 "--- END REMINDER ---"
             )
 
+        resolved_context_clauses = (
+            self._resolved_context_clauses()
+            if _resolved_context_clauses is None
+            else tuple(_resolved_context_clauses)
+        )
         return assemble_system_prompt(
             constitution=constitution,
             bootstrap_files=self._bootstrap_files,
@@ -1124,7 +1289,14 @@ Use `!constitution book <I-IV>`, `!constitution chapter <N>`, `!constitution ame
             state_of_mind_block=state_of_mind_block,
             style_reminder=style_reminder,
             additional_context=additional_context,
+            context_clauses=tuple(
+                (clause.owner, clause.name, clause.priority, clause.body)
+                for clause in resolved_context_clauses
+            ),
             budget_bytes=budget_bytes,
+            budget_tokens=budget_tokens,
+            count_tokens=self.counter.count if budget_tokens is not None else None,
+            required_suffix=required_suffix,
         )
 
     async def build_rag_context(

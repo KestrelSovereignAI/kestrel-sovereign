@@ -357,6 +357,55 @@ class SourceRegistry:
                 removed.append(name)
         return tuple(removed)
 
+    def quarantine_claims(
+        self,
+        owner,
+        registrations: Iterable[SourceRegistration],
+        role: str = CLAIM_CONTRIBUTION,
+    ) -> tuple[str, ...]:
+        """Release exact drifted claims without deleting replacement sources.
+
+        The ordinary ownership inverse removes the resident source when its
+        final claim is released. Recovery additionally knows the exact source
+        objects declared by the lifecycle. If the claim ledger is already
+        absent, an exact unheld resident is still removed. If a different,
+        non-equivalent object now occupies that name, release the stale claim
+        but preserve the replacement.
+        """
+
+        if owner is None:
+            raise TypeError("quarantine owner must not be None")
+        normalized_role = _claim_role_for(owner, role)
+        values = tuple(registrations)
+        if any(not isinstance(item, SourceRegistration) for item in values):
+            raise TypeError(
+                "quarantine registrations must be SourceRegistration values"
+            )
+        names = [registration.name for registration in values]
+        if len(set(names)) != len(names):
+            raise RegistrationError(
+                "duplicate source name in quarantine registration set"
+            )
+        key = (id(owner), normalized_role)
+        released = []
+        for registration in values:
+            holders = self._claims.get(registration.name)
+            if holders and key not in holders:
+                continue
+            if holders:
+                holders.remove(key)
+                released.append(registration.name)
+            if not holders:
+                self._claims.pop(registration.name, None)
+                resident = self._sources.get(registration.name)
+                if resident is registration or (
+                    resident is not None
+                    and self.contract_equivalent(resident, registration)
+                ):
+                    self._sources.pop(registration.name, None)
+        self._forget_owner_if_unreferenced(key)
+        return tuple(released)
+
     def unregister(self, name: str) -> bool:
         """Remove a source by name. Returns True if one was present.
 

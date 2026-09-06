@@ -85,6 +85,8 @@ class TaskWorker:
         max_concurrent: int = 5,
         max_retries: int = 3,
         retry_delay: float = 5.0,
+        *,
+        recipient_agent_id: Optional[str] = None,
     ):
         """
         Initialize the task worker.

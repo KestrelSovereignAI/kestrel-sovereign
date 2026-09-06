@@ -47,6 +47,7 @@ def _make_feature(enabled=True):
     feature.enabled = enabled
     feature.on_enable = AsyncMock()
     feature.on_disable = AsyncMock()
+    feature.on_agent_ready = AsyncMock()
     return feature
 
 
@@ -84,7 +85,9 @@ def _make_agent(features=None):
                 agent.hooks_manager.unregister(hook)
         feature.enabled = False
 
-    async def _activate_feature_runtime(feature, *, prepared_contributions=None):
+    async def _activate_feature_runtime(
+        feature, *, prepared_contributions=None, notify_ready=True
+    ):
         if prepared_contributions is not None:
             assert prepared_contributions is prepared_by_feature[id(feature)]
             assert prepared_contributions.feature is feature
@@ -98,6 +101,11 @@ def _make_agent(features=None):
             raise
         feature.enabled = True
 
+    async def _notify_feature_runtime_ready(feature):
+        ready_hook = getattr(feature, "on_agent_ready", None)
+        if ready_hook is not None:
+            await ready_hook(agent)
+
     # Feature endpoints delegate lifecycle transitions to these canonical async
     # agent helpers.  Keep the fixture faithful so UI capability assertions
     # exercise the post-transition state rather than a non-awaitable mock.
@@ -108,6 +116,10 @@ def _make_agent(features=None):
         side_effect=_prepare_feature_contribution_transition
     )
     agent._activate_feature_runtime = AsyncMock(side_effect=_activate_feature_runtime)
+    agent._notify_feature_runtime_ready = AsyncMock(
+        side_effect=_notify_feature_runtime_ready
+    )
+    agent._quarantine_feature_contributions = MagicMock(return_value=False)
     return agent
 
 
@@ -346,7 +358,7 @@ class TestLifecyclePushesCapabilities:
         assert feature.enabled is False
 
     @patch("kestrel_sovereign.ui_capabilities.get_registry")
-    def test_disable_rollback_can_reactivate_without_prepared_handle(
+    def test_disable_rollback_reactivates_before_ready_notification(
         self, mock_registry
     ):
         feature = _make_feature(enabled=True)
@@ -361,7 +373,12 @@ class TestLifecyclePushesCapabilities:
             resp = client.post("/api/features/VoiceFeature/disable")
 
         assert resp.status_code == 500
-        agent._activate_feature_runtime.assert_awaited_once_with(feature)
+        agent._activate_feature_runtime.assert_awaited_once()
+        activation = agent._activate_feature_runtime.await_args
+        assert activation.args == (feature,)
+        assert activation.kwargs["prepared_contributions"].feature is feature
+        assert activation.kwargs["notify_ready"] is False
+        agent._notify_feature_runtime_ready.assert_awaited_once_with(feature)
         feature.on_enable.assert_awaited_once()
         assert feature.enabled is True
 

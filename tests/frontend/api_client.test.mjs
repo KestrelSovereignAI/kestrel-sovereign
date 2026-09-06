@@ -6,6 +6,7 @@ import {
     createBearerTokenAuthProvider,
     applyHostAgentPrefix,
     isHostLevelEndpoint,
+    requestApiKeyFromOperator,
 } from '../../kestrel_sovereign/static/js/api_client.mjs';
 
 function createStorage(initial = {}) {
@@ -92,6 +93,46 @@ function createFetchQueue(...responses) {
     return fetchFn;
 }
 
+function createMinimalDocument() {
+    const elements = [];
+    function createElement(tagName) {
+        const listeners = {};
+        const element = {
+            tagName,
+            listeners,
+            children: [],
+            style: {},
+            hidden: false,
+            value: '',
+            removed: false,
+            focused: false,
+            append(...children) {
+                this.children.push(...children);
+            },
+            setAttribute(name, value) {
+                this[name] = String(value);
+            },
+            addEventListener(name, listener) {
+                listeners[name] = listener;
+            },
+            remove() {
+                this.removed = true;
+            },
+            focus() {
+                this.focused = true;
+            },
+        };
+        elements.push(element);
+        return element;
+    }
+    const body = createElement('body');
+    return {
+        documentRef: { body, createElement },
+        elements,
+        body,
+    };
+}
+
 function createClient({ fetchFn, sessionInitial = {}, authProvider = null } = {}) {
     const logger = createLogger();
     const location = { href: '/console', search: '' };
@@ -106,6 +147,58 @@ function createClient({ fetchFn, sessionInitial = {}, authProvider = null } = {}
     return { client, logger, location, sessionStorage };
 }
 
+test('init accepts a host key from the URL fragment without bootstrap disclosure', async () => {
+    const fetchFn = createFetchQueue();
+    const logger = createLogger();
+    const location = {
+        href: '/#key=host-secret',
+        pathname: '/',
+        search: '',
+        hash: '#key=host-secret',
+    };
+    const history = {
+        state: null,
+        calls: [],
+        replaceState(...args) {
+            this.calls.push(args);
+        },
+    };
+    const sessionStorage = createStorage();
+    const client = createApiClient({
+        fetchFn,
+        sessionStorage,
+        location,
+        history,
+        logger,
+    });
+
+    await client.init();
+
+    assert.equal(client.getApiKey(), 'host-secret');
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'host-secret');
+    assert.equal(fetchFn.calls.length, 0);
+    assert.deepEqual(history.calls, [[null, '', '/']]);
+});
+
+test('default fleet key entry keeps the secret in a password control', async () => {
+    const { documentRef, elements, body } = createMinimalDocument();
+    const entered = requestApiKeyFromOperator({ documentRef });
+    const input = elements.find((element) => element.tagName === 'input');
+    const form = elements.find((element) => element.tagName === 'form');
+    const overlay = body.children[0];
+
+    assert.equal(input.type, 'password');
+    assert.equal(input.autocomplete, 'off');
+    assert.equal(input.focused, true);
+    input.value = 'key-entered-in-password-control';
+    let prevented = false;
+    form.listeners.submit({ preventDefault() { prevented = true; } });
+
+    assert.equal(await entered, 'key-entered-in-password-control');
+    assert.equal(prevented, true);
+    assert.equal(overlay.removed, true);
+});
+
 test('init caches bootstrap API key when bootstrap succeeds', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, { key: 'k-secret' }));
     const { client, sessionStorage, location } = createClient({ fetchFn });
@@ -116,6 +209,38 @@ test('init caches bootstrap API key when bootstrap succeeds', async () => {
     assert.equal(sessionStorage.getItem('kestrel_api_key'), 'k-secret');
     assert.equal(location.href, '/console');
     assert.deepEqual(fetchFn.calls.map((call) => call.url), ['/api/auth/key']);
+});
+
+test('init accepts an explicitly entered fleet key when bootstrap and OAuth are absent', async () => {
+    const fetchFn = createFetchQueue(
+        jsonResponse(404, { detail: 'disabled' }),
+        jsonResponse(401, { detail: 'unauthenticated' }),
+    );
+    const logger = createLogger();
+    const location = { href: '/', pathname: '/', search: '', hash: '' };
+    const sessionStorage = createStorage();
+    const requested = [];
+    const client = createApiClient({
+        fetchFn,
+        sessionStorage,
+        location,
+        logger,
+        requestApiKey: async () => {
+            requested.push('requested');
+            return 'operator-entered-key';
+        },
+    });
+
+    await client.init();
+
+    assert.deepEqual(requested, ['requested']);
+    assert.equal(client.getApiKey(), 'operator-entered-key');
+    assert.equal(sessionStorage.getItem('kestrel_api_key'), 'operator-entered-key');
+    assert.equal(location.href, '/');
+    assert.deepEqual(fetchFn.calls.map((call) => call.url), [
+        '/api/auth/key',
+        '/auth/me',
+    ]);
 });
 
 test('init redirects to login when bootstrap is unavailable and OAuth session is absent', async () => {

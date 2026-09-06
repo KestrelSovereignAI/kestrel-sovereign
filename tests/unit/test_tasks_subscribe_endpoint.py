@@ -1,13 +1,14 @@
-"""``GET /api/agent/api/agent/tasks/{task_id}/subscribe`` — sender-side push ingress
+"""``GET /api/agent/api/agent/tasks/{task_id}/subscribe`` — recipient-scoped push view
 for the async ``send_a2a_question`` resumption design (#1444).
 
-The receiver-side endpoint wraps ``TaskManager.subscribe(task_id)`` as an
-SSE stream so a sender can wait on a question's terminal state without
-polling. The first frame is the current state snapshot (so a late
-subscriber doesn't miss a terminal that already fired), subsequent
-frames stream live updates, the stream closes on the first final event.
+The receiver-side endpoint wraps the recipient-authorized
+``TaskManager.subscribe`` view as an SSE stream. Same-host senders use the
+manager's non-serializable creator capability instead. The first frame is the
+current state snapshot (so a late subscriber doesn't miss a terminal that
+already fired), subsequent frames stream live updates, and the stream closes
+on the first final event.
 
-Pre-#1444 the only sender-side mechanism was an adaptive backoff polling
+Pre-#1444 the only task-update mechanism was an adaptive backoff polling
 loop in ``PeersFeature.send_a2a_question``. The polling burn was the
 root cause of the multi-hop chain failure (see #1444 description).
 """
@@ -54,12 +55,14 @@ def _stub_agent_with_task(*, task_present: bool, sse_frames):
     agent.task_manager = MagicMock()
     agent.task_manager.task_store = MagicMock()
 
-    async def fake_get(task_id):
+    async def fake_get(task_id, recipient_agent_id):
+        assert recipient_agent_id == agent.agent_id
         return MagicMock() if task_present else None
 
-    agent.task_manager.task_store.get = fake_get
+    agent.task_manager.get_task_for_recipient = fake_get
 
-    async def fake_subscribe(task_id):
+    async def fake_subscribe(task_id, *, recipient_agent_id):
+        assert recipient_agent_id == agent.agent_id
         for frame in sse_frames:
             yield frame
 

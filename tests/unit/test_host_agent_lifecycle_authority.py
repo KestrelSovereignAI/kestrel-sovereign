@@ -139,3 +139,7 @@ def test_agent_discovery_advertises_caller_scoped_lifecycle_authority(
     assert response.status_code == 200
     assert response.json()["can_create_agents"] is expected
     assert response.json()["can_delete_agents"] is expected
+    assert response.headers["cache-control"] == "private, no-store"
+    assert {
+        value.strip().lower() for value in response.headers["vary"].split(",")
+    } >= {"authorization", "cookie", "x-api-key"}

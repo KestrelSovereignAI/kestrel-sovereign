@@ -8,6 +8,7 @@ POST /api/identity/avatar/generate, and the description field on GET /api/identi
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from io import BytesIO
+from starlette.responses import Response
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +340,7 @@ class TestMultiAgentDiscoveryLiveName:
         request.app.state.agent_manager = manager
         request.app.state.demo_mode = False
 
-        result = await get_agents(request)
+        result = await get_agents(request, Response())
 
         assert result["mode"] == "multi_agent"
         entry = result["agents"][0]
@@ -364,7 +365,7 @@ class TestMultiAgentDiscoveryLiveName:
         request.app.state.agent_manager = manager
         request.app.state.demo_mode = False
 
-        result = await get_agents(request)
+        result = await get_agents(request, Response())
         entry = result["agents"][0]
         assert entry["status"] == "error"
         assert entry["name"] == "Emma"

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from kestrel_sovereign.features.peers.directory import (
     PeerDirectoryError,
@@ -49,9 +49,16 @@ def mark_a2a_inbound_scoped_policy(
 class RecipientA2ASenderAuthorizer:
     """Authorize verified sender DIDs under one recipient's live peer scope."""
 
-    def __init__(self, manager: Any, *, recipient: Any):
+    def __init__(
+        self,
+        manager: Any,
+        *,
+        recipient: Any,
+        sender_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
+    ):
         self._manager = manager
         self._recipient = recipient
+        self._sender_id_resolver = sender_id_resolver
         recipient_declares_scope = (
             getattr(recipient, "peer_directory_router", None) is not None
             or getattr(recipient, "peer_requester", None) is not None
@@ -88,12 +95,30 @@ class RecipientA2ASenderAuthorizer:
         requester: Any,
     ) -> bool:
         """Authorize against manager-owned context, never mutable agent attrs."""
+        return (
+            await self.authorize_principal_with_policy(
+                verified_sender_did,
+                router=router,
+                requester=requester,
+            )
+            is not None
+        )
+
+    async def authorize_principal_with_policy(
+        self,
+        verified_sender_did: str,
+        *,
+        router: Any,
+        requester: Any,
+    ) -> Optional[str]:
+        """Authorize and return the stable principal bound by host policy."""
+
         if not isinstance(verified_sender_did, str) or not verified_sender_did:
-            return False
+            return None
         context = self._validate_scoped_context(router, requester)
         if context is None:
-            return False
-        return await self._authorize_with_context(
+            return None
+        return await self._authorize_principal_with_context(
             verified_sender_did,
             context,
         )
@@ -122,30 +147,39 @@ class RecipientA2ASenderAuthorizer:
 
     async def authorize(self, verified_sender_did: str) -> bool:
         """Authorize a sender only after its signature has been verified."""
+        return await self.authorize_principal(verified_sender_did) is not None
+
+    async def authorize_principal(
+        self,
+        verified_sender_did: str,
+    ) -> Optional[str]:
+        """Authorize and return the stable principal for durable task state."""
+
         if not isinstance(verified_sender_did, str) or not verified_sender_did:
-            return False
+            return None
 
         context = self._scoped_context()
         if context is None:
             # True standalone compatibility is allowed only when this
             # authorizer has never observed hosted scope.
-            return not self._scoped_policy_required
+            return verified_sender_did if not self._scoped_policy_required else None
 
-        return await self._authorize_with_context(
+        return await self._authorize_principal_with_context(
             verified_sender_did,
             context,
         )
 
-    async def _authorize_with_context(
+    async def _authorize_principal_with_context(
         self,
         verified_sender_did: str,
         context: tuple[Any, PeerRequester],
-    ) -> bool:
+    ) -> Optional[str]:
         sender_id = self._sender_directory_id(verified_sender_did)
         if sender_id is None:
-            return False
+            return None
 
-        return await self._authorize_sender_id_with_context(sender_id, context)
+        authorized = await self._authorize_sender_id_with_context(sender_id, context)
+        return sender_id if authorized else None
 
     async def _authorize_sender_id_with_context(
         self,
@@ -218,6 +252,19 @@ class RecipientA2ASenderAuthorizer:
 
     def _sender_directory_id(self, signing_did: str) -> Optional[str]:
         """Map a loaded signing DID to its stable id; retain external DIDs."""
+        if self._sender_id_resolver is not None:
+            try:
+                sender_id = self._sender_id_resolver(signing_did)
+            except Exception:  # noqa: BLE001 - launcher registry boundary
+                logger.warning(
+                    "Inbound A2A signing-DID mapping failed for %s",
+                    signing_did,
+                    exc_info=True,
+                )
+                return None
+            if isinstance(sender_id, str) and sender_id:
+                return sender_id
+            return None
         matches = []
         for agent in self._agents():
             identity = getattr(agent, "identity", None)
@@ -254,11 +301,13 @@ def install_a2a_inbound_sender_authorizer(
     manager: Any,
     *,
     recipient: Any,
+    sender_id_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> RecipientA2ASenderAuthorizer:
     """Install the explicit inbound authorization seam on one recipient."""
     authorizer = RecipientA2ASenderAuthorizer(
         manager,
         recipient=recipient,
+        sender_id_resolver=sender_id_resolver,
     )
     recipient.a2a_inbound_sender_authorizer = authorizer
     logger.info(

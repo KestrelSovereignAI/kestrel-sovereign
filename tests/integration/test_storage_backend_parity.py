@@ -3634,7 +3634,7 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
         recipient_agent_id="did:test:recipient-a",
     )
 
-    retrieved = await store.get(task_a)
+    retrieved = await store._get_unscoped(task_a)
     assert retrieved is not None
     assert retrieved.sessionId == session_a
     assert retrieved.status.state == TaskState.WORKING
@@ -3646,15 +3646,25 @@ async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backen
     assert retrieved.artifacts[0].parts[0].text == "semantic parity"
     assert retrieved.metadata == {"task_type": "audit", "user_id": user_a, "marker": "first"}
 
-    session_tasks = await store.list_tasks(session_id=session_a, user_id=user_a, limit=10)
+    session_tasks = await store.list_tasks(
+        recipient_agent_id="did:test:recipient-a",
+        session_id=session_a,
+        user_id=user_a,
+        limit=10,
+    )
     assert {task.id for task in session_tasks} == {task_a, task_b}
     assert {task.metadata["marker"] for task in session_tasks} == {"first", "second"}
 
-    working_tasks = await store.list_tasks(user_id=user_a, status=TaskState.WORKING, limit=10)
+    working_tasks = await store.list_tasks(
+        recipient_agent_id="did:test:recipient-a",
+        user_id=user_a,
+        status=TaskState.WORKING,
+        limit=10,
+    )
     assert [task.id for task in working_tasks] == [task_a]
 
     assert await store.delete(task_a) is True
-    assert await store.get(task_a) is None
+    assert await store._get_unscoped(task_a) is None
 
 
 @pytest.mark.asyncio

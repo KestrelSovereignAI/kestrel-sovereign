@@ -439,7 +439,8 @@ class EventManagerMixin:
                     # every earlier cancellation.
                     snapshot = (
                         await self.task_manager.get_task_cancellation_snapshot(
-                            str(task_id)
+                            str(task_id),
+                            recipient_agent_id=self.did,
                         )
                     )
                     if snapshot is not None and snapshot.state == "canceled":
@@ -496,7 +497,10 @@ class EventManagerMixin:
         if not isinstance(task_id, str) or not task_id:
             return "a2a.task_submitted has no concrete durable task id"
 
-        snapshot = await self.task_manager.get_task_cancellation_snapshot(task_id)
+        snapshot = await self.task_manager.get_task_cancellation_snapshot(
+            task_id,
+            recipient_agent_id=self.did,
+        )
         if snapshot is None:
             return f"A2A task {task_id!r} no longer exists"
         durable_state = snapshot.state
@@ -528,7 +532,8 @@ class EventManagerMixin:
         poll_delay = A2A_CANCELLATION_POLL_INITIAL_SECONDS
         while True:
             snapshot = await self.task_manager.get_task_cancellation_snapshot(
-                task_id
+                task_id,
+                recipient_agent_id=self.did,
             )
             if snapshot is None:
                 return f"A2A task {task_id!r} no longer exists"

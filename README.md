@@ -151,7 +151,7 @@ Your agent is now running. Two ports to know about, depending on which start for
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
-> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for the public aggregate JSON readiness probe. Full `/health/detailed` diagnostics require the normal API key, JWT, or OAuth session.
+> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page. On a fresh multi-agent browser session, enter the `KESTREL_API_KEY` stored in the project `.env`; the password-style handoff keeps it out of URLs and launcher logs. Append `/health` for the public aggregate JSON readiness probe. Full `/health/detailed` diagnostics require the normal API key, JWT, or OAuth session.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
@@ -308,20 +308,23 @@ traffic with `KESTREL_SHARED_AGENT_POSTGRES_MAX_POOL_SIZE` and
 positive integers. These are independent host budgets: scheduler effect gates
 use the scheduler host's own storage pool, not the agents' advisory pool.
 
-#### SDK 0.37 release cascade
+#### SDK 0.37–0.38 release cascade
 
-Core requires `kestrel-sovereign-sdk[tracing]>=0.37.0,<0.38`; the
+Core requires `kestrel-sovereign-sdk[tracing]>=0.37.1,<0.39`; the
 `observability` extra carries the same SDK line with `metrics`. This is a
 runtime contract for durable isolated execution, provider-neutral private
 inference leases (including bounded owner-scoped idle renewal), and private
-host ingress, plus feature-owned operator contribution contracts. It is not a
-preference that a downstream package may relax. The Core-owned release-cascade
-contract is:
+host ingress, plus feature-owned operator and context-clause contribution
+contracts. SDK 0.38.1 adds the optional awaited preparation hook that Core
+invokes before synchronously rendering a context-clause batch; Core continues
+to resolve that hook defensively for features built against 0.37.1. It is not
+a preference that a downstream package may relax. The Core-owned
+release-cascade contract is:
 
 | Downstream release gate | Required published SDK constraint before Core ships | Core assertion |
 |---|---|---|
-| Frinz | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
-| Observability fleet | `kestrel-sovereign-sdk>=0.37.0,<0.38` | External prerequisite; Core does not claim observability has changed. |
+| Frinz | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim Frinz has changed. |
+| Observability fleet | `kestrel-sovereign-sdk>=0.37.1,<0.38` | External prerequisite; Core does not claim observability has changed. |
 
 Verify the published Frinz and observability constraints and tests before the
 Core publish. Do not weaken Core's requirement to make an older sibling
@@ -481,7 +484,7 @@ the complete precedence and managed-container behavior.
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
-Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required. A fresh multi-agent browser session asks for the project `.env`'s `KESTREL_API_KEY` in a password field and retains it only in that tab's session storage.
 
 The built-in console exposes the following panels; installed features may add
 their own contributions:
