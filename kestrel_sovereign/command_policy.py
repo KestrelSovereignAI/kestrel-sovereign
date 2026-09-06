@@ -53,10 +53,14 @@ RECOVERY_SOVEREIGN_COMMANDS: Final[frozenset[str]] = frozenset(
 HOST_ADMIN_COMMANDS: Final[frozenset[str]] = frozenset({"!create-agent"})
 # Feature-package management commands (contributed by the external
 # ``kestrel-feature-features`` package) mutate the routed agent's loaded
-# runtime, and ``!feature-add`` installs into the shared interpreter. Typed by
-# an external caller into ``/api/agents/{name}/api/agent/invoke`` they are the
-# same per-agent mutation the HTTP routes gate on sovereign authority
-# (kestrel-sovereign#3214, #3234), reached through a different door. The
+# runtime: ``!feature-add`` constructs and registers an already-discoverable
+# class (it installs nothing), ``!feature-remove`` tears one down and persists
+# a durable ``disabled`` delta, ``!feature-configure`` mirrors ``PATCH
+# /config``. Typed by an external caller into
+# ``/api/agents/{name}/api/agent/invoke`` they are the same per-agent mutation
+# the HTTP routes gate on sovereign authority (kestrel-sovereign#3234),
+# reached through a different door; interpreter installs are the #3214
+# routes and the CLI, gated separately. The
 # agent's own tool calls are not commands and are not gated here: an agent
 # acting on its own runtime is self-scope; host-scope features are refused
 # at the runtime door regardless of who asks.

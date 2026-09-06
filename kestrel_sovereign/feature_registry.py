@@ -11,6 +11,7 @@ Consumed by CLI, API, and Feature Store UI.
 
 import importlib.metadata
 import logging
+from functools import lru_cache
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -490,8 +491,16 @@ class HostScopeFeatureError(RuntimeError):
         )
 
 
+@lru_cache(maxsize=None)
 def host_scope_feature_classes(path: Optional[Path] = None) -> frozenset:
-    """Feature class names declared ``host_scope = true`` in the registry."""
+    """Feature class names declared ``host_scope = true`` in the registry.
+
+    Memoized per path: the bundled registry is read-only at runtime and
+    ``feature_disable_refusal`` asks for this set once per class on every
+    catalog read (round 3 of kestrel-sovereign#3234 measured ~50 full
+    registry parses per ``GET /api/features``, ~92 ms of event-loop CPU).
+    Tests that swap the registry file clear it with ``cache_clear()``.
+    """
     return frozenset(
         class_name
         for info in load_registry(path).values()

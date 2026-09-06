@@ -4333,6 +4333,36 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
                 assert resp.status_code == 200, (path, resp.text)
                 assert resp.json()["can_manage_features"] is expected, path
 
+    def test_catalog_read_parses_the_registry_once(self, monkeypatch):
+        """#3234 round 3: publishing ``disable_refusal`` per row asked the
+        host-scope set per class, and that set re-parsed and re-validated the
+        whole registry every time — ~50 loads and ~92 ms of event-loop CPU
+        per ``GET /api/features``. The set is memoized; a catalog read loads
+        the registry exactly once (the catalog's own load).
+        """
+        from kestrel_sovereign import feature_registry
+
+        feature_registry.host_scope_feature_classes.cache_clear()
+        real_load = feature_registry.load_registry
+        calls = []
+
+        def counting_load(path=None):
+            calls.append(path)
+            return real_load(path)
+
+        monkeypatch.setattr(feature_registry, "load_registry", counting_load)
+        # The endpoint module imports get_registry, which calls load_registry
+        # through the feature_registry module namespace; host_scope_feature_classes
+        # does too, so both are counted.
+        agent = _lifecycle_agent(features={"WebSearchFeature": _make_feature(name="WebSearchFeature")})
+        app = _make_app(agent)
+        with TestClient(app) as client:
+            assert client.get("/api/features").status_code == 200
+            first = len(calls)
+            assert client.get("/api/features").status_code == 200
+        assert first <= 2, calls  # the catalog's own load + at most one host-scope load
+        assert len(calls) - first <= 1, calls  # nothing per row, nothing per class
+
     def test_catalog_and_detail_publish_the_servers_own_disable_answer(self):
         """#3234 round 2: the console gated Disable on ``host_scope`` alone
         while the server refuses two classes (mandatory too), so the modal
