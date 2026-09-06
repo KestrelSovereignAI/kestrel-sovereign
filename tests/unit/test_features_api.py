@@ -12,6 +12,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.auth import AuthMethod, CallerContext, CallerRole
+
 from kestrel_sovereign import cli
 from kestrel_sovereign.endpoints import features as features_endpoint
 from kestrel_sovereign.endpoints.features import router as features_router
@@ -77,9 +79,28 @@ def _make_feature(
     return feature
 
 
-def _make_app(agent=None):
-    """Create a FastAPI app with the features router mounted."""
+_UNSET = object()
+
+
+def _make_app(agent=None, caller=_UNSET):
+    """Create a FastAPI app with the features router mounted.
+
+    ``caller`` stands in for the auth middleware that populates
+    ``request.state.caller`` in ``server.py``. It defaults to a sovereign
+    caller because install and remove now require sovereign authority
+    (#3214) and the tests below are about install mechanics, not about
+    who may ask. Pass an explicit caller — including ``None`` for "no
+    middleware ran" — to exercise the authority gate itself.
+    """
     app = FastAPI()
+
+    resolved = CallerContext.sovereign() if caller is _UNSET else caller
+
+    @app.middleware("http")
+    async def _attach_caller(request, call_next):
+        request.state.caller = resolved
+        return await call_next(request)
+
     app.include_router(features_router)
     if agent is not None:
         app.state.agent = agent
@@ -3953,3 +3974,93 @@ class TestPostRepairRevalidation:
 
         assert resp.status_code == 500, resp.json()   # the check really ran...
         assert held == [True]                          # ...and ran holding the lock
+
+
+# =============================================================================
+# Sovereign authority on the shared-environment routes (#3214)
+# =============================================================================
+
+
+class TestSharedEnvironmentRoutesRequireSovereignAuthority:
+    """Install and remove run pip against the interpreter every agent on the
+    host is loaded from, so they are host administration rather than the
+    routed agent's own business.
+
+    The claim was already in the docstring — "Requires a sovereign agent —
+    governed agents cannot install packages" — while the handler resolved
+    the routed agent and installed. The predicate that would have enforced
+    it existed and guarded ``POST /api/agents``; these routes just never
+    used it.
+    """
+
+    @pytest.mark.parametrize("route", ["install", "remove"])
+    @pytest.mark.parametrize(
+        "caller,label",
+        [
+            (CallerContext(role=CallerRole.AUTHENTICATED), "an OAuth/JWT user"),
+            (CallerContext.a2a_transport(), "a peer admitted by transport"),
+            (CallerContext.anonymous(), "an anonymous caller"),
+            (None, "no auth middleware at all"),
+        ],
+    )
+    def test_a_caller_without_sovereign_authority_is_refused(
+        self, route, caller, label
+    ):
+        agent = _make_agent()
+        app = _make_app(agent, caller=caller)
+
+        with TestClient(app) as client:
+            response = client.post(f"/api/features/test-pkg/{route}")
+
+        assert response.status_code == 403, (label, route, response.text)
+        assert "Sovereign authority is required." in response.text
+
+    @pytest.mark.parametrize("route", ["install", "remove"])
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_refusal_does_not_reveal_whether_the_package_exists(
+        self, mock_registry, route
+    ):
+        """403 before 404, so the refusal is not an existence oracle.
+
+        The guard is a route dependency for this reason: a check inside
+        the handler would run after the registry lookup, and an
+        unauthorized caller could tell a real package from an invented
+        one by whether they got 404 or 403.
+
+        The registry has to be the real fake one for this to mean
+        anything. Written first against a bare `_make_agent()`, both
+        names resolved identically, so the two requests could not
+        differ however the guard was placed — and a mutant that moved
+        the check after the lookup passed. `test-pkg` is in the catalog
+        below and the invented name is not, so the oracle exists to be
+        closed.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _make_agent()
+        app = _make_app(agent, caller=CallerContext.anonymous())
+
+        with TestClient(app) as client:
+            known = client.post(f"/api/features/test-pkg/{route}")
+            invented = client.post(
+                f"/api/features/no-such-package-anywhere/{route}"
+            )
+
+        assert known.status_code == invented.status_code == 403
+        assert known.text == invented.text
+
+    @pytest.mark.parametrize("route", ["install", "remove"])
+    def test_a_sovereign_caller_is_admitted_past_the_gate(self, route):
+        """The positive control.
+
+        Without it, a guard that refused everyone would satisfy every
+        assertion above. A sovereign caller must get *past* authority —
+        whatever the route then does about an unknown package is the
+        route's business, but it must not be 403.
+        """
+        agent = _make_agent()
+        app = _make_app(agent, caller=CallerContext.sovereign(AuthMethod.API_KEY))
+
+        with TestClient(app) as client:
+            response = client.post(f"/api/features/no-such-package-anywhere/{route}")
+
+        assert response.status_code != 403, response.text

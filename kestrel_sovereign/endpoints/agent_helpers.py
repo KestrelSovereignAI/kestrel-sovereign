@@ -14,6 +14,33 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.api_errors import ApiHTTPException
 
 
+def require_sovereign_host_lifecycle(request: Request):
+    """Admit only the sovereign-key principal to host lifecycle mutations.
+
+    A FastAPI dependency rather than a call inside a handler, and that
+    placement is load-bearing: it runs before the handler body, so an
+    unauthorized caller cannot learn from the response whether the thing
+    they named exists. A check placed after a registry lookup would
+    answer 404 for an unknown package and 403 for a known one.
+
+    Lives here, next to :func:`get_caller`, because it is the host's
+    authority predicate and not one endpoint module's private helper.
+    #3214 was what that privacy cost: `POST /api/features/{name}/install`
+    documented "requires a sovereign agent — governed agents cannot
+    install packages" and enforced nothing, while the predicate that
+    would have said so sat in a sibling module guarding
+    `POST /api/agents`.
+    """
+
+    caller = get_caller(request)
+    if getattr(caller, "is_sovereign", False) is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="Sovereign authority is required.",
+        )
+    return caller
+
+
 def get_caller(request: Request):
     """Return the CallerContext attached by the auth middleware, or None.
 

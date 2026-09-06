@@ -9,11 +9,14 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    require_sovereign_host_lifecycle,
+)
 from kestrel_sovereign.features.config_validation import (
     FeatureConfigInvalid,
     validate_feature_config,
@@ -374,12 +377,23 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"Feature '{name}' not found in registry or loaded features")
 
 
-@router.post("/api/features/{name}/install")
+@router.post(
+    "/api/features/{name}/install",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Install a feature package via pip.
 
-    Requires a sovereign agent — governed agents cannot install packages.
+    Requires sovereign authority — governed agents cannot install
+    packages. That sentence used to be documentation only: the handler
+    resolved the routed agent and installed, so any authenticated caller
+    routed to any agent could run pip against the shared interpreter
+    every agent on the host is loaded from (#3214).
+
+    The guard is a route dependency, not a call in the body, so it runs
+    before the registry lookup below. An unauthorized caller therefore
+    gets the same 403 whether or not the package exists.
     """
     agent = get_agent(request)
 
@@ -889,10 +903,19 @@ async def _restore_feature_group(
     ) from None
 
 
-@router.post("/api/features/{name}/remove")
+@router.post(
+    "/api/features/{name}/remove",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Uninstall a feature package.
+
+    Requires sovereign authority, for the same reason as ``install``: the
+    pip uninstall at the end of this reaches the shared interpreter every
+    agent on the host runs from, so it is host administration and not the
+    routed agent's own business (#3214). Guarded as a route dependency so
+    the refusal precedes any lookup that would reveal package state.
 
     Runs the agent's canonical runtime *teardown*
     (``KestrelAgent._unregister_feature_runtime`` with ``unload=True``) per
