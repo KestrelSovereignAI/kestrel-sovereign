@@ -115,9 +115,13 @@ async def test_summary_counts_only_the_routed_agents_events(
 
     assert mine["total_events"] == 1, mine
     assert theirs["total_events"] == 2, theirs
-    # The positive control: without it, a summary that counted nothing at
-    # all would satisfy the assertions above.
-    assert mine["total_events"] + theirs["total_events"] == 3
+    # A real control, unlike the sum that used to sit here: that was
+    # implied by the two equalities above and could not fail
+    # independently. This one asserts the reads are non-empty for the
+    # identity PRODUCTION writes, which is the failure an
+    # empty-but-well-formed 200 produces (#3215 review F1).
+    assert mine["events_by_type"], mine
+    assert mine["metrics_by_name"], mine
 
 
 @pytest.mark.asyncio
@@ -152,6 +156,16 @@ async def test_a_caller_supplied_agent_name_cannot_widen_the_scope(
     """
     MINE, THEIRS = identities
     async with _client(shared_store, MINE) as client:
+        # `/summary` too. It had no smuggle coverage, so reinstating a
+        # caller-supplied override there — the ticket's own defect class,
+        # on the other route — survived the whole suite.
+        smuggled_summary = (
+            await client.get(
+                f"/api/observability/summary?minutes=60&agent_name={THEIRS}"
+            )
+        ).json()
+        assert smuggled_summary["total_events"] == 1, smuggled_summary
+
         smuggled = (
             await client.get(
                 f"/api/observability/metrics/turns-{MINE}?agent_name={THEIRS}"
