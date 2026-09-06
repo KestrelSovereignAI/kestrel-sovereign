@@ -303,11 +303,131 @@ def test_plan_limit_400_is_retryable_despite_the_status_code():
     assert is_retryable_error(err) is True
 
 
-def test_plan_limit_400_gets_the_patient_throttle_budget():
-    """A plan window needs the 8-attempt budget to be ridden out; the tight
-    failover budget would give up while the window is still open."""
+# Near-miss negatives. These share WORDING with the positive case, not just a
+# status code, so they can kill a pattern broadened toward a realistic
+# near-miss ("usage", "extra usage") — which fixtures sharing only the status
+# code cannot do.
+USAGE_WORDED_400 = (
+    "Error code: 400 - {'type': 'error', 'error': {'type': "
+    "'invalid_request_error', 'message': 'usage of the extra field is "
+    "invalid for this request'}}"
+)
+PLAN_LIMIT_WORDING_ON_401 = (
+    "Error code: 401 - {'type': 'error', 'error': {'type': "
+    "'authentication_error', 'message': \"Invalid API key. You're out of "
+    "extra usage.\"}}"
+)
+PLAN_LIMIT_400_SHOUTED = (
+    "ERROR CODE: 400 - YOU'RE OUT OF EXTRA USAGE. ADD MORE AT "
+    "CLAUDE.AI/SETTINGS/USAGE AND KEEP GOING."
+)
+
+
+def test_a_400_merely_mentioning_usage_is_not_a_plan_limit():
+    """Kills a pattern broadened to 'usage'."""
+    assert is_plan_limit_error(
+        _FakeRateLimit(USAGE_WORDED_400, status_code=400)
+    ) is False
+
+
+def test_extra_usage_wording_alone_is_not_enough():
+    """Kills a pattern broadened to 'extra usage': the phrase has to be the
+    plan-limit sentence, not any sentence containing those two words."""
+    err = _FakeRateLimit(
+        "Error code: 400 - {'message': 'extra usage fields are not allowed'}",
+        status_code=400,
+    )
+    assert is_plan_limit_error(err) is False
+
+
+def test_plan_limit_wording_on_a_401_is_not_retryable():
+    """Scoping guard: a dead key whose message happens to carry the phrase
+    must stay permanent. `with_retry` is shared by every adapter, so an
+    unscoped match would hand one a retry budget."""
+    err = _FakeRateLimit(PLAN_LIMIT_WORDING_ON_401, status_code=401)
+    assert is_plan_limit_error(err) is False
+    assert is_retryable_error(err) is False
+
+
+def test_structured_status_wins_over_400_in_the_message_text():
+    """The structured `status_code` is authoritative, mirroring
+    `test_structured_401_non_retryable_even_with_retry_wording`.
+
+    A provider that reports 401 while its rendered body still carries "Error
+    code: 400" and the plan-limit sentence must stay permanent. Without this,
+    dropping the structured-status branch is undetectable: every other
+    negative fixture happens to omit "400", so the text-based fallback
+    returns the right answer for the wrong reason.
+    """
+    err = _FakeRateLimit(
+        "Error code: 400 - {'type': 'error', 'error': {'type': "
+        "'invalid_request_error', 'message': \"You're out of extra usage.\"}}",
+        status_code=401,
+    )
+    assert is_plan_limit_error(err) is False
+    assert is_retryable_error(err) is False
+
+
+def test_plan_limit_match_is_case_insensitive():
+    """Exercises the `.lower()` fold, which the lowercase fixture alone never
+    reached."""
+    assert is_plan_limit_error(
+        _FakeRateLimit(PLAN_LIMIT_400_SHOUTED, status_code=400)
+    ) is True
+
+
+def test_plan_limit_is_not_treated_as_a_429_throttle():
+    """The patient 8-attempt/131s throttle budget would overrun the 180s
+    orchestrator turn watchdog. Plan-limit gets its own tighter budget."""
     from kestrel_sovereign.llm.retry import _is_throttle_error
-    assert _is_throttle_error(_FakeRateLimit(PLAN_LIMIT_400, status_code=400)) is True
+    assert _is_throttle_error(_FakeRateLimit(PLAN_LIMIT_400, status_code=400)) is False
+
+
+def test_plan_limit_retry_budget_fits_inside_the_turn_watchdog():
+    """Behavioural guard on the constants themselves: worst-case sleep must
+    stay a small fraction of the watchdog, or a window that clears late is
+    killed as `timeout after 180s` instead of returning its answer."""
+    from kestrel_sovereign.llm.retry import (
+        PLAN_LIMIT_MAX_RETRIES,
+        PLAN_LIMIT_MAX_DELAY,
+    )
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        ORCHESTRATOR_TURN_TIMEOUT_SECS,
+    )
+
+    worst_case = sum(
+        min(1.0 * (2 ** a) + 1.0, PLAN_LIMIT_MAX_DELAY)
+        for a in range(PLAN_LIMIT_MAX_RETRIES - 1)
+    )
+    assert worst_case < ORCHESTRATOR_TURN_TIMEOUT_SECS * 0.25, (
+        f"plan-limit sleep budget {worst_case}s is too much of the "
+        f"{ORCHESTRATOR_TURN_TIMEOUT_SECS}s turn watchdog"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_limit_uses_its_own_attempt_budget():
+    """Pins the budget by COUNTING attempts, not by asserting a predicate.
+    A white-box assertion on `_is_throttle_error` stayed green when the
+    budget selection was broken."""
+    from kestrel_sovereign.llm.retry import PLAN_LIMIT_MAX_RETRIES
+    calls = {"n": 0}
+
+    async def always_plan_limited():
+        calls["n"] += 1
+        raise _FakeRateLimit(PLAN_LIMIT_400, status_code=400)
+
+    async def fake_sleep(d):
+        pass
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        with pytest.raises(_FakeRateLimit):
+            await with_retry(always_plan_limited)
+
+    assert calls["n"] == PLAN_LIMIT_MAX_RETRIES
+    # And specifically NOT the patient throttle budget.
+    from kestrel_sovereign.llm.retry import THROTTLE_MAX_RETRIES
+    assert calls["n"] != THROTTLE_MAX_RETRIES
 
 
 def test_ordinary_400_stays_non_retryable():
