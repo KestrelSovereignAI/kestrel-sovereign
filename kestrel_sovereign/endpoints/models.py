@@ -21,6 +21,7 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
     request_invocation_provenance,
+    require_sovereign_host_lifecycle,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
 )
@@ -45,18 +46,6 @@ router = APIRouter(tags=["models"])
 
 # Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
-
-
-def require_sovereign_host_lifecycle(request: Request):
-    """Admit only the sovereign-key principal to host lifecycle mutations."""
-
-    caller = get_caller(request)
-    if getattr(caller, "is_sovereign", False) is not True:
-        raise HTTPException(
-            status_code=403,
-            detail="Sovereign authority is required.",
-        )
-    return caller
 
 
 def _key_storage_privacy_detail() -> str:
