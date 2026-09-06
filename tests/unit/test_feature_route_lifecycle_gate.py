@@ -20,7 +20,7 @@ actual server/app path, asserting:
 """
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -831,6 +831,35 @@ def test_one_receiver_reachable_through_two_agents_is_one_owner():
         restore()
 
 
+@contextmanager
+def _receiver_log():
+    """Collect the webhook receiver module's log records directly.
+
+    The server's boot reconfigures root logging, so a root-level capture
+    (``caplog``) misses records emitted during the first boot in a process;
+    a handler on the module logger itself sees them regardless.
+    """
+    import logging
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.receiver")
+    handler = _Collect(level=logging.WARNING)
+    previous = target.level
+    target.addHandler(handler)
+    if previous == logging.NOTSET or previous > logging.WARNING:
+        target.setLevel(logging.WARNING)
+    try:
+        yield records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
+
+
 class _MinimalReceiverFeatureStub:
     """A receiver meeting only the host's duck-typed contract: ``webhooks`` +
     ``handle_webhook``. No ``record_refusal``, no ring buffer — the shape an
@@ -855,15 +884,13 @@ class _MinimalReceiverFeatureStub:
         return None
 
 
-def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404(caplog):
+def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404():
     """#3216 round 3: a receiver that meets only the required contract
     (no ``record_refusal``) must not turn the refusal into a 500 — that would
     be the ownership oracle the shared response denies. Same 404, no
     dispatch to either owner, the core owner still audits, and the host log
     says the other owner could not audit its own refusal.
     """
-    import logging
-
     os.environ["KESTREL_API_KEY"] = API_KEY
     core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
     minimal = _MinimalReceiverFeatureStub(webhook_name="deposit")
@@ -877,10 +904,7 @@ def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404(caplog
         minimal.receiver.handled.clear()
         app, restore = _boot_multi_agent(agents)
         try:
-            with caplog.at_level(
-                logging.WARNING,
-                logger="kestrel_sovereign.features.webhooks.receiver",
-            ):
+            with _receiver_log() as records:
                 with TestClient(app) as client:
                     resp = client.post("/webhooks/deposit", content=b"{}")
             assert resp.status_code == 404, (order, resp.text)
@@ -888,8 +912,104 @@ def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404(caplog
             assert minimal.receiver.handled == [], order
             assert [e.status_code for e in core_hook.receiver.event_log] == [404], order
             assert any(
-                "cannot audit its own refusal" in r.getMessage()
-                for r in caplog.records
+                "cannot audit its own refusal" in r.getMessage() for r in records
             ), order
+        finally:
+            restore()
+
+
+def test_two_distinct_receivers_that_compare_equal_are_two_owners():
+    """#3216 round 4: the dedupe must be by identity, never ``==``.
+
+    An out-of-tree receiver class with value equality (a dataclass, a
+    pydantic model) is admitted on the same two-attribute contract. Two
+    distinct instances that compare equal collapsed to one owner under an
+    ``in``-based dedupe, so the unprefixed form dispatched again — to
+    whichever agent the fleet listed first. Both orders must refuse.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+
+    class _ValueEqualReceiver(_MinimalReceiverFeatureStub._Receiver):
+        def __eq__(self, other):
+            return isinstance(other, _ValueEqualReceiver)
+
+        __hash__ = object.__hash__
+
+    class _ValueEqualFeature(_MinimalReceiverFeatureStub):
+        def __init__(self):
+            self.enabled = True
+            self.receiver = _ValueEqualReceiver("deposit")
+
+    first, second = _ValueEqualFeature(), _ValueEqualFeature()
+    assert first.receiver == second.receiver and first.receiver is not second.receiver
+    fleets = [
+        # Two agents, one value-equal receiver each — both fleet orders.
+        {"a": _make_agent({"ThirdPartyWebhookFeature": first}),
+         "b": _make_agent({"ThirdPartyWebhookFeature": second})},
+        {"b": _make_agent({"ThirdPartyWebhookFeature": second}),
+         "a": _make_agent({"ThirdPartyWebhookFeature": first})},
+        # One agent, two features with value-equal receivers: the per-agent
+        # scan dedupes too, and must also do so by identity.
+        {"a": _make_agent({"FirstFeature": first, "SecondFeature": second})},
+    ]
+    for agents in fleets:
+        first.receiver.handled.clear()
+        second.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with TestClient(app) as client:
+                resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (list(agents), resp.text)
+            assert first.receiver.handled == [] and second.receiver.handled == [], list(agents)
+        finally:
+            restore()
+
+
+@pytest.mark.parametrize(
+    "record_refusal,label",
+    [
+        (lambda self, name, **_: (_ for _ in ()).throw(RuntimeError("audit sink down")), "raises"),
+        (lambda self, name, **_: None, "synchronous"),
+    ],
+)
+def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
+    record_refusal, label
+):
+    """#3216 round 4: the refusal path awaits foreign ``record_refusal``
+    implementations. One that raises, or returns nothing awaitable, must not
+    turn the indistinguishable 404 into a 500 (the ownership oracle). The
+    core owner still audits; the failure is host-logged.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    Foreign = type(
+        "_ForeignReceiver",
+        (_MinimalReceiverFeatureStub._Receiver,),
+        {"record_refusal": record_refusal},
+    )
+    foreign = _MinimalReceiverFeatureStub("deposit")
+    foreign.receiver = Foreign("deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": foreign}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (label, order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, (label, order)
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], (label, order)
+            assert foreign.receiver.handled == [], (label, order)
+            failures = [r for r in records if "failed to audit" in r.getMessage()]
+            if label == "raises":
+                assert failures, order
+            else:
+                # A synchronous audit is a valid implementation, not a failure.
+                assert not failures, (order, [r.getMessage() for r in failures])
         finally:
             restore()

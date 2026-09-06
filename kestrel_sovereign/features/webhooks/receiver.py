@@ -10,6 +10,7 @@ Responsibilities:
 """
 
 import hashlib
+import inspect
 import logging
 import time
 import uuid
@@ -32,6 +33,45 @@ def unknown_webhook_result(name: str) -> Dict[str, Any]:
     here; a divergent body would hand out an ownership oracle.
     """
     return {"status_code": 404, "body": {"error": f"Unknown webhook: {name}"}}
+
+
+async def _audit_refusal(
+    owner: Any, name: str, *, source_ip: str, body: bytes, status_code: int
+) -> None:
+    """Ask ``owner`` to audit a refused request; never let that change the
+    response.
+
+    The host admits any receiver with ``handle_webhook`` + ``webhooks``
+    (duck-typed, so an out-of-tree feature can contribute one).
+    ``record_refusal`` is the optional half of that contract, and this is
+    the one seam where core awaits foreign code on the refusal path — so
+    it absorbs everything that seam can do: the method may be absent, may
+    be synchronous, may raise. Any of those turning the deliberately
+    indistinguishable 404 into a 500 would be the ownership oracle the
+    shared response exists to deny; core's own receiver already states the
+    rule ("never let persistence failure break the response") two frames
+    down, and it has to hold at the frame that crosses the boundary. The
+    refusal is always host-logged, so an owner that cannot audit is still
+    visible to the operator.
+    """
+    record = getattr(owner, "record_refusal", None)
+    if record is None:
+        logger.warning(
+            "Receiver for webhook '%s' cannot audit its own refusal "
+            "(no record_refusal); host-logged only.",
+            name,
+        )
+        return
+    try:
+        outcome = record(name, source_ip=source_ip, body=body, status_code=status_code)
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception as exc:  # audit failure never changes the response
+        logger.warning(
+            "Receiver for webhook '%s' failed to audit its own refusal: %s",
+            name,
+            exc,
+        )
 
 
 def build_webhook_dispatch_router(
@@ -114,22 +154,8 @@ def build_webhook_dispatch_router(
                 webhook_name,
             )
             for owner in owners:
-                # The host admits any receiver with ``handle_webhook`` +
-                # ``webhooks`` (duck-typed, so an out-of-tree feature can
-                # contribute one); ``record_refusal`` is the optional half of
-                # that contract. A receiver without it still gets the same
-                # 404 — never a 500, which would be the ownership oracle the
-                # shared response exists to deny — and the refusal stays
-                # host-logged.
-                record = getattr(owner, "record_refusal", None)
-                if record is None:
-                    logger.warning(
-                        "Receiver for webhook '%s' cannot audit its own "
-                        "refusal (no record_refusal); host-logged only.",
-                        webhook_name,
-                    )
-                    continue
-                await record(
+                await _audit_refusal(
+                    owner,
                     webhook_name,
                     source_ip=source_ip,
                     body=body,

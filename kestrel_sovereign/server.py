@@ -1147,12 +1147,14 @@ def _agent_webhook_receivers(agent) -> list:
     Deduplicated by identity; a disabled/removed feature's receiver is dropped.
     """
     receivers: list = []
+    seen: set[int] = set()
     features = getattr(agent, "features", {}) or {}
     for feature in features.values():
         if not bool(getattr(feature, "enabled", True)):
             continue
         receiver = getattr(feature, "receiver", None)
-        if _is_webhook_receiver(receiver) and receiver not in receivers:
+        if _is_webhook_receiver(receiver) and id(receiver) not in seen:
+            seen.add(id(receiver))
             receivers.append(receiver)
     return receivers
 
@@ -1174,15 +1176,21 @@ def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
     of every current agent's enabled receivers is returned. Deduplicated by
     identity because one receiver can be reached through multiple agents.
     The dispatch router refuses a name owned by more than one receiver in
-    the returned set (#3216); this provider only decides the scope.
+    the returned set (#3216); this provider only decides the scope. The
+    dedupe is by ``id()``, never ``==``: a receiver is admitted on a
+    two-attribute duck-typed contract, and an out-of-tree class with value
+    equality (a dataclass, a pydantic model) would otherwise collapse two
+    distinct owners into one and hand the target back to iteration order.
     """
     if agent is not None:
         return _agent_webhook_receivers(agent)
 
     receivers: list = []
+    seen: set[int] = set()
     for current in _iter_current_agents(app):
         for receiver in _agent_webhook_receivers(current):
-            if receiver not in receivers:
+            if id(receiver) not in seen:
+                seen.add(id(receiver))
                 receivers.append(receiver)
     return receivers
 

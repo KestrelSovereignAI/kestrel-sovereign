@@ -1371,7 +1371,7 @@ class TestWebhookMultiAgentDispatch:
 
     @pytest.mark.asyncio
     async def test_duplicate_name_is_refused_in_either_order_and_audited_on_every_owner(
-        self, tmp_path, sqlite_database_factory, caplog
+        self, tmp_path, sqlite_database_factory
     ):
         """#3216: two receivers own the same name → refused, not first-wins.
 
@@ -1407,9 +1407,18 @@ class TestWebhookMultiAgentDispatch:
         )
 
         payload = b'{"amount": 5}'
-        with caplog.at_level(
-            logging.WARNING, logger="kestrel_sovereign.features.webhooks.receiver"
-        ):
+        # A handler on the module logger itself: the app's boot reconfigures
+        # root logging, so a root-level capture can miss the warning.
+        records = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        target = logging.getLogger("kestrel_sovereign.features.webhooks.receiver")
+        handler = _Collect(level=logging.WARNING)
+        target.addHandler(handler)
+        try:
             for order in ((feat_a, feat_b), (feat_b, feat_a)):
                 receivers = [feat.receiver for feat in order]
                 app = FastAPI()
@@ -1421,9 +1430,11 @@ class TestWebhookMultiAgentDispatch:
                 resp = TestClient(app).post("/webhooks/alpha", content=payload)
                 assert resp.status_code == 404, order
                 assert resp.json() == {"error": "Unknown webhook: alpha"}, order
+        finally:
+            target.removeHandler(handler)
 
         collisions = [
-            record for record in caplog.records
+            record for record in records
             if record.levelno == logging.WARNING and "alpha" in record.getMessage()
         ]
         assert len(collisions) == 2, [r.getMessage() for r in caplog.records]
