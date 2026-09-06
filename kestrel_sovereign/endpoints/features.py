@@ -385,8 +385,10 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Install a feature package via pip.
 
-    Requires sovereign authority — governed agents cannot install
-    packages. That sentence used to be documentation only: the handler
+    Requires the sovereign principal. A governed agent has no sovereign
+    credential of its own, so it cannot reach this — but the check is on
+    the caller's authority, not on which agent the request was routed
+    to. The requirement used to be documentation only: the handler
     resolved the routed agent and installed, so any authenticated caller
     routed to any agent could run pip against the shared interpreter
     every agent on the host is loaded from (#3214).
@@ -913,7 +915,7 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Uninstall a feature package.
 
-    Requires sovereign authority, for the same reason as ``install``: the
+    Requires the sovereign principal, for the same reason as ``install``: the
     pip uninstall at the end of this reaches the shared interpreter every
     agent on the host runs from, so it is host administration and not the
     routed agent's own business (#3214). Guarded as a route dependency so
@@ -930,7 +932,7 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     executable because tool resolution gates on the feature's ``enabled`` flag,
     not on membership of a still-registered tool map, so a "removed" feature's
     ``@tool`` methods remained callable until restart (kestrel-sovereign#2522
-    P1). Requires a sovereign agent — governed agents cannot remove packages.
+    P1).
     """
     agent = get_agent(request)
 

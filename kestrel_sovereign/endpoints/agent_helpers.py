@@ -25,9 +25,10 @@ def require_sovereign_host_lifecycle(request: Request):
 
     That is a property of the refusal, not a confidentiality guarantee
     about the surface. `GET /api/features` deliberately returns the whole
-    catalogue with per-package status to any caller, so a non-sovereign
-    caller can already read what is installed and never needs a probe
-    pair. Do not cite this as though it hid anything.
+    catalogue with per-package status to any *authenticated* caller (it
+    sits behind the auth middleware, unlike `/health` or `/metrics`), so
+    a non-sovereign caller can already read what is installed and never
+    needs a probe pair. Do not cite this as though it hid anything.
 
     Lives here, next to :func:`get_caller`, because it is the host's
     authority predicate and not one endpoint module's private helper.
