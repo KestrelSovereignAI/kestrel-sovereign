@@ -200,7 +200,11 @@ def test_metric_summary_endpoint_passes_through_store_summary():
         "truncated": False,
     }
     observability_store = MagicMock(get_metric_summary=AsyncMock(return_value=dict(summary)))
-    agent = MagicMock(storage=MagicMock(), observability_store=observability_store)
+    agent = MagicMock(
+        storage=MagicMock(),
+        observability_store=observability_store,
+        did="did:test:emma",
+    )
 
     app, original = _prepare_app(agent)
     try:
@@ -218,7 +222,11 @@ def test_metric_summary_endpoint_passes_through_store_summary():
         assert body["time_window_minutes"] == 120
         # endpoint forwarded the window to the store
         _, kwargs = observability_store.get_metric_summary.call_args
-        assert kwargs.get("agent_name") is None
+        # Scoped to the routed agent's DID, which is what
+        # `a2a_observability.agent_name` holds — note this fixture's own
+        # `by_agent` keys are DIDs. It used to be None, meaning every
+        # agent's rows (#3215).
+        assert kwargs.get("agent_name") == "did:test:emma"
         assert "since" in kwargs
     finally:
         _restore_app(app, original)

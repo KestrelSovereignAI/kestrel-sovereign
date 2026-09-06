@@ -1,6 +1,6 @@
 """Observability endpoint - query A2A observability events for debugging."""
 from fastapi import APIRouter, Request, Query, HTTPException
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from datetime import datetime, timezone, timedelta
 import logging
 
@@ -9,6 +9,47 @@ from kestrel_sovereign.endpoints.agent_helpers import get_agent
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["observability"])
+
+
+def _scope_did(agent) -> str:
+    """The value this agent's own observability rows carry: the DID.
+
+    Despite the column's name, `a2a_observability.agent_name` is not the
+    display name for these rows. Every in-repo recorder of *this agent's
+    own* events resolves to the DID: ten direct `agent_name=self.did`
+    sites across `agent/streaming.py`, `agent/orchestrator_engine.py`
+    and `kestrel_agent.py`, plus `a2a/task_manager.py`'s
+    `create_task`/`fail_task`/`update_status`, whose callers pass a
+    did-first value. `kestrel_agent.py` says so where it wires the
+    ephemeral purge: "Tool-call args in a2a_observability use the agent
+    DID as agent_name ... so scope by DID on both columns".
+
+    The column is NOT exclusively DIDs, and that is deliberate rather
+    than a bug to fix here: `kestrel_feature_talon` scopes its
+    `talon_job` reads by the display name, because those rows describe
+    an external producer's jobs rather than this agent's turns, and
+    pre-#2461 rows carry `"unknown"`. So this scope is "my own events",
+    not "every row an agent could be said to own" — do not carry it to a
+    read whose producer uses the other convention. `test_observability_
+    writer_identity_convention.py` pins the in-repo half.
+
+    Scoping by `agent.agent_name` instead would not be a narrower read
+    of this agent's events, it would be an empty one: every panel blank,
+    and the #969 forensic metric answering "never happened".
+
+    Missing identity refuses rather than falls back, and the emptiness
+    test is truthiness, not `is None`: the store gates on
+    `if agent_name:`, so an EMPTY STRING is an unscoped read — every
+    agent's rows in a well-formed 200 — which is the defect this
+    function exists to prevent.
+    """
+    did = getattr(agent, "did", None)
+    if not did:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent identity unavailable; cannot scope observability.",
+        )
+    return did
 
 @router.get("/api/observability/summary")
 async def get_observability_summary(
@@ -29,13 +70,27 @@ async def get_observability_summary(
     if not obs_store:
         raise HTTPException(status_code=503, detail="Observability store not available")
 
+    # Resolved BEFORE the try below, which turns every exception into a
+    # generic 500 — a refusal that says "identity unavailable" is not the
+    # same answer as "the query blew up", and only the first tells the
+    # caller the read was declined rather than attempted.
+    scope_did = _scope_did(agent)
+
     try:
         from datetime import timedelta
         from kestrel_sovereign.kestrel_config.constants import DEFAULT_OBSERVABILITY_LIMIT
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
-        # Query recent events
+        # Scoped to the routed agent's own rows. Without the predicate
+        # this returned every agent's events whenever the store is
+        # shared — which it is on PostgreSQL, where one table serves the
+        # whole host. SQLite-per-agent masked it: the file boundary was
+        # doing the scoping, so the query never needed to (#3215).
+        #
+        # The identity comes from the resolved agent, never from the
+        # request. Routing to an agent is not authority over it.
         events = await obs_store.query_events(
+            agent_name=scope_did,
             since=since,
             limit=DEFAULT_OBSERVABILITY_LIMIT,
         )
@@ -127,7 +182,6 @@ async def get_metric_summary(
     request: Request,
     metric_name: str,
     minutes: int = Query(1440, ge=1, le=43200, description="Time window in minutes (default 24h)"),
-    agent_name: Optional[str] = Query(None, description="Filter to a single agent"),
 ) -> Dict[str, Any]:
     """Summarize a single named metric over a recent window.
 
@@ -136,6 +190,15 @@ async def get_metric_summary(
     assistant-turn persist falls back to the error path — with count, last_seen,
     per-agent breakdown, and recent samples carrying the metric's metadata
     (e.g. ``error_type``/``session_id``). Generic: works for any metric name.
+
+    Scoped to the routed agent. This used to take ``agent_name`` as a
+    query parameter: omitting it summarised every agent's rows, and
+    supplying it addressed another agent's (#3215). A caller-supplied
+    identity is a request, not an authority, so the parameter is gone
+    rather than validated — validating it would answer "that agent has
+    no such metric" differently from "that agent is not you", which is
+    the same leak one step removed. Fleet-wide observability belongs on
+    an explicit sovereign surface, not on an agent-routed read.
     """
     try:
         agent = get_agent(request)
@@ -146,11 +209,13 @@ async def get_metric_summary(
     if not obs_store:
         raise HTTPException(status_code=503, detail="Observability store not available")
 
+    scope_did = _scope_did(agent)
+
     try:
         since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         summary = await obs_store.get_metric_summary(
             metric_name,
-            agent_name=agent_name,
+            agent_name=scope_did,
             since=since,
         )
         summary["time_window_minutes"] = minutes
