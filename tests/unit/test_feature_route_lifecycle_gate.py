@@ -957,9 +957,35 @@ def test_two_distinct_receivers_that_compare_equal_are_two_owners():
         second.receiver.handled.clear()
         app, restore = _boot_multi_agent(agents)
         try:
-            with TestClient(app) as client:
-                resp = client.post("/webhooks/deposit", content=b"{}")
-            assert resp.status_code == 404, (list(agents), resp.text)
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+                    assert resp.status_code == 404, (list(agents), resp.text)
+                    if len(agents) == 1:
+                        # A collision INSIDE one agent: the prefixed form
+                        # refuses too, and the log must not send the
+                        # operator to an address that also 404s.
+                        scoped = client.post(
+                            "/api/agents/a/webhooks/deposit", content=b"{}"
+                        )
+                        assert scoped.status_code == 404, scoped.text
+                        assert scoped.json() == {"error": "Unknown webhook: deposit"}
+            collisions = [
+                r.getMessage() for r in records if "is owned by" in r.getMessage()
+            ]
+            assert collisions, [r.getMessage() for r in records]
+            if len(agents) == 1:
+                # The unprefixed refusal AND the prefixed refusal both name
+                # the within-agent cause; neither sends the operator to the
+                # prefixed address that also 404s.
+                assert len(collisions) == 2, collisions
+                assert all("within the addressed agent" in m for m in collisions[1:]), collisions
+                assert all("Address it as" not in m for m in collisions[1:]), collisions
+            else:
+                assert all(
+                    "Address it as /api/agents/{agent}/webhooks/deposit" in m
+                    for m in collisions
+                ), collisions
             assert first.receiver.handled == [] and second.receiver.handled == [], list(agents)
         finally:
             restore()

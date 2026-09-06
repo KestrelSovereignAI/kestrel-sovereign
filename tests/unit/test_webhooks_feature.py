@@ -1437,7 +1437,7 @@ class TestWebhookMultiAgentDispatch:
             record for record in records
             if record.levelno == logging.WARNING and "alpha" in record.getMessage()
         ]
-        assert len(collisions) == 2, [r.getMessage() for r in caplog.records]
+        assert len(collisions) == 2, [r.getMessage() for r in records]
         for record in collisions:
             assert "/api/agents/{agent}/webhooks/alpha" in record.getMessage()
 

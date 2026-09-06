@@ -103,8 +103,10 @@ def build_webhook_dispatch_router(
       same ``404 Unknown webhook`` an unregistered name gets, so a keyless
       caller cannot probe which names are registered on more than one
       agent; each owning receiver audits the refusal as a 404 and the host
-      log names the collision. The agent-prefixed form stays unambiguous
-      because its scope is a single agent;
+      log names the collision. Addressing one agent with the agent-prefixed
+      form resolves a collision *between* agents; a collision *within* one
+      agent (two of its receivers owning the name) is refused on that form
+      too, and the log says which case it is;
     * none owns it → recorded on the first in-scope receiver (so the 404 is
       still audited) or a bare 404 when no in-scope receiver exists.
 
@@ -144,15 +146,29 @@ def build_webhook_dispatch_router(
             # the refusal, and the host log carries the collision so an
             # operator can re-address the sender to the agent-prefixed form.
             result = unknown_webhook_result(webhook_name)
-            logger.warning(
-                "Webhook '%s' is owned by %d enabled receivers; refusing the "
-                "unscoped request from %s without dispatch. Address it as "
-                "/api/agents/{agent}/webhooks/%s instead.",
-                webhook_name,
-                len(owners),
-                source_ip,
-                webhook_name,
-            )
+            if target_agent is None:
+                logger.warning(
+                    "Webhook '%s' is owned by %d enabled receivers; refusing the "
+                    "unscoped request from %s without dispatch. Address it as "
+                    "/api/agents/{agent}/webhooks/%s instead.",
+                    webhook_name,
+                    len(owners),
+                    source_ip,
+                    webhook_name,
+                )
+            else:
+                # Already scoped to one agent and still ambiguous: two of that
+                # agent's own receivers own the name. No address disambiguates
+                # this; the name itself has to be un-collided.
+                logger.warning(
+                    "Webhook '%s' is owned by %d enabled receivers within the "
+                    "addressed agent; refusing the request from %s without "
+                    "dispatch. The agent-prefixed form cannot disambiguate a "
+                    "collision inside one agent — unregister one of them.",
+                    webhook_name,
+                    len(owners),
+                    source_ip,
+                )
             for owner in owners:
                 await _audit_refusal(
                     owner,
