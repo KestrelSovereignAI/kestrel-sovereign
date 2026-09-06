@@ -200,9 +200,13 @@ def test_prefixed_rasa_alias_invokes_only_the_routed_agent():
 
 
 def test_prefixed_rasa_alias_beats_the_host_default_agent():
-    """#3220, the reported shape: A is the host default and the request names
-    B. The old handler ran A. The routed agent must win over the default;
-    the unprefixed form on the same host still reaches the default.
+    """Defence-in-depth precedence check over a SYNTHETIC state.
+
+    A real multi-agent boot sets ``app.state.agent = None``, so on a real
+    host the pre-fix symptom was a 503 on every prefixed request (see the
+    no-default test), never cross-agent execution. Should a default and a
+    manager ever coexist, the routed agent must still win and the
+    unprefixed form must still reach the default.
     """
     a = _rasa_agent("reply from a")
     b = _rasa_agent("reply from b")
@@ -392,4 +396,121 @@ def test_token_check_precedes_agent_resolution():
                 )
         assert response.status_code == 401, response.text
     finally:
+        _restore_app(app, original)
+
+
+def _rasa_shim_log():
+    """Collect the shim's own log records via a handler on its logger (the
+    app's boot reconfigures root logging, so a root capture can miss them)."""
+    import logging
+    from contextlib import contextmanager
+
+    @contextmanager
+    def capture():
+        records = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        target = logging.getLogger("kestrel_sovereign.endpoints.rasa_shim")
+        handler = _Collect(level=logging.WARNING)
+        target.addHandler(handler)
+        try:
+            yield records
+        finally:
+            target.removeHandler(handler)
+
+    return capture()
+
+
+def test_unlisted_agent_answers_the_middlewares_own_not_found_envelope_and_logs():
+    """#3220 round 2: an unlisted agent must be indistinguishable from an
+    absent one to a token holder — same ``agent_not_found`` envelope the
+    routing middleware answers — and the refusal must be host-logged naming
+    the agent and the variable to set. The comparison is case-insensitive,
+    as ``AgentManager.get_agent`` is: routing key ``Nellie``, list ``nellie``.
+    """
+    nellie = _rasa_agent("reply from nellie")
+    env = {
+        "KESTREL_API_KEY": "test-key",
+        "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+        "KESTREL_RASA_WEBHOOK_AGENTS": "nellie",
+    }
+    app, original = _prepare_multi_agent_app({"Nellie": nellie, "Emma": _rasa_agent("reply from emma")})
+    try:
+        with patch.dict("os.environ", env), _rasa_shim_log() as records:
+            with TestClient(app) as client:
+                listed = client.post(
+                    "/api/agents/Nellie/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-1", "message": "hi"},
+                )
+                assert listed.status_code == 200, listed.text
+                unlisted = client.post(
+                    "/api/agents/Emma/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-2", "message": "hi"},
+                )
+                unknown = client.post(
+                    "/api/agents/Nobody/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-3", "message": "hi"},
+                )
+        assert unlisted.status_code == unknown.status_code == 404
+        assert unlisted.json()["error"]["code"] == unknown.json()["error"]["code"]
+        assert (
+            unlisted.json()["error"]["message"].replace("Emma", "X")
+            == unknown.json()["error"]["message"].replace("Nobody", "X")
+        )
+        refusals = [r.getMessage() for r in records if "KESTREL_RASA_WEBHOOK_AGENTS" in r.getMessage()]
+        assert refusals and "Emma" in refusals[0], [r.getMessage() for r in records]
+    finally:
+        _restore_app(app, original)
+
+
+def test_concurrency_gate_is_per_routed_agent():
+    """#3220 round 2: the ten-permit semaphore was one module global. Before
+    the routed agent was bound only the host default could be invoked here,
+    so the permits belonged to one agent; shared across the fleet, agent A's
+    slow turns would stall agent B with no 429 and no timeout. With A's gate
+    fully held, B's request must still complete.
+    """
+    import asyncio
+
+    from kestrel_sovereign.endpoints import rasa_shim
+
+    sa = _rasa_agent("reply from sa")
+    sb = _rasa_agent("reply from sb")
+    env = {
+        "KESTREL_API_KEY": "test-key",
+        "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+        "KESTREL_RASA_WEBHOOK_AGENTS": "sa,sb",
+    }
+    gate_a = rasa_shim._agent_semaphore_for("sa")
+    assert gate_a is rasa_shim._agent_semaphore_for("sa")
+    assert gate_a is not rasa_shim._agent_semaphore_for("sb")
+    assert rasa_shim._agent_semaphore_for(None) is rasa_shim._agent_semaphore_for("default")
+
+    async def drain():
+        for _ in range(rasa_shim._AGENT_CONCURRENCY):
+            await gate_a.acquire()
+
+    asyncio.run(drain())
+    app, original = _prepare_multi_agent_app({"sa": sa, "sb": sb})
+    try:
+        assert gate_a.locked()
+        with patch.dict("os.environ", env):
+            with TestClient(app) as client:
+                other = client.post(
+                    "/api/agents/sb/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-b", "message": "hi"},
+                )
+        assert other.status_code == 200, other.text
+        sb.process_input.assert_awaited_once()
+        assert gate_a.locked()  # B's turn never touched A's permits
+    finally:
+        for _ in range(rasa_shim._AGENT_CONCURRENCY):
+            gate_a.release()
         _restore_app(app, original)
