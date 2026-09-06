@@ -7303,6 +7303,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "reset",
         "restart",
         "retire",
+        "revoke",
         "resume",
         "shutdown",
         "start",
@@ -8580,6 +8581,7 @@ def _is_unambiguous_control_token(token: str) -> bool:
         "kill_process",
         "offboard",
         "restart",
+        "revoke",
         "shutdown",
         "spawn",
         "stop",
@@ -9700,6 +9702,10 @@ def _local_parameter_return_flows(
         function: _scope_callable_alias_edges(function)
         for function in functions
     }
+    container_aliases = {
+        function: _mutable_container_alias_snapshots(function)
+        for function in functions
+    }
 
     def call_flows(
         call: ast.Call,
@@ -9740,6 +9746,26 @@ def _local_parameter_return_flows(
                 for argument in _bound_parameter_flow_arguments(value, flow)
             ):
                 return True
+            callable_sources = _expanded_callable_sources(
+                _call_name(value).casefold(),
+                callable_alias_edges[caller],
+            )
+            if callable_sources.intersection(all_parameter_names[caller]):
+                # The callee is itself supplied by the caller.  A returned
+                # invocation can therefore retain both the selected callback
+                # and any value handed to it.  With no callable body available
+                # in this scope, conservatively summarize all operands at the
+                # same parameter-flow boundary used for ordinary wrappers.
+                callback_inputs: list[ast.AST] = [
+                    value.func,
+                    *value.args,
+                    *(keyword.value for keyword in value.keywords),
+                ]
+                if any(
+                    expression_flows_from_aliases(argument, aliases, caller)
+                    for argument in callback_inputs
+                ):
+                    return True
             if not (
                 _is_provenance_transform_call(value)
                 or _is_provenance_accessor_call(value)
@@ -9781,6 +9807,15 @@ def _local_parameter_return_flows(
                 elif isinstance(node, (ast.For, ast.AsyncFor)):
                     targets = [node.target]
                     value = node.iter
+                elif isinstance(node, ast.Call):
+                    mutation = _mutable_container_write(node)
+                    if mutation is not None:
+                        target_names, value = mutation
+                        target_names.update(
+                            container_aliases[function].get(node, ())
+                        )
+                        assignments.append((target_names, value))
+                        continue
                 elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
                     if node.value is not None:
                         returned_values.append(node.value)
@@ -9790,8 +9825,9 @@ def _local_parameter_return_flows(
                             {
                                 name
                                 for target in targets
-                                for name in _binding_target_names(target)
-                            },
+                                for name in _reference_binding_names(target)
+                            }
+                            | set(container_aliases[function].get(node, ())),
                             value,
                         )
                     )
@@ -13579,6 +13615,16 @@ def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None
     assert _authority_provenance_lines(process_kill) == {2}
 
 
+def test_provenance_scanner_recognizes_delegation_revocation_control_sink() -> None:
+    tree = ast.parse(
+        "def dispatch(request, delegation):\n"
+        "    if request.causation_chain:\n"
+        "        delegation.revoke()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
 def test_provenance_scanner_recognizes_agent_process_kills() -> None:
     controlled = ast.parse(
         "def dispatch(request, child):\n"
@@ -13716,6 +13762,60 @@ def test_provenance_scanner_follows_assignment_inside_return_wrapper() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {9}
+
+
+def test_provenance_scanner_follows_returned_callback_parameters() -> None:
+    positional = ast.parse(
+        "def invoke(callback, value):\n"
+        "    return callback(value)\n\n"
+        "def derive(request):\n"
+        "    return invoke(bool, request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    aliased_keyword = ast.parse(
+        "def invoke(callback, value):\n"
+        "    apply = callback\n"
+        "    return apply(value)\n\n"
+        "def derive(request):\n"
+        "    return invoke(callback=bool, value=request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(positional) == {8}
+    assert _authority_provenance_lines(aliased_keyword) == {9}
+
+
+def test_provenance_scanner_follows_container_writes_in_return_wrappers() -> None:
+    subscript_write = ast.parse(
+        "def wrap(value):\n"
+        "    result = {}\n"
+        "    result['decision'] = value\n"
+        "    return result['decision']\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    aliased_mutator = ast.parse(
+        "def wrap(value):\n"
+        "    result = []\n"
+        "    alias = result\n"
+        "    alias.append(value)\n"
+        "    return result[0]\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(subscript_write) == {10}
+    assert _authority_provenance_lines(aliased_mutator) == {11}
 
 
 def test_provenance_scanner_binds_variadic_return_wrapper_arguments() -> None:
