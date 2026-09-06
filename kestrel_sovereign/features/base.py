@@ -1342,11 +1342,16 @@ class Feature(_SdkFeature):
         # happenstance.
         subagent_parts: List[dict] = []
         try:
-            # Get feature's own tools, excluding any denied by security policy
-            available_tools = self.get_tools()
+            # The canonical runtime toolset for this invocation: the feature's
+            # own tools minus anything security denied, plus the framework's
+            # lent context-retrieval tools. The advertised schemas, the prompt
+            # and the loop's executable map all derive from THIS list.
+            available_tools = self._compose_subagent_runtime_tools(denied_tools)
             if denied_tools:
-                available_tools = [t for t in available_tools if t.name not in denied_tools]
-                logger.info(f"Feature {self.name}: stripped {len(denied_tools)} denied tools, {len(available_tools)} remaining")
+                logger.info(
+                    f"Feature {self.name}: stripped {len(denied_tools)} denied tools, "
+                    f"{len(available_tools)} remaining"
+                )
 
             # If ALL tools are denied, return immediately with denial
             if not available_tools and denied_tools:
@@ -1363,8 +1368,9 @@ class Feature(_SdkFeature):
             ]
             logger.debug(f"Feature {self.name} has {len(feature_tools)} tools available")
 
-            # Feature-specific system prompt
-            system_prompt = self._get_subagent_prompt()
+            # Feature-specific system prompt, named from the SAME list the
+            # model is given so the two cannot disagree.
+            system_prompt = self._get_subagent_prompt(available_tools)
 
             # Build user prompt with task and context
             user_prompt = f"Task: {task}"
@@ -1383,7 +1389,9 @@ class Feature(_SdkFeature):
             # translation and break Gemini/Vertex routes — codex
             # round 3 P2 on #1461 follow-up.
             tool_executor = (
-                self._make_feature_inline_tool_executor(parts_sink=subagent_parts)
+                self._make_feature_inline_tool_executor(
+                    parts_sink=subagent_parts, runtime_tools=available_tools
+                )
                 if feature_tools else None
             )
             # The subagent reasons on behalf of the turn that dispatched it, so
@@ -1430,6 +1438,7 @@ class Feature(_SdkFeature):
                 model_override=model_override,
                 parts_sink=subagent_parts,
                 session_id=turn_session_id,
+                runtime_tools=available_tools,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -1451,11 +1460,21 @@ class Feature(_SdkFeature):
                 err_envelope["parts"] = subagent_parts
             return err_envelope
 
-    def _make_feature_inline_tool_executor(self, parts_sink: Optional[List[dict]] = None):
+    def _make_feature_inline_tool_executor(
+        self,
+        parts_sink: Optional[List[dict]] = None,
+        runtime_tools: Optional[List[Any]] = None,
+    ):
         """Build an inline ``(name, args) -> result_dict`` async callable
-        bound to this feature's OWN tool palette, gated by the same
+        bound to this invocation's runtime tool palette, gated by the same
         ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
         path enforces.
+
+        ``runtime_tools`` is the same list the non-inline loop executes
+        against. Both paths must resolve a name identically: this one was
+        rebuilding the map from an unfiltered ``self.get_tools()``, so the
+        two doors to the same tool palette disagreed about which tools
+        security had denied.
 
         ``parts_sink`` (#2641) is the subagent-local typed-parts buffer:
         threaded into ``_execute_subagent_tool`` so parts emitted by inline
@@ -1530,7 +1549,9 @@ class Feature(_SdkFeature):
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
-                    tools_by_name={t.name: t for t in self.get_tools()},
+                    tools_by_name={
+                        t.name: t for t in (runtime_tools or self.get_tools())
+                    },
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
                 )
@@ -1705,13 +1726,95 @@ class Feature(_SdkFeature):
                     parts_sink.extend(envelope_parts)
             return _shape(effective_args, serialized)
 
-    def _get_subagent_prompt(self) -> str:
+    # Framework-owned tools lent to EVERY subagent for the duration of one
+    # invocation. Deliberately NOT part of any feature's ``get_tools()``: that
+    # method answers "what is this feature", and feeds ``get_agent_card()`` and
+    # the A2A skill list, so adding these there would make every feature
+    # advertise capabilities it does not own. This table answers the different
+    # question "what is this turn given to work with".
+    #
+    # They exist so a subagent whose context is compacted can read back what
+    # was moved out (see ``salvage.py``: "No model-visible pruning without a
+    # synchronous durable artifact or lossless pointer"). Without retrieval, a
+    # trimmed subagent silently forgets and redoes work.
+    _SUBAGENT_BORROWED_TOOLS = (
+        ("ContextFeature", "recursive_query"),
+        ("AttachmentsFeature", "read_attachment"),
+    )
+
+    def _borrowed_subagent_tools(self) -> List[Any]:
+        """Context-retrieval tools lent from other features, if present.
+
+        Absence is normal, not an error: a host may not have the Context or
+        Attachments feature enabled, and a subagent simply goes without.
+        """
+        borrowed: List[Any] = []
+        agent = getattr(self, "agent", None)
+        getter = getattr(agent, "get_feature", None)
+        if not callable(getter):
+            return borrowed
+        for feature_name, tool_name in self._SUBAGENT_BORROWED_TOOLS:
+            try:
+                feature = getter(feature_name)
+                if feature is None or feature is self:
+                    continue
+                for tool in feature.get_tools():
+                    if tool.name == tool_name:
+                        borrowed.append(tool)
+                        break
+            except Exception as e:  # never let lending break a subagent
+                logger.debug(
+                    f"{self.name}: could not borrow {tool_name} from "
+                    f"{feature_name}: {e}"
+                )
+        return borrowed
+
+    def _compose_subagent_runtime_tools(
+        self, denied_tools: Optional[Any] = None
+    ) -> List[Any]:
+        """The canonical tool set for ONE subagent invocation.
+
+        Three things have to agree — the schemas advertised to the model, the
+        "your tools are" line in the subagent prompt, and ``tools_by_name``,
+        the map the loop executes against. Before this they were derived
+        separately and disagreed in two ways:
+
+        * ``execute_as_subagent`` filtered ``denied_tools`` out of the
+          advertised schemas, but both the prompt and ``tools_by_name`` were
+          rebuilt from an unfiltered ``self.get_tools()``. A denied tool was
+          therefore still *executable* if its name reached the loop — the
+          model was not offered it, which is why this had not bitten, but the
+          policy was enforced only by omission.
+        * The prompt listed tools the model was not given, and (once tools are
+          lent) would omit tools it was.
+
+        Deriving all three from this one list is what keeps them from drifting
+        again.
+        """
+        denied = set(denied_tools or ())
+        tools = [t for t in self.get_tools() if t.name not in denied]
+        for tool in self._borrowed_subagent_tools():
+            if tool.name in denied:
+                continue
+            if any(existing.name == tool.name for existing in tools):
+                continue  # the feature's own tool wins over a borrowed one
+            tools.append(tool)
+        return tools
+
+    def _get_subagent_prompt(self, runtime_tools: Optional[List[Any]] = None) -> str:
         """
         Get the system prompt for this feature's subagent context.
 
+        ``runtime_tools`` is the toolset the model will actually be given for
+        this invocation (see ``_compose_subagent_runtime_tools``). It is passed
+        rather than re-derived so the prompt cannot name a different set from
+        the one the loop advertises and executes. Omitted, it falls back to
+        ``get_tools()`` for callers and subclasses that predate this.
+
         Override this in subclasses for more specialized prompts.
         """
-        tool_names = [t.name for t in self.get_tools()]
+        source = runtime_tools if runtime_tools is not None else self.get_tools()
+        tool_names = [t.name for t in source]
         tools_list = ", ".join(tool_names) if tool_names else "None"
 
         return f"""EXECUTION MODE: You are now executing as the {self.name} subagent.
@@ -1752,6 +1855,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         model_override: Optional[str] = None,
         parts_sink: Optional[List[dict]] = None,
         session_id: Optional[str] = None,
+        runtime_tools: Optional[List[Any]] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -1818,7 +1922,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {agent_tool.name: agent_tool for agent_tool in self.get_tools()}
+        # The executable map is the RUNTIME toolset, not an unfiltered
+        # re-derivation: rebuilding from ``self.get_tools()`` here put every
+        # security-denied tool back into the map (the model was not offered
+        # them, so policy held by omission alone) and left lent tools out.
+        tools_by_name = {t.name: t for t in (runtime_tools or self.get_tools())}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit

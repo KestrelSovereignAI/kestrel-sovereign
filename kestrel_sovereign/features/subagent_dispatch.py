@@ -41,6 +41,8 @@ _DISPATCH_METHODS: tuple[str, ...] = (
     "_make_feature_inline_tool_executor",
     "_execute_subagent_tool",
     "_get_subagent_prompt",
+    "_compose_subagent_runtime_tools",
+    "_borrowed_subagent_tools",
     "_turn_session_id",
     "_repair_subagent_premature_yield",
     "_get_tool_by_name",
