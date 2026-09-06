@@ -4048,6 +4048,46 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         assert known.status_code == invented.status_code == 403
         assert known.text == invented.text
 
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_the_gate_is_not_on_the_reads_or_the_per_agent_routes(
+        self, mock_registry
+    ):
+        """Where the guard is NOT, stated executably.
+
+        Everything above pins the gate ON install and remove and nothing
+        pinned it OFF anywhere, so three mutations survived the whole
+        suite: hoisting the dependency onto the `APIRouter` (which 403s
+        the entire feature UI for every OAuth user), and adding it to
+        `/enable`, `/disable`, `PATCH /config` or `GET
+        /api/features/{name}`. A scoping decision recorded only in prose
+        is not a decision the suite can keep.
+
+        This says the catalog stays readable and the per-agent routes
+        stay reachable without sovereign authority. It is deliberately
+        `!= 403` rather than a specific success code: what those routes
+        do about an unknown feature is their business — the claim here is
+        only that authority is not what stops them.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _make_agent()
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+
+        with TestClient(app) as client:
+            assert client.get("/api/features").status_code == 200
+            assert client.get("/api/features/installed").status_code == 200
+
+            for route in ("enable", "disable"):
+                response = client.post(f"/api/features/test-pkg/{route}")
+                assert response.status_code != 403, (route, response.text)
+
+            assert client.get("/api/features/test-pkg").status_code != 403
+            assert (
+                client.patch(
+                    "/api/features/test-pkg/config", json={"config": {}}
+                ).status_code
+                != 403
+            )
+
     @pytest.mark.parametrize("route", ["install", "remove"])
     def test_a_sovereign_caller_is_admitted_past_the_gate(self, route):
         """The positive control.

@@ -34,6 +34,7 @@ from kestrel_sdk.features import (
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.security.feature import SecurityFeature
@@ -41,6 +42,28 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
+
+
+def _sovereign_feature_app(agent) -> FastAPI:
+    """A features-router app whose caller is the sovereign.
+
+    `/install` and `/remove` require sovereign authority (#3214) and read
+    it from `request.state.caller`, which the auth middleware sets in
+    production and nothing sets here. Without this stand-in the tests
+    below stop at a 403 instead of asserting what they exist for — that
+    teardown drains every registration a live feature acquired (#2522).
+    """
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _attach_sovereign_caller(request, call_next):
+        request.state.caller = CallerContext.sovereign()
+        return await call_next(request)
+
+    app.include_router(features_router)
+    app.state.agent = agent
+    return app
+
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +283,7 @@ async def test_endpoint_disable_detaches_everything_then_enable_recreates(tmp_pa
     live = _live_registrations(agent, feature)
     assert all(live.values()), f"feature not fully live after boot: {live}"
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with TestClient(app) as client:
         disable = client.post("/api/features/_FullFeature/disable")
@@ -580,9 +601,7 @@ async def test_disabled_feature_is_invisible_to_llm_then_enable_restores(tmp_pat
     live = _llm_visibility(agent, feature)
     assert all(live.values()), f"feature not fully visible while enabled: {live}"
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with TestClient(app) as client:
         assert client.post("/api/features/_DispatchFeature/disable").status_code == 200
@@ -1049,9 +1068,7 @@ async def test_endpoint_remove_drains_every_registration_and_direct_tool(tmp_pat
         features=["_FullFeature"], description="full", core=False,
     )
 
-    app = FastAPI()
-    app.include_router(features_router)
-    app.state.agent = agent
+    app = _sovereign_feature_app(agent)
 
     with patch(
         "kestrel_sovereign.endpoints.features.get_package_for_feature",

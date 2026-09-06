@@ -392,8 +392,10 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     every agent on the host is loaded from (#3214).
 
     The guard is a route dependency, not a call in the body, so it runs
-    before the registry lookup below. An unauthorized caller therefore
-    gets the same 403 whether or not the package exists.
+    before the registry lookup below and the refusal is the same whether
+    or not the package exists. That keeps the refusal from being a probe;
+    it does not hide the catalogue, which `GET /api/features` serves to
+    anyone.
     """
     agent = get_agent(request)
 

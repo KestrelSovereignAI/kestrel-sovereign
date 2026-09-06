@@ -18,10 +18,16 @@ def require_sovereign_host_lifecycle(request: Request):
     """Admit only the sovereign-key principal to host lifecycle mutations.
 
     A FastAPI dependency rather than a call inside a handler, and that
-    placement is load-bearing: it runs before the handler body, so an
-    unauthorized caller cannot learn from the response whether the thing
-    they named exists. A check placed after a registry lookup would
-    answer 404 for an unknown package and 403 for a known one.
+    placement is load-bearing: it runs before the handler body, so the
+    refusal itself carries no state about what it refused. A check placed
+    after a registry lookup would answer 404 for an unknown package and
+    403 for a known one, making the refusal a probe.
+
+    That is a property of the refusal, not a confidentiality guarantee
+    about the surface. `GET /api/features` deliberately returns the whole
+    catalogue with per-package status to any caller, so a non-sovereign
+    caller can already read what is installed and never needs a probe
+    pair. Do not cite this as though it hid anything.
 
     Lives here, next to :func:`get_caller`, because it is the host's
     authority predicate and not one endpoint module's private helper.
