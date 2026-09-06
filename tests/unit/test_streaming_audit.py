@@ -2509,7 +2509,7 @@ class TestStrictContinuationTimeoutSafeBlock:
 # preserved.
 # =========================================================================
 
-from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import HookInput
 
 
 class _RecorderHook(Hook):
