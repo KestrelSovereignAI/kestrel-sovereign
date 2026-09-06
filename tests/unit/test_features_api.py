@@ -16,6 +16,9 @@ from kestrel_sovereign.auth import AuthMethod, CallerContext, CallerRole
 
 from kestrel_sovereign import cli
 from kestrel_sovereign.endpoints import features as features_endpoint
+from kestrel_sovereign.endpoints.agent_helpers import (
+    require_sovereign_host_lifecycle,
+)
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -4000,7 +4003,7 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
             (CallerContext(role=CallerRole.AUTHENTICATED), "an OAuth/JWT user"),
             (CallerContext.a2a_transport(), "a peer admitted by transport"),
             (CallerContext.anonymous(), "an anonymous caller"),
-            (None, "no auth middleware at all"),
+            (None, "middleware ran but attached no caller"),
         ],
     )
     def test_a_caller_without_sovereign_authority_is_refused(
@@ -4016,9 +4019,31 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         assert "Sovereign authority is required." in response.text
 
     @pytest.mark.parametrize("route", ["install", "remove"])
+    def test_an_app_with_no_auth_middleware_at_all_is_refused(self, route):
+        """The shape round 1's P1 actually had.
+
+        `_make_app` always registers its middleware, so passing
+        ``caller=None`` produces "middleware ran and attached nothing" —
+        a different thing from "no middleware ran", where
+        ``request.state.caller`` is not merely None but absent. The
+        existing regression tests build exactly this kind of app, so the
+        guard has to fail closed on a missing attribute and not only on
+        a None one.
+        """
+        app = FastAPI()
+        app.include_router(features_router)
+        app.state.agent = _make_agent()
+
+        with TestClient(app) as client:
+            response = client.post(f"/api/features/test-pkg/{route}")
+
+        assert response.status_code == 403, response.text
+
+    @pytest.mark.parametrize("route", ["install", "remove"])
+    @patch("kestrel_sovereign.endpoints.features.subprocess.run")
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_refusal_does_not_reveal_whether_the_package_exists(
-        self, mock_registry, route
+        self, mock_registry, mock_subprocess, route, monkeypatch
     ):
         """403 before 404, so the refusal is not an existence oracle.
 
@@ -4036,10 +4061,19 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         closed.
         """
         mock_registry.return_value = dict(FAKE_REGISTRY)
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        # The installer seams its neighbours use. Today the 403 lands
+        # first, so nothing here reaches them — but the mutation this
+        # test exists to catch is "the gate is gone", and without these
+        # that mutation runs a real `uv pip install kestrel-feature-test`
+        # and `pip uninstall` against the developer's own venv. A test
+        # whose failure mode is installing software is not a test.
+        use_fake_uv(monkeypatch, FakeUv(feature="kestrel-feature-test",
+                                        core_checkout="/src/core"))
         agent = _make_agent()
         app = _make_app(agent, caller=CallerContext.anonymous())
 
-        with TestClient(app) as client:
+        with TestClient(app, raise_server_exceptions=False) as client:
             known = client.post(f"/api/features/test-pkg/{route}")
             invented = client.post(
                 f"/api/features/no-such-package-anywhere/{route}"
@@ -4047,6 +4081,20 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
 
         assert known.status_code == invented.status_code == 403
         assert known.text == invented.text
+
+        # The differential has to exist for its absence to mean anything.
+        # Stated in prose, this was unasserted: rename `test-pkg` in
+        # FAKE_REGISTRY and both probes collapse to one answer, the
+        # oracle disappears, and the test above stays green proving
+        # nothing.
+        sovereign = _make_app(agent, caller=CallerContext.sovereign())
+        with TestClient(sovereign, raise_server_exceptions=False) as client:
+            real = client.post(f"/api/features/test-pkg/{route}")
+            fake = client.post(f"/api/features/no-such-package-anywhere/{route}")
+        assert real.status_code != fake.status_code, (
+            "a sovereign caller must be able to tell these apart, or the "
+            "anonymous pair above proves nothing"
+        )
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_the_gate_is_not_on_the_reads_or_the_per_agent_routes(
@@ -4069,24 +4117,62 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         only that authority is not what stops them.
         """
         mock_registry.return_value = dict(FAKE_REGISTRY)
-        agent = _make_agent()
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
         app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
 
         with TestClient(app) as client:
             assert client.get("/api/features").status_code == 200
             assert client.get("/api/features/installed").status_code == 200
+            assert client.get("/api/features/TestFeature").status_code == 200
 
+            # `== 200`, not `!= 403`: a deleted or renamed route answers
+            # 404, and 404 is also `!= 403`, so the weaker form could not
+            # tell "reachable without sovereign authority" from "not
+            # there at all".
             for route in ("enable", "disable"):
-                response = client.post(f"/api/features/test-pkg/{route}")
-                assert response.status_code != 403, (route, response.text)
+                response = client.post(f"/api/features/TestFeature/{route}")
+                assert response.status_code == 200, (route, response.text)
 
-            assert client.get("/api/features/test-pkg").status_code != 403
             assert (
                 client.patch(
-                    "/api/features/test-pkg/config", json={"config": {}}
+                    "/api/features/TestFeature/config", json={"config": {}}
                 ).status_code
-                != 403
+                == 200
             )
+
+    def test_exactly_the_shared_environment_routes_carry_the_gate(self):
+        """The scoping decision, read off the route table rather than a list.
+
+        A hand-picked list of unguarded routes is an open statement: it
+        says nothing about the routes it forgot, and this router has 14.
+        Adding the dependency to `GET /api/ui/contributions`,
+        `/api/features/{name}/config`, `/skills` or `/api/skills/...`
+        survived the whole suite until this existed.
+
+        `GET /api/ui/capabilities` is the sharpest of those: `server.py`
+        exempts `/api/ui/` from auth entirely when serving the UI, so
+        `request.state.caller` is never set there and a gate would refuse
+        everyone, sovereign included.
+        """
+        gated = {
+            route.path
+            for route in features_router.routes
+            if any(
+                dependency.dependency is require_sovereign_host_lifecycle
+                for dependency in getattr(route, "dependencies", ())
+            )
+        }
+
+        assert gated == {
+            "/api/features/{name}/install",
+            "/api/features/{name}/remove",
+        }, (
+            "only the routes that mutate the shared interpreter may require "
+            "sovereign authority; everything else on this router serves the "
+            "console for ordinary callers"
+        )
 
     @pytest.mark.parametrize("route", ["install", "remove"])
     def test_a_sovereign_caller_is_admitted_past_the_gate(self, route):
