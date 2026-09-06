@@ -1844,6 +1844,73 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 - If a tool call fails or is not available, say so explicitly - do not fill in fake values
 - A fabricated cryptographic value is a lie and a constitutional violation"""
 
+    # Fraction of the model's context window a subagent may fill before the
+    # loop refuses to continue. The remainder covers the response and the
+    # provider's own accounting slack.
+    _SUBAGENT_CONTEXT_FRACTION = 0.85
+
+    def _subagent_context_budget(self, model: Optional[str]) -> Optional[int]:
+        """Token ceiling for one subagent's message array, or None if unknown.
+
+        None means "do not enforce": an unknown model is not a reason to kill
+        a working subagent, and the provider's own limit still backstops it.
+        """
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            limit = get_token_counter(model or "auto").get_context_limit()
+        except Exception as e:
+            logger.debug(f"{self.name}: no context limit for {model!r}: {e}")
+            return None
+        if not limit or limit <= 0:
+            return None
+        return int(limit * self._SUBAGENT_CONTEXT_FRACTION)
+
+    def _subagent_context_overflow(
+        self, messages: List[Dict[str, Any]], model: Optional[str]
+    ) -> Optional[str]:
+        """Return an operator-facing reason when ``messages`` will not fit.
+
+        Why this refuses instead of trimming. Trimming is model-visible
+        pruning, and salvage.py's invariant forbids that without "a
+        synchronous durable artifact or lossless pointer". For conversation
+        history that machinery exists (``salvage_messages`` marks persisted
+        rows and links a salvage marker). For TOOL RESULTS it does not:
+        they are never written to ``conversation_history``, so they have no
+        row id to salvage, and ``_log_tool_dispatch`` records only
+        ``result_status`` and ``result_size_bytes`` -- never the content.
+        The orchestrator's own cap calls ``_build_persisted_preview``, which
+        despite its name persists nothing: it keeps a head and a tail and
+        discards the middle irrecoverably.
+
+        So there is currently nowhere to put what trimming would drop.
+        Refusing loudly is the only behaviour here that neither loses data
+        nor sends a request the provider will certainly reject. Once tool
+        results have a durable home, this is the seam that becomes a
+        microcompact-and-salvage step.
+        """
+        budget = self._subagent_context_budget(model)
+        if budget is None:
+            return None
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            used = get_token_counter(model or "auto").count_messages(messages)
+        except Exception as e:
+            logger.debug(f"{self.name}: could not measure subagent context: {e}")
+            return None
+        if used <= budget:
+            return None
+        return (
+            f"Subagent {self.name!r} exceeded its context budget: {used:,} tokens "
+            f"against a {budget:,} ceiling for model {model or 'default'!r}. The "
+            f"tool-call loop accumulates every tool result and resends them, and "
+            f"tool results have no durable store to be salvaged into, so the loop "
+            f"stops here rather than dropping them silently or sending a request "
+            f"the provider will reject. Narrow the task, or have the tool return "
+            f"less."
+        )
+
     async def _handle_feature_tool_calls(
         self,
         response: Union[str, Any],
@@ -1969,6 +2036,16 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     "tool_call_id": tool_call.id,
                     "content": json.dumps(result)
                 })
+
+            # Refuse before sending rather than after being rejected. The
+            # array grows by a full tool result every iteration and is resent
+            # whole, so this is where an unbounded run is caught -- see
+            # ``_subagent_context_overflow`` for why it refuses instead of
+            # trimming.
+            overflow = self._subagent_context_overflow(messages, model_override)
+            if overflow is not None:
+                logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                return f"Error: {overflow}"
 
             # Continue conversation with tool results — thread the
             # ``tool_executor`` through so codex-routed continuation
