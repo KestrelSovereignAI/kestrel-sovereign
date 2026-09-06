@@ -425,11 +425,12 @@ def _rasa_shim_log():
 
 
 def test_unlisted_agent_answers_the_middlewares_own_not_found_envelope_and_logs():
-    """#3220 round 2: an unlisted agent must be indistinguishable from an
-    absent one to a token holder — same ``agent_not_found`` envelope the
-    routing middleware answers — and the refusal must be host-logged naming
-    the agent and the variable to set. The comparison is case-insensitive,
-    as ``AgentManager.get_agent`` is: routing key ``Nellie``, list ``nellie``.
+    """#3220 round 2: an unlisted agent answers the same ``agent_not_found``
+    envelope the routing middleware answers for an absent one (not a
+    secrecy property — the echoed name and the rate bucket still tell them
+    apart), and the refusal is host-logged naming the agent and the
+    variable to set. The comparison is case-insensitive, as
+    ``AgentManager.get_agent`` is: routing key ``Nellie``, list ``nellie``.
     """
     nellie = _rasa_agent("reply from nellie")
     env = {
@@ -488,9 +489,22 @@ def test_concurrency_gate_is_per_routed_agent():
         "KESTREL_RASA_WEBHOOK_AGENTS": "sa,sb",
     }
     gate_a = rasa_shim._agent_semaphore_for("sa")
+    gate_b = rasa_shim._agent_semaphore_for("sb")
     assert gate_a is rasa_shim._agent_semaphore_for("sa")
-    assert gate_a is not rasa_shim._agent_semaphore_for("sb")
+    assert gate_a is not gate_b
     assert rasa_shim._agent_semaphore_for(None) is rasa_shim._agent_semaphore_for("default")
+
+    # The wiring, observed from inside the turn: while B's process_input
+    # runs, B's own gate holds exactly one permit and A's is untouched — a
+    # postcondition the handler produces, not one the test writes.
+    seen = {}
+
+    async def observe(**_kwargs):
+        seen["b_permits"] = gate_b._value
+        seen["a_locked"] = gate_a.locked()
+        return "reply from sb"
+
+    sb.process_input = AsyncMock(side_effect=observe)
 
     async def drain():
         for _ in range(rasa_shim._AGENT_CONCURRENCY):
@@ -509,8 +523,42 @@ def test_concurrency_gate_is_per_routed_agent():
                 )
         assert other.status_code == 200, other.text
         sb.process_input.assert_awaited_once()
+        assert seen == {"b_permits": rasa_shim._AGENT_CONCURRENCY - 1, "a_locked": True}, seen
         assert gate_a.locked()  # B's turn never touched A's permits
+        assert gate_b._value == rasa_shim._AGENT_CONCURRENCY  # released after the turn
     finally:
         for _ in range(rasa_shim._AGENT_CONCURRENCY):
             gate_a.release()
+        _restore_app(app, original)
+
+
+def test_a_routed_agent_the_registry_can_no_longer_name_fails_closed():
+    """#3220 round 3: ``_routed_agent_name`` is ``None`` for the unprefixed
+    form AND for a prefixed request whose agent was fenced between routing
+    and the opt-in check. The second must not fall into the permissive
+    unprefixed branch: refuse, invoke nobody.
+    """
+    ghost = _rasa_agent("reply from ghost")
+    app, original = _prepare_multi_agent_app({"ghost": ghost})
+    # Routed (middleware resolves it) but the registry no longer names it.
+    app.state.agent_manager.get_agent_name = MagicMock(return_value=None)
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "test-key",
+                "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+                "KESTREL_RASA_WEBHOOK_AGENTS": "ghost",
+            },
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/agents/ghost/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p", "message": "hi"},
+                )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "agent_not_found"
+        ghost.process_input.assert_not_awaited()
+    finally:
         _restore_app(app, original)

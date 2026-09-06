@@ -103,7 +103,7 @@ def _rasa_enabled_agents() -> frozenset[str]:
     )
 
 
-def _verify_routed_agent_enabled(routed_name: Optional[str]) -> None:
+def _verify_routed_agent_enabled(request: Request, routed_name: Optional[str]) -> None:
     """Refuse the agent-prefixed alias for an agent not enabled for Rasa.
 
     One host-wide token authenticates this endpoint. Before #3220 that token
@@ -111,14 +111,31 @@ def _verify_routed_agent_enabled(routed_name: Optional[str]) -> None:
     have let the same token drive a paid ``process_input`` turn on EVERY
     agent on the host by changing one path segment. So the prefixed form is
     an explicit, per-agent, sovereign-configured opt-in and FAILS CLOSED:
-    unset or unlisted answers the routing middleware's own
-    ``agent_not_found`` envelope, so a token holder cannot tell an unlisted
-    agent from an absent one, and nobody is invoked. The refusal is
-    host-logged with the variable to set, since a dead endpoint whose only
-    explanation is a docstring is not an operator surface.
+    unset or unlisted answers with the routing middleware's
+    ``agent_not_found`` envelope and nobody is invoked. (A token holder can
+    still tell an unlisted agent from an absent one — the refusal echoes the
+    canonical routing name and counts against the rate bucket — so this is
+    a fail-closed opt-in whose refusal is name-shaped, not a secrecy
+    property.) The refusal is host-logged with the variable to set, since a
+    dead endpoint whose only explanation is a docstring is not an operator
+    surface.
+
+    ``routed_name`` is ``None`` for two different facts: the unprefixed
+    form, and a prefixed request whose agent the registry can no longer
+    name (a spawn route fenced between routing and this check). Only the
+    first is admitted; the second fails closed too.
     """
-    if routed_name is None:
+    routed = getattr(request.state, "agent", None)
+    if routed is None:
         return
+    if routed_name is None:
+        logger.warning(
+            "[rasa-shim] refused prefixed alias: the routed agent is no longer "
+            "resolvable in the routing registry (fenced?)"
+        )
+        raise ApiHTTPException(
+            status_code=404, code="agent_not_found", message="Agent not found"
+        )
     if routed_name.casefold() not in _rasa_enabled_agents():
         logger.warning(
             "[rasa-shim] refused prefixed alias for agent '%s': not listed in "
@@ -223,7 +240,7 @@ async def rasa_webhook(
     """
     _verify_webhook_token(request)
     routed_name = _routed_agent_name(request)
-    _verify_routed_agent_enabled(routed_name)
+    _verify_routed_agent_enabled(request, routed_name)
 
     agent = get_agent(request)
 
