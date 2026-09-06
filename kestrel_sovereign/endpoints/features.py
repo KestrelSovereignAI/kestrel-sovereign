@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    get_caller,
     require_sovereign_host_lifecycle,
 )
 from kestrel_sovereign.features.config_validation import (
@@ -25,6 +26,7 @@ from kestrel_sovereign.features.isolated_runtime import (
     IsolatedRuntimeConfigGenerationChanged,
 )
 from kestrel_sovereign.feature_registry import (
+    feature_disable_refusal,
     FeaturePackageInfo,
     FeatureStatus,
     get_all_skills,
@@ -169,6 +171,17 @@ def _get_enabled_class_names(agent) -> set:
     return active_feature_class_names(agent)
 
 
+def _caller_can_manage_features(request: Request) -> bool:
+    """Whether the request's caller passes the mutation routes' authority gate.
+
+    The same predicate ``require_sovereign_host_lifecycle`` enforces, asked
+    without raising, so a catalog read can tell the console which controls
+    to draw (kestrel-sovereign#3234). Absent or non-sovereign caller → False.
+    """
+    caller = get_caller(request)
+    return getattr(caller, "is_sovereign", False) is True
+
+
 def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:
     """Resolve a catalog stable ID or Feature class name to package metadata."""
     registry = get_registry(enabled_class_names=_get_enabled_class_names(agent))
@@ -176,19 +189,6 @@ def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:
         if name in {stable_id, info.name} or name in info.features:
             return info
     return None
-
-
-def _is_core_feature_class(agent, class_name: str) -> bool:
-    """Whether a loaded Feature class belongs to a ``core = true`` package.
-
-    ``_get_loaded_features_or_404`` resolves a bare class name straight from
-    ``agent.features`` without consulting the registry, so the registry's
-    ``core`` flag has to be looked up separately for the refusal to see it
-    (kestrel-sovereign#3234). A class the registry does not know is not
-    core.
-    """
-    info = _registry_info(agent, class_name)
-    return bool(info is not None and info.core and class_name in info.features)
 
 
 def _get_loaded_features_or_404(agent, name: str) -> List[tuple[str, Any]]:
@@ -265,7 +265,15 @@ async def list_features(
             continue
         results.append(_feature_package_to_dict(info))
 
-    return {"features": results, "count": len(results)}
+    return {
+        "features": results,
+        "count": len(results),
+        # Whether THIS caller may install/remove/enable/disable/configure
+        # (sovereign only, #3214/#3234). Lets the console hide controls that
+        # would only 403, the way `GET /api/agents` publishes
+        # `can_create_agents` for the danger zone. Reads stay open.
+        "can_manage_features": _caller_can_manage_features(request),
+    }
 
 
 @router.get("/api/features/installed")
@@ -297,7 +305,11 @@ async def list_installed_features(request: Request) -> Dict[str, Any]:
             entry["boundary"] = pkg.boundary.value
         results.append(entry)
 
-    return {"features": results, "count": len(results)}
+    return {
+        "features": results,
+        "count": len(results),
+        "can_manage_features": _caller_can_manage_features(request),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -752,13 +764,17 @@ async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     Disable a loaded feature.
 
     Requires the sovereign principal, for the reason given on ``enable``
-    (kestrel-sovereign#3234). A core (baseline) package is additionally
-    refused outright, sovereign or not: the baseline is host policy, set in
-    ``kestrel.toml`` ``disabled_features`` and applied at boot to every
-    agent, and a per-agent routed request has no standing to carve one
-    agent out of it at runtime — least of all for a host-scope surface such
-    as ``RestartCoordinatorFeature``, whose own authority module guards its
-    operations but could not guard its existence.
+    (kestrel-sovereign#3234). A ``host_scope = true`` package is additionally
+    refused outright, sovereign or not: such a feature participates in a
+    host-wide protocol for every co-hosted agent (``RestartCoordinatorFeature``
+    and the whole-host restart handshake), so switching it off on one agent
+    degrades the host rather than that agent. Its own authority module guards
+    its operations but could not guard its existence. Ordinary ``core = true``
+    packages are the shipped baseline and stay per-agent toggles — a per-agent
+    carve-out is a first-class concept (``[agents.<name>].features``). The
+    refusal is one rule shared with the agent's own runtime disable and the
+    persistent enablement delta, so the tool-driven ``feature_remove`` door
+    declines exactly where this route answers 409.
 
     Runs the agent's canonical runtime *teardown*
     (``KestrelAgent._unregister_feature_runtime`` with ``unload=False``) per
@@ -790,31 +806,22 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     """Disable a feature group while the agent's turn boundary is held."""
 
     loaded = _get_loaded_features_or_404(agent, name)
-    mandatory = sorted(
-        class_name
-        for class_name, _feature in loaded
-        if class_name in MANDATORY_FEATURES
-    )
-    if mandatory:
+    # One rule for every disable door (kestrel-sovereign#3234): mandatory
+    # sovereignty features and host-scope features are refused here, in the
+    # agent's own runtime disable, and in the persistent enablement delta.
+    # ``_get_loaded_features_or_404`` resolves a bare class name without the
+    # registry, so the rule is asked per class, not per package.
+    refusals: Dict[str, List[str]] = {}
+    for class_name, _feature in loaded:
+        reason = feature_disable_refusal(class_name)
+        if reason is not None:
+            refusals.setdefault(reason, []).append(class_name)
+    if refusals:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Mandatory sovereignty features cannot be disabled: "
-                + ", ".join(mandatory)
-            ),
-        )
-    core = sorted(
-        class_name
-        for class_name, _feature in loaded
-        if _is_core_feature_class(agent, class_name)
-    )
-    if core:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Core features are host policy and cannot be disabled per "
-                "agent; set disabled_features in kestrel.toml instead: "
-                + ", ".join(core)
+            detail="; ".join(
+                f"{reason}: {', '.join(sorted(classes))}"
+                for reason, classes in refusals.items()
             ),
         )
 
@@ -1151,6 +1158,9 @@ async def get_feature_config(request: Request, name: str) -> Dict[str, Any]:
         "config": config,
         "config_schema": schema,
         "secrets_set": secrets_set,
+        # PATCH on this path is sovereign-gated (#3234); the form reads this
+        # to decide whether to offer Save at all.
+        "can_manage_features": _caller_can_manage_features(request),
     }
 
 

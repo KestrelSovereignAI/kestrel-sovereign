@@ -270,6 +270,10 @@ description = "Coordinated agent restart and update lifecycle"
 tags = ["core", "restart", "operations"]
 icon = "refresh-cw"
 core = true
+# Whole-host restart is a protocol every co-hosted agent takes part in;
+# disabling the coordinator on one agent degrades the host, so no per-agent
+# door may disable it (kestrel-sovereign#3234).
+host_scope = true
 
 [todo]
 boundary = "bundled"

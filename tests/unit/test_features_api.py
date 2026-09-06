@@ -1516,42 +1516,91 @@ class TestDisableFeature:
         feature.on_disable.assert_not_awaited()
         assert feature.enabled is True
 
-    @patch("kestrel_sovereign.endpoints.features.get_registry")
-    def test_core_package_disable_is_rejected_before_lifecycle(self, mock_registry):
-        """#3234: a ``core = true`` package cannot be disabled per agent, even
-        by the sovereign — the baseline is host policy (``kestrel.toml``
-        ``disabled_features``), not a per-agent runtime toggle.
+    def test_host_scope_disable_is_rejected_and_core_baseline_still_toggles(self):
+        """#3234: a ``host_scope = true`` package cannot be disabled per agent,
+        even by the sovereign; an ordinary ``core = true`` package can.
 
-        ``MANDATORY_FEATURES`` is five classes; everything else bundled
-        (``RestartCoordinatorFeature`` included) was disableable through this
-        route. The positive control in the same registry: a non-core package
-        still disables, so the refusal keys on ``core`` and not on "known to
-        the registry".
+        The REAL registry, not a fake: ``restart_coordinator`` declares
+        ``host_scope`` and ``web_search`` is ``core`` without it. The class is
+        resolved by bare name (the path that never consults the registry) and
+        by package stable id. The positive control is the correction of the
+        first cut of this ticket, which refused all 37 core classes on the
+        premise that the baseline is host policy — a per-agent carve-out of a
+        core feature is a first-class concept (``[agents.<name>].features``).
         """
-        mock_registry.return_value = dict(FAKE_REGISTRY)
-        core = _make_feature(name="CoreFeature")
-        addon = _make_feature(name="TestFeature")
+        host_scope = _make_feature(name="RestartCoordinatorFeature")
+        baseline = _make_feature(name="WebSearchFeature")
         agent = _lifecycle_agent(
-            features={"CoreFeature": core, "TestFeature": addon}
+            features={
+                "RestartCoordinatorFeature": host_scope,
+                "WebSearchFeature": baseline,
+            }
         )
         app = _make_app(agent)  # sovereign caller
 
         with TestClient(app) as client:
-            # By class name (the bare-name path that never consults the
-            # registry) and by package stable id.
-            for name in ("CoreFeature", "core-pkg"):
+            for name in ("RestartCoordinatorFeature", "restart_coordinator"):
                 resp = client.post(f"/api/features/{name}/disable")
                 assert resp.status_code == 409, (name, resp.text)
-                assert "CoreFeature" in resp.json()["detail"]
-                assert "kestrel.toml" in resp.json()["detail"]
-            core.on_disable.assert_not_awaited()
-            core.shutdown.assert_not_awaited()
-            assert core.enabled is True
+                assert "RestartCoordinatorFeature" in resp.json()["detail"]
+                assert "host-wide" in resp.json()["detail"]
+            host_scope.on_disable.assert_not_awaited()
+            host_scope.shutdown.assert_not_awaited()
+            assert host_scope.enabled is True
 
-            resp = client.post("/api/features/TestFeature/disable")
+            resp = client.post("/api/features/WebSearchFeature/disable")
             assert resp.status_code == 200, resp.text
-            addon.on_disable.assert_awaited_once()
-            assert addon.enabled is False
+            baseline.on_disable.assert_awaited_once()
+            assert baseline.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_the_agents_own_disable_doors_read_the_same_rule(self):
+        """#3234 round 1 (P1): the HTTP route was one door of two. The
+        tool-driven ``feature_remove`` reaches ``KestrelAgent._disable_feature``
+        and then persists a per-agent ``disabled`` delta that is replayed at
+        every boot — the durable door. Both now refuse a host-scope class with
+        the same rule the route answers 409 with, and both still admit an
+        ordinary core class.
+        """
+        from kestrel_sovereign.feature_registry import HostScopeFeatureError
+
+        # ``_disable_feature`` keys on ``type(feature).__name__``, so the
+        # stand-in must carry the real class name, not a MagicMock's.
+        RestartCoordinatorFeature = type("RestartCoordinatorFeature", (MagicMock,), {})
+        WebSearchFeature = type("WebSearchFeature", (MagicMock,), {})
+        host_scope = RestartCoordinatorFeature()
+        host_scope.name = "RestartCoordinatorFeature"
+        baseline = WebSearchFeature()
+        baseline.name = "WebSearchFeature"
+        agent = _lifecycle_agent(
+            features={
+                "RestartCoordinatorFeature": host_scope,
+                "WebSearchFeature": baseline,
+            }
+        )
+        agent._unregister_feature_runtime = AsyncMock()
+        store = MagicMock()
+        store.set_state = AsyncMock()
+        agent._feature_enablement_store = store
+
+        with pytest.raises(HostScopeFeatureError):
+            await agent._disable_feature("RestartCoordinatorFeature")
+        with pytest.raises(HostScopeFeatureError):
+            await agent.persist_feature_enablement(
+                "feature", "RestartCoordinatorFeature", "disabled"
+            )
+        agent._unregister_feature_runtime.assert_not_awaited()
+        store.set_state.assert_not_awaited()
+
+        await agent._disable_feature("WebSearchFeature")
+        await agent.persist_feature_enablement("feature", "WebSearchFeature", "disabled")
+        agent._unregister_feature_runtime.assert_awaited_once()
+        store.set_state.assert_awaited_once()
+        # Re-enabling a host-scope feature is never refused: only "disabled"
+        # deltas are governed.
+        await agent.persist_feature_enablement(
+            "feature", "RestartCoordinatorFeature", "enabled"
+        )
 
     def test_disable_calls_on_disable(self):
         feature = _make_feature()
@@ -4205,6 +4254,40 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
             "the sovereign request should have reached the installer through "
             f"the sealed seam; captured {attempted!r}"
         )
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @pytest.mark.parametrize(
+        "caller,expected",
+        [
+            (CallerContext.sovereign(), True),
+            (CallerContext(role=CallerRole.AUTHENTICATED), False),
+            (CallerContext.anonymous(), False),
+            (None, False),
+        ],
+    )
+    def test_catalog_reads_publish_whether_the_caller_may_manage(
+        self, mock_registry, caller, expected
+    ):
+        """The console draws Install/Remove/Enable/Disable/Save only for a
+        caller the mutation gate would admit (#3234 round 1 F3), the way
+        ``GET /api/agents`` publishes ``can_create_agents``. The flag is the
+        gate's own predicate, asked without raising; the reads stay open to
+        every caller.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
+        app = _make_app(agent, caller=caller)
+        with TestClient(app) as client:
+            for path in (
+                "/api/features",
+                "/api/features/installed",
+                "/api/features/TestFeature/config",
+            ):
+                resp = client.get(path)
+                assert resp.status_code == 200, (path, resp.text)
+                assert resp.json()["can_manage_features"] is expected, path
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
     def test_the_gate_is_not_on_the_reads(self, mock_registry):

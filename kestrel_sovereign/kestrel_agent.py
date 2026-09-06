@@ -4735,6 +4735,16 @@ class KestrelAgent(
                     "persistent enablement",
                     "cannot be disabled",
                 )
+            # A durable per-agent "disabled" delta is replayed at every boot,
+            # so it is the strongest disable door; it reads the same rule as
+            # the runtime and HTTP doors (kestrel-sovereign#3234).
+            from kestrel_sovereign.feature_registry import (
+                HostScopeFeatureError,
+                feature_disable_refusal,
+            )
+
+            if feature_disable_refusal(name) is not None:
+                raise HostScopeFeatureError(name)
         store = getattr(self, "_feature_enablement_store", None)
         if store is None:
             return
@@ -5810,6 +5820,16 @@ class KestrelAgent(
                 "runtime disable",
                 "cannot be disabled",
             )
+        # The same rule the HTTP disable route answers 409 with: a host-scope
+        # feature is not one agent's to switch off (kestrel-sovereign#3234).
+        # This is the door the tool-driven `feature_remove` reaches.
+        from kestrel_sovereign.feature_registry import (
+            HostScopeFeatureError,
+            feature_disable_refusal,
+        )
+
+        if feature_disable_refusal(feature_class_name) is not None:
+            raise HostScopeFeatureError(feature_class_name)
 
         await self._unregister_feature_runtime(feature)
         logging.info(f"Feature '{feature_name}' disabled and removed")
