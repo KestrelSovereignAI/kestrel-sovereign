@@ -33,10 +33,19 @@ STORE = CORE / "a2a" / "stores" / "unified" / "observability_store.py"
 TABLE = "INSERT INTO a2a_observability"
 
 # Modules that take `agent_name` as their OWN parameter and forward it,
-# so the value is chosen by their callers rather than here. Each must
-# still match a real forwarding call — `test_the_allowlist_is_tight`
-# fails on an entry that has stopped applying, so this cannot decay into
-# a place to put inconvenient results.
+# so the value is chosen by their callers rather than here. An entry has
+# to EARN the exemption: `test_the_allowlist_is_tight` requires every
+# recorder call in the module to pass a bare name bound to a parameter
+# of the enclosing function.
+#
+# Checking only for staleness was not enough, and the difference matters.
+# A one-directional check rejects entries that stopped calling a
+# recorder — but a module that really does write a display name is
+# non-stale by construction, so the more it offends the better it
+# qualifies. Verified: replacing this set with "every module that calls
+# a recorder" left all three tests green. The gate could be silenced by
+# a one-line edit, which is the decay this comment used to claim was
+# impossible.
 _FORWARDS_A_PARAMETER = {"a2a/task_manager.py"}
 
 
@@ -125,17 +134,60 @@ def test_the_scan_covers_every_recorder_the_store_defines():
 
 
 def test_the_allowlist_is_tight():
-    """An exemption that no longer applies must be removed, not inherited.
+    """An exemption must be earned, not merely declared.
 
-    The first version of this file also exempted `a2a/task_worker.py`,
-    which has no production constructor at all — an entry that hid
-    nothing and would have hidden anything added there later.
+    Two ways it can rot, and both are checked. An entry that stopped
+    calling a recorder is stale and must go — the first version of this
+    file exempted `a2a/task_worker.py`, which has no production
+    constructor at all. And an entry whose calls pass a CHOSEN value
+    rather than a forwarded parameter is not a pass-through at all; it
+    is a writer that has been waved through.
     """
     scanned = {path for path, _, _ in _agent_name_expressions()}
     stale = _FORWARDS_A_PARAMETER - scanned
     assert stale == set(), (
         f"these modules are exempted but no longer call a recorder: {stale}"
     )
+
+    unearned = [
+        f"{path}:{line} passes {expr}"
+        for path, line, expr in _agent_name_expressions()
+        if path in _FORWARDS_A_PARAMETER and not _is_forwarded_parameter(path, line)
+    ]
+    assert unearned == [], (
+        "an exempted module must FORWARD its caller's identity, not choose "
+        "one: " + "; ".join(unearned)
+    )
+
+
+def _is_forwarded_parameter(rel_path: str, lineno: int) -> bool:
+    """Is the identity at *lineno* a bare name bound to an enclosing parameter?"""
+    tree = ast.parse((CORE / rel_path).read_text(errors="replace"))
+    recorders = _recorder_arg_positions()
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        parameters = {
+            a.arg
+            for a in (
+                func.args.args + func.args.kwonlyargs + func.args.posonlyargs
+            )
+        }
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call) or node.lineno != lineno:
+                continue
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name not in recorders:
+                continue
+            keyword = {kw.arg: kw.value for kw in node.keywords}
+            value = keyword.get("agent_name")
+            if value is None:
+                index = recorders[name]
+                value = node.args[index] if len(node.args) > index else None
+            if isinstance(value, ast.Name) and value.id in parameters:
+                return True
+    return False
 
 
 def test_every_recorder_of_our_own_events_writes_the_did():
