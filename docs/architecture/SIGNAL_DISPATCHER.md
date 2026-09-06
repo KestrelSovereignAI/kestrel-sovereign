@@ -632,7 +632,9 @@ deletes pending, retriable, or leased work.  Consumers are long-lived
 registrations and are not removed by the event cleanup sweep.  The existing
 `trash_retention` maintenance rail invokes this cleanup alongside its
 conversation sweep; a durable-ledger cleanup error is logged but does not
-prevent the independent conversation-retention operation.
+prevent the independent conversation-retention operation.  The same scheduled
+sweep removes per-source rate-admission rows after their one-hour quota window,
+including for sources that receive no later traffic.
 
 ## Concerns
 

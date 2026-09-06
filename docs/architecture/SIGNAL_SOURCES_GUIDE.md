@@ -424,8 +424,9 @@ contexts and only then build a `Signal`:
 - The source allows four attempts per minute and twenty per hour. These limits
   are authority-bearing: a peer that could stop every replacement turn without
   limit would have synthesized Hold.
-- The authenticated sender plus correlation id becomes the durable
-  `source_event_id`. The signed-envelope nonce is separately bound to a digest
+- The authenticated sender plus correlation id becomes a secret-keyed durable
+  `source_event_id`; neither principal nor correlation is retained in the
+  display redaction. The signed-envelope nonce is separately bound to a digest
   of the exact canonical signed fields: only a verbatim authenticated retry may
   enter this idempotent lane, while a different valid Stop reusing the nonce is
   rejected. A durable replay then returns `COALESCED` without running the

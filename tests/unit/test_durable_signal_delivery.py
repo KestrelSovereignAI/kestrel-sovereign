@@ -407,6 +407,48 @@ async def test_durable_rate_admission_serializes_across_sqlite_instances(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_scheduled_purge_removes_stale_rate_admissions_after_restart(tmp_path):
+    """Idle source quotas expire on maintenance, without requiring new traffic."""
+
+    path = tmp_path / "rate-admission-retention.db"
+    backend = SQLiteBackend(str(path))
+    await backend.connect()
+    store = DurableSignalStore(backend)
+    await store.initialize()
+    now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+    rows = (
+        ("stale-own", "did:agent:one", "a2a.peer_stop", now - timedelta(hours=2)),
+        ("fresh-own", "did:agent:one", "a2a.peer_stop", now - timedelta(minutes=30)),
+        ("stale-other", "did:agent:two", "a2a.peer_stop", now - timedelta(hours=2)),
+    )
+    for event_id, agent_id, source, admitted_at in rows:
+        await backend.execute(
+            f"INSERT INTO {store.RATE_ADMISSIONS} "
+            "(event_id, agent_id, source, admitted_at) VALUES (?, ?, ?, ?)",
+            (
+                event_id,
+                agent_id,
+                source,
+                store.to_timestamp_param(admitted_at),
+            ),
+        )
+    await backend.close()
+
+    restarted_backend = SQLiteBackend(str(path))
+    await restarted_backend.connect()
+    restarted = DurableSignalStore(restarted_backend)
+    try:
+        await restarted.initialize()
+        assert await restarted.purge_expired(agent_id="did:agent:one", now=now) == 0
+        remaining = await restarted_backend.fetch_all(
+            f"SELECT event_id FROM {restarted.RATE_ADMISSIONS} ORDER BY event_id"
+        )
+        assert remaining == [("fresh-own",), ("stale-other",)]
+    finally:
+        await restarted_backend.close()
+
+
+@pytest.mark.asyncio
 async def test_public_source_boundary_orders_ingress_without_timestamps(tmp_path):
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "source-boundary.db", "did:agent:one"

@@ -20,10 +20,11 @@ import json
 import os
 import re
 import secrets
-import tempfile
+import stat
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import (
     Any,
     AsyncContextManager,
@@ -94,6 +95,65 @@ def _runtime_owner_lock_platform_name() -> str:
     """Return the native file-lock lane (a seam for cross-platform tests)."""
 
     return os.name
+
+
+def _runtime_owner_lock_path(db_path: str, *, agent_id: str) -> str:
+    """Return one DB-adjacent lock name shared across process environments."""
+
+    if not isinstance(db_path, str) or not db_path or db_path == ":memory:":
+        raise ValueError("runtime-owner lock requires a file-backed SQLite path")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("runtime-owner lock requires an agent id")
+    canonical_db = Path(db_path).resolve()
+    lock_key = hashlib.sha256(
+        f"{os.path.normcase(str(canonical_db))}\x00{agent_id}".encode("utf-8")
+    ).hexdigest()
+    return str(canonical_db.parent / f".kestrel-runtime-owner-{lock_key}.lock")
+
+
+def _open_runtime_owner_lock_descriptor(db_path: str, *, agent_id: str) -> int:
+    """Open the shared SQLite owner fence only inside a trusted namespace."""
+
+    lock_path = _runtime_owner_lock_path(db_path, agent_id=agent_id)
+    parent = os.stat(Path(lock_path).parent)
+    if not stat.S_ISDIR(parent.st_mode):
+        raise RuntimeError("SQLite runtime-owner lock parent is not a directory")
+    if os.name == "posix" and (
+        parent.st_uid != os.geteuid() or parent.st_mode & 0o022
+    ):
+        raise RuntimeError(
+            "SQLite runtime-owner lock parent must be owner-controlled"
+        )
+
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(
+            "SQLite runtime-owner lock cannot be opened safely"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        listed = os.lstat(lock_path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(listed.st_mode)
+            or (listed.st_dev, listed.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_nlink != 1
+        ):
+            raise RuntimeError("SQLite runtime-owner lock is not a safe regular file")
+        if os.name == "posix" and (
+            opened.st_uid != os.geteuid() or opened.st_mode & 0o077
+        ):
+            raise RuntimeError(
+                "SQLite runtime-owner lock must be owned by the current user "
+                "with mode 0600"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _try_lock_windows_runtime_owner_descriptor(
@@ -5023,7 +5083,7 @@ class DurableSignalStore(UnifiedStoreBase):
     async def purge_expired(
         self, *, agent_id: str, now: Optional[datetime] = None
     ) -> int:
-        """Delete only this agent's retained, terminal event histories.
+        """Delete this agent's expired quota rows and terminal event histories.
 
         Pending, retriable, and leased work is never cleaned up by retention;
         operators must first resolve it to an observable terminal state.
@@ -5032,19 +5092,30 @@ class DurableSignalStore(UnifiedStoreBase):
         """
         self._require_nonempty("agent_id", agent_id)
         now = _as_utc(now or self.now_utc())
-        return await self._backend.execute(
-            f"""
-            DELETE FROM {self.EVENTS}
-            WHERE agent_id = ?
-              AND retention_until < ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM {self.DELIVERIES} d
-                  WHERE d.event_id = {self.EVENTS}.event_id
-                    AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}')
-              )
-            """,
-            (agent_id, self.to_timestamp_param(now)),
-        )
+        async with self._backend.transaction():
+            await self._backend.execute(
+                f"""
+                DELETE FROM {self.RATE_ADMISSIONS}
+                WHERE agent_id = ? AND admitted_at < ?
+                """,
+                (
+                    agent_id,
+                    self.to_timestamp_param(now - timedelta(hours=1)),
+                ),
+            )
+            return await self._backend.execute(
+                f"""
+                DELETE FROM {self.EVENTS}
+                WHERE agent_id = ?
+                  AND retention_until < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {self.DELIVERIES} d
+                      WHERE d.event_id = {self.EVENTS}.event_id
+                        AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}')
+                  )
+                """,
+                (agent_id, self.to_timestamp_param(now)),
+            )
 
     # ------------------------------------------------------------------
     # Internal storage helpers
@@ -5495,15 +5566,10 @@ class DurableSignalStore(UnifiedStoreBase):
                 yield False
             return
 
-        lock_key = hashlib.sha256(
-            f"{os.path.normcase(os.path.realpath(db_path))}\x00{agent_id}".encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        lock_path = os.path.join(
-            tempfile.gettempdir(), f"kestrel-runtime-owner-{lock_key}.lock"
+        resolved_db_path = getattr(self._backend, "_resolved_path", None) or db_path
+        descriptor = _open_runtime_owner_lock_descriptor(
+            str(resolved_db_path), agent_id=agent_id
         )
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         acquired = False
         lock_token: Any = None
         try:

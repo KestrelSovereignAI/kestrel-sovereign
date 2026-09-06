@@ -1633,7 +1633,7 @@ class SignalDispatcher:
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
-        """Run the durable-ledger retention sweep (terminal history only)."""
+        """Sweep expired quota rows and terminal durable event history."""
         async with self._admit_durable_operation():
             await self.initialize_durable_delivery()
             purged = await self._durable_store.purge_expired(agent_id=self._agent.did)

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -157,6 +160,37 @@ async def test_peer_stop_dispatch_reaches_handler_while_turn_holds_privacy_lock(
     assert json.loads(durable_row[1]) == []
     assert "private-signal-id" not in durable_row[1]
     assert "private-turn-id" not in durable_row[1]
+
+    audit_row = await c.backend.fetch_one(
+        "SELECT dedupe_key, payload_redacted FROM signal_log WHERE id = ?",
+        (signal.id,),
+    )
+    assert audit_row is not None
+    enumerable_material = json.dumps(
+        ["did:test:peer", "peer-stop-live-stream"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert audit_row[0] != hashlib.sha256(enumerable_material).hexdigest()
+    assert "did:test:peer" not in audit_row[1]
+    assert "peer-stop-live-stream" not in audit_row[1]
+
+
+def test_peer_stop_source_event_id_is_keyed_and_not_roster_enumerable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "first-private-binding-key")
+    first = peer_stop_source_event_id("did:test:peer", "peer-stop-keyed")
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "second-private-binding-key")
+    second = peer_stop_source_event_id("did:test:peer", "peer-stop-keyed")
+    enumerable_material = json.dumps(
+        ["did:test:peer", "peer-stop-keyed"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert first != second
+    assert first != hashlib.sha256(enumerable_material).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -793,6 +827,69 @@ async def test_file_backed_sqlite_runtime_owner_fence_uses_windows_native_lock(
     assert windows_unlock.call_count == 2
     for call in windows_unlock.call_args_list:
         assert call.args[1] is token
+
+
+def test_sqlite_runtime_owner_lock_is_db_adjacent_and_tmpdir_independent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "trusted" / "signals.db"
+    db_path.parent.mkdir(mode=0o700)
+    db_path.touch(mode=0o600)
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "first-process-temp"))
+    first = Path(
+        durable_module._runtime_owner_lock_path(
+            str(db_path), agent_id="did:test:stable-lock"
+        )
+    )
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "second-process-temp"))
+    second = Path(
+        durable_module._runtime_owner_lock_path(
+            str(db_path), agent_id="did:test:stable-lock"
+        )
+    )
+
+    assert first == second
+    assert first.parent == db_path.resolve().parent
+    assert first.name.startswith(".kestrel-runtime-owner-")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX secure-open contract")
+def test_sqlite_runtime_owner_lock_refuses_precreated_symlink(tmp_path) -> None:
+    db_path = tmp_path / "signals.db"
+    db_path.touch(mode=0o600)
+    lock_path = Path(
+        durable_module._runtime_owner_lock_path(
+            str(db_path), agent_id="did:test:unsafe-lock"
+        )
+    )
+    target = tmp_path / "attacker-selected"
+    target.touch(mode=0o600)
+    lock_path.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="runtime-owner lock"):
+        durable_module._open_runtime_owner_lock_descriptor(
+            str(db_path), agent_id="did:test:unsafe-lock"
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX secure-open contract")
+def test_sqlite_runtime_owner_lock_refuses_precreated_hardlink(tmp_path) -> None:
+    db_path = tmp_path / "signals.db"
+    db_path.touch(mode=0o600)
+    lock_path = Path(
+        durable_module._runtime_owner_lock_path(
+            str(db_path), agent_id="did:test:hardlink-lock"
+        )
+    )
+    target = tmp_path / "attacker-selected"
+    target.touch(mode=0o600)
+    os.link(target, lock_path)
+
+    with pytest.raises(RuntimeError, match="runtime-owner lock"):
+        durable_module._open_runtime_owner_lock_descriptor(
+            str(db_path), agent_id="did:test:hardlink-lock"
+        )
 
 
 @pytest.mark.asyncio

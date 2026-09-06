@@ -9,6 +9,7 @@ and per-source rate-limit decisions remain load-bearing.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
@@ -220,7 +221,7 @@ def peer_stop_audience(metadata: Mapping[str, Any]) -> str:
 
 
 def peer_stop_source_event_id(actor_id: str, correlation_id: str) -> str:
-    """Bind replay identity to the authenticated actor and signed request id."""
+    """Secret-bind replay identity to the actor and signed request id."""
 
     if not isinstance(actor_id, str) or not actor_id.strip():
         raise ValueError("peer Stop actor must be authenticated")
@@ -233,7 +234,14 @@ def peer_stop_source_event_id(actor_id: str, correlation_id: str) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(material).hexdigest()
+    from kestrel_sovereign.a2a.transport_auth import ensure_a2a_transport_key
+
+    binding_key = ensure_a2a_transport_key().encode("utf-8")
+    return hmac.new(
+        binding_key,
+        b"kestrel:a2a.peer_stop:source-event:v1\x00" + material,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def build_peer_stop_signal(
@@ -442,7 +450,7 @@ def _peer_stop_redaction(payload: dict) -> str:
         f"scope={payload.get('scope', '?')} "
         f"target_present={payload.get('target') is not None} "
         f"cascade={payload.get('cascade', False)!r} "
-        f"correlation_id={payload.get('correlation_id', '?')}"
+        f"correlation_present={isinstance(payload.get('correlation_id'), str)}"
     )
 
 
