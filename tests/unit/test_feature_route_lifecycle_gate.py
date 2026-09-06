@@ -714,6 +714,8 @@ def _post_unprefixed_and_prefixed_ambiguous(agents, a_hook, b_hook):
                 events = list(hook.receiver.event_log)
                 assert [e.status_code for e in events] == [404], events
                 assert not any(e.authenticated for e in events)
+                # Refused, so no rate-limit window was opened on either owner.
+                assert "deposit" not in hook.receiver._rate_windows
 
             # The explicit agent-prefixed form is unaffected by the
             # collision: each agent still receives ONLY what is addressed to

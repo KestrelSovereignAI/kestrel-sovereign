@@ -1371,15 +1371,22 @@ class TestWebhookMultiAgentDispatch:
 
     @pytest.mark.asyncio
     async def test_duplicate_name_is_refused_in_either_order_and_audited_on_every_owner(
-        self, tmp_path, sqlite_database_factory
+        self, tmp_path, sqlite_database_factory, caplog
     ):
         """#3216: two receivers own the same name → refused, not first-wins.
 
         For BOTH provider orders the unprefixed form answers the unregistered-
         name 404 and dispatches to neither receiver; each owner's own
-        ``webhook_log`` persists the refusal (404, unauthenticated) and holds
-        no successful receive.
+        ``webhook_log`` persists the refusal (404, unauthenticated, with the
+        real source and payload hash) and holds no successful receive. The
+        host log names the collision and the agent-prefixed remedy, and no
+        owner's rate-limit window is touched — the properties the refusal
+        docstrings promise, each pinned here because a refactor that dropped
+        any one of them left every test green.
         """
+        import hashlib
+        import logging
+
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from kestrel_sovereign.features.webhooks.receiver import (
@@ -1399,27 +1406,90 @@ class TestWebhookMultiAgentDispatch:
             name="alpha", auth_type="none", allow_unauthenticated=True
         )
 
-        for order in ((feat_a, feat_b), (feat_b, feat_a)):
-            receivers = [feat.receiver for feat in order]
-            app = FastAPI()
-            app.include_router(
-                build_webhook_dispatch_router(
-                    lambda _agent=None, receivers=receivers: receivers
+        payload = b'{"amount": 5}'
+        with caplog.at_level(
+            logging.WARNING, logger="kestrel_sovereign.features.webhooks.receiver"
+        ):
+            for order in ((feat_a, feat_b), (feat_b, feat_a)):
+                receivers = [feat.receiver for feat in order]
+                app = FastAPI()
+                app.include_router(
+                    build_webhook_dispatch_router(
+                        lambda _agent=None, receivers=receivers: receivers
+                    )
                 )
-            )
-            resp = TestClient(app).post("/webhooks/alpha", content=b"{}")
-            assert resp.status_code == 404, order
-            assert resp.json() == {"error": "Unknown webhook: alpha"}, order
+                resp = TestClient(app).post("/webhooks/alpha", content=payload)
+                assert resp.status_code == 404, order
+                assert resp.json() == {"error": "Unknown webhook: alpha"}, order
 
-        for db in (db_a, db_b):
+        collisions = [
+            record for record in caplog.records
+            if record.levelno == logging.WARNING and "alpha" in record.getMessage()
+        ]
+        assert len(collisions) == 2, [r.getMessage() for r in caplog.records]
+        for record in collisions:
+            assert "/api/agents/{agent}/webhooks/alpha" in record.getMessage()
+
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        for feat, db in ((feat_a, db_a), (feat_b, db_b)):
             rows = await db.fetchall(
-                "SELECT webhook_name, status_code, authenticated FROM webhook_log"
+                "SELECT webhook_name, status_code, authenticated, source_ip, "
+                "payload_hash FROM webhook_log"
             )
-            # One refusal per order, nothing dispatched.
-            assert [(r[0], r[1], bool(r[2])) for r in rows] == [
-                ("alpha", 404, False),
-                ("alpha", 404, False),
+            # One refusal per order, nothing dispatched, each row carrying the
+            # forensic fields a real receive would.
+            assert [(r[0], r[1], bool(r[2]), r[3], r[4]) for r in rows] == [
+                ("alpha", 404, False, "testclient", expected_hash),
+                ("alpha", 404, False, "testclient", expected_hash),
             ]
+            # A refusal is not a receive: no sliding window was opened, so
+            # the collision cannot pre-poison the limit that applies once
+            # the sender is re-addressed.
+            assert "alpha" not in feat.receiver._rate_windows
+
+
+    @pytest.mark.asyncio
+    async def test_register_hands_back_the_agent_prefixed_address_that_always_dispatches(
+        self, tmp_path, sqlite_database_factory
+    ):
+        """#3216, registration side: the tool cannot see its peers, so it
+        cannot refuse a colliding name — but it must not hand back
+        ``/webhooks/{name}`` as though the host will honour it.
+
+        With a routing name the reply carries ``agent_endpoint`` (the form
+        the shared router never refuses) and says in words when the
+        unprefixed form stops dispatching. Without a routing name (a mock
+        agent, or a legacy single-agent boot that never registered one)
+        the reply is unchanged: no invented address.
+        """
+        db = await sqlite_database_factory(tmp_path / "named.db")
+        agent = _make_agent(db=db, agent_id="did:test:agent-emma")
+        agent.agent_name = "emma"
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        reg = await feat.webhooks_register(
+            name="deposit", auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        assert reg.data["endpoint"] == "/webhooks/deposit"
+        assert reg.data["agent_endpoint"] == "/api/agents/emma/webhooks/deposit"
+        assert "/api/agents/emma/webhooks/deposit" in reg.confirmation
+        assert "refused" in reg.confirmation
+        assert "/webhooks/deposit" in reg.confirmation
+
+        db_anon = await sqlite_database_factory(tmp_path / "anon.db")
+        unnamed = _make_agent(db=db_anon, agent_id="did:test:agent-unnamed")
+        # A MagicMock attribute is truthy but not a name; a real agent that
+        # never had a routing key registered exposes no usable string either.
+        assert not isinstance(unnamed.agent_name, str)
+        feat_unnamed = WebhookFeature(unnamed)
+        await feat_unnamed.initialize()
+        reg = await feat_unnamed.webhooks_register(
+            name="deposit", auth_type="bearer_token",
+            auth_config_json='{"token": "sekret"}',
+        )
+        assert "agent_endpoint" not in reg.data
+        assert "/api/agents/" not in reg.confirmation
 
 
 # The legacy multi-agent host's ``/webhooks/{name}`` PROXY (which forwarded to a
