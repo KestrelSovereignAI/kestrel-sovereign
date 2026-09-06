@@ -178,6 +178,19 @@ def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:
     return None
 
 
+def _is_core_feature_class(agent, class_name: str) -> bool:
+    """Whether a loaded Feature class belongs to a ``core = true`` package.
+
+    ``_get_loaded_features_or_404`` resolves a bare class name straight from
+    ``agent.features`` without consulting the registry, so the registry's
+    ``core`` flag has to be looked up separately for the refusal to see it
+    (kestrel-sovereign#3234). A class the registry does not know is not
+    core.
+    """
+    info = _registry_info(agent, class_name)
+    return bool(info is not None and info.core and class_name in info.features)
+
+
 def _get_loaded_features_or_404(agent, name: str) -> List[tuple[str, Any]]:
     """Resolve a class name or package stable ID to loaded feature instances."""
     features = getattr(agent, "features", {}) or {}
@@ -567,10 +580,23 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     }
 
 
-@router.post("/api/features/{name}/enable")
+@router.post(
+    "/api/features/{name}/enable",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Enable a loaded feature.
+
+    Requires the sovereign principal (kestrel-sovereign#3234). The routed
+    agent is whichever one the caller named in the path — the routing
+    middleware pins it, the auth middleware applies no per-agent
+    authorization, and the caller model carries no binding between a
+    principal and an agent — so "the routed agent's own runtime" describes
+    the blast radius of the call, not the caller's authority over it. An
+    enable also re-runs ``initialize()``, which for an isolated feature can
+    provision a venv with ``uv pip install``. The gate is a route dependency
+    so the refusal precedes the feature lookup (no existence oracle).
 
     Runs the agent's canonical runtime *activation*
     (``KestrelAgent._activate_feature_runtime``) per member — the exact inverse
@@ -717,10 +743,22 @@ async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> Non
         setattr(agent, "_safe_mode_cause", lifecycle_cause)
 
 
-@router.post("/api/features/{name}/disable")
+@router.post(
+    "/api/features/{name}/disable",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Disable a loaded feature.
+
+    Requires the sovereign principal, for the reason given on ``enable``
+    (kestrel-sovereign#3234). A core (baseline) package is additionally
+    refused outright, sovereign or not: the baseline is host policy, set in
+    ``kestrel.toml`` ``disabled_features`` and applied at boot to every
+    agent, and a per-agent routed request has no standing to carve one
+    agent out of it at runtime — least of all for a host-scope surface such
+    as ``RestartCoordinatorFeature``, whose own authority module guards its
+    operations but could not guard its existence.
 
     Runs the agent's canonical runtime *teardown*
     (``KestrelAgent._unregister_feature_runtime`` with ``unload=False``) per
@@ -763,6 +801,20 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
             detail=(
                 "Mandatory sovereignty features cannot be disabled: "
                 + ", ".join(mandatory)
+            ),
+        )
+    core = sorted(
+        class_name
+        for class_name, _feature in loaded
+        if _is_core_feature_class(agent, class_name)
+    )
+    if core:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Core features are host policy and cannot be disabled per "
+                "agent; set disabled_features in kestrel.toml instead: "
+                + ", ".join(core)
             ),
         )
 
@@ -1102,7 +1154,10 @@ async def get_feature_config(request: Request, name: str) -> Dict[str, Any]:
     }
 
 
-@router.patch("/api/features/{name}/config")
+@router.patch(
+    "/api/features/{name}/config",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def update_feature_config(
     request: Request,
     name: str,
@@ -1110,6 +1165,13 @@ async def update_feature_config(
 ) -> Dict[str, Any]:
     """
     Update feature configuration.
+
+    Requires the sovereign principal (kestrel-sovereign#3234): a per-agent
+    mutation of a caller-selected agent, and a second disable door — a
+    config that fails reconciliation tears the feature down
+    (``_disable_feature_after_config_reconciliation_failure``), so an
+    ungated PATCH would let a non-sovereign caller do what ``disable`` now
+    refuses.
 
     Validates against the feature's config_schema if available.
 

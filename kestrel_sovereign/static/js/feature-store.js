@@ -249,6 +249,14 @@ function getStatusBadge(status) {
 
 function renderActionButton(feature) {
     const status = feature.status || 'available';
+    const isCore = feature.core || false;
+
+    if (status === 'enabled' && isCore) {
+        // A core (baseline) package cannot be disabled per agent — the server
+        // answers 409 and points at kestrel.toml (#3234). The detail modal
+        // already hides the action for core rows; the card matches it.
+        return '';
+    }
 
     if (status === 'enabled') {
         return `<button class="feature-action-btn" onclick="FeatureStore.disableFeature('${escapeHtml(feature.name)}')" style="

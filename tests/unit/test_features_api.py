@@ -1516,6 +1516,43 @@ class TestDisableFeature:
         feature.on_disable.assert_not_awaited()
         assert feature.enabled is True
 
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_core_package_disable_is_rejected_before_lifecycle(self, mock_registry):
+        """#3234: a ``core = true`` package cannot be disabled per agent, even
+        by the sovereign — the baseline is host policy (``kestrel.toml``
+        ``disabled_features``), not a per-agent runtime toggle.
+
+        ``MANDATORY_FEATURES`` is five classes; everything else bundled
+        (``RestartCoordinatorFeature`` included) was disableable through this
+        route. The positive control in the same registry: a non-core package
+        still disables, so the refusal keys on ``core`` and not on "known to
+        the registry".
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        core = _make_feature(name="CoreFeature")
+        addon = _make_feature(name="TestFeature")
+        agent = _lifecycle_agent(
+            features={"CoreFeature": core, "TestFeature": addon}
+        )
+        app = _make_app(agent)  # sovereign caller
+
+        with TestClient(app) as client:
+            # By class name (the bare-name path that never consults the
+            # registry) and by package stable id.
+            for name in ("CoreFeature", "core-pkg"):
+                resp = client.post(f"/api/features/{name}/disable")
+                assert resp.status_code == 409, (name, resp.text)
+                assert "CoreFeature" in resp.json()["detail"]
+                assert "kestrel.toml" in resp.json()["detail"]
+            core.on_disable.assert_not_awaited()
+            core.shutdown.assert_not_awaited()
+            assert core.enabled is True
+
+            resp = client.post("/api/features/TestFeature/disable")
+            assert resp.status_code == 200, resp.text
+            addon.on_disable.assert_awaited_once()
+            assert addon.enabled is False
+
     def test_disable_calls_on_disable(self):
         feature = _make_feature()
         agent = _lifecycle_agent(features={"TestFeature": feature})
@@ -4030,10 +4067,34 @@ def _seal_installer_seams(monkeypatch):
     return attempted
 
 
+# Every mutation on this router, as (method, path suffix, body). Install and
+# remove mutate the interpreter every agent is loaded from (#3214); enable,
+# disable and config PATCH mutate a caller-SELECTED agent's runtime — the
+# routing middleware pins whichever agent the path names and the caller
+# model carries no binding to any agent, so "the routed agent's own runtime"
+# is a blast radius, not an authority (#3234). PATCH is also a disable door:
+# a config that fails reconciliation tears the feature down.
+_MUTATIONS = [
+    ("POST", "install", None),
+    ("POST", "remove", None),
+    ("POST", "enable", None),
+    ("POST", "disable", None),
+    ("PATCH", "config", {"config": {}}),
+]
+_MUTATION_IDS = [suffix for _method, suffix, _body in _MUTATIONS]
+
+
+def _mutate(client, method, name, suffix, body):
+    return client.request(method, f"/api/features/{name}/{suffix}", json=body)
+
+
 class TestSharedEnvironmentRoutesRequireSovereignAuthority:
     """Install and remove run pip against the interpreter every agent on the
     host is loaded from, so they are host administration rather than the
-    routed agent's own business.
+    routed agent's own business (#3214). Enable, disable and config PATCH
+    act on whichever agent the caller named in the path, with no per-agent
+    authorization anywhere between the auth middleware and the handler, so
+    they are not the caller's own business either (#3234).
 
     The claim was already in the docstring — "Requires a sovereign agent —
     governed agents cannot install packages" — while the handler resolved
@@ -4042,7 +4103,7 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
     used it.
     """
 
-    @pytest.mark.parametrize("route", ["install", "remove"])
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
     @pytest.mark.parametrize(
         "caller,label",
         [
@@ -4053,19 +4114,21 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         ],
     )
     def test_a_caller_without_sovereign_authority_is_refused(
-        self, route, caller, label
+        self, method, suffix, body, caller, label
     ):
         agent = _make_agent()
         app = _make_app(agent, caller=caller)
 
         with TestClient(app) as client:
-            response = client.post(f"/api/features/test-pkg/{route}")
+            response = _mutate(client, method, "test-pkg", suffix, body)
 
-        assert response.status_code == 403, (label, route, response.text)
+        assert response.status_code == 403, (label, suffix, response.text)
         assert "Sovereign authority is required." in response.text
 
-    @pytest.mark.parametrize("route", ["install", "remove"])
-    def test_an_app_with_no_auth_middleware_at_all_is_refused(self, route):
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
+    def test_an_app_with_no_auth_middleware_at_all_is_refused(
+        self, method, suffix, body
+    ):
         """The shape round 1's P1 actually had.
 
         `_make_app` always registers its middleware, so passing
@@ -4081,7 +4144,7 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         app.state.agent = _make_agent()
 
         with TestClient(app) as client:
-            response = client.post(f"/api/features/test-pkg/{route}")
+            response = _mutate(client, method, "test-pkg", suffix, body)
 
         assert response.status_code == 403, response.text
 
@@ -4144,24 +4207,27 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         )
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
-    def test_the_gate_is_not_on_the_reads_or_the_per_agent_routes(
-        self, mock_registry
-    ):
+    def test_the_gate_is_not_on_the_reads(self, mock_registry):
         """Where the guard is NOT, stated executably.
 
-        Everything above pins the gate ON install and remove and nothing
-        pinned it OFF anywhere, so three mutations survived the whole
-        suite: hoisting the dependency onto the `APIRouter` (which 403s
-        the entire feature UI for every OAuth user), and adding it to
-        `/enable`, `/disable`, `PATCH /config` or `GET
-        /api/features/{name}`. A scoping decision recorded only in prose
-        is not a decision the suite can keep.
+        Everything above pins the gate ON the mutations and nothing pinned
+        it OFF anywhere, so hoisting the dependency onto the `APIRouter`
+        (which 403s the entire feature UI for every OAuth user) or adding
+        it to `GET /api/features/{name}` survived the whole suite until
+        this existed. A scoping decision recorded only in prose is not a
+        decision the suite can keep.
 
-        This says the catalog stays readable and the per-agent routes
-        stay reachable without sovereign authority. It is deliberately
-        `!= 403` rather than a specific success code: what those routes
-        do about an unknown feature is their business — the claim here is
-        only that authority is not what stops them.
+        Until #3234 this test also pinned enable/disable/config OFF, on the
+        reasoning that they touch "the routed agent's own loaded runtime".
+        That premise was wrong — the routed agent is caller-selected — and
+        the pin was removed deliberately: the same loaded feature that
+        those routes answered 200 for now answers 403, asserted here so the
+        reversal is visible in one place rather than inferred from the
+        refusal matrix above.
+
+        `== 200`, not `!= 403`: a deleted or renamed route answers 404,
+        and 404 is also `!= 403`, so the weaker form could not tell
+        "reachable without sovereign authority" from "not there at all".
         """
         mock_registry.return_value = dict(FAKE_REGISTRY)
         agent = _lifecycle_agent(
@@ -4174,20 +4240,47 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
             assert client.get("/api/features/installed").status_code == 200
             assert client.get("/api/features/TestFeature").status_code == 200
 
-            # `== 200`, not `!= 403`: a deleted or renamed route answers
-            # 404, and 404 is also `!= 403`, so the weaker form could not
-            # tell "reachable without sovereign authority" from "not
-            # there at all".
-            for route in ("enable", "disable"):
-                response = client.post(f"/api/features/TestFeature/{route}")
-                assert response.status_code == 200, (route, response.text)
+            for method, suffix, body in _MUTATIONS[2:]:
+                response = _mutate(client, method, "TestFeature", suffix, body)
+                assert response.status_code == 403, (suffix, response.text)
 
-            assert (
-                client.patch(
-                    "/api/features/TestFeature/config", json={"config": {}}
-                ).status_code
-                == 200
-            )
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_per_agent_mutation_refusal_does_not_reveal_whether_the_feature_is_loaded(
+        self, mock_registry
+    ):
+        """403 before the loaded-feature lookup, for enable/disable/config.
+
+        Same shape as the install/remove oracle test above, with the
+        differential these routes actually have: a LOADED feature versus an
+        invented name. A sovereign caller gets 200 for the former and 404
+        for the latter; a non-sovereign caller must get one indistinguishable
+        answer for both, which only a route-level dependency delivers.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
+
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+        with TestClient(app) as client:
+            for method, suffix, body in _MUTATIONS[2:]:
+                known = _mutate(client, method, "TestFeature", suffix, body)
+                invented = _mutate(
+                    client, method, "NoSuchFeatureAnywhere", suffix, body
+                )
+                assert known.status_code == invented.status_code == 403, suffix
+                assert known.text == invented.text, suffix
+
+        # The differential has to exist for its absence to mean anything.
+        sovereign = _make_app(agent, caller=CallerContext.sovereign())
+        with TestClient(sovereign) as client:
+            for method, suffix, body in _MUTATIONS[2:]:
+                real = _mutate(client, method, "TestFeature", suffix, body)
+                fake = _mutate(
+                    client, method, "NoSuchFeatureAnywhere", suffix, body
+                )
+                assert real.status_code == 200, (suffix, real.text)
+                assert fake.status_code == 404, (suffix, fake.text)
 
     def test_exactly_the_shared_environment_routes_carry_the_gate(self):
         """The scoping decision, read off the route table rather than a list.
@@ -4229,10 +4322,13 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         assert gated == {
             ("/api/features/{name}/install", "POST"),
             ("/api/features/{name}/remove", "POST"),
+            ("/api/features/{name}/enable", "POST"),
+            ("/api/features/{name}/disable", "POST"),
+            ("/api/features/{name}/config", "PATCH"),
         }, (
-            "only the routes that mutate the shared interpreter may require "
-            "sovereign authority; everything else on this router serves the "
-            "console for ordinary callers"
+            "exactly the mutation routes require sovereign authority "
+            "(#3214 shared interpreter, #3234 caller-selected agent); every "
+            "read on this router serves the console for ordinary callers"
         )
 
         # Stated limits, so nobody reads this as more than it is. It sees
@@ -4242,8 +4338,10 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         # `include_router(..., dependencies=[...])` there; and an
         # install-shaped route added in another endpoint module.
 
-    @pytest.mark.parametrize("route", ["install", "remove"])
-    def test_a_sovereign_caller_is_admitted_past_the_gate(self, route, monkeypatch):
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
+    def test_a_sovereign_caller_is_admitted_past_the_gate(
+        self, method, suffix, body, monkeypatch
+    ):
         """The positive control.
 
         Without it, a guard that refused everyone would satisfy every
@@ -4256,6 +4354,8 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         app = _make_app(agent, caller=CallerContext.sovereign(AuthMethod.API_KEY))
 
         with TestClient(app, raise_server_exceptions=False) as client:
-            response = client.post(f"/api/features/no-such-package-anywhere/{route}")
+            response = _mutate(
+                client, method, "no-such-package-anywhere", suffix, body
+            )
 
         assert response.status_code != 403, response.text
