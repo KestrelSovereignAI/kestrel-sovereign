@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import secrets
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
@@ -33,6 +34,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
 )
 from kestrel_sovereign.rate_limit import limiter
+from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,64 @@ logger = logging.getLogger(__name__)
 _agent_semaphore = asyncio.Semaphore(10)
 
 router = APIRouter(prefix="/webhooks/rest", tags=["rasa-shim"])
+
+
+def _routed_agent_name(request: Request) -> Optional[str]:
+    """The routing name of the agent an agent-prefixed request named, or
+    ``None`` for the unprefixed form.
+
+    The routing middleware pins ``request.state.agent`` but not the name it
+    matched; the AgentManager maps the agent back to its routing key
+    (``None`` for a fenced spawn route).
+    """
+    routed = getattr(request.state, "agent", None)
+    if routed is None:
+        return None
+    manager = getattr(request.app.state, "agent_manager", None)
+    if manager is None:
+        return None
+    name = manager.get_agent_name(getattr(routed, "did", None))
+    return name if isinstance(name, str) and name else None
+
+
+def _rasa_rate_limit_key(request: Request) -> str:
+    """Rate-limit bucket: remote address × routed agent (kestrel-sovereign#3220).
+
+    The middleware strips the agent prefix before SlowAPI sees the path, so
+    without this every agent on the host shared one 30/minute bucket per
+    source and one gateway forwarding for the fleet had agent A's traffic
+    starve agent B.
+    """
+    return f"{get_remote_address(request)}|{_routed_agent_name(request) or 'default'}"
+
+
+def _rasa_enabled_agents() -> frozenset[str]:
+    """Routing names the sovereign has enabled the Rasa channel for.
+
+    ``KESTREL_RASA_WEBHOOK_AGENTS`` is a comma-separated list. It governs
+    ONLY the agent-prefixed alias; the unprefixed form reaches the host
+    default under the token's pre-existing authority.
+    """
+    raw = os.environ.get("KESTREL_RASA_WEBHOOK_AGENTS", "")
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+
+def _verify_routed_agent_enabled(request: Request) -> None:
+    """Refuse the agent-prefixed alias for an agent not enabled for Rasa.
+
+    One host-wide token authenticates this endpoint. Before #3220 that token
+    could only ever reach the host default; binding the routed agent would
+    have let the same token drive a paid ``process_input`` turn on EVERY
+    agent on the host by changing one path segment. So the prefixed form is
+    an explicit, per-agent, sovereign-configured opt-in and FAILS CLOSED:
+    unset or unlisted → 404, indistinguishable from an unknown agent (the
+    routing middleware's own answer), and nobody is invoked.
+    """
+    name = _routed_agent_name(request)
+    if name is None:
+        return
+    if name not in _rasa_enabled_agents():
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _verify_webhook_token(request: Request) -> None:
@@ -90,7 +150,7 @@ class RasaWebhookResponse(BaseModel):
 
 
 @router.post("/webhook", response_model=list[RasaWebhookResponse])
-@limiter.limit("30/minute")
+@limiter.limit("30/minute", key_func=_rasa_rate_limit_key)
 async def rasa_webhook(
     request: Request,
     payload: RasaWebhookRequest,
@@ -114,9 +174,20 @@ async def rasa_webhook(
     ignore it and run ``app.state.agent`` — the host default — so a message
     explicitly addressed to agent B executed on agent A, or 503'd when no
     default existed. ``get_agent`` prefers the routed agent and falls back to
-    the single-agent default, so the standalone unprefixed form is unchanged.
+    the single-agent default. The unprefixed form keeps its behaviour with
+    one visible change: the no-agent case now answers the canonical
+    ``503 "Agent not initialized."`` (it said "Kestrel agent not
+    initialized." before).
+
+    The prefixed alias is additionally an explicit per-agent opt-in
+    (``KESTREL_RASA_WEBHOOK_AGENTS``), because one host-wide token must not
+    become paid turns on every agent by path segment; and the rate-limit
+    bucket is per remote address AND routed agent, so one gateway forwarding
+    for the fleet cannot let agent A starve agent B. Order: token, then
+    opt-in, then agent resolution, then payload validation.
     """
     _verify_webhook_token(request)
+    _verify_routed_agent_enabled(request)
 
     agent = get_agent(request)
 

@@ -127,19 +127,31 @@ def _prepare_multi_agent_app(agents, default=None):
         "agent": getattr(app.state, "agent", None),
         "manager": getattr(app.state, "agent_manager", None),
     }
+    by_did = {getattr(agent, "did", None): name for name, agent in agents.items()}
     manager = MagicMock()
     manager.list_agents = MagicMock(side_effect=lambda: dict(agents))
     manager.get_agent = MagicMock(side_effect=lambda name: agents.get(name))
+    manager.get_agent_name = MagicMock(side_effect=lambda did: by_did.get(did))
     app.router.lifespan_context = noop_lifespan
     app.state.agent = default
     app.state.agent_manager = manager
     return app, original
 
 
-def _rasa_agent(reply):
+def _rasa_agent(reply, did=None):
     agent = MagicMock()
+    agent.did = did or f"did:test:{reply.replace(' ', '-')}"
     agent.process_input = AsyncMock(return_value=reply)
     return agent
+
+
+# Multi-agent tests enable the Rasa channel for the agents they address
+# (#3220 round 1 F1): the prefixed alias is a per-agent opt-in.
+_MULTI_ENV = {
+    "KESTREL_API_KEY": "test-key",
+    "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+    "KESTREL_RASA_WEBHOOK_AGENTS": "a, b",
+}
 
 
 def test_prefixed_rasa_alias_invokes_only_the_routed_agent():
@@ -155,10 +167,7 @@ def test_prefixed_rasa_alias_invokes_only_the_routed_agent():
     b = _rasa_agent("reply from b")
     app, original = _prepare_multi_agent_app({"a": a, "b": b})
     try:
-        with patch.dict(
-            "os.environ",
-            {"KESTREL_API_KEY": "test-key", "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token"},
-        ):
+        with patch.dict("os.environ", _MULTI_ENV):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/agents/b/webhooks/rest/webhook",
@@ -199,10 +208,7 @@ def test_prefixed_rasa_alias_beats_the_host_default_agent():
     b = _rasa_agent("reply from b")
     app, original = _prepare_multi_agent_app({"a": a, "b": b}, default=a)
     try:
-        with patch.dict(
-            "os.environ",
-            {"KESTREL_API_KEY": "test-key", "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token"},
-        ):
+        with patch.dict("os.environ", _MULTI_ENV):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/agents/b/webhooks/rest/webhook",
@@ -261,10 +267,7 @@ def test_prefixed_rasa_alias_still_requires_the_webhook_token():
     b = _rasa_agent("reply from b")
     app, original = _prepare_multi_agent_app({"b": b})
     try:
-        with patch.dict(
-            "os.environ",
-            {"KESTREL_API_KEY": "test-key", "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token"},
-        ):
+        with patch.dict("os.environ", _MULTI_ENV):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/agents/b/webhooks/rest/webhook",
@@ -273,5 +276,120 @@ def test_prefixed_rasa_alias_still_requires_the_webhook_token():
                 )
         assert response.status_code == 401, response.text
         b.process_input.assert_not_awaited()
+    finally:
+        _restore_app(app, original)
+
+
+def test_prefixed_rasa_alias_is_a_per_agent_opt_in_that_fails_closed():
+    """#3220 round 1 (P2): one host-wide token must not become paid turns on
+    every agent by path segment. The prefixed alias is refused — 404, the
+    routing middleware's own unknown-agent answer, nobody invoked — unless
+    the routed agent is listed in ``KESTREL_RASA_WEBHOOK_AGENTS``. Unset
+    refuses everything prefixed; the unprefixed default is untouched by the
+    list either way.
+    """
+    a = _rasa_agent("reply from a")
+    b = _rasa_agent("reply from b")
+    # "" is the unset case: no agent is enabled for the prefixed alias.
+    for env_agents in ("", "a"):
+        env = {
+            "KESTREL_API_KEY": "test-key",
+            "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+            "KESTREL_RASA_WEBHOOK_AGENTS": env_agents,
+        }
+        a.process_input.reset_mock()
+        b.process_input.reset_mock()
+        app, original = _prepare_multi_agent_app({"a": a, "b": b}, default=a)
+        try:
+            with patch.dict("os.environ", env):
+                with TestClient(app) as client:
+                    refused = client.post(
+                        "/api/agents/b/webhooks/rest/webhook",
+                        headers=_api_headers(),
+                        json={"sender": "patient-7", "message": "for b"},
+                    )
+                    assert refused.status_code == 404, (env_agents, refused.text)
+                    b.process_input.assert_not_awaited()
+                    a.process_input.assert_not_awaited()
+
+                    default = client.post(
+                        "/webhooks/rest/webhook",
+                        headers=_api_headers(),
+                        json={"sender": "patient-8", "message": "for default"},
+                    )
+                    assert default.status_code == 200, (env_agents, default.text)
+                    a.process_input.assert_awaited_once()
+
+                    if env_agents == "a":
+                        listed = client.post(
+                            "/api/agents/a/webhooks/rest/webhook",
+                            headers=_api_headers(),
+                            json={"sender": "patient-9", "message": "for a"},
+                        )
+                        assert listed.status_code == 200, listed.text
+                        assert a.process_input.await_count == 2
+                        b.process_input.assert_not_awaited()
+        finally:
+            _restore_app(app, original)
+
+
+def test_rasa_rate_limit_bucket_is_per_routed_agent():
+    """#3220 round 1 (P2): the middleware strips the prefix before SlowAPI
+    keys the request, so the fleet shared one 30/minute bucket per source.
+    Exhausting agent RA's bucket must not touch agent RB's.
+    """
+    ra = _rasa_agent("reply from ra")
+    rb = _rasa_agent("reply from rb")
+    env = {
+        "KESTREL_API_KEY": "test-key",
+        "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+        "KESTREL_RASA_WEBHOOK_AGENTS": "ra,rb",
+    }
+    app, original = _prepare_multi_agent_app({"ra": ra, "rb": rb})
+    try:
+        with patch.dict("os.environ", env):
+            with TestClient(app) as client:
+                for i in range(30):
+                    resp = client.post(
+                        "/api/agents/ra/webhooks/rest/webhook",
+                        headers=_api_headers(),
+                        json={"sender": f"p-{i}", "message": "hi"},
+                    )
+                    assert resp.status_code == 200, (i, resp.text)
+                exhausted = client.post(
+                    "/api/agents/ra/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-31", "message": "hi"},
+                )
+                assert exhausted.status_code == 429, exhausted.text
+                other = client.post(
+                    "/api/agents/rb/webhooks/rest/webhook",
+                    headers=_api_headers(),
+                    json={"sender": "p-b", "message": "hi"},
+                )
+                assert other.status_code == 200, other.text
+                rb.process_input.assert_awaited_once()
+    finally:
+        _restore_app(app, original)
+
+
+def test_token_check_precedes_agent_resolution():
+    """The shim's own auth runs first: with NO resolvable agent and a bad
+    token the answer is 401, not 503 — the discriminating input the
+    ordering claim needs (round 1 coverage note).
+    """
+    app, original = _prepare_multi_agent_app({})
+    try:
+        with patch.dict(
+            "os.environ",
+            {"KESTREL_API_KEY": "test-key", "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token"},
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/webhooks/rest/webhook",
+                    headers={"X-API-Key": "test-key", "X-Webhook-Token": "wrong"},
+                    json={"sender": "p", "message": "hi"},
+                )
+        assert response.status_code == 401, response.text
     finally:
         _restore_app(app, original)
