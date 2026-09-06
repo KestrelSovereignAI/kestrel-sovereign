@@ -3987,31 +3987,47 @@ class TestPostRepairRevalidation:
 def _seal_installer_seams(monkeypatch):
     """Make it impossible for these tests to install or uninstall anything.
 
-    Both seams go through `monkeypatch`, deliberately. Using
-    `@patch("...features.subprocess.run")` alongside `use_fake_uv` does
-    not work: the decorator targets the STDLIB module object, which
-    `use_fake_uv` then monkeypatches as well, so monkeypatch records the
-    MagicMock as the "old" value and writes it back at fixture teardown
-    — after the decorator has exited. `subprocess.run` stays a
-    MagicMock configured `returncode=0, stdout=""` for the rest of the
-    worker, which is the silent-success shape: any later test that
-    shells out and checks only the return code passes without running
-    anything. One mechanism, one LIFO teardown, no leak.
+    **This is load-bearing today, not only under mutation.** The tests
+    below deliberately drive a sovereign caller *past* the gate to show
+    the differential exists, and both handlers then run to completion:
+    `install` reaches `uv pip install --python <venv> -c <constraints>
+    kestrel-feature-test` and `remove` reaches
+    `<venv>/bin/python -m pip uninstall -y kestrel-feature-test`
+    (`_remove_feature_locked` does not 404 when nothing is loaded).
+    Delete this call and the suite really does install and uninstall a
+    package in whichever venv is running it. The returned recorder is
+    asserted on for that reason — so the danger is visible in the test
+    body rather than trusted to this docstring.
 
-    These tests are about the authority gate, and today the 403 lands
-    before either seam matters. They exist for the mutation where the
-    gate is gone, which is exactly when an unsealed test would run
-    `uv pip install` and `pip uninstall` against the developer's venv.
+    Everything goes through `monkeypatch`, deliberately. Using
+    `@patch("...features.subprocess.run")` alongside `use_fake_uv` does
+    not work: the decorator targets the STDLIB module object — the same
+    one `use_fake_uv` patches, since `cli.subprocess`,
+    `cli_features.subprocess` and `features.subprocess` are all that
+    module — so monkeypatch records the MagicMock as the "old" value and
+    writes it back at fixture teardown, after the decorator has exited.
+    `subprocess.run` then stays a MagicMock configured
+    `returncode=0, stdout=""` for the rest of the worker: the
+    silent-success shape, which makes any later test that shells out and
+    checks only a return code pass without running anything. One
+    mechanism, one LIFO teardown, no leak.
+
+    Note the second `setattr` replaces FakeUv's own modelled installer
+    on that same attribute; FakeUv is still what answers the venv-state
+    reads, which is what the constraints resolution needs.
     """
     use_fake_uv(
         monkeypatch,
         FakeUv(feature="kestrel-feature-test", core_checkout="/src/core"),
     )
-    monkeypatch.setattr(
-        features_endpoint.subprocess,
-        "run",
-        MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr="")),
-    )
+    attempted: list[list[str]] = []
+
+    def _record(*args, **kwargs):
+        attempted.append(list(args[0] if args else kwargs.get("args") or []))
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(features_endpoint.subprocess, "run", _record)
+    return attempted
 
 
 class TestSharedEnvironmentRoutesRequireSovereignAuthority:
@@ -4090,7 +4106,7 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         closed.
         """
         mock_registry.return_value = dict(FAKE_REGISTRY)
-        _seal_installer_seams(monkeypatch)
+        attempted = _seal_installer_seams(monkeypatch)
         agent = _make_agent()
         app = _make_app(agent, caller=CallerContext.anonymous())
 
@@ -4115,6 +4131,16 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         assert real.status_code != fake.status_code, (
             "a sovereign caller must be able to tell these apart, or the "
             "anonymous pair above proves nothing"
+        )
+
+        # The sovereign leg above ran a real handler to completion, and
+        # the seam is what stopped it touching this machine. Asserting
+        # that keeps the seal from looking optional to the next reader.
+        assert any(
+            "kestrel-feature-test" in " ".join(command) for command in attempted
+        ), (
+            "the sovereign request should have reached the installer through "
+            f"the sealed seam; captured {attempted!r}"
         )
 
     @patch("kestrel_sovereign.endpoints.features.get_registry")
@@ -4177,19 +4203,18 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
         `request.state.caller` is never set there and a gate would refuse
         everyone, sovereign included.
         """
-        # Read off a MOUNTED app, not the bare router. FastAPI merges
-        # router-level `dependencies=` into each route at decoration
-        # time, so the router table does catch a hoist onto
-        # `APIRouter(...)` — but `include_router(..., dependencies=[...])`
-        # builds NEW route objects on the app and leaves
-        # `features_router.routes` untouched. Someone "closing a hole"
-        # that way in server.py would 403 the whole feature UI with a
-        # router-table assertion still green.
-        #
         # Keyed by (path, method) rather than path: this router already
         # has two routes sharing `/api/features/{name}/config`, so an
-        # ungated sibling method on a gated path would vanish into a set
-        # of paths.
+        # ungated sibling method on a gated path would otherwise vanish
+        # into a set of paths.
+        #
+        # Read off a mounted app for readability — it is the table that
+        # serves. It buys nothing over the bare router here, and saying
+        # so matters: FastAPI merges router-level `dependencies=` into
+        # each route at decoration time, so both views catch a hoist
+        # onto `APIRouter(...)`, and neither catches
+        # `include_router(..., dependencies=[...])` in server.py, because
+        # this test mounts its own app and never imports server.
         app = _make_app(_make_agent())
         gated = {
             (route.path, method)
@@ -4210,10 +4235,12 @@ class TestSharedEnvironmentRoutesRequireSovereignAuthority:
             "console for ordinary callers"
         )
 
-        # Stated limits, so nobody reads this as more than it is: it sees
-        # route-level dependencies on this router only. A check written
-        # inside a handler body, in middleware, or on an install-shaped
-        # route in another endpoint module is invisible here.
+        # Stated limits, so nobody reads this as more than it is. It sees
+        # route-level dependencies on this router only. Invisible to it:
+        # a check written inside a handler body; one in middleware; how
+        # `server.py` actually mounts this router, including a
+        # `include_router(..., dependencies=[...])` there; and an
+        # install-shaped route added in another endpoint module.
 
     @pytest.mark.parametrize("route", ["install", "remove"])
     def test_a_sovereign_caller_is_admitted_past_the_gate(self, route, monkeypatch):
