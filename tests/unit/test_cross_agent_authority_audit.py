@@ -6753,10 +6753,20 @@ def test_a2a_cancellation_delegates_to_issue_3134() -> None:
     assert "Defect:" not in row
 
 
-def test_unverified_spawn_authority_is_recorded_as_a_defect() -> None:
+def test_spawn_authority_distinguishes_issuance_from_control_boundaries() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
+    assert "signs while `child_did` is unset" not in audit
+
+    creation_row = next(
+        line
+        for line in audit.splitlines()
+        if line.startswith("| Create child |")
+    )
+    assert "[#3133]" in creation_row
+    assert "Enforced by" in creation_row
+    assert "final child DID" in creation_row
+
     for action in (
-        "Create child",
         "List/read child work",
         "Delegate work to child",
         "Terminate/offboard child",
