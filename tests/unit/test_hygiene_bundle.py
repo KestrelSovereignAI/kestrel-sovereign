@@ -119,8 +119,11 @@ class TestSpawnCaps:
         m._child_mandates = {"existing": MagicMock()}
         parent = MagicMock()
         parent.agent_id = "did:test:parent"
+        from kestrel_sovereign.spawn.mandate import SpawnMandate
         with pytest.raises(ValueError, match="cap"):
-            await m.spawn_agent("child", parent, MagicMock())
+            await m.spawn_agent(
+                "child", parent, SpawnMandate(parent_did=parent.agent_id)
+            )
 
     @pytest.mark.asyncio
     async def test_spawn_refused_when_parent_is_leaf(self):
@@ -134,8 +137,11 @@ class TestSpawnCaps:
         leaf_mandate = MagicMock()
         leaf_mandate.max_child_depth = 0
         m._child_mandates = {"parentname": leaf_mandate}
+        from kestrel_sovereign.spawn.mandate import SpawnMandate
         with pytest.raises(ValueError, match="max child depth"):
-            await m.spawn_agent("child", parent, MagicMock())
+            await m.spawn_agent(
+                "child", parent, SpawnMandate(parent_did=parent.agent_id)
+            )
 
     @pytest.mark.asyncio
     async def test_child_depth_is_decremented_from_parent(self):
@@ -151,12 +157,19 @@ class TestSpawnCaps:
         parent_mandate.max_child_depth = 2
         m._child_mandates = {"parentname": parent_mandate}
         # Caller tries to keep depth high.
-        child_mandate = MagicMock()
-        child_mandate.max_child_depth = 5
+        from kestrel_sovereign.spawn.mandate import SpawnMandate
+        child_mandate = SpawnMandate(
+            parent_did=parent.agent_id,
+            max_child_depth=5,
+        )
         m._do_spawn = AsyncMock(return_value=MagicMock())
         await m.spawn_agent("child", parent, child_mandate)
-        # Clamped to parent (2) - 1 = 1.
-        assert child_mandate.max_child_depth == 1
+        # The public proposal stays caller-owned, while the private snapshot
+        # passed into the spawn is clamped to parent (2) - 1 = 1.
+        assert child_mandate.max_child_depth == 5
+        delegated = m._do_spawn.await_args.args[2]
+        assert delegated is not child_mandate
+        assert delegated.max_child_depth == 1
 
     def test_port_allocation_never_reuses(self):
         from kestrel_sovereign.multi_agent.agent_manager import AgentManager

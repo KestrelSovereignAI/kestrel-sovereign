@@ -218,6 +218,9 @@ def _detect_running_agent_server(
     agent_name: str,
     agent_cfg: LocalAgentConfig,
     multi_agent: MultiAgentConfig,
+    *,
+    operator_api_key: str = "",
+    operator_api_keys: tuple[str, ...] = (),
 ) -> Optional[tuple[str, str]]:
     """Probe for a running server that hosts this agent.
 
@@ -235,12 +238,22 @@ def _detect_running_agent_server(
        (``multi_agent.host.port``) under ``/api/agents/{name}/``. Base URL is
        host:port + that prefix.
 
-    Health probe uses ``GET /health`` (public, no auth). Key fetch uses
-    ``GET /api/auth/key`` (public). Network errors fall through silently
-    — no server is a normal case, not an error.
+    Health probes use ``GET /health`` (public, no auth). A standalone process
+    may still expose its localhost bootstrap endpoint, but an in-process fleet
+    host must be probed with the operator key resolved locally from the same
+    project environment used to launch it. A managed peer can also reach
+    loopback, so fetching the fleet host's sovereign key over HTTP would erase
+    the transport/authority boundary.
     """
     import httpx
 
+    fleet_api_keys = tuple(
+        dict.fromkeys(
+            key
+            for key in (*operator_api_keys, operator_api_key)
+            if isinstance(key, str) and key
+        )
+    )
     candidates = [
         (f"http://localhost:{agent_cfg.port}", ""),
         (
@@ -255,33 +268,64 @@ def _detect_running_agent_server(
             continue
         if health.status_code != 200:
             continue
-        try:
-            key_resp = httpx.get(f"{origin}/api/auth/key", timeout=2.0)
-        except httpx.RequestError:
-            continue
         api_key = ""
-        if key_resp.status_code == 200:
+        if not prefix:
+            try:
+                key_resp = httpx.get(f"{origin}/api/auth/key", timeout=2.0)
+            except httpx.RequestError:
+                continue
+            if key_resp.status_code != 200:
+                # A ProcessManager child is intentionally transport-only: its
+                # public health endpoint can answer on the configured agent
+                # port, but it cannot bootstrap an operator credential. Keep
+                # probing so the fleet host remains discoverable.
+                continue
             try:
                 api_key = key_resp.json().get("key", "") or ""
             except ValueError:
                 api_key = ""
-        # In multi-agent mode, confirm the named agent is actually routed
-        # by this server. The routing middleware returns 404 for unknown
-        # names; hit the prefix's /health proxy to verify before declaring
-        # success. (Standalone mode has no prefix, and /health above
-        # already confirmed the single-agent server is alive.)
-        if prefix:
+            if not api_key:
+                continue
+            return (origin, api_key)
+
+        # Fleet bootstrap is deliberately disabled. The CLI is an operator
+        # process and must arrive with an out-of-band project credential. Try
+        # both supported launch precedences: direct server startup keeps an
+        # exported value, while ``kestrel start`` lets the project file win.
+        for candidate_key in fleet_api_keys:
             try:
                 scoped = httpx.get(
-                    f"{origin}{prefix}/health", timeout=1.0,
-                    headers={"X-API-Key": api_key} if api_key else {},
+                    f"{origin}{prefix}/health",
+                    timeout=1.0,
+                    headers={"X-API-Key": candidate_key},
                 )
             except httpx.RequestError:
                 continue
-            if scoped.status_code != 200:
-                continue
-        return (f"{origin}{prefix}", api_key)
+            if scoped.status_code == 200:
+                return (f"{origin}{prefix}", candidate_key)
     return None
+
+
+def _operator_api_keys(project_dir: Path) -> tuple[str, ...]:
+    """Resolve credentials for both supported fleet-host launch paths."""
+    from kestrel_sovereign.auth import normalize_api_key
+
+    candidates: list[str] = []
+    # server.py loads the project file with ``override=False`` when launched
+    # directly, so the exported credential is the first candidate.
+    if "KESTREL_API_KEY" in os.environ:
+        exported = normalize_api_key(os.environ.get("KESTREL_API_KEY")) or ""
+        if exported:
+            candidates.append(exported)
+    # ProcessManager deliberately applies the opposite precedence. Retain the
+    # file-selected key as a fallback and let the authenticated health probe
+    # identify which launch path owns the live host.
+    launched = normalize_api_key(
+        spawned_agent_env(project_dir).get("KESTREL_API_KEY")
+    ) or ""
+    if launched and launched not in candidates:
+        candidates.append(launched)
+    return tuple(candidates)
 
 
 # Default read timeout (seconds) for talking to a running agent. An agentic
@@ -396,7 +440,12 @@ def cmd_shell(args) -> int:
     # HTTP routing when the user passed --app so extensions still work.
     use_extension = bool(getattr(args, "app", None))
     if not use_extension:
-        server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
+        server = _detect_running_agent_server(
+            args.name,
+            agent_cfg,
+            multi_agent,
+            operator_api_keys=_operator_api_keys(project_dir),
+        )
         if server is not None:
             base_url, api_key = server
             return _run_http_shell(args.name, base_url, api_key)
@@ -472,7 +521,12 @@ def cmd_ask(args) -> int:
         return 1
 
     agent_cfg = local_agents[args.name]
-    server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
+    server = _detect_running_agent_server(
+        args.name,
+        agent_cfg,
+        multi_agent,
+        operator_api_keys=_operator_api_keys(project_dir),
+    )
     if server is None:
         print(
             f"No running server hosts agent '{args.name}'. "

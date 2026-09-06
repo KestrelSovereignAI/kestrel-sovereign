@@ -39,13 +39,10 @@ def _get_lifecycle(agent, request: Request | None = None) -> Any:
 def _get_agent_manager(agent, request: Request | None = None) -> Any:
     """Get AgentManager — first from the agent, then from app.state.
 
-    In multi-agent mode the shared AgentManager lives on
-    ``request.app.state.agent_manager`` and is NOT attached to each
-    loaded agent (``AgentManager.load_agent()`` doesn't backref).
-    Without the request fallback the panel reports an empty spawn
-    state for routed-agent calls like ``/api/agents/{name}/api/spawn/children``
-    even when the app-level manager has children. Codex round 3 of
-    #1149 caught this; the bug existed in the archived package too.
+    In multi-agent mode the shared AgentManager is attached to every published
+    agent. The request fallback remains for legacy/test hosts and startup seams
+    that have not completed publication; without it those calls would report
+    an empty spawn state even when app-level state has children (#1149).
     """
     manager = getattr(agent, '_agent_manager', None) or getattr(agent, 'agent_manager', None)
     if manager is None and request is not None:

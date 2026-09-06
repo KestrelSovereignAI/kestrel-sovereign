@@ -4255,7 +4255,13 @@ class SignalDispatcher:
                                     audit.injected_clauses = ["KESTREL_CONSTITUTION"]
                                 if fname not in audit.injected_clauses:
                                     audit.injected_clauses.append(fname)
-                    except Exception:
+                    except Exception as exc:
+                        from kestrel_sovereign.agent.system_prompt_assembler import (
+                            SystemPromptNamespaceError,
+                        )
+
+                        if isinstance(exc, SystemPromptNamespaceError):
+                            raise
                         logger.exception(
                             "Inline-format doctrine resolution failed for "
                             "signal %s; reviewer will see only the "
@@ -4419,7 +4425,29 @@ class SignalDispatcher:
                         value = await value
                     if value:
                         anchored_doctrine = value
-                except Exception:
+                except Exception as exc:
+                    from kestrel_sovereign.agent.system_prompt_assembler import (
+                        SystemPromptNamespaceError,
+                    )
+
+                    if isinstance(exc, SystemPromptNamespaceError):
+                        # Receipt registration and causation binding happen
+                        # before doctrine resolution. This validation error is
+                        # intentionally loud, but it must not leave either
+                        # ephemeral capability visible to a later turn.
+                        try:
+                            if receipt_tool_registered:
+                                clear_receipt = getattr(
+                                    self._agent,
+                                    "clear_constitution_receipt_tool",
+                                    None,
+                                )
+                                if callable(clear_receipt):
+                                    clear_receipt()
+                        finally:
+                            if clear_chain is not None:
+                                clear_chain(token)
+                        raise
                     logger.exception(
                         "agent.get_anchored_doctrine_files raised for "
                         "signal %s; proceeding without anchored doctrine",

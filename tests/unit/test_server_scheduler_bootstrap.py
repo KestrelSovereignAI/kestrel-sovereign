@@ -329,6 +329,10 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     fake_config = SimpleNamespace(
         host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
     )
+    effective_config = SimpleNamespace(
+        host=fake_config.host,
+        agents={"RecoveredChild": object()},
+    )
     events: list[str] = []
 
     class _Manager:
@@ -337,8 +341,22 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
-        async def load_from_config(self, config) -> int:
+        def reconcile_spawn_authority_restart_roster(self, config):
             assert config is fake_config
+            events.append("reconcile")
+            return effective_config
+
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+        ) -> int:
+            assert config is effective_config
+            # Scheduler preflight seeded authority from this exact snapshot.
+            # Loading must not re-read multi_agent.toml behind that authority
+            # boundary and silently switch to a different tenant roster.
+            assert restart_roster_reconciled is True
             events.append("load")
             return 0
 
@@ -349,12 +367,12 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
 
     async def _preflight(app, supplied_manager, config) -> None:
         assert supplied_manager is manager
-        assert config is fake_config
+        assert config is effective_config
         events.append("preflight")
 
     async def _start(app, supplied_manager, config) -> None:
         assert supplied_manager is manager
-        assert config is fake_config
+        assert config is effective_config
         events.append("host-start")
 
     shared_backend = object()
@@ -367,6 +385,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         return manager
 
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-host-test-key")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
@@ -391,4 +410,4 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     async with server._lifespan_startup(FastAPI()):
         pass
 
-    assert events == ["preflight", "load", "host-start"]
+    assert events == ["reconcile", "preflight", "load", "host-start"]

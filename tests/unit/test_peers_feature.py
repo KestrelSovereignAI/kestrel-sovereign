@@ -1,11 +1,22 @@
 """Direct contracts for the Peers feature."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sovereign.a2a.did_registry import (
+    A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+    A2A_PEER_STABLE_AGENT_ID_FIELD,
+)
+from kestrel_sovereign.a2a.inbound_authorization import (
+    has_a2a_inbound_scoped_policy,
+)
+from kestrel_sovereign.endpoints.agent import (
+    _a2a_inbound_requires_verified_sender,
+)
 from kestrel_sovereign.features.peers.feature import (
     MAX_OUTBOUND_ARTIFACT_BYTES,
     PeersFeature,
@@ -20,11 +31,71 @@ def test_discover_host_url_from_env(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_managed_subprocess_installs_scoped_inbound_policy(monkeypatch):
+    """A fleet child transport key is admission, never sender authority."""
+
+    monkeypatch.setenv("KESTREL_HOST_URL", "http://localhost:9999")
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_ONLY", "true")
+    signing_did = "did:web:example.test:claw"
+    monkeypatch.setenv(
+        A2A_PEER_IDENTITY_DOCUMENTS_ENV,
+        json.dumps(
+            [
+                {
+                    "id": signing_did,
+                    "verificationMethod": [
+                        {
+                            "id": f"{signing_did}#key-1",
+                            "controller": signing_did,
+                            "publicKeyMultibase": "zTest",
+                        }
+                    ],
+                    A2A_PEER_STABLE_AGENT_ID_FIELD: "did:test:claw",
+                }
+            ]
+        ),
+    )
+    agent = SimpleNamespace(
+        _agent_name="ivy",
+        did="did:test:ivy",
+        peer_directory_router=None,
+        peer_requester=None,
+    )
+    feature = PeersFeature(agent)
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.ensure_a2a_transport_key",
+        return_value="peer-transport-key",
+    ), patch(
+        "kestrel_sovereign.features.storage_access.resolve_feature_database",
+        return_value=None,
+    ):
+        await feature.initialize()
+
+    authorizer = getattr(agent, "a2a_inbound_sender_authorizer", None)
+    assert has_a2a_inbound_scoped_policy(agent) is True
+    assert authorizer is not None
+    assert authorizer.requires_verified_sender is True
+    assert _a2a_inbound_requires_verified_sender(agent, authorizer) is True
+
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.get.return_value = _mock_directory_response()
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        assert await authorizer.authorize(signing_did) is True
+        assert await authorizer.authorize("did:web:example.test:outsider") is False
+
+
+@pytest.mark.asyncio
 async def test_list_peers_filters_out_self():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     response = MagicMock()
@@ -57,7 +128,7 @@ async def test_ask_agent_rejects_self_target():
     agent = SimpleNamespace(_agent_name="emma", did="did:test:emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     client = AsyncMock()
@@ -81,7 +152,7 @@ async def test_ask_agent_reports_offline_peer():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     response = MagicMock(status_code=503)
@@ -105,7 +176,7 @@ async def test_ask_agent_returns_peer_response():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = "key"
+    feature._transport_key = "key"
     feature._own_name = "emma"
 
     response = MagicMock(status_code=200)
@@ -131,7 +202,7 @@ async def test_local_host_routes_resolved_routing_name_not_display_name():
     agent = SimpleNamespace(_agent_name="emma")
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     directory = MagicMock(status_code=200)
@@ -200,8 +271,14 @@ def _make_a2a_feature(name="emma"):
 
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = name
+    # Result-fetch tests model a task this agent previously sent to Meridian.
+    # The durable dispatch row is the authority for the stable recipient DID;
+    # individual artifact-shape tests should not bypass that production check.
+    feature._outbound_recipient_agent_id = AsyncMock(
+        return_value="did:test:meridian"
+    )
     return feature
 
 
@@ -232,20 +309,13 @@ def _mock_directory_response():
     return response
 
 
-def _async_client_with(post_resp=None, get_resp=None):
+def _async_client_with(post_resp=None):
     client = AsyncMock()
     client.__aenter__.return_value = client
     client.__aexit__.return_value = False
     if post_resp is not None:
         client.post.return_value = post_resp
-    if get_resp is not None:
-        # The local adapter resolves once for the tool input, then
-        # reauthorizes the stable identity before fetching a task result.
-        client.get.side_effect = [
-            _mock_directory_response(), _mock_directory_response(), get_resp,
-        ]
-    else:
-        client.get.return_value = _mock_directory_response()
+    client.get.return_value = _mock_directory_response()
     return client
 
 
@@ -782,7 +852,8 @@ async def test_get_peer_task_result_reassembles_artifacts_in_index_order():
              "parts": [{"type": "text", "text": "second-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -818,7 +889,8 @@ async def test_get_peer_task_result_flags_incomplete_chunked_body():
              "parts": [{"type": "text", "text": "second-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -845,7 +917,8 @@ async def test_get_peer_task_result_falls_back_to_inline_message_when_no_artifac
         "message": "Rome",
         "artifacts": [],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -881,7 +954,8 @@ async def test_get_peer_task_result_legacy_terminal_artifacts_complete():
             {"name": "result", "parts": [{"type": "text", "text": "42"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -919,7 +993,8 @@ async def test_get_peer_task_result_multi_group_artifacts_isolate_reply_body():
              "parts": [{"type": "text", "text": "first-"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -960,7 +1035,8 @@ async def test_get_peer_task_result_legacy_single_unnamed_group_still_works():
             {"name": "result", "parts": [{"type": "text", "text": "the answer"}]},
         ],
     }
-    client = _async_client_with(get_resp=get_resp)
+    feature._local_host_get = AsyncMock(return_value=get_resp.json.return_value)
+    client = _async_client_with()
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
@@ -1026,7 +1102,7 @@ async def test_replay_supervisor_is_feature_owned_and_cancelled_on_shutdown():
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     # Replace the real SSE supervisor with one that blocks forever, so the
@@ -1075,7 +1151,7 @@ async def test_replay_past_deadline_row_spawns_no_supervisor():
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
     feature._handle_expired_row = AsyncMock(return_value=None)
 
@@ -1184,7 +1260,7 @@ async def test_question_answered_retry_is_feature_owned_and_cancelled_on_shutdow
     agent = _TrackingAgent()
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
-    feature._api_key = ""
+    feature._transport_key = ""
     feature._own_name = "emma"
 
     # Block the retry loop forever so the spawned task stays PENDING and teardown

@@ -8,8 +8,10 @@ key and can be verified by anyone with the parent's public key.
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -21,6 +23,20 @@ from kestrel_sovereign.inception_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def validate_spawn_max_child_depth(value: object) -> int:
+    """Validate the exact delegation-depth schema persisted on the wire."""
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("spawn mandate max_child_depth must be an integer")
+    if value < 0:
+        raise ValueError("spawn mandate max_child_depth cannot be negative")
+    return value
+
+
+class PersistedSpawnMandateExpiredError(RuntimeError):
+    """A verified durable child receipt reached its terminal expiry."""
 
 
 @dataclass
@@ -45,6 +61,41 @@ class SpawnMandate:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
 
+    def _wire_budget_allocation(self) -> int | float:
+        """Normalize and return the JSON number bound by the signature.
+
+        ``Decimal`` is accepted at API boundaries, but the persisted receipt is
+        a JSON number. Normalize the mandate itself to that exact finite float
+        before signing so runtime enforcement cannot retain a more precise (or
+        overflowed) value than the cryptographic authorization records.
+        """
+
+        value = self.budget_allocation
+        if isinstance(value, Decimal):
+            if not value.is_finite():
+                raise ValueError("spawn mandate budget must be finite")
+            wire_value = float(value)
+            if not math.isfinite(wire_value):
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            if value != 0 and wire_value == 0:
+                raise ValueError("spawn mandate budget exceeds JSON numeric range")
+            # The signed JSON number and the delegated-wallet hold are both
+            # reconstructed through the float's canonical decimal spelling.
+            # Refuse a conversion that would authorize even slightly more
+            # than the caller requested; affordability was checked against
+            # the original Decimal, so widening here would bypass that bound.
+            if Decimal(str(wire_value)) > value:
+                raise ValueError(
+                    "spawn mandate budget normalization would widen signed limit"
+                )
+            self.budget_allocation = wire_value
+            return wire_value
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError("spawn mandate budget must be numeric")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("spawn mandate budget must be finite")
+        return value
+
     def _signable_payload(self) -> bytes:
         """Return the canonical bytes representation for signing.
 
@@ -55,18 +106,18 @@ class SpawnMandate:
         otherwise-valid mandate. ``created_at`` is assigned at construction
         (``default_factory``), so it is always present by signing time.
 
-        Format note: mandates are ephemeral — signed at spawn and held in the
-        AgentManager's in-memory ``_child_mandates`` map, never persisted or
-        re-verified across restarts (a restart re-spawns and re-signs). So
-        adding ``created_at`` to the signed bytes is a clean cutover: there are
-        no stored old-format signatures to invalidate.
+        Format note: current mandates are persisted as signed ``spawned_by``
+        receipts and re-verified when runtime authority is restored. Legacy
+        edges without a signature remain attribution-only and cannot regain
+        governance authority after restart.
         """
+        validate_spawn_max_child_depth(self.max_child_depth)
         payload = {
             "parent_did": self.parent_did,
             "child_did": self.child_did,
             "constitution_hash": self.constitution_hash,
             "additional_constraints": self.additional_constraints,
-            "budget_allocation": self.budget_allocation,
+            "budget_allocation": self._wire_budget_allocation(),
             "ttl_seconds": self.ttl_seconds,
             "features_allowed": self.features_allowed,
             "purpose": self.purpose,
@@ -80,6 +131,54 @@ class SpawnMandate:
     def to_dict(self) -> dict:
         """Serialize the mandate to a plain dict."""
         return asdict(self)
+
+    def to_edge_properties(self) -> dict:
+        """Serialize the signed receipt fields carried by ``spawned_by``.
+
+        Parent and child DIDs are encoded by the edge endpoints. Every other
+        signable field and the signature itself must survive together or the
+        receipt cannot be verified after restart.
+        """
+
+        return {
+            "constitution_hash": self.constitution_hash,
+            "additional_constraints": dict(self.additional_constraints),
+            "budget_allocation": self._wire_budget_allocation(),
+            "ttl_seconds": self.ttl_seconds,
+            "features_allowed": list(self.features_allowed),
+            "purpose": self.purpose,
+            "max_child_depth": self.max_child_depth,
+            "parent_signature": self.parent_signature,
+            "created_at": self.created_at,
+        }
+
+
+def remaining_spawn_ttl_seconds(
+    created_at: str,
+    ttl_seconds: int,
+    *,
+    now: Optional[datetime] = None,
+) -> float:
+    """Return a signed spawn receipt's remaining lifetime.
+
+    ``ttl_seconds <= 0`` denotes a persistent child.  A signed ephemeral
+    receipt with a missing or timezone-naive creation time is invalid rather
+    than eligible for a fresh window at restart.
+    """
+
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+        raise TypeError("spawn mandate TTL must be an integer")
+    if ttl_seconds <= 0:
+        return 0.0
+    if not isinstance(created_at, str) or not created_at:
+        return 0.0
+    created = datetime.fromisoformat(created_at)
+    if created.tzinfo is None:
+        raise ValueError("persisted spawn mandate created_at must include timezone")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("spawn TTL comparison time must include timezone")
+    return max(0.0, created.timestamp() + ttl_seconds - current.timestamp())
 
 
 _HYBRID_PREFIX = "hybrid:"
@@ -151,7 +250,7 @@ def sign_mandate(
 
 def verify_mandate(
     mandate: SpawnMandate,
-    parent_public_key: ec.EllipticCurvePublicKey,
+    parent_public_key: Optional[ec.EllipticCurvePublicKey],
     *,
     parent_identity=None,
 ) -> bool:
@@ -173,12 +272,10 @@ def verify_mandate(
         3. Requires every signature in the array to crypto-verify and
            BOTH ed25519 + ml-dsa-65 to be present (HYBRID_REQUIRED).
 
-    - Otherwise (bare hex) → classic secp256k1 ECDSA verify against
-      ``parent_public_key``. Pre-ceremony mandates follow this path
-      unchanged — UNLESS the trusted ``parent_identity`` is hybrid, in
-      which case a classical-only signature is a downgrade and is
-      rejected outright (#2400) rather than routed to ECDSA, mirroring
-      ``verify_policy``'s post-cutoff classical-downgrade semantics.
+    - Otherwise (bare hex) → classic secp256k1 ECDSA verify only for a current
+      classical identity. A hybrid identity rejects the receipt because its
+      caller-controlled ``created_at`` cannot independently prove that the
+      classical signature was issued before the succession cutoff (#2400).
     """
     if not mandate.parent_signature:
         logger.warning("Mandate has no signature to verify")
@@ -217,20 +314,13 @@ def verify_mandate(
             parent_identity.new_verification_methods,
         )
 
-    # Policy-first downgrade check (#2400): a bare-hex (classical
-    # secp256k1) signature must NOT be accepted for a hybrid parent.
-    # Sniffing the verification path from the wire format alone let an
-    # attacker present a classical-only mandate for a hybrid parent
-    # (HYBRID_REQUIRED enforced only *inside* the hybrid envelope).
-    # Mirror ``evaluate_signatures``' post-cutoff classical-downgrade
-    # rejection: once the trusted parent identity is hybrid, a
-    # non-hybrid signature is a downgrade and is refused outright.
     if parent_identity is not None and getattr(
         parent_identity, "is_hybrid", False
     ):
         logger.warning(
-            "Mandate for hybrid parent %r carries a classical (non-hybrid) "
-            "signature; refusing classical downgrade (HYBRID_REQUIRED)",
+            "Mandate for hybrid parent %r carries a classical signature "
+            "without independently trusted pre-rotation issuance evidence; "
+            "refusing classical downgrade (HYBRID_REQUIRED)",
             mandate.parent_did,
         )
         return False
@@ -244,11 +334,14 @@ def verify_mandate(
         logger.warning("Mandate signature is neither hex nor a known prefix")
         return False
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
-    if suite.verify(payload, signature_bytes, parent_public_key):
+    if parent_public_key is not None and suite.verify(
+        payload,
+        signature_bytes,
+        parent_public_key,
+    ):
         return True
     logger.warning("Mandate signature verification failed")
     return False
-
 
 def _verify_mandate_hybrid(
     mandate: SpawnMandate,

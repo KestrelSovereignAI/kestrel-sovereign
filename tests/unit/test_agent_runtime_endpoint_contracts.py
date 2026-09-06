@@ -968,9 +968,10 @@ def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values():
         metadata={"agent_id": "did:test:agent", "skill": "deliver"},
     )
     task_store = MagicMock()
-    task_store.list_tasks = AsyncMock(return_value=[working_task, completed_task])
+    task_store.list_tasks = AsyncMock(return_value=[working_task])
     task_manager = MagicMock(task_store=task_store)
     agent = MagicMock(task_manager=task_manager)
+    agent.agent_id = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -987,7 +988,11 @@ def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values():
         assert filtered["tasks"][0]["agent_id"] == "did:test:agent"
         assert filtered["tasks"][0]["skill"] == "reflect"
         assert filtered["tasks"][0]["artifacts_count"] == 0
-        task_store.list_tasks.assert_awaited_with(limit=25)
+        task_store.list_tasks.assert_awaited_with(
+            recipient_agent_id="did:test:agent",
+            status=TaskState.WORKING,
+            limit=25,
+        )
         assert invalid_response.status_code == 400
         assert "Invalid status" in invalid_response.json()["detail"]
     finally:
@@ -1007,10 +1012,10 @@ def test_task_detail_endpoint_returns_task_with_artifacts():
         ],
         metadata={"agent_id": "did:test:agent", "skill": "deliver"},
     )
-    task_store = MagicMock()
-    task_store.get = AsyncMock(return_value=task)
-    task_manager = MagicMock(task_store=task_store)
+    task_manager = MagicMock()
+    task_manager.get_task_for_recipient = AsyncMock(return_value=task)
     agent = MagicMock(task_manager=task_manager)
+    agent.agent_id = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -1025,16 +1030,19 @@ def test_task_detail_endpoint_returns_task_with_artifacts():
         assert len(payload["artifacts"]) == 2
         assert payload["artifacts"][0]["name"] == "summary"
         assert payload["metadata"]["skill"] == "deliver"
-        task_store.get.assert_awaited_once_with("task-42")
+        task_manager.get_task_for_recipient.assert_awaited_once_with(
+            "task-42",
+            "did:test:agent",
+        )
     finally:
         _restore_app(app, original)
 
 
 def test_task_detail_endpoint_returns_404_when_task_missing():
-    task_store = MagicMock()
-    task_store.get = AsyncMock(return_value=None)
-    task_manager = MagicMock(task_store=task_store)
+    task_manager = MagicMock()
+    task_manager.get_task_for_recipient = AsyncMock(return_value=None)
     agent = MagicMock(task_manager=task_manager)
+    agent.agent_id = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -1043,6 +1051,28 @@ def test_task_detail_endpoint_returns_404_when_task_missing():
                 response = client.get("/api/agent/tasks/missing", headers=_api_headers())
         assert response.status_code == 404
         assert "not found" in response.json()["detail"].lower()
+    finally:
+        _restore_app(app, original)
+
+
+def test_task_detail_endpoint_preserves_recipient_identity_readiness_503():
+    task_manager = MagicMock()
+    task_manager.get_task_for_recipient = AsyncMock()
+    agent = MagicMock(task_manager=task_manager)
+    agent.agent_id = None
+    agent.did = None
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/agent/tasks/not-ready",
+                    headers=_api_headers(),
+                )
+        assert response.status_code == 503
+        assert "durable recipient identity" in response.json()["detail"]
+        task_manager.get_task_for_recipient.assert_not_awaited()
     finally:
         _restore_app(app, original)
 

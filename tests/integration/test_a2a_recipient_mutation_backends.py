@@ -70,7 +70,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert allowed is True
         assert denied is False
-        assert (await store.get(status_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(status_id)).status.state is TaskState.WORKING
 
         artifact = Artifact(name="result", parts=[TextPart(text="payload")])
         with pytest.raises(TaskMutationAuthorizationError):
@@ -84,11 +84,11 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             artifact,
             recipient_agent_id=recipient,
         )
-        assert [item.name for item in (await store.get(artifact_id)).artifacts] == [
+        assert [item.name for item in (await store._get_unscoped(artifact_id)).artifacts] == [
             "result"
         ]
 
-        worker_copy = await store.get(lifecycle_id)
+        worker_copy = await store._get_unscoped(lifecycle_id)
         worker_copy.status = TaskStatus(state=TaskState.WORKING)
         assert not await store.save_recipient_lifecycle(
             worker_copy,
@@ -100,10 +100,10 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
             recipient_agent_id=recipient,
             expected_state=TaskState.SUBMITTED,
         )
-        assert (await store.get(lifecycle_id)).status.state is TaskState.WORKING
+        assert (await store._get_unscoped(lifecycle_id)).status.state is TaskState.WORKING
 
-        first = await store.get(lifecycle_race_id)
-        second = await store.get(lifecycle_race_id)
+        first = await store._get_unscoped(lifecycle_race_id)
+        second = await store._get_unscoped(lifecycle_race_id)
         first.status = TaskStatus(state=TaskState.COMPLETED)
         second.status = TaskStatus(state=TaskState.FAILED)
         lifecycle_winners = await asyncio.gather(
@@ -120,7 +120,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert lifecycle_winners.count(True) == 1
         assert lifecycle_winners.count(False) == 1
-        assert (await store.get(lifecycle_race_id)).status.state in {
+        assert (await store._get_unscoped(lifecycle_race_id)).status.state in {
             TaskState.COMPLETED,
             TaskState.FAILED,
         }
@@ -141,7 +141,7 @@ async def _exercise_recipient_mutations(store: TaskStore) -> None:
         )
         assert status_winners.count(True) == 1
         assert status_winners.count(False) == 1
-        assert (await store.get(status_race_id)).status.state in {
+        assert (await store._get_unscoped(status_race_id)).status.state in {
             TaskState.COMPLETED,
             TaskState.FAILED,
         }
@@ -183,6 +183,78 @@ async def test_recipient_mutation_authority_postgres():
 
 
 @pytest.mark.asyncio
+async def test_postgres_v4_fence_is_installed_and_enforced():
+    if not POSTGRES_URL:  # pragma: no cover - environment gate
+        pytest.skip(
+            "TEST_POSTGRES_URL / KESTREL_DATABASE_URL / DATABASE_URL required"
+        )
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    backend = PostgresBackend(POSTGRES_URL)
+    await backend.connect()
+    terminal_id = f"authority-fence-terminal-{uuid4().hex}"
+    authorityless_id = f"authority-fence-authorityless-{uuid4().hex}"
+    try:
+        store = TaskStore(backend)
+        await store.initialize()
+
+        fence_ready = await backend.fetch_one("""
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM pg_proc procedure
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = procedure.pronamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND procedure.proname =
+                          'a2a_tasks_enforce_authority_fence_v4'
+                      AND pg_get_function_identity_arguments(procedure.oid) = ''
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_trigger trigger
+                    JOIN pg_class relation
+                      ON relation.oid = trigger.tgrelid
+                    JOIN pg_namespace namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = current_schema()
+                      AND relation.relname = 'a2a_tasks'
+                      AND trigger.tgname = 'a2a_tasks_authority_fence_v4'
+                      AND NOT trigger.tgisinternal
+                )
+        """)
+        assert fence_ready and fence_ready[0] is True
+
+        await backend.execute(
+            """
+            INSERT INTO a2a_tasks
+                (id, task_type, status, creator_agent_id, recipient_agent_id)
+            VALUES (?, 'generic', 'completed', ?, ?)
+            """,
+            (terminal_id, "did:test:creator", "did:test:recipient"),
+        )
+        with pytest.raises(Exception, match="terminal A2A task cannot be replaced"):
+            await backend.execute(
+                "UPDATE a2a_tasks SET status = 'failed' WHERE id = ?",
+                (terminal_id,),
+            )
+        with pytest.raises(Exception, match="requires durable authority"):
+            await backend.execute(
+                """
+                INSERT INTO a2a_tasks (id, task_type, status)
+                VALUES (?, 'generic', 'completed')
+                """,
+                (authorityless_id,),
+            )
+    finally:
+        await backend.execute(
+            "DELETE FROM a2a_tasks WHERE id IN (?, ?)",
+            (terminal_id, authorityless_id),
+        )
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "recipient-terminal-replace.db"))
     await backend.connect()
@@ -211,7 +283,7 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
                 recipient_agent_id=recipient,
             )
 
-        rows = await backend.execute(
+        await backend.execute(
             """
             INSERT OR REPLACE INTO a2a_tasks
                 (id, task_type, status, creator_agent_id, recipient_agent_id)
@@ -219,9 +291,8 @@ async def test_sqlite_legacy_replace_cannot_resurrect_terminal_task(tmp_path):
             """,
             (task_id, creator, recipient),
         )
-        assert rows == 0
 
-        persisted = await store.get(task_id)
+        persisted = await store._get_unscoped(task_id)
         assert persisted.status.state is TaskState.CANCELED
         assert persisted.metadata["cancellation_receipt"]["actor_agent_id"] == creator
     finally:
@@ -256,7 +327,7 @@ async def test_sqlite_authorityless_terminal_replace_cannot_claim_live_task(tmp_
                 (task_id,),
             )
 
-        persisted = await store.get(task_id)
+        persisted = await store._get_unscoped(task_id)
         assert persisted is not None
         assert persisted.status.state is TaskState.SUBMITTED
         authority = await backend.fetch_one(

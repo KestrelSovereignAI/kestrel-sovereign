@@ -12,14 +12,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.features.health.checks import check_scheduler_liveness
 from kestrel_sovereign.features.restart_coordinator.feature import (
     MAX_IDLE_ONLY_DEFERRAL_SECONDS,
     RestartCoordinatorFeature,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
+    clear_deferral_started,
     get_request,
     insert_request,
+    mark_deferral_started,
 )
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import (
@@ -45,6 +48,18 @@ async def _database(path) -> AsyncDatabase:
     backend = SQLiteBackend(str(path))
     await backend.connect()
     return AsyncDatabase(backend)
+
+
+async def _insert_sovereign_restart(db, **kwargs):
+    """Create a restart through the authority boundary used in production."""
+
+    with caller_context_scope(
+        CallerContext.sovereign(
+            identity="scheduler-reliability-test",
+            credential="scheduler-reliability-test-key",
+        )
+    ):
+        return await insert_request(db, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2013,11 @@ async def test_schedule_list_survives_unavailable_runtime_telemetry(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_path):
+async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-reliability-test-key")
     db = await _database(tmp_path / "restart-scope.db")
     requester = SimpleNamespace(
         did="agent-1",
@@ -2022,7 +2041,7 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
     feature = RestartCoordinatorFeature(requester)
     try:
         await feature.initialize()
-        fresh = await insert_request(
+        fresh = await _insert_sovereign_restart(
             db, requested_by_agent="agent-1", reason="requester scoped"
         )
         fresh, decision = await feature._evaluate_and_track_safety(fresh)
@@ -2039,11 +2058,18 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
             datetime.now(timezone.utc)
             - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
         ).isoformat()
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, fresh.id),
+        assert await clear_deferral_started(
+            db,
+            fresh.id,
+            expected_current_status=fresh.status,
         )
-        fresh.first_blocked_at = aged
+        fresh = await mark_deferral_started(
+            db,
+            fresh.id,
+            expected_current_status=fresh.status,
+            blocked_at=aged,
+        )
+        assert fresh is not None
         escalated = feature._evaluate_safety(
             fresh, database_now=await scheduler_database_clock(db)
         )
@@ -2089,33 +2115,57 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
 
         # A migrated backlog row starts a fresh deferral clock on this boot and
         # cannot escalate until its one-time acknowledgement is recorded.
-        legacy = await insert_request(
-            db, requested_by_agent="agent-1", reason="pre-upgrade backlog"
+        from kestrel_sovereign.features.restart_coordinator import (
+            store as restart_store_module,
         )
-        ancient_request = (
-            datetime.now(timezone.utc) - timedelta(days=30)
-        ).isoformat()
+
+        ancient_request = datetime.now(timezone.utc) - timedelta(days=30)
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(
+                restart_store_module,
+                "database_clock",
+                AsyncMock(return_value=ancient_request),
+            )
+            legacy = await _insert_sovereign_restart(
+                db,
+                requested_by_agent="agent-1",
+                reason="pre-upgrade backlog",
+            )
         await db.execute(
-            "UPDATE restart_requests SET requested_at = ?, "
-            "first_blocked_at = '', escalation_acknowledged = 0 WHERE id = ?",
-            (ancient_request, legacy.id),
+            "UPDATE restart_requests SET escalation_acknowledged = 0 WHERE id = ?",
+            (legacy.id,),
         )
         legacy = await get_request(db, legacy.id)
         legacy, initial = await feature._evaluate_and_track_safety(legacy)
         assert initial["safe"] is False
         assert initial["request_age_seconds"] > 60 * 60 * 24
         assert initial["deferral_age_seconds"] < 5
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, legacy.id),
+        assert await clear_deferral_started(
+            db,
+            legacy.id,
+            expected_current_status=legacy.status,
         )
-        legacy = await get_request(db, legacy.id)
+        legacy = await mark_deferral_started(
+            db,
+            legacy.id,
+            expected_current_status=legacy.status,
+            blocked_at=aged,
+        )
+        assert legacy is not None
         needs_ack = feature._evaluate_safety(
             legacy, database_now=await scheduler_database_clock(db)
         )
         assert needs_ack["safe"] is False
         assert "acknowledgement required" in needs_ack["reason"]
-        acknowledged = await feature.acknowledge_restart_escalation(legacy.id)
+        with caller_context_scope(
+            CallerContext.sovereign(
+                identity="scheduler-reliability-test",
+                credential="scheduler-reliability-test-key",
+            )
+        ):
+            acknowledged = await feature.acknowledge_restart_escalation(
+                legacy.id
+            )
         assert acknowledged.data["acknowledged"] is True
         legacy = await get_request(db, legacy.id)
         assert feature._evaluate_safety(
@@ -2130,6 +2180,7 @@ async def test_restart_scope_and_bounded_escalation_keep_blocker_evidence(tmp_pa
 async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
     monkeypatch, tmp_path,
 ):
+    monkeypatch.setenv("KESTREL_API_KEY", "scheduler-reliability-test-key")
     from kestrel_sovereign.features.restart_coordinator import (
         feature as restart_feature_module,
     )
@@ -2164,7 +2215,7 @@ async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
 
     try:
         await feature.initialize()
-        request = await insert_request(
+        request = await _insert_sovereign_restart(
             db, requested_by_agent="agent-1", reason="clock skew"
         )
         monkeypatch.setattr(restart_feature_module, "datetime", FastHostDateTime)
@@ -2182,11 +2233,18 @@ async def test_restart_deferral_escalation_uses_database_time_under_host_skew(
             database_now
             - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
         ).isoformat()
-        await db.execute(
-            "UPDATE restart_requests SET first_blocked_at = ? WHERE id = ?",
-            (aged, request.id),
+        assert await clear_deferral_started(
+            db,
+            request.id,
+            expected_current_status=request.status,
         )
-        request = await get_request(db, request.id)
+        request = await mark_deferral_started(
+            db,
+            request.id,
+            expected_current_status=request.status,
+            blocked_at=aged,
+        )
+        assert request is not None
         monkeypatch.setattr(restart_feature_module, "datetime", SlowHostDateTime)
         monkeypatch.setattr(restart_store_module, "datetime", SlowHostDateTime)
 

@@ -1003,25 +1003,13 @@ class StreamingMixin:
         # same constitutional boundary as process_input. Commands delegate
         # below so Sovereign recovery remains available; ordinary cognition is
         # refused before a turn lock, context build, or LLM stream can start.
-        safe_mode = getattr(self, "_safe_mode", False) is True
-        audit_pending = (
-            getattr(self, "_constitution_audit_pending", False) is True
+        from kestrel_sovereign.agent.constitution import (
+            safe_mode_cognition_block,
         )
-        if (safe_mode or audit_pending) and not user_input.startswith("!"):
-            from kestrel_sovereign.agent.constitution import (
-                describe_safe_mode_restriction,
-            )
 
-            restriction = describe_safe_mode_restriction(
-                self, audit_pending=audit_pending
-            )
-            yield (
-                "🚨 SAFE MODE ACTIVE\n\n"
-                f"The agent cannot process queries due to {restriction}.\n"
-                "Use !safe-mode to check status or !verify-constitution to "
-                "re-verify.\n\n"
-                "Normal operation will resume once the restriction is cleared."
-            )
+        safe_mode_block = safe_mode_cognition_block(self, user_input)
+        if safe_mode_block is not None:
+            yield safe_mode_block
             return
 
         # Commands are not streamable - delegate to non-streaming handler.
@@ -1122,6 +1110,10 @@ class StreamingMixin:
             # directions (the AB-BA wedge this replaces, where streaming took the
             # transition lock first and then blocked on CONVERSATION).
             async with self._turn_lifecycle():
+                safe_mode_block = safe_mode_cognition_block(self, user_input)
+                if safe_mode_block is not None:
+                    yield safe_mode_block
+                    return
                 transition_lock = self._get_privacy_transition_lock()
                 async with transition_lock:
                     # #1914: bind a per-turn part buffer so tools/features can

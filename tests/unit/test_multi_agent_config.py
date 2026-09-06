@@ -4,9 +4,13 @@ Unit tests for MultiAgent configuration.
 Tests config parsing, validation, and auto-discovery.
 """
 
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import toml
-from pathlib import Path
 from pydantic import ValidationError
 
 from kestrel_sovereign.multi_agent import (
@@ -494,6 +498,103 @@ class TestAutoDiscovery:
         assert "agent1" in config.agents
         assert config.agents["agent1"].port == 8801
         assert config.agents["agent1"].autostart is True
+
+    def test_auto_discover_skips_durably_retired_spawn(self, tmp_path):
+        """A retained child database must not resurrect after TTL retirement."""
+
+        agent_data = tmp_path / "agent_data"
+        retired = agent_data / "retired-child"
+        retired.mkdir(parents=True)
+        with sqlite3.connect(retired / "kestrel_prime.db") as connection:
+            connection.execute(
+                "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO graph_nodes (node_id, node_type) VALUES (?, ?)",
+                ("did:test:retired", "agent"),
+            )
+        (retired / ".kestrel-spawn-retired").write_text("did:test:retired\n")
+
+        config = MultiAgentConfig.auto_discover(agent_data)
+
+        assert "retired-child" not in config.agents
+
+    def test_auto_discover_ignores_retirement_for_replaced_identity(self, tmp_path):
+        """A tombstone for an old DID cannot retire a replacement identity."""
+
+        agent_data = tmp_path / "agent_data"
+        replacement = agent_data / "replacement-child"
+        replacement.mkdir(parents=True)
+        with sqlite3.connect(replacement / "kestrel_prime.db") as connection:
+            connection.execute(
+                "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO graph_nodes (node_id, node_type) VALUES (?, ?)",
+                ("did:test:replacement", "agent"),
+            )
+        (replacement / ".kestrel-spawn-retired").write_text(
+            "did:test:retired\n"
+        )
+
+        config = MultiAgentConfig.auto_discover(agent_data)
+
+        assert "replacement-child" in config.agents
+
+    def test_auto_discover_reads_replacement_identity_from_wal(self, tmp_path):
+        """A stale marker cannot hide a replacement whose DID is still in WAL."""
+
+        agent_data = tmp_path / "agent_data"
+        replacement = agent_data / "wal-replacement-child"
+        replacement.mkdir(parents=True)
+        database = replacement / "kestrel_prime.db"
+        script = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)")
+connection.execute(
+    "INSERT INTO graph_nodes (node_id, node_type) VALUES (?, ?)",
+    ("did:test:wal-replacement", "agent"),
+)
+connection.commit()
+os._exit(0)
+"""
+        subprocess.run(
+            [sys.executable, "-c", script, str(database)],
+            check=True,
+        )
+        assert database.with_name(f"{database.name}-wal").is_file()
+        (replacement / ".kestrel-spawn-retired").write_text(
+            "did:test:retired\n"
+        )
+
+        config = MultiAgentConfig.auto_discover(agent_data)
+
+        assert "wal-replacement-child" in config.agents
+
+    def test_auto_discover_fails_closed_on_unverifiable_retirement(self, tmp_path):
+        """Corrupt marker bindings cannot reactivate a retired directory."""
+
+        agent_data = tmp_path / "agent_data"
+        ambiguous = agent_data / "ambiguous-child"
+        ambiguous.mkdir(parents=True)
+        with sqlite3.connect(ambiguous / "kestrel_prime.db") as connection:
+            connection.execute(
+                "CREATE TABLE graph_nodes (node_id TEXT, node_type TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO graph_nodes (node_id, node_type) VALUES (?, ?)",
+                ("did:test:current", "agent"),
+            )
+        (ambiguous / ".kestrel-spawn-retired").write_text("not-a-did\n")
+
+        config = MultiAgentConfig.auto_discover(agent_data)
+
+        assert "ambiguous-child" not in config.agents
 
     def test_auto_discover_multiple_agents(self, tmp_path):
         """Test auto-discovery with multiple agents."""

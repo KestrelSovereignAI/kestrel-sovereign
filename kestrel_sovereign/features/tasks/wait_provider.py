@@ -45,7 +45,13 @@ class TaskWaitable:
         if manager is None:
             return None
         try:
-            task = await manager.get_task(handle)
+            recipient_agent_id = getattr(self._feature.agent, "did", None)
+            if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
+                return False
+            task = await manager.get_task_for_recipient(
+                handle,
+                recipient_agent_id,
+            )
         except Exception:
             return None
         return task is not None
