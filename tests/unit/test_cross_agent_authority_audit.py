@@ -53,10 +53,14 @@ CONTROL_NAME_TERMS = (
     "kill_process",
 )
 PERMISSION_NAME_TERMS = (
+    "approv",
     "authoriz",
     "authority",
+    "delegat",
+    "grant",
     "mandate",
     "owner",
+    "permit",
     "permission",
     "allowed",
     "permitted",
@@ -93,10 +97,17 @@ PROVENANCE_ACCESSOR_SUFFIXES = (
     "causation_chain",
     "get_current_chain",
 )
+TRACE_PARENT_MARKERS = (
+    "trace_parent",
+    "trace-parent",
+    "traceparent",
+    "parent_trace",
+)
 PROVENANCE_SOURCE_MARKERS = (
     "causation",
     "orchestrator",
     "current_chain",
+    *TRACE_PARENT_MARKERS,
 )
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
@@ -7267,6 +7278,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "remove",
         "reset",
         "restart",
+        "retire",
         "resume",
         "shutdown",
         "start",
@@ -7759,6 +7771,13 @@ def _child_statement_blocks(statement: ast.stmt) -> list[list[ast.stmt]]:
     return []
 
 
+def _is_trace_parent_token(token: str) -> bool:
+    """Recognize common W3C and Python spellings of trace-parent metadata."""
+
+    words = set(token.casefold().replace("-", "_").replace(".", "_").split("_"))
+    return "traceparent" in words or {"trace", "parent"} <= words
+
+
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
     tokens = set(_identifier_tokens(node))
     # The bare string ``"ORCHESTRATOR"`` is also a provider role label in
@@ -7808,6 +7827,7 @@ def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> boo
     provenance_tokens = {"orchestrator", "kestrel.orchestrator"}
     return any(
         token in provenance_tokens
+        or _is_trace_parent_token(token)
         or (
             "orchestrator" in token.split("_")
             and not set(token.split("_")).intersection(
@@ -7826,8 +7846,11 @@ def _is_provenance_accessor_call(node: ast.AST) -> bool:
 
     return any(
         isinstance(child, ast.Call)
-        and _call_name(child).casefold().strip("_").endswith(
-            PROVENANCE_ACCESSOR_SUFFIXES
+        and (
+            _call_name(child).casefold().strip("_").endswith(
+                PROVENANCE_ACCESSOR_SUFFIXES
+            )
+            or _is_provenance_accessor_getattr_reference(child.func)
         )
         for child in ast.walk(node)
     )
@@ -13042,9 +13065,15 @@ def test_provenance_scanner_tracks_getattr_accessor_invocations() -> None:
         "    if provider():\n"
         "        terminate_child(target)\n"
     )
+    immediately_invoked = ast.parse(
+        "def dispatch(self, target):\n"
+        "    if getattr(self.agent, '_provide_causation_chain', None)():\n"
+        "        terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(assigned_result) == {4}
     assert _authority_provenance_lines(direct_guard) == {3}
+    assert _authority_provenance_lines(immediately_invoked) == {2}
 
 
 def test_provenance_scanner_follows_repository_local_imported_helpers(
@@ -13531,9 +13560,48 @@ def test_provenance_scanner_recognizes_qualified_provenance_names() -> None:
     assert _authority_provenance_lines(tree) == {2, 6}
 
 
+def test_provenance_scanner_classifies_trace_parent_metadata(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "def direct(request, target):\n"
+        "    if request.trace_parent:\n"
+        "        target.shutdown()\n\n"
+        "def w3c(metadata, target):\n"
+        "    if metadata.get('traceparent'):\n"
+        "        terminate_child(target)\n\n"
+        "def inverse(request, target):\n"
+        "    if request.parent_trace_id:\n"
+        "        target.shutdown()\n"
+    )
+    tree = ast.parse(source)
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(source, encoding="utf-8")
+
+    assert _authority_provenance_lines(tree) == {2, 6, 10}
+    assert _cached_authority_provenance_lines(source_path) == frozenset(
+        {2, 6, 10}
+    )
+
+
+def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> None:
+    tree = ast.parse(
+        "def grant_restart_delegation(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def approve_request(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def request_approval(request):\n"
+        "    return bool(request.causation_chain)\n\n"
+        "def permit_child(request):\n"
+        "    return bool(request.causation_chain)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 5, 8, 11}
+
+
 @pytest.mark.parametrize(
     "method",
-    ["start", "pause", "resume", "disable", "enable", "delete"],
+    ["start", "pause", "resume", "disable", "enable", "delete", "retire"],
 )
 def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
     method: str,
@@ -13562,6 +13630,8 @@ def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
         "disable_agent",
         "enable_peer",
         "pause_agent",
+        "retire_agent",
+        "retire_persisted_child",
         "reset_child",
         "resume_child",
         "start_peer",
