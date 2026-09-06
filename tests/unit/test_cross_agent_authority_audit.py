@@ -8168,6 +8168,7 @@ def _mutable_container_alias_snapshots(
 def _cross_agent_control_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     control_helpers: set[str] | None = None,
+    control_return_helpers: set[str] | None = None,
 ) -> set[str]:
     """Resolve local names that reference cross-agent control callables."""
 
@@ -8205,7 +8206,9 @@ def _cross_agent_control_aliases(
     for parameter, default in default_bindings:
         assignments.extend(
             (parameter.arg.casefold(), source)
-            for source in _control_reference_sources(default)
+            for source in _control_reference_sources(
+                default, control_return_helpers
+            )
         )
 
     for node in _walk_lexical_scope(function):
@@ -8230,7 +8233,9 @@ def _cross_agent_control_aliases(
             if mutation is not None:
                 target_names, value = mutation
                 target_names = expand_container_aliases(target_names, node)
-                sources = _control_reference_sources(value)
+                sources = _control_reference_sources(
+                    value, control_return_helpers
+                )
                 assignments.extend(
                     (target_name, source)
                     for target_name in target_names
@@ -8239,7 +8244,7 @@ def _cross_agent_control_aliases(
             continue
         if value is None:
             continue
-        sources = _control_reference_sources(value)
+        sources = _control_reference_sources(value, control_return_helpers)
         if not sources:
             continue
         for target in targets:
@@ -8252,7 +8257,9 @@ def _cross_agent_control_aliases(
                 for source in sources
             )
 
-    aliases: set[str] = set(control_helpers or ())
+    aliases: set[str] = set(control_helpers or ()) | set(
+        control_return_helpers or ()
+    )
     changed = True
     while changed:
         changed = False
@@ -8263,6 +8270,52 @@ def _cross_agent_control_aliases(
                 aliases.add(target)
                 changed = True
     return aliases
+
+
+def _local_control_return_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    control_helpers: set[str] | None = None,
+    function_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
+) -> set[str]:
+    """Find local helpers whose returned value is a control callable."""
+
+    return_helpers: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            function_name = function.name.casefold()
+            if function_name in return_helpers:
+                continue
+            visible_controls = set(control_helpers or ()) | set(
+                (function_control_aliases or {}).get(function, ())
+            )
+            aliases = _cross_agent_control_aliases(
+                function,
+                visible_controls,
+                return_helpers,
+            )
+            returned_values = [
+                node.value
+                for node in _walk_lexical_scope(function)
+                if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
+                and node.value is not None
+            ]
+            if any(
+                any(
+                    _is_unambiguous_control_token(source)
+                    or source in aliases
+                    for source in _control_reference_sources(
+                        value, return_helpers
+                    )
+                )
+                for value in returned_values
+            ):
+                return_helpers.add(function_name)
+                changed = True
+    return return_helpers
 
 
 def _invoked_lambda_bodies(
@@ -8350,7 +8403,10 @@ def _invoked_lambda_bodies(
     return tuple(invoked)
 
 
-def _control_reference_sources(node: ast.AST) -> set[str]:
+def _control_reference_sources(
+    node: ast.AST,
+    control_return_helpers: set[str] | None = None,
+) -> set[str]:
     """Return callable names preserved by static control factories.
 
     A control remains a control when code obtains the bound method through a
@@ -8385,11 +8441,15 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             source
             for element in elements
             if element is not None
-            for source in _control_reference_sources(element)
+            for source in _control_reference_sources(
+                element, control_return_helpers
+            )
         }
     if isinstance(node, ast.IfExp):
-        return _control_reference_sources(node.body) | _control_reference_sources(
-            node.orelse
+        return _control_reference_sources(
+            node.body, control_return_helpers
+        ) | _control_reference_sources(
+            node.orelse, control_return_helpers
         )
     if isinstance(node, ast.Lambda):
         return (
@@ -8405,6 +8465,8 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
         return set()
 
     factory_name = _call_name(node).casefold()
+    if factory_name in (control_return_helpers or set()):
+        return {factory_name}
     if factory_name == "getattr":
         attribute = (
             node.args[1]
@@ -8431,7 +8493,9 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             else {"dynamic_control_attribute"}
         )
     if factory_name == "get" and isinstance(node.func, ast.Attribute):
-        sources = _control_reference_sources(node.func.value)
+        sources = _control_reference_sources(
+            node.func.value, control_return_helpers
+        )
         if node.args:
             key = _resolved_string(node.args[0])
             if key is not None:
@@ -8440,10 +8504,12 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
             *node.args[1:],
             *(keyword.value for keyword in node.keywords),
         ]:
-            sources.update(_control_reference_sources(default))
+            sources.update(
+                _control_reference_sources(default, control_return_helpers)
+            )
         return sources
     if factory_name in {"partial", "partialmethod"} and node.args:
-        return _control_reference_sources(node.args[0])
+        return _control_reference_sources(node.args[0], control_return_helpers)
     # Type adapters and decorator helpers preserve a callable argument in
     # their return value.  Do not generalize this to every call: an ordinary
     # consumer may accept a callback without returning it, and treating that
@@ -8482,7 +8548,9 @@ def _control_reference_sources(node: ast.AST) -> set[str]:
                     for keyword in call.keywords
                 ),
             ]
-            for source in _control_reference_sources(argument)
+            for source in _control_reference_sources(
+                argument, control_return_helpers
+            )
         }
     return set()
 
@@ -8641,6 +8709,7 @@ def _provenance_aliases(
     control_helpers: set[str] | None = None,
     initial_aliases: set[str] | None = None,
     *,
+    control_return_helpers: set[str] | None = None,
     authority_analysis: bool = True,
     state_object_aliases: set[str] | None = None,
     provenance_accessor_aliases: set[str] | None = None,
@@ -8773,7 +8842,9 @@ def _provenance_aliases(
         provenance_accessor_aliases or ()
     )
     control_aliases = (
-        _cross_agent_control_aliases(function, control_helpers)
+        _cross_agent_control_aliases(
+            function, control_helpers, control_return_helpers
+        )
         if authority_analysis
         else set()
     )
@@ -8829,6 +8900,9 @@ def _provenance_aliases(
         elif isinstance(node, ast.NamedExpr):
             targets = [node.target]
             value = node.value
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+            value = ast.BinOp(left=node.target, op=node.op, right=node.value)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             targets = [node.target]
             value = node.iter
@@ -9011,9 +9085,10 @@ def _provenance_aliases(
                         authority_decision_names.update(
                             _identifier_tokens(statement.test)
                         )
-                elif isinstance(
-                    statement, (ast.For, ast.AsyncFor, ast.While)
-                ) and _loop_else_guards_continuation(statement):
+                elif isinstance(statement, ast.While) or (
+                    isinstance(statement, (ast.For, ast.AsyncFor))
+                    and _loop_else_guards_continuation(statement)
+                ):
                     decision = (
                         statement.iter
                         if isinstance(statement, (ast.For, ast.AsyncFor))
@@ -9309,6 +9384,128 @@ def _class_provenance_state_aliases(
                 discovered = {
                     alias for alias in aliases if alias.startswith(("self.", "cls."))
                 }
+                new_aliases = discovered - shared
+                if new_aliases:
+                    shared.update(new_aliases)
+                    changed = True
+        for method in methods:
+            by_method[method] = set(shared)
+    return by_method
+
+
+def _class_control_state_aliases(
+    tree: ast.AST,
+    control_helpers: set[str],
+    module_control_aliases: set[str],
+    function_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    control_return_helpers: set[str],
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]:
+    """Share statically stored control callables across class methods."""
+
+    if not isinstance(tree, ast.Module):
+        return {}
+
+    def expanded_member_names(
+        names: set[str], class_name: str
+    ) -> set[str]:
+        expanded = set(names)
+        prefixes = ("self.", "cls.", f"{class_name.casefold()}.")
+        for name in names:
+            member = next(
+                (
+                    name.removeprefix(prefix)
+                    for prefix in prefixes
+                    if name.startswith(prefix)
+                ),
+                name,
+            )
+            member = member.split("[", maxsplit=1)[0]
+            expanded.update(
+                {
+                    member,
+                    f"self.{member}",
+                    f"cls.{member}",
+                    f"{class_name.casefold()}.{member}",
+                }
+            )
+        return expanded
+
+    def stored_names(
+        scope: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        class_body: bool,
+    ) -> set[str]:
+        names: set[str] = set()
+        for node in _walk_lexical_scope(scope):
+            targets: list[ast.AST] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.NamedExpr):
+                targets = [node.target]
+            for target in targets:
+                target_source = ast.unparse(target).casefold()
+                if class_body or target_source.startswith(("self.", "cls.")):
+                    names.update(_reference_binding_names(target))
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                _call_name(node).casefold() == "setattr"
+                and len(node.args) >= 3
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id.casefold() in {"self", "cls"}
+            ):
+                attribute = _resolved_string(node.args[1])
+                if attribute is not None:
+                    names.update(
+                        {
+                            attribute.casefold(),
+                            f"{node.args[0].id.casefold()}.{attribute.casefold()}",
+                        }
+                    )
+        return names
+
+    by_method: dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]] = {}
+    for class_node in (
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    ):
+        methods = [
+            statement
+            for statement in class_node.body
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        class_scope = ast.parse("def __audit_class_body__():\n    pass\n").body[0]
+        assert isinstance(class_scope, ast.FunctionDef)
+        class_scope.body = class_node.body
+        ast.copy_location(class_scope, class_node)
+        class_targets = stored_names(class_scope, class_body=True)
+        class_aliases = _cross_agent_control_aliases(
+            class_scope,
+            control_helpers | module_control_aliases,
+            control_return_helpers | module_control_aliases,
+        )
+        shared = expanded_member_names(
+            class_targets.intersection(class_aliases), class_node.name
+        )
+        changed = True
+        while changed:
+            changed = False
+            for method in methods:
+                method_targets = stored_names(method, class_body=False)
+                aliases = _cross_agent_control_aliases(
+                    method,
+                    control_helpers
+                    | function_control_aliases.get(method, set())
+                    | shared,
+                    control_return_helpers
+                    | function_control_aliases.get(method, set()),
+                )
+                discovered = expanded_member_names(
+                    method_targets.intersection(aliases), class_node.name
+                )
                 new_aliases = discovered - shared
                 if new_aliases:
                     shared.update(new_aliases)
@@ -10352,9 +10549,10 @@ def _guard_clause_provenance_lines(
                     if isinstance(statement, (ast.For, ast.AsyncFor))
                     else statement.test
                 )
-                if _loop_else_guards_continuation(
-                    statement
-                ) and _has_provenance_value(
+                guards_continuation = isinstance(
+                    statement, ast.While
+                ) or _loop_else_guards_continuation(statement)
+                if guards_continuation and _has_provenance_value(
                     decision,
                     provenance_aliases,
                     provenance_return_helpers,
@@ -11197,16 +11395,23 @@ def _direct_control_helper_names(source_path: Path) -> frozenset[str]:
     # "Direct" summaries must not recursively traverse imports: repository
     # resolution layers the cycle-aware import graph on top of this result.
     module_aliases = _module_imported_control_aliases(tree)
+    function_aliases = _function_control_import_aliases(
+        tree,
+        functions,
+        module_aliases,
+        None,
+    )
+    control_helpers = _local_control_helpers(
+        functions,
+        module_aliases,
+        function_aliases,
+    )
     return frozenset(
-        _local_control_helpers(
+        control_helpers
+        | _local_control_return_helpers(
             functions,
-            module_aliases,
-            _function_control_import_aliases(
-                tree,
-                functions,
-                module_aliases,
-                None,
-            ),
+            control_helpers,
+            function_aliases,
         )
     )
 
@@ -12159,6 +12364,49 @@ def _authority_provenance_lines(
         module_control_aliases,
         function_control_imports,
     )
+    control_return_helpers: set[str] = set()
+    class_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {}
+    control_changed = True
+    while control_changed:
+        previous_helpers = set(control_helpers)
+        previous_return_helpers = set(control_return_helpers)
+        previous_class_aliases = {
+            function: set(aliases)
+            for function, aliases in class_control_aliases.items()
+        }
+        visible_control_aliases = {
+            function: function_control_imports[function]
+            | class_control_aliases.get(function, set())
+            for function in functions
+        }
+        control_return_helpers.update(
+            _local_control_return_helpers(
+                functions,
+                control_helpers,
+                visible_control_aliases,
+            )
+        )
+        control_helpers.update(
+            _local_control_helpers(
+                functions,
+                module_control_aliases | control_helpers,
+                visible_control_aliases,
+            )
+        )
+        class_control_aliases = _class_control_state_aliases(
+            tree,
+            control_helpers,
+            module_control_aliases,
+            visible_control_aliases,
+            control_return_helpers,
+        )
+        control_changed = (
+            control_helpers != previous_helpers
+            or control_return_helpers != previous_return_helpers
+            or class_control_aliases != previous_class_aliases
+        )
     function_accessor_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
@@ -12264,10 +12512,16 @@ def _authority_provenance_lines(
             function,
             provenance_return_helpers
             | function_imported_provenance_helpers[function],
-            control_helpers | function_control_imports[function],
+            control_helpers
+            | function_control_imports[function]
+            | class_control_aliases.get(function, set()),
             module_provenance_aliases
             | class_provenance_aliases.get(function, set())
             | inherited,
+            control_return_helpers=(
+                control_return_helpers
+                | function_control_imports[function]
+            ),
             state_object_aliases=function_state_objects[function],
             provenance_accessor_aliases=function_accessor_aliases[function],
         )
@@ -12285,7 +12539,10 @@ def _authority_provenance_lines(
         )
         control_aliases = _cross_agent_control_aliases(
             function,
-            control_helpers | function_control_imports[function],
+            control_helpers
+            | function_control_imports[function]
+            | class_control_aliases.get(function, set()),
+            control_return_helpers | function_control_imports[function],
         )
         state_object_aliases = function_state_objects[function]
         provenance_aliases, provenance_selected_targets = (
@@ -14073,6 +14330,49 @@ def test_provenance_scanner_follows_callable_control_factories() -> None:
     assert _authority_provenance_lines(decorator_wrapped_callback) == {3}
 
 
+def test_provenance_scanner_follows_control_return_helpers(
+    tmp_path: Path,
+) -> None:
+    local_factory = ast.parse(
+        "def factory():\n"
+        "    return terminate_child\n\n"
+        "def dispatch(request, child):\n"
+        "    action = factory()\n"
+        "    if request.causation_chain:\n"
+        "        action(child)\n"
+    )
+    chained_factory = ast.parse(
+        "def first():\n"
+        "    action = terminate_child\n"
+        "    return action\n\n"
+        "def second():\n"
+        "    return first()\n\n"
+        "def dispatch(request, child):\n"
+        "    action = second()\n"
+        "    if request.causation_chain:\n"
+        "        action(child)\n"
+    )
+    helper_path = tmp_path / "control_factory.py"
+    helper_path.write_text(
+        "def factory():\n"
+        "    return terminate_child\n",
+        encoding="utf-8",
+    )
+    controller_path = tmp_path / "controller.py"
+    controller_path.write_text(
+        "from .control_factory import factory\n\n"
+        "def dispatch(request, child):\n"
+        "    action = factory()\n"
+        "    if request.causation_chain:\n"
+        "        action(child)\n",
+        encoding="utf-8",
+    )
+
+    assert _authority_provenance_lines(local_factory) == {6}
+    assert _authority_provenance_lines(chained_factory) == {10}
+    assert _cached_authority_provenance_lines(controller_path) == frozenset({5})
+
+
 def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> None:
     imported_alias = ast.parse(
         "from lifecycle import terminate_child as apply\n\n"
@@ -14450,6 +14750,50 @@ def test_provenance_scanner_preserves_post_loop_control_reachability() -> None:
     assert _authority_provenance_lines(both_paths_return) == set()
 
 
+def test_provenance_scanner_tracks_augmented_assignment_decisions() -> None:
+    local_decision = ast.parse(
+        "def dispatch(request, child):\n"
+        "    allowed = True\n"
+        "    allowed &= bool(request.causation_chain)\n"
+        "    if allowed:\n"
+        "        child.terminate()\n"
+    )
+    attribute_decision = ast.parse(
+        "def dispatch(self, request, child):\n"
+        "    self.allowed |= bool(request.causation_chain)\n"
+        "    if self.allowed:\n"
+        "        child.terminate()\n"
+    )
+
+    assert _authority_provenance_lines(local_decision) == {4}
+    assert _authority_provenance_lines(attribute_decision) == {3}
+
+
+def test_provenance_scanner_tracks_post_while_control_reachability() -> None:
+    negated_condition = ast.parse(
+        "def dispatch(request, child):\n"
+        "    while not request.causation_chain:\n"
+        "        pass\n"
+        "    child.terminate()\n"
+    )
+    positive_condition = ast.parse(
+        "def dispatch(request, child):\n"
+        "    while request.causation_chain:\n"
+        "        pass\n"
+        "    child.terminate()\n"
+    )
+    finite_iteration = ast.parse(
+        "def dispatch(request, child):\n"
+        "    for frame in request.causation_chain:\n"
+        "        record(frame)\n"
+        "    child.terminate()\n"
+    )
+
+    assert _authority_provenance_lines(negated_condition) == {2}
+    assert _authority_provenance_lines(positive_condition) == {2}
+    assert _authority_provenance_lines(finite_iteration) == set()
+
+
 def test_provenance_scanner_follows_exception_guard_clause_exits() -> None:
     tree = ast.parse(
         "def dispatch(request, child):\n"
@@ -14799,6 +15143,36 @@ def test_provenance_scanner_classifies_manager_lifecycle_methods(
     )
 
     assert _authority_provenance_lines(controlled) == {2}
+
+
+def test_provenance_scanner_shares_class_stored_control_aliases() -> None:
+    class_attribute = ast.parse(
+        "class Controller:\n"
+        "    action = terminate_child\n\n"
+        "    def dispatch(self, request, child):\n"
+        "        if request.causation_chain:\n"
+        "            self.action(child)\n"
+    )
+    instance_attribute = ast.parse(
+        "class Controller:\n"
+        "    def __init__(self):\n"
+        "        self.action = terminate_child\n\n"
+        "    def dispatch(self, request, child):\n"
+        "        if request.causation_chain:\n"
+        "            self.action(child)\n"
+    )
+    setattr_attribute = ast.parse(
+        "class Controller:\n"
+        "    def __init__(self):\n"
+        "        setattr(self, 'action', terminate_child)\n\n"
+        "    def dispatch(self, request, child):\n"
+        "        if request.causation_chain:\n"
+        "            self.action(child)\n"
+    )
+
+    assert _authority_provenance_lines(class_attribute) == {5}
+    assert _authority_provenance_lines(instance_attribute) == {6}
+    assert _authority_provenance_lines(setattr_attribute) == {6}
 
 
 def test_provenance_scanner_follows_imported_class_control_helpers(
