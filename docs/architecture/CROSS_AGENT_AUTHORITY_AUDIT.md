@@ -159,11 +159,11 @@ method inventory and target-specific authority.
 | `kestrel_sovereign/features/restart_coordinator/feature.py::revoke_restart_delegation` | Sovereign-only durable, signed revocation rechecked before use; enforced by #3148. |
 | `kestrel_sovereign/features/scheduler/feature.py::schedule_add` | Self-owned indirect dispatcher: it persists only a registered tool name, and the scheduled execution re-enters the downstream tool's runtime permission gate; scheduling conveys no relation authority. |
 | `kestrel_sovereign/features/scheduler/feature.py::schedule_add_deadline` | Self-owned one-shot indirect dispatcher with the same registered-name and downstream runtime permission gates; scheduling conveys no relation authority. |
-| `kestrel_sovereign/features/spawn/feature.py::delegate_task` | Unverified process-local child map; defect #3142. |
+| `kestrel_sovereign/features/spawn/feature.py::delegate_task` | Receipt-derived process-local child projection without operation-boundary receipt verification; defect #3142. |
 | `kestrel_sovereign/features/spawn/feature.py::get_child_result` | Self-owned result state keyed by the caller's prior delegated task. |
-| `kestrel_sovereign/features/spawn/feature.py::list_children` | Unverified process-local child map; defects #3133/#3142. |
-| `kestrel_sovereign/features/spawn/feature.py::spawn_agent` | Signature is invalidated when the final child DID is assigned; defect #3142. |
-| `kestrel_sovereign/features/spawn/feature.py::terminate_child` | Unverified process-local child map plus lifecycle gates; defect #3142. |
+| `kestrel_sovereign/features/spawn/feature.py::list_children` | Receipt-derived process-local child projection without read-boundary receipt verification; defect #3142. |
+| `kestrel_sovereign/features/spawn/feature.py::spawn_agent` | Enforced by #3133: issuance binds the final child DID before signing, persists the receipt before publication, and verifies restored receipts before rebuilding authority projections. |
+| `kestrel_sovereign/features/spawn/feature.py::terminate_child` | Receipt-derived process-local child projection without operation-boundary receipt verification, composed with lifecycle gates; defect #3142. |
 | `kestrel_sovereign/features/strategic_memory/feature.py::signal_dispatch` | Self-owned indirect dispatcher through the governed `workflow_run` tool; the contributed workflow and selected downstream controls retain their own consent, evidence, and target-authority gates. |
 | `kestrel_sovereign/features/tasks/feature.py::attach_artifact_to_a2a_task` | Recipient-owned mutation; #3144. |
 | `kestrel_sovereign/features/tasks/feature.py::cancel_task` | Creator/recipient-owned mutation; #3134. |
@@ -616,7 +616,7 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files` | D-3225 — shared host export-cache listing lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
 | `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files/{filename}` | D-3225 — shared host export-cache download lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
 | `kestrel_sovereign/endpoints/sovereignty.py::GET /api/sovereignty/files/{filename}/preview` | D-3225 — shared host export-cache preview lacks routed-agent ownership or sovereign host-only enforcement; defect [#3225](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3225). |
-| `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from unverified process-local relationships; defects #3133/#3142. |
+| `kestrel_sovereign/endpoints/spawn.py::GET /api/spawn/children` | Read-only child status projected from receipt-derived process-local relationships without read-boundary receipt verification; defect #3142. |
 | `kestrel_sovereign/features/bridge/router.py::POST /api/bridge/invoke` | Host-authenticated external invocation of the request-routed agent; gateway metadata is not authority. |
 | `kestrel_sovereign/features/bridge/router.py::POST /api/bridge/stream` | Host-authenticated external streaming invocation of the request-routed agent; gateway metadata is not authority. |
 | `kestrel_sovereign/features/bridge/router.py::GET /api/bridge/capabilities` | Host-authenticated capability read from the request-routed agent; no cross-agent grant. |
@@ -835,7 +835,7 @@ known focused defect n.
 | `kestrel_sovereign/endpoints/sovereignty.py::GET /api/agents/{selected_agent_name}/api/storage/stats` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/sovereignty.py::POST /api/agents/{selected_agent_name}/api/sovereignty/export` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/sovereignty.py::POST /api/agents/{selected_agent_name}/api/sovereignty/import` | A — target-local policy remains enforcement. |
-| `kestrel_sovereign/endpoints/spawn.py::GET /api/agents/{selected_agent_name}/api/spawn/children` | D-3142 — unverified process-local child relation. |
+| `kestrel_sovereign/endpoints/spawn.py::GET /api/agents/{selected_agent_name}/api/spawn/children` | D-3142 — receipt-derived process-local child relation without read-boundary receipt verification. |
 | `kestrel_sovereign/endpoints/ui.py::GET /api/agents/{selected_agent_name}/api/ui/theme` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/endpoints/ui.py::GET /api/agents/{selected_agent_name}/api/ui/themes` | A — target-local policy remains enforcement. |
 | `kestrel_sovereign/features/bridge/router.py::GET /api/agents/{selected_agent_name}/api/bridge/capabilities` | A — target-local policy remains enforcement. |

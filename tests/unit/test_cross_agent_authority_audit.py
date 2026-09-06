@@ -6766,6 +6766,15 @@ def test_spawn_authority_distinguishes_issuance_from_control_boundaries() -> Non
     assert "Enforced by" in creation_row
     assert "final child DID" in creation_row
 
+    spawn_surface_row = next(
+        line
+        for line in audit.splitlines()
+        if "features/spawn/feature.py::spawn_agent`" in line
+    )
+    assert "Enforced by #3133" in spawn_surface_row
+    assert "#3142" not in spawn_surface_row
+    assert "Signature is invalidated" not in spawn_surface_row
+
     for action in (
         "List/read child work",
         "Delegate work to child",
@@ -9489,6 +9498,152 @@ def _local_provenance_return_helpers(
     wrap either imported or local helpers without escaping the contract.
     """
 
+    functions_by_name: dict[
+        str, list[ast.FunctionDef | ast.AsyncFunctionDef]
+    ] = {}
+    for function in functions:
+        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+
+    def parameter_names(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        return {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+                *(
+                    [function.args.vararg]
+                    if function.args.vararg is not None
+                    else []
+                ),
+                *(
+                    [function.args.kwarg]
+                    if function.args.kwarg is not None
+                    else []
+                ),
+            ]
+        }
+
+    def bound_arguments(
+        call: ast.Call,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+        selected_parameters: set[str],
+    ) -> list[ast.AST]:
+        positional = [*callee.args.posonlyargs, *callee.args.args]
+        if (
+            isinstance(call.func, ast.Attribute)
+            and positional
+            and positional[0].arg.casefold() in {"self", "cls"}
+        ):
+            positional = positional[1:]
+        values = [
+            value
+            for parameter, value in zip(positional, call.args)
+            if parameter.arg.casefold() in selected_parameters
+        ]
+        values.extend(
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg is not None
+            and keyword.arg.casefold() in selected_parameters
+        )
+        if selected_parameters:
+            values.extend(
+                argument.value
+                for argument in call.args
+                if isinstance(argument, ast.Starred)
+            )
+            values.extend(
+                keyword.value for keyword in call.keywords if keyword.arg is None
+            )
+        return values
+
+    parameter_return_flows: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {function: set() for function in functions}
+
+    def expression_flows_from_parameter(
+        value: ast.AST,
+        parameter: str,
+    ) -> bool:
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        if isinstance(value, ast.Name):
+            return value.id.casefold() == parameter
+        if isinstance(value, ast.Constant):
+            return False
+        if isinstance(value, ast.Call):
+            for callee in functions_by_name.get(_call_name(value).casefold(), ()):
+                flowed_parameters = parameter_return_flows[callee]
+                if any(
+                    expression_flows_from_parameter(argument, parameter)
+                    for argument in bound_arguments(
+                        value,
+                        callee,
+                        flowed_parameters,
+                    )
+                ):
+                    return True
+            if not (
+                _is_provenance_transform_call(value)
+                or _is_provenance_accessor_call(value)
+            ):
+                return False
+            inputs: list[ast.AST] = [
+                *value.args,
+                *(keyword.value for keyword in value.keywords),
+            ]
+            if isinstance(value.func, ast.Attribute):
+                inputs.append(value.func.value)
+            return any(
+                expression_flows_from_parameter(argument, parameter)
+                for argument in inputs
+            )
+        return any(
+            expression_flows_from_parameter(child, parameter)
+            for child in ast.iter_child_nodes(value)
+        )
+
+    flow_changed = True
+    while flow_changed:
+        flow_changed = False
+        for function in functions:
+            returned_values = [
+                node.value
+                for node in _walk_lexical_scope(function)
+                if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
+                and node.value is not None
+            ]
+            discovered = {
+                parameter
+                for parameter in parameter_names(function)
+                if any(
+                    expression_flows_from_parameter(value, parameter)
+                    for value in returned_values
+                )
+            }
+            new_parameters = discovered - parameter_return_flows[function]
+            if new_parameters:
+                parameter_return_flows[function].update(new_parameters)
+                flow_changed = True
+
+    def call_returns_supplied_provenance(
+        call: ast.Call,
+        aliases: set[str],
+        visible_helpers: set[str],
+    ) -> bool:
+        return any(
+            _has_provenance_value(argument, aliases, visible_helpers)
+            for callee in functions_by_name.get(_call_name(call).casefold(), ())
+            for argument in bound_arguments(
+                call,
+                callee,
+                parameter_return_flows[callee],
+            )
+        )
+
     helper_names: set[str] = set(imported_provenance_helpers or ())
     changed = True
     while changed:
@@ -9529,6 +9684,11 @@ def _local_provenance_return_helpers(
                     returns_provenance = (
                         _is_provenance_accessor_call(value)
                         or call_name in visible_helpers
+                        or call_returns_supplied_provenance(
+                            value,
+                            aliases,
+                            visible_helpers,
+                        )
                         or _is_provenance_transform_call(value)
                         and (
                             _has_provenance_token(value, aliases)
@@ -12917,6 +13077,28 @@ def test_provenance_scanner_follows_local_helper_return_values() -> None:
     assert _authority_provenance_lines(propagation_only_helper) == set()
     assert _authority_provenance_lines(serialized_helper) == {7}
     assert _authority_provenance_lines(normalized_helper) == {5}
+
+
+def test_provenance_scanner_follows_neutral_parameter_return_wrappers() -> None:
+    wrapped_parameter = ast.parse(
+        "def wrap(value):\n"
+        "    return bool(value)\n\n"
+        "def derive(request):\n"
+        "    return wrap(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    if derive(request):\n"
+        "        child.stop()\n"
+    )
+    ordinary_parameter = ast.parse(
+        "def wrap(value):\n"
+        "    return bool(value)\n\n"
+        "def dispatch(request, child, configured):\n"
+        "    if wrap(configured):\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(wrapped_parameter) == {8}
+    assert _authority_provenance_lines(ordinary_parameter) == set()
 
 
 def test_provenance_scanner_covers_direct_targets_accessors_and_control_helpers() -> None:
