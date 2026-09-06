@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
     request_invocation_provenance,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
@@ -106,11 +107,18 @@ async def rasa_webhook(
 
     Authenticated via a shared webhook token and rate-limited (#1729) — this is
     an anonymous-path endpoint that drives a full paid LLM turn.
+
+    The agent is the request-routed one (kestrel-sovereign#3220): on a
+    multi-agent host the routing middleware pins ``request.state.agent`` for
+    ``/api/agents/{name}/webhooks/rest/webhook``, and this handler used to
+    ignore it and run ``app.state.agent`` — the host default — so a message
+    explicitly addressed to agent B executed on agent A, or 503'd when no
+    default existed. ``get_agent`` prefers the routed agent and falls back to
+    the single-agent default, so the standalone unprefixed form is unchanged.
     """
     _verify_webhook_token(request)
 
-    if not hasattr(request.app.state, "agent") or not request.app.state.agent:
-        raise HTTPException(status_code=503, detail="Kestrel agent not initialized.")
+    agent = get_agent(request)
 
     sender = payload.sender.strip()
     message = payload.message.strip()
@@ -133,7 +141,6 @@ async def rasa_webhook(
     )
 
     try:
-        agent = request.app.state.agent
         async with _agent_semaphore:
             response_text = await agent.process_input(
                 user_input=enriched_input,
