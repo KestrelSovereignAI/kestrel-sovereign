@@ -559,16 +559,18 @@ async def test_command_position_grammar_is_refused(workspace: Path):
     """codex review round 7, P1 — the allow-list cannot see this.
 
     Every character in ``eval`` and ``FOO=x`` is inert, so the
-    character rule passes them. They matter because the DEFAULT backend
-    does not exec the argv it is handed: DockerSandboxBackend rebuilds
-    a bash script from it, where a bare word in command position is
-    grammar. ``eval 'dd ...'`` then runs ``dd`` with only ``eval``
-    vetted — and ``eval`` is not a binary at all.
+    character rule passes them. They mattered because the DEFAULT
+    backend did not exec the argv it was handed: DockerSandboxBackend
+    rebuilt a bash script from it, where a bare word in command
+    position is grammar, so ``eval 'dd ...'`` ran ``dd`` with only
+    ``eval`` vetted — and ``eval`` is not a binary at all.
 
-    Measured before fixing: the script the backend builds for
-    ``eval 'printf HACKED'`` prints HACKED under bash, while the local
-    backend raises FileNotFoundError. The backend's own claim to exec
-    argv is #3187.
+    Measured before that was fixed: the script the backend built for
+    ``eval 'printf HACKED'`` printed HACKED, while the local backend
+    raised FileNotFoundError. #3187 closed the divergence at the
+    backend; this refusal stays in front of it, because the answer a
+    caller needs is "that is not a program", not exit 127 from a
+    container that started to find out.
     """
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(

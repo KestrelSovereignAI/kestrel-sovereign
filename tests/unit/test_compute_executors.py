@@ -27,7 +27,11 @@ from kestrel_sovereign.features.compute.executors import (
     docker_executor as docker_executor_module,
     uv_executor as uv_executor_module,
 )
-from kestrel_sovereign.features.compute.models import ComputeScript, ExecutionRecord
+from kestrel_sovereign.features.compute.models import (
+    ComputeCommand,
+    ComputeScript,
+    ExecutionRecord,
+)
 
 
 EXECUTOR_NAMES = ("local", "uv", "docker")
@@ -1175,3 +1179,323 @@ class TestDockerTrashStaging:
         DockerExecutor._promote_staged_trash(
             tmp_path / "trash" / ".staging-gone", tmp_path / "trash"
         )
+
+
+# =============================================================================
+# Argv execution mode (#3187)
+# =============================================================================
+
+
+def _command(
+    *,
+    argv: Optional[list[str]] = None,
+    timeout_seconds: int = 1,
+    environment: Optional[dict[str, str]] = None,
+) -> ComputeCommand:
+    return ComputeCommand(
+        id="executor-command-test",
+        name="executor command",
+        argv=argv or ["printf", "ok"],
+        purpose="exercise the argv execution mode",
+        timeout_seconds=timeout_seconds,
+        environment=environment or {},
+    )
+
+
+async def _capture_container_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    run,
+) -> tuple[list[str], list[list[Path]]]:
+    """Run one executor call, returning the docker argv and the temp-dir contents.
+
+    The directory listing is taken at the moment the subprocess starts,
+    which is the only moment a written script would still exist: the
+    lifecycle deletes the temp directory on the way out.
+    """
+    executor = _make_executor(monkeypatch, "docker", max_bytes=128)
+    created = _track_temp_dirs(monkeypatch, tmp_path)
+    process = _SuccessfulProcess(b"ok", b"")
+    calls: list[list[str]] = []
+    contents: list[list[Path]] = []
+
+    async def create_subprocess(*args: object, **kwargs: object):
+        calls.append([str(arg) for arg in args])
+        contents.append(
+            [entry for directory in created for entry in directory.iterdir()]
+        )
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    await run(executor)
+    # Later calls are the lifecycle's own container removal, not the run.
+    assert calls, "the executor never started a container"
+    return calls[0], contents[:1]
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_execs_the_vector_and_writes_no_script(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """#3187: a backend named ``exec(argv)`` must exec argv.
+
+    The vector here is chosen so that any re-reading would show: under
+    the previous implementation these words were quoted into a bash
+    script, and ``eval`` ran ``printf`` with only ``eval`` vetted.
+
+    ``argv[0]`` is named to Docker with ``--entrypoint`` rather than
+    positioned after the image. Position is not enough: words after the
+    image are appended to whatever ``ENTRYPOINT`` the image declares,
+    so on an entrypoint-bearing image the first word is demoted to an
+    argument and the image's own program runs (codex round 1 P1,
+    reproduced live — see the parity test for the measurement).
+    """
+    argv = ["eval", "printf HACKED", ";", "--privileged", "$(id)"]
+    captured, contents = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=argv)),
+    )
+
+    entrypoint_at = captured.index("--entrypoint")
+    image_at = captured.index(docker_executor_module.DEFAULT_COMMAND_IMAGE)
+    assert captured[entrypoint_at + 1] == argv[0]
+    assert entrypoint_at < image_at, "--entrypoint is an option, not an argument"
+    assert captured[image_at + 1 :] == argv[1:]
+
+    # Nothing interprets it: no interpreter is named, and no script
+    # file exists to be interpreted.
+    flags = captured[:image_at]
+    assert "sh" not in flags and "bash" not in flags and "python" not in flags
+    assert contents == [[]], f"the executor wrote a file: {contents}"
+
+    # No mounts that only a script would need — and in particular no
+    # writable host bind, because the deletion rewriter that the trash
+    # mount exists for only rewrites script text.
+    binds = [captured[i + 1] for i, arg in enumerate(captured) if arg == "-v"]
+    assert binds == [], binds
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_runs_under_the_same_isolation_as_a_script(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The two modes must not drift apart on container hardening.
+
+    Derived from the script path rather than restated, so a flag added
+    to one mode and not the other fails here instead of being noticed
+    later — the drift the sandbox backend reuses this executor to
+    avoid.
+    """
+    script_cmd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute(
+            ComputeScript(
+                id="isolation-parity",
+                name="isolation parity",
+                language="bash",
+                content="printf ok\n",
+                purpose="compare container hardening across execution modes",
+                timeout_seconds=1,
+            )
+        ),
+    )
+    command_cmd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command()),
+    )
+
+    def isolation_flags(cmd: list[str]) -> set[str]:
+        return {arg for arg in cmd if arg.startswith("--") and arg != "--name"}
+
+    assert isolation_flags(command_cmd) == isolation_flags(script_cmd)
+    assert "--read-only" in isolation_flags(command_cmd)
+    assert "--network=none" in isolation_flags(command_cmd)
+
+
+@pytest.mark.asyncio
+async def test_docker_script_mode_mounts_the_script_and_the_trash_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The shared builder has to attach the binds it is handed.
+
+    Found by mutating it: with the bind loop removed, every other test
+    here still passed, while a real container would have started with
+    no script to run and nowhere to put a trashed file. The command
+    mode above asserts these binds are *absent*, which is only half an
+    invariant — this is the other half, and it belongs to the caller
+    that needs them.
+    """
+    script_cmd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute(
+            ComputeScript(
+                id="bind-mounts",
+                name="bind mounts",
+                language="bash",
+                content="printf ok\n",
+                purpose="pin the mounts a script execution needs",
+                timeout_seconds=1,
+            )
+        ),
+    )
+
+    binds = [
+        script_cmd[i + 1] for i, arg in enumerate(script_cmd) if arg == "-v"
+    ]
+    assert any(bind.endswith(":/scripts:ro") for bind in binds), binds
+    assert any(bind.endswith(":/kestrel-trash:rw") for bind in binds), binds
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_stands_in_the_directory_it_mounted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A relative operand must resolve against the caller's directory.
+
+    With a host directory mounted, the container's working directory is
+    that mount; without one there is no workspace to stand in, so the
+    read-only image root is used rather than whatever the last mount
+    happened to leave behind.
+    """
+    workspace = tmp_path / "caller cwd"
+    workspace.mkdir()
+
+    with_cwd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(
+            _command(argv=["ls", "."]), working_dir=str(workspace)
+        ),
+    )
+    without_cwd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=["ls", "."])),
+    )
+
+    assert f"{workspace}:/workspace:ro" in with_cwd
+    assert with_cwd[with_cwd.index("-w") + 1] == "/workspace"
+    assert without_cwd[without_cwd.index("-w") + 1] == "/"
+    assert "-v" not in without_cwd
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_redacts_environment_values_from_the_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A secret passed as an env var must not reach the debug log."""
+    caplog.set_level(logging.DEBUG, logger=docker_executor_module.logger.name)
+    captured, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(
+            _command(environment={"TOKEN": "s3cret-value"})
+        ),
+    )
+
+    assert "-e" in captured and "TOKEN=s3cret-value" in captured
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "TOKEN=<redacted>" in logged
+    assert "s3cret-value" not in logged
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_logs_how_many_arguments_not_which(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Arguments are where a caller's secrets are (codex round 2 P1).
+
+    The environment values on this same log line are redacted for that
+    reason, and the script path never logged arguments at all — they
+    were inside a file, and the line ended at ``sh /scripts/script.sh``.
+    The program still appears: it is what the policy vetted, and it is
+    the one thing a reader of this line needs.
+    """
+    caplog.set_level(logging.DEBUG, logger=docker_executor_module.logger.name)
+    argv = ["curl", "-H", "Authorization: Bearer s3cret-token", "https://x"]
+    captured, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=argv)),
+    )
+
+    # The secret still reaches the container — this is about the log.
+    assert "Authorization: Bearer s3cret-token" in captured
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "s3cret-token" not in logged
+    assert "3 argument(s) not logged" in logged
+    assert "curl" in logged, "the program is what the reader needs"
+
+
+@pytest.mark.asyncio
+async def test_docker_command_mode_cannot_have_a_log_line_forged_through_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A newline in the program name must not become a new log line.
+
+    ``shlex.join`` quotes a newline; it does not encode it, so the raw
+    byte would still land in the log and everything after it would read
+    as a separate record.
+    """
+    caplog.set_level(logging.DEBUG, logger=docker_executor_module.logger.name)
+    forged = "prog\nERROR forged-by-the-caller"
+    await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute_command(_command(argv=[forged, "x"])),
+    )
+
+    container_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "Container command" in record.getMessage()
+    ]
+    assert container_lines, "the container command was never logged"
+    for line in container_lines:
+        assert "\nERROR forged-by-the-caller" not in line
+        assert "forged-by-the-caller" in line, "escaped, not dropped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor_name", ("local", "uv"))
+async def test_a_script_executor_refuses_an_argv_vector(
+    monkeypatch: pytest.MonkeyPatch,
+    executor_name: str,
+) -> None:
+    """The default is a refusal, not a fallback.
+
+    An executor that can only run scripts could always quote the vector
+    into one — which is precisely the substitution #3187 was filed for.
+    Refusing keeps "this executor execs argv" a claim a subclass has to
+    make, rather than one every caller may assume.
+    """
+    executor = _make_executor(monkeypatch, executor_name)
+
+    with pytest.raises(executor_base.CommandExecutionUnsupported) as exc_info:
+        await executor.execute_command(_command())
+
+    assert executor.name in str(exc_info.value)
+    assert "shell grammar" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_the_base_executor_refuses_an_argv_vector_by_default() -> None:
+    """Including for an executor written outside this package."""
+    with pytest.raises(executor_base.CommandExecutionUnsupported):
+        await _CompatibilityExecutor().execute_command(_command())
