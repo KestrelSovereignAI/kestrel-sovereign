@@ -194,19 +194,37 @@ def test_the_metrics_route_no_longer_accepts_an_agent_name_parameter():
 
 
 @pytest.mark.asyncio
-async def test_an_agent_without_a_resolvable_identity_is_refused(shared_store):
+@pytest.mark.parametrize(
+    "identity",
+    [
+        pytest.param({}, id="attribute-absent"),
+        pytest.param({"did": None}, id="did-is-none"),
+        pytest.param({"did": ""}, id="did-is-empty-string"),
+    ],
+)
+async def test_an_agent_without_a_resolvable_identity_is_refused(
+    shared_store, identity
+):
     """No identity means no read — never an unscoped one.
 
-    The failure mode this guards is the one the fix exists to prevent:
-    if the scope cannot be determined, the tempting fallback is to pass
-    `None`, and `None` means "every agent" to the store. Refusing is the
-    only answer that cannot become the original defect.
+    The empty string is the dangerous one, and the reason the guard
+    tests truthiness rather than `is None`. `query_events` and
+    `get_metric_summary` both gate on `if agent_name:`, so `""` does not
+    narrow the query — it silences the predicate entirely and returns
+    every agent's rows in a well-formed 200. That is this ticket's own
+    defect, reached through the fix for it.
     """
     app = FastAPI()
     app.include_router(router)
     app.state.agent = type(
-        "Agent", (), {"observability_store": shared_store, "agent_name": "display"}
-    )()  # no `did` attribute at all
+        "Agent",
+        (),
+        {
+            "observability_store": shared_store,
+            "agent_name": "display",
+            **identity,
+        },
+    )()
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"

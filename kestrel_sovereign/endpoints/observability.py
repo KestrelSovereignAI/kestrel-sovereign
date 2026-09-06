@@ -12,24 +12,36 @@ router = APIRouter(tags=["observability"])
 
 
 def _scope_did(agent) -> str:
-    """The value `a2a_observability.agent_name` actually holds: the DID.
+    """The value this agent's own observability rows carry: the DID.
 
-    Despite the column's name it is not the display name. Every live
-    recorder writes `agent_name=self.did` — ten call sites across
-    `agent/streaming.py`, `agent/orchestrator_engine.py` and
-    `kestrel_agent.py` — and `a2a/task_manager.py` documents its
-    parameter as "Durable DID". `kestrel_agent.py` says so itself where
-    it wires the ephemeral purge: "Tool-call args in a2a_observability
-    use the agent DID as agent_name ... so scope by DID on both
-    columns".
+    Despite the column's name, `a2a_observability.agent_name` is not the
+    display name for these rows. Every in-repo recorder of *this agent's
+    own* events resolves to the DID: ten direct `agent_name=self.did`
+    sites across `agent/streaming.py`, `agent/orchestrator_engine.py`
+    and `kestrel_agent.py`, plus `a2a/task_manager.py`'s
+    `create_task`/`fail_task`/`update_status`, whose callers pass a
+    did-first value. `kestrel_agent.py` says so where it wires the
+    ephemeral purge: "Tool-call args in a2a_observability use the agent
+    DID as agent_name ... so scope by DID on both columns".
 
-    Scoping by `agent.agent_name` instead is not a narrower read, it is
-    an empty one: no row carries that value, so every panel would go
-    blank and the #969 forensic metric would answer "never happened".
+    The column is NOT exclusively DIDs, and that is deliberate rather
+    than a bug to fix here: `kestrel_feature_talon` scopes its
+    `talon_job` reads by the display name, because those rows describe
+    an external producer's jobs rather than this agent's turns, and
+    pre-#2461 rows carry `"unknown"`. So this scope is "my own events",
+    not "every row an agent could be said to own" — do not carry it to a
+    read whose producer uses the other convention. `test_observability_
+    writer_identity_convention.py` pins the in-repo half.
 
-    Missing identity refuses rather than falls back. An unscoped query
-    is the defect this function exists to prevent, so it must not be
-    what happens when the identity cannot be resolved.
+    Scoping by `agent.agent_name` instead would not be a narrower read
+    of this agent's events, it would be an empty one: every panel blank,
+    and the #969 forensic metric answering "never happened".
+
+    Missing identity refuses rather than falls back, and the emptiness
+    test is truthiness, not `is None`: the store gates on
+    `if agent_name:`, so an EMPTY STRING is an unscoped read — every
+    agent's rows in a well-formed 200 — which is the defect this
+    function exists to prevent.
     """
     did = getattr(agent, "did", None)
     if not did:
