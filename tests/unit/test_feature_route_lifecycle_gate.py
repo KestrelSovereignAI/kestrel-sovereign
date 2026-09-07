@@ -107,13 +107,34 @@ class _InstanceBoundRouterFeature:
     def __init__(self, owner: str):
         self.enabled = True
         self.owner = owner
+        self.served = 0
 
     def get_router(self):
         router = APIRouter()
 
         @router.get("/test-feature-lifecycle/instance-bound")
         async def instance_bound():
+            self.served += 1
             return {"owner": self.owner}
+
+        return router
+
+
+class _DriftedRouterFeature:
+    """Enabled, same feature name, but its router no longer exposes the
+    mounted shape: it must not count as a survivor of that route."""
+
+    def __init__(self):
+        self.enabled = True
+        self.served = 0
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/somewhere-else")
+        async def elsewhere():
+            self.served += 1
+            return {"owner": "drifted"}
 
         return router
 
@@ -1060,3 +1081,309 @@ def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
                 assert not failures, (order, [r.getMessage() for r in failures])
         finally:
             restore()
+
+
+# ---------------------------------------------------------------------------
+# #3240: an unprefixed feature route whose mount owner was withdrawn
+# ---------------------------------------------------------------------------
+
+
+def _reorder(agents: dict, *names: str) -> None:
+    """Re-key the live fleet mapping in place so ``list_agents()`` iterates in
+    the given order; the manager stub reads the same dict on every call."""
+    snapshot = {name: agents[name] for name in names}
+    agents.clear()
+    agents.update(snapshot)
+
+
+def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_order():
+    """Once the mount owner is withdrawn, two remaining agents that both serve
+    the shape must not be chosen between by ``list_agents()`` order: the
+    unprefixed form is refused in both orders and neither endpoint runs, while
+    each agent-prefixed form still serves its own agent."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            # The mount owner serves the unprefixed form while it is managed.
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+
+            agents.pop("alice")
+            for order in (("bob", "carol"), ("carol", "bob")):
+                _reorder(agents, *order)
+                response = client.get(path, headers=headers)
+                assert response.status_code == 404, order
+                assert bob.served == 0 and carol.served == 0, order
+
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v1"
+            }
+            assert client.get(f"/api/agents/carol{path}", headers=headers).json() == {
+                "owner": "carol-v1"
+            }
+            assert bob.served == 1 and carol.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
+    """One remaining agent that serves the shape is not an ambiguous choice."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert alice.served == 1 and bob.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
+    """A candidate that no longer serves the shape (feature disabled, or the
+    feature removed) does not count: with it gone the other one is the only
+    survivor and serves; with both live the unprefixed form is refused."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            bob.enabled = False
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0
+
+            bob.enabled = True
+            assert client.get(path, headers=headers).status_code == 404
+
+            agents["bob"].features.pop("ProxyFeature")
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0 and carol.served == 2
+
+            # Enabled and same-named, but the shape is gone from its router:
+            # not a survivor of THIS route, so carol is still the only one.
+            drifted = _DriftedRouterFeature()
+            agents["bob"].features["ProxyFeature"] = drifted
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert drifted.served == 0 and carol.served == 3
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_follows_the_mount_owner_across_its_reload():
+    """Review r1 P2: the mount owner reloaded under a NEW object with the same
+    routing name and DID is still the mount owner. Retention by object
+    identity made that a permanent 404 while another agent served the shape;
+    the DID is the stable identity, so the reloaded owner serves — even with
+    two other survivors that would otherwise be an ambiguous pair."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    agents["carol"].did = "did:test:carol"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: two survivors, refused.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            # Re-created under a new object, same name and DID: the owner is
+            # back, and it wins over the pair that was ambiguous a moment ago.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert alice_v1.served == 1 and alice_v2.served == 1
+            assert bob.served == 0 and carol.served == 0
+            assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
+                "owner": "alice-v2"
+            }
+
+            # A different agent under the owner's old name is not the owner.
+            impostor = _InstanceBoundRouterFeature("impostor")
+            agents["alice"] = _make_agent({"ProxyFeature": impostor})
+            agents["alice"].did = "did:test:someone-else"
+            assert client.get(path, headers=headers).status_code == 404
+            assert impostor.served == 0
+    finally:
+        restore()
+
+
+class _FeaturesOnceThenGone(dict):
+    """A ``features`` mapping whose lookup answers once and then reports the
+    feature gone: the change between ``route.matches()`` and dispatch."""
+
+    def __init__(self, name, feature, *, answers: int):
+        super().__init__({name: feature})
+        self._answers = answers
+
+    def get(self, key, default=None):
+        if self._answers <= 0:
+            return default
+        self._answers -= 1
+        return super().get(key, default)
+
+
+def test_dispatch_refuses_a_feature_that_vanished_after_the_match():
+    """Review r1 M12: the match gate admits the request, then the feature is
+    gone by dispatch. Dispatch must refuse, never fall back to the mounted
+    copy's first-tenant endpoint (which is #3240 itself)."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    agents = {"alice": agent}
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            # One answer for the match gate; dispatch sees no feature.
+            agent.features = _FeaturesOnceThenGone("ProxyFeature", alice, answers=1)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
+    finally:
+        restore()
+
+
+class _FeaturesDisabledAfterFirstLookup(dict):
+    """A ``features`` mapping that soft-disables the feature after the first
+    lookup: the match gate sees it enabled, dispatch sees it disabled."""
+
+    def __init__(self, name, feature):
+        super().__init__({name: feature})
+        self._looked_up = 0
+
+    def get(self, key, default=None):
+        feature = super().get(key, default)
+        self._looked_up += 1
+        if self._looked_up > 1 and feature is not None:
+            feature.enabled = False
+        return feature
+
+
+def test_dispatch_refuses_a_feature_disabled_after_the_match():
+    """Review r2: the match gate admits the request, then the feature is
+    soft-disabled before dispatch. Dispatch re-checks ``enabled`` itself and
+    refuses; it must not serve on the match gate's stale answer."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    app, restore = _boot_multi_agent({"alice": agent})
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            agent.features = _FeaturesDisabledAfterFirstLookup("ProxyFeature", alice)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
+            assert alice.enabled is False
+            # Exactly two lookups per request: the match gate, then dispatch.
+            # The double disables after the FIRST, so this pins that the 404
+            # came from dispatch's own check; a future extra lookup earlier
+            # in the request would move the disable into the gate and make
+            # this test vacuous — fail loudly instead.
+            assert agent.features._looked_up == 2
+    finally:
+        restore()
+
+
+def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
+    """Review r2: the owner clause precedes the survivor rule. A mount owner
+    re-created under its DID with the feature disabled (readiness rollback,
+    then retry) is still the owner: the unprefixed form refuses rather than
+    quietly rebinding to the one peer that serves, which is exactly the
+    order-chosen executor this ticket removes."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: bob is the sole survivor and serves.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert bob.served == 1
+
+            # Back under the same DID, but not serving: the owner is retained
+            # and refuses; the surviving peer is not chosen instead.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            alice_v2.enabled = False
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).status_code == 404
+            assert bob.served == 1 and alice_v2.served == 0
+
+            # Once it serves again, it serves.
+            alice_v2.enabled = True
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert bob.served == 1
+    finally:
+        restore()
