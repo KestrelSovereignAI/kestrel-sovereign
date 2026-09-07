@@ -27,7 +27,10 @@ from typing import Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from .models import ConsentRecord
 
 logger = logging.getLogger(__name__)
@@ -111,19 +114,15 @@ class ConsentFeature(Feature):
         never from a tool argument: routing to an agent is not authority over
         another one's history.
 
-        An agent without a usable DID refuses rather than reads: an empty or
-        non-string value is not "unscoped", it is "cannot be scoped", and the
-        write refuses for the same reason so it can never mint a row nobody
-        can read back. Rows whose ``agent_id`` is NULL (none are written by
-        this feature; see the ticket) are attributable to no one and are
-        excluded from every read.
+        An agent without a usable DID refuses rather than reads (the shared
+        guard, ``resolve_scoped_agent_did``): an empty or non-string value is
+        not "unscoped", it is "cannot be scoped", and the write refuses for
+        the same reason so it can never mint a row nobody can read back.
+        Rows whose ``agent_id`` is NULL (none are written by this feature;
+        see the ticket) are attributable to no one and are excluded from
+        every read.
         """
-        did = getattr(self.agent, "did", None)
-        if not isinstance(did, str) or not did:
-            raise RuntimeError(
-                "agent identity unavailable; refusing an unscoped consent_log access"
-            )
-        return did
+        return resolve_scoped_agent_did(self.agent)
 
     # =========================================================================
     # Core consent API (called by other features)

@@ -70,6 +70,29 @@ def _safe_privacy_config(value: Any) -> Any:
     return getattr(value, "privacy_config", None)
 
 
+class AgentIdentityUnavailable(RuntimeError):
+    """The agent has no usable DID, so nothing can be scoped to it."""
+
+
+def resolve_scoped_agent_did(agent: Any) -> str:
+    """The DID every self-scoped read and write of this agent is bound to.
+
+    One guard for every site that scopes a shared table to the calling
+    agent: the consent log and audit anchors (#3229/#3230), observability
+    (#3215), the A2A task list. They had drifted — one gated on truthiness
+    alone, so a non-string truthy value was bound as a query parameter.
+
+    A missing, empty, or non-string DID is "cannot be scoped", never
+    "unscoped": the caller refuses (a store that gates on ``if agent_id:``
+    turns an empty string into every agent's rows). Read without MagicMock
+    fabrication, so a test double that never set a DID is refused too.
+    """
+    did = _safe_attr(agent, "did")
+    if not isinstance(did, str) or not did:
+        raise AgentIdentityUnavailable("agent identity unavailable")
+    return did
+
+
 def resolve_feature_database(agent: Any) -> Optional[Any]:
     """Resolve the database handle a feature should use for its own tables.
 

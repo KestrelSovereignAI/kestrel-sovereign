@@ -21,7 +21,10 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from kestrel_sovereign.audit_time import normalize_audit_timestamp
 
 logger = logging.getLogger(__name__)
@@ -423,11 +426,12 @@ class AuditAnchorFeature(Feature):
         entries and reports a false integrity failure (#3230).
 
         The identity is the runtime-bound DID, never a tool argument. An agent
-        without a usable DID refuses (raises) rather than falls back to an
-        unscoped read, and the helpers below resolve it *outside* their
-        catch-all ``except`` so the refusal cannot be swallowed into "no
-        anchors yet" — which would re-anchor everything. The write uses the
-        same door so no row can be minted that no agent can read back.
+        without a usable DID refuses (the shared guard,
+        ``resolve_scoped_agent_did``) rather than falls back to an unscoped
+        read, and the helpers below resolve it *outside* their catch-all
+        ``except`` so the refusal cannot be swallowed into "no anchors yet" —
+        which would re-anchor everything. The write uses the same door so no
+        row can be minted that no agent can read back.
 
         Rows whose ``agent_id`` is NULL cannot be attributed and are excluded
         from every read. That is the conservative side for an audit trail:
@@ -436,12 +440,7 @@ class AuditAnchorFeature(Feature):
         verified against this log (a foreign hash is a guaranteed false
         failure). No writer of this table has ever left the column NULL.
         """
-        did = getattr(self.agent, "did", None)
-        if not isinstance(did, str) or not did:
-            raise RuntimeError(
-                "agent identity unavailable; refusing an unscoped audit_anchors access"
-            )
-        return did
+        return resolve_scoped_agent_did(self.agent)
 
     def _get_permission_store(self):
         """
