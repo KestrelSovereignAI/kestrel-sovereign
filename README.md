@@ -88,6 +88,7 @@ uv run kestrel doctor
 # 5. (Optional) Create an additional agent. `--quickstart` already
 #    registers one named `Kestrel`; this step is for adding more or
 #    if you ran the interactive wizard without auto-registering.
+set -a; source .env; set +a      # the operator lane: lifecycle verbs need the sovereign key exported (#3233)
 uv run kestrel create MyAgent
 
 # 6. Start an agent. Name the one you want, or omit to start every

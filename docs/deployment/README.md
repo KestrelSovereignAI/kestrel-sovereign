@@ -236,6 +236,7 @@ backend:
 
 ```bash
 # Local checkout: stop the old server before asking the new CLI to restart it.
+set -a; source .env; set +a   # operator lane (#3233): lifecycle verbs need the sovereign key exported
 kestrel terminate
 kestrel update
 

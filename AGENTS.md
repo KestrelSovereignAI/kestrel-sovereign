@@ -204,13 +204,17 @@ kestrel update --dry-run          # preview (incl. the reconcile plan); mutate n
 
 The lifecycle verbs — `kestrel create|start|terminate|restart|update` — run
 only through the **operator lane** (#3233): the shell that invokes them must
-carry the host's stable `KESTREL_API_KEY` (the value in the project `.env`),
-exported for that session — `set -a; source .env; set +a` — not read from the
-file by the CLI, and not placed in a login profile. An agent's host shell never
-carries it (its subprocess environment is an allowlist without Kestrel
-variables), so an agent cannot create, kill, restart or re-image agents, the
-host, or the fleet through the CLI; the host process and the restart
-coordinator's own re-exec inherit it and are unaffected.
+carry the host's stable `KESTREL_API_KEY`, exported for that session
+(`set -a; source .env; set +a`), not read from the file by the CLI and not
+placed in a login profile. It must match the project `.env`, and for
+`terminate`/`restart`/`update` every port the verb would touch that is held
+must accept that key as its sovereign credential, or the verb refuses (a hung
+host is stopped by PID). What this establishes is a *presented* credential
+verified by the host acted on, instead of mere process access: an agent's host
+shell subprocess never carries the key. What it does not establish is secret
+custody — an agent that can read the project's files can read `.env`; that is
+the filesystem and shell policy's boundary, not this one. The host process and
+the restart coordinator's own re-exec inherit the key and are unaffected.
 
 What it actually does:
 

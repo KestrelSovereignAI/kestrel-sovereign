@@ -346,7 +346,17 @@ class TestCommandDispatch:
         (#3233): the invoking environment carries the project's sovereign
         key. These tests are about dispatch, so give them the lane; the
         lane itself is tested in test_operator_lane.py."""
+        import socket
+
         (tmp_path / ".env").write_text("KESTREL_API_KEY=dispatch-test-key\n")
+        # A host port nothing listens on. Without a multi_agent.toml the
+        # default is 8888 — a live host's — and the lane would (rightly)
+        # probe it and refuse; the safety must be structural.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        unused = probe.getsockname()[1]
+        probe.close()
+        (tmp_path / "multi_agent.toml").write_text(f'[host]\nport = {unused}\nbind = "127.0.0.1"\n')
         monkeypatch.setenv("KESTREL_API_KEY", "dispatch-test-key")
         with patch("kestrel_sovereign.cli._get_project_dir", return_value=tmp_path):
             yield

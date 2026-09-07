@@ -212,7 +212,7 @@ When `KESTREL_DATA_KEY` is set, the memory database is encrypted using Fernet sy
 
 The pillars are independent but complementary. Here's what happens at each lifecycle event:
 
-**Agent creation (`kestrel create`)**
+**Agent creation (`kestrel create`)** — a lifecycle verb: it runs through the operator lane (#3233), with the host's sovereign key exported in the invoking shell.
 1. Identity generates the secp256k1 keypair and DID
 2. Constitution is loaded, hashed, and the hash is written into the identity node (linking identity to governance)
 3. Memory is initialized: the agent node is written to the graph with the DID and constitution hash embedded

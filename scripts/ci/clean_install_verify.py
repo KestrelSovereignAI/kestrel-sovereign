@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -200,14 +201,45 @@ def _agent_port(agent_name: str) -> int | None:
     return ((multi_agent.get("agents") or {}).get(agent_name) or {}).get("port")
 
 
-def _run_captured(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_captured(
+    command: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a command with locale-independent, loss-preserving text capture."""
     return subprocess.run(
         command,
         capture_output=True,
         encoding="utf-8",
         errors="backslashreplace",
+        env=env,
     )
+
+
+def _operator_lane_env() -> dict[str, str]:
+    """The environment the lifecycle verbs need: this process's, plus the
+    wizard-written sovereign key.
+
+    The verbs run only through the operator lane (#3233): the invoking
+    environment must carry the host's ``KESTREL_API_KEY``, which the CLI
+    deliberately does not read from ``.env`` on the invoker's behalf. This
+    script *is* the operator here, so it presents the key the wizard wrote —
+    read with a minimal stdlib parse, since the script is stdlib-only.
+    """
+    env = dict(os.environ)
+    if env.get("KESTREL_API_KEY", "").strip():
+        return env
+    env_file = Path(".env")
+    if env_file.exists():
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line.startswith("KESTREL_API_KEY="):
+                continue
+            value = line[len("KESTREL_API_KEY="):].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                env["KESTREL_API_KEY"] = value
+            break
+    return env
 
 
 def _write_captured(stream: TextIO, output: str) -> None:
@@ -227,6 +259,7 @@ def _kestrel(*args: str) -> subprocess.CompletedProcess[str]:
     """
     return _run_captured(
         [sys.executable, "-m", "kestrel_sovereign.cli", *args],
+        env=_operator_lane_env(),
     )
 
 

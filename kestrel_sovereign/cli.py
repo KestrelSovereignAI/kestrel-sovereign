@@ -2373,7 +2373,9 @@ def _ensure_utf8_stdio() -> None:
             pass
 
 
-def _operator_lane_refusal(command: str, invoking_env: dict) -> Optional[str]:
+def _operator_lane_refusal(
+    command: str, invoking_env: dict, agent_name: Optional[str] = None
+) -> Optional[str]:
     """Refuse a host lifecycle verb that lacks the operator lane (#3233).
 
     Decided here, at dispatch, so every entry — the ``kestrel`` binary,
@@ -2388,7 +2390,9 @@ def _operator_lane_refusal(command: str, invoking_env: dict) -> Optional[str]:
 
     if command not in LIFECYCLE_VERBS:
         return None
-    return operator_lane_refusal(command, _get_project_dir(), invoking_env)
+    return operator_lane_refusal(
+        command, _get_project_dir(), invoking_env, agent_name=agent_name
+    )
 
 
 def main() -> int:
@@ -2406,7 +2410,9 @@ def main() -> int:
         parser.print_help()
         return 1
 
-    refusal = _operator_lane_refusal(args.command, invoking_env)
+    refusal = _operator_lane_refusal(
+        args.command, invoking_env, getattr(args, "name", None)
+    )
     if refusal is not None:
         print(refusal, file=sys.stderr)
         return 1

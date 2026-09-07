@@ -350,7 +350,7 @@ def test_captured_output_is_safe_for_strict_cp1252_streams():
 def test_kestrel_uses_current_interpreter_and_module_entrypoint(monkeypatch):
     captured: list[str] = []
 
-    def fake_run_captured(command):
+    def fake_run_captured(command, env=None):
         captured.extend(command)
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -408,3 +408,29 @@ def test_main_dispatch_unknown_subcommand_exits():
     """Unknown subcommand should fail at argparse, not silently no-op."""
     with pytest.raises(SystemExit):
         verify.main(["nonexistent-sub"])
+
+
+def test_kestrel_presents_the_wizard_written_key_to_the_operator_lane(monkeypatch, tmp_path):
+    """Lifecycle verbs refuse without KESTREL_API_KEY in the invoking
+    environment (#3233); the CI script is the operator and passes the key
+    the wizard wrote to .env. An exported key wins over the file."""
+    seen = {}
+
+    def fake_run_captured(command, env=None):
+        seen["env"] = env
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(verify, "_run_captured", fake_run_captured)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    verify._kestrel("start", "Kestrel")
+    assert "KESTREL_API_KEY" not in seen["env"]
+
+    (tmp_path / ".env").write_text('KESTREL_DATA_KEY=x\nKESTREL_API_KEY="wizard-key"\n')
+    verify._kestrel("start", "Kestrel")
+    assert seen["env"]["KESTREL_API_KEY"] == "wizard-key"
+
+    monkeypatch.setenv("KESTREL_API_KEY", "exported-key")
+    verify._kestrel("start", "Kestrel")
+    assert seen["env"]["KESTREL_API_KEY"] == "exported-key"

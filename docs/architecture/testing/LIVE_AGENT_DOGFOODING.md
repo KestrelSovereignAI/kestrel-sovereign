@@ -143,6 +143,7 @@ worktree, run its **own** kestrel so the update targets the test env (not your p
 
 ```bash
 git -C <worktree> pull                    # get the new code
+set -a; source .env; set +a                # operator lane (#3233): the sovereign key must be exported
 <worktree>/.venv/bin/kestrel update       # syncs dependencies AND reconciles feature packages
 ```
 

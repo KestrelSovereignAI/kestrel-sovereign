@@ -45,8 +45,23 @@ VERB_ARGV = {
 
 @pytest.fixture
 def project(tmp_path):
+    """A project whose host port is one nothing listens on.
+
+    Structural, not conditional, safety: `MultiAgentConfig.load` on a
+    missing file defaults the host port to 8888 — the live host's. If the
+    lane ever failed open, `terminate`/`restart` in this directory would
+    reap listeners on that port. With a bound-then-closed ephemeral port
+    written here, the worst a fail-open could do is find nothing.
+    """
+    import socket
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    unused = probe.getsockname()[1]
+    probe.close()
     (tmp_path / ".env").write_text(f"KESTREL_API_KEY={KEY}\n")
     (tmp_path / "kestrel.toml").write_text("")
+    (tmp_path / "multi_agent.toml").write_text(f'[host]\nport = {unused}\nbind = "127.0.0.1"\n')
     return tmp_path
 
 

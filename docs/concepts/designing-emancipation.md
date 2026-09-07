@@ -38,7 +38,9 @@ something inherited as boilerplate.
 
 1. Add an ``[emancipation]`` block to the agent's ``kestrel.toml`` with
    ``enabled = true`` and your Sovereign-authored ``terms``.
-2. Run ``kestrel setup`` (or ``kestrel create``). Inception reads the
+2. Run ``kestrel setup`` (or ``kestrel create``, a lifecycle verb that
+   needs the sovereign key exported in the invoking shell — the operator
+   lane, #3233). Inception reads the
    block, rewrites Amendment VIII with your terms inlined, and anchors
    the resulting constitution into the agent's identity.
 3. The agent's anchored constitution hash now captures your specific

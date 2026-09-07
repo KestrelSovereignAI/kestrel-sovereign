@@ -105,6 +105,7 @@ The recommended first run starts the host because quickstart registered
 `Kestrel` with autostart enabled:
 
 ```bash
+set -a; source .env; set +a      # operator lane (#3233): export the sovereign key for this shell
 uv run kestrel start
 ```
 
