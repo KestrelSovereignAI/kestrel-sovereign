@@ -2361,7 +2361,7 @@ async def reflection_status(request: Request):
     return result
 
 
-def _task_recipient_principal(agent) -> str:
+def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:
     """Return the route-bound durable recipient, never request metadata.
 
     The agent's ``did`` through the shared guard, and only that. This used
@@ -2381,7 +2381,7 @@ def _task_recipient_principal(agent) -> str:
     except AgentIdentityUnavailable:
         raise HTTPException(
             status_code=503,
-            detail="A2A task reads require a durable recipient identity",
+            detail=f"A2A task {verb} a durable recipient identity",
         ) from None
 
 
@@ -3419,23 +3419,13 @@ async def cancel_task_from_peer(request: Request, task_id: str):
         message=Message(role="user", parts=[TextPart(text=reason)]),
         metadata=metadata,
     )
-    recipient_agent_id = next(
-        (
-            candidate
-            for candidate in (
-                getattr(agent.task_manager, "host_agent_id", None),
-                getattr(agent, "did", None),
-                getattr(agent, "agent_id", None),
-            )
-            if isinstance(candidate, str) and candidate
-        ),
-        None,
+    # The same recipient as every other task route. This used to try the
+    # task manager's ``host_agent_id`` first — a copy of the agent's own DID
+    # taken at construction — then ``did``, then ``agent_id``: a third
+    # resolution order over the one ``a2a_tasks`` table (#3246 review).
+    recipient_agent_id = _task_recipient_principal(
+        agent, verb="cancellation requires"
     )
-    if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
-        raise HTTPException(
-            status_code=503,
-            detail="A2A task cancellation requires a durable recipient identity",
-        )
 
     async def _cancel(authorized_sender_id: str):
         if not isinstance(authorized_sender_id, str) or not authorized_sender_id:

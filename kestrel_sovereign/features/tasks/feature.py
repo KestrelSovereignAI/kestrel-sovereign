@@ -111,15 +111,24 @@ class TaskFeature(Feature):
     # ------------------------------------------------------------------
 
     def _durable_agent_id(self) -> Optional[str]:
-        """Return the host's durable identity, never a display-derived name."""
+        """Return the host's durable identity, never a display-derived name.
 
-        if self.agent is None:
+        The agent's ``did`` through the shared guard; ``None`` when it has
+        none. This used to accept ``agent_id`` as a second choice. On every
+        real agent that is a property returning the DID, so the fallback
+        only ever admitted a test double carrying a bare ``agent_id`` — the
+        shape the guard refuses everywhere else (#3246).
+        """
+
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        try:
+            return resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable:
             return None
-        for attribute in ("did", "agent_id"):
-            value = getattr(self.agent, attribute, None)
-            if isinstance(value, str) and value:
-                return value
-        return None
 
     async def _get_task_status_data(self, task_id: str) -> Dict[str, Any]:
         """Fetch a task and shape its status into a dict.

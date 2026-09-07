@@ -934,7 +934,10 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
     agent.sleep_hooks = [object()]
     agent.features = {"SchedulerFeature": scheduler}
     agent._raw_storage = SimpleNamespace(db=db)
-    agent.did = "did:test:agent"
+    # The reflection route reads ``agent_id`` first (its own inline
+    # resolution, outside #3246): a MagicMock without it would bind a
+    # fabricated attribute as a SQL parameter.
+    agent.agent_id = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:

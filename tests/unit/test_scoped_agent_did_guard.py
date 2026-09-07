@@ -4,7 +4,12 @@ Four sites scoped a shared table to the calling agent and each carried
 its own copy of the check (observability #3215, the A2A task list, the
 consent log and audit anchors #3229/#3230); they had drifted — one gated
 on truthiness alone and would bind a non-string value as a query
-parameter. `resolve_scoped_agent_did` is the single copy.
+parameter. `resolve_scoped_agent_did` is the single copy. #3246 routed
+the remaining self-scoped reads of the same kind through it: the A2A
+task routes (reads, subscribe, cancel), the task feature's own durable
+identity, the task wait provider, the pre-turn sections and the restart
+status-events route. Other tables still resolve inline; the guard's
+docstring names them.
 """
 
 from __future__ import annotations
@@ -367,3 +372,72 @@ async def test_status_events_are_empty_without_a_did(monkeypatch, agent):
         "count": 0,
     }
     reads.assert_not_awaited()
+
+
+# -- the two sites the round-1 review found over the same a2a_tasks table --
+
+
+def test_task_feature_durable_identity_is_the_did_not_agent_id():
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    feature = TaskFeature(SimpleNamespace(agent_id=OTHER, did=ME))
+    assert feature._durable_agent_id() == ME
+    assert feature._recipient_agent_id() == ME
+
+
+@pytest.mark.parametrize("agent", _identity_cases() + [pytest.param(None, id="no-agent")])
+def test_task_feature_has_no_durable_identity_without_a_did(agent):
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    feature = TaskFeature(agent)
+    assert feature._durable_agent_id() is None
+    with pytest.raises(ValueError, match="identity unavailable"):
+        feature._recipient_agent_id()
+
+
+def _post_cancel(monkeypatch, agent):
+    """POST the cancel route on a real app: the route is rate-limited and
+    needs a real Starlette request."""
+    from fastapi.testclient import TestClient
+
+    from tests.unit.test_a2a_principal_reads import _principal_endpoint_app
+
+    app = _principal_endpoint_app(monkeypatch, agent)
+    body = {
+        "reason": "stop",
+        "sessionId": "s-1",
+        "metadata": {"a2a_verb": "cancel_task"},
+    }
+    with TestClient(app) as client:
+        return client.post("/api/agent/tasks/task-1/cancel", json=body)
+
+
+def test_cancel_route_refuses_when_only_the_task_manager_carries_an_id(monkeypatch):
+    """The route used to take ``task_manager.host_agent_id`` before the
+    agent's own DID. A manager that carries one while the agent has none
+    is now a 503, not a cancellation on the manager's copy."""
+    agent = SimpleNamespace(did="", task_manager=SimpleNamespace(host_agent_id=OTHER))
+    response = _post_cancel(monkeypatch, agent)
+    assert response.status_code == 503
+    assert "cancellation requires a durable recipient identity" in response.json()["detail"]
+
+
+def test_cancel_route_resolves_its_recipient_through_the_shared_helper(monkeypatch):
+    """Wiring: the route asks the one helper, with the agent (not the task
+    manager) and its own verb. A sentinel refusal proves the call site."""
+    from fastapi import HTTPException
+
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    asked = []
+
+    def sentinel(agent, *, verb="reads require"):
+        asked.append((agent, verb))
+        raise HTTPException(status_code=503, detail="sentinel")
+
+    monkeypatch.setattr(agent_endpoint, "_task_recipient_principal", sentinel)
+    agent = SimpleNamespace(did=ME, task_manager=SimpleNamespace(host_agent_id=OTHER))
+    response = _post_cancel(monkeypatch, agent)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "sentinel"
+    assert asked == [(agent, "cancellation requires")]
