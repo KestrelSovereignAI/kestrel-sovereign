@@ -177,7 +177,7 @@ window.previewFile = async function(filename) {
 
 window.downloadFile = function(filename) {
     const link = document.createElement('a');
-    link.href = `/api/sovereignty/files/${encodeURIComponent(filename)}`;
+    link.href = API.sovereigntyFileUrl(filename);
     link.download = filename;
     link.click();
     Toast.success('Download started');

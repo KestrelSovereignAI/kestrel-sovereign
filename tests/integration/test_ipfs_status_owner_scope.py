@@ -110,16 +110,18 @@ async def agents(db_backend, identities):
     )
 
 
-def _daemon(identities, *, fail=None):
+def _daemon(identities, *, fail=None, id_status=200, extra_pins=()):
     api = f"{model_endpoints.get_ipfs_api_url()}/api/v0"
     pins = {
         identities.mine_pinned: {"Type": "recursive"},
         identities.theirs_pinned: {"Type": "recursive"},
         identities.nobodys: {"Type": "recursive"},
     }
+    for cid in extra_pins:
+        pins[cid] = {"Type": "recursive"}
     return _Session(
         posts={
-            f"{api}/id": _Response(payload={"ID": "peer-123", "AgentVersion": "kubo/1.0.0"}),
+            f"{api}/id": _Response(status=id_status, payload={"ID": "peer-123", "AgentVersion": "kubo/1.0.0"}),
             f"{api}/version": _Response(payload={"Version": "1.2.3"}),
             f"{api}/pin/ls?type=recursive": _Response(payload={"Keys": pins}),
         },
@@ -136,8 +138,12 @@ def _gateways():
     })
 
 
-def _client(routed_agent, other_agent, caller) -> httpx.AsyncClient:
-    """Routed to one agent, app default another, caller as the auth middleware would attach."""
+def _client(routed_agent, other_agent, caller, *, agent_manager=None) -> httpx.AsyncClient:
+    """Routed to one agent, app default another, caller as the auth middleware would attach.
+
+    ``other_agent=None`` is the multi-agent host's shape: ``app.state.agent``
+    is None there and only the routing middleware names an agent.
+    """
     app = FastAPI()
 
     @app.middleware("http")
@@ -148,6 +154,8 @@ def _client(routed_agent, other_agent, caller) -> httpx.AsyncClient:
 
     app.include_router(model_endpoints.router)
     app.state.agent = other_agent
+    if agent_manager is not None:
+        app.state.agent_manager = agent_manager
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
 
 
@@ -273,3 +281,54 @@ async def test_node_view_gives_the_sovereign_the_whole_daemon(agents, identities
     assert node["pinned_total"] == 3
     assert "details" in node["backup_tier"]
     assert node["filecoin_adapter"] == {"configured": True, "cache_dir": "/host/storage_cache"}
+
+
+@pytest.mark.asyncio
+async def test_node_view_finds_the_adapter_on_a_multi_agent_host(identities):
+    """On a multi-agent host ``app.state.agent`` is None; the host view must
+    still carry the adapter, via the routed agent or any managed one."""
+    adapter = SimpleNamespace(filecoin_adapter=SimpleNamespace(cache_dir="/host/storage_cache"))
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=lambda t: [], sovereign_adapter=adapter)
+    routed = SimpleNamespace(did=identities.mine, agent_name="x", storage=storage)
+    with _sessions(_daemon(identities)):
+        async with _client(routed, None, CallerContext.sovereign()) as client:
+            node = (await client.get("/api/ipfs/node")).json()
+    assert node["filecoin_adapter"] == {"configured": True, "cache_dir": "/host/storage_cache"}
+
+    # Routed agent without an adapter, app default None, a managed peer has one.
+    bare = SimpleNamespace(did=identities.mine, agent_name="x",
+                           storage=SimpleNamespace(privacy_config=None, get_nodes_by_type=lambda t: []))
+    peer = SimpleNamespace(storage=SimpleNamespace(sovereign_adapter=adapter))
+    manager = SimpleNamespace(list_agents=lambda: {"Peer": peer})
+    with _sessions(_daemon(identities)):
+        async with _client(bare, None, CallerContext.sovereign(), agent_manager=manager) as client:
+            node = (await client.get("/api/ipfs/node")).json()
+    assert node["filecoin_adapter"]["cache_dir"] == "/host/storage_cache"
+
+
+@pytest.mark.asyncio
+async def test_an_erroring_daemon_is_not_reported_connected(identities):
+    async def nothing(node_type):
+        return []
+
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=nothing)
+    agent = SimpleNamespace(did=identities.mine, agent_name="x", storage=storage)
+    with _sessions(_daemon(identities, id_status=500), _gateways()):
+        async with _client(agent, agent, CallerContext.authenticated("u")) as client:
+            status = (await client.get("/api/ipfs/status")).json()
+    assert status["local_node"]["available"] is False
+    assert status["pinned_content"] == []
+
+
+@pytest.mark.asyncio
+async def test_node_view_caps_the_pin_list_but_reports_the_total(identities):
+    from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
+
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=lambda t: [])
+    agent = SimpleNamespace(did=identities.mine, agent_name="x", storage=storage)
+    extra = [f"bafyEXTRA{i}" for i in range(MAX_PINNED_ITEMS_DISPLAY)]
+    with _sessions(_daemon(identities, extra_pins=extra)):
+        async with _client(agent, agent, CallerContext.sovereign()) as client:
+            node = (await client.get("/api/ipfs/node")).json()
+    assert node["pinned_total"] == 3 + MAX_PINNED_ITEMS_DISPLAY
+    assert len(node["pinned_content"]) == MAX_PINNED_ITEMS_DISPLAY

@@ -1344,6 +1344,31 @@ def _filecoin_adapter(agent):
         return None
 
 
+def _host_filecoin_adapter(request: Request):
+    """The host's Filecoin adapter via whichever agent carries one.
+
+    Routed agent, then the app-level default, then any agent the manager
+    lists: the adapter's cache directory is process-global, so the first
+    configured one is the host's.
+    """
+    candidates = [
+        getattr(request.state, "agent", None),
+        getattr(request.app.state, "agent", None),
+    ]
+    manager = getattr(request.app.state, "agent_manager", None)
+    list_agents = getattr(manager, "list_agents", None)
+    if callable(list_agents):
+        try:
+            candidates.extend(list_agents().values())
+        except Exception:
+            pass
+    for agent in candidates:
+        adapter = _filecoin_adapter(agent)
+        if adapter is not None:
+            return adapter
+    return None
+
+
 @router.get("/api/ipfs/status")
 async def get_ipfs_status(request: Request):
     """The routed agent's view of IPFS.
@@ -1425,7 +1450,11 @@ async def get_ipfs_node(request: Request):
         ],
         "pinned_total": len(probe.pins),
     }
-    adapter = _filecoin_adapter(getattr(request.app.state, "agent", None))
+    # The adapter is one directory per host, so any agent's will do; the
+    # routed agent comes first because on a multi-agent host the app-level
+    # default is None and the host view would otherwise silently lose the
+    # one field it exists to carry.
+    adapter = _host_filecoin_adapter(request)
     if adapter is not None:
         cache_dir = getattr(adapter, "cache_dir", None)
         node["filecoin_adapter"] = {

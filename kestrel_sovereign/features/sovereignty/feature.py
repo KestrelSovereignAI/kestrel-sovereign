@@ -378,16 +378,32 @@ class SovereigntyFeature(Feature):
         try:
             adapter = FilecoinAdapter()
 
-            # Look up the backup artifact to check if it was encrypted
-            # The CID maps to a backup_artifact node with content_hash = cid
+            # The receipt is the gate, not a lookup for the key hash (#3225).
+            # ``retrieve_content`` reads ``storage_cache/{name}.cache`` by
+            # whatever name it is given, and the cache is one directory per
+            # host: without this, any co-hosted agent could name another
+            # agent's 64-hex content hash (which passes the CID pattern) and
+            # restore that agent's conversation history into its own
+            # database, or probe which hashes exist by the error text. A
+            # name this agent holds no receipt for is refused with the same
+            # message an absent artifact gets, before anything is read.
             backup_nodes = await self.agent.storage.get_nodes_by_type("backup_artifact")
-            key_hash = None
-
-            for node in backup_nodes:
-                if node.properties.get("ipfs_cid") == cid or node.node_id == cid:
-                    key_hash = node.properties.get("encryption_key_hash")
-                    logger.info(f"Found backup artifact node for CID {cid}, encrypted: {node.properties.get('encrypted')}")
-                    break
+            receipt = next(
+                (
+                    node for node in backup_nodes
+                    if node.properties.get("ipfs_cid") == cid or node.node_id == cid
+                ),
+                None,
+            )
+            if receipt is None:
+                logger.warning(
+                    f"Refused sovereignty import of {cid}: no backup receipt for it in this agent's storage"
+                )
+                return ToolResult.failed(
+                    error=f"Could not retrieve content for CID {cid}"
+                )
+            key_hash = receipt.properties.get("encryption_key_hash")
+            logger.info(f"Found backup artifact node for CID {cid}, encrypted: {receipt.properties.get('encrypted')}")
 
             # Retrieve content (will decrypt if key_hash provided)
             content = await asyncio.to_thread(

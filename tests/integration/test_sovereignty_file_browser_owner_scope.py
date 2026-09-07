@@ -39,6 +39,7 @@ def identities():
         mine=f"did:pkh:eip155:1:0xMINE{unique}",
         theirs=f"did:pkh:eip155:1:0xTHEIRS{unique}",
         mine_hash=hashlib.sha256(f"mine-{unique}".encode()).hexdigest(),
+        mine_bare_hash=hashlib.sha256(f"mine-bare-{unique}".encode()).hexdigest(),
         theirs_hash=hashlib.sha256(f"theirs-{unique}".encode()).hexdigest(),
         orphan_hash=hashlib.sha256(f"orphan-{unique}".encode()).hexdigest(),
     )
@@ -63,6 +64,7 @@ async def agents(db_backend, identities):
     await mine.initialize()
     await theirs.initialize()
     await mine.record_backup_artifact(identities.mine, _artifact(identities.mine_hash))
+    await mine.record_backup_artifact(identities.mine, _artifact(identities.mine_bare_hash))
     await theirs.record_backup_artifact(identities.theirs, _artifact(identities.theirs_hash))
     return (
         SimpleNamespace(did=identities.mine, agent_name="display-mine", storage=mine),
@@ -81,6 +83,8 @@ def cache_dir(tmp_path, identities, monkeypatch):
     cache.mkdir()
     (cache / f"{identities.mine_hash}.cache").write_bytes(b"mine-bytes")
     (cache / f"{identities.mine_hash}.meta").write_text(json.dumps({"agent": identities.mine}))
+    # Owned, but written without a sidecar (the pre-#1725 shape).
+    (cache / f"{identities.mine_bare_hash}.cache").write_bytes(b"bare")
     (cache / f"{identities.theirs_hash}.cache").write_bytes(b"theirs-bytes")
     (cache / f"{identities.theirs_hash}.meta").write_text(json.dumps({"agent": identities.theirs}))
     (cache / f"key_{identities.theirs_hash}.key").write_bytes(b"wrapped-key")
@@ -122,17 +126,22 @@ async def test_listing_shows_only_the_routed_agents_artifacts(agents, cache_dir,
     assert {f["name"] for f in mine_list["files"]} == {
         f"{identities.mine_hash}.cache",
         f"{identities.mine_hash}.meta",
+        f"{identities.mine_bare_hash}.cache",
     }, mine_list
+    bare = next(f for f in mine_list["files"] if f["hash"] == identities.mine_bare_hash)
+    assert bare["has_meta"] is False and bare["metadata"] is None
     assert {f["name"] for f in theirs_list["files"]} == {
         f"{identities.theirs_hash}.cache",
         f"{identities.theirs_hash}.meta",
         f"key_{identities.theirs_hash}.key",
     }, theirs_list
-    assert mine_list["file_count"] == 2 and theirs_list["file_count"] == 3
-    assert mine_list["total_size"] == len(b"mine-bytes") + len(json.dumps({"agent": identities.mine}))
+    assert mine_list["file_count"] == 3 and theirs_list["file_count"] == 3
+    assert mine_list["total_size"] == (
+        len(b"mine-bytes") + len(json.dumps({"agent": identities.mine})) + len(b"bare")
+    )
     # Host layout is not the agent's to see.
     assert "cache_dir" not in mine_list
-    cache_entry = next(f for f in mine_list["files"] if f["type"] == "cache")
+    cache_entry = next(f for f in mine_list["files"] if f["hash"] == identities.mine_hash and f["type"] == "cache")
     assert cache_entry["has_meta"] is True
     assert cache_entry["metadata"] == {"agent": identities.mine}
     assert cache_entry["hash"] == identities.mine_hash
