@@ -12,6 +12,11 @@ from typing import ClassVar, Optional
 
 from kestrel_sdk.tools import Outcome, WaitStatus
 
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_scoped_agent_did,
+)
+
 
 class TaskWaitable:
     """Polls a Kestrel A2A background task by id."""
@@ -40,14 +45,21 @@ class TaskWaitable:
         Returns ``None`` (unverifiable → caller fails open) when no task
         manager is wired or the lookup raises, so a transient backend hiccup
         never blocks an otherwise-valid watch.
+
+        An agent with no usable DID owns nothing (``False``), and that is
+        decided before the catch-all: resolved inside it, the guard's
+        refusal would read as a backend hiccup and fail open.
         """
         manager = getattr(self._feature, "task_manager", None)
         if manager is None:
             return None
         try:
-            recipient_agent_id = getattr(self._feature.agent, "did", None)
-            if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
-                return False
+            recipient_agent_id = resolve_scoped_agent_did(
+                getattr(self._feature, "agent", None)
+            )
+        except AgentIdentityUnavailable:
+            return False
+        try:
             task = await manager.get_task_for_recipient(
                 handle,
                 recipient_agent_id,

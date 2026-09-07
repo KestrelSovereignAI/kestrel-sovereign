@@ -2362,16 +2362,27 @@ async def reflection_status(request: Request):
 
 
 def _task_recipient_principal(agent) -> str:
-    """Return the route-bound durable recipient, never request metadata."""
+    """Return the route-bound durable recipient, never request metadata.
 
-    for attribute in ("agent_id", "did"):
-        value = getattr(agent, attribute, None)
-        if isinstance(value, str) and value:
-            return value
-    raise HTTPException(
-        status_code=503,
-        detail="A2A task reads require a durable recipient identity",
+    The agent's ``did`` through the shared guard, and only that. This used
+    to try ``agent_id`` first, so the one ``a2a_tasks`` table was scoped by
+    a different resolution order here than under ``!tasks``; the two agreed
+    only because ``KestrelAgent.agent_id`` returns ``self.did``, which
+    neither surface asserted (#3246).
+    """
+
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
     )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="A2A task reads require a durable recipient identity",
+        ) from None
 
 
 @router.get("/tasks")

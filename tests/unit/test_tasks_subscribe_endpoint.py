@@ -51,18 +51,18 @@ def _stub_agent_with_task(*, task_present: bool, sse_frames):
     or None per ``task_present``. ``sse_frames`` is an iterable of dicts
     matching the shape ``TaskManager.subscribe`` emits."""
     agent = MagicMock()
-    agent.agent_id = "did:test:agent"
+    agent.did = "did:test:agent"
     agent.task_manager = MagicMock()
     agent.task_manager.task_store = MagicMock()
 
     async def fake_get(task_id, recipient_agent_id):
-        assert recipient_agent_id == agent.agent_id
+        assert recipient_agent_id == agent.did
         return MagicMock() if task_present else None
 
     agent.task_manager.get_task_for_recipient = fake_get
 
     async def fake_subscribe(task_id, *, recipient_agent_id):
-        assert recipient_agent_id == agent.agent_id
+        assert recipient_agent_id == agent.did
         for frame in sse_frames:
             yield frame
 
@@ -86,7 +86,7 @@ def _set_scope_state_agent(app: FastAPI, agent) -> None:
 
 def test_subscribe_returns_404_when_task_manager_missing(app_with_subscribe):
     agent = MagicMock()
-    agent.agent_id = "did:test:agent"
+    agent.did = "did:test:agent"
     agent.task_manager = None
     _set_scope_state_agent(app_with_subscribe, agent)
 

@@ -79,14 +79,13 @@ def resolve_scoped_agent_did(agent: Any) -> str:
 
     The guard for the sites that scope a shared table to the calling agent
     and route through it: the consent log and audit anchors (#3229/#3230),
-    observability (#3215), and the ``!tasks`` command. They had drifted —
-    one gated on truthiness alone, so a non-string truthy value was bound
-    as a query parameter. Other self-scoped reads still resolve the DID
-    inline (`endpoints/agent.py` ``_task_recipient_principal``,
-    `features/tasks/wait_provider.py`, `agent/preturn_state.py`,
-    `endpoints/restart_events.py`); routing them here is tracked as a
-    follow-up, so grep for ``"did"`` in a gating position before adding
-    another copy.
+    observability (#3215), the ``!tasks`` command, and since #3246 the
+    A2A task routes' recipient, the task wait provider's ownership check,
+    the pre-turn state sections, and the restart status-events route.
+    They had drifted — one gated on truthiness alone, so a non-string
+    truthy value was bound as a query parameter, and the task routes read
+    ``agent_id`` before ``did``. Grep for ``"did"`` in a gating position
+    before adding another copy.
 
     A missing, empty, or non-string DID is "cannot be scoped", never
     "unscoped": the caller refuses (a store that gates on ``if agent_id:``
