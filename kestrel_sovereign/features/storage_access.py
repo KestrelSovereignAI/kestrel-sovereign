@@ -84,10 +84,13 @@ def resolve_scoped_agent_did(agent: Any) -> str:
 
     A missing, empty, or non-string DID is "cannot be scoped", never
     "unscoped": the caller refuses (a store that gates on ``if agent_id:``
-    turns an empty string into every agent's rows). Read without MagicMock
-    fabrication, so a test double that never set a DID is refused too.
+    turns an empty string into every agent's rows). A plain read, not the
+    module's mock-safe one: the agent protocol declares ``did`` and an
+    implementation may back it with a property, which ``_safe_attr`` would
+    refuse; a MagicMock's fabricated attribute is not a string and is
+    refused by the type check regardless.
     """
-    did = _safe_attr(agent, "did")
+    did = getattr(agent, "did", None)
     if not isinstance(did, str) or not did:
         raise AgentIdentityUnavailable("agent identity unavailable")
     return did

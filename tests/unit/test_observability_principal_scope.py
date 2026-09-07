@@ -200,6 +200,9 @@ def test_the_metrics_route_no_longer_accepts_an_agent_name_parameter():
         pytest.param({}, id="attribute-absent"),
         pytest.param({"did": None}, id="did-is-none"),
         pytest.param({"did": ""}, id="did-is-empty-string"),
+        # A truthy non-string: the old site-local gate would have bound it
+        # as a query parameter; the shared guard refuses it.
+        pytest.param({"did": 12345}, id="did-is-not-a-string"),
     ],
 )
 async def test_an_agent_without_a_resolvable_identity_is_refused(
