@@ -33,6 +33,38 @@ MAX_DELAY = 60.0      # seconds
 THROTTLE_MAX_RETRIES = 8
 THROTTLE_MAX_DELAY = 120.0
 
+# PLAN-LIMIT budget — deliberately much tighter than the throttle budget.
+#
+# The throttle budget sleeps 127-134s across its 8 attempts. The orchestrator
+# wraps the whole provider call in `asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS)`
+# = 180s (orchestrator_engine.py:94,3081,3093), and that watchdog is NOT lifted
+# for a cloud route (`effective_request_timeout` returns None unless EVERY
+# candidate is local, service.py:2158). Spending 131s of a 180s turn on sleep
+# leaves under 50s for the HTTP round-trips AND the streamed generation, so a
+# window that cleared on attempt 7 or 8 — exactly the case patience exists for —
+# would be killed by the watchdog and reported as `timeout after 180s`. That is
+# worse than the hard failure this retry replaces: it converts a diagnosable
+# error into a hang marker, and it defeats the fix precisely when it works.
+#
+# So this budget is sized to be a small fraction of the watchdog: 5 attempts,
+# sleeps 1+2+4+8 = 15s (+ up to 4s jitter). It covers a brief blip and nothing
+# more.
+#
+# It does NOT cover the ~3-minute window measured on 2026-09-04 (16:31 open,
+# closed by 16:34), and it deliberately does not try: no retry budget can ride
+# out a 180s window from inside a 180s watchdog. Widening the watchdog to suit
+# is a turn-latency decision that belongs to the orchestrator, not to this
+# module. When the budget is exhausted the provider's own message ("You're out
+# of extra usage...") propagates, which names the real cause.
+#
+# The tight bound is also what keeps a GENUINELY exhausted account from
+# stalling: this message is not always spurious — with credits enabled and
+# drained, or a real cap reached, Anthropic returns the same 400 for hours.
+# At 8 attempts / 131s every call would burn two minutes forever, which is the
+# "retrying a dead key burns wall-time" pattern this module exists to avoid.
+PLAN_LIMIT_MAX_RETRIES = 5
+PLAN_LIMIT_MAX_DELAY = 16.0
+
 # HTTP status codes that warrant retry. 401/403/404 are permanent and MUST
 # NOT appear here — retrying a dead API key burns wall-time on an error that
 # will never recover.
@@ -52,6 +84,29 @@ RETRYABLE_PATTERNS = [
     "capacity",
     "try again",
 ]
+
+# Subscription/plan-route limit reported with a NON-429 status.
+#
+# Anthropic's subscription endpoint reports a transient plan-limit window as
+# ``400 invalid_request_error`` with billing wording ("You're out of extra
+# usage..."), NOT as the ``429 rate_limit_error`` that #2074 taught the retry
+# layer to ride out. Both are the same condition — a window that clears on its
+# own — so both must get the patient throttle budget.
+#
+# Measured 2026-09-04: the 400 window lasted ~3 minutes and cleared with no
+# intervention, while the account's plan usage sat at 3% (session) / 4%
+# (weekly) and its usage credits were switched OFF with a $0.00 balance. So
+# the message names a billing surface the request never actually reached; the
+# status code is the only thing that differs from the 429 form. Without this,
+# NON_RETRYABLE_STATUS_CODES short-circuits a 400 to zero retries and the
+# window surfaces to the operator as a hard route failure.
+#
+# Matched against the message BEFORE the status-code short-circuit, and kept
+# narrow on purpose: a genuine malformed-request 400 must stay permanent.
+PLAN_LIMIT_PATTERNS = [
+    "out of extra usage",
+]
+
 
 # Error message patterns that indicate permanent failure. Matched FIRST —
 # takes precedence over RETRYABLE_PATTERNS to prevent a 401 message that
@@ -111,11 +166,44 @@ def retry_after_seconds(error: Exception) -> Optional[float]:
     return None
 
 
+def is_plan_limit_error(error: Exception) -> bool:
+    """True when ``error`` is a subscription plan-limit window reported with a
+    non-429 status (see ``PLAN_LIMIT_PATTERNS``).
+
+    Classified on the message because the status code is precisely what makes
+    this shape indistinguishable from a caller error.
+    """
+    # Scoped to 400 on purpose. The wording alone is not enough: a dead key
+    # or a missing model whose message happens to carry it ("401 Invalid API
+    # key. You're out of extra usage.") would otherwise be handed a retry
+    # budget, and `with_retry` is shared by every adapter, not just Anthropic.
+    # Verified before scoping: 401/403/404 carrying the phrase all classified
+    # retryable. Reachability was low, but the narrowness the comment above
+    # claims has to be in the code, not only in the intent.
+    status_code = getattr(error, "status_code", None)
+    error_str = str(error).lower()
+    if isinstance(status_code, int):
+        if status_code != 400:
+            return False
+    elif not _mentions_status_400(error_str):
+        return False
+    return any(pattern in error_str for pattern in PLAN_LIMIT_PATTERNS)
+
+
+def _mentions_status_400(error_str: str) -> bool:
+    """Whether an unstructured error text names HTTP 400, with the same
+    word-boundary care ``is_retryable_error`` uses for status tokens."""
+    return (" 400" in error_str or "400 " in error_str or "400:" in error_str
+            or "400," in error_str or "400-" in error_str
+            or "code: 400" in error_str or error_str.startswith("400"))
+
+
 def is_retryable_error(error: Exception) -> bool:
     """
     Check if an error is transient and should be retried.
 
     Order of checks:
+      0. PLAN_LIMIT_PATTERNS (plan window wearing a non-429 status) → retry.
       1. NON_RETRYABLE_STATUS_CODES (401/403/404/422/400) → no retry.
       2. NON_RETRYABLE_PATTERNS (auth/quota/invalid) → no retry.
       3. RETRYABLE_STATUS_CODES (429/5xx) → retry.
@@ -132,7 +220,13 @@ def is_retryable_error(error: Exception) -> bool:
     text doesn't literally contain the number — we classify on the actual
     error, not a hopeful substring.
     """
-    # 0. Structured status code from the SDK exception (most authoritative).
+    # 0a. Plan-limit window wearing a non-429 status. Checked before the
+    #     status-code short-circuit below, which would otherwise classify the
+    #     400 form as a permanent caller error and skip retry entirely.
+    if is_plan_limit_error(error):
+        return True
+
+    # 0b. Structured status code from the SDK exception (most authoritative).
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         if status_code in NON_RETRYABLE_STATUS_CODES:
@@ -234,9 +328,21 @@ async def with_retry(
 
             # Pick the budget from the error type: patient for a throttle,
             # tight for any other transient error.
-            throttled = _is_throttle_error(e)
-            eff_max_retries = throttle_max_retries if throttled else max_retries
-            eff_max_delay = throttle_max_delay if throttled else max_delay
+            # A plan-limit window is checked FIRST: it is neither a 429
+            # throttle (whose patient budget would overrun the turn watchdog)
+            # nor an ordinary transient error.
+            if is_plan_limit_error(e):
+                budget_kind = "plan_limit"
+                eff_max_retries = PLAN_LIMIT_MAX_RETRIES
+                eff_max_delay = PLAN_LIMIT_MAX_DELAY
+            elif _is_throttle_error(e):
+                budget_kind = "throttle"
+                eff_max_retries = throttle_max_retries
+                eff_max_delay = throttle_max_delay
+            else:
+                budget_kind = "default"
+                eff_max_retries = max_retries
+                eff_max_delay = max_delay
 
             if attempt >= eff_max_retries - 1:
                 raise
@@ -254,8 +360,8 @@ async def with_retry(
             # fallback) is visible, not silent.
             status_code = getattr(e, "status_code", None)
             logger.warning(
-                "LLM retry %d/%d after %.1fs (status=%s, throttle=%s, retry_after=%s): %s: %s",
-                attempt + 1, eff_max_retries, delay, status_code, throttled,
+                "LLM retry %d/%d after %.1fs (status=%s, budget=%s, retry_after=%s): %s: %s",
+                attempt + 1, eff_max_retries, delay, status_code, budget_kind,
                 advised, type(e).__name__, e,
             )
             await asyncio.sleep(delay)
