@@ -420,14 +420,30 @@ async def test_a_standalone_agent_has_no_host_and_no_peers(tmp_path, sqlite_data
 
 
 @pytest.mark.asyncio
-async def test_a_host_answer_that_is_not_a_mapping_is_a_host_bug(tmp_path, sqlite_database_factory):
-    db = await sqlite_database_factory(tmp_path / "solo.db")
-    agent = _make_feature_agent(db=db)
-    agent._host_webhook_collisions = lambda **_kw: "deposit"
-    feat = WebhookFeature(agent)
-    await feat.initialize()
-    with pytest.raises(RuntimeError, match="not a mapping"):
-        await feat.webhooks_list()
+async def test_a_host_answer_that_is_not_a_mapping_is_logged_not_trusted(tmp_path, sqlite_database_factory):
+    """A host bug is named in the log and answered as "no collisions" —
+    never as a collision, and never as a failed read (review r3 F3)."""
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.feature")
+    target.addHandler(handler)
+    try:
+        db = await sqlite_database_factory(tmp_path / "solo.db")
+        agent = _make_feature_agent(db=db)
+        agent._host_webhook_collisions = lambda **_kw: "deposit"
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        listing = await feat.webhooks_list()
+        assert listing.status.name == "OK"
+        assert listing.data["collisions"] == {}
+        assert any("not a mapping" in m for m in records)
+    finally:
+        target.removeHandler(handler)
 
 
 @pytest.mark.asyncio
@@ -455,6 +471,7 @@ async def test_registration_colliding_with_this_agents_own_receiver_names_no_add
         assert "unregister one of them" in reg.error
         assert "point each sender" not in reg.error
         assert "/api/agents/emma/webhooks/deposit" not in reg.error
+        assert "/api/agents/emma/webhooks/deposit" not in reg.confirmation  # r3 F4
         (message,) = host_log.about("deposit")
         assert "of one agent (emma)" in message
         # The surfaces the owner reads say the same thing (review r2 F1).
@@ -520,8 +537,13 @@ def test_describer_cross_agent_points_at_the_prefixed_address():
     text = describe_collision("deposit", ["a", "b"])
     assert "owned by 2 enabled receivers on this host (agents: a, b)" in text
     assert "point each sender at /api/agents/<agent>/webhooks/deposit" in text
-    own = describe_collision("deposit", ["a", "b"], own_endpoint="/api/agents/a/webhooks/deposit")
+    own = describe_collision(
+        "deposit", ["a", "b"], own_label="a", own_endpoint="/api/agents/a/webhooks/deposit"
+    )
     assert "point each sender at /api/agents/a/webhooks/deposit" in own
+    # An endpoint without the label it belongs to is never printed.
+    anonymous = describe_collision("deposit", ["a", "b"], own_endpoint="/api/agents/a/webhooks/deposit")
+    assert "/api/agents/a/webhooks/deposit" not in anonymous
 
 
 def test_describer_within_one_agent_names_no_address():
@@ -545,7 +567,7 @@ def test_describer_mixed_ownership_says_both():
     assert "3 enabled receivers on this host (agents: emma, emma, nellie)" in text
     assert "for emma the agent-prefixed form is refused too" in text
     assert "one of them must be unregistered" in text
-    assert "other senders use /api/agents/<agent>/webhooks/deposit" in text
+    assert "senders of nellie use /api/agents/<agent>/webhooks/deposit" in text
     assert "point each sender" not in text
 
 
@@ -578,8 +600,14 @@ async def test_mixed_ownership_is_described_the_same_on_every_surface(
         for label, text in surfaces.items():
             assert "for emma the agent-prefixed form is refused too" in text, label
             assert "point each sender" not in text, label
-        assert "other senders use /api/agents/emma/webhooks/deposit" in surfaces["register"]
-        assert "other senders use /api/agents/nellie/webhooks/deposit" in surfaces["nellie list"]
+            # Review r3 F1: emma's own prefixed form is refused, so no surface
+            # — least of all emma's own — may hand it out.
+            assert "/api/agents/emma/webhooks/deposit" not in text, label
+        assert "senders of nellie use /api/agents/<agent>/webhooks/deposit" in surfaces["register"]
+        assert "senders of nellie use /api/agents/nellie/webhooks/deposit" in surfaces["nellie list"]
+        # Review r3 F4: the confirmation is worded after the consult.
+        assert "/api/agents/emma/webhooks/deposit" not in reg.confirmation
+        assert reg.data["agent_endpoint"] == "/api/agents/emma/webhooks/deposit"
     finally:
         from kestrel_sovereign.server import _unmount_feature_routers
 
@@ -712,3 +740,75 @@ async def test_a_rollback_that_reactivates_a_feature_announces():
     )
     assert feature.enabled is True
     assert announced == [True]
+
+
+def test_describer_two_agents_each_with_two_receivers_is_not_one_agent():
+    """Review r3 F2: ``duplicated and not single`` also matched two agents
+    that each own the name twice; that is not "one agent" and no
+    agent-prefixed form dispatches until each unregisters one."""
+    from kestrel_sovereign.features.webhooks.collision import describe_collision
+
+    text = describe_collision("deposit", ["a", "a", "b", "b"], own_label="a",
+                              own_endpoint="/api/agents/a/webhooks/deposit")
+    assert "of one agent" not in text
+    assert "each of a, b through two of its own receivers" in text
+    assert "every agent-prefixed form are refused" in text
+    assert "/api/agents/a/webhooks/deposit" not in text
+
+
+def test_describer_prints_the_readers_address_only_where_it_dispatches():
+    from kestrel_sovereign.features.webhooks.collision import (
+        describe_collision,
+        prefixed_form_dispatches,
+    )
+
+    owners = ["emma", "emma", "nellie"]
+    assert prefixed_form_dispatches(owners, "nellie") is True
+    assert prefixed_form_dispatches(owners, "emma") is False
+    assert prefixed_form_dispatches(owners, None) is False
+    emma = describe_collision("deposit", owners, own_label="emma",
+                              own_endpoint="/api/agents/emma/webhooks/deposit")
+    assert "/api/agents/emma/webhooks/deposit" not in emma
+    assert "senders of nellie use /api/agents/<agent>/webhooks/deposit" in emma
+    nellie = describe_collision("deposit", owners, own_label="nellie",
+                                own_endpoint="/api/agents/nellie/webhooks/deposit")
+    assert "senders of nellie use /api/agents/nellie/webhooks/deposit" in nellie
+
+
+@pytest.mark.asyncio
+async def test_a_raising_host_report_does_not_fail_registration_or_reads(
+    tmp_path, sqlite_database_factory
+):
+    """Review r3 F3: the registration consult is audit-class, like the
+    host's enable/rollback announce. The webhook is live and persisted; the
+    reply says so; the failure is logged, not returned."""
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.feature")
+    target.addHandler(handler)
+    try:
+        db = await sqlite_database_factory(tmp_path / "raise.db")
+        agent = _make_feature_agent(db=db)
+
+        def broken(*, announce=True):
+            raise RuntimeError("a peer's feature property blew up")
+
+        agent._host_webhook_collisions = broken
+        feat = WebhookFeature(agent)
+        await feat.initialize()
+        reg = await feat.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        assert reg.status.name == "OK", reg
+        assert "deposit" in feat.receiver.webhooks
+        assert "owners" not in reg.data
+        assert (await feat.webhooks_list()).status.name == "OK"
+        assert (await feat.webhooks_history()).data["collisions"] == {}
+        assert sum("collision report failed" in m and "blew up" in m for m in records) >= 3
+    finally:
+        target.removeHandler(handler)

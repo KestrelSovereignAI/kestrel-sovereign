@@ -25,7 +25,10 @@ from typing import Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.features.storage_access import installed_host_hook
-from kestrel_sovereign.features.webhooks.collision import describe_collision
+from kestrel_sovereign.features.webhooks.collision import (
+    describe_collision,
+    prefixed_form_dispatches,
+)
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -219,13 +222,30 @@ class WebhookFeature(Feature):
         hook = installed_host_hook(self.agent, "_host_webhook_collisions")
         if hook is None:
             return {}
-        answer = hook(announce=announce)
-        if not isinstance(answer, dict):
-            raise RuntimeError(
-                "host webhook collision hook returned "
-                f"{type(answer).__name__}, not a mapping"
+        # The scan walks every peer agent's features: audit-class work that
+        # must never turn a committed registration, or an unrelated read,
+        # into a failure (the same rule the host's enable/rollback announce
+        # follows). A failure is logged with the moment it was asked at.
+        try:
+            answer = hook(announce=announce)
+            if not isinstance(answer, dict):
+                raise RuntimeError(
+                    "host webhook collision hook returned "
+                    f"{type(answer).__name__}, not a mapping"
+                )
+            return {
+                str(name): [str(owner) for owner in owners]
+                for name, owners in answer.items()
+            }
+        except Exception as exc:  # noqa: BLE001 - the caller's operation stands
+            logger.warning(
+                "WebhookFeature: host webhook collision report failed "
+                "(announce=%s): %s: %s",
+                announce,
+                type(exc).__name__,
+                exc,
             )
-        return {str(name): [str(owner) for owner in owners] for name, owners in answer.items()}
+            return {}
 
     def _agent_prefixed_endpoint(self, name: str) -> Optional[str]:
         """This agent's own ``/api/agents/{routing name}/webhooks/{name}``.
@@ -237,19 +257,31 @@ class WebhookFeature(Feature):
         no ``/api/agents/*`` route at all, and a fenced spawn route resolves
         to ``None``. In both cases no address is invented.
         """
+        routing_name = self._routing_name()
+        if routing_name is not None:
+            return f"/api/agents/{routing_name}/webhooks/{name}"
+        return None
+
+    def _routing_name(self) -> Optional[str]:
+        """The routing name the host registered this agent under, or None."""
         manager = getattr(self.agent, "_agent_manager", None)
         routing_name = (
             manager.get_agent_name(self._agent_id) if manager is not None else None
         )
         if isinstance(routing_name, str) and routing_name:
-            return f"/api/agents/{routing_name}/webhooks/{name}"
+            return routing_name
         return None
 
     def _collision_note(self, collisions: Dict[str, List[str]]) -> str:
-        """Every collided name with the remedy the refusal itself implies."""
+        """Every collided name with the remedy the refusal itself implies;
+        this agent's own address only where it dispatches to this agent."""
+        own_label = self._routing_name()
         return "; ".join(
             describe_collision(
-                name, owners, own_endpoint=self._agent_prefixed_endpoint(name)
+                name,
+                owners,
+                own_label=own_label,
+                own_endpoint=self._agent_prefixed_endpoint(name),
             )
             for name, owners in sorted(collisions.items())
         )
@@ -563,23 +595,29 @@ class WebhookFeature(Feature):
         # manager and serves no ``/api/agents/*`` route at all, and a fenced
         # spawn route resolves to ``None``. In both cases no address is
         # invented.
+        # The host, not this feature, knows whether another agent already
+        # owns the name (#3239). Announced: this is the registration moment
+        # of the operator report. The incumbent owner reads the same answer
+        # in its own webhooks_list / webhooks_history. Consulted BEFORE the
+        # confirmation is worded, so one reply cannot hand out an address its
+        # own warning says is refused.
+        owners = self._host_collisions(announce=True).get(name) or []
+        if owners:
+            data["owners"] = owners
+
+        routing_name = self._routing_name()
         agent_endpoint = self._agent_prefixed_endpoint(name)
         if agent_endpoint is not None:
             data["agent_endpoint"] = agent_endpoint
+        if agent_endpoint is not None and (
+            not owners or prefixed_form_dispatches(owners, routing_name)
+        ):
             confirmation += (
                 f" On a host running more than one agent, point the sender at "
                 f"{agent_endpoint}: the unprefixed /webhooks/{name} form is "
                 f"refused (404, no dispatch) whenever another agent also "
                 f"registers '{name}'."
             )
-
-        # The host, not this feature, knows whether another agent already
-        # owns the name (#3239). Announced: this is the registration moment
-        # of the operator report. The incumbent owner reads the same answer
-        # in its own webhooks_list / webhooks_history.
-        owners = self._host_collisions(announce=True).get(name)
-        if owners:
-            data["owners"] = owners
 
         # Collect any conditions that warrant a PARTIAL (vs a clean OK).
         warnings: List[str] = []
@@ -588,7 +626,9 @@ class WebhookFeature(Feature):
             # remedy is the refusal's own (#3216), never an address it refuses.
             warnings.append(
                 "NAME COLLISION from this moment: "
-                + describe_collision(name, owners, own_endpoint=agent_endpoint)
+                + describe_collision(
+                    name, owners, own_label=routing_name, own_endpoint=agent_endpoint
+                )
             )
         if is_unauthenticated and not allow_unauthenticated:
             warnings.append(
