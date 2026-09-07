@@ -143,6 +143,23 @@ def test_every_lifecycle_verb_runs_for_the_operator(verb, project, monkeypatch):
     mocked.assert_called_once()
 
 
+def test_dispatch_hands_the_named_agent_to_the_lane(project, monkeypatch, capsys):
+    """`kestrel terminate Nellie` must check Nellie's port, not only the host's:
+    the host port is free here, Nellie's is held by something that refuses."""
+    (project / "multi_agent.toml").write_text(
+        "[host]\nport = 8912\n\n[agents.Nellie]\ndata_dir = \"agent_data/nellie\"\nport = 8802\n"
+    )
+    monkeypatch.setattr(operator_lane, "held_port_admits", _held({8802: False}))
+    monkeypatch.setattr(sys, "argv", ["kestrel", "terminate", "Nellie"])
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": KEY}, clear=True):
+        with patch.object(cli, "cmd_terminate") as terminate:
+            rc = cli.main()
+    assert rc == 1
+    terminate.assert_not_called()
+    assert "holds :8802" in capsys.readouterr().err
+
+
 def test_non_lifecycle_verbs_need_no_lane(project, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["kestrel", "status"])
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
