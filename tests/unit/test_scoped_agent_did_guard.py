@@ -441,3 +441,65 @@ def test_cancel_route_resolves_its_recipient_through_the_shared_helper(monkeypat
     assert response.status_code == 503
     assert response.json()["detail"] == "sentinel"
     assert asked == [(agent, "cancellation requires")]
+
+
+# -- the write side of the same table (review r2) ---------------------------
+
+
+def _send_params():
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+
+    return TaskSendParams(
+        id="task-1",
+        sessionId="sess-1",
+        message=Message(role="user", parts=[TextPart(text="do it")]),
+        metadata={"sender": OTHER},
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_creation_refuses_a_recipient_without_a_did_before_verifying():
+    """The creation path used to file the row under ``did``, else the display
+    name, else ``"unknown"`` — a fourth resolution order over the same table
+    the reads now guard. No identity: 503, and nothing is verified or
+    created."""
+    from fastapi import HTTPException
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    task_manager = MagicMock()
+    task_manager.create_task = AsyncMock()
+    agent = SimpleNamespace(did="", _agent_name="recipient", task_manager=task_manager)
+    params = _send_params()
+    with pytest.raises(HTTPException) as excinfo:
+        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
+            agent, params, params.message.parts, [], [], manager=None
+        )
+    assert excinfo.value.status_code == 503
+    assert "creation requires a durable recipient identity" in excinfo.value.detail
+    task_manager.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_creation_resolves_its_recipient_through_the_shared_helper(monkeypatch):
+    """Wiring: creation asks the one helper with the agent and its own verb,
+    and an action carrying a ``commit`` does not (its route already did)."""
+    from fastapi import HTTPException
+
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    asked = []
+
+    def sentinel(agent, *, verb="reads require"):
+        asked.append((agent, verb))
+        raise HTTPException(status_code=503, detail="sentinel")
+
+    monkeypatch.setattr(agent_endpoint, "_task_recipient_principal", sentinel)
+    agent = SimpleNamespace(did=ME, _agent_name=OTHER, task_manager=MagicMock())
+    params = _send_params()
+    with pytest.raises(HTTPException, match="sentinel"):
+        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
+            agent, params, params.message.parts, [], [], manager=None
+        )
+    assert asked == [(agent, "creation requires")]

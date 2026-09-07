@@ -2663,6 +2663,17 @@ async def _create_a2a_task_under_lifecycle_lease(
         verify_inbound_envelope,
     )
 
+    recipient_agent_id = None
+    if commit is None:
+        # The recipient a new task is filed under is the same principal
+        # every read of the table resolves (#3246 review r2). Decided before
+        # any verification work: a recipient with no identity cannot file a
+        # task whatever the sender proves. Actions carrying a ``commit``
+        # resolve their own recipient at their route.
+        recipient_agent_id = _task_recipient_principal(
+            agent, verb="creation requires"
+        )
+
     if hosted_policy is not None:
         inbound_authorizer = hosted_policy.authorizer
         # Hosted recipients normally require a verified sender.  Keep the
@@ -2939,15 +2950,10 @@ async def _create_a2a_task_under_lifecycle_lease(
                 status_code=500, detail="Failed to commit A2A action"
             ) from exc
 
-    local_name = (
-        getattr(agent, "did", None)
-        or getattr(agent, "_agent_name", None)
-        or "unknown"
-    )
     try:
         return await agent.task_manager.create_task(
             params=params,
-            agent_name=local_name,
+            agent_name=recipient_agent_id,
             artifacts=sender_artifacts or None,
             creator_agent_id=authorized_sender_id,
         )
