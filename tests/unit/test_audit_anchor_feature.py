@@ -138,6 +138,9 @@ async def _make_mock_agent(tmp_path, audit_entries=None):
     """Create a mock agent with storage and optionally a SecurityFeature."""
     agent = MagicMock()
     agent.agent_id = "test-agent-001"
+    # audit_anchors rows are written and read under `agent.did` (#3230); a
+    # MagicMock attribute is not an identity and the feature refuses it.
+    agent.did = "did:test:anchor-agent-001"
 
     # Mock AsyncStorage
     storage = MagicMock()
