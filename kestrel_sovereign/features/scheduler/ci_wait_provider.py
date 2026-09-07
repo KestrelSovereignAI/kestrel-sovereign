@@ -187,6 +187,19 @@ def classify_ci_state(
     )
 
 
+class _UnderscopedToken(Exception):
+    """The credential can read the PR but not its checks.
+
+    Distinct from a transient auth blip on purpose. This module's contract is
+    that every observed state must be either terminal or provably
+    still-progressing (#2939), and an under-scoped token is neither: nothing
+    is progressing, and nothing will change until a human edits the token's
+    permissions. Reported as ordinary PENDING it is indistinguishable from a
+    gate that is merely slow — which is how a wait sat blind for 920 seconds
+    on 2026-09-07 while ``gh`` read the same check runs without trouble.
+    """
+
+
 class CIWaitable:
     """Polls a GitHub PR's merge/CI-check state by ``owner/repo#<number>``."""
 
@@ -217,7 +230,10 @@ class CIWaitable:
         self, repo: str, number: int, token: str
     ) -> Tuple[Dict[str, Any], Any, Any]:
         """Fetch the PR payload + head-commit checks. Split out for tests."""
-        from kestrel_sovereign.signals.sources.github_pr_watch import _github_get
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            PRWatchAuthError,
+            _github_get,
+        )
 
         base = f"https://api.github.com/repos/{repo}"
         ref = f"{repo}#{number}"
@@ -236,9 +252,23 @@ class CIWaitable:
         check_runs: Any = None
         combined_status: Any = None
         if head_sha:
-            check_runs = await _github_get_check_runs(
-                base, head_sha, token=token, timeout=10, ref=f"{ref} check-runs"
-            )
+            # Reaching here means the PR read SUCCEEDED with this token. If the
+            # checks read now returns 401/403, the credential is valid and
+            # merely under-scoped — a condition no amount of waiting fixes.
+            # ``_UnderscopedToken`` carries that distinction up to ``poll``,
+            # which cannot otherwise tell it from a transient blip.
+            try:
+                check_runs = await _github_get_check_runs(
+                    base, head_sha, token=token, timeout=10,
+                    ref=f"{ref} check-runs",
+                )
+            except PRWatchAuthError as exc:
+                raise _UnderscopedToken(
+                    f"{ref}: the PR read succeeded but check-runs returned an "
+                    f"authorization error ({exc}). The token is valid and is "
+                    f"missing the Checks / Commit-statuses read permission; "
+                    f"this will not resolve on its own."
+                ) from exc
             combined_status = await _github_get(
                 f"{base}/commits/{head_sha}/status",
                 token=token, timeout=10, ref=f"{ref} status",
@@ -278,6 +308,21 @@ class CIWaitable:
         try:
             pr_raw, check_runs, combined_status = await self._fetch(
                 repo, number, token
+            )
+        except _UnderscopedToken as exc:
+            # Still not terminal — a human can widen the token and the watch
+            # should then complete — but it must never read as progress.
+            # ``blocked="permission"`` is the flag a caller can act on;
+            # ``"auth"`` below is the one it should keep waiting through.
+            return WaitStatus(
+                Outcome.PENDING,
+                f"{repo}#{number}: CI GATE BLIND — {exc}",
+                data={
+                    "repo": repo,
+                    "number": number,
+                    "blocked": "permission",
+                    "actionable": True,
+                },
             )
         except (PRWatchAuthError, PRWatchNetworkError) as exc:
             # Auth/network blip is transient — stay pending, never a false
