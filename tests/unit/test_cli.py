@@ -340,6 +340,17 @@ class TestArgumentParsing:
 class TestCommandDispatch:
     """Test that commands dispatch to the right handlers."""
 
+    @pytest.fixture(autouse=True)
+    def operator_lane(self, tmp_path, monkeypatch):
+        """The lifecycle verbs dispatch only through the operator lane
+        (#3233): the invoking environment carries the project's sovereign
+        key. These tests are about dispatch, so give them the lane; the
+        lane itself is tested in test_operator_lane.py."""
+        (tmp_path / ".env").write_text("KESTREL_API_KEY=dispatch-test-key\n")
+        monkeypatch.setenv("KESTREL_API_KEY", "dispatch-test-key")
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=tmp_path):
+            yield
+
     def test_dispatch_start(self):
         """'start' should dispatch to cmd_start."""
         with patch("sys.argv", ["kestrel", "start"]), \

@@ -202,6 +202,16 @@ kestrel update Emma               # restart only one named agent
 kestrel update --dry-run          # preview (incl. the reconcile plan); mutate nothing
 ```
 
+The lifecycle verbs — `kestrel create|start|terminate|restart|update` — run
+only through the **operator lane** (#3233): the shell that invokes them must
+carry the host's stable `KESTREL_API_KEY` (the value in the project `.env`),
+exported for that session — `set -a; source .env; set +a` — not read from the
+file by the CLI, and not placed in a login profile. An agent's host shell never
+carries it (its subprocess environment is an allowlist without Kestrel
+variables), so an agent cannot create, kill, restart or re-image agents, the
+host, or the fleet through the CLI; the host process and the restart
+coordinator's own re-exec inherit it and are unaffected.
+
 What it actually does:
 
 1. `git pull --ff-only` in the source checkout (NOT `KESTREL_HOME`). Refuses on modified TRACKED files only — untracked `kestrel.toml.backup-*` etc. are ignored. `--allow-dirty` bypasses.
