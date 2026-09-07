@@ -534,8 +534,9 @@ class WebhookFeature(Feature):
         # refuses it the moment another agent registers the same name
         # (kestrel-sovereign#3216). This feature has no view of its peers —
         # each agent owns its own database — so it cannot detect the
-        # collision here; what it CAN do is hand the caller the address that
-        # always dispatches to this agent. That is the agent-prefixed form,
+        # collision by itself; the host installs that answer and it is
+        # consulted below (#3239). What the feature can do on its own is hand
+        # the caller the address that always dispatches to this agent. That is the agent-prefixed form,
         # keyed by the ROUTING name the host's AgentManager registered this
         # agent under — not ``agent_name``, which is a display name that
         # equals the routing key only for a published hosted agent. Only a
@@ -567,7 +568,16 @@ class WebhookFeature(Feature):
 
         # Collect any conditions that warrant a PARTIAL (vs a clean OK).
         warnings: List[str] = []
-        if owners:
+        if owners and len(set(owners)) == 1:
+            # Two of THIS agent's receivers: the agent-prefixed form is refused
+            # too (#3216), so no address is a remedy — mirror the refusal.
+            warnings.append(
+                f"NAME COLLISION within this agent: '{name}' is now owned by "
+                f"{len(owners)} of its enabled receivers. Both the unprefixed "
+                f"/webhooks/{name} form and the agent-prefixed form are refused "
+                f"from this moment; unregister one of them."
+            )
+        elif owners:
             warnings.append(
                 f"NAME COLLISION: '{name}' is now owned by {len(owners)} enabled "
                 f"receivers on this host ({', '.join(owners)}). The unprefixed "

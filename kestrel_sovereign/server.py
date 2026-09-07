@@ -4,7 +4,6 @@ A FastAPI server to expose Kestrel agent functionality as a service.
 """
 import argparse
 import asyncio
-import functools
 import logging
 import os
 import re
@@ -971,7 +970,7 @@ def _feature_router_signature(feature_name: str, router) -> tuple:
     return (feature_name, getattr(router, "prefix", ""), routes)
 
 
-def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
+def _mount_feature_routers(app: FastAPI, *, agents=None, candidates=None) -> None:
     """Mount routers contributed by discovered features.
 
     After agent initialization, iterate over all registered features and
@@ -1128,29 +1127,40 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     if mounted:
         logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
 
-    _install_webhook_collision_reporting(app)
+    _install_webhook_collision_reporting(app, candidates=candidates)
 
 
-def _labelled_current_agents(app: FastAPI):
-    """Yield ``(routing_name, agent)`` for every agent currently loaded.
+def _labelled_current_agents(app: FastAPI, candidates=None):
+    """Yield ``(routing_name, agent)`` for every agent currently loaded,
+    then every ``candidates`` entry (routing name → agent) not already seen.
 
     The label is the name the AgentManager routes ``/api/agents/{name}/…``
     by; a single-agent boot has no routing name and is labelled by its
-    display name.
+    display name. Candidates are agents the manager has not published yet:
+    the onboarding hook runs before ``_register_agent`` commits, so a
+    dynamically onboarded agent is invisible to ``list_agents()`` at its own
+    mount pass and must be named explicitly (#3239 review r1).
     """
+    seen: set[int] = set()
     agent = getattr(app.state, "agent", None)
     if agent is not None:
         display = getattr(agent, "agent_name", None)
+        seen.add(id(agent))
         yield (display if isinstance(display, str) and display else "agent"), agent
     manager = getattr(app.state, "agent_manager", None)
     if manager is not None:
         for agent_name in manager.list_agents():
             resolved = manager.get_agent(agent_name)
-            if resolved is not None:
+            if resolved is not None and id(resolved) not in seen:
+                seen.add(id(resolved))
                 yield str(agent_name), resolved
+    for label, candidate in (candidates or {}).items():
+        if candidate is not None and id(candidate) not in seen:
+            seen.add(id(candidate))
+            yield str(label), candidate
 
 
-def _webhook_name_owners(app: FastAPI) -> dict:
+def _webhook_name_owners(app: FastAPI, candidates=None) -> dict:
     """``name -> [routing name of each enabled receiver that owns it]``.
 
     One entry per owning receiver, not per agent, so an agent whose two
@@ -1159,7 +1169,7 @@ def _webhook_name_owners(app: FastAPI) -> dict:
     """
     owners: dict = {}
     seen: set[int] = set()
-    for label, agent in _labelled_current_agents(app):
+    for label, agent in _labelled_current_agents(app, candidates):
         for receiver in _agent_webhook_receivers(agent):
             if id(receiver) in seen:
                 continue
@@ -1170,23 +1180,29 @@ def _webhook_name_owners(app: FastAPI) -> dict:
 
 
 def _report_webhook_name_collisions(
-    app: FastAPI, *, scope=None, announce: bool = True
+    app: FastAPI, *, scope=None, announce: bool = True, candidates=None
 ) -> dict:
     """Webhook names owned by more than one enabled receiver on this host.
 
     Returns ``name -> owners`` (routing names, one per owning receiver).
     With ``scope`` set to an agent, only the names that agent's receivers
-    own are returned, still mapped to the full owner list. With ``announce``
-    the host log carries one warning per colliding name: that is the
-    operator surface at boot, at dynamic onboarding and at registration
+    own are returned, still mapped to the full owner list. ``candidates``
+    names agents not yet published by the manager (see
+    :func:`_labelled_current_agents`). With ``announce`` the host log
+    carries one warning per colliding name: that is the operator surface at
+    boot, at dynamic onboarding, at registration and at a runtime enable
     (#3239); the agents read the same answer through their webhook tools.
 
     The dispatch router already refuses a collided name where it is
     consumed (#3216). This is the same fact reported where the name is
     created, from the only place that sees every agent: a feature cannot
-    look across the tenancy boundary at its peers' registrations.
+    look across the tenancy boundary at its peers' registrations. The
+    remedy printed matches the refusal's: a collision between agents is
+    resolved by the agent-prefixed address; a collision inside one agent
+    (two of its receivers) is refused on that form too and only an
+    unregister resolves it.
     """
-    owners = _webhook_name_owners(app)
+    owners = _webhook_name_owners(app, candidates)
     collided = {name: agents for name, agents in owners.items() if len(agents) > 1}
     if scope is not None:
         own_names = set()
@@ -1195,6 +1211,17 @@ def _report_webhook_name_collisions(
         collided = {name: agents for name, agents in collided.items() if name in own_names}
     if announce:
         for name, agents in sorted(collided.items()):
+            if len(set(agents)) == 1:
+                logger.warning(
+                    "Webhook name '%s' is owned by %d enabled receivers of one "
+                    "agent (%s): both the unprefixed /webhooks/%s form and the "
+                    "agent-prefixed form are refused; unregister one of them.",
+                    name,
+                    len(agents),
+                    agents[0],
+                    name,
+                )
+                continue
             logger.warning(
                 "Webhook name '%s' is owned by %d enabled receivers on this host "
                 "(agents: %s): the unprefixed /webhooks/%s form is refused for "
@@ -1209,21 +1236,37 @@ def _report_webhook_name_collisions(
     return collided
 
 
-def _install_webhook_collision_reporting(app: FastAPI) -> None:
-    """Give every current agent the host's scoped collision answer, then
-    announce the current collisions once.
+def _scoped_webhook_collision_hook(app: FastAPI, label: str, agent):
+    """The host's answer for one agent, closed over that agent.
 
-    Runs at the end of every router mount pass, which is exactly the boot
-    pass and the dynamic-onboarding pass. The installed hook is what
-    ``webhooks_register`` consults, so a registration is reported the moment
-    it collides — the third moment — without the feature reaching across
-    agents itself.
+    A closure rather than a partial with a ``scope`` default: the feature
+    can only ask about its own names, never widen the scope. The agent is
+    also passed as a candidate under its routing name so the answer is
+    right even before the manager publishes it.
     """
-    for _label, agent in _labelled_current_agents(app):
-        agent._host_webhook_collisions = functools.partial(
-            _report_webhook_name_collisions, app, scope=agent
+
+    def hook(*, announce: bool = True) -> dict:
+        return _report_webhook_name_collisions(
+            app, scope=agent, announce=announce, candidates={label: agent}
         )
-    _report_webhook_name_collisions(app)
+
+    return hook
+
+
+def _install_webhook_collision_reporting(app: FastAPI, candidates=None) -> None:
+    """Give every current agent, and every candidate, the host's scoped
+    collision answer, then announce the current collisions once.
+
+    Runs at the end of every router mount pass — the boot pass and the
+    dynamic-onboarding pass, where the newcomer arrives as a candidate the
+    manager has not published yet. The installed hook is what
+    ``webhooks_register`` and a runtime feature enable consult, so a name
+    created later is reported the moment it collides, without the feature
+    reaching across agents itself.
+    """
+    for label, agent in _labelled_current_agents(app, candidates):
+        agent._host_webhook_collisions = _scoped_webhook_collision_hook(app, label, agent)
+    _report_webhook_name_collisions(app, candidates=candidates)
 
 
 def _iter_current_agents(app: FastAPI):
@@ -1800,7 +1843,7 @@ async def _onboard_host_registered_agent(
         requester=peer_requester,
     )
     _mount_feature_ui_assets(app, agents=(agent,))
-    _mount_feature_routers(app, agents=(agent,))
+    _mount_feature_routers(app, agents=(agent,), candidates={name: agent})
     owned_route_ids.update(
         id(route) for route in app.routes if id(route) not in prior_route_ids
     )

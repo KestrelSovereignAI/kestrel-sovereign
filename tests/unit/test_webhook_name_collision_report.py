@@ -152,7 +152,12 @@ def test_two_receivers_of_one_agent_list_that_agent_twice(host_log):
     app, restore = _boot_multi_agent(agents)
     try:
         (message,) = host_log.about("deposit")
-        assert "agents: a, a" in message
+        assert "2 enabled receivers of one agent (a)" in message
+        # The remedy mirrors the refusal (#3216): the agent-prefixed form is
+        # refused too, so the log must not send the operator there.
+        assert "agent-prefixed form are refused" in message
+        assert "unregister one of them" in message
+        assert "point each sender" not in message
         assert agents["a"]._host_webhook_collisions(announce=False) == {
             "deposit": ["a", "a"]
         }
@@ -166,6 +171,11 @@ def test_two_receivers_of_one_agent_list_that_agent_twice(host_log):
 
 
 def test_onboarding_reports_the_collision_the_new_agent_brings(host_log):
+    """Production order (review r1 P1): the onboarding hook mounts the
+    newcomer's routers BEFORE the manager publishes it, so at its own mount
+    pass the newcomer is absent from ``list_agents()``. The hook names it as
+    a candidate under its routing name; the pass must announce and install
+    from that, not from the (still unpublished) fleet."""
     os.environ["KESTREL_API_KEY"] = API_KEY
     agents = {"a": _make_agent({"WebhookFeature": _WebhookFeatureStub("deposit")})}
     app, restore = _boot_multi_agent(agents)
@@ -173,21 +183,86 @@ def test_onboarding_reports_the_collision_the_new_agent_brings(host_log):
         assert host_log.about("deposit") == []
 
         newcomer = _make_agent({"WebhookFeature": _WebhookFeatureStub("deposit")})
-        agents["b"] = newcomer
-        # The onboarding hook's mount pass for exactly the new agent.
-        _mount_feature_routers(app, agents=(newcomer,))
+        assert "b" not in agents  # not published yet: exactly the hook's moment
+        _mount_feature_routers(app, agents=(newcomer,), candidates={"b": newcomer})
 
         (message,) = host_log.about("deposit")
         assert "agents: a, b" in message
+        # The newcomer holds the answer already, before publication.
         assert newcomer._host_webhook_collisions(announce=False) == {
             "deposit": ["a", "b"]
         }
-        # The incumbent's answer is live: it sees the newcomer too.
+
+        # Publication commits; the incumbent's answer is live and sees it.
+        agents["b"] = newcomer
         assert agents["a"]._host_webhook_collisions(announce=False) == {
+            "deposit": ["a", "b"]
+        }
+        assert newcomer._host_webhook_collisions(announce=False) == {
             "deposit": ["a", "b"]
         }
     finally:
         restore()
+
+
+def test_onboarding_a_newcomer_with_no_collision_reports_nothing(host_log):
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    agents = {"a": _make_agent({"WebhookFeature": _WebhookFeatureStub("deposit")})}
+    app, restore = _boot_multi_agent(agents)
+    try:
+        newcomer = _make_agent({"WebhookFeature": _WebhookFeatureStub("alpha")})
+        _mount_feature_routers(app, agents=(newcomer,), candidates={"b": newcomer})
+        assert [m for m in host_log.messages() if "Webhook name" in m] == []
+        assert newcomer._host_webhook_collisions(announce=False) == {}
+    finally:
+        restore()
+
+
+def test_the_scoped_hook_cannot_be_widened():
+    """The feature asks only about its own names; the hook takes no scope."""
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    agents = {
+        "a": _make_agent({"WebhookFeature": _WebhookFeatureStub("deposit")}),
+        "b": _make_agent({"WebhookFeature": _WebhookFeatureStub("alpha")}),
+        "c": _make_agent({"WebhookFeature": _WebhookFeatureStub("alpha")}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        assert agents["a"]._host_webhook_collisions(announce=False) == {}
+        with pytest.raises(TypeError):
+            agents["a"]._host_webhook_collisions(scope=None)
+        with pytest.raises(TypeError):
+            agents["a"]._host_webhook_collisions(announce=False, candidates={})
+    finally:
+        restore()
+
+
+def test_single_agent_boot_is_labelled_by_its_display_name(host_log):
+    """The ``app.state.agent`` branch: no manager, no routing name."""
+    from server import app
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    solo = _make_agent(
+        {
+            "WebhookFeature": _WebhookFeatureStub("deposit"),
+            "OtherWebhookFeature": _WebhookFeatureStub("deposit"),
+        }
+    )
+    solo.agent_name = "Solo"
+    original = (getattr(app.state, "agent", None), getattr(app.state, "agent_manager", None))
+    app.state.agent = solo
+    app.state.agent_manager = None
+    _mount_feature_routers(app)
+    try:
+        (message,) = host_log.about("deposit")
+        assert "of one agent (Solo)" in message
+        assert solo._host_webhook_collisions(announce=False) == {"deposit": ["Solo", "Solo"]}
+    finally:
+        from kestrel_sovereign.server import _unmount_feature_routers
+
+        _unmount_feature_routers(app)
+        app.state.agent = original[0]
+        app.state.agent_manager = original[1]
 
 
 def test_scoped_hook_announces_only_when_asked(host_log):
@@ -279,6 +354,13 @@ async def test_registration_is_reported_and_both_owners_can_read_it(
         assert history.data["collisions"] == {"deposit": ["emma", "nellie"]}
         assert "Name collision on this host" in history.confirmation
 
+        # Reading is silent: only where a name is created does the host log.
+        before = len(host_log.about("deposit"))
+        await feat_a.webhooks_list()
+        await feat_a.webhooks_history()
+        await feat_b.webhooks_list()
+        assert len(host_log.about("deposit")) == before
+
         # Live, not recorded: once the newcomer withdraws, nothing collides.
         removed = await feat_b.webhooks_remove("deposit")
         assert removed.status.name == "OK", removed
@@ -342,3 +424,75 @@ async def test_a_host_answer_that_is_not_a_mapping_is_a_host_bug(tmp_path, sqlit
     await feat.initialize()
     with pytest.raises(RuntimeError, match="not a mapping"):
         await feat.webhooks_list()
+
+
+@pytest.mark.asyncio
+async def test_registration_colliding_with_this_agents_own_receiver_names_no_address(
+    tmp_path, sqlite_database_factory, host_log
+):
+    """Two receivers of one agent (a second feature with a receiver): the
+    agent-prefixed form is refused too, so the reply must say unregister,
+    not point at that address."""
+    from server import app
+
+    feat_a, feat_b, manager = await _hosted_pair(tmp_path, sqlite_database_factory)
+    feat_a.agent.features["OtherWebhookFeature"] = _WebhookFeatureStub("deposit")
+    original = (getattr(app.state, "agent", None), getattr(app.state, "agent_manager", None))
+    app.state.agent = None
+    app.state.agent_manager = manager
+    _mount_feature_routers(app)
+    try:
+        reg = await feat_a.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        assert reg.status.name == "PARTIAL", reg
+        assert reg.data["owners"] == ["emma", "emma"]
+        assert "within this agent" in reg.error
+        assert "unregister one of them" in reg.error
+        assert "point each sender" not in reg.error
+        (message,) = host_log.about("deposit")
+        assert "of one agent (emma)" in message
+    finally:
+        from kestrel_sovereign.server import _unmount_feature_routers
+
+        _unmount_feature_routers(app)
+        app.state.agent = original[0]
+        app.state.agent_manager = original[1]
+
+
+# ---------------------------------------------------------------------------
+# The fourth moment: a runtime feature enable (review r1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enabling_a_feature_at_runtime_announces_a_collision():
+    """A feature enabled through the host endpoint brings its webhook names
+    live without a mount pass; the endpoint asks the installed hook to
+    announce. Nothing is announced when the host installed no hook."""
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+    from tests.unit.test_features_api import _lifecycle_agent
+    from kestrel_sovereign.endpoints.features import _enable_feature_locked
+
+    class ReceivingFeature(SDKFixtureFeature):
+        contribution_prefix = "collision-announce-fixture"
+
+    agent = _lifecycle_agent()
+    feature = ReceivingFeature(agent)
+    feature.enabled = False
+    agent.features = {feature.name: feature}
+    announced = []
+    agent._host_webhook_collisions = lambda *, announce=True: announced.append(announce) or {}
+
+    result = await _enable_feature_locked(agent, feature.name)
+    assert result["status"] == "enabled"
+    assert feature.enabled is True
+    assert announced == [True]
+
+    # No host, no hook: a fabricated attribute on a mock is not a host either.
+    standalone = _lifecycle_agent()
+    solo = ReceivingFeature(standalone)
+    solo.enabled = False
+    standalone.features = {solo.name: solo}
+    result = await _enable_feature_locked(standalone, solo.name)
+    assert result["status"] == "enabled"

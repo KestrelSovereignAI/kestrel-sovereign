@@ -741,6 +741,16 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     for _class_name, feature in activated:
         await agent._notify_feature_runtime_ready(feature)
 
+    # An enable brings a feature's webhook names live without a router mount
+    # pass, so this is a fourth moment a collision can appear (#3239). The
+    # host installed the scoped answer on this agent; announce it now rather
+    # than on the first refused delivery. A standalone agent has no hook.
+    from kestrel_sovereign.features.storage_access import installed_host_hook
+
+    collision_hook = installed_host_hook(agent, "_host_webhook_collisions")
+    if collision_hook is not None:
+        collision_hook(announce=True)
+
     return {
         "name": name,
         "features": [class_name for class_name, _ in loaded],
