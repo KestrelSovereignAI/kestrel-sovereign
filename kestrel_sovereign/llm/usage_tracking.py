@@ -9,7 +9,9 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional, TYPE_CHECKING
+from typing import Dict, Any, Iterable, List, Optional, Set, TYPE_CHECKING
+
+from kestrel_sovereign.security.host_authority import require_sovereign_caller
 
 from kestrel_sovereign.storage.db.postgres import (
     concurrent_write_retry_delay,
@@ -321,7 +323,18 @@ class UsageTrackingMixin:
         auto_confirm: bool = True,
         progress_callback=None
     ) -> bool:
-        """Pull (download) an Ollama model."""
+        """Pull (download) an Ollama model.
+
+        The daemon is one per host and the download lands on shared disk, so
+        this is host administration, not an agent's own change: it requires
+        the turn's endpoint-bound sovereign caller (#3221). The check sits
+        here rather than in the tool because this method is also reached by
+        the silent auto-pull in ``get_response_with_model``; a scheduler
+        wake or an OAuth-driven turn that names a missing model must not
+        install it host-wide as a side effect.
+        """
+        require_sovereign_caller("shared local model installation")
+
         ollama_provider = None
         for provider in self.providers:
             if provider.get("vendor") == "ollama":
@@ -392,14 +405,60 @@ class UsageTrackingMixin:
             logger.error(f"Failed to pull model {model_name}: {e}")
             raise RuntimeError(f"Failed to pull model: {e}")
 
+    def locally_protected_models(self) -> Set[str]:
+        """Local model names this service must keep: its Ollama providers,
+        its mandate defaults and mandates, and its active preference.
+
+        One agent's view. On a multi-agent host the daemon is shared, so a
+        deletion must union this over every co-hosted agent's service
+        (``ModelAgent.cleanup_models`` does), not just the caller's.
+        """
+        protected: Set[str] = set()
+        for provider in self.providers:
+            if provider.get("vendor") == "ollama" and provider.get("model"):
+                protected.add(provider["model"])
+
+        mandate_config = getattr(self, "mandate_config", None)
+        if mandate_config:
+            defaults = mandate_config.get("defaults", {})
+            if "preferred" in defaults:
+                protected.add(defaults["preferred"])
+            mandates = mandate_config.get("mandates", {})
+            for model in mandates.values():
+                if "ollama" in model or ":" in model:
+                    protected.add(model)
+
+        # The model this agent is pinned to right now. It was never in the
+        # protected set before, so an agent pinned to a local model could
+        # have it deleted under it by its own cleanup.
+        get_preference = getattr(self, "get_model_preference", None)
+        if callable(get_preference):
+            preferred = (get_preference() or {}).get("model")
+            if isinstance(preferred, str) and preferred:
+                protected.add(preferred)
+        return protected
+
     async def cleanup_unused_models(
         self,
         threshold_days: int = 30,
         min_free_space_pct: int = 10,
-        dry_run: bool = False
+        dry_run: bool = False,
+        protected_models: Iterable[str] = (),
     ) -> List[str]:
-        """Clean up unused Ollama models to free space."""
+        """Clean up unused Ollama models to free space.
+
+        ``protected_models`` are names other co-hosted agents still need,
+        unioned with this service's own; nothing named there is deleted.
+
+        A real deletion removes files every agent on the host loads from,
+        so it requires the turn's endpoint-bound sovereign caller (#3221) —
+        decided before any storage is inspected. A dry run is a report and
+        needs no authority.
+        """
         from datetime import timedelta
+
+        if not dry_run:
+            require_sovereign_caller("shared local model deletion")
 
         storage = await self.get_storage_info(use_cache=False)
         free_space_pct = (storage["available_gb"] / storage["total_gb"]) * 100
@@ -410,19 +469,9 @@ class UsageTrackingMixin:
 
         logger.info(f"Starting cleanup. Free space: {free_space_pct:.1f}%")
 
-        protected_models = set()
-        for provider in self.providers:
-            if provider.get("vendor") == "ollama":
-                protected_models.add(provider["model"])
-
-        if self.mandate_config:
-            defaults = self.mandate_config.get("defaults", {})
-            if "preferred" in defaults:
-                protected_models.add(defaults["preferred"])
-            mandates = self.mandate_config.get("mandates", {})
-            for model in mandates.values():
-                if "ollama" in model or ":" in model:
-                    protected_models.add(model)
+        protected_models = self.locally_protected_models() | {
+            name for name in protected_models if isinstance(name, str) and name
+        }
 
         logger.info(f"Protected models: {protected_models}")
 

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.security.host_authority import HostAuthorityError
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +72,23 @@ class ModelAgent(Feature):
         command_prefix="!model-pull"
     )
     async def pull_model(self, model_name: str, progress_callback=None) -> ToolResult:
-        """Pull (download) a model (primarily for Ollama)."""
+        """Pull (download) a model (primarily for Ollama).
+
+        Installs onto the host's shared daemon: the service refuses unless
+        the turn carries sovereign authority (#3221). Tool consent (ASK/AUTO)
+        is not that authority and cannot promote it.
+        """
         try:
             ok = await self.llm_service.pull_model(
                 model_name=model_name,
                 auto_confirm=True,
                 progress_callback=progress_callback
+            )
+        except HostAuthorityError as e:
+            logger.warning(f"Refused shared model pull of {model_name!r}: {e}")
+            return ToolResult.failed(
+                str(e),
+                data={"model_name": model_name, "pulled": False, "authority": "sovereign"},
             )
         except Exception as e:
             logger.error(f"Error pulling model {model_name}: {e}")
@@ -134,7 +146,14 @@ class ModelAgent(Feature):
             result = await self.llm_service.cleanup_unused_models(
                 threshold_days=threshold_days,
                 min_free_space_pct=10,
-                dry_run=dry_run
+                dry_run=dry_run,
+                protected_models=self._fleet_protected_models(),
+            )
+        except HostAuthorityError as e:
+            logger.warning(f"Refused shared model cleanup: {e}")
+            return ToolResult.failed(
+                str(e),
+                data={"dry_run": dry_run, "authority": "sovereign"},
             )
         except Exception as e:
             logger.error(f"Error cleaning up models: {e}")
@@ -163,6 +182,33 @@ class ModelAgent(Feature):
             ),
             data=data,
         )
+
+    def _fleet_protected_models(self) -> set:
+        """Local models any co-hosted agent still needs.
+
+        The Ollama daemon is one per host. Before #3221 cleanup protected
+        only the models the *calling* agent's service named, so one agent
+        could delete a model another was pinned to. Every agent registered
+        with the host's manager contributes its own service's protected set;
+        a standalone agent contributes only itself. The report (dry run) and
+        the deletion use the same set, so the preview is the plan.
+        """
+        protected: set = set()
+        services = [self.llm_service]
+        manager = getattr(self.agent, "_agent_manager", None) or getattr(
+            self.agent, "agent_manager", None
+        )
+        list_agents = getattr(manager, "list_agents", None)
+        if callable(list_agents):
+            for peer in list(list_agents().values()):
+                service = getattr(peer, "llm_service", None)
+                if service is not None:
+                    services.append(service)
+        for service in services:
+            locally = getattr(service, "locally_protected_models", None)
+            if callable(locally):
+                protected |= set(locally())
+        return protected
 
     @tool(
         name="get_model_info",
