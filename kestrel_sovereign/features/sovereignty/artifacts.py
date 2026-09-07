@@ -26,8 +26,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from kestrel_sovereign.endpoints.agent_helpers import privacy_hides_persisted
-
 BACKUP_ARTIFACT_NODE_TYPE = "backup_artifact"
 SOVEREIGNTY_RECEIPT_NODE_TYPE = "sovereignty_receipt"
 
@@ -52,6 +50,11 @@ async def owned_artifacts(storage: Any) -> List[OwnedArtifact]:
     Raises whatever the storage raises: a receipt read that fails is a
     fault in the agent's own database, not an empty set.
     """
+    # Function-local: ``endpoints/__init__`` imports the sovereignty router,
+    # which imports this module, so a module-level import here is a cycle
+    # for anyone importing ``artifacts`` first (a script, a feature package).
+    from kestrel_sovereign.endpoints.agent_helpers import privacy_hides_persisted
+
     if storage is None or privacy_hides_persisted(storage):
         return []
 

@@ -75,3 +75,18 @@ def test_adapter_honours_allow_local_cache(tmp_path):
         adapter.retrieve_content(stored.content_hash, allow_local_cache=False)
     with pytest.raises(ValueError, match="Content not found"):
         adapter.retrieve_content("b" * 64, allow_local_cache=False)
+
+
+def test_artifacts_module_imports_standalone():
+    """Round 2 found a cycle: importing the ownership module before the
+    endpoints package failed. A script or feature package reusing the
+    predicate imports it first."""
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import kestrel_sovereign.features.sovereignty.artifacts as a; print(a.owned_artifacts.__name__)"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "owned_artifacts"
