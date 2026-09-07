@@ -206,12 +206,15 @@ The lifecycle verbs — `kestrel create|start|terminate|restart|update` — run
 only through the **operator lane** (#3233): the shell that invokes them must
 carry the host's stable `KESTREL_API_KEY`, exported for that session
 (`set -a; source .env; set +a`), not read from the file by the CLI and not
-placed in a login profile. It must match the project `.env`, and for
-`terminate`/`restart`/`update` every port the verb would touch that is held
-must accept that key as its sovereign credential, or the verb refuses (a hung
-host is stopped by PID). What this establishes is a *presented* credential
-verified by the host acted on, instead of mere process access: an agent's host
-shell subprocess never carries the key. What it does not establish is secret
+placed in a login profile. It must match the project `.env`, and
+`terminate`/`restart`/`update` signal a process only after it has **vouched**:
+the CLI challenges one of the process's own loopback listeners with a fresh
+nonce, and only a Kestrel host holding the same stable key can answer (the key
+is never transmitted). A process that does not vouch is left alone and the verb
+refuses; a hung host is stopped by PID. What this establishes is a *presented*
+credential verified by the process acted on, instead of mere process access: an
+agent's host shell subprocess never carries the key, and no caller-written port,
+bind, pid file or config can stand in for the process's own answer. What it does not establish is secret
 custody — an agent that can read the project's files can read `.env`; that is
 the filesystem and shell policy's boundary, not this one. The host process and
 the restart coordinator's own re-exec inherit the key and are unaffected.

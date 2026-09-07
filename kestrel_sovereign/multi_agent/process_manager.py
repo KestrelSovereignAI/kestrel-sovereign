@@ -593,6 +593,16 @@ class ProcessManager:
                     pid, live_start, started_at,
                 )
                 return False
+        # The operator lane (#3233): when a CLI lifecycle verb is the caller,
+        # the process about to be signalled must have vouched for the
+        # presented sovereign key on one of its own listening sockets. This
+        # is the one chokepoint every lifecycle kill passes through, so the
+        # vouch covers whatever named the PID — a pid file, a port, a config
+        # the invoker may have written. Raises; a refusal is not a failed
+        # signal. Inactive outside the CLI (the host managing its own agents).
+        from kestrel_sovereign.security.operator_lane import require_vouched_pid
+
+        require_vouched_pid(pid)
         try:
             if sys.platform == "win32":
                 subprocess.run(

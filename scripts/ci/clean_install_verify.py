@@ -221,24 +221,15 @@ def _operator_lane_env() -> dict[str, str]:
     The verbs run only through the operator lane (#3233): the invoking
     environment must carry the host's ``KESTREL_API_KEY``, which the CLI
     deliberately does not read from ``.env`` on the invoker's behalf. This
-    script *is* the operator here, so it presents the key the wizard wrote —
-    read with a minimal stdlib parse, since the script is stdlib-only.
+    script *is* the operator here, so it presents the key the wizard wrote,
+    read with the same parser every other check in this script uses.
     """
     env = dict(os.environ)
     if env.get("KESTREL_API_KEY", "").strip():
         return env
-    env_file = Path(".env")
-    if env_file.exists():
-        for raw in env_file.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line.startswith("KESTREL_API_KEY="):
-                continue
-            value = line[len("KESTREL_API_KEY="):].strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            if value:
-                env["KESTREL_API_KEY"] = value
-            break
+    value = _read_dotenv(Path(".env")).get("KESTREL_API_KEY", "")
+    if value:
+        env["KESTREL_API_KEY"] = value
     return env
 
 

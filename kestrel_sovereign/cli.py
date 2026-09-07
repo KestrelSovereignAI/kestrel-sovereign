@@ -2373,9 +2373,10 @@ def _ensure_utf8_stdio() -> None:
             pass
 
 
-def _operator_lane_refusal(
-    command: str, invoking_env: dict, agent_name: Optional[str] = None
-) -> Optional[str]:
+from kestrel_sovereign.security.operator_lane import LIFECYCLE_VERBS as _LIFECYCLE_VERBS
+
+
+def _operator_lane_refusal(command: str, invoking_env: dict) -> Optional[str]:
     """Refuse a host lifecycle verb that lacks the operator lane (#3233).
 
     Decided here, at dispatch, so every entry — the ``kestrel`` binary,
@@ -2390,9 +2391,7 @@ def _operator_lane_refusal(
 
     if command not in LIFECYCLE_VERBS:
         return None
-    return operator_lane_refusal(
-        command, _get_project_dir(), invoking_env, agent_name=agent_name
-    )
+    return operator_lane_refusal(command, _get_project_dir(), invoking_env)
 
 
 def main() -> int:
@@ -2410,12 +2409,17 @@ def main() -> int:
         parser.print_help()
         return 1
 
-    refusal = _operator_lane_refusal(
-        args.command, invoking_env, getattr(args, "name", None)
-    )
+    refusal = _operator_lane_refusal(args.command, invoking_env)
     if refusal is not None:
         print(refusal, file=sys.stderr)
         return 1
+    if args.command in _LIFECYCLE_VERBS:
+        # Admitted at dispatch; every process the verb signals still has to
+        # vouch at the signal (#3233). Armed here, in the CLI only — the
+        # host's own process management is not an invoker's re-entry.
+        from kestrel_sovereign.security.operator_lane import activate_operator_lane
+
+        activate_operator_lane(invoking_env.get("KESTREL_API_KEY", ""))
 
     if args.command == "help":
         topic = getattr(args, "topic", None)
@@ -2489,7 +2493,13 @@ def main() -> int:
         parser.print_help()
         return 1
 
-    return handler(args)
+    from kestrel_sovereign.security.operator_lane import OperatorLaneRefused
+
+    try:
+        return handler(args)
+    except OperatorLaneRefused as refused:
+        print(f"kestrel {args.command} refused: {refused}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

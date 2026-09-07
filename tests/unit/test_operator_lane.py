@@ -20,17 +20,18 @@ from kestrel_sovereign import cli
 from kestrel_sovereign.security import operator_lane
 from kestrel_sovereign.security.operator_lane import (
     LIFECYCLE_VERBS,
-    held_port_admits,
+    OperatorLaneRefused,
     operator_lane_refusal,
-    ports_the_verb_touches,
+    vouch_pid,
+    vouch_response,
 )
 
 
 @pytest.fixture(autouse=True)
-def nothing_listens(monkeypatch):
-    """By default no port is held, so the file comparison is what is under test.
-    The live-host tests below override this per case."""
-    monkeypatch.setattr(operator_lane, "held_port_admits", lambda port, presented, *, bind="0.0.0.0": None)
+def lane_disarmed(monkeypatch):
+    """Every test starts with the vouch disarmed; the ones about the signal
+    arm it themselves. `main()` arms it for admitted lifecycle verbs."""
+    monkeypatch.setattr(operator_lane, "_presented_key", None)
 
 KEY = "stable-sovereign-key-3233"
 
@@ -81,11 +82,9 @@ def test_a_project_without_a_stable_key_cannot_open_the_lane(tmp_path):
     refusal = operator_lane_refusal("create", tmp_path, {"KESTREL_API_KEY": KEY})
     assert refusal is not None
     assert "kestrel setup keys" in refusal
-    # A live-process verb with nothing running and no file: also refused,
-    # with the reference named (an EnvironmentFile host puts the key there too).
-    refusal = operator_lane_refusal("terminate", tmp_path, {"KESTREL_API_KEY": KEY})
-    assert refusal is not None
-    assert "nothing is running to verify" in refusal
+    # A live-process verb with no file is admitted at dispatch: whatever it
+    # signals still has to vouch (an EnvironmentFile host is verified there).
+    assert operator_lane_refusal("terminate", tmp_path, {"KESTREL_API_KEY": KEY}) is None
 
 
 def test_the_reference_is_the_env_file_not_the_process_environment(project, monkeypatch):
@@ -143,23 +142,6 @@ def test_every_lifecycle_verb_runs_for_the_operator(verb, project, monkeypatch):
     mocked.assert_called_once()
 
 
-def test_dispatch_hands_the_named_agent_to_the_lane(project, monkeypatch, capsys):
-    """`kestrel terminate Nellie` must check Nellie's port, not only the host's:
-    the host port is free here, Nellie's is held by something that refuses."""
-    (project / "multi_agent.toml").write_text(
-        "[host]\nport = 8912\n\n[agents.Nellie]\ndata_dir = \"agent_data/nellie\"\nport = 8802\n"
-    )
-    monkeypatch.setattr(operator_lane, "held_port_admits", _held({8802: False}))
-    monkeypatch.setattr(sys, "argv", ["kestrel", "terminate", "Nellie"])
-    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
-    with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": KEY}, clear=True):
-        with patch.object(cli, "cmd_terminate") as terminate:
-            rc = cli.main()
-    assert rc == 1
-    terminate.assert_not_called()
-    assert "holds :8802" in capsys.readouterr().err
-
-
 def test_non_lifecycle_verbs_need_no_lane(project, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["kestrel", "status"])
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
@@ -190,154 +172,177 @@ def test_the_lane_is_judged_on_the_environment_at_entry(project, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The reference is the host acted on, not a file the caller wrote
+# The signal: the process about to die must vouch
 # ---------------------------------------------------------------------------
 
-
-def _held(verdicts):
-    """A fake `held_port_admits`: port → None (free) / True / False."""
-    calls = []
-
-    def fake(port, presented, *, bind="0.0.0.0"):
-        calls.append((port, presented))
-        return verdicts.get(port)
-
-    fake.calls = calls
-    return fake
+import json
+import socket
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 
-@pytest.mark.parametrize("verb", ["terminate", "restart", "update"])
-def test_a_held_port_that_rejects_the_key_refuses_the_verb(project, monkeypatch, verb):
-    """A caller-written project can point multi_agent.toml at any port;
-    the process holding it decides, not the file."""
-    (project / "multi_agent.toml").write_text("[host]\nport = 8912\n")
-    fake = _held({8912: False})
-    monkeypatch.setattr(operator_lane, "held_port_admits", fake)
-    refusal = operator_lane_refusal(verb, project, {"KESTREL_API_KEY": KEY})
-    assert refusal is not None
-    assert "holds :8912" in refusal and "not touching it" in refusal
-    assert fake.calls == [(8912, KEY)]
+class _VouchingHost(HTTPServer):
+    """A loopback HTTP server that answers the vouch route with a given key."""
+
+    def __init__(self, key, *, wrong=False):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet
+                pass
+
+            def do_GET(inner):
+                url = urlparse(inner.path)
+                if url.path != "/api/auth/vouch":
+                    inner.send_response(404); inner.end_headers(); return
+                nonce = parse_qs(url.query).get("nonce", [""])[0]
+                answer = vouch_response(key, nonce)
+                if wrong:
+                    answer = "0" * len(answer)
+                body = json.dumps({"vouch": answer}).encode()
+                inner.send_response(200)
+                inner.send_header("Content-Type", "application/json")
+                inner.send_header("Content-Length", str(len(body)))
+                inner.end_headers()
+                inner.wfile.write(body)
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.shutdown()
+        self.server_close()
 
 
-def test_a_held_port_that_admits_the_key_opens_the_lane(project, monkeypatch):
-    (project / "multi_agent.toml").write_text("[host]\nport = 8912\n")
-    monkeypatch.setattr(operator_lane, "held_port_admits", _held({8912: True}))
-    assert operator_lane_refusal("terminate", project, {"KESTREL_API_KEY": KEY}) is None
+@pytest.fixture
+def vouching_host():
+    host = _VouchingHost(KEY)
+    yield host
+    host.stop()
 
 
-def test_an_environmentfile_host_is_verified_by_its_live_process(tmp_path, monkeypatch):
-    """No .env at all, but the live host accepts the key: admitted."""
-    (tmp_path / "multi_agent.toml").write_text("[host]\nport = 8912\n")
-    monkeypatch.setattr(operator_lane, "held_port_admits", _held({8912: True}))
-    assert operator_lane_refusal("restart", tmp_path, {"KESTREL_API_KEY": KEY}) is None
+def test_vouch_answers_and_nonces_are_bound_to_the_key():
+    nonce = "ab" * 16
+    assert vouch_response(KEY, nonce) == vouch_response(f'"{KEY}"', nonce)
+    assert vouch_response(KEY, nonce) != vouch_response(KEY + "x", nonce)
+    assert vouch_response(KEY, nonce) != vouch_response(KEY, "cd" * 16)
 
 
-def test_every_port_the_verb_touches_is_checked(project, monkeypatch):
-    (project / "multi_agent.toml").write_text(
-        "[host]\nport = 8912\n\n"
-        "[agents.Emma]\ndata_dir = \"agent_data/emma\"\nport = 8801\n\n"
-        "[agents.Nellie]\ndata_dir = \"agent_data/nellie\"\nport = 8802\n"
-    )
-    assert ports_the_verb_touches(project, None) == ("0.0.0.0", [8801, 8802, 8912])
-    assert ports_the_verb_touches(project, "Nellie") == ("0.0.0.0", [8802, 8912])
-    # The host is fine but a named agent's port is held by something that
-    # rejects the key: `terminate Nellie` refuses.
-    fake = _held({8912: True, 8802: False})
-    monkeypatch.setattr(operator_lane, "held_port_admits", fake)
-    refusal = operator_lane_refusal("terminate", project, {"KESTREL_API_KEY": KEY}, agent_name="Nellie")
-    assert refusal is not None and "holds :8802" in refusal
-    # Terminate-all touches every agent port too.
-    fake = _held({8912: True, 8801: False})
-    monkeypatch.setattr(operator_lane, "held_port_admits", fake)
-    refusal = operator_lane_refusal("terminate", project, {"KESTREL_API_KEY": KEY})
-    assert refusal is not None and "holds :8801" in refusal
+def test_this_process_vouches_when_one_of_its_listeners_answers(vouching_host):
+    """The test process owns the vouching listener, so its own PID vouches."""
+    assert vouch_pid(os.getpid(), KEY) is True
+    assert vouch_pid(os.getpid(), "some-other-key") is False
 
 
-def test_create_and_start_do_not_probe_live_ports(project, monkeypatch):
-    (project / "multi_agent.toml").write_text("[host]\nport = 8912\n")
-    fake = _held({8912: False})
-    monkeypatch.setattr(operator_lane, "held_port_admits", fake)
-    assert operator_lane_refusal("create", project, {"KESTREL_API_KEY": KEY}) is None
-    assert operator_lane_refusal("start", project, {"KESTREL_API_KEY": KEY}) is None
-    assert fake.calls == []
-
-
-def test_held_port_admits_against_real_sockets(monkeypatch):
-    """The real probe: a free port is None; a listener that is not a Kestrel
-    server (the review's victim process) is False, and is left untouched."""
-    import socket
-
-    monkeypatch.undo()  # use the real held_port_admits
-    from kestrel_sovereign.security.operator_lane import held_port_admits as real
-
-    victim = socket.socket()
-    victim.bind(("127.0.0.1", 0))
-    victim.listen(1)
-    port = victim.getsockname()[1]
+def test_a_wrong_answer_does_not_vouch():
+    host = _VouchingHost(KEY, wrong=True)
     try:
-        assert real(port, KEY, bind="127.0.0.1") is False
-        victim.close()
-        assert real(port, KEY, bind="127.0.0.1") is None
+        assert vouch_pid(os.getpid(), KEY) is False
     finally:
-        try:
-            victim.close()
-        except OSError:
-            pass
+        host.stop()
 
 
-@pytest.mark.parametrize(
-    "status, admitted",
-    [(200, True), (401, False), (403, False), (404, False), (503, False)],
-)
-def test_held_port_admits_only_on_an_authenticated_200(monkeypatch, status, admitted):
-    """A Kestrel server that rejects the key answers 401/403; a server in
-    safe mode 503; anything but 200 on the sovereign route is not a vouch."""
-    import httpx
+def _throwaway_listener(bind="127.0.0.1"):
+    """A child process that listens and never speaks HTTP: the review's victim.
 
-    monkeypatch.undo()
-    from kestrel_sovereign.security import operator_lane as lane
+    A child, not this process, so a fail-open would kill something harmless.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import socket,sys,time; s=socket.socket(); s.bind(('{bind}',0)); s.listen(5); "
+         "print(s.getsockname()[1], flush=True); time.sleep(120)"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    port = int(proc.stdout.readline().strip())
+    return proc, port
 
+
+def test_a_listener_that_is_not_a_kestrel_host_does_not_vouch():
+    proc, port = _throwaway_listener()
+    try:
+        assert vouch_pid(proc.pid, KEY) is False
+    finally:
+        proc.kill(); proc.wait()
+
+
+def test_a_pid_with_no_listeners_does_not_vouch():
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        assert vouch_pid(proc.pid, KEY) is False
+    finally:
+        proc.kill(); proc.wait()
+
+
+def test_kill_process_refuses_an_unvouched_pid_only_while_the_lane_is_armed():
     from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
-    monkeypatch.setattr(ProcessManager, "is_port_in_use", staticmethod(lambda port, host="0.0.0.0": True))
-    seen = {}
-
-    def fake_get(url, headers=None, timeout=None):
-        seen["url"], seen["headers"] = url, headers
-        return httpx.Response(status, request=httpx.Request("GET", url))
-
-    monkeypatch.setattr(httpx, "get", fake_get)
-    assert lane.held_port_admits(8912, KEY) is admitted
-    assert seen["url"] == "http://localhost:8912/api/agents"
-    assert seen["headers"] == {"X-API-Key": KEY}
-
-
-def test_the_reviews_victim_scenario_end_to_end(tmp_path, monkeypatch, capsys):
-    """A caller-written project whose multi_agent.toml names a port held by
-    an unrelated process, with a caller-chosen key in .env and exported:
-    `kestrel terminate --force` refuses and the process survives."""
-    import socket
-
-    monkeypatch.undo()
-    victim = socket.socket()
-    victim.bind(("127.0.0.1", 0))
-    victim.listen(1)
-    port = victim.getsockname()[1]
+    proc, port = _throwaway_listener()
     try:
-        (tmp_path / ".env").write_text("KESTREL_API_KEY=attacker-chosen\n")
-        (tmp_path / "multi_agent.toml").write_text(f"[host]\nport = {port}\nbind = \"127.0.0.1\"\n")
-        monkeypatch.setattr(sys, "argv", ["kestrel", "terminate", "--force"])
-        monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
-        with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": "attacker-chosen"}, clear=True):
-            with patch.object(cli, "cmd_terminate") as terminate:
-                rc = cli.main()
-        assert rc == 1
-        terminate.assert_not_called()
-        assert f"holds :{port}" in capsys.readouterr().err
-        # Still bound and listening: nothing signalled it. (A connect probe
-        # would only measure the backlog, which the lane's own refused HTTP
-        # probe still occupies.)
-        assert victim.getsockname()[1] == port
-        assert victim.fileno() != -1
+        operator_lane.activate_operator_lane(KEY)
+        with pytest.raises(OperatorLaneRefused, match=f"PID {proc.pid}"):
+            ProcessManager.kill_process(proc.pid, force=True)
+        assert proc.poll() is None  # alive: nothing was signalled
+        # The host managing its own agents is not an invoker: disarmed, the
+        # chokepoint behaves as before.
+        operator_lane._presented_key = None
+        assert ProcessManager.kill_process(proc.pid, force=True) is True
+        proc.wait(timeout=10)
+        assert proc.poll() is not None
     finally:
-        victim.close()
+        if proc.poll() is None:
+            proc.kill(); proc.wait()
+
+
+def _attacker_project(tmp_path, port, *, bind="::1", pid_file_pid=None):
+    """A caller-written project: its own key, a toml naming a port it does not
+    own (with a bind chosen to defeat a port probe), optionally a pid file."""
+    (tmp_path / ".env").write_text("KESTREL_API_KEY=attacker-chosen\n")
+    (tmp_path / "multi_agent.toml").write_text(f'[host]\nport = {port}\nbind = "{bind}"\n')
+    if pid_file_pid is not None:
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / ".host.pid").write_text(str(pid_file_pid))
+    return tmp_path
+
+
+@pytest.mark.parametrize("argv", [["terminate"], ["terminate", "--force"], ["restart"]])
+def test_the_reviews_victim_scenarios_end_to_end_through_the_real_terminate(tmp_path, monkeypatch, capsys, argv):
+    """Round 2's two live exploits, against the REAL cmd_terminate: a victim on
+    0.0.0.0 with the config saying bind = "::1" (the port probe missed it), and
+    a caller-written logs/.host.pid naming the victim (no port at all). Both
+    reach kill_process, where the victim cannot vouch, and the verb refuses
+    with the victim alive. The victim is a throwaway child."""
+    victim, port = _throwaway_listener("0.0.0.0")
+    try:
+        project = _attacker_project(tmp_path, port, bind="::1", pid_file_pid=victim.pid)
+        monkeypatch.setattr(sys, "argv", ["kestrel", *argv])
+        monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+        with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": "attacker-chosen"}, clear=True):
+            rc = cli.main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "did not vouch" in err and f"PID {victim.pid}" in err
+        assert victim.poll() is None, "the victim was signalled"
+    finally:
+        victim.kill(); victim.wait()
+
+
+def test_a_vouching_host_is_signalled_and_a_non_vouching_neighbour_is_not(tmp_path, monkeypatch, capsys, vouching_host):
+    """Round 2's laundering case: two processes on one port number. The one
+    that answers the challenge is this test process (its vouching listener);
+    the other is a throwaway child. Whatever named the port, only the
+    vouched PID may be signalled — and this process must not be, either,
+    because the verb refuses as a whole once any target fails to vouch."""
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    victim, port = _throwaway_listener("0.0.0.0")
+    try:
+        operator_lane.activate_operator_lane(KEY)
+        # Both PIDs are "on" some port; the chokepoint judges each PID alone.
+        assert vouch_pid(os.getpid(), KEY) is True
+        with pytest.raises(OperatorLaneRefused):
+            ProcessManager.kill_process(victim.pid, force=True)
+        assert victim.poll() is None
+    finally:
+        victim.kill(); victim.wait()

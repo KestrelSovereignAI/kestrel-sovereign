@@ -3555,6 +3555,7 @@ async def auth_middleware(request: Request, call_next):
         "/health",
         "/favicon.ico",
         "/api/auth/key",
+        "/api/auth/vouch",
         "/metrics",
         "/webhooks/github-app",
     ]
@@ -3948,6 +3949,38 @@ if SERVE_UI:
                 html = html.replace("</head>", f"{script}\n</head>", 1)
 
         return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/api/auth/vouch")
+@limiter.limit("60/minute")
+async def vouch_for_operator_lane(request: Request, nonce: str):
+    """Answer the operator lane's nonce challenge (#3233).
+
+    ``kestrel terminate|restart|update`` signal a process only after it has
+    vouched: the CLI opens one of the process's own loopback listeners and
+    asks for the HMAC of a fresh nonce under the host's stable sovereign
+    key. Only a Kestrel host holding that key can answer, the key is never
+    transmitted, and the answer binds the exact process about to be
+    signalled — a caller-written port, bind, pid file or config cannot
+    stand in for it. Loopback only, like the bootstrap route; an HMAC over
+    a caller-chosen nonce reveals nothing about the key. A host running on
+    a temporary generated key has no durable sovereign and does not vouch.
+    """
+    from kestrel_sovereign.security.operator_lane import (
+        is_valid_nonce,
+        vouch_response,
+    )
+    from kestrel_sovereign.security.sovereign_key import is_ephemeral_sovereign_key
+
+    client_host = request.client.host if request.client else None
+    if not is_bootstrap_host_allowed(client_host):
+        raise HTTPException(status_code=403, detail="Vouching only over loopback")
+    if not is_valid_nonce(nonce):
+        raise HTTPException(status_code=400, detail="nonce must be 32 hex characters")
+    key = get_api_key()
+    if is_ephemeral_sovereign_key(key):
+        raise HTTPException(status_code=404, detail="No stable sovereign key on this host")
+    return {"vouch": vouch_response(key, nonce)}
 
 
 @app.get("/api/auth/key")

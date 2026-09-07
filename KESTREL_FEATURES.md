@@ -717,6 +717,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 - `GET /`
 - `GET /api/auth/key`
+- `GET /api/auth/vouch`
 - `GET /api/host/csrf`
 - `POST /api/host/phoenix/session`
 - `GET /api/host/ui/contributions`
