@@ -1910,6 +1910,14 @@ class AsyncGraphStore:
             raise ValueError("A bound graph store cannot purge another agent")
 
         since_iso = _normalize_purge_watermark(since_iso)
+        # A value shorter than ``YYYY-MM-DD HH:MM:SS`` (a bare date, an empty
+        # string) carries no instant to compare: it reads as NULL on both
+        # backends and falls into the untimed branch below — preserved and
+        # counted, never purged. Some live writers stamp ``created_at`` with a
+        # bare date; appending a fraction to those sorted them ABOVE the
+        # watermark and would have purged every same-day one (#3227 review).
+        # On Postgres the guard also keeps ``''`` away from the timestamptz
+        # cast, which used to fail the whole sweep.
         if self.db.backend_type == "postgres":
             # graph_nodes.properties.created_at is documented as
             # ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00`` (ISO with T separator,
@@ -1921,27 +1929,43 @@ class AsyncGraphStore:
             # nodes get purged; without the microseconds, a NORMAL node from
             # earlier in the transition second compared equal to the
             # watermark and was purged too (#3227).
+            # A fraction longer than six digits is TRUNCATED before the
+            # cast: ``timestamptz`` would round it, and SQLite truncates, so
+            # ``.4999999`` must land on the same side on both.
+            truncated = (
+                "regexp_replace(properties::jsonb->>'created_at', "
+                "'(\\.[0-9]{6})[0-9]+', '\\1')"
+            )
             created_normalized = (
-                "to_char(("
-                "  CASE WHEN (properties::jsonb->>'created_at') IS NULL THEN NULL "
-                "       ELSE ((properties::jsonb->>'created_at')::timestamptz) "
-                "  END "
-                ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"
+                "(CASE WHEN (properties::jsonb->>'created_at') IS NULL "
+                "        OR length(properties::jsonb->>'created_at') < 19 THEN NULL "
+                f" ELSE to_char(({truncated}::timestamptz) "
+                "              AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') END)"
             )
         else:
             # SQLite normalisation: ``T`` → space, then
-            # ``YYYY-MM-DD HH:MM:SS.ffffff`` (length 26) — the fractional
-            # part kept when present, ``.000000`` supplied when the row was
-            # stamped at whole seconds — with any UTC offset dropped.
-            # Handles ISO (``2026-04-26T16:31:06.123456+00:00``), offset-
-            # free ISO, and SQLite-format (``2026-04-26 16:31:06``) inputs
+            # ``YYYY-MM-DD HH:MM:SS.ffffff`` (length 26): the fractional
+            # digits kept when present — cut at the first non-digit so an
+            # offset or ``Z`` never enters the compared text — and padded or
+            # truncated to exactly six; ``.000000`` supplied when the row was
+            # stamped at whole seconds.  Handles ISO with any fraction length
+            # and offset, offset-free ISO, and SQLite-format inputs
             # uniformly, at the precision the rows are written with (#3227).
+            value = "replace(json_extract(properties, '$.created_at'), 'T', ' ')"
+            frac = f"substr({value}, 21)"
+            digits = (
+                f"(CASE WHEN instr({frac}, '+') > 0 THEN substr({frac}, 1, instr({frac}, '+') - 1) "
+                f"      WHEN instr({frac}, '-') > 0 THEN substr({frac}, 1, instr({frac}, '-') - 1) "
+                f"      WHEN instr({frac}, 'Z') > 0 THEN substr({frac}, 1, instr({frac}, 'Z') - 1) "
+                f"      WHEN instr({frac}, ' ') > 0 THEN substr({frac}, 1, instr({frac}, ' ') - 1) "
+                f"      ELSE {frac} END)"
+            )
             created_normalized = (
-                "(CASE WHEN json_extract(properties, '$.created_at') IS NULL THEN NULL "
-                " WHEN substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 20, 1) = '.' "
-                "  THEN substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 1, 26) "
-                " ELSE substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 1, 19) || '.000000' "
-                " END)"
+                f"(CASE WHEN json_extract(properties, '$.created_at') IS NULL "
+                f"        OR length({value}) < 19 THEN NULL "
+                f" WHEN substr({value}, 20, 1) = '.' "
+                f"  THEN substr({value}, 1, 19) || '.' || substr({digits} || '000000', 1, 6) "
+                f" ELSE substr({value}, 1, 19) || '.000000' END)"
             )
 
         ownership_clause = (

@@ -409,3 +409,23 @@ def test_watermark_setter_accepts_legacy_whole_second_strings(tmp_path):
     assert wrapper._graph_purge_watermark() is None
     with pytest.raises(ValueError, match="watermark"):
         wrapper._entered_ephemeral_at = "not a timestamp"
+
+
+def test_the_transition_clock_carries_sub_second_precision(tmp_path):
+    """Unpinned: the one line the fix rests on. A clock truncated to seconds
+    would reintroduce #3227 while every pinned test stayed green."""
+    from datetime import datetime, timezone
+
+    instant = PrivacyEnforcingStorage._now_instant()
+    assert isinstance(instant, datetime) and instant.tzinfo is not None
+    assert instant.utcoffset() == timezone.utc.utcoffset(instant)
+
+    storage = AsyncStorage(str(tmp_path / "clock.db"), agent_id=AGENT_ID)
+    marks = set()
+    for _ in range(25):
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        mark = wrapper._graph_purge_watermark()
+        assert len(mark) == 26 and mark[19] == ".", mark
+        marks.add(mark[20:])
+    assert any(fraction != "000000" for fraction in marks), marks
