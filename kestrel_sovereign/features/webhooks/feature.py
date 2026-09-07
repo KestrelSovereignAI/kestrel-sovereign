@@ -20,11 +20,12 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.features.storage_access import installed_host_hook
+from kestrel_sovereign.features.webhooks.collision import describe_collision
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -226,10 +227,30 @@ class WebhookFeature(Feature):
             )
         return {str(name): [str(owner) for owner in owners] for name, owners in answer.items()}
 
-    @staticmethod
-    def _collision_note(collisions: Dict[str, List[str]]) -> str:
+    def _agent_prefixed_endpoint(self, name: str) -> Optional[str]:
+        """This agent's own ``/api/agents/{routing name}/webhooks/{name}``.
+
+        Keyed by the ROUTING name the host's AgentManager registered this
+        agent under — not ``agent_name``, which is a display name that
+        equals the routing key only for a published hosted agent. Only a
+        hosted agent carries ``_agent_manager``; a single-agent boot serves
+        no ``/api/agents/*`` route at all, and a fenced spawn route resolves
+        to ``None``. In both cases no address is invented.
+        """
+        manager = getattr(self.agent, "_agent_manager", None)
+        routing_name = (
+            manager.get_agent_name(self._agent_id) if manager is not None else None
+        )
+        if isinstance(routing_name, str) and routing_name:
+            return f"/api/agents/{routing_name}/webhooks/{name}"
+        return None
+
+    def _collision_note(self, collisions: Dict[str, List[str]]) -> str:
+        """Every collided name with the remedy the refusal itself implies."""
         return "; ".join(
-            f"'{name}' is also owned by: {', '.join(owners)}"
+            describe_collision(
+                name, owners, own_endpoint=self._agent_prefixed_endpoint(name)
+            )
             for name, owners in sorted(collisions.items())
         )
 
@@ -289,9 +310,7 @@ class WebhookFeature(Feature):
         )
         if collisions:
             confirmation += (
-                f" Name collision on this host ({self._collision_note(collisions)}): "
-                "the unprefixed /webhooks/{name} form is refused for those names; "
-                "senders must use the agent-prefixed address."
+                f" Name collision on this host: {self._collision_note(collisions)}"
             )
         if db_failed:
             return ToolResult.partial(
@@ -363,9 +382,9 @@ class WebhookFeature(Feature):
         confirmation = f"Returned {len(events)} webhook event(s)."
         if collisions:
             confirmation += (
-                f" Name collision on this host ({self._collision_note(collisions)}): "
-                "a 404 in this log for one of those names may be the host refusing "
-                "the unprefixed form, not an unknown name."
+                f" Name collision on this host: {self._collision_note(collisions)} "
+                "A 404 in this log for one of those names may be the host "
+                "refusing the collided form, not an unknown name."
             )
         if db_failed:
             return ToolResult.partial(
@@ -544,12 +563,8 @@ class WebhookFeature(Feature):
         # manager and serves no ``/api/agents/*`` route at all, and a fenced
         # spawn route resolves to ``None``. In both cases no address is
         # invented.
-        manager = getattr(self.agent, "_agent_manager", None)
-        routing_name = (
-            manager.get_agent_name(self._agent_id) if manager is not None else None
-        )
-        if isinstance(routing_name, str) and routing_name:
-            agent_endpoint = f"/api/agents/{routing_name}/webhooks/{name}"
+        agent_endpoint = self._agent_prefixed_endpoint(name)
+        if agent_endpoint is not None:
             data["agent_endpoint"] = agent_endpoint
             confirmation += (
                 f" On a host running more than one agent, point the sender at "
@@ -568,29 +583,12 @@ class WebhookFeature(Feature):
 
         # Collect any conditions that warrant a PARTIAL (vs a clean OK).
         warnings: List[str] = []
-        if owners and len(set(owners)) == 1:
-            # Two of THIS agent's receivers: the agent-prefixed form is refused
-            # too (#3216), so no address is a remedy — mirror the refusal.
+        if owners:
+            # The same sentence the host log and the read surfaces print; the
+            # remedy is the refusal's own (#3216), never an address it refuses.
             warnings.append(
-                f"NAME COLLISION within this agent: '{name}' is now owned by "
-                f"{len(owners)} of its enabled receivers. Both the unprefixed "
-                f"/webhooks/{name} form and the agent-prefixed form are refused "
-                f"from this moment; unregister one of them."
-            )
-        elif owners:
-            warnings.append(
-                f"NAME COLLISION: '{name}' is now owned by {len(owners)} enabled "
-                f"receivers on this host ({', '.join(owners)}). The unprefixed "
-                f"/webhooks/{name} form is refused for every owner from this "
-                f"moment; point each sender at "
-                + (
-                    data["agent_endpoint"]
-                    if "agent_endpoint" in data
-                    else "the agent-prefixed /api/agents/<agent>/webhooks/"
-                    + name
-                    + " form"
-                )
-                + ", or unregister one of them."
+                "NAME COLLISION from this moment: "
+                + describe_collision(name, owners, own_endpoint=agent_endpoint)
             )
         if is_unauthenticated and not allow_unauthenticated:
             warnings.append(

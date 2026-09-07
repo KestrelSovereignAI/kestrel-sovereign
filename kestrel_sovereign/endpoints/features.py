@@ -741,15 +741,9 @@ async def _enable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     for _class_name, feature in activated:
         await agent._notify_feature_runtime_ready(feature)
 
-    # An enable brings a feature's webhook names live without a router mount
-    # pass, so this is a fourth moment a collision can appear (#3239). The
-    # host installed the scoped answer on this agent; announce it now rather
-    # than on the first refused delivery. A standalone agent has no hook.
-    from kestrel_sovereign.features.storage_access import installed_host_hook
-
-    collision_hook = installed_host_hook(agent, "_host_webhook_collisions")
-    if collision_hook is not None:
-        collision_hook(announce=True)
+    # The members are live: a report about them must never turn a committed
+    # enable into a failed one (#3239).
+    _announce_webhook_collisions(agent, moment="enable")
 
     return {
         "name": name,
@@ -888,6 +882,34 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     }
 
 
+def _announce_webhook_collisions(agent: object, *, moment: str) -> None:
+    """Report webhook names this agent just brought live that collide.
+
+    A feature enabled at runtime, or re-activated by a rollback, brings its
+    webhook names live without a router mount pass — moments the host's
+    collision report would otherwise miss (#3239). The host installed the
+    scoped answer on the agent; a standalone agent has none. The scan walks
+    every current agent's features, so it is audit-class work: it can never
+    change the outcome of the lifecycle operation that is already committed
+    (the rule ``receiver.py``'s ``_audit_refusal`` states). A failure is
+    logged with the moment it was asked at, so it does not go silent.
+    """
+    from kestrel_sovereign.features.storage_access import installed_host_hook
+
+    hook = installed_host_hook(agent, "_host_webhook_collisions")
+    if hook is None:
+        return
+    try:
+        hook(announce=True)
+    except Exception as exc:  # noqa: BLE001 - the operation is already committed
+        logger.warning(
+            "Webhook collision report at %s failed: %s: %s",
+            moment,
+            type(exc).__name__,
+            exc,
+        )
+
+
 async def _restore_feature_group(
     agent: object,
     attempted: tuple[tuple[str, Any, bool], ...],
@@ -978,6 +1000,11 @@ async def _restore_feature_group(
                 operation.lower(),
                 class_name,
             )
+
+    # Whatever was re-activated is live now, with its webhook names: the
+    # fifth moment a collision can appear (#3239).
+    if restored:
+        _announce_webhook_collisions(agent, moment=f"{operation} rollback")
 
     # Rollback is best-effort. Only open the cognition-capable ready seam when
     # the complete formerly-enabled generation is live again; a partial restore

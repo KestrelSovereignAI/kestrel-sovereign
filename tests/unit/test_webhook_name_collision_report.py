@@ -349,10 +349,14 @@ async def test_registration_is_reported_and_both_owners_can_read_it(
         listing = await feat_a.webhooks_list()
         assert listing.data["collisions"] == {"deposit": ["emma", "nellie"]}
         assert "Name collision on this host" in listing.confirmation
-        assert "'deposit' is also owned by: emma, nellie" in listing.confirmation
+        assert "agents: emma, nellie" in listing.confirmation
+        # The reader's OWN agent-prefixed address, which does dispatch to it.
+        assert "point each sender at /api/agents/emma/webhooks/deposit" in listing.confirmation
         history = await feat_a.webhooks_history()
         assert history.data["collisions"] == {"deposit": ["emma", "nellie"]}
         assert "Name collision on this host" in history.confirmation
+        assert "point each sender at /api/agents/emma/webhooks/deposit" in history.confirmation
+        assert "/api/agents/nellie/webhooks/deposit" in (await feat_b.webhooks_list()).confirmation
 
         # Reading is silent: only where a name is created does the host log.
         before = len(host_log.about("deposit"))
@@ -447,11 +451,18 @@ async def test_registration_colliding_with_this_agents_own_receiver_names_no_add
         )
         assert reg.status.name == "PARTIAL", reg
         assert reg.data["owners"] == ["emma", "emma"]
-        assert "within this agent" in reg.error
+        assert "of one agent (emma)" in reg.error
         assert "unregister one of them" in reg.error
         assert "point each sender" not in reg.error
+        assert "/api/agents/emma/webhooks/deposit" not in reg.error
         (message,) = host_log.about("deposit")
         assert "of one agent (emma)" in message
+        # The surfaces the owner reads say the same thing (review r2 F1).
+        for surface in (await feat_a.webhooks_list(), await feat_a.webhooks_history()):
+            assert "of one agent (emma)" in surface.confirmation
+            assert "unregister one of them" in surface.confirmation
+            assert "point each sender" not in surface.confirmation
+            assert "/api/agents/emma/webhooks/deposit" not in surface.confirmation
     finally:
         from kestrel_sovereign.server import _unmount_feature_routers
 
@@ -496,3 +507,208 @@ async def test_enabling_a_feature_at_runtime_announces_a_collision():
     standalone.features = {solo.name: solo}
     result = await _enable_feature_locked(standalone, solo.name)
     assert result["status"] == "enabled"
+
+
+# ---------------------------------------------------------------------------
+# The one describer behind every surface (review r2 F1/F2)
+# ---------------------------------------------------------------------------
+
+
+def test_describer_cross_agent_points_at_the_prefixed_address():
+    from kestrel_sovereign.features.webhooks.collision import describe_collision
+
+    text = describe_collision("deposit", ["a", "b"])
+    assert "owned by 2 enabled receivers on this host (agents: a, b)" in text
+    assert "point each sender at /api/agents/<agent>/webhooks/deposit" in text
+    own = describe_collision("deposit", ["a", "b"], own_endpoint="/api/agents/a/webhooks/deposit")
+    assert "point each sender at /api/agents/a/webhooks/deposit" in own
+
+
+def test_describer_within_one_agent_names_no_address():
+    from kestrel_sovereign.features.webhooks.collision import describe_collision
+
+    text = describe_collision("deposit", ["a", "a"], own_endpoint="/api/agents/a/webhooks/deposit")
+    assert "of one agent (a)" in text
+    assert "agent-prefixed form are refused" in text
+    assert "unregister one of them" in text
+    assert "/api/agents/a/webhooks/deposit" not in text
+    assert "point each sender" not in text
+
+
+def test_describer_mixed_ownership_says_both():
+    """Review r2 F2: ``len(set(owners)) == 1`` was a proxy that mixed
+    ownership defeated. Emma owns it twice, nellie once: the prefixed form
+    resolves it for nellie's senders and is refused for emma's."""
+    from kestrel_sovereign.features.webhooks.collision import describe_collision
+
+    text = describe_collision("deposit", ["emma", "emma", "nellie"])
+    assert "3 enabled receivers on this host (agents: emma, emma, nellie)" in text
+    assert "for emma the agent-prefixed form is refused too" in text
+    assert "one of them must be unregistered" in text
+    assert "other senders use /api/agents/<agent>/webhooks/deposit" in text
+    assert "point each sender" not in text
+
+
+@pytest.mark.asyncio
+async def test_mixed_ownership_is_described_the_same_on_every_surface(
+    tmp_path, sqlite_database_factory, host_log
+):
+    from server import app
+
+    feat_a, feat_b, manager = await _hosted_pair(tmp_path, sqlite_database_factory)
+    feat_a.agent.features["OtherWebhookFeature"] = _WebhookFeatureStub("deposit")
+    original = (getattr(app.state, "agent", None), getattr(app.state, "agent_manager", None))
+    app.state.agent = None
+    app.state.agent_manager = manager
+    _mount_feature_routers(app)
+    try:
+        await feat_b.webhooks_register(name="deposit", auth_type="none", allow_unauthenticated=True)
+        host_log.records.clear()
+        reg = await feat_a.webhooks_register(
+            name="deposit", auth_type="none", allow_unauthenticated=True
+        )
+        assert reg.data["owners"] == ["emma", "emma", "nellie"]
+        surfaces = {
+            "register": reg.error,
+            "host log": host_log.about("deposit")[0],
+            "emma list": (await feat_a.webhooks_list()).confirmation,
+            "emma history": (await feat_a.webhooks_history()).confirmation,
+            "nellie list": (await feat_b.webhooks_list()).confirmation,
+        }
+        for label, text in surfaces.items():
+            assert "for emma the agent-prefixed form is refused too" in text, label
+            assert "point each sender" not in text, label
+        assert "other senders use /api/agents/emma/webhooks/deposit" in surfaces["register"]
+        assert "other senders use /api/agents/nellie/webhooks/deposit" in surfaces["nellie list"]
+    finally:
+        from kestrel_sovereign.server import _unmount_feature_routers
+
+        _unmount_feature_routers(app)
+        app.state.agent = original[0]
+        app.state.agent_manager = original[1]
+
+
+# ---------------------------------------------------------------------------
+# The onboarding moment, through the REAL host hook (review r2 F3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_real_onboarding_hook_names_the_newcomer_before_publication(
+    monkeypatch, host_log
+):
+    """Not the mount pass called by hand: ``_onboard_host_registered_agent``
+    itself, with a real ``AgentManager`` that has NOT published the newcomer
+    — the order production runs it in. The hook must pass the candidate."""
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    monkeypatch.delenv("KESTREL_HOST_URL", raising=False)
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "peer-transport-key")
+    app = FastAPI()
+    app.state.multi_agent_config = MultiAgentConfig.model_validate(
+        {"host": {"bind": "0.0.0.0", "port": 8888}}
+    )
+    app.state.multi_agent_config_path = None
+    manager = AgentManager()
+    app.state.agent = None
+    app.state.agent_manager = manager
+
+    incumbent = SimpleNamespace(
+        did="did:test:a", agent_id="did:test:a",
+        features={"WebhookFeature": _WebhookFeatureStub("deposit")},
+    )
+    manager._register_agent("a", incumbent)
+    newcomer = SimpleNamespace(
+        did="did:test:b", agent_id="did:test:b",
+        features={"WebhookFeature": _WebhookFeatureStub("deposit")},
+    )
+    assert "b" not in manager.list_agents()
+    # Production order (agent_manager ~5448): the candidate is parked in the
+    # manager's private onboarding registry, the hook runs, THEN
+    # _register_agent publishes. The hook's own policy install requires the
+    # first step; nothing here publishes the newcomer.
+    manager._onboarding_agents["b"] = newcomer
+    try:
+        await server._onboard_host_registered_agent(app, manager, "b", newcomer)
+        (message,) = host_log.about("deposit")
+        assert "agents: a, b" in message
+        assert newcomer._host_webhook_collisions(announce=False) == {"deposit": ["a", "b"]}
+        assert "b" not in manager.list_agents()  # still unpublished: the hook's moment
+        manager._register_agent("b", newcomer)
+        manager._onboarding_agents.pop("b", None)
+        assert incumbent._host_webhook_collisions(announce=False) == {"deposit": ["a", "b"]}
+    finally:
+        server._unmount_feature_routers(app)
+
+
+# ---------------------------------------------------------------------------
+# The announce never fails a committed lifecycle operation (review r2 F4/F5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_raising_hook_does_not_fail_a_committed_enable():
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+    from tests.unit.test_features_api import _lifecycle_agent
+    from kestrel_sovereign.endpoints.features import _enable_feature_locked
+
+    class ReceivingFeature(SDKFixtureFeature):
+        contribution_prefix = "collision-raise-fixture"
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    target = logging.getLogger("kestrel_sovereign.endpoints.features")
+    target.addHandler(handler)
+    try:
+        agent = _lifecycle_agent()
+        feature = ReceivingFeature(agent)
+        feature.enabled = False
+        agent.features = {feature.name: feature}
+
+        def broken(*, announce=True):
+            raise RuntimeError("a peer's feature property blew up")
+
+        agent._host_webhook_collisions = broken
+        result = await _enable_feature_locked(agent, feature.name)
+        assert result["status"] == "enabled"
+        assert feature.enabled is True
+        assert any("collision report at enable failed" in m and "blew up" in m for m in records)
+    finally:
+        target.removeHandler(handler)
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_that_reactivates_a_feature_announces():
+    """A failed disable/remove restores the formerly-enabled members without
+    a mount pass: the fifth moment (review r2 F5)."""
+    from tests.fixtures.sdk_contribution_fixture import SDKFixtureFeature
+    from tests.unit.test_features_api import _lifecycle_agent
+    from kestrel_sovereign.endpoints.features import _restore_feature_group
+
+    class ReceivingFeature(SDKFixtureFeature):
+        contribution_prefix = "collision-restore-fixture"
+
+    agent = _lifecycle_agent()
+    feature = ReceivingFeature(agent)
+    feature.enabled = False  # torn down by the failed operation
+    agent.features = {feature.name: feature}
+    announced = []
+    agent._host_webhook_collisions = lambda *, announce=True: announced.append(announce) or {}
+
+    await _restore_feature_group(
+        agent, ((feature.name, feature, True),), operation="disable"
+    )
+    assert feature.enabled is True
+    assert announced == [True]

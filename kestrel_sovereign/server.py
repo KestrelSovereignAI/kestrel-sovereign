@@ -1197,10 +1197,8 @@ def _report_webhook_name_collisions(
     consumed (#3216). This is the same fact reported where the name is
     created, from the only place that sees every agent: a feature cannot
     look across the tenancy boundary at its peers' registrations. The
-    remedy printed matches the refusal's: a collision between agents is
-    resolved by the agent-prefixed address; a collision inside one agent
-    (two of its receivers) is refused on that form too and only an
-    unregister resolves it.
+    remedy printed is :func:`describe_collision`'s, the same sentence every
+    surface prints.
     """
     owners = _webhook_name_owners(app, candidates)
     collided = {name: agents for name, agents in owners.items() if len(agents) > 1}
@@ -1210,29 +1208,10 @@ def _report_webhook_name_collisions(
             own_names.update(str(n) for n in (getattr(receiver, "webhooks", None) or ()))
         collided = {name: agents for name, agents in collided.items() if name in own_names}
     if announce:
+        from kestrel_sovereign.features.webhooks.collision import describe_collision
+
         for name, agents in sorted(collided.items()):
-            if len(set(agents)) == 1:
-                logger.warning(
-                    "Webhook name '%s' is owned by %d enabled receivers of one "
-                    "agent (%s): both the unprefixed /webhooks/%s form and the "
-                    "agent-prefixed form are refused; unregister one of them.",
-                    name,
-                    len(agents),
-                    agents[0],
-                    name,
-                )
-                continue
-            logger.warning(
-                "Webhook name '%s' is owned by %d enabled receivers on this host "
-                "(agents: %s): the unprefixed /webhooks/%s form is refused for "
-                "every owner; point each sender at "
-                "/api/agents/<agent>/webhooks/%s.",
-                name,
-                len(agents),
-                ", ".join(agents),
-                name,
-                name,
-            )
+            logger.warning("Webhook name %s", describe_collision(name, agents))
     return collided
 
 
