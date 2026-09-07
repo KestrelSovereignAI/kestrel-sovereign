@@ -99,3 +99,83 @@ def test_identity_with_no_source_is_still_a_string():
 def test_file_source_identity_is_its_path(tmp_path):
     p = tmp_path / ".credentials.json"
     assert FileCredentialSource(p).identity() == str(p)
+
+
+# ---------------------------------------------------------------------------
+# Keychain account resolution must not bind silently to a stale login
+# ---------------------------------------------------------------------------
+
+import json
+from kestrel_sovereign.llm.anthropic_oauth import KeychainCredentialSource
+
+
+def _item(exp_offset):
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": TOKEN, "refreshToken": "r",
+        "expiresAt": int((time.time() + exp_offset) * 1000),
+    }})
+
+
+class _FakeKeychain(KeychainCredentialSource):
+    """Drives resolution without touching the real keychain."""
+
+    def __init__(self, accounts, items, enumerate_ok=True, default=None):
+        super().__init__()
+        self._accounts = accounts
+        self._items = items
+        self._enumerate_ok = enumerate_ok
+        self._default = default
+
+    def _list_service_accounts(self):
+        return list(self._accounts) if self._enumerate_ok else []
+
+    def _read_account_raw(self, account):
+        raw = self._items.get(account)
+        return json.loads(raw) if raw else None
+
+    def _run(self, args):
+        if args and args[0] == "find-generic-password" and self._default:
+            class R:
+                returncode = 0
+                stdout = f'"acct"<blob>="{self._default}"'
+                stderr = ""
+            return R()
+        return None
+
+
+def test_picks_the_live_login_over_a_stale_one():
+    src = _FakeKeychain(
+        ["stale", "live"],
+        {"stale": _item(-86400 * 240), "live": _item(3600)},
+    )
+    assert src._resolve_account() == "live"
+
+
+def test_warns_when_the_freshest_item_is_itself_expired(caplog):
+    src = _FakeKeychain(["stale"], {"stale": _item(-86400 * 240)})
+    with caplog.at_level("WARNING"):
+        assert src._resolve_account() == "stale"
+    assert any("itself expired" in r.message for r in caplog.records), (
+        "binding to an expired credential must not be silent"
+    )
+
+
+def test_warns_when_falling_back_to_the_default_item(caplog):
+    """The path that can bind a process to a dead credential for its whole
+    lifetime — reached whenever enumeration fails, including a `security`
+    timeout, since _run returns None then."""
+    src = _FakeKeychain([], {}, enumerate_ok=False, default="whichever-is-first")
+    with caplog.at_level("WARNING"):
+        assert src._resolve_account() == "whichever-is-first"
+    assert any("not \nnecessarily" in r.message.replace("  ", " ")
+               or "necessarily the live login" in r.message
+               for r in caplog.records), "silent fallback to the default item"
+
+
+def test_a_single_valid_item_resolves_without_warning(caplog):
+    """Control: the ordinary one-login case must stay quiet, or the warnings
+    above are noise nobody reads."""
+    src = _FakeKeychain(["only"], {"only": _item(3600)})
+    with caplog.at_level("WARNING"):
+        assert src._resolve_account() == "only"
+    assert not [r for r in caplog.records if "Claude OAuth" in r.message]
