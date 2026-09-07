@@ -34,11 +34,20 @@ class HostAttestedLocalTaskOwner:
 
 
 def _stable_agent_id(agent: Any) -> str | None:
-    for attribute in ("agent_id", "did"):
-        value = getattr(agent, attribute, None)
-        if isinstance(value, str) and value:
-            return value
-    return None
+    """The agent's DID through the shared guard, or None (#3246).
+
+    This read ``agent_id`` before ``did`` — the order the task routes
+    dropped — and files the row's recipient; it must agree with them.
+    """
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return None
 
 
 def _recipient_peer_context(recipient: Any) -> tuple[Any, PeerRequester, str]:

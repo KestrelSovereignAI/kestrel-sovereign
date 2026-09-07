@@ -80,17 +80,26 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     The guard for the sites that scope a shared table to the calling agent
     and route through it: the consent log and audit anchors (#3229/#3230),
     observability (#3215), the ``!tasks`` command, and since #3246 the
-    A2A task routes' recipient (reads, subscribe and cancel), the task
-    feature's own durable identity, the task wait provider's ownership
-    check, the pre-turn state sections, and the restart status-events
-    route. They had drifted — one gated on truthiness alone, so a
-    non-string truthy value was bound as a query parameter; the task routes
-    read ``agent_id`` before ``did``; the cancel route tried the task
-    manager's ``host_agent_id`` first. Other tables still scope themselves
-    inline (the reflection status route, the wait reconciler, the scheduler
-    and restart-coordinator features, the memory reflection hook, the
-    health checks, key resolution); grep for ``"did"`` in a gating position
-    before adding another copy, and route through here instead.
+    A2A task routes' recipient (reads, subscribe, cancel, and the creation
+    of an inbound task), the host-attested local submission's recipient,
+    the task feature's own durable identity, the task wait provider's
+    ownership check, the pre-turn state sections, and the restart
+    status-events route. They had drifted — one gated on truthiness alone,
+    so a non-string truthy value was bound as a query parameter; the task
+    routes read ``agent_id`` before ``did``; the cancel route tried the
+    task manager's ``host_agent_id`` first; creation fell back to the
+    display name and then ``"unknown"``.
+
+    One ``a2a_tasks`` writer still resolves inline because it has no agent
+    object: ``TaskManager.execute_skill`` files a feature-run task under
+    ``self.host_agent_id or agent_id`` — the manager's own DID copied at
+    construction (``KestrelAgent`` passes ``host_agent_id=self.did``), else
+    the feature name. In production the two agree. Other tables still
+    scope themselves inline (the reflection status route, the wait
+    reconciler, the scheduler and restart-coordinator features, the memory
+    reflection hook, the health checks, key resolution; #3251). Grep for
+    ``"did"`` in a gating position before adding another copy, and route
+    through here instead.
 
     A missing, empty, or non-string DID is "cannot be scoped", never
     "unscoped": the caller refuses (a store that gates on ``if agent_id:``

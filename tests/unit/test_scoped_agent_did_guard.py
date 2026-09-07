@@ -503,3 +503,66 @@ async def test_task_creation_resolves_its_recipient_through_the_shared_helper(mo
             agent, params, params.message.parts, [], [], manager=None
         )
     assert asked == [(agent, "creation requires")]
+
+    # An action carrying a commit resolved its recipient at its route: the
+    # creation guard is not consulted. The sentinel would raise first if it
+    # were; instead the unsigned envelope is what refuses, later.
+    asked.clear()
+    from unittest.mock import AsyncMock
+
+    commit = AsyncMock(return_value="committed")
+    with pytest.raises(HTTPException) as excinfo:
+        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
+            agent, params, params.message.parts, [], [], manager=None, commit=commit
+        )
+    assert excinfo.value.detail != "sentinel"
+    assert asked == []
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_creation_refuses_before_any_verification_work(monkeypatch):
+    """Review r3: the ordering is load-bearing. Verification reserves the
+    replay nonce with no rollback, so a refusal AFTER it would burn a
+    correctly signed envelope that a repaired recipient could otherwise
+    accept on retry. With no identity, neither the verifier nor the replay
+    store is touched."""
+    from fastapi import HTTPException
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.a2a import envelope_signing
+    from kestrel_sovereign.endpoints import agent as agent_endpoint
+
+    verifier = AsyncMock(side_effect=AssertionError("verified before the guard"))
+    monkeypatch.setattr(envelope_signing, "verify_inbound_envelope", verifier)
+    replay = MagicMock(side_effect=AssertionError("replay store touched"))
+    monkeypatch.setattr(agent_endpoint, "_a2a_replay_store", replay)
+
+    task_manager = MagicMock()
+    task_manager.create_task = AsyncMock()
+    agent = SimpleNamespace(did="", _agent_name="recipient", task_manager=task_manager)
+    params = _send_params()
+    with pytest.raises(HTTPException) as excinfo:
+        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
+            agent, params, params.message.parts, [], [], manager=None
+        )
+    assert excinfo.value.status_code == 503
+    verifier.assert_not_awaited()
+    replay.assert_not_called()
+    task_manager.create_task.assert_not_awaited()
+
+
+# -- a2a/local_submission: the host-attested local writer ------------------
+
+
+def test_local_submission_recipient_is_the_did_not_agent_id():
+    from kestrel_sovereign.a2a.local_submission import _stable_agent_id
+
+    assert _stable_agent_id(SimpleNamespace(agent_id=OTHER, did=ME)) == ME
+
+
+@pytest.mark.parametrize("agent", _identity_cases() + [pytest.param(None, id="no-agent")])
+def test_local_submission_has_no_recipient_without_a_did(agent):
+    from kestrel_sovereign.a2a.local_submission import _stable_agent_id
+
+    assert _stable_agent_id(agent) is None
