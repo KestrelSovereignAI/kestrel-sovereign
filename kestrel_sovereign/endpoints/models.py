@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Mapping, Optional
 import aiohttp
 import httpx
 import asyncio
@@ -17,10 +18,12 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+from kestrel_sovereign.features.sovereignty.artifacts import owned_artifacts, owned_cids
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
     request_invocation_provenance,
+    caller_is_sovereign,
     require_sovereign_host_lifecycle,
     resolve_request_invocation_id,
     stopped_invocation_http_error,
@@ -1233,30 +1236,71 @@ async def get_constitution(request: Request):
         raise HTTPException(status_code=500, detail="Error retrieving constitution.")
 
 
-@router.get("/api/ipfs/status")
-async def get_ipfs_status(request: Request):
-    """Check IPFS node connectivity and status."""
-    # Resolve the agent up front so a missing agent surfaces as the
-    # contractual 503 before any network probing starts (#2495).
-    agent = get_agent(request)
-    status = {
-        "local_node": {"available": False, "error": None, "peer_id": None, "version": None},
-        "backup_tier": {},
-        "gateways": [],
-        "pinned_content": [],
-    }
+@dataclass(frozen=True)
+class _LocalNodeProbe:
+    """What the host's IPFS daemon answered, before anyone decides who may see it."""
 
+    available: bool = False
+    error: Optional[str] = None
+    peer_id: Optional[str] = None
+    agent_version: Optional[str] = None
+    version: Optional[str] = None
+    # Every recursive pin the daemon reports, CID → pin info.
+    pins: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+
+async def _probe_local_node() -> _LocalNodeProbe:
+    """Ask the process-global IPFS daemon for identity, version and pins.
+
+    The full pin set stays in this process: the agent-local status
+    intersects it with the routed agent's own CIDs, the sovereign node
+    view returns it whole (#3226). A failed connection is reported as a
+    connection failure and nothing else — never as "nothing pinned".
+    """
+    local_api_url = get_ipfs_api_url() + "/api/v0"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.post(f"{local_api_url}/id") as resp:
+                if resp.status != 200:
+                    return _LocalNodeProbe()
+                data = await resp.json()
+                peer_id = data.get("ID")
+                agent_version = data.get("AgentVersion")
+
+            version = None
+            async with session.post(f"{local_api_url}/version") as resp:
+                if resp.status == 200:
+                    version = (await resp.json()).get("Version")
+
+            pins: Mapping[str, Mapping[str, Any]] = {}
+            async with session.post(f"{local_api_url}/pin/ls?type=recursive") as resp:
+                if resp.status == 200:
+                    pins = (await resp.json()).get("Keys", {}) or {}
+    except Exception as e:
+        logger.error(f"IPFS local node check failed: {e}")
+        return _LocalNodeProbe(error="Connection failed")
+
+    return _LocalNodeProbe(
+        available=True,
+        peer_id=peer_id,
+        agent_version=agent_version,
+        version=version,
+        pins=pins,
+    )
+
+
+async def _backup_tier_health() -> dict:
     try:
         from kestrel_sovereign.storage.sync.health import check_sovereign_ipfs_health
 
-        status["backup_tier"] = (
+        return (
             await check_sovereign_ipfs_health(
                 api_url=os.environ.get("SOVEREIGN_IPFS_URL")
             )
         ).to_dict()
     except Exception as e:
         logger.error(f"Sovereign IPFS backup tier check failed: {e}")
-        status["backup_tier"] = {
+        return {
             "name": "sovereign_ipfs",
             "label": "sovereign-operated",
             "configured": False,
@@ -1265,42 +1309,15 @@ async def get_ipfs_status(request: Request):
             "details": {},
         }
 
-    local_api_url = get_ipfs_api_url() + "/api/v0"
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.post(f"{local_api_url}/id") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    status["local_node"]["available"] = True
-                    status["local_node"]["peer_id"] = data.get("ID")
-                    status["local_node"]["agent_version"] = data.get("AgentVersion")
 
-            if status["local_node"]["available"]:
-                async with session.post(f"{local_api_url}/version") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        status["local_node"]["version"] = data.get("Version")
-
-                async with session.post(f"{local_api_url}/pin/ls?type=recursive") as resp:
-                    if resp.status == 200:
-                        from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
-                        data = await resp.json()
-                        pins = data.get("Keys", {})
-                        status["pinned_content"] = [
-                            {"cid": cid, "type": info.get("Type")}
-                            for cid, info in list(pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
-                        ]
-    except Exception as e:
-        logger.error(f"IPFS local node check failed: {e}")
-        status["local_node"]["error"] = "Connection failed"
-
+async def _probe_gateways() -> list:
     test_cid = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
     gateways = [
         {"name": "ipfs.io", "url": f"https://ipfs.io/ipfs/{test_cid}"},
         {"name": "dweb.link", "url": f"https://dweb.link/ipfs/{test_cid}"},
         {"name": "cloudflare-ipfs", "url": f"https://cloudflare-ipfs.com/ipfs/{test_cid}"},
     ]
-
+    results = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         for gw in gateways:
             gw_status = {"name": gw["name"], "available": False, "latency_ms": None, "error": None}
@@ -1313,24 +1330,138 @@ async def get_ipfs_status(request: Request):
             except Exception as e:
                 logger.error(f"IPFS gateway {gw['name']} check failed: {e}")
                 gw_status["error"] = "Connection failed"
-            status["gateways"].append(gw_status)
+            results.append(gw_status)
+    return results
 
+
+def _filecoin_adapter(agent):
+    """The routed agent's Filecoin adapter, or None. Best-effort introspection."""
     try:
-        if hasattr(agent, 'storage') and agent.storage:
-            storage = agent.storage
-            if hasattr(storage, 'sovereign_adapter') and storage.sovereign_adapter:
-                adapter = storage.sovereign_adapter
-                if hasattr(adapter, 'filecoin_adapter') and adapter.filecoin_adapter:
-                    status["filecoin_adapter"] = {
-                        "configured": True,
-                        "cache_dir": str(adapter.filecoin_adapter.cache_dir) if hasattr(adapter.filecoin_adapter, 'cache_dir') else None,
-                    }
-                else:
-                    status["filecoin_adapter"] = {"configured": False}
+        storage = getattr(agent, "storage", None)
+        sovereign_adapter = getattr(storage, "sovereign_adapter", None) if storage else None
+        return getattr(sovereign_adapter, "filecoin_adapter", None) if sovereign_adapter else None
     except Exception:
-        pass  # Filecoin adapter introspection is best-effort
+        return None
+
+
+def _host_filecoin_adapter(request: Request):
+    """The host's Filecoin adapter via whichever agent carries one.
+
+    Routed agent, then the app-level default, then any agent the manager
+    lists: the adapter's cache directory is process-global, so the first
+    configured one is the host's.
+    """
+    candidates = [
+        getattr(request.state, "agent", None),
+        getattr(request.app.state, "agent", None),
+    ]
+    manager = getattr(request.app.state, "agent_manager", None)
+    list_agents = getattr(manager, "list_agents", None)
+    if callable(list_agents):
+        try:
+            candidates.extend(list_agents().values())
+        except Exception:
+            pass
+    for agent in candidates:
+        adapter = _filecoin_adapter(agent)
+        if adapter is not None:
+            return adapter
+    return None
+
+
+@router.get("/api/ipfs/status")
+async def get_ipfs_status(request: Request):
+    """The routed agent's view of IPFS.
+
+    Whether the local node and the sovereign backup tier are reachable,
+    which of *this agent's own* exports the node holds pinned, and public
+    gateway health. The node's identity and version, the daemon's full pin
+    set, the backup tier's connection details and the adapter's host path
+    are the host's facts, not the agent's: co-hosted agents share one
+    daemon, so an agent-local route that returned its recursive pin set
+    disclosed every other agent's CIDs (#3226). Those live on
+    ``GET /api/ipfs/node``, which requires sovereign authority;
+    ``can_view_node`` tells the console whether this caller may fetch it.
+
+    Pin visibility is bound to the agent's durable receipts: a CID appears
+    here only if the agent's own storage recorded it as its export and the
+    daemon reports it pinned. A guessed CID has no receipt and so no
+    answer, pinned or not.
+    """
+    # Resolve the agent up front so a missing agent surfaces as the
+    # contractual 503 before any network probing starts (#2495).
+    agent = get_agent(request)
+    own_cids = owned_cids(await owned_artifacts(getattr(agent, "storage", None)))
+
+    backup_tier = await _backup_tier_health()
+    backup_tier.pop("details", None)
+
+    probe = await _probe_local_node()
+    pinned_content = [
+        {"cid": cid, "type": (probe.pins.get(cid) or {}).get("Type")}
+        for cid in sorted(own_cids)
+        if cid in probe.pins
+    ]
+
+    status = {
+        "local_node": {"available": probe.available, "error": probe.error},
+        "backup_tier": backup_tier,
+        "gateways": await _probe_gateways(),
+        "pinned_content": pinned_content,
+        "can_view_node": caller_is_sovereign(request),
+    }
+
+    adapter = _filecoin_adapter(agent)
+    if adapter is not None:
+        status["filecoin_adapter"] = {"configured": True}
+    elif getattr(getattr(agent, "storage", None), "sovereign_adapter", None):
+        status["filecoin_adapter"] = {"configured": False}
 
     return status
+
+
+@router.get(
+    "/api/ipfs/node",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
+async def get_ipfs_node(request: Request):
+    """The host's IPFS daemon, whole: identity, version, every recursive pin.
+
+    Host administration (#3226): the daemon is one per host and its pin set
+    names every co-hosted agent's content, so this is a sovereign surface.
+    The dependency refuses before the body runs, and needs no agent — the
+    node is not any agent's.
+    """
+    from kestrel_sovereign.kestrel_config.constants import MAX_PINNED_ITEMS_DISPLAY
+
+    probe = await _probe_local_node()
+    node = {
+        "local_node": {
+            "available": probe.available,
+            "error": probe.error,
+            "peer_id": probe.peer_id,
+            "agent_version": probe.agent_version,
+            "version": probe.version,
+        },
+        "backup_tier": await _backup_tier_health(),
+        "pinned_content": [
+            {"cid": cid, "type": info.get("Type")}
+            for cid, info in list(probe.pins.items())[:MAX_PINNED_ITEMS_DISPLAY]
+        ],
+        "pinned_total": len(probe.pins),
+    }
+    # The adapter is one directory per host, so any agent's will do; the
+    # routed agent comes first because on a multi-agent host the app-level
+    # default is None and the host view would otherwise silently lose the
+    # one field it exists to carry.
+    adapter = _host_filecoin_adapter(request)
+    if adapter is not None:
+        cache_dir = getattr(adapter, "cache_dir", None)
+        node["filecoin_adapter"] = {
+            "configured": True,
+            "cache_dir": str(cache_dir) if cache_dir is not None else None,
+        }
+    return node
 
 
 @router.get("/api/wallet")

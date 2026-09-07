@@ -307,9 +307,18 @@ class FilecoinAdapter:
                          ipfs_cid: Optional[str] = None, 
                          key_hash: Optional[str] = None,
                          *,
-                         max_output_bytes: Optional[int] = None) -> bytes:
+                         max_output_bytes: Optional[int] = None,
+                         allow_local_cache: bool = True) -> bytes:
         """
         Retrieve content from storage (cache first, then IPFS).
+
+        ``allow_local_cache=False`` never consults the host's shared
+        ``storage_cache`` and lets only ``ipfs_cid`` answer. The cache is one
+        directory per host: a caller-supplied name that is really a co-hosted
+        agent's content hash would otherwise be served from it — a LOCAL_ONLY
+        export that was never published — or, failing that, tell the caller by
+        its error whether the name exists (#3225). A caller with no ownership
+        record for the name passes False.
         
         Args:
             content_hash: SHA256 hash of original content
@@ -331,13 +340,15 @@ class FilecoinAdapter:
             content_hash = content_hash.lower()
         encoded_limit = _encoded_retrieval_limit(max_output_bytes)
 
-        # Try local cache first
+        # Try local cache first (unless the caller may not use it)
         try:
             from_ipfs = False
-            retrieved_content = self._retrieve_local_cache(
-                content_hash,
-                max_bytes=encoded_limit,
-            )
+            retrieved_content = None
+            if allow_local_cache:
+                retrieved_content = self._retrieve_local_cache(
+                    content_hash,
+                    max_bytes=encoded_limit,
+                )
             if retrieved_content:
                 logging.info(f"📂 Retrieved from cache: {content_hash[:16]}...")
             else:

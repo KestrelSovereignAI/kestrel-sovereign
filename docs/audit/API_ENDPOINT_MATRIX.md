@@ -73,6 +73,7 @@ privacy: public
   - `/api/identity`
   - `/api/constitution`
   - `/api/ipfs/status`
+  - `/api/ipfs/node`
   - `/api/wallet`
   - `/api/keys`
   - `/api/models`

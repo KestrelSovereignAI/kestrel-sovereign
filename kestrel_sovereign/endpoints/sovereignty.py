@@ -23,6 +23,10 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     invocation_id_response_header,
 )
+from kestrel_sovereign.features.sovereignty.artifacts import (
+    owned_artifacts,
+    owned_content_hashes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,23 +94,79 @@ def _read_metadata_file(meta_path: Path):
     return {"raw": content}
 
 
-def _list_storage_cache_files(cache_dir: Path):
+def _artifact_hash(filename: str) -> "str | None":
+    """The content hash a cache filename belongs to, or None.
+
+    The producers write exactly three shapes into the cache:
+    ``{hash}.cache`` (the bytes), ``{hash}.meta`` (the durability
+    sidecar) and, for content encrypted before F187, ``key_{hash}.key``.
+    Any other name belongs to no artifact and so to no agent.
+    """
+    if filename.endswith(".cache") or filename.endswith(".meta"):
+        stem = filename.rsplit(".", 1)[0]
+    elif filename.startswith("key_") and filename.endswith(".key"):
+        stem = filename[len("key_"):-len(".key")]
+    else:
+        return None
+    return stem or None
+
+
+async def _owned_hashes(agent) -> set:
+    """Content hashes the routed agent durably owns (#3225).
+
+    From the receipts in the agent's *own* storage, never from the cache:
+    the directory is one per host, shared by every agent and every producer
+    that ever ran here, so a filename, a CID, or a sidecar's ``agent`` field
+    is a claim anyone with the filesystem can plant. A hash with no receipt
+    here is unavailable to this agent, indistinguishably from a hash that
+    does not exist.
+    """
+    return owned_content_hashes(await owned_artifacts(getattr(agent, "storage", None)))
+
+
+async def _artifact_is_owned(agent, filename: str) -> bool:
+    content_hash = _artifact_hash(filename)
+    if content_hash is None:
+        return False
+    return content_hash in await _owned_hashes(agent)
+
+
+def _list_owned_cache_files(cache_dir: Path, owned: set):
+    """List the cache entries for the given hashes, and only those.
+
+    Walks the owned set rather than the directory: the host cache holds
+    thousands of other agents' and long-gone producers' files, and reading
+    their sidecars (or even their names) would be the disclosure this
+    browser exists to avoid. Symlinks are followed here as before; the
+    download and preview handlers still resolve and contain the real path.
+    """
     files = []
     total_size = 0
 
-    for filepath in cache_dir.iterdir():
-        if filepath.is_file():
-            stat = filepath.stat()
+    for content_hash in sorted(owned):
+        candidates = (
+            (f"{content_hash}.cache", "cache"),
+            (f"{content_hash}.meta", "meta"),
+            # Pre-F187 key sidecar, classified as it always was.
+            (f"key_{content_hash}.key", "other"),
+        )
+        for name, file_type in candidates:
+            filepath = cache_dir / name
+            try:
+                if not filepath.is_file():
+                    continue
+                stat = filepath.stat()
+            except OSError:
+                continue
             size = stat.st_size
             total_size += size
 
-            ext = filepath.suffix.lower()
-            file_type = "cache" if ext == ".cache" else "meta" if ext == ".meta" else "other"
-
             metadata = None
+            has_meta = False
             if file_type == "cache":
-                meta_path = filepath.with_suffix(".meta")
-                if meta_path.exists():
+                meta_path = cache_dir / f"{content_hash}.meta"
+                has_meta = meta_path.exists()
+                if has_meta:
                     try:
                         metadata = _read_metadata_file(meta_path)
                     except (json.JSONDecodeError, UnicodeDecodeError, IOError) as e:
@@ -114,13 +174,13 @@ def _list_storage_cache_files(cache_dir: Path):
                         metadata = {"error": "Could not read metadata"}
 
             files.append({
-                "name": filepath.name,
+                "name": name,
                 "size": size,
                 "type": file_type,
                 "modified": stat.st_mtime,
                 "modified_iso": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stat.st_mtime)),
-                "hash": filepath.stem,
-                "has_meta": (file_type == "cache" and filepath.with_suffix(".meta").exists()),
+                "hash": content_hash,
+                "has_meta": has_meta,
                 "metadata": metadata,
             })
 
@@ -327,18 +387,27 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
 
 @router.get("/sovereignty/files")
 async def list_sovereignty_files(request: Request):
-    """List files in storage_cache/ directory for the local file browser."""
-    if not STORAGE_CACHE_DIR.exists():
+    """List the routed agent's own export artifacts in the host storage cache.
+
+    The cache directory is host-wide (#3225); an agent sees the entries its
+    own receipts name and nothing else — not other agents' names, sizes,
+    sidecars, or the directory's host path, which the response no longer
+    carries.
+    """
+    agent = get_agent(request)
+    owned = await _owned_hashes(agent)
+    if not owned or not STORAGE_CACHE_DIR.exists():
         return {"files": [], "total_size": 0, "file_count": 0}
 
     try:
-        files, total_size = await asyncio.to_thread(_list_storage_cache_files, STORAGE_CACHE_DIR)
+        files, total_size = await asyncio.to_thread(
+            _list_owned_cache_files, STORAGE_CACHE_DIR, owned
+        )
 
         return {
             "files": files,
             "total_size": total_size,
             "file_count": len(files),
-            "cache_dir": str(STORAGE_CACHE_DIR),
         }
     except Exception as e:
         logger.error(f"Error listing sovereignty files: {e}", exc_info=True)
@@ -347,9 +416,16 @@ async def list_sovereignty_files(request: Request):
 
 @router.get("/sovereignty/files/{filename}")
 async def download_sovereignty_file(request: Request, filename: str):
-    """Download a specific file from storage_cache/."""
+    """Download one of the routed agent's own artifacts from storage_cache/."""
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    # Ownership is decided before the filesystem is touched, and refused
+    # with the same 404 an absent file gets: a name the caller does not own
+    # must not be a probe for whether it exists (#3225).
+    agent = get_agent(request)
+    if not await _artifact_is_owned(agent, filename):
+        raise HTTPException(status_code=404, detail="File not found.")
 
     filepath = STORAGE_CACHE_DIR / filename
 
@@ -378,9 +454,14 @@ async def preview_sovereignty_file(
     filename: str,
     max_size: int = Query(default=MAX_SOVEREIGNTY_PREVIEW_SIZE, gt=0, le=MAX_SOVEREIGNTY_PREVIEW_SIZE),
 ):
-    """Get a preview of a file's content."""
+    """Preview one of the routed agent's own artifacts."""
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    # Same door as download: ownership first, refused as "not found" (#3225).
+    agent = get_agent(request)
+    if not await _artifact_is_owned(agent, filename):
+        raise HTTPException(status_code=404, detail="File not found.")
 
     filepath = STORAGE_CACHE_DIR / filename
 

@@ -222,6 +222,9 @@ async def test_cid_loader_forwards_bound_and_key_hash(monkeypatch):
         "ipfs_cid": "QmIdentityCid",
         "key_hash": "key-hash",
         "max_output_bytes": package_intake.MAX_IDENTITY_PACKAGE_BYTES,
+        # A CID source is fetched from IPFS only; the host's shared cache
+        # must not answer for a caller-supplied name (#3225).
+        "allow_local_cache": False,
     }
 
 

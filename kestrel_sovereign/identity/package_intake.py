@@ -136,11 +136,18 @@ def _retrieve_cid_identity_package(source: str, key_hash: Optional[str]) -> str:
     )
 
     try:
+        # A CID source is fetched from IPFS only. The importer holds no
+        # ownership record for a package (imports are, by design, of some
+        # other agent's export), so the host's shared cache must not answer
+        # for a name: a 64-hex content hash would read a co-hosted agent's
+        # never-published LOCAL_ONLY package, and under F187 the caller's
+        # ``key_hash`` is that same hash and decrypts it (#3225).
         content = FilecoinAdapter().retrieve_content(
             source,
             ipfs_cid=source,
             key_hash=key_hash,
             max_output_bytes=MAX_IDENTITY_PACKAGE_BYTES,
+            allow_local_cache=False,
         )
     except ContentRetrievalLimitError as exc:
         raise IdentityPackageIntakeError(
