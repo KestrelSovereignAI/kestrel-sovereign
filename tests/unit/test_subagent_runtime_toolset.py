@@ -152,8 +152,14 @@ async def test_loop_still_executes_a_permitted_tool(feature):
     assert executed == ["own_b"]
 
 
-def test_inline_executor_uses_the_runtime_toolset(feature):
-    """The second door. Built with the runtime list, its map must match."""
+@pytest.mark.asyncio
+async def test_inline_executor_uses_the_runtime_toolset(feature):
+    """The second door. Built with the runtime list, its map must match.
+
+    Async rather than driving a loop by hand: `asyncio.get_event_loop()` has
+    no current loop outside a running one on modern Python, so the manual
+    form passed locally and failed in CI under xdist.
+    """
     runtime = feature._compose_subagent_runtime_tools({"own_a"})
     seen = {}
 
@@ -163,8 +169,8 @@ def test_inline_executor_uses_the_runtime_toolset(feature):
 
     feature._execute_subagent_tool = _spy
     executor = feature._make_feature_inline_tool_executor(runtime_tools=runtime)
-    import asyncio
-    asyncio.get_event_loop().run_until_complete(executor("own_b", {}))
+    await executor("own_b", {})
+    assert seen, "executor never ran — the assertions below would be vacuous"
     assert "own_a" not in seen
     assert "own_b" in seen
 
