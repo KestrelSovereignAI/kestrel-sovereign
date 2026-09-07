@@ -1295,3 +1295,89 @@ def test_dispatch_refuses_a_feature_that_vanished_after_the_match():
             assert alice.served == 1
     finally:
         restore()
+
+
+class _FeaturesDisabledAfterFirstLookup(dict):
+    """A ``features`` mapping that soft-disables the feature after the first
+    lookup: the match gate sees it enabled, dispatch sees it disabled."""
+
+    def __init__(self, name, feature):
+        super().__init__({name: feature})
+        self._looked_up = 0
+
+    def get(self, key, default=None):
+        feature = super().get(key, default)
+        self._looked_up += 1
+        if self._looked_up > 1 and feature is not None:
+            feature.enabled = False
+        return feature
+
+
+def test_dispatch_refuses_a_feature_disabled_after_the_match():
+    """Review r2: the match gate admits the request, then the feature is
+    soft-disabled before dispatch. Dispatch re-checks ``enabled`` itself and
+    refuses; it must not serve on the match gate's stale answer."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    app, restore = _boot_multi_agent({"alice": agent})
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            agent.features = _FeaturesDisabledAfterFirstLookup("ProxyFeature", alice)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
+            assert alice.enabled is False
+    finally:
+        restore()
+
+
+def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
+    """Review r2: the owner clause precedes the survivor rule. A mount owner
+    re-created under its DID with the feature disabled (readiness rollback,
+    then retry) is still the owner: the unprefixed form refuses rather than
+    quietly rebinding to the one peer that serves, which is exactly the
+    order-chosen executor this ticket removes."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: bob is the sole survivor and serves.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert bob.served == 1
+
+            # Back under the same DID, but not serving: the owner is retained
+            # and refuses; the surviving peer is not chosen instead.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            alice_v2.enabled = False
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).status_code == 404
+            assert bob.served == 1 and alice_v2.served == 0
+
+            # Once it serves again, it serves.
+            alice_v2.enabled = True
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert bob.served == 1
+    finally:
+        restore()
