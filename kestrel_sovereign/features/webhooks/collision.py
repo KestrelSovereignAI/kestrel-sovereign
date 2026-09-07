@@ -59,34 +59,54 @@ def describe_collision(
     duplicated, single = collision_facts(owners)
     n = len(owners)
     listed = ", ".join(owners)
+    counts = {label: list(owners).count(label) for label in duplicated}
+
+    def _through(label: str) -> str:
+        return f"{counts[label]} of its own receivers"
+
     if duplicated and not single:
         if len(duplicated) == 1:
             return (
                 f"'{name}' is owned by {n} enabled receivers of one agent "
                 f"({duplicated[0]}): both the unprefixed /webhooks/{name} form "
-                f"and the agent-prefixed form are refused; unregister one of "
-                f"them."
+                f"and the agent-prefixed form are refused; unregister all but "
+                f"one of them."
             )
         return (
             f"'{name}' is owned by {n} enabled receivers on this host (agents: "
-            f"{listed}), each of {', '.join(duplicated)} through two of its own "
-            f"receivers: the unprefixed /webhooks/{name} form and every "
-            f"agent-prefixed form are refused; each must unregister one of them, "
-            f"after which the agent-prefixed form is the address."
+            f"{listed}), "
+            + ", ".join(f"{label} through {_through(label)}" for label in duplicated)
+            + f": the unprefixed /webhooks/{name} form and every agent-prefixed "
+            f"form are refused; each must unregister all but one of them, after "
+            f"which the agent-prefixed form is the address."
         )
-    address = (
-        own_endpoint
-        if own_endpoint and prefixed_form_dispatches(owners, own_label)
-        else f"/api/agents/<agent>/webhooks/{name}"
+    own_address_dispatches = bool(own_endpoint) and prefixed_form_dispatches(
+        owners, own_label
     )
+    generic = f"/api/agents/<agent>/webhooks/{name}"
     if duplicated:
+        # This sentence names the single owners whose senders can use the
+        # prefixed form. A concrete address may stand there only when the
+        # reader is the ONLY such agent: naming other agents next to one
+        # agent's address would send their senders into that receiver.
+        address = (
+            own_endpoint
+            if own_address_dispatches and single == [own_label]
+            else generic
+        )
         return (
             f"'{name}' is owned by {n} enabled receivers on this host (agents: "
             f"{listed}): the unprefixed /webhooks/{name} form is refused for "
-            f"every owner; for {', '.join(duplicated)} the agent-prefixed form "
-            f"is refused too (two of its own receivers) and one of them must be "
-            f"unregistered; senders of {', '.join(single)} use {address}."
+            f"every owner; for "
+            + ", ".join(f"{label} ({_through(label)})" for label in duplicated)
+            + " the agent-prefixed form is refused too and all but one of those "
+            f"receivers must be unregistered; senders of {', '.join(single)} use "
+            f"{address}."
         )
+    # Addressed to the reader's own senders ("each sender" of the reader), so
+    # the reader's own dispatching address is right however many agents own
+    # the name once.
+    address = own_endpoint if own_address_dispatches else generic
     return (
         f"'{name}' is owned by {n} enabled receivers on this host (agents: "
         f"{listed}): the unprefixed /webhooks/{name} form is refused for every "

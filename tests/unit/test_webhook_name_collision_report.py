@@ -156,7 +156,7 @@ def test_two_receivers_of_one_agent_list_that_agent_twice(host_log):
         # The remedy mirrors the refusal (#3216): the agent-prefixed form is
         # refused too, so the log must not send the operator there.
         assert "agent-prefixed form are refused" in message
-        assert "unregister one of them" in message
+        assert "unregister all but one of them" in message
         assert "point each sender" not in message
         assert agents["a"]._host_webhook_collisions(announce=False) == {
             "deposit": ["a", "a"]
@@ -412,11 +412,29 @@ async def test_a_standalone_agent_has_no_host_and_no_peers(tmp_path, sqlite_data
     db = await sqlite_database_factory(tmp_path / "solo.db")
     feat = WebhookFeature(_make_feature_agent(db=db))
     await feat.initialize()
-    reg = await feat.webhooks_register(name="deposit", auth_type="none", allow_unauthenticated=True)
-    assert reg.status.name == "OK", reg
-    assert "owners" not in reg.data
-    assert (await feat.webhooks_list()).data["collisions"] == {}
-    assert (await feat.webhooks_history()).data["collisions"] == {}
+    from kestrel_sovereign.features.storage_access import installed_host_hook
+
+    # The mock-safety claim itself (review r4 P2-3): the fabricated attribute
+    # is not read as a hook at all — not merely swallowed by the guard.
+    assert installed_host_hook(feat.agent, "_host_webhook_collisions") is None
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.feature")
+    target.addHandler(handler)
+    try:
+        reg = await feat.webhooks_register(name="deposit", auth_type="none", allow_unauthenticated=True)
+        assert reg.status.name == "OK", reg
+        assert "owners" not in reg.data
+        assert (await feat.webhooks_list()).data["collisions"] == {}
+        assert (await feat.webhooks_history()).data["collisions"] == {}
+        assert not any("collision report failed" in m for m in records)
+    finally:
+        target.removeHandler(handler)
 
 
 @pytest.mark.asyncio
@@ -468,7 +486,7 @@ async def test_registration_colliding_with_this_agents_own_receiver_names_no_add
         assert reg.status.name == "PARTIAL", reg
         assert reg.data["owners"] == ["emma", "emma"]
         assert "of one agent (emma)" in reg.error
-        assert "unregister one of them" in reg.error
+        assert "unregister all but one of them" in reg.error
         assert "point each sender" not in reg.error
         assert "/api/agents/emma/webhooks/deposit" not in reg.error
         assert "/api/agents/emma/webhooks/deposit" not in reg.confirmation  # r3 F4
@@ -477,7 +495,7 @@ async def test_registration_colliding_with_this_agents_own_receiver_names_no_add
         # The surfaces the owner reads say the same thing (review r2 F1).
         for surface in (await feat_a.webhooks_list(), await feat_a.webhooks_history()):
             assert "of one agent (emma)" in surface.confirmation
-            assert "unregister one of them" in surface.confirmation
+            assert "unregister all but one of them" in surface.confirmation
             assert "point each sender" not in surface.confirmation
             assert "/api/agents/emma/webhooks/deposit" not in surface.confirmation
     finally:
@@ -552,7 +570,7 @@ def test_describer_within_one_agent_names_no_address():
     text = describe_collision("deposit", ["a", "a"], own_endpoint="/api/agents/a/webhooks/deposit")
     assert "of one agent (a)" in text
     assert "agent-prefixed form are refused" in text
-    assert "unregister one of them" in text
+    assert "unregister all but one of them" in text
     assert "/api/agents/a/webhooks/deposit" not in text
     assert "point each sender" not in text
 
@@ -565,8 +583,8 @@ def test_describer_mixed_ownership_says_both():
 
     text = describe_collision("deposit", ["emma", "emma", "nellie"])
     assert "3 enabled receivers on this host (agents: emma, emma, nellie)" in text
-    assert "for emma the agent-prefixed form is refused too" in text
-    assert "one of them must be unregistered" in text
+    assert "for emma (2 of its own receivers) the agent-prefixed form is refused too" in text
+    assert "all but one of those receivers must be unregistered" in text
     assert "senders of nellie use /api/agents/<agent>/webhooks/deposit" in text
     assert "point each sender" not in text
 
@@ -598,7 +616,7 @@ async def test_mixed_ownership_is_described_the_same_on_every_surface(
             "nellie list": (await feat_b.webhooks_list()).confirmation,
         }
         for label, text in surfaces.items():
-            assert "for emma the agent-prefixed form is refused too" in text, label
+            assert "for emma (2 of its own receivers) the agent-prefixed form is refused too" in text, label
             assert "point each sender" not in text, label
             # Review r3 F1: emma's own prefixed form is refused, so no surface
             # — least of all emma's own — may hand it out.
@@ -751,7 +769,7 @@ def test_describer_two_agents_each_with_two_receivers_is_not_one_agent():
     text = describe_collision("deposit", ["a", "a", "b", "b"], own_label="a",
                               own_endpoint="/api/agents/a/webhooks/deposit")
     assert "of one agent" not in text
-    assert "each of a, b through two of its own receivers" in text
+    assert "a through 2 of its own receivers, b through 2 of its own receivers" in text
     assert "every agent-prefixed form are refused" in text
     assert "/api/agents/a/webhooks/deposit" not in text
 
@@ -812,3 +830,55 @@ async def test_a_raising_host_report_does_not_fail_registration_or_reads(
         assert sum("collision report failed" in m and "blew up" in m for m in records) >= 3
     finally:
         target.removeHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# The property behind every sentence (review r4 P2-1/P2-2): a concrete
+# address belongs only to an agent whose prefixed form dispatches, and only
+# when no other agent could be meant; receiver counts are never invented.
+# ---------------------------------------------------------------------------
+
+import itertools
+import re as _re
+
+_ADDRESS = _re.compile(r"/api/agents/(?P<label>[^/<]+)/webhooks/deposit")
+
+
+def _owner_shapes():
+    labels = ("a", "b", "c")
+    for counts in itertools.product(range(0, 4), repeat=len(labels)):
+        owners = [label for label, n in zip(labels, counts) for _ in range(n)]
+        if len(owners) > 1:
+            yield owners
+
+
+@pytest.mark.parametrize("owners", list(_owner_shapes()), ids=lambda o: "".join(o))
+def test_describer_never_attaches_an_address_to_an_agent_it_cannot_dispatch_to(owners):
+    from kestrel_sovereign.features.webhooks.collision import (
+        collision_facts,
+        describe_collision,
+        prefixed_form_dispatches,
+    )
+
+    duplicated, single = collision_facts(owners)
+    for reader in ("a", "b", "c", None):
+        text = describe_collision(
+            "deposit", owners, own_label=reader,
+            own_endpoint=f"/api/agents/{reader}/webhooks/deposit" if reader else None,
+        )
+        for match in _ADDRESS.finditer(text):
+            label = match.group("label")
+            # A concrete address is the reader's own and dispatches to the
+            # reader. Where the sentence names OTHER agents' senders (the
+            # mixed case), the reader must be the only agent it could mean.
+            assert label == reader, (owners, reader, text)
+            assert prefixed_form_dispatches(owners, label), (owners, reader, text)
+            if duplicated:
+                assert single == [reader], (owners, reader, text)
+        # Every receiver count named is the real one.
+        for label, n in _re.findall(r"(\w) (?:through |\()(\d+) of its own receivers", text):
+            assert int(n) == owners.count(label), (owners, text)
+        assert "two of its own" not in text
+        # A double owner is never told to unregister just one (unless one is all but one).
+        if any(owners.count(label) > 2 for label in duplicated):
+            assert "unregister one of them" not in text
