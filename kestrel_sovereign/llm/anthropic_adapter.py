@@ -847,6 +847,16 @@ class AnthropicAdapter(LLMAdapter):
 
     # ---- Claude subscription (OAuth / plan route) shaping ------------------
 
+    def _credential_identity(self) -> str:
+        """The credential this adapter is bound to, for error reporting."""
+        manager = getattr(self, "_oauth_token_manager", None)
+        if manager is None:
+            return "api-key"
+        try:
+            return manager.credential_identity()
+        except Exception:
+            return "<unknown>"
+
     def _uses_claude_code_identity(self) -> bool:
         """Whether requests must carry the Claude Code identity shaping.
 
@@ -1127,7 +1137,10 @@ class AnthropicAdapter(LLMAdapter):
             )
 
         except Exception as e:
-            logger.error(f"Anthropic API error: {e}", exc_info=True)
+            logger.error(
+                f"Anthropic API error [credential={self._credential_identity()}]: {e}",
+                exc_info=True,
+            )
             raise
 
     async def get_streaming_response(
@@ -1227,7 +1240,10 @@ class AnthropicAdapter(LLMAdapter):
                     yield item
 
         except Exception as e:
-            logger.error(f"Anthropic streaming error: {e}", exc_info=True)
+            logger.error(
+                f"Anthropic streaming error [credential={self._credential_identity()}]: {e}",
+                exc_info=True,
+            )
             raise
 
     async def get_streaming_response_with_tools(
@@ -1520,7 +1536,11 @@ class AnthropicAdapter(LLMAdapter):
             )
 
         except Exception as e:
-            logger.error(f"Anthropic streaming with tools failed: {e}", exc_info=True)
+            logger.error(
+                f"Anthropic streaming with tools failed "
+                f"[credential={self._credential_identity()}]: {e}",
+                exc_info=True,
+            )
             raise
 
     async def continue_with_tool_results(

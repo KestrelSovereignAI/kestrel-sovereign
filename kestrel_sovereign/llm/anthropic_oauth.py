@@ -250,6 +250,9 @@ class FileCredentialSource(CredentialSource):
             return None
         return parse_credentials(raw) if isinstance(raw, dict) else None
 
+    def identity(self) -> str:
+        return str(self.path)
+
     def write(self, creds: OAuthCredentials) -> bool:
         try:
             try:
@@ -370,6 +373,26 @@ class KeychainCredentialSource(CredentialSource):
         raw = self._read_raw()
         return parse_credentials(raw) if raw is not None else None
 
+    def identity(self) -> str:
+        """Which keychain item this source is bound to.
+
+        The keychain can hold several ``Claude Code-credentials`` items — a
+        stale login beside the live one — and ``_resolve_account`` caches its
+        pick for the life of the source. Every agent builds its own
+        ``LLMService`` and therefore its own source, so two agents in one
+        process can bind to DIFFERENT accounts. When one of them is a
+        different Anthropic subscription, the endpoint answers with a billing
+        message ("You're out of extra usage") that names no account, and the
+        divergence is invisible: one agent works while another fails on the
+        same route, model and host.
+
+        Reported so that condition is one log line instead of an inference.
+        """
+        try:
+            return self._resolve_account() or "<unresolved>"
+        except Exception:  # identity reporting must never break a request
+            return "<unresolved>"
+
     def write(self, creds: OAuthCredentials) -> bool:
         # Merge into the existing item so scopes/subscriptionType/etc. survive,
         # and target the SAME account we read from.
@@ -439,6 +462,22 @@ class ClaudeOAuthTokenManager:
         self._client_id = client_id
         self._token_url = token_url
         self._lock = asyncio.Lock()
+
+    def credential_identity(self) -> str:
+        """``<source item>#<token fingerprint>`` — never the token itself.
+
+        The fingerprint is the last 6 characters, which distinguishes two
+        accounts' tokens without being usable as one.
+        """
+        try:
+            src = getattr(self._source, "identity", None)
+            where = src() if callable(src) else "<no-source>"
+        except Exception:
+            # A source that cannot answer (locked keychain, I/O error) must
+            # not break the request it is only annotating.
+            where = "<unresolved>"
+        tok = self._creds.access or ""
+        return f"{where}#{tok[-6:] if len(tok) > 6 else '<short>'}"
 
     @property
     def initial_access_token(self) -> str:
