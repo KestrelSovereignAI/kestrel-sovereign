@@ -9,7 +9,7 @@ properties, which emit warnings and bypass the privacy API by accident.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _MISSING = object()
 
@@ -68,6 +68,18 @@ def _safe_privacy_config(value: Any) -> Any:
         return None
 
     return getattr(value, "privacy_config", None)
+
+
+def installed_host_hook(agent: Any, name: str) -> Optional[Callable[..., Any]]:
+    """A callable the host installed on ``agent`` as an instance attribute.
+
+    ``None`` when nothing was installed. Mock-safe on purpose: a feature
+    asks the host a question it cannot answer itself (its peers are behind
+    the tenancy boundary), and a MagicMock's fabricated attribute must read
+    as "no host here", never as an answer.
+    """
+    hook = _safe_attr(agent, name)
+    return hook if callable(hook) else None
 
 
 class AgentIdentityUnavailable(RuntimeError):

@@ -20,10 +20,11 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List
+from typing import Dict, List
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import installed_host_hook
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -204,6 +205,34 @@ class WebhookFeature(Feature):
     # Tools
     # ------------------------------------------------------------------
 
+    def _host_collisions(self, *, announce: bool) -> Dict[str, List[str]]:
+        """Which of this agent's webhook names another enabled receiver on
+        this host also owns, mapped to every owner's routing name.
+
+        The host installs the answer (``_host_webhook_collisions``, #3239)
+        because only it sees every agent; this feature cannot look at its
+        peers' registrations. A standalone agent has no host and no peers:
+        empty. ``announce`` asks the host to log the collision as well —
+        the operator surface — and is set only where a name is created.
+        """
+        hook = installed_host_hook(self.agent, "_host_webhook_collisions")
+        if hook is None:
+            return {}
+        answer = hook(announce=announce)
+        if not isinstance(answer, dict):
+            raise RuntimeError(
+                "host webhook collision hook returned "
+                f"{type(answer).__name__}, not a mapping"
+            )
+        return {str(name): [str(owner) for owner in owners] for name, owners in answer.items()}
+
+    @staticmethod
+    def _collision_note(collisions: Dict[str, List[str]]) -> str:
+        return "; ".join(
+            f"'{name}' is also owned by: {', '.join(owners)}"
+            for name, owners in sorted(collisions.items())
+        )
+
     @tool(
         "webhooks_list",
         "List all registered webhook endpoints",
@@ -249,7 +278,8 @@ class WebhookFeature(Feature):
                 logger.warning("WebhookFeature: DB query failed: %s", exc)
                 db_failed = True
 
-        data = {"webhooks": webhooks, "count": len(webhooks)}
+        collisions = self._host_collisions(announce=False)
+        data = {"webhooks": webhooks, "count": len(webhooks), "collisions": collisions}
         confirmation = (
             "No webhooks registered."
             if not webhooks
@@ -257,6 +287,12 @@ class WebhookFeature(Feature):
             + ", ".join(w.get("name", "?") for w in webhooks)
             + "."
         )
+        if collisions:
+            confirmation += (
+                f" Name collision on this host ({self._collision_note(collisions)}): "
+                "the unprefixed /webhooks/{name} form is refused for those names; "
+                "senders must use the agent-prefixed address."
+            )
         if db_failed:
             return ToolResult.partial(
                 confirmation,
@@ -322,8 +358,15 @@ class WebhookFeature(Feature):
         if not events:
             events = self.receiver.get_recent_events(limit)
 
-        data = {"events": events, "count": len(events)}
+        collisions = self._host_collisions(announce=False)
+        data = {"events": events, "count": len(events), "collisions": collisions}
         confirmation = f"Returned {len(events)} webhook event(s)."
+        if collisions:
+            confirmation += (
+                f" Name collision on this host ({self._collision_note(collisions)}): "
+                "a 404 in this log for one of those names may be the host refusing "
+                "the unprefixed form, not an unknown name."
+            )
         if db_failed:
             return ToolResult.partial(
                 confirmation,
@@ -514,8 +557,31 @@ class WebhookFeature(Feature):
                 f"registers '{name}'."
             )
 
+        # The host, not this feature, knows whether another agent already
+        # owns the name (#3239). Announced: this is the registration moment
+        # of the operator report. The incumbent owner reads the same answer
+        # in its own webhooks_list / webhooks_history.
+        owners = self._host_collisions(announce=True).get(name)
+        if owners:
+            data["owners"] = owners
+
         # Collect any conditions that warrant a PARTIAL (vs a clean OK).
         warnings: List[str] = []
+        if owners:
+            warnings.append(
+                f"NAME COLLISION: '{name}' is now owned by {len(owners)} enabled "
+                f"receivers on this host ({', '.join(owners)}). The unprefixed "
+                f"/webhooks/{name} form is refused for every owner from this "
+                f"moment; point each sender at "
+                + (
+                    data["agent_endpoint"]
+                    if "agent_endpoint" in data
+                    else "the agent-prefixed /api/agents/<agent>/webhooks/"
+                    + name
+                    + " form"
+                )
+                + ", or unregister one of them."
+            )
         if is_unauthenticated and not allow_unauthenticated:
             warnings.append(
                 f"UNAUTHENTICATED endpoint: anyone who can reach "

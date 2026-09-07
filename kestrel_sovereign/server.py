@@ -4,6 +4,7 @@ A FastAPI server to expose Kestrel agent functionality as a service.
 """
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -1127,6 +1128,103 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     if mounted:
         logger.info("Dynamically mounted routers from features: %s", ", ".join(mounted))
 
+    _install_webhook_collision_reporting(app)
+
+
+def _labelled_current_agents(app: FastAPI):
+    """Yield ``(routing_name, agent)`` for every agent currently loaded.
+
+    The label is the name the AgentManager routes ``/api/agents/{name}/…``
+    by; a single-agent boot has no routing name and is labelled by its
+    display name.
+    """
+    agent = getattr(app.state, "agent", None)
+    if agent is not None:
+        display = getattr(agent, "agent_name", None)
+        yield (display if isinstance(display, str) and display else "agent"), agent
+    manager = getattr(app.state, "agent_manager", None)
+    if manager is not None:
+        for agent_name in manager.list_agents():
+            resolved = manager.get_agent(agent_name)
+            if resolved is not None:
+                yield str(agent_name), resolved
+
+
+def _webhook_name_owners(app: FastAPI) -> dict:
+    """``name -> [routing name of each enabled receiver that owns it]``.
+
+    One entry per owning receiver, not per agent, so an agent whose two
+    receivers own the same name appears twice: that is the within-agent
+    collision the dispatch router refuses on the prefixed form too.
+    """
+    owners: dict = {}
+    seen: set[int] = set()
+    for label, agent in _labelled_current_agents(app):
+        for receiver in _agent_webhook_receivers(agent):
+            if id(receiver) in seen:
+                continue
+            seen.add(id(receiver))
+            for name in tuple(getattr(receiver, "webhooks", None) or ()):
+                owners.setdefault(str(name), []).append(label)
+    return owners
+
+
+def _report_webhook_name_collisions(
+    app: FastAPI, *, scope=None, announce: bool = True
+) -> dict:
+    """Webhook names owned by more than one enabled receiver on this host.
+
+    Returns ``name -> owners`` (routing names, one per owning receiver).
+    With ``scope`` set to an agent, only the names that agent's receivers
+    own are returned, still mapped to the full owner list. With ``announce``
+    the host log carries one warning per colliding name: that is the
+    operator surface at boot, at dynamic onboarding and at registration
+    (#3239); the agents read the same answer through their webhook tools.
+
+    The dispatch router already refuses a collided name where it is
+    consumed (#3216). This is the same fact reported where the name is
+    created, from the only place that sees every agent: a feature cannot
+    look across the tenancy boundary at its peers' registrations.
+    """
+    owners = _webhook_name_owners(app)
+    collided = {name: agents for name, agents in owners.items() if len(agents) > 1}
+    if scope is not None:
+        own_names = set()
+        for receiver in _agent_webhook_receivers(scope):
+            own_names.update(str(n) for n in (getattr(receiver, "webhooks", None) or ()))
+        collided = {name: agents for name, agents in collided.items() if name in own_names}
+    if announce:
+        for name, agents in sorted(collided.items()):
+            logger.warning(
+                "Webhook name '%s' is owned by %d enabled receivers on this host "
+                "(agents: %s): the unprefixed /webhooks/%s form is refused for "
+                "every owner; point each sender at "
+                "/api/agents/<agent>/webhooks/%s.",
+                name,
+                len(agents),
+                ", ".join(agents),
+                name,
+                name,
+            )
+    return collided
+
+
+def _install_webhook_collision_reporting(app: FastAPI) -> None:
+    """Give every current agent the host's scoped collision answer, then
+    announce the current collisions once.
+
+    Runs at the end of every router mount pass, which is exactly the boot
+    pass and the dynamic-onboarding pass. The installed hook is what
+    ``webhooks_register`` consults, so a registration is reported the moment
+    it collides — the third moment — without the feature reaching across
+    agents itself.
+    """
+    for _label, agent in _labelled_current_agents(app):
+        agent._host_webhook_collisions = functools.partial(
+            _report_webhook_name_collisions, app, scope=agent
+        )
+    _report_webhook_name_collisions(app)
+
 
 def _iter_current_agents(app: FastAPI):
     """Yield every agent currently loaded on the app (single- or multi-agent)."""
@@ -1507,6 +1605,7 @@ async def _onboard_host_registered_agent(
     agent_fields = (
         "_scoped_policy_required",
         "_a2a_host_manager",
+        "_host_webhook_collisions",
         "a2a_did_resolver",
         "a2a_inbound_sender_authorizer",
     )
