@@ -579,13 +579,41 @@ from pathlib import Path
 
 _PACKAGE = Path(__file__).resolve().parents[2] / "kestrel_sovereign"
 
+
+def _normalize(text: str) -> str:
+    """One line, one space, no space inside parentheses: the scan sees the
+    resolution, not the formatter's wrapping (review r5)."""
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\(\s+", "(", text)
+    text = re.sub(r"\s+\)", ")", text)
+    text = re.sub(r",\s*\)", ")", text)
+    return text
+
+
 # A loop that tries the two identity attributes in either order.
 _TUPLE_LOOP = re.compile(r'for \w+ in \("(?:did|agent_id)", "(?:did|agent_id)"\)')
-# An `or` chain over the SAME object trying both attributes (either order).
-_OR_CHAIN = re.compile(
-    r'getattr\((?P<obj>[\w.]+), "(?:did|agent_id)"[^\n]*?\)\s+or\s+'
-    r'getattr\((?P=obj), "(?:did|agent_id)"'
+# Both identity attributes read from the SAME object within one bounded
+# window, in either order and any nesting: an `or` chain, a nested default,
+# a candidate tuple, or two statements.
+_PAIR = re.compile(
+    r'getattr\((?P<obj>[\w.]+), "(?P<a>did|agent_id)"[^\n]{0,240}?'
+    r'getattr\((?P=obj), "(?P<b>did|agent_id)"'
 )
+
+
+def _count_inline(text: str) -> int:
+    norm = _normalize(text)
+    hits = len(_TUPLE_LOOP.findall(norm))
+    pos = 0
+    while True:
+        match = _PAIR.search(norm, pos)
+        if match is None:
+            break
+        if match.group("a") != match.group("b"):
+            hits += 1
+        pos = match.start() + 1
+    return hits
+
 
 # path (relative to the package) -> (count, why it is not routed through the guard)
 KNOWN_INLINE_RESOLUTIONS = {
@@ -604,38 +632,60 @@ KNOWN_INLINE_RESOLUTIONS = {
         2,
         "wait-signal store scope; '' is the documented solo-agent legacy scope (#3251)",
     ),
+    "features/skills/feature.py": (1, "reflection_insights scope, '' fallback (#3251)"),
+    "features/bootstrap/feature.py": (
+        1,
+        "soul-seed created_by attribution, agent_id first (#3251)",
+    ),
+    "features/contribution_runtime.py": (
+        1,
+        "agent-scoped service registration key, agent_id first (#3251)",
+    ),
+    "features/scheduler/feature.py": (
+        1,
+        "scheduler watcher owner identity from a candidate tuple; raises when absent (#3251)",
+    ),
     # The agent reading its own identity on `self`: on a real agent
-    # `agent_id` is a property returning `did`, so nothing is resolved.
-    "agent/backup.py": (2, "the agent reads its own identity on self"),
+    # `agent_id` is a property returning `did`, so nothing is resolved. The
+    # window counts the three chains of one policy-context call.
+    "agent/backup.py": (3, "the agent reads its own identity on self"),
     # Not table scopes: a filesystem namespace owner (raises on a missing
     # DID) and the hosted scheduler's identity match against a claim.
     "features/isolated_runtime.py": (1, "isolated-runtime namespace owner; raises when absent"),
+    "features/scheduler/runner.py": (1, "hosted scheduler matches a resolved agent against a claimed id"),
     # The manager's routing/lineage identity loader — also the read end of
     # the host-attested local task route whose write end is routed. Its
     # suite builds agents carrying agent_id alone; routing it is a
     # suite-wide double change tracked in #3251.
     "multi_agent/agent_manager.py": (1, "manager identity loader; did then agent_id (#3251)"),
-    "features/scheduler/runner.py": (1, "hosted scheduler matches a resolved agent against a claimed id"),
 }
 
 
 def _inline_resolutions() -> dict[str, int]:
     found: dict[str, int] = {}
     for path in sorted(_PACKAGE.rglob("*.py")):
-        text = path.read_text()
-        n = len(_TUPLE_LOOP.findall(text)) + len(_OR_CHAIN.findall(text))
+        n = _count_inline(path.read_text())
         if n:
             found[str(path.relative_to(_PACKAGE))] = n
     return found
 
 
 def test_every_inline_did_resolution_is_a_known_exception():
-    # Positive control: each shape's regex matches its own fixture, so an
-    # empty census could never be a weakened regex passing vacuously.
-    assert _TUPLE_LOOP.search('for attribute in ("did", "agent_id"):')
-    assert _TUPLE_LOOP.search('for attribute in ("agent_id", "did"):')
-    assert _OR_CHAIN.search('x = getattr(agent, "did", None) or getattr(agent, "agent_id", "")')
-    assert not _OR_CHAIN.search('getattr(storage, "agent_id", None) or getattr(self, "agent_id", "")')
+    # Positive controls: each shape counts exactly once on its own fixture,
+    # so an empty census could never be a weakened scan passing vacuously.
+    assert _count_inline('for attribute in ("did", "agent_id"):\n    pass') == 1
+    assert _count_inline('for attribute in ("agent_id", "did"):\n    pass') == 1
+    assert _count_inline('x = getattr(agent, "did", None) or getattr(agent, "agent_id", "")') == 1
+    # Wrapped by a formatter (review r5): still one resolution.
+    assert _count_inline('x = getattr(a.agent, "agent_id", None) or getattr(\n    a.agent, "did", None\n)') == 1
+    # Nested default and a candidate tuple: still one each.
+    assert _count_inline('getattr(agent, "agent_id", getattr(agent, "did", ""))') == 1
+    assert _count_inline('(getattr(self.agent, "did", None), getattr(self.agent, "agent_id", None))') == 1
+    # Two statements on one object: one resolution.
+    assert _count_inline('did = getattr(self.agent, "did", None)\nreturn did or getattr(self.agent, "agent_id", "")') == 1
+    # Different objects, or the same attribute twice, are not a resolution.
+    assert _count_inline('getattr(storage, "agent_id", None) or getattr(self, "agent_id", "")') == 0
+    assert _count_inline('getattr(agent, "did", None) or getattr(agent, "did", "")') == 0
 
     found = _inline_resolutions()
     expected = {path: count for path, (count, _why) in KNOWN_INLINE_RESOLUTIONS.items()}
@@ -648,3 +698,20 @@ def test_every_inline_did_resolution_is_a_known_exception():
         "the census drifted (a routed site restored, or a registered site gone): "
         f"found={found} expected={expected}"
     )
+
+
+# -- a2a/inbound_authorization: the inbound-scope gate's recipient identity --
+
+
+def test_inbound_authorizer_recipient_is_the_did_not_agent_id():
+    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
+
+    resolve = RecipientA2ASenderAuthorizer._stable_agent_id
+    assert resolve(SimpleNamespace(agent_id=OTHER, did=ME)) == ME
+
+
+@pytest.mark.parametrize("agent", _identity_cases() + [pytest.param(None, id="no-agent")])
+def test_inbound_authorizer_has_no_recipient_without_a_did(agent):
+    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
+
+    assert RecipientA2ASenderAuthorizer._stable_agent_id(agent) is None
