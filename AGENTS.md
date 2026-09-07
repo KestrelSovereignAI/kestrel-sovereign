@@ -53,6 +53,31 @@ uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888 &
 cd tests/e2e && npx playwright test
 ```
 
+### Testing a sibling feature repo: unset `VIRTUAL_ENV` first
+
+```bash
+cd /path/to/kestrel-feature-<name>
+env -u VIRTUAL_ENV uv run pytest -q     # NOT plain `uv run`
+```
+
+`uv run` syncs the **active** virtualenv to the project it is run from. When
+`VIRTUAL_ENV` points at this repo's `.venv` (as it does in any shell where
+core is active), running a sibling feature's tests silently re-resolves
+core's venv to that feature's dependency solution and downgrades whatever
+the two disagree on.
+
+Measured 2026-09-06: running the five feature suites in sequence downgraded
+`openinference-semantic-conventions` 0.1.35 → 0.1.30 in core's venv.
+`openinference-instrumentation` requires `>=0.1.33`, so `phoenix` then fails
+to import (`cannot import name 'AnnotationAttributes'`), pytest plugin
+autoload aborts before writing a JUnit report, and the release-evidence
+runner records a content-free `blocked` — the failure #2853 added
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` to work around.
+
+This is why manual `uv pip install` repairs to core's venv keep reverting:
+the next sibling test run undoes them. Unsetting `VIRTUAL_ENV` makes `uv`
+use (or create) the sibling's own `.venv` and leaves core's alone.
+
 ### Test Pyramid Strategy
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
@@ -66,18 +91,84 @@ permission each time.
 
 ### 1. Review your own full diff before asking anyone else to
 
+The gate is **a full-diff review against `main` that printed a verdict**. Which
+reviewer produced it is not part of the requirement — name the tool you used.
+Two satisfy it:
+
 ```bash
 cd <worktree> && codex review --base main
 ```
+
+```bash
+cd <worktree> && claude -p --model <model> -- "Review this branch for
+correctness defects. Run: git diff main...HEAD. Be adversarial: name failure
+scenarios with file:line, and say plainly if you find nothing real rather than
+inventing style points." </dev/null
+```
+
+Two details in that line are load-bearing, both found the hard way:
+
+* **`</dev/null`** — `claude -p` blocks forever on inherited stdin. Without it
+  the run never starts and never fails, and the "silence is not a hang" advice
+  below turns a five-second mistake into a 45-minute wait for an empty result.
+  Probe it for five seconds before committing to the long form.
+* **`--` before the prompt** — `--allowed-tools` is variadic and will silently
+  swallow the prompt as one more tool name. The review then runs with no
+  instructions and returns something plausible.
+
+**Run the review on the strongest model available, and prove it.** A gate is
+only as strong as its reviewer, and substituting a weaker one silently makes
+the gate weaker without making it look weaker. Probe first — five seconds:
+
+```bash
+claude -p --model <model> -- "Reply with exactly: PROBE_OK" </dev/null
+```
+
+An unavailable model fails loudly and distinctively
+(`[claude-code:unrecognized_model]`), so a probe that returns `PROBE_OK`
+settles it and a probe that does not tells you to escalate, not to downgrade.
+Do not infer availability from the host's model catalog: that answers a
+different question, the two have disagreed, and on 2026-09-07 a 1269-line diff
+was reviewed on `claude-opus-4-6` because `claude-opus-5` was believed
+unavailable when a probe would have returned `PROBE_OK` for it.
+
+If you do end up on a weaker model, that is a gate condition to declare in the
+turn output alongside the verdict — not a detail to mention afterwards.
+
+**As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
+is why the gate names the requirement and not a command: an outage in one
+reviewer must not make the merge gate unsatisfiable, and a rule written around
+one tool's argv stops being true the moment that tool changes or goes away.
+
+**The verdict must arrive whole, and that is a separate gate.** `shell`
+tokenizes with `shlex` and hands an argv vector to a backend — no shell
+interprets the string (#3129). So `> review.txt` is not a redirect, it is a
+literal argument, and `... | tail` is not a pipe, it is three extra arguments
+to a command that then prints everything and exits 0. Neither a file hatch nor
+a pager is available to a governed caller; the review has to come back through
+the ToolResult, and each of stdout and stderr is capped at 1 MiB with
+`truncated_stdout: true` set on the result.
+
+**A truncated review is a gate FAILURE, not a verdict** — it is the same shape
+as the dead-reviewer case above: plausible text, no completed judgement. Check
+`truncated_stdout` before reading findings, and if it is set, say the gate was
+not met rather than reporting what arrived. Tracked as #3243, filed by the
+agent this rule kept blocking.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
 seen whole by anything. Every defect a human reviewer found in agent-authored
 PRs through 2026-08-25 lived across exactly that boundary.
 
-It takes 10–45 minutes and **buffers its output**, so silence is not a hang. A
-review that times out exits 0 with no verdict — no findings printed is not the
-same as no findings, and only the second means clean.
+Either form takes 10–45 minutes and **buffers its output**, so silence is not a
+hang. A review that times out exits 0 with no verdict — no findings printed is
+not the same as no findings, and only the second means clean.
+
+Exit status is not a verdict anywhere on this surface, and it has produced at
+least five distinct false greens: a wrapper returning 0 while its own summary
+says `Blocked: 1`, `git ls-remote` returning 0 for "no match" exactly as for a
+hit, and a piped gate reporting the status of the last command in the pipe.
+Read the verdict, never the code.
 
 ### 2. Act on what it finds, and verify by mutation
 
@@ -101,8 +192,8 @@ demonstrate is worth less than an honest boundary.
 Squash-merge your own PR when **all** of these hold:
 
 - CI green (every required check, not just unit tests)
-- a full-diff `codex review --base main` came back with **a printed verdict**
-  and no unaddressed P1
+- a full-diff review against `main` (codex or claude — see above) came back
+  with **a printed verdict** and no unaddressed P1
 - every finding you fixed has a test that fails without the fix
 
 If a gate is not met, say which one and what you need. Do not sit silently on a
@@ -112,7 +203,7 @@ because a blocker nobody reads is a blocker nobody acts on.
 ### What you already have
 
 Unrestricted `shell` (arbitrary `timeout`, no upper clamp), `git`, `gh`, and
-`codex` on PATH. Almost nothing here is a capability you lack; it is a procedure
+both `codex` and `claude` on PATH. Almost nothing here is a capability you lack; it is a procedure
 that has to survive the turn boundary, which is why it is written down here
 rather than remembered.
 
