@@ -431,6 +431,23 @@ async def test_a_non_sovereign_caller_learns_nothing_about_the_roster():
     llm_service.cleanup_unused_models.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_an_unreadable_roster_is_an_honest_refusal(stable_key):
+    """A bad multi_agent.toml must not delete under a roster that could not
+    be read, and must not escape the tool as a bare exception either."""
+    feature, llm_service = await _model_feature()
+
+    def broken():
+        raise ValueError("Invalid TOML in multi_agent.toml")
+
+    feature._configured_agent_names = broken
+    with caller_context_scope(sovereign()):
+        result = await feature.cleanup_models(dry_run=False)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Invalid TOML" in result.error
+    llm_service.cleanup_unused_models.assert_not_awaited()
+
+
 def test_configured_agent_names_reads_the_hosts_roster(tmp_path, monkeypatch):
     from kestrel_sovereign.features.model.feature import _configured_agent_names
 
