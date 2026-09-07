@@ -4686,13 +4686,16 @@ class KestrelAgent(
         except Exception as e:  # noqa: BLE001 - never block init on this
             logging.warning("Could not read feature enablement deltas: %s", e)
             return set(bootstrap)
-        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-        mandatory = set(MANDATORY_FEATURES)
+        # The same rule the writer enforces (kestrel-sovereign#3234): a
+        # persisted "disabled" row for a mandatory or host-scope class is
+        # never replayed, so a row that predates the rule cannot drop the
+        # class from the load loop for good.
+        from kestrel_sovereign.feature_registry import feature_disable_refusal
         effective = set(bootstrap)
         for d in deltas:
             if d["state"] == "enabled":
                 effective.add(d["name"])
-            elif d["state"] == "disabled" and d["name"] not in mandatory:
+            elif d["state"] == "disabled" and feature_disable_refusal(d["name"]) is None:
                 effective.discard(d["name"])
         return effective
 
@@ -4709,11 +4712,10 @@ class KestrelAgent(
         except Exception as e:  # noqa: BLE001 - never block init on this
             logging.warning("Could not read disabled feature deltas: %s", e)
             return set()
-        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-        mandatory = set(MANDATORY_FEATURES)
+        from kestrel_sovereign.feature_registry import feature_disable_refusal
         return {
             d["name"] for d in deltas
-            if d["state"] == "disabled" and d["name"] not in mandatory
+            if d["state"] == "disabled" and feature_disable_refusal(d["name"]) is None
         }
 
     async def persist_feature_enablement(
@@ -4735,6 +4737,16 @@ class KestrelAgent(
                     "persistent enablement",
                     "cannot be disabled",
                 )
+            # A durable per-agent "disabled" delta is replayed at every boot,
+            # so it is the strongest disable door; it reads the same rule as
+            # the runtime and HTTP doors (kestrel-sovereign#3234).
+            from kestrel_sovereign.feature_registry import (
+                HostScopeFeatureError,
+                feature_disable_refusal,
+            )
+
+            if feature_disable_refusal(name) is not None:
+                raise HostScopeFeatureError(name)
         store = getattr(self, "_feature_enablement_store", None)
         if store is None:
             return
@@ -5810,6 +5822,16 @@ class KestrelAgent(
                 "runtime disable",
                 "cannot be disabled",
             )
+        # The same rule the HTTP disable route answers 409 with: a host-scope
+        # feature is not one agent's to switch off (kestrel-sovereign#3234).
+        # This is the door the tool-driven `feature_remove` reaches.
+        from kestrel_sovereign.feature_registry import (
+            HostScopeFeatureError,
+            feature_disable_refusal,
+        )
+
+        if feature_disable_refusal(feature_class_name) is not None:
+            raise HostScopeFeatureError(feature_class_name)
 
         await self._unregister_feature_runtime(feature)
         logging.info(f"Feature '{feature_name}' disabled and removed")

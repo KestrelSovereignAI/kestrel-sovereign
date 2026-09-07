@@ -651,9 +651,19 @@ class TestAPIEndpointLifecycle:
         from fastapi.testclient import TestClient
         from kestrel_sovereign.endpoints.features import router
         from kestrel_sovereign.signals.registry import SourceRegistry
+        from kestrel_sovereign.auth import CallerContext
         from kestrel_sovereign.waits import WaitRegistry
 
         app = FastAPI()
+
+        # Stands in for the auth middleware: enable/disable require the
+        # sovereign principal (#3234); these tests are about the lifecycle
+        # the routes drive, not about who may ask.
+        @app.middleware("http")
+        async def _attach_caller(request, call_next):
+            request.state.caller = CallerContext.sovereign()
+            return await call_next(request)
+
         app.include_router(router)
 
         agent = KestrelAgent(
