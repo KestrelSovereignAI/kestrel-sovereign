@@ -53,6 +53,31 @@ uv run python -m kestrel_sovereign.server --host 127.0.0.1 --port 8888 &
 cd tests/e2e && npx playwright test
 ```
 
+### Testing a sibling feature repo: unset `VIRTUAL_ENV` first
+
+```bash
+cd /path/to/kestrel-feature-<name>
+env -u VIRTUAL_ENV uv run pytest -q     # NOT plain `uv run`
+```
+
+`uv run` syncs the **active** virtualenv to the project it is run from. When
+`VIRTUAL_ENV` points at this repo's `.venv` (as it does in any shell where
+core is active), running a sibling feature's tests silently re-resolves
+core's venv to that feature's dependency solution and downgrades whatever
+the two disagree on.
+
+Measured 2026-09-06: running the five feature suites in sequence downgraded
+`openinference-semantic-conventions` 0.1.35 → 0.1.30 in core's venv.
+`openinference-instrumentation` requires `>=0.1.33`, so `phoenix` then fails
+to import (`cannot import name 'AnnotationAttributes'`), pytest plugin
+autoload aborts before writing a JUnit report, and the release-evidence
+runner records a content-free `blocked` — the failure #2853 added
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` to work around.
+
+This is why manual `uv pip install` repairs to core's venv keep reverting:
+the next sibling test run undoes them. Unsetting `VIRTUAL_ENV` makes `uv`
+use (or create) the sibling's own `.venv` and leaves core's alone.
+
 ### Test Pyramid Strategy
 
 Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
