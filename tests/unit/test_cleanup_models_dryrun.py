@@ -22,9 +22,11 @@ async def _feature() -> tuple[ModelAgent, MagicMock]:
     llm_service.cleanup_unused_models = AsyncMock(
         return_value={"would_delete": ["m1", "m2"], "freed_bytes": 0}
     )
-    agent = SimpleNamespace(llm_service=llm_service, features={})
+    agent = SimpleNamespace(llm_service=llm_service, features={}, agent_name="Solo")
     feature = ModelAgent(agent)
     await feature.initialize()
+    # A standalone host: nobody configured that this process cannot consult.
+    feature._configured_agent_names = lambda: []
     return feature, llm_service
 
 
@@ -44,11 +46,17 @@ class TestCleanupModelsDryRunDefault:
         assert kwargs["dry_run"] is True
 
     @pytest.mark.asyncio
-    async def test_explicit_dry_run_false_deletes(self):
-        """dry_run=False still performs the real deletion (OK status)."""
+    async def test_explicit_dry_run_false_deletes(self, monkeypatch):
+        """dry_run=False still performs the real deletion (OK status) — for
+        the sovereign: a real deletion from the shared daemon requires the
+        turn's sovereign caller (#3221). This test is about the flag."""
+        from kestrel_sovereign.auth import CallerContext, caller_context_scope
+
+        monkeypatch.setenv("KESTREL_API_KEY", "dryrun-test-key")
         feature, llm_service = await _feature()
 
-        result = await feature.cleanup_models(dry_run=False)
+        with caller_context_scope(CallerContext.sovereign(credential="dryrun-test-key")):
+            result = await feature.cleanup_models(dry_run=False)
 
         assert result.status is ToolResultStatus.OK
         _, kwargs = llm_service.cleanup_unused_models.call_args

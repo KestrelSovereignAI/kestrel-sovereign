@@ -16,6 +16,19 @@ from datetime import datetime, timedelta
 from kestrel_sovereign.llm.service import LLMService
 
 
+@pytest.fixture(autouse=True)
+def sovereign_turn(monkeypatch):
+    """These tests install onto and delete from the host's shared Ollama
+    daemon, which since #3221 requires the turn's endpoint-bound sovereign
+    caller under the host's stable key. Run them as that caller."""
+    from kestrel_sovereign.auth import CallerContext, caller_context_scope
+
+    key = "integration-test-sovereign-key"
+    monkeypatch.setenv("KESTREL_API_KEY", key)
+    with caller_context_scope(CallerContext.sovereign(identity="integration", credential=key)):
+        yield
+
+
 @pytest.fixture(scope="module")
 def skip_if_no_ollama():
     """Check if Ollama is running"""
