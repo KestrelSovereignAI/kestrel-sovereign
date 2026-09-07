@@ -737,6 +737,7 @@ ROUTED_MODULES = {
     "features/storage_access.py",  # the definition itself
     "features/tasks/feature.py",
     "features/tasks/wait_provider.py",
+    "server.py",  # the feature-route mount owner's stable identity (#3240)
 }
 
 
