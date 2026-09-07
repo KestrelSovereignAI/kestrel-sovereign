@@ -448,6 +448,29 @@ async def test_an_unreadable_roster_is_an_honest_refusal(stable_key):
     llm_service.cleanup_unused_models.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_an_unreadable_rosters_detail_reaches_only_the_sovereign(stable_key, dry_run):
+    """The loader's own message names an agent or the host path (round 3,
+    P2). A non-sovereign caller learns that the read failed, nothing more."""
+    feature, llm_service = await _model_feature()
+
+    def broken():
+        raise ValueError("Agent 'Secret-Peer' must have either 'url' (remote) or 'data_dir' + 'port' (local)")
+
+    feature._configured_agent_names = broken
+    with caller_context_scope(CallerContext.authenticated("u")):
+        result = await feature.cleanup_models(dry_run=dry_run)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Secret-Peer" not in result.error and "Secret-Peer" not in str(result.data)
+    assert "roster could not be read" in result.error
+    llm_service.cleanup_unused_models.assert_not_awaited()
+
+    with caller_context_scope(sovereign()):
+        result = await feature.cleanup_models(dry_run=dry_run)
+    assert "Secret-Peer" in result.error
+
+
 def test_configured_agent_names_reads_the_hosts_roster(tmp_path, monkeypatch):
     from kestrel_sovereign.features.model.feature import _configured_agent_names
 

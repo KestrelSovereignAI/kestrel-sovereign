@@ -190,15 +190,25 @@ class ModelAgent(Feature):
             threshold_days: Only models unused for at least this many days are eligible for deletion (default: 30).
             dry_run: If True (the default), only preview what would be deleted; nothing is removed. Set False to actually delete.
         """
+        # The roster is host information (which agents exist here, which are
+        # cold). Only a sovereign caller sees it — on the deletion path by
+        # asking first, on the report path by asking quietly: a non-sovereign
+        # dry run gets a count-free caveat and no names. The same holds for
+        # the roster read's own failure: a malformed multi_agent.toml raises
+        # with an agent name or the host path in the message, so that detail
+        # reaches the sovereign only; anyone else learns the read failed.
+        roster_visible = _caller_is_sovereign()
         try:
-            # Inside the try: an unreadable multi_agent.toml is a refusal
-            # with the reason, not an exception through the tool wrapper.
             roster = self._fleet_model_roster()
-            # The roster is host information (which agents exist here, which
-            # are cold). Only a sovereign caller sees it — on the deletion
-            # path by asking first, on the report path by asking quietly:
-            # a non-sovereign dry run gets a count-free caveat and no names.
-            roster_visible = _caller_is_sovereign()
+        except Exception as e:
+            logger.error(f"Could not read the host roster: {e}")
+            return ToolResult.failed(
+                str(e)
+                if roster_visible
+                else "shared local model cleanup refused: the host roster could not be read",
+                data={"dry_run": dry_run, "authority": "sovereign"},
+            )
+        try:
             if not dry_run:
                 require_sovereign_caller("shared local model deletion")
                 if roster.unconsulted:
