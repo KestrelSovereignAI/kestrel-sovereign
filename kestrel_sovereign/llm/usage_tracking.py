@@ -330,8 +330,11 @@ class UsageTrackingMixin:
         the turn's endpoint-bound sovereign caller (#3221). The check sits
         here rather than in the tool because this method is also reached by
         the silent auto-pull in ``get_response_with_model``; a scheduler
-        wake or an OAuth-driven turn that names a missing model must not
-        install it host-wide as a side effect.
+        wake, an OAuth-driven turn, or the in-process ``kestrel shell`` (which
+        runs turns with no caller, like the restart authority before it) that
+        names a missing model must not install it host-wide as a side effect.
+        Operators pull through ``kestrel ask``/the console (sovereign key) or
+        ``ollama pull`` directly.
         """
         require_sovereign_caller("shared local model installation")
 
@@ -452,8 +455,9 @@ class UsageTrackingMixin:
 
         A real deletion removes files every agent on the host loads from,
         so it requires the turn's endpoint-bound sovereign caller (#3221) —
-        decided before any storage is inspected. A dry run is a report and
-        needs no authority.
+        decided before any storage is inspected; the in-process
+        ``kestrel shell`` carries none and is refused too. A dry run is a
+        report and needs no authority.
         """
         from datetime import timedelta
 

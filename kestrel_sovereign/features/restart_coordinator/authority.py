@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
 from dataclasses import dataclass

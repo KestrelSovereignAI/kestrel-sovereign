@@ -1,12 +1,44 @@
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.security.host_authority import HostAuthorityError
+from kestrel_sovereign.security.host_authority import (
+    HostAuthorityError,
+    require_sovereign_caller,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FleetModelRoster:
+    """What a shared-daemon cleanup accounted for, and what it could not."""
+
+    protected: set
+    consulted: List[str]
+    unconsulted: List[str]
+
+
+def _configured_agent_names() -> List[str]:
+    """Every local agent the host is configured with, loaded or not.
+
+    Read from the project's ``multi_agent.toml`` — the same roster
+    ``kestrel start`` launches from — rather than from the in-process
+    manager, which knows only what is loaded. No file means no fleet.
+    """
+    from kestrel_sovereign.multi_agent.config import (
+        MULTI_AGENT_CONFIG_FILENAME,
+        MultiAgentConfig,
+    )
+    from kestrel_sovereign.paths import project_dir
+
+    path = project_dir() / MULTI_AGENT_CONFIG_FILENAME
+    if not path.exists():
+        return []
+    return sorted(MultiAgentConfig.load(path).get_local_agents().keys())
 
 
 class ModelAgent(Feature):
@@ -14,6 +46,10 @@ class ModelAgent(Feature):
     Agent responsible for managing LLM models.
     Handles discovery, switching, pulling, and cleanup of models.
     """
+
+    # The host roster reader, an instance hook so a test can hand a feature
+    # a roster without patching the module for every other test.
+    _configured_agent_names = staticmethod(_configured_agent_names)
 
     @property
     def tool_description(self) -> str:
@@ -142,12 +178,34 @@ class ModelAgent(Feature):
             threshold_days: Only models unused for at least this many days are eligible for deletion (default: 30).
             dry_run: If True (the default), only preview what would be deleted; nothing is removed. Set False to actually delete.
         """
+        roster = self._fleet_model_roster()
         try:
+            if not dry_run:
+                # The service asks the same question; asking here first keeps
+                # the host's roster (below) from being disclosed to a caller
+                # the deletion would refuse anyway.
+                require_sovereign_caller("shared local model deletion")
+                if roster.unconsulted:
+                    # A partial roster is not a smaller risk, it is an unknown
+                    # one: the models a cold or out-of-process agent is pinned
+                    # to are exactly the ones this process cannot see (#3221).
+                    names = ", ".join(roster.unconsulted)
+                    return ToolResult.failed(
+                        "shared local model deletion refused: cannot account for "
+                        f"models in use by configured agents this process cannot "
+                        f"consult ({names}). Start them on this host, or preview "
+                        "with dry_run=True.",
+                        data={
+                            "dry_run": False,
+                            "consulted_agents": roster.consulted,
+                            "unconsulted_agents": roster.unconsulted,
+                        },
+                    )
             result = await self.llm_service.cleanup_unused_models(
                 threshold_days=threshold_days,
                 min_free_space_pct=10,
                 dry_run=dry_run,
-                protected_models=self._fleet_protected_models(),
+                protected_models=roster.protected,
             )
         except HostAuthorityError as e:
             logger.warning(f"Refused shared model cleanup: {e}")
@@ -160,6 +218,10 @@ class ModelAgent(Feature):
             return ToolResult.failed(str(e))
 
         data = result if isinstance(result, dict) else {"raw": result}
+        # The plan is auditable: which agents' models it accounted for, and
+        # which it could not — a real deletion refuses on the latter.
+        data["consulted_agents"] = roster.consulted
+        data["unconsulted_agents"] = roster.unconsulted
 
         # Honesty: dry-run is an explicit "did not actually delete"
         # mode. The agent must speak that nothing was actually freed —
@@ -167,12 +229,19 @@ class ModelAgent(Feature):
         # narrates "freed 12GB" would be lying. Surface as PARTIAL with
         # the dry-run caveat so the model cannot omit it.
         if dry_run:
+            caveat = (
+                "dry_run=True; no models were actually deleted and no "
+                "space was freed. Re-run with dry_run=False to apply."
+            )
+            if roster.unconsulted:
+                caveat += (
+                    " This plan could not account for configured agents this "
+                    f"process cannot consult ({', '.join(roster.unconsulted)}); "
+                    "a real deletion will refuse until they are loaded here."
+                )
             return ToolResult.partial(
                 confirmation="Cleanup planned (dry-run)",
-                error=(
-                    "dry_run=True; no models were actually deleted and no "
-                    "space was freed. Re-run with dry_run=False to apply."
-                ),
+                error=caveat,
                 data=data,
             )
 
@@ -183,32 +252,44 @@ class ModelAgent(Feature):
             data=data,
         )
 
-    def _fleet_protected_models(self) -> set:
-        """Local models any co-hosted agent still needs.
+    def _fleet_model_roster(self) -> "FleetModelRoster":
+        """Local models any co-hosted agent still needs, and who was asked.
 
         The Ollama daemon is one per host. Before #3221 cleanup protected
         only the models the *calling* agent's service named, so one agent
-        could delete a model another was pinned to. Every agent registered
-        with the host's manager contributes its own service's protected set;
-        a standalone agent contributes only itself. The report (dry run) and
-        the deletion use the same set, so the preview is the plan.
+        could delete a model another was pinned to. Every agent **loaded in
+        this process** contributes its own service's protected set. The
+        host's configured roster (``multi_agent.toml``) is the reference:
+        an agent configured but not loaded here — ``autostart = false`` and
+        still cold, or running in its own process under ``kestrel start
+        <name>`` — cannot be consulted, and its pins are exactly the models
+        this process cannot see. Those names are reported, and a real
+        deletion refuses while any exist. The report (dry run) and the
+        deletion use the same set, so the preview is the plan.
         """
-        protected: set = set()
-        services = [self.llm_service]
+        own_name = getattr(self.agent, "agent_name", None)
+        services = {own_name or "<self>": self.llm_service}
         manager = getattr(self.agent, "_agent_manager", None) or getattr(
             self.agent, "agent_manager", None
         )
         list_agents = getattr(manager, "list_agents", None)
         if callable(list_agents):
-            for peer in list(list_agents().values()):
+            for name, peer in list(list_agents().items()):
                 service = getattr(peer, "llm_service", None)
                 if service is not None:
-                    services.append(service)
-        for service in services:
+                    services[name] = service
+        protected: set = set()
+        for service in services.values():
             locally = getattr(service, "locally_protected_models", None)
             if callable(locally):
                 protected |= set(locally())
-        return protected
+        consulted = sorted(str(name) for name in services)
+        unconsulted = sorted(
+            name for name in self._configured_agent_names() if name not in services
+        )
+        return FleetModelRoster(
+            protected=protected, consulted=consulted, unconsulted=unconsulted
+        )
 
     @tool(
         name="get_model_info",

@@ -225,15 +225,24 @@ def _peer(protected):
     return SimpleNamespace(llm_service=SimpleNamespace(locally_protected_models=lambda: set(protected)))
 
 
-async def _model_feature(peers=None):
+async def _model_feature(peers=None, *, manager=True, configured=None):
+    """A ModelAgent named "Me" with loaded peers and a configured roster.
+
+    ``configured`` stands in for the host's multi_agent.toml; the real
+    reader is tested on its own below. ``manager=False`` is the
+    per-agent-process topology (``kestrel start <name>``): no manager at all.
+    """
     llm_service = MagicMock()
     llm_service.locally_protected_models = lambda: {"mine:1b"}
     llm_service.cleanup_unused_models = AsyncMock(return_value={"would_delete": []})
     llm_service.pull_model = AsyncMock(side_effect=HostAuthorityError("shared local model installation requires an authenticated sovereign-key caller"))
-    manager = SimpleNamespace(list_agents=lambda: dict(peers or {}))
-    agent = SimpleNamespace(llm_service=llm_service, features={}, _agent_manager=manager)
+    agent = SimpleNamespace(llm_service=llm_service, features={}, agent_name="Me")
+    if manager:
+        agent._agent_manager = SimpleNamespace(list_agents=lambda: dict(peers or {}))
     feature = ModelAgent(agent)
     await feature.initialize()
+    roster = ["Me", *(peers or {})] if configured is None else configured
+    feature._configured_agent_names = lambda: list(roster)
     return feature, llm_service
 
 
@@ -342,3 +351,110 @@ async def test_reads_and_missing_profile_are_not_gated(stable_key):
     assert status.status is ToolResultStatus.OK
     assert missing.status is ToolResultStatus.ERROR
     assert missing.error == "Profile required"
+
+
+# ---------------------------------------------------------------------------
+# A partial roster refuses; the plan says who was asked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_who_it_consulted():
+    feature, llm_service = await _model_feature(peers={"Emma": _peer({"emma:70b"})})
+    plan = await feature.cleanup_models(dry_run=True)
+    assert plan.data["consulted_agents"] == ["Emma", "Me"]
+    assert plan.data["unconsulted_agents"] == []
+    assert "could not account" not in plan.error
+
+
+@pytest.mark.asyncio
+async def test_a_cold_configured_agent_blocks_a_real_deletion(stable_key):
+    """Nellie is configured (autostart = false) and not loaded: her pinned
+    model is exactly what this process cannot see. The plan says so; the
+    deletion refuses rather than deleting under a partial set."""
+    feature, llm_service = await _model_feature(
+        peers={"Emma": _peer({"emma:70b"})}, configured=["Emma", "Me", "Nellie"]
+    )
+    with caller_context_scope(sovereign()):
+        plan = await feature.cleanup_models(dry_run=True)
+        deletion = await feature.cleanup_models(dry_run=False)
+    assert plan.status is ToolResultStatus.PARTIAL
+    assert plan.data["unconsulted_agents"] == ["Nellie"]
+    assert "Nellie" in plan.error
+    assert deletion.status is ToolResultStatus.ERROR, deletion
+    assert "Nellie" in deletion.error and "cannot account" in deletion.error
+    assert deletion.data["unconsulted_agents"] == ["Nellie"]
+    # Only the dry run reached the service; the deletion never did.
+    assert llm_service.cleanup_unused_models.await_count == 1
+    assert llm_service.cleanup_unused_models.await_args.kwargs["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_per_agent_process_cannot_delete_when_the_host_has_peers(stable_key):
+    """`kestrel start <name>` runs the agent alone in its own process with no
+    manager; the shared daemon still serves every other configured agent."""
+    feature, llm_service = await _model_feature(manager=False, configured=["Emma", "Me"])
+    with caller_context_scope(sovereign()):
+        deletion = await feature.cleanup_models(dry_run=False)
+    assert deletion.status is ToolResultStatus.ERROR
+    assert "Emma" in deletion.error
+    llm_service.cleanup_unused_models.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_non_sovereign_caller_learns_nothing_about_the_roster():
+    """Authority is asked before the roster is disclosed."""
+    feature, llm_service = await _model_feature(configured=["Me", "Secret-Peer"])
+    with caller_context_scope(CallerContext.authenticated("u")):
+        result = await feature.cleanup_models(dry_run=False)
+    assert result.status is ToolResultStatus.ERROR
+    assert "Secret-Peer" not in result.error
+    assert result.data == {"dry_run": False, "authority": "sovereign"}
+    llm_service.cleanup_unused_models.assert_not_awaited()
+
+
+def test_configured_agent_names_reads_the_hosts_roster(tmp_path, monkeypatch):
+    from kestrel_sovereign.features.model.feature import _configured_agent_names
+
+    monkeypatch.setattr("kestrel_sovereign.paths.project_dir", lambda: tmp_path)
+    assert _configured_agent_names() == []
+    (tmp_path / "multi_agent.toml").write_text(
+        "[agents.Emma]\ndata_dir = \"agent_data/emma\"\nport = 8801\n\n"
+        "[agents.Nellie]\ndata_dir = \"agent_data/nellie\"\nport = 8802\nautostart = false\n"
+    )
+    assert _configured_agent_names() == ["Emma", "Nellie"]
+
+
+# ---------------------------------------------------------------------------
+# The restart authority's messages are byte-identical after the refactor
+# ---------------------------------------------------------------------------
+
+
+def test_restart_authority_messages_are_unchanged(stable_key, monkeypatch):
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+        _sovereign_secret,
+        require_restart_request_authority,
+    )
+
+    with caller_context_scope(None):
+        with pytest.raises(RestartAuthorityError) as excinfo:
+            require_restart_request_authority()
+    assert str(excinfo.value) == "whole-host restart requires an authenticated sovereign-key caller"
+
+    with caller_context_scope(sovereign(credential="a-key-since-rotated")):
+        with pytest.raises(RestartAuthorityError) as excinfo:
+            require_restart_request_authority()
+    assert str(excinfo.value) == (
+        "whole-host restart authority no longer matches the authenticated "
+        "credential at request entry"
+    )
+
+    with caller_context_scope(sovereign()):
+        assert require_restart_request_authority() == "operator"
+    assert _sovereign_secret() == STABLE_KEY.encode()
+
+    monkeypatch.delenv("KESTREL_API_KEY")
+    with pytest.raises(RestartAuthorityError) as excinfo:
+        _sovereign_secret()
+    assert str(excinfo.value) == "whole-host restart authority is unavailable: no stable sovereign key"
