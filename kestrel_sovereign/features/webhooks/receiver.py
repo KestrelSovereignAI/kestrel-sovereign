@@ -10,6 +10,7 @@ Responsibilities:
 """
 
 import hashlib
+import inspect
 import logging
 import time
 import uuid
@@ -21,6 +22,56 @@ from .auth import WebhookAuth, create_auth_handler
 from .models import WebhookConfig, WebhookEvent
 
 logger = logging.getLogger(__name__)
+
+
+def unknown_webhook_result(name: str) -> Dict[str, Any]:
+    """The one public response for a name this host will not dispatch.
+
+    Returned for an unregistered name AND for a name whose ownership is
+    ambiguous (#3216), so the two cases are indistinguishable to a keyless
+    caller. Every site that answers "not dispatching" builds its response
+    here; a divergent body would hand out an ownership oracle.
+    """
+    return {"status_code": 404, "body": {"error": f"Unknown webhook: {name}"}}
+
+
+async def _audit_refusal(
+    owner: Any, name: str, *, source_ip: str, body: bytes, status_code: int
+) -> None:
+    """Ask ``owner`` to audit a refused request; never let that change the
+    response.
+
+    The host admits any receiver with ``handle_webhook`` + ``webhooks``
+    (duck-typed, so an out-of-tree feature can contribute one).
+    ``record_refusal`` is the optional half of that contract, and this is
+    the one seam where core awaits foreign code on the refusal path — so
+    it absorbs everything that seam can do: the method may be absent, may
+    be synchronous, may raise. Any of those turning the deliberately
+    indistinguishable 404 into a 500 would be the ownership oracle the
+    shared response exists to deny; core's own receiver already states the
+    rule ("never let persistence failure break the response") two frames
+    down, and it has to hold at the frame that crosses the boundary. The
+    refusal is always host-logged, so an owner that cannot audit is still
+    visible to the operator.
+    """
+    record = getattr(owner, "record_refusal", None)
+    if record is None:
+        logger.warning(
+            "Receiver for webhook '%s' cannot audit its own refusal "
+            "(no record_refusal); host-logged only.",
+            name,
+        )
+        return
+    try:
+        outcome = record(name, source_ip=source_ip, body=body, status_code=status_code)
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception as exc:  # audit failure never changes the response
+        logger.warning(
+            "Receiver for webhook '%s' failed to audit its own refusal: %s",
+            name,
+            exc,
+        )
 
 
 def build_webhook_dispatch_router(
@@ -43,10 +94,23 @@ def build_webhook_dispatch_router(
       name (kestrel-sovereign#2522);
     * unprefixed → the aggregate of every current agent's enabled receivers.
 
-    Each request resolves ``{name}`` to the (scoped) receiver that has that
-    webhook registered and dispatches there; an unregistered name is recorded
-    on the first in-scope receiver (so the 404 is still audited) or returns a
-    bare 404 when no in-scope receiver exists.
+    Each request resolves ``{name}`` against the in-scope receivers:
+
+    * exactly one receiver owns the name → dispatch to it;
+    * more than one owns it → the target is ambiguous and the request is
+      REFUSED without dispatching to any of them (kestrel-sovereign#3216).
+      Iteration order never selects the target. The public response is the
+      same ``404 Unknown webhook`` an unregistered name gets, so a keyless
+      caller cannot probe which names are registered on more than one
+      agent; each owning receiver audits the refusal as a 404 and the host
+      log names the collision. Addressing one agent with the agent-prefixed
+      form resolves a collision *between* agents; a collision *within* one
+      agent (two of its receivers owning the name) is refused on that form
+      too. The router sees receivers, not their agents, so an unscoped
+      refusal cannot tell the two cases apart and its remedy says so; a
+      scoped refusal knows it is the within-agent case;
+    * none owns it → recorded on the first in-scope receiver (so the 404 is
+      still audited) or a bare 404 when no in-scope receiver exists.
 
     This replaces mounting each agent's own ``/webhooks/{name}`` catch-all: two
     identical routes would otherwise shadow each other (first-mounted wins),
@@ -71,27 +135,65 @@ def build_webhook_dispatch_router(
         # across all agents for the unprefixed form (#2522).
         target_agent = getattr(request.state, "agent", None)
         receivers = list(receiver_provider(target_agent))
-        target = next(
-            (r for r in receivers if webhook_name in r.webhooks),
-            None,
-        )
-        if target is None:
-            # No agent owns this name. Route to the first receiver so the
-            # unknown-webhook 404 is still audited; fall back to a bare 404
-            # when there are no receivers at all.
-            if receivers:
-                result = await receivers[0].handle_webhook(
-                    webhook_name, headers=headers, body=body, source_ip=source_ip
-                )
-            else:
-                result = {
-                    "status_code": 404,
-                    "body": {"error": f"Unknown webhook: {webhook_name}"},
-                }
-        else:
-            result = await target.handle_webhook(
+        owners = [r for r in receivers if webhook_name in r.webhooks]
+        if len(owners) == 1:
+            result = await owners[0].handle_webhook(
                 webhook_name, headers=headers, body=body, source_ip=source_ip
             )
+        elif owners:
+            # More than one in-scope receiver owns this name, so no rule but
+            # iteration order could pick the target. Refuse without
+            # dispatching to any owner (#3216): the public response is the
+            # unknown-webhook 404 (no ownership oracle), every owner audits
+            # the refusal, and the host log carries the collision so an
+            # operator can re-address the sender to the agent-prefixed form.
+            result = unknown_webhook_result(webhook_name)
+            if target_agent is None:
+                # Unscoped: the provider returns receivers with no agent
+                # attribution, so the router cannot tell "two agents own it"
+                # from "one agent's two receivers own it". The remedy is
+                # conditional rather than a proxy for a fact it lacks.
+                logger.warning(
+                    "Webhook '%s' is owned by %d enabled receivers; refusing the "
+                    "unscoped request from %s without dispatch. Address it as "
+                    "/api/agents/{agent}/webhooks/%s for the intended agent; if "
+                    "that form refuses too, two of that agent's own receivers "
+                    "own the name and one must be unregistered.",
+                    webhook_name,
+                    len(owners),
+                    source_ip,
+                    webhook_name,
+                )
+            else:
+                # Already scoped to one agent and still ambiguous: two of that
+                # agent's own receivers own the name. No address disambiguates
+                # this; the name itself has to be un-collided.
+                logger.warning(
+                    "Webhook '%s' is owned by %d enabled receivers within the "
+                    "addressed agent; refusing the request from %s without "
+                    "dispatch. The agent-prefixed form cannot disambiguate a "
+                    "collision inside one agent — unregister one of them.",
+                    webhook_name,
+                    len(owners),
+                    source_ip,
+                )
+            for owner in owners:
+                await _audit_refusal(
+                    owner,
+                    webhook_name,
+                    source_ip=source_ip,
+                    body=body,
+                    status_code=result["status_code"],
+                )
+        elif receivers:
+            # No receiver owns this name. Route to the first receiver so the
+            # unknown-webhook 404 is still audited.
+            result = await receivers[0].handle_webhook(
+                webhook_name, headers=headers, body=body, source_ip=source_ip
+            )
+        else:
+            # No receivers at all: bare 404.
+            result = unknown_webhook_result(webhook_name)
 
         return JSONResponse(content=result["body"], status_code=result["status_code"])
 
@@ -205,7 +307,7 @@ class WebhookReceiver:
                 body=body,
             )
             await self._record_event(event)
-            return {"status_code": 404, "body": {"error": f"Unknown webhook: {name}"}}
+            return unknown_webhook_result(name)
 
         config = self.webhooks[name]
 
@@ -283,6 +385,33 @@ class WebhookReceiver:
                 "webhook": name,
             },
         }
+
+    async def record_refusal(
+        self,
+        name: str,
+        *,
+        source_ip: str,
+        body: bytes,
+        status_code: int,
+    ) -> None:
+        """Audit a request for a webhook this receiver owns that the host
+        refused to dispatch.
+
+        Used by the shared dispatch router when ``name`` is owned by more than
+        one in-scope receiver (#3216): the request is answered with
+        ``status_code`` and NOT dispatched, but the receive still happened at
+        this receiver's name and belongs in its audit log (source, payload
+        hash, outcome) like every other failed receive. Runs no auth handler
+        and touches no rate-limit window — nothing here is a dispatch.
+        """
+        event = self._create_event(
+            webhook_name=name,
+            source_ip=source_ip,
+            authenticated=False,
+            status_code=status_code,
+            body=body,
+        )
+        await self._record_event(event)
 
     # ------------------------------------------------------------------
     # FastAPI router

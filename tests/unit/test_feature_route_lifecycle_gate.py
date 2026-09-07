@@ -20,7 +20,7 @@ actual server/app path, asserting:
 """
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -689,3 +689,374 @@ def test_unprefixed_webhook_form_retains_aggregate_lookup():
             assert _event_count(a_hook) == 0
     finally:
         restore()
+
+
+def _post_unprefixed_and_prefixed_ambiguous(agents, a_hook, b_hook):
+    """Boot ``agents`` (an ordered ``{name: agent}`` map whose iteration order
+    IS the fleet order) and exercise the ambiguous unprefixed form plus both
+    explicit agent-prefixed forms. ``a_hook``/``b_hook`` are agent a's and
+    agent b's webhook features, whichever order the fleet lists them in.
+
+    Returns ``(unprefixed_response, unknown_response)`` where the unknown
+    response is for a name nobody owns, taken AFTER every ownership assertion
+    (the unknown-name 404 is audited on the first receiver, which would skew
+    the per-receiver tallies asserted here).
+    """
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            # Refused, not dispatched: neither owner handled it. Each owner
+            # audits exactly one refusal (a 404, unauthenticated) and no
+            # receive succeeded anywhere.
+            assert resp.status_code == 404, resp.text
+            for hook in (a_hook, b_hook):
+                events = list(hook.receiver.event_log)
+                assert [e.status_code for e in events] == [404], events
+                assert not any(e.authenticated for e in events)
+                # Refused, so no rate-limit window was opened on either owner.
+                assert "deposit" not in hook.receiver._rate_windows
+
+            # The explicit agent-prefixed form is unaffected by the
+            # collision: each agent still receives ONLY what is addressed to
+            # it, in the same boot.
+            resp_a = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp_a.status_code == 200, resp_a.text
+            assert resp_a.json()["webhook"] == "deposit"
+            resp_b = client.post("/api/agents/b/webhooks/deposit", content=b"{}")
+            assert resp_b.status_code == 200, resp_b.text
+            assert resp_b.json()["webhook"] == "deposit"
+            assert [e.status_code for e in a_hook.receiver.event_log] == [404, 200]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+
+            unknown = client.post("/webhooks/ghost", content=b"{}")
+            return resp, unknown
+    finally:
+        restore()
+
+
+def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order():
+    """#3216: two enabled agents own ``deposit``; the unprefixed form must not
+    let fleet iteration order choose the target.
+
+    Before the fix the first receiver in ``list_agents()`` order won: fleet
+    order (a, b) dispatched to A and order (b, a) dispatched to B, each a 200
+    with the other agent none the wiser. Now BOTH orders refuse without any
+    dispatch, with the same public 404 an unregistered name gets — so a
+    keyless caller learns nothing about which names collide — while the
+    explicit ``/api/agents/{name}/webhooks/deposit`` form keeps working.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    for order in (("a", "b"), ("b", "a")):
+        a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        by_name = {
+            "a": _make_agent({"WebhookFeature": a_hook}),
+            "b": _make_agent({"WebhookFeature": b_hook}),
+        }
+        agents = {name: by_name[name] for name in order}
+        assert list(agents) == list(order)
+        resp, unknown = _post_unprefixed_and_prefixed_ambiguous(
+            agents, a_hook, b_hook
+        )
+        # Same safe public response as an unregistered name: status and body
+        # shape are identical (only the echoed name differs).
+        assert unknown.status_code == 404
+        assert resp.status_code == unknown.status_code, order
+        assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+        assert unknown.json() == {"error": "Unknown webhook: ghost"}, order
+
+
+def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
+    """#3216: only ENABLED owners count, and the count is read live.
+
+    A enabled + B disabled is one owner → the unprefixed form dispatches to
+    A. Enabling B makes the name ambiguous → refused, A's tally unchanged.
+    Disabling A leaves B the sole owner → dispatches to B. A stale or
+    enabled-blind count would fail one of the three legs.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=False)
+    agents = {
+        "a": _make_agent({"WebhookFeature": a_hook}),
+        "b": _make_agent({"WebhookFeature": b_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200]
+            assert _event_count(b_hook) == 0
+
+            b_hook.enabled = True
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404]
+
+            a_hook.enabled = False
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+    finally:
+        restore()
+
+
+def test_one_receiver_reachable_through_two_agents_is_one_owner():
+    """#3216: dedupe-by-identity is now load-bearing for correctness.
+
+    The aggregate provider dedupes receivers by identity because one
+    receiver can be reached through more than one agent. Before the
+    ambiguity rule that only saved a redundant scan; now a duplicate entry
+    would count as two owners and falsely refuse a single-owner name. The
+    same feature instance mounted on two fleet entries must still dispatch
+    exactly once.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    shared_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    agents = {
+        "a": _make_agent({"WebhookFeature": shared_hook}),
+        "b": _make_agent({"WebhookFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()
+
+    # The per-agent scan dedupes too (round 7 coverage gap): one agent whose
+    # two feature entries share one receiver object is one owner on the
+    # agent-prefixed form, which is the only path where the per-agent scan's
+    # result reaches dispatch without the aggregate's own dedupe.
+    shared_hook.receiver.event_log.clear()
+    agents = {
+        "a": _make_agent({"FirstFeature": shared_hook, "SecondFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()
+
+
+@contextmanager
+def _receiver_log():
+    """Collect the webhook receiver module's log records directly.
+
+    The server's boot reconfigures root logging, so a root-level capture
+    (``caplog``) misses records emitted during the first boot in a process;
+    a handler on the module logger itself sees them regardless.
+    """
+    import logging
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.receiver")
+    handler = _Collect(level=logging.WARNING)
+    previous = target.level
+    target.addHandler(handler)
+    if previous == logging.NOTSET or previous > logging.WARNING:
+        target.setLevel(logging.WARNING)
+    try:
+        yield records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
+
+
+class _MinimalReceiverFeatureStub:
+    """A receiver meeting only the host's duck-typed contract: ``webhooks`` +
+    ``handle_webhook``. No ``record_refusal``, no ring buffer — the shape an
+    out-of-tree feature package can contribute."""
+
+    name = "ThirdPartyWebhookFeature"
+
+    class _Receiver:
+        def __init__(self, webhook_name):
+            self.webhooks = {webhook_name: object()}
+            self.handled = []
+
+        async def handle_webhook(self, name, *, headers, body, source_ip):
+            self.handled.append(name)
+            return {"status_code": 200, "body": {"status": "received", "webhook": name}}
+
+    def __init__(self, webhook_name="deposit"):
+        self.enabled = True
+        self.receiver = self._Receiver(webhook_name)
+
+    def get_router(self):  # pragma: no cover - never mounted per-feature
+        return None
+
+
+def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404():
+    """#3216 round 3: a receiver that meets only the required contract
+    (no ``record_refusal``) must not turn the refusal into a 500 — that would
+    be the ownership oracle the shared response denies. Same 404, no
+    dispatch to either owner, the core owner still audits, and the host log
+    says the other owner could not audit its own refusal.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    minimal = _MinimalReceiverFeatureStub(webhook_name="deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": minimal}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        minimal.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+            assert minimal.receiver.handled == [], order
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], order
+            assert any(
+                "cannot audit its own refusal" in r.getMessage() for r in records
+            ), order
+        finally:
+            restore()
+
+
+def test_two_distinct_receivers_that_compare_equal_are_two_owners():
+    """#3216 round 4: the dedupe must be by identity, never ``==``.
+
+    An out-of-tree receiver class with value equality (a dataclass, a
+    pydantic model) is admitted on the same two-attribute contract. Two
+    distinct instances that compare equal collapsed to one owner under an
+    ``in``-based dedupe, so the unprefixed form dispatched again — to
+    whichever agent the fleet listed first. Both orders must refuse.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+
+    class _ValueEqualReceiver(_MinimalReceiverFeatureStub._Receiver):
+        def __eq__(self, other):
+            return isinstance(other, _ValueEqualReceiver)
+
+        __hash__ = object.__hash__
+
+    class _ValueEqualFeature(_MinimalReceiverFeatureStub):
+        def __init__(self):
+            self.enabled = True
+            self.receiver = _ValueEqualReceiver("deposit")
+
+    first, second = _ValueEqualFeature(), _ValueEqualFeature()
+    assert first.receiver == second.receiver and first.receiver is not second.receiver
+    fleets = [
+        # Two agents, one value-equal receiver each — both fleet orders.
+        {"a": _make_agent({"ThirdPartyWebhookFeature": first}),
+         "b": _make_agent({"ThirdPartyWebhookFeature": second})},
+        {"b": _make_agent({"ThirdPartyWebhookFeature": second}),
+         "a": _make_agent({"ThirdPartyWebhookFeature": first})},
+        # One agent, two features with value-equal receivers: the per-agent
+        # scan dedupes too, and must also do so by identity.
+        {"a": _make_agent({"FirstFeature": first, "SecondFeature": second})},
+    ]
+    for agents in fleets:
+        first.receiver.handled.clear()
+        second.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+                    assert resp.status_code == 404, (list(agents), resp.text)
+                    if len(agents) == 1:
+                        # A collision INSIDE one agent: the prefixed form
+                        # refuses too, and the log must not send the
+                        # operator to an address that also 404s.
+                        scoped = client.post(
+                            "/api/agents/a/webhooks/deposit", content=b"{}"
+                        )
+                        assert scoped.status_code == 404, scoped.text
+                        assert scoped.json() == {"error": "Unknown webhook: deposit"}
+            collisions = [
+                r.getMessage() for r in records if "is owned by" in r.getMessage()
+            ]
+            assert collisions, [r.getMessage() for r in records]
+            # An unscoped refusal cannot know whether the owners span agents,
+            # so its remedy is conditional: try the prefixed form for the
+            # intended agent, and if that refuses too the collision is inside
+            # that agent. It must never present the prefixed form as a bare
+            # "instead", which 404s in the one-agent fleet.
+            unscoped = collisions[0]
+            assert "/api/agents/{agent}/webhooks/deposit for the intended agent" in unscoped, unscoped
+            assert "if that form refuses too" in unscoped, unscoped
+            assert "instead." not in unscoped, unscoped
+            if len(agents) == 1:
+                # The scoped refusal KNOWS it is the within-agent case.
+                assert len(collisions) == 2, collisions
+                assert "within the addressed agent" in collisions[1], collisions
+                assert "Address it as" not in collisions[1], collisions
+            else:
+                assert len(collisions) == 1, collisions
+            assert first.receiver.handled == [] and second.receiver.handled == [], list(agents)
+        finally:
+            restore()
+
+
+@pytest.mark.parametrize(
+    "record_refusal,label",
+    [
+        (lambda self, name, **_: (_ for _ in ()).throw(RuntimeError("audit sink down")), "raises"),
+        (lambda self, name, **_: None, "synchronous"),
+    ],
+)
+def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
+    record_refusal, label
+):
+    """#3216 round 4: the refusal path awaits foreign ``record_refusal``
+    implementations. One that raises, or returns nothing awaitable, must not
+    turn the indistinguishable 404 into a 500 (the ownership oracle). The
+    core owner still audits; the failure is host-logged.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    Foreign = type(
+        "_ForeignReceiver",
+        (_MinimalReceiverFeatureStub._Receiver,),
+        {"record_refusal": record_refusal},
+    )
+    foreign = _MinimalReceiverFeatureStub("deposit")
+    foreign.receiver = Foreign("deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": foreign}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (label, order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, (label, order)
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], (label, order)
+            assert foreign.receiver.handled == [], (label, order)
+            failures = [r for r in records if "failed to audit" in r.getMessage()]
+            if label == "raises":
+                assert failures, order
+            else:
+                # A synchronous audit is a valid implementation, not a failure.
+                assert not failures, (order, [r.getMessage() for r in failures])
+        finally:
+            restore()

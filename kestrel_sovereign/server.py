@@ -616,7 +616,14 @@ async def verify_api_key(
 
 
 def _is_webhook_receiver(receiver) -> bool:
-    """Duck-typed webhook-receiver check (keeps core decoupled from the class)."""
+    """Duck-typed webhook-receiver check (keeps core decoupled from the class).
+
+    ``handle_webhook`` + ``webhooks`` is the whole required contract.
+    ``record_refusal`` (auditing a refused ambiguous-ownership request,
+    #3216) is optional: the dispatch router calls it only when present, so a
+    receiver without it is still dispatched and still refused with the same
+    404, just without an audit row of its own.
+    """
     return (
         receiver is not None
         and hasattr(receiver, "handle_webhook")
@@ -1068,8 +1075,10 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # /api/agents/{name}/webhooks/{name} request sees ONLY that agent's enabled
     # receivers (so it can't dispatch to another agent's identically-named
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
-    # every agent (#2522). Mounted when at least one enabled webhook receiver
-    # exists at startup; the provider itself stays live thereafter.
+    # every agent (#2522) and the router refuses a name that more than one of
+    # them owns, so iteration order never picks the target (#3216). Mounted
+    # when at least one enabled webhook receiver exists at startup; the
+    # provider itself stays live thereafter.
     candidate_webhook_receivers = []
     if agents is not None:
         for candidate in agents:
@@ -1138,12 +1147,14 @@ def _agent_webhook_receivers(agent) -> list:
     Deduplicated by identity; a disabled/removed feature's receiver is dropped.
     """
     receivers: list = []
+    seen: set[int] = set()
     features = getattr(agent, "features", {}) or {}
     for feature in features.values():
         if not bool(getattr(feature, "enabled", True)):
             continue
         receiver = getattr(feature, "receiver", None)
-        if _is_webhook_receiver(receiver) and receiver not in receivers:
+        if _is_webhook_receiver(receiver) and id(receiver) not in seen:
+            seen.add(id(receiver))
             receivers.append(receiver)
     return receivers
 
@@ -1164,14 +1175,22 @@ def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
     unprefixed ``/webhooks/{name}`` form, or single-agent mode) the aggregate
     of every current agent's enabled receivers is returned. Deduplicated by
     identity because one receiver can be reached through multiple agents.
+    The dispatch router refuses a name owned by more than one receiver in
+    the returned set (#3216); this provider only decides the scope. The
+    dedupe is by ``id()``, never ``==``: a receiver is admitted on a
+    two-attribute duck-typed contract, and an out-of-tree class with value
+    equality (a dataclass, a pydantic model) would otherwise collapse two
+    distinct owners into one and hand the target back to iteration order.
     """
     if agent is not None:
         return _agent_webhook_receivers(agent)
 
     receivers: list = []
+    seen: set[int] = set()
     for current in _iter_current_agents(app):
         for receiver in _agent_webhook_receivers(current):
-            if receiver not in receivers:
+            if id(receiver) not in seen:
+                seen.add(id(receiver))
                 receivers.append(receiver)
     return receivers
 
