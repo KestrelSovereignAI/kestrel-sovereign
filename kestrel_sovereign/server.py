@@ -702,6 +702,24 @@ def _current_feature_router_route(feature, selector: tuple):
     return current
 
 
+def _stable_agent_did(agent) -> Optional[str]:
+    """The agent's DID through the shared guard, or None when it has none.
+
+    Used to recognise a mount owner that was reloaded under a new object.
+    A test double with no string DID has no stable identity here and is
+    only ever matched by object.
+    """
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return None
+
+
 def _live_feature_route(agent, feature_name: str, selector: tuple):
     """The current child route ``agent`` serves for one mounted shape, or None.
 
@@ -728,11 +746,14 @@ def _resolve_live_route_agent(
     """Resolve a live owner for one physically shared feature route.
 
     Request-scoped routing is authoritative.  For unprefixed routes, retain
-    the original mount owner while it is managed.  If readiness rollback or
-    DELETE withdrew that owner, the route may rebind only when exactly one
-    managed agent still serves it: an unprefixed address names no agent, so
-    with two or more candidates the executor would be chosen by
-    ``list_agents()`` order, invisible to the caller (#3240, the shape of
+    the original mount owner while it is managed — the same object, or the
+    same agent reloaded under a new object (readiness rollback then retry,
+    DELETE then re-create, a scheduler cold wake): the manager keeps one
+    routing name per DID, so the DID is the owner's stable identity and the
+    object is not.  If that owner is gone, the route may rebind only when
+    exactly one managed agent still serves it: an unprefixed address names
+    no agent, so with two or more candidates the executor would be chosen
+    by ``list_agents()`` order, invisible to the caller (#3240, the shape of
     #3216). Refuse instead; the agent-prefixed form stays the unambiguous
     address.
     """
@@ -758,6 +779,15 @@ def _resolve_live_route_agent(
         )
     if any(current is mount_agent for current in managed_agents):
         return mount_agent
+    mount_did = _stable_agent_did(mount_agent)
+    if mount_did is not None:
+        reloaded = [
+            current
+            for current in managed_agents
+            if _stable_agent_did(current) == mount_did
+        ]
+        if len(reloaded) == 1:
+            return reloaded[0]
     survivors = [
         candidate
         for candidate in managed_agents

@@ -120,6 +120,25 @@ class _InstanceBoundRouterFeature:
         return router
 
 
+class _DriftedRouterFeature:
+    """Enabled, same feature name, but its router no longer exposes the
+    mounted shape: it must not count as a survivor of that route."""
+
+    def __init__(self):
+        self.enabled = True
+        self.served = 0
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/somewhere-else")
+        async def elsewhere():
+            self.served += 1
+            return {"owner": "drifted"}
+
+        return router
+
+
 class _PartiallyCopiedRouterFeature:
     """A router whose mounted child FastAPI cannot be copied by include_router."""
 
@@ -1174,5 +1193,105 @@ def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
             agents["bob"].features.pop("ProxyFeature")
             assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
             assert bob.served == 0 and carol.served == 2
+
+            # Enabled and same-named, but the shape is gone from its router:
+            # not a survivor of THIS route, so carol is still the only one.
+            drifted = _DriftedRouterFeature()
+            agents["bob"].features["ProxyFeature"] = drifted
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert drifted.served == 0 and carol.served == 3
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_follows_the_mount_owner_across_its_reload():
+    """Review r1 P2: the mount owner reloaded under a NEW object with the same
+    routing name and DID is still the mount owner. Retention by object
+    identity made that a permanent 404 while another agent served the shape;
+    the DID is the stable identity, so the reloaded owner serves — even with
+    two other survivors that would otherwise be an ambiguous pair."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    agents["carol"].did = "did:test:carol"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: two survivors, refused.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            # Re-created under a new object, same name and DID: the owner is
+            # back, and it wins over the pair that was ambiguous a moment ago.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert alice_v1.served == 1 and alice_v2.served == 1
+            assert bob.served == 0 and carol.served == 0
+            assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
+                "owner": "alice-v2"
+            }
+
+            # A different agent under the owner's old name is not the owner.
+            impostor = _InstanceBoundRouterFeature("impostor")
+            agents["alice"] = _make_agent({"ProxyFeature": impostor})
+            agents["alice"].did = "did:test:someone-else"
+            assert client.get(path, headers=headers).status_code == 404
+            assert impostor.served == 0
+    finally:
+        restore()
+
+
+class _FeaturesOnceThenGone(dict):
+    """A ``features`` mapping whose lookup answers once and then reports the
+    feature gone: the change between ``route.matches()`` and dispatch."""
+
+    def __init__(self, name, feature, *, answers: int):
+        super().__init__({name: feature})
+        self._answers = answers
+
+    def get(self, key, default=None):
+        if self._answers <= 0:
+            return default
+        self._answers -= 1
+        return super().get(key, default)
+
+
+def test_dispatch_refuses_a_feature_that_vanished_after_the_match():
+    """Review r1 M12: the match gate admits the request, then the feature is
+    gone by dispatch. Dispatch must refuse, never fall back to the mounted
+    copy's first-tenant endpoint (which is #3240 itself)."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    agents = {"alice": agent}
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            # One answer for the match gate; dispatch sees no feature.
+            agent.features = _FeaturesOnceThenGone("ProxyFeature", alice, answers=1)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
     finally:
         restore()
