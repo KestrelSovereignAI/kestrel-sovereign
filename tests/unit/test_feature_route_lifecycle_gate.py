@@ -1333,6 +1333,12 @@ def test_dispatch_refuses_a_feature_disabled_after_the_match():
             assert response.status_code == 404
             assert alice.served == 1
             assert alice.enabled is False
+            # Exactly two lookups per request: the match gate, then dispatch.
+            # The double disables after the FIRST, so this pins that the 404
+            # came from dispatch's own check; a future extra lookup earlier
+            # in the request would move the disable into the gate and make
+            # this test vacuous — fail loudly instead.
+            assert agent.features._looked_up == 2
     finally:
         restore()
 
