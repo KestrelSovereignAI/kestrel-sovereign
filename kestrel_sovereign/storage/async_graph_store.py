@@ -851,6 +851,30 @@ class Edge:
     properties: Optional[Dict[str, Any]] = None
 
 
+def _normalize_purge_watermark(since_iso: Optional[str]) -> Optional[str]:
+    """``YYYY-MM-DD HH:MM:SS.ffffff`` from any watermark the callers hand in.
+
+    The privacy wrapper passes the transition instant at microsecond
+    precision; older callers and tests pass whole seconds, which read as
+    ``.000000``. A ``T`` separator is turned into a space and a trailing
+    UTC offset is dropped, so the text compares lexicographically against
+    the normalised row timestamps on both backends (#3227).
+    """
+    if not since_iso:
+        return since_iso
+    text = str(since_iso).strip().replace("T", " ")
+    if len(text) > 19 and text[19] in "+-":
+        text = text[:19]
+    if len(text) == 19:
+        return text + ".000000"
+    if len(text) > 20 and text[19] == ".":
+        fraction = "".join(ch for ch in text[20:] if ch.isdigit())[:6]
+        return text[:19] + "." + fraction.ljust(6, "0")
+    raise ValueError(
+        f"purge watermark must be YYYY-MM-DD HH:MM:SS[.ffffff]; got {since_iso!r}"
+    )
+
+
 class AsyncGraphStore:
     """Async knowledge graph storage.
 
@@ -1861,14 +1885,19 @@ class AsyncGraphStore:
 
         Args:
             agent_id: agent's DID.
-            since_iso: Optional ISO-8601 timestamp.  When provided, only
-                nodes whose ``properties.created_at >= since_iso`` are
-                destroyed — this scopes the EPHEMERAL leak-purge to the
-                rows authored *during* the EPHEMERAL stint and leaves
-                preexisting NORMAL data alone (#867).  When omitted,
-                every node owned by this agent is destroyed (legacy
-                behaviour preserved for restore-from-CAR and explicit
-                administrative wipes).
+            since_iso: Optional watermark, ``YYYY-MM-DD HH:MM:SS[.ffffff]``
+                (a ``T`` separator or a UTC offset is tolerated).  When
+                provided, only nodes whose ``properties.created_at >=
+                since_iso`` are destroyed — this scopes the EPHEMERAL
+                leak-purge to the rows authored *during* the EPHEMERAL
+                stint and leaves preexisting NORMAL data alone (#867).
+                Compared at microsecond precision: graph rows are stamped
+                with ``isoformat()``, and a whole-second comparison
+                destroyed NORMAL nodes written earlier in the same second
+                as the transition (#3227). A whole-second watermark is
+                read as ``.000000``.  When omitted, every node owned by
+                this agent is destroyed (legacy behaviour preserved for
+                restore-from-CAR and explicit administrative wipes).
 
         Returns:
             Number of node rows destroyed. Zero is the happy path; any
@@ -1880,32 +1909,39 @@ class AsyncGraphStore:
         if self.agent_id and self.agent_id != agent_id:
             raise ValueError("A bound graph store cannot purge another agent")
 
+        since_iso = _normalize_purge_watermark(since_iso)
         if self.db.backend_type == "postgres":
             # graph_nodes.properties.created_at is documented as
-            # ``YYYY-MM-DDTHH:MM:SS+00:00`` (ISO with T separator, fixed
-            # offset).  Normalise it to ``YYYY-MM-DD HH:MM:SS`` so it can
-            # be lex-compared against the SQLite-format watermark the
-            # privacy wrapper records.  Without this normalisation the
-            # ``T`` (0x54) sorts AFTER space (0x20) and every same-day
-            # graph row appears strictly greater than the watermark — so
-            # pre-stint nodes get purged.
+            # ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00`` (ISO with T separator,
+            # fixed offset).  Normalise it to ``YYYY-MM-DD HH:MM:SS.ffffff``
+            # so it can be lex-compared against the watermark the privacy
+            # wrapper records.  Without the separator normalisation the
+            # ``T`` (0x54) sorts AFTER space (0x20) and every same-day graph
+            # row appears strictly greater than the watermark — so pre-stint
+            # nodes get purged; without the microseconds, a NORMAL node from
+            # earlier in the transition second compared equal to the
+            # watermark and was purged too (#3227).
             created_normalized = (
                 "to_char(("
                 "  CASE WHEN (properties::jsonb->>'created_at') IS NULL THEN NULL "
                 "       ELSE ((properties::jsonb->>'created_at')::timestamptz) "
                 "  END "
-                ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+                ") AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"
             )
         else:
-            # SQLite normalisation: ``T`` → space, then truncate to
-            # ``YYYY-MM-DD HH:MM:SS`` (length 19).  Handles both ISO
-            # (``2026-04-26T16:31:06+00:00``) and SQLite-format (``2026-04-26
-            # 16:31:06``) inputs uniformly.
+            # SQLite normalisation: ``T`` → space, then
+            # ``YYYY-MM-DD HH:MM:SS.ffffff`` (length 26) — the fractional
+            # part kept when present, ``.000000`` supplied when the row was
+            # stamped at whole seconds — with any UTC offset dropped.
+            # Handles ISO (``2026-04-26T16:31:06.123456+00:00``), offset-
+            # free ISO, and SQLite-format (``2026-04-26 16:31:06``) inputs
+            # uniformly, at the precision the rows are written with (#3227).
             created_normalized = (
-                "substr("
-                "  replace(json_extract(properties, '$.created_at'), 'T', ' '), "
-                "  1, 19"
-                ")"
+                "(CASE WHEN json_extract(properties, '$.created_at') IS NULL THEN NULL "
+                " WHEN substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 20, 1) = '.' "
+                "  THEN substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 1, 26) "
+                " ELSE substr(replace(json_extract(properties, '$.created_at'), 'T', ' '), 1, 19) || '.000000' "
+                " END)"
             )
 
         ownership_clause = (

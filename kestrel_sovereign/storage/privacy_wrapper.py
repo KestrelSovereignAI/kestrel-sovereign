@@ -18,6 +18,7 @@ import asyncio
 import contextvars
 import json
 import logging
+from datetime import datetime, timezone
 import re
 import sys
 import threading
@@ -1554,9 +1555,9 @@ class PrivacyEnforcingStorage:
         # preceded it — only rows authored on/after this timestamp can be
         # leaks.  None when the agent was never in EPHEMERAL during this
         # process; refreshed each time we re-enter EPHEMERAL.
-        self._entered_ephemeral_at: Optional[str] = None
+        self._entered_ephemeral_instant: Optional[datetime] = None
         if self._privacy_config.is_ephemeral():
-            self._entered_ephemeral_at = self._now_iso()
+            self._entered_ephemeral_instant = self._now_instant()
         # Optional safety-net sweep for the A2A observability sink (F076). The
         # observability store lives in the TaskManager, not the storage facade,
         # so the agent binds it after construction via
@@ -2112,8 +2113,21 @@ class PrivacyEnforcingStorage:
         self._observability_purge = purge_callable
 
     @staticmethod
-    def _now_iso() -> str:
-        """Watermark format used to scope the EPHEMERAL leak-purge.
+    def _now_instant() -> datetime:
+        """The instant a transition INTO EPHEMERAL happened, at full precision.
+
+        One fact, two projections: :attr:`_entered_ephemeral_at` (whole
+        seconds, for the stores whose rows carry ``datetime('now')``-shaped
+        timestamps) and :meth:`_graph_purge_watermark` (microseconds, for
+        the graph purge, whose rows carry ``isoformat()`` timestamps). The
+        whole-second projection alone destroyed NORMAL-mode graph nodes
+        written earlier in the same second as the transition (#3227).
+        """
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _whole_second(instant: datetime) -> str:
+        """Watermark format used to scope the conversation/channel purges.
 
         Matches SQLite's ``datetime('now')`` shape (``YYYY-MM-DD HH:MM:SS``,
         UTC, no offset, no microseconds) so a lexicographic ``>=`` compares
@@ -2124,8 +2138,54 @@ class PrivacyEnforcingStorage:
         (watermark) was lexicographically *higher* than
         ``2026-04-26 13:24:06`` (row), so no rows ever matched.
         """
-        from datetime import datetime, timezone
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return instant.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _now_iso(cls) -> str:
+        """The whole-second watermark for the current instant."""
+        return cls._whole_second(cls._now_instant())
+
+    @property
+    def _entered_ephemeral_at(self) -> Optional[str]:
+        """Whole-second watermark of the current EPHEMERAL stint, or None.
+
+        A projection of :attr:`_entered_ephemeral_instant`. Assigning a
+        ``YYYY-MM-DD HH:MM:SS[.ffffff]`` string (or ``None``) sets the
+        instant, so callers that pin the watermark keep working.
+        """
+        instant = self._entered_ephemeral_instant
+        return None if instant is None else self._whole_second(instant)
+
+    @_entered_ephemeral_at.setter
+    def _entered_ephemeral_at(self, value: Optional[str]) -> None:
+        if value is None:
+            self._entered_ephemeral_instant = None
+            return
+        text = str(value).replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(text[:26], fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(
+                f"EPHEMERAL watermark must be YYYY-MM-DD HH:MM:SS[.ffffff]; got {value!r}"
+            )
+        self._entered_ephemeral_instant = parsed.replace(tzinfo=timezone.utc)
+
+    def _graph_purge_watermark(self) -> Optional[str]:
+        """Microsecond watermark for the graph purge: ``YYYY-MM-DD HH:MM:SS.ffffff``.
+
+        Graph rows stamp ``properties.created_at`` with ``isoformat()`` (sub-
+        second), so the purge compares at that precision; a whole-second
+        watermark treated a NORMAL node from earlier in the transition
+        second as an in-window leak (#3227).
+        """
+        instant = self._entered_ephemeral_instant
+        if instant is None:
+            return None
+        return instant.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
     @property
     def agent_id(self) -> str:
@@ -2272,7 +2332,7 @@ class PrivacyEnforcingStorage:
             was_ephemeral = old_config.is_ephemeral()
             is_ephemeral = new_config.is_ephemeral()
             if is_ephemeral and not was_ephemeral:
-                self._entered_ephemeral_at = self._now_iso()
+                self._entered_ephemeral_instant = self._now_instant()
             self._privacy_config = new_config
             self._policy = PrivacyPolicy.from_config(self._privacy_config)
         logger.info(f"Privacy config changed: storage={old_config.storage}->{self._privacy_config.storage}, llm={old_config.llm_location}->{self._privacy_config.llm_location}")
@@ -2384,9 +2444,12 @@ class PrivacyEnforcingStorage:
             "conversation_history",
             lambda: self._storage.purge_conversations_since(since, reason=reason),
         ))
+        # The graph purge compares at the precision graph rows are stamped
+        # with (#3227); the same instant, not the whole-second projection.
+        graph_since = self._graph_purge_watermark()
         report.record(await self._sweep_store(
             "graph_nodes",
-            lambda: self._storage.purge_agent_graph_nodes(since_iso=since),
+            lambda: self._storage.purge_agent_graph_nodes(since_iso=graph_since),
         ))
         # Defense-in-depth for the channels feature (#2096 / F112): a leaked
         # channel_messages row must be swept on EPHEMERAL exit, scoped to the
@@ -2510,7 +2573,7 @@ class PrivacyEnforcingStorage:
         # same stint rather than hitting the #867 no-watermark refusal (#2673).
         # Re-entering EPHEMERAL refreshes it via :meth:`set_privacy_mode`.
         if not report.required_sweep_failed:
-            self._entered_ephemeral_at = None
+            self._entered_ephemeral_instant = None
 
         # Audit-log emission is the caller's responsibility — the agent
         # has natural access to its SecurityFeature; the storage wrapper

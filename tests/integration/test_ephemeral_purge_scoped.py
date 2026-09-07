@@ -306,3 +306,106 @@ async def test_other_agents_data_untouched(tmp_path):
             "Other agent's row must not be touched by this agent's "
             "EPHEMERAL leak-purge"
         )
+
+
+# ---------------------------------------------------------------------------
+# #3227: the transition instant and a graph node can share one second
+# ---------------------------------------------------------------------------
+
+
+def _pin_clock(monkeypatch, instant):
+    """Pin the wrapper's transition clock to one exact instant."""
+    monkeypatch.setattr(PrivacyEnforcingStorage, "_now_instant", staticmethod(lambda: instant))
+
+
+@pytest.mark.asyncio
+async def test_same_second_pre_transition_node_survives_and_post_transition_node_is_purged(
+    tmp_path, monkeypatch
+):
+    """Deterministic same-second boundary. A NORMAL node stamped 300 ms
+    BEFORE the transition, in the same second, survives; a node stamped at
+    the transition instant and one 300 ms after it, still in that second,
+    are purged. The whole-second watermark treated all three alike."""
+    from datetime import datetime, timedelta, timezone
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    before = transition - timedelta(milliseconds=300)   # 12:00:05.200000
+    after = transition + timedelta(milliseconds=300)    # 12:00:05.800000
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.graph.add_node(GraphNode(
+            node_id="pre-transition-same-second", node_type="memory", label="NORMAL",
+            properties={"agent_id": AGENT_ID, "created_at": before.isoformat()},
+        ))
+        _pin_clock(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        assert wrapper._entered_ephemeral_at == "2026-09-07 12:00:05"
+        assert wrapper._graph_purge_watermark() == "2026-09-07 12:00:05.500000"
+
+        for node_id, stamp in (("at-transition", transition), ("post-transition-same-second", after)):
+            await storage.graph.add_node(GraphNode(
+                node_id=node_id, node_type="memory", label="leak",
+                properties={"agent_id": AGENT_ID, "created_at": stamp.isoformat()},
+            ))
+
+        result = await wrapper.purge_ephemeral_session(reason="test-same-second")
+
+    assert result["graph_nodes"] == 2, result
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        assert await storage.graph.get_node("pre-transition-same-second") is not None, (
+            "a NORMAL node written earlier in the transition second was purged (#3227)"
+        )
+        assert await storage.graph.get_node("at-transition") is None
+        assert await storage.graph.get_node("post-transition-same-second") is None
+
+
+@pytest.mark.asyncio
+async def test_whole_second_rows_in_the_transition_second_are_preserved(tmp_path, monkeypatch):
+    """A row stamped at whole-second precision inside the transition second
+    cannot be placed before or after the instant; it reads as ``.000000``
+    and is preserved unless the transition itself is at the second's start.
+    A whole-second row in a LATER second is purged."""
+    from datetime import datetime, timezone
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        for node_id, stamp in (
+            ("whole-second-same", "2026-09-07T12:00:05+00:00"),
+            ("whole-second-later", "2026-09-07 12:00:06"),
+        ):
+            await storage.graph.add_node(GraphNode(
+                node_id=node_id, node_type="memory", label="x",
+                properties={"agent_id": AGENT_ID, "created_at": stamp},
+            ))
+        _pin_clock(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        result = await wrapper.purge_ephemeral_session(reason="test-whole-second")
+    assert result["graph_nodes"] == 1, result
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        assert await storage.graph.get_node("whole-second-same") is not None
+        assert await storage.graph.get_node("whole-second-later") is None
+
+
+def test_watermark_setter_accepts_legacy_whole_second_strings(tmp_path):
+    """Callers that pin the watermark by hand keep working: a whole-second
+    string sets the instant at ``.000000``; the projections agree."""
+    storage = AsyncStorage(str(tmp_path / "w.db"), agent_id=AGENT_ID)
+    wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    assert wrapper._entered_ephemeral_at is None
+    assert wrapper._graph_purge_watermark() is None
+    wrapper._entered_ephemeral_at = "2026-07-01 12:00:00"
+    assert wrapper._entered_ephemeral_at == "2026-07-01 12:00:00"
+    assert wrapper._graph_purge_watermark() == "2026-07-01 12:00:00.000000"
+    wrapper._entered_ephemeral_at = "2026-07-01T12:00:00.250000"
+    assert wrapper._entered_ephemeral_at == "2026-07-01 12:00:00"
+    assert wrapper._graph_purge_watermark() == "2026-07-01 12:00:00.250000"
+    wrapper._entered_ephemeral_at = None
+    assert wrapper._graph_purge_watermark() is None
+    with pytest.raises(ValueError, match="watermark"):
+        wrapper._entered_ephemeral_at = "not a timestamp"
