@@ -702,6 +702,22 @@ def _current_feature_router_route(feature, selector: tuple):
     return current
 
 
+def _live_feature_route(agent, feature_name: str, selector: tuple):
+    """The current child route ``agent`` serves for one mounted shape, or None.
+
+    One check for "this agent still serves this route": the feature is
+    present, enabled, and exposes the mounted shape now. The owner
+    resolution and both request paths ask the same question; three copies
+    of it drifted once already.
+    """
+
+    features = getattr(agent, "features", None) or {}
+    feature = features.get(feature_name) if hasattr(features, "get") else None
+    if feature is None or not bool(getattr(feature, "enabled", True)):
+        return None
+    return _current_feature_router_route(feature, selector)
+
+
 def _resolve_live_route_agent(
     app: FastAPI,
     scope,
@@ -712,10 +728,13 @@ def _resolve_live_route_agent(
     """Resolve a live owner for one physically shared feature route.
 
     Request-scoped routing is authoritative.  For unprefixed routes, retain
-    the original mount owner while it is managed; if readiness rollback or
-    DELETE withdrew that owner while another agent shares the physical route,
-    rebind to the first currently managed compatible feature instead of
-    leaving the preserved route closed over a dead owner.
+    the original mount owner while it is managed.  If readiness rollback or
+    DELETE withdrew that owner, the route may rebind only when exactly one
+    managed agent still serves it: an unprefixed address names no agent, so
+    with two or more candidates the executor would be chosen by
+    ``list_agents()`` order, invisible to the caller (#3240, the shape of
+    #3216). Refuse instead; the agent-prefixed form stays the unambiguous
+    address.
     """
 
     state = scope.get("state") or {}
@@ -739,15 +758,13 @@ def _resolve_live_route_agent(
         )
     if any(current is mount_agent for current in managed_agents):
         return mount_agent
-    for candidate in managed_agents:
-        features = getattr(candidate, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if (
-            feature is not None
-            and bool(getattr(feature, "enabled", True))
-            and _current_feature_router_route(feature, selector) is not None
-        ):
-            return candidate
+    survivors = [
+        candidate
+        for candidate in managed_agents
+        if _live_feature_route(candidate, feature_name, selector) is not None
+    ]
+    if len(survivors) == 1:
+        return survivors[0]
     return None
 
 
@@ -905,13 +922,7 @@ def _gate_feature_route(
         # that exposes the same feature.
         if agent is None:
             return Match.NONE, {}
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if (
-            feature is None
-            or not bool(getattr(feature, "enabled", True))
-            or _current_feature_router_route(feature, selector) is None
-        ):
+        if _live_feature_route(agent, feature_name, selector) is None:
             return Match.NONE, {}
         return original_matches(scope)
 
@@ -927,12 +938,7 @@ def _gate_feature_route(
         if agent is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if feature is None or not bool(getattr(feature, "enabled", True)):
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current = _current_feature_router_route(feature, selector)
+        current = _live_feature_route(agent, feature_name, selector)
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return

@@ -107,12 +107,14 @@ class _InstanceBoundRouterFeature:
     def __init__(self, owner: str):
         self.enabled = True
         self.owner = owner
+        self.served = 0
 
     def get_router(self):
         router = APIRouter()
 
         @router.get("/test-feature-lifecycle/instance-bound")
         async def instance_bound():
+            self.served += 1
             return {"owner": self.owner}
 
         return router
@@ -1060,3 +1062,117 @@ def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
                 assert not failures, (order, [r.getMessage() for r in failures])
         finally:
             restore()
+
+
+# ---------------------------------------------------------------------------
+# #3240: an unprefixed feature route whose mount owner was withdrawn
+# ---------------------------------------------------------------------------
+
+
+def _reorder(agents: dict, *names: str) -> None:
+    """Re-key the live fleet mapping in place so ``list_agents()`` iterates in
+    the given order; the manager stub reads the same dict on every call."""
+    snapshot = {name: agents[name] for name in names}
+    agents.clear()
+    agents.update(snapshot)
+
+
+def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_order():
+    """Once the mount owner is withdrawn, two remaining agents that both serve
+    the shape must not be chosen between by ``list_agents()`` order: the
+    unprefixed form is refused in both orders and neither endpoint runs, while
+    each agent-prefixed form still serves its own agent."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            # The mount owner serves the unprefixed form while it is managed.
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+
+            agents.pop("alice")
+            for order in (("bob", "carol"), ("carol", "bob")):
+                _reorder(agents, *order)
+                response = client.get(path, headers=headers)
+                assert response.status_code == 404, order
+                assert bob.served == 0 and carol.served == 0, order
+
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v1"
+            }
+            assert client.get(f"/api/agents/carol{path}", headers=headers).json() == {
+                "owner": "carol-v1"
+            }
+            assert bob.served == 1 and carol.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
+    """One remaining agent that serves the shape is not an ambiguous choice."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert alice.served == 1 and bob.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
+    """A candidate that no longer serves the shape (feature disabled, or the
+    feature removed) does not count: with it gone the other one is the only
+    survivor and serves; with both live the unprefixed form is refused."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            bob.enabled = False
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0
+
+            bob.enabled = True
+            assert client.get(path, headers=headers).status_code == 404
+
+            agents["bob"].features.pop("ProxyFeature")
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0 and carol.served == 2
+    finally:
+        restore()
