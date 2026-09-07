@@ -92,16 +92,17 @@ def resolve_scoped_agent_did(agent: Any) -> str:
 
     The sites that still resolve an agent's identity inline are not listed
     here: four review rounds found a hand-written list wrong four times.
-    They are enumerated, with a reason each, by
+    Those that read BOTH identity attributes off one object — an ``or``
+    chain, a nested default, a candidate tuple, a two-name loop — are
+    enumerated, with a reason each, by
     ``tests/unit/test_scoped_agent_did_guard.py::
     test_every_inline_did_resolution_is_a_known_exception``, which scans the
-    package for the inline shapes and fails when one appears or disappears.
-    Two kinds are not resolutions at all and are not in that scan:
-    ``TaskManager.execute_skill`` and ``a2a/task_worker.py`` scope by the
-    manager's ``host_agent_id`` (the agent's DID copied at construction;
-    they have no agent object), and the event-manager mixin reads
-    ``self.did`` on the agent itself. Before adding a copy, route through
-    here; if a site genuinely cannot, add it to that test with its reason.
+    package for those shapes and fails when one appears or disappears. A
+    single-attribute copy (``getattr(agent, "did", …)`` plus its own type
+    check, or a scope taken from a manager's ``host_agent_id``) is NOT in
+    that scan; several exist over other tables (#3251). Before adding a
+    copy of either kind, route through here; if a site genuinely cannot,
+    register it in that test with its reason.
 
     A missing, empty, or non-string DID is "cannot be scoped", never
     "unscoped": the caller refuses (a store that gates on ``if agent_id:``

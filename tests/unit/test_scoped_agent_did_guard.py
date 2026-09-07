@@ -611,7 +611,10 @@ def _count_inline(text: str) -> int:
             break
         if match.group("a") != match.group("b"):
             hits += 1
-        pos = match.start() + 1
+        # Non-overlapping: one resolution counts once. An overlapping scan
+        # paired one chain's `did` with the next chain's `agent_id` inside
+        # the window and counted a third resolution that does not exist.
+        pos = match.end()
     return hits
 
 
@@ -630,7 +633,8 @@ KNOWN_INLINE_RESOLUTIONS = {
     "features/todo/feature.py": (1, "todo table scope, falls back to 'default' (#3251)"),
     "waits/reconciler.py": (
         2,
-        "wait-signal store scope; '' is the documented solo-agent legacy scope (#3251)",
+        "the wait-signal store scope ('' is the documented solo-agent legacy "
+        "scope) and a signal's target agent (#3251)",
     ),
     "features/skills/feature.py": (1, "reflection_insights scope, '' fallback (#3251)"),
     "features/bootstrap/feature.py": (
@@ -646,9 +650,9 @@ KNOWN_INLINE_RESOLUTIONS = {
         "scheduler watcher owner identity from a candidate tuple; raises when absent (#3251)",
     ),
     # The agent reading its own identity on `self`: on a real agent
-    # `agent_id` is a property returning `did`, so nothing is resolved. The
-    # window counts the three chains of one policy-context call.
-    "agent/backup.py": (3, "the agent reads its own identity on self"),
+    # `agent_id` is a property returning `did`, so nothing is resolved. Two
+    # chains in one policy-context call.
+    "agent/backup.py": (2, "the agent reads its own identity on self"),
     # Not table scopes: a filesystem namespace owner (raises on a missing
     # DID) and the hosted scheduler's identity match against a claim.
     "features/isolated_runtime.py": (1, "isolated-runtime namespace owner; raises when absent"),
