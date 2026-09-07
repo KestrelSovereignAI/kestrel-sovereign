@@ -566,3 +566,85 @@ def test_local_submission_has_no_recipient_without_a_did(agent):
     from kestrel_sovereign.a2a.local_submission import _stable_agent_id
 
     assert _stable_agent_id(agent) is None
+
+
+# ---------------------------------------------------------------------------
+# The census (review r4): every inline resolution left in the package is a
+# known exception with a reason, and this test is the register — not a
+# docstring. It fails when a copy appears or disappears.
+# ---------------------------------------------------------------------------
+
+import re
+from pathlib import Path
+
+_PACKAGE = Path(__file__).resolve().parents[2] / "kestrel_sovereign"
+
+# A loop that tries the two identity attributes in either order.
+_TUPLE_LOOP = re.compile(r'for \w+ in \("(?:did|agent_id)", "(?:did|agent_id)"\)')
+# An `or` chain over the SAME object trying both attributes (either order).
+_OR_CHAIN = re.compile(
+    r'getattr\((?P<obj>[\w.]+), "(?:did|agent_id)"[^\n]*?\)\s+or\s+'
+    r'getattr\((?P=obj), "(?:did|agent_id)"'
+)
+
+# path (relative to the package) -> (count, why it is not routed through the guard)
+KNOWN_INLINE_RESOLUTIONS = {
+    # #3251: other shared tables, filed separately from the a2a_tasks work.
+    "endpoints/agent.py": (
+        2,
+        "the reflection-status route scopes task_execution_log (#3251); the "
+        "local-witness loop resolves the SENDER's stable identity from a "
+        "witnessed peer object, not this agent's own scope",
+    ),
+    "features/memory/reflection_hook.py": (1, "memory table scope (#3251)"),
+    "features/health/checks.py": (1, "scheduler status scope (#3251)"),
+    "services/key_resolution.py": (1, "service-key storage scope (#3251)"),
+    "features/todo/feature.py": (1, "todo table scope, falls back to 'default' (#3251)"),
+    "waits/reconciler.py": (
+        2,
+        "wait-signal store scope; '' is the documented solo-agent legacy scope (#3251)",
+    ),
+    # The agent reading its own identity on `self`: on a real agent
+    # `agent_id` is a property returning `did`, so nothing is resolved.
+    "agent/backup.py": (2, "the agent reads its own identity on self"),
+    # Not table scopes: a filesystem namespace owner (raises on a missing
+    # DID) and the hosted scheduler's identity match against a claim.
+    "features/isolated_runtime.py": (1, "isolated-runtime namespace owner; raises when absent"),
+    # The manager's routing/lineage identity loader — also the read end of
+    # the host-attested local task route whose write end is routed. Its
+    # suite builds agents carrying agent_id alone; routing it is a
+    # suite-wide double change tracked in #3251.
+    "multi_agent/agent_manager.py": (1, "manager identity loader; did then agent_id (#3251)"),
+    "features/scheduler/runner.py": (1, "hosted scheduler matches a resolved agent against a claimed id"),
+}
+
+
+def _inline_resolutions() -> dict[str, int]:
+    found: dict[str, int] = {}
+    for path in sorted(_PACKAGE.rglob("*.py")):
+        text = path.read_text()
+        n = len(_TUPLE_LOOP.findall(text)) + len(_OR_CHAIN.findall(text))
+        if n:
+            found[str(path.relative_to(_PACKAGE))] = n
+    return found
+
+
+def test_every_inline_did_resolution_is_a_known_exception():
+    # Positive control: each shape's regex matches its own fixture, so an
+    # empty census could never be a weakened regex passing vacuously.
+    assert _TUPLE_LOOP.search('for attribute in ("did", "agent_id"):')
+    assert _TUPLE_LOOP.search('for attribute in ("agent_id", "did"):')
+    assert _OR_CHAIN.search('x = getattr(agent, "did", None) or getattr(agent, "agent_id", "")')
+    assert not _OR_CHAIN.search('getattr(storage, "agent_id", None) or getattr(self, "agent_id", "")')
+
+    found = _inline_resolutions()
+    expected = {path: count for path, (count, _why) in KNOWN_INLINE_RESOLUTIONS.items()}
+    unexpected = {p: n for p, n in found.items() if p not in expected}
+    assert not unexpected, (
+        "inline DID resolution added — route it through resolve_scoped_agent_did, "
+        f"or register it here with a reason: {unexpected}"
+    )
+    assert found == expected, (
+        "the census drifted (a routed site restored, or a registered site gone): "
+        f"found={found} expected={expected}"
+    )

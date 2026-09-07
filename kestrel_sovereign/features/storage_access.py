@@ -90,16 +90,18 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     task manager's ``host_agent_id`` first; creation fell back to the
     display name and then ``"unknown"``.
 
-    One ``a2a_tasks`` writer still resolves inline because it has no agent
-    object: ``TaskManager.execute_skill`` files a feature-run task under
-    ``self.host_agent_id or agent_id`` — the manager's own DID copied at
-    construction (``KestrelAgent`` passes ``host_agent_id=self.did``), else
-    the feature name. In production the two agree. Other tables still
-    scope themselves inline (the reflection status route, the wait
-    reconciler, the scheduler and restart-coordinator features, the memory
-    reflection hook, the health checks, key resolution; #3251). Grep for
-    ``"did"`` in a gating position before adding another copy, and route
-    through here instead.
+    The sites that still resolve an agent's identity inline are not listed
+    here: four review rounds found a hand-written list wrong four times.
+    They are enumerated, with a reason each, by
+    ``tests/unit/test_scoped_agent_did_guard.py::
+    test_every_inline_did_resolution_is_a_known_exception``, which scans the
+    package for the inline shapes and fails when one appears or disappears.
+    Two kinds are not resolutions at all and are not in that scan:
+    ``TaskManager.execute_skill`` and ``a2a/task_worker.py`` scope by the
+    manager's ``host_agent_id`` (the agent's DID copied at construction;
+    they have no agent object), and the event-manager mixin reads
+    ``self.did`` on the agent itself. Before adding a copy, route through
+    here; if a site genuinely cannot, add it to that test with its reason.
 
     A missing, empty, or non-string DID is "cannot be scoped", never
     "unscoped": the caller refuses (a store that gates on ``if agent_id:``
