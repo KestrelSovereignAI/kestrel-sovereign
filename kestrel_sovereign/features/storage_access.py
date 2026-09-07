@@ -82,13 +82,16 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     observability (#3215), the ``!tasks`` command, and since #3246 the
     A2A task routes' recipient (reads, subscribe, cancel, and the creation
     of an inbound task), the host-attested local submission's recipient,
+    the inbound-scope gate's recipient (``a2a/inbound_authorization``),
     the task feature's own durable identity, the task wait provider's
     ownership check, the pre-turn state sections, and the restart
     status-events route. They had drifted — one gated on truthiness alone,
     so a non-string truthy value was bound as a query parameter; the task
-    routes read ``agent_id`` before ``did``; the cancel route tried the
-    task manager's ``host_agent_id`` first; creation fell back to the
-    display name and then ``"unknown"``.
+    routes and the inbound-scope gate read ``agent_id`` before ``did``; the
+    cancel route tried the task manager's ``host_agent_id`` first; creation
+    fell back to the display name and then ``"unknown"``. That list is
+    hand-written too, so ``test_every_routed_site_is_named_here`` in the
+    same test module holds the set of modules that call this guard.
 
     The sites that still resolve an agent's identity inline are not listed
     here: four review rounds found a hand-written list wrong four times.

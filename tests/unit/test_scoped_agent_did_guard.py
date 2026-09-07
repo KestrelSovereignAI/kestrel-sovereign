@@ -719,3 +719,34 @@ def test_inbound_authorizer_has_no_recipient_without_a_did(agent):
     from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
 
     assert RecipientA2ASenderAuthorizer._stable_agent_id(agent) is None
+
+
+# The other half of the guard's docstring — the ROUTED sites — is a hand-
+# written list too (review r7 found it one module short). This is its
+# register: the modules that call the guard, asserted exactly.
+ROUTED_MODULES = {
+    "agent/preturn_state.py",
+    "a2a/inbound_authorization.py",
+    "a2a/local_submission.py",
+    "command_handler.py",
+    "endpoints/agent.py",
+    "endpoints/observability.py",
+    "endpoints/restart_events.py",
+    "features/audit_anchor/feature.py",
+    "features/consent/feature.py",
+    "features/storage_access.py",  # the definition itself
+    "features/tasks/feature.py",
+    "features/tasks/wait_provider.py",
+}
+
+
+def test_every_routed_site_is_named_here():
+    callers = {
+        str(path.relative_to(_PACKAGE))
+        for path in _PACKAGE.rglob("*.py")
+        if "resolve_scoped_agent_did(" in path.read_text()
+    }
+    assert callers == ROUTED_MODULES, {
+        "new callers (add them here and to the guard's docstring)": sorted(callers - ROUTED_MODULES),
+        "callers gone (a site un-routed?)": sorted(ROUTED_MODULES - callers),
+    }
