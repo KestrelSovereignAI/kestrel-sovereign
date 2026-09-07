@@ -44,3 +44,41 @@ def test_refuses_anything_that_is_not_a_did(agent):
     with pytest.raises(AgentIdentityUnavailable, match="identity"):
         resolve_scoped_agent_did(agent)
     assert issubclass(AgentIdentityUnavailable, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# The `!tasks` command routes through the guard (it had no coverage before)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_scopes_by_the_guarded_did():
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    agent = MagicMock()
+    agent.did = "did:test:recipient"
+    task_manager = MagicMock()
+    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    handler = CommandHandler(agent, task_manager=task_manager)
+
+    assert await handler._cmd_tasks("!tasks") == "📋 No tasks found"
+    task_manager.task_store.list_tasks.assert_awaited_once_with(
+        recipient_agent_id="did:test:recipient", limit=10
+    )
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_refuses_without_a_did():
+    from unittest.mock import AsyncMock
+
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    agent = MagicMock()  # a fabricated `did`, not an identity
+    task_manager = MagicMock()
+    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    handler = CommandHandler(agent, task_manager=task_manager)
+
+    assert await handler._cmd_tasks("!tasks") == "❌ Task recipient identity unavailable"
+    task_manager.task_store.list_tasks.assert_not_awaited()
