@@ -13,6 +13,15 @@ from kestrel_sovereign.security.host_authority import (
 logger = logging.getLogger(__name__)
 
 
+def _caller_is_sovereign() -> bool:
+    """The deletion predicate, asked without raising, for the report path."""
+    try:
+        require_sovereign_caller("shared local model deletion")
+    except HostAuthorityError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class FleetModelRoster:
     """What a shared-daemon cleanup accounted for, and what it could not."""
@@ -25,9 +34,14 @@ class FleetModelRoster:
 def _configured_agent_names() -> List[str]:
     """Every local agent the host is configured with, loaded or not.
 
-    Read from the project's ``multi_agent.toml`` — the same roster
-    ``kestrel start`` launches from — rather than from the in-process
-    manager, which knows only what is loaded. No file means no fleet.
+    Resolved exactly as ``kestrel start`` resolves what it launches:
+    ``MultiAgentConfig.load`` on the project's ``multi_agent.toml``, which
+    falls back to auto-discovering ``agent_data/*`` when the file is absent
+    (the file is gitignored; a restored host may have only the directories).
+    An earlier version short-circuited on a missing file and reported "no
+    fleet" for a fleet the launcher would start — the refusal below could
+    then never fire on such a host. A bad file raises, and the tool reports
+    it, rather than deleting under a roster it could not read.
     """
     from kestrel_sovereign.multi_agent.config import (
         MULTI_AGENT_CONFIG_FILENAME,
@@ -35,10 +49,8 @@ def _configured_agent_names() -> List[str]:
     )
     from kestrel_sovereign.paths import project_dir
 
-    path = project_dir() / MULTI_AGENT_CONFIG_FILENAME
-    if not path.exists():
-        return []
-    return sorted(MultiAgentConfig.load(path).get_local_agents().keys())
+    config = MultiAgentConfig.load(project_dir() / MULTI_AGENT_CONFIG_FILENAME)
+    return sorted(config.get_local_agents().keys())
 
 
 class ModelAgent(Feature):
@@ -178,12 +190,16 @@ class ModelAgent(Feature):
             threshold_days: Only models unused for at least this many days are eligible for deletion (default: 30).
             dry_run: If True (the default), only preview what would be deleted; nothing is removed. Set False to actually delete.
         """
-        roster = self._fleet_model_roster()
         try:
+            # Inside the try: an unreadable multi_agent.toml is a refusal
+            # with the reason, not an exception through the tool wrapper.
+            roster = self._fleet_model_roster()
+            # The roster is host information (which agents exist here, which
+            # are cold). Only a sovereign caller sees it — on the deletion
+            # path by asking first, on the report path by asking quietly:
+            # a non-sovereign dry run gets a count-free caveat and no names.
+            roster_visible = _caller_is_sovereign()
             if not dry_run:
-                # The service asks the same question; asking here first keeps
-                # the host's roster (below) from being disclosed to a caller
-                # the deletion would refuse anyway.
                 require_sovereign_caller("shared local model deletion")
                 if roster.unconsulted:
                     # A partial roster is not a smaller risk, it is an unknown
@@ -218,10 +234,12 @@ class ModelAgent(Feature):
             return ToolResult.failed(str(e))
 
         data = result if isinstance(result, dict) else {"raw": result}
-        # The plan is auditable: which agents' models it accounted for, and
-        # which it could not — a real deletion refuses on the latter.
-        data["consulted_agents"] = roster.consulted
-        data["unconsulted_agents"] = roster.unconsulted
+        # The plan is auditable to the sovereign: which agents' models it
+        # accounted for, and which it could not — a real deletion refuses on
+        # the latter. Anyone else learns only that the plan is incomplete.
+        if roster_visible:
+            data["consulted_agents"] = roster.consulted
+            data["unconsulted_agents"] = roster.unconsulted
 
         # Honesty: dry-run is an explicit "did not actually delete"
         # mode. The agent must speak that nothing was actually freed —
@@ -235,10 +253,12 @@ class ModelAgent(Feature):
             )
             if roster.unconsulted:
                 caveat += (
-                    " This plan could not account for configured agents this "
-                    f"process cannot consult ({', '.join(roster.unconsulted)}); "
-                    "a real deletion will refuse until they are loaded here."
+                    " This plan could not account for every configured agent "
+                    "(some cannot be consulted from this process); a real "
+                    "deletion will refuse until they are loaded here."
                 )
+                if roster_visible:
+                    caveat += f" Unconsulted: {', '.join(roster.unconsulted)}."
             return ToolResult.partial(
                 confirmation="Cleanup planned (dry-run)",
                 error=caveat,

@@ -554,7 +554,13 @@ class UsageTrackingMixin:
         return deleted_models
 
     async def _check_and_cleanup_if_needed(self):
-        """Check storage and automatically cleanup if space is low."""
+        """Check storage and automatically cleanup if space is low.
+
+        No production caller. The deletion it attempts requires the turn's
+        sovereign caller (#3221), so from any unattended path this logs
+        "Auto-cleanup failed" and deletes nothing — by design: an automatic
+        low-disk sweep of a daemon every agent shares is host administration.
+        """
         try:
             storage = await self.get_storage_info(use_cache=False)
             free_space_pct = (storage["available_gb"] / storage["total_gb"]) * 100

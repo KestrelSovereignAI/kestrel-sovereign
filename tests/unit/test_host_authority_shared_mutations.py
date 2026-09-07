@@ -359,12 +359,30 @@ async def test_reads_and_missing_profile_are_not_gated(stable_key):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_reports_who_it_consulted():
+async def test_cleanup_reports_who_it_consulted_to_the_sovereign(stable_key):
     feature, llm_service = await _model_feature(peers={"Emma": _peer({"emma:70b"})})
-    plan = await feature.cleanup_models(dry_run=True)
+    with caller_context_scope(sovereign()):
+        plan = await feature.cleanup_models(dry_run=True)
     assert plan.data["consulted_agents"] == ["Emma", "Me"]
     assert plan.data["unconsulted_agents"] == []
     assert "could not account" not in plan.error
+
+
+@pytest.mark.asyncio
+async def test_a_non_sovereign_dry_run_learns_no_agent_names(stable_key):
+    """The roster is host information. A dry run needs no authority, so a
+    non-sovereign caller gets the plan and a count-free caveat — never the
+    names, on either the data or the error side."""
+    feature, llm_service = await _model_feature(
+        peers={"Emma": _peer({"emma:70b"})}, configured=["Emma", "Me", "Cold-Tenant", "Secret-Peer"]
+    )
+    with caller_context_scope(CallerContext.authenticated("u")):
+        plan = await feature.cleanup_models(dry_run=True)
+    assert plan.status is ToolResultStatus.PARTIAL
+    assert "consulted_agents" not in plan.data and "unconsulted_agents" not in plan.data
+    assert "could not account for every configured agent" in plan.error
+    for name in ("Cold-Tenant", "Secret-Peer", "Emma"):
+        assert name not in plan.error and name not in str(plan.data)
 
 
 @pytest.mark.asyncio
@@ -417,7 +435,14 @@ def test_configured_agent_names_reads_the_hosts_roster(tmp_path, monkeypatch):
     from kestrel_sovereign.features.model.feature import _configured_agent_names
 
     monkeypatch.setattr("kestrel_sovereign.paths.project_dir", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
     assert _configured_agent_names() == []
+    # No file, but agent directories: `kestrel start` auto-discovers and
+    # launches them, so the roster must name them too (review round 2, P1).
+    for name in ("claw", "emma"):
+        (tmp_path / "agent_data" / name).mkdir(parents=True)
+        (tmp_path / "agent_data" / name / "kestrel_prime.db").write_bytes(b"")
+    assert _configured_agent_names() == ["claw", "emma"]
     (tmp_path / "multi_agent.toml").write_text(
         "[agents.Emma]\ndata_dir = \"agent_data/emma\"\nport = 8801\n\n"
         "[agents.Nellie]\ndata_dir = \"agent_data/nellie\"\nport = 8802\nautostart = false\n"
