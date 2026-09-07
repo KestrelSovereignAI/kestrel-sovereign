@@ -165,6 +165,14 @@ def activate_operator_lane(presented: str) -> None:
     _presented_key = normalize_sovereign_api_key(presented)
 
 
+def deactivate_operator_lane() -> None:
+    """Disarm. The CLI does this when the verb returns, so arming is scoped to
+    one verb's execution — an in-process caller of ``main()`` (a test, an
+    embedding tool) must not leave every later ``kill_process`` gated."""
+    global _presented_key
+    _presented_key = None
+
+
 def operator_lane_is_active() -> bool:
     return bool(_presented_key)
 

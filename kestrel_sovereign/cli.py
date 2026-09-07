@@ -2493,13 +2493,18 @@ def main() -> int:
         parser.print_help()
         return 1
 
-    from kestrel_sovereign.security.operator_lane import OperatorLaneRefused
+    from kestrel_sovereign.security.operator_lane import (
+        OperatorLaneRefused,
+        deactivate_operator_lane,
+    )
 
     try:
         return handler(args)
     except OperatorLaneRefused as refused:
         print(f"kestrel {args.command} refused: {refused}", file=sys.stderr)
         return 1
+    finally:
+        deactivate_operator_lane()
 
 
 if __name__ == "__main__":

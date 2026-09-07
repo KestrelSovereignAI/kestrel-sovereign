@@ -346,3 +346,17 @@ def test_a_vouching_host_is_signalled_and_a_non_vouching_neighbour_is_not(tmp_pa
         assert victim.poll() is None
     finally:
         victim.kill(); victim.wait()
+
+
+def test_main_disarms_the_lane_when_the_verb_returns(project, monkeypatch):
+    """Arming is scoped to one verb's execution: an in-process caller of
+    main() (a test suite, an embedding tool) must not leave every later
+    kill_process gated. The gate caught this as a leak into another file."""
+    monkeypatch.setattr(sys, "argv", ["kestrel", "terminate"])
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    seen = {}
+    with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": KEY}, clear=True):
+        with patch.object(cli, "cmd_terminate", side_effect=lambda args: seen.setdefault("armed", operator_lane.operator_lane_is_active()) and 0):
+            cli.main()
+    assert seen["armed"] is True
+    assert operator_lane.operator_lane_is_active() is False
