@@ -1314,6 +1314,8 @@ export function createApiClient({
             return client.requestForAgent(url, {}, agent);
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
+        // Host view of the daemon (identity, version, every pin): sovereign only (#3226).
+        getIpfsNode: () => client.request('/api/ipfs/node'),
         getWallet: () => client.request('/api/wallet'),
         invoke: async (input, model = null, sessionId = null, provider = null) => {
             // Capture dispatchAgent BEFORE the await so the session_id

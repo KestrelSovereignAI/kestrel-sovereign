@@ -16,6 +16,7 @@ from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    caller_is_sovereign,
     require_sovereign_host_lifecycle,
 )
 from kestrel_sovereign.features.config_validation import (
@@ -194,8 +195,7 @@ def _caller_can_manage_features(request: Request) -> bool:
     without raising, so a catalog read can tell the console which controls
     to draw (kestrel-sovereign#3234). Absent or non-sovereign caller → False.
     """
-    caller = get_caller(request)
-    return getattr(caller, "is_sovereign", False) is True
+    return caller_is_sovereign(request)
 
 
 def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:

@@ -39,13 +39,29 @@ def require_sovereign_host_lifecycle(request: Request):
     `POST /api/agents`.
     """
 
-    caller = get_caller(request)
-    if getattr(caller, "is_sovereign", False) is not True:
+    if not caller_is_sovereign(request):
         raise HTTPException(
             status_code=403,
             detail="Sovereign authority is required.",
         )
-    return caller
+    return get_caller(request)
+
+
+def caller_is_sovereign(request: Request) -> bool:
+    """Whether the caller would pass :func:`require_sovereign_host_lifecycle`.
+
+    The same predicate, asked without raising, so a read can tell the
+    console which controls to draw or which host view to fetch
+    (``can_manage_features`` on the feature catalogue, #3234;
+    ``can_view_node`` on the agent-local IPFS status, #3226). Absent or
+    non-sovereign caller → False.
+
+    This is a hint for the client, never the gate: a mutation or a
+    host-scoped read still declares the dependency, which refuses before
+    the handler body runs.
+    """
+    caller = get_caller(request)
+    return getattr(caller, "is_sovereign", False) is True
 
 
 def get_caller(request: Request):
