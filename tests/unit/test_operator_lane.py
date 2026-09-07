@@ -268,6 +268,33 @@ def test_held_port_admits_against_real_sockets(monkeypatch):
             pass
 
 
+@pytest.mark.parametrize(
+    "status, admitted",
+    [(200, True), (401, False), (403, False), (404, False), (503, False)],
+)
+def test_held_port_admits_only_on_an_authenticated_200(monkeypatch, status, admitted):
+    """A Kestrel server that rejects the key answers 401/403; a server in
+    safe mode 503; anything but 200 on the sovereign route is not a vouch."""
+    import httpx
+
+    monkeypatch.undo()
+    from kestrel_sovereign.security import operator_lane as lane
+
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    monkeypatch.setattr(ProcessManager, "is_port_in_use", staticmethod(lambda port, host="0.0.0.0": True))
+    seen = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"], seen["headers"] = url, headers
+        return httpx.Response(status, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    assert lane.held_port_admits(8912, KEY) is admitted
+    assert seen["url"] == "http://localhost:8912/api/agents"
+    assert seen["headers"] == {"X-API-Key": KEY}
+
+
 def test_the_reviews_victim_scenario_end_to_end(tmp_path, monkeypatch, capsys):
     """A caller-written project whose multi_agent.toml names a port held by
     an unrelated process, with a caller-chosen key in .env and exported:
