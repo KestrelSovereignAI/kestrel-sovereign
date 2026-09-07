@@ -11,6 +11,18 @@ is created, started, terminated, restarted, or updated.
 The operator path is exercised in-process in ``tests/unit/test_operator_lane.py``
 (handlers patched) rather than here: a real ``kestrel terminate`` that passed
 the lane on this host would terminate this host.
+
+Only ``create`` and ``terminate`` are executed here. The safety of this
+module has to be structural, and for ``start``, ``restart`` (whose second
+leg is ``start``) and ``update`` (whose last leg is ``restart``) it cannot
+be: if the lane ever failed open, the real ``cmd_start`` would launch a
+detached host from this project's ``multi_agent.toml``. On 2026-09-07 a
+review's mutation sweep did exactly that; the stray held :8888 for two
+hours and the fleet was down. Those three verbs are covered per verb by
+``test_every_lifecycle_verb_is_refused_before_its_handler_runs`` with the
+handlers patched. For ``create`` a fail-open provisions an agent directory
+under the temporary ``KESTREL_HOME``; for ``terminate`` it finds nothing
+on an unused port with no pid file. Neither can outlive the test.
 """
 
 from __future__ import annotations
@@ -34,12 +46,13 @@ def test_the_lane_covers_exactly_the_five_verbs():
     assert set(LIFECYCLE_VERBS) == set(THE_FIVE_VERBS)
 
 
+# A literal list again, for the same reason as THE_FIVE_VERBS. See the module
+# docstring for why the other three verbs are never executed for real.
+EXECUTED_VERBS = ["create", "terminate"]
+
 VERB_ARGV = {
     "create": ["create", "Nobody"],
-    "start": ["start"],
     "terminate": ["terminate"],
-    "restart": ["restart"],
-    "update": ["update", "--dry-run"],
 }
 
 
@@ -66,7 +79,7 @@ def project(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verb", THE_FIVE_VERBS)
+@pytest.mark.parametrize("verb", EXECUTED_VERBS)
 async def test_agent_shell_cannot_reach_a_lifecycle_verb(project, verb):
     backend = LocalSandboxBackend({"shell_execution_host", "shell_execution_sandboxed"})
     # The agent process holds the key (the host loaded .env at boot); the

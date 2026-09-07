@@ -343,12 +343,22 @@ def test_the_reviews_victim_scenarios_end_to_end_through_the_real_terminate(tmp_
     0.0.0.0 with the config saying bind = "::1" (the port probe missed it), and
     a caller-written logs/.host.pid naming the victim (no port at all). Both
     reach kill_process, where the victim cannot vouch, and the verb refuses
-    with the victim alive. The victim is a throwaway child."""
+    with the victim alive. The victim is a throwaway child.
+
+    `cmd_start` is replaced by a recorder for every case, not only `restart`:
+    structural safety, not conditional. Under a fail-open mutant the
+    `restart` terminate leg passes and the REAL `cmd_start` launches a
+    detached `uvicorn` host from this attacker project (bind `::1`, the
+    victim's port). Seven such hosts were left behind by review sweeps on
+    2026-09-07; the same sweep held :8888 for two hours and took the fleet
+    down. A test that can start a host is not a unit test."""
     victim, port = _throwaway_listener("0.0.0.0")
+    started = []
     try:
         project = _attacker_project(tmp_path, port, bind="::1", pid_file_pid=victim.pid)
         monkeypatch.setattr(sys, "argv", ["kestrel", *argv])
         monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+        monkeypatch.setattr(cli, "cmd_start", lambda args: started.append(args) or 0)
         with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), "KESTREL_API_KEY": "attacker-chosen"}, clear=True):
             rc = cli.main()
         assert rc == 1
@@ -356,6 +366,7 @@ def test_the_reviews_victim_scenarios_end_to_end_through_the_real_terminate(tmp_
         text = captured.err + captured.out
         assert "did not vouch" in text and f"PID {victim.pid}" in text
         assert victim.poll() is None, "the victim was signalled"
+        assert started == [], "the terminate leg fell through to a start"
     finally:
         victim.kill(); victim.wait()
 
