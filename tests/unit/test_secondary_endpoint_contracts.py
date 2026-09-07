@@ -122,6 +122,9 @@ def test_file_get_and_observability_summary_contracts():
     agent = MagicMock(
         storage=storage,
         agent_id="did:test:file-get",
+        # The summary is scoped to the agent's DID and refuses a MagicMock
+        # fabrication as identity (the shared guard, #3229).
+        did="did:test:file-get",
         observability_store=observability_store,
     )
 
@@ -168,7 +171,9 @@ def test_observability_summary_breaks_out_metrics_by_name():
     observability_store = MagicMock(
         query_events=AsyncMock(return_value=[metric_a, metric_a, metric_b])
     )
-    agent = MagicMock(storage=MagicMock(), observability_store=observability_store)
+    agent = MagicMock(
+        storage=MagicMock(), observability_store=observability_store, did="did:test:metrics"
+    )
 
     app, original = _prepare_app(agent)
     try:

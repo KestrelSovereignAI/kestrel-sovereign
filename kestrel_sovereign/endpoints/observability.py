@@ -5,6 +5,10 @@ from datetime import datetime, timezone, timedelta
 import logging
 
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_scoped_agent_did,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +47,13 @@ def _scope_did(agent) -> str:
     agent's rows in a well-formed 200 — which is the defect this
     function exists to prevent.
     """
-    did = getattr(agent, "did", None)
-    if not did:
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
         raise HTTPException(
             status_code=503,
             detail="Agent identity unavailable; cannot scope observability.",
         )
-    return did
 
 @router.get("/api/observability/summary")
 async def get_observability_summary(

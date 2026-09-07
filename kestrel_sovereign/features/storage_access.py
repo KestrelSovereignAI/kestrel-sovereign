@@ -70,6 +70,38 @@ def _safe_privacy_config(value: Any) -> Any:
     return getattr(value, "privacy_config", None)
 
 
+class AgentIdentityUnavailable(RuntimeError):
+    """The agent has no usable DID, so nothing can be scoped to it."""
+
+
+def resolve_scoped_agent_did(agent: Any) -> str:
+    """The DID every self-scoped read and write of this agent is bound to.
+
+    The guard for the sites that scope a shared table to the calling agent
+    and route through it: the consent log and audit anchors (#3229/#3230),
+    observability (#3215), and the ``!tasks`` command. They had drifted —
+    one gated on truthiness alone, so a non-string truthy value was bound
+    as a query parameter. Other self-scoped reads still resolve the DID
+    inline (`endpoints/agent.py` ``_task_recipient_principal``,
+    `features/tasks/wait_provider.py`, `agent/preturn_state.py`,
+    `endpoints/restart_events.py`); routing them here is tracked as a
+    follow-up, so grep for ``"did"`` in a gating position before adding
+    another copy.
+
+    A missing, empty, or non-string DID is "cannot be scoped", never
+    "unscoped": the caller refuses (a store that gates on ``if agent_id:``
+    turns an empty string into every agent's rows). A plain read, not the
+    module's mock-safe one: the agent protocol declares ``did`` and an
+    implementation may back it with a property, which ``_safe_attr`` would
+    refuse; a MagicMock's fabricated attribute is not a string and is
+    refused by the type check regardless.
+    """
+    did = getattr(agent, "did", None)
+    if not isinstance(did, str) or not did:
+        raise AgentIdentityUnavailable("agent identity unavailable")
+    return did
+
+
 def resolve_feature_database(agent: Any) -> Optional[Any]:
     """Resolve the database handle a feature should use for its own tables.
 

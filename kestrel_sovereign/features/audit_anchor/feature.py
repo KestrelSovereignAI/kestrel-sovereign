@@ -21,7 +21,10 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from kestrel_sovereign.audit_time import normalize_audit_timestamp
 
 logger = logging.getLogger(__name__)
@@ -133,7 +136,7 @@ class AuditAnchorFeature(Feature):
         # Record anchor in database
         anchor_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        agent_id = self.agent.did
+        agent_id = self._scope_did()
 
         db = self._get_db()
         if db is not None:
@@ -410,6 +413,35 @@ class AuditAnchorFeature(Feature):
         """Get the main AsyncDatabase instance, or None if unavailable."""
         return resolve_feature_database(self.agent)
 
+    def _scope_did(self) -> str:
+        """The identity every ``audit_anchors`` row of this agent is written and read under.
+
+        ``audit_anchors`` lives in the main agent storage, which is one table
+        per *database*: per agent on SQLite, per host on shared PostgreSQL.
+        The audit entries it hashes stay per-agent either way (the
+        PermissionStore and destructive-audit files), so an unscoped anchor
+        read mixes another agent's anchors with this agent's log: a foreign
+        newer anchor makes this agent skip its own unanchored entries, status
+        counts the fleet, and verify checks a foreign hash against the local
+        entries and reports a false integrity failure (#3230).
+
+        The identity is the runtime-bound DID, never a tool argument. An agent
+        without a usable DID refuses (the shared guard,
+        ``resolve_scoped_agent_did``) rather than falls back to an unscoped
+        read, and the helpers below resolve it *outside* their catch-all
+        ``except`` so the refusal cannot be swallowed into "no anchors yet" —
+        which would re-anchor everything. The write uses the same door so no
+        row can be minted that no agent can read back.
+
+        Rows whose ``agent_id`` is NULL cannot be attributed and are excluded
+        from every read. That is the conservative side for an audit trail:
+        an unattributable anchor must not suppress anchoring (a duplicate
+        anchor is still a valid hash over its entries) and must not be
+        verified against this log (a foreign hash is a guaranteed false
+        failure). No writer of this table has ever left the column NULL.
+        """
+        return resolve_scoped_agent_did(self.agent)
+
     def _get_permission_store(self):
         """
         Get the SecurityFeature's PermissionStore for querying the audit log.
@@ -664,10 +696,11 @@ class AuditAnchorFeature(Feature):
             return []
 
     async def _get_last_anchor_timestamp(self) -> Optional[str]:
-        """Get the created_at timestamp of the most recent anchor, or None."""
+        """Get the last_entry_at of this agent's most recent anchor, or None."""
         db = self._get_db()
         if db is None:
             return None
+        scope_did = self._scope_did()
 
         try:
             # Check if table exists first
@@ -677,7 +710,9 @@ class AuditAnchorFeature(Feature):
 
             row = await db.fetchone(
                 """SELECT last_entry_at FROM audit_anchors
-                   ORDER BY created_at DESC LIMIT 1"""
+                   WHERE agent_id = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (scope_did,),
             )
             return row[0] if row else None
         except Exception as e:
@@ -685,26 +720,31 @@ class AuditAnchorFeature(Feature):
             return None
 
     async def _count_anchors(self) -> int:
-        """Count total number of anchors."""
+        """Count this agent's anchors."""
         db = self._get_db()
         if db is None:
             return 0
+        scope_did = self._scope_did()
 
         try:
             exists = await db.table_exists("audit_anchors")
             if not exists:
                 return 0
 
-            val = await db.fetchval("SELECT COUNT(*) FROM audit_anchors")
+            val = await db.fetchval(
+                "SELECT COUNT(*) FROM audit_anchors WHERE agent_id = ?",
+                (scope_did,),
+            )
             return val or 0
         except Exception:
             return 0
 
     async def _get_all_anchors(self) -> list:
-        """Get all anchors ordered by creation time."""
+        """Get this agent's anchors ordered by creation time."""
         db = self._get_db()
         if db is None:
             return []
+        scope_did = self._scope_did()
 
         try:
             exists = await db.table_exists("audit_anchors")
@@ -715,7 +755,9 @@ class AuditAnchorFeature(Feature):
                 """SELECT id, agent_id, anchor_hash, storage_ref,
                           entries_count, first_entry_at, last_entry_at, created_at
                    FROM audit_anchors
-                   ORDER BY created_at ASC"""
+                   WHERE agent_id = ?
+                   ORDER BY created_at ASC""",
+                (scope_did,),
             )
             columns = [
                 "id", "agent_id", "anchor_hash", "storage_ref",
