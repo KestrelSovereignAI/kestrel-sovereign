@@ -100,17 +100,31 @@ cd <worktree> && codex review --base main
 ```
 
 ```bash
-cd <worktree> && git diff main...HEAD > /tmp/d.patch
-claude -p --model claude-opus-5 "Review this branch for correctness defects.
-Run \`git diff main...HEAD\`. Be adversarial: name failure scenarios with
-file:line, and say plainly if you find nothing real rather than inventing
-style points."
+cd <worktree> && claude -p --model claude-opus-5 "Review this branch for
+correctness defects. Run: git diff main...HEAD. Be adversarial: name failure
+scenarios with file:line, and say plainly if you find nothing real rather than
+inventing style points."
 ```
 
 **As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
 is why the gate names the requirement and not a command: an outage in one
 reviewer must not make the merge gate unsatisfiable, and a rule written around
 one tool's argv stops being true the moment that tool changes or goes away.
+
+**The verdict must arrive whole, and that is a separate gate.** `shell`
+tokenizes with `shlex` and hands an argv vector to a backend — no shell
+interprets the string (#3129). So `> review.txt` is not a redirect, it is a
+literal argument, and `... | tail` is not a pipe, it is three extra arguments
+to a command that then prints everything and exits 0. Neither a file hatch nor
+a pager is available to a governed caller; the review has to come back through
+the ToolResult, and each of stdout and stderr is capped at 1 MiB with
+`truncated_stdout: true` set on the result.
+
+**A truncated review is a gate FAILURE, not a verdict** — it is the same shape
+as the dead-reviewer case above: plausible text, no completed judgement. Check
+`truncated_stdout` before reading findings, and if it is set, say the gate was
+not met rather than reporting what arrived. Tracked as #3243, filed by the
+agent this rule kept blocking.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
@@ -119,9 +133,13 @@ PRs through 2026-08-25 lived across exactly that boundary.
 
 Either form takes 10–45 minutes and **buffers its output**, so silence is not a
 hang. A review that times out exits 0 with no verdict — no findings printed is
-not the same as no findings, and only the second means clean. Redirect to a file
-and read it; do not pipe the review into `tail`, or the exit status you check
-belongs to `tail`.
+not the same as no findings, and only the second means clean.
+
+Exit status is not a verdict anywhere on this surface, and it has produced at
+least five distinct false greens: a wrapper returning 0 while its own summary
+says `Blocked: 1`, `git ls-remote` returning 0 for "no match" exactly as for a
+hit, and a piped gate reporting the status of the last command in the pipe.
+Read the verdict, never the code.
 
 ### 2. Act on what it finds, and verify by mutation
 
