@@ -22,16 +22,24 @@ The lane is a presented credential, verified by the process acted on:
    operator.
 2. At the signal, ``ProcessManager.kill_process`` — the one chokepoint every
    lifecycle kill passes through — refuses to signal a PID that has not
-   **vouched**: the CLI opens one of the PID's own listening loopback
-   sockets and asks ``GET /api/auth/vouch?nonce=…``; only a Kestrel host
-   holding the same stable key can answer with the right HMAC. The key is
-   never transmitted, a fresh nonce defeats replay, and the answer is bound
-   to the exact process about to die. A project directory, its ``.env``,
-   its ``multi_agent.toml``, the pid files and the port number are all
-   files and numbers the invoker can write; the process listening on the
-   socket is not. A PID that does not vouch — a process that is not a
-   Kestrel host, a host under another key, a hung host — is left alone,
-   and the verb refuses. A hung host is stopped by PID, by hand.
+   **vouched**: the CLI connects to one of the PID's own listening sockets,
+   confirms through the kernel's connection table that the *accepted* end
+   of that very connection belongs to the PID, and only then asks
+   ``GET /api/auth/vouch?nonce=…``; only a holder of the presented key can
+   answer with the right HMAC. The answer is bound to the connection, not
+   to an address: a second process squatting the same port on a more
+   specific bind answers for itself and is credited to itself, never to
+   the PID under judgement. The key is never transmitted and a fresh nonce
+   defeats replay. A project directory, its ``.env``, its
+   ``multi_agent.toml``, the pid files, the port number and the bind are
+   all things the invoker can write; the process that accepted the
+   connection is not. A process identity ``(pid, start time)`` vouches
+   once: a host mid-graceful-shutdown has already closed its listeners
+   when the SIGKILL escalation arrives, and must not be un-vouched by
+   that. A PID that never vouches — not a Kestrel host, a host under
+   another key, a hung host — is left alone and reported; the verb
+   continues with its other targets and refuses as a whole. A hung host
+   is stopped by PID, by hand.
 
 What the lane does not do, on purpose: it does not infer the invoker from
 a marker, a TTY, or process ancestry (all changeable by an evading shell),
@@ -46,6 +54,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import time
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Tuple
 
@@ -154,6 +163,8 @@ def operator_lane_refusal(
 # --------------------------------------------------------------------------
 
 _presented_key: Optional[str] = None
+# Identities — (pid, start time) — that vouched while the lane was armed.
+_vouched: set = set()
 
 
 def activate_operator_lane(presented: str) -> None:
@@ -163,6 +174,7 @@ def activate_operator_lane(presented: str) -> None:
     is not an invoker's re-entry."""
     global _presented_key
     _presented_key = normalize_sovereign_api_key(presented)
+    _vouched.clear()
 
 
 def deactivate_operator_lane() -> None:
@@ -171,80 +183,149 @@ def deactivate_operator_lane() -> None:
     embedding tool) must not leave every later ``kill_process`` gated."""
     global _presented_key
     _presented_key = None
+    _vouched.clear()
 
 
 def operator_lane_is_active() -> bool:
     return bool(_presented_key)
 
 
-def _loopback_listeners(pid: int) -> List[Tuple[str, int]]:
-    """``(host, port)`` loopback endpoints ``pid`` is listening on.
+def _listeners(pid: int) -> List[Tuple[str, int, int]]:
+    """``(dial address, port, family)`` for every socket ``pid`` listens on.
 
-    A wildcard bind (``0.0.0.0`` / ``::``) is reached through loopback of the
-    same family; a socket bound to a non-loopback interface only is not
-    probed — it cannot be this host's operator-facing listener.
+    A wildcard bind is dialled through loopback of its family; a specific
+    address — loopback or not — is dialled as reported. The answer is bound
+    to the key, not to an interface, so a host bound to ``10.0.0.5`` can
+    vouch too.
     """
+    import socket
+
     try:
         import psutil
     except ImportError:
         return []
-    endpoints: List[Tuple[str, int]] = []
+    endpoints: List[Tuple[str, int, int]] = []
     try:
         for conn in psutil.Process(pid).net_connections(kind="inet"):
             if conn.status != psutil.CONN_LISTEN or not conn.laddr:
                 continue
             ip, port = conn.laddr.ip, conn.laddr.port
-            if ip in ("0.0.0.0", "127.0.0.1"):
-                endpoints.append(("127.0.0.1", port))
-            elif ip in ("::", "::1"):
-                endpoints.append(("[::1]", port))
+            if ip == "0.0.0.0":
+                endpoints.append(("127.0.0.1", port, socket.AF_INET))
+            elif ip == "::":
+                endpoints.append(("::1", port, socket.AF_INET6))
+            else:
+                endpoints.append((ip, port, conn.family))
     except (psutil.Error, OSError):
         return []
     return sorted(set(endpoints))
 
 
+def _connection_belongs_to(pid: int, local: Tuple[str, int]) -> bool:
+    """Whether ``pid`` owns the accepted end of the connection whose client
+    side is ``local`` — the kernel's connection table, not an address."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    local_ip, local_port = local[0], local[1]
+    try:
+        for conn in psutil.Process(pid).net_connections(kind="inet"):
+            if (
+                conn.status == psutil.CONN_ESTABLISHED
+                and conn.raddr
+                and conn.raddr.port == local_port
+                and conn.raddr.ip == local_ip
+            ):
+                return True
+    except (psutil.Error, OSError):
+        return False
+    return False
+
+
+def _challenge_over_own_connection(pid: int, address: str, port: int, family: int, key: str) -> bool:
+    """One challenge: connect, prove the acceptor is ``pid``, then ask."""
+    import http.client
+    import json
+    import socket
+
+    nonce = secrets.token_hex(NONCE_HEX_LENGTH // 2)
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(2.0)
+    try:
+        sock.connect((address, port))
+        local = sock.getsockname()
+        # The kernel completes the handshake before the process calls
+        # accept(); until then the connection is not yet a descriptor of the
+        # PID and the table does not attribute it. Give the acceptor a moment
+        # — a live server accepts within milliseconds — before concluding
+        # that the accepted end belongs to someone else.
+        deadline = time.monotonic() + 1.5
+        while not _connection_belongs_to(pid, (local[0], local[1])):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+        conn = http.client.HTTPConnection(address, port, timeout=2.0)
+        conn.sock = sock
+        conn.request("GET", f"{VOUCH_PATH}?nonce={nonce}", headers={"Host": "localhost"})
+        response = conn.getresponse()
+        if response.status != 200:
+            return False
+        try:
+            answer = json.loads(response.read().decode("utf-8")).get("vouch")
+        except (ValueError, AttributeError):
+            return False
+        return isinstance(answer, str) and hmac.compare_digest(answer, vouch_response(key, nonce))
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def vouch_pid(pid: int, presented: str) -> bool:
-    """Whether ``pid`` answers the nonce challenge with ``presented``'s HMAC.
+    """Whether ``pid`` answers the nonce challenge with ``presented``'s HMAC
+    over a connection the kernel attributes to ``pid``.
 
-    Asked of each listening loopback socket the process owns; one correct
-    answer vouches. Nothing about the port number, the bind address, or a
-    pid file enters the decision — only the process's own answer.
+    Asked of each listening socket the process owns; one correct answer
+    over a connection it accepted vouches. Nothing about the port number,
+    the bind address, or a pid file enters the decision — only the
+    process's own answer on its own connection.
     """
-    import httpx
-
     expected_key = normalize_sovereign_api_key(presented)
-    for host, port in _loopback_listeners(pid):
-        nonce = secrets.token_hex(NONCE_HEX_LENGTH // 2)
-        try:
-            response = httpx.get(
-                f"http://{host}:{port}{VOUCH_PATH}",
-                params={"nonce": nonce},
-                timeout=2.0,
-            )
-        except httpx.HTTPError:
-            continue
-        if response.status_code != 200:
-            continue
-        try:
-            answer = response.json().get("vouch")
-        except ValueError:
-            continue
-        if isinstance(answer, str) and hmac.compare_digest(
-            answer, vouch_response(expected_key, nonce)
-        ):
+    for address, port, family in _listeners(pid):
+        if _challenge_over_own_connection(pid, address, port, family, expected_key):
             return True
     return False
 
 
-def require_vouched_pid(pid: int) -> None:
-    """Refuse to signal ``pid`` unless it vouched. No-op when the lane is inactive."""
+def require_vouched_pid(pid: int, started_at: Optional[float] = None) -> None:
+    """Refuse to signal ``pid`` unless its identity vouched. No-op when the
+    lane is inactive.
+
+    The identity is ``(pid, start time)``; it vouches once per armed lane.
+    A graceful shutdown closes the listeners before the process exits, so
+    the SIGKILL escalation that follows a SIGTERM could never vouch afresh —
+    and a process that vouched a moment ago is the same process until its
+    start time says otherwise.
+    """
     if not operator_lane_is_active():
         return
+    if started_at is None:
+        from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+        started_at = ProcessManager.process_start_time(pid)
+    identity = (pid, round(started_at, 3) if started_at is not None else None)
+    if identity in _vouched:
+        return
     if vouch_pid(pid, _presented_key or ""):
+        _vouched.add(identity)
         return
     raise OperatorLaneRefused(
         f"refusing to signal PID {pid}: it did not vouch for the presented "
-        "KESTREL_API_KEY on any of its loopback listeners (not a Kestrel host, "
-        "a host under another key, or a hung host). Nothing was signalled. "
-        "A hung Kestrel host is stopped by PID, by hand."
+        "KESTREL_API_KEY on any connection it accepted (not a Kestrel host, "
+        "a host under another key, or a hung host). A hung Kestrel host is "
+        "stopped by PID, by hand."
     )

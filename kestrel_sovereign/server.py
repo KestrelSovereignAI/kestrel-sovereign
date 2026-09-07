@@ -3962,9 +3962,11 @@ async def vouch_for_operator_lane(request: Request, nonce: str):
     key. Only a Kestrel host holding that key can answer, the key is never
     transmitted, and the answer binds the exact process about to be
     signalled — a caller-written port, bind, pid file or config cannot
-    stand in for it. Loopback only, like the bootstrap route; an HMAC over
-    a caller-chosen nonce reveals nothing about the key. A host running on
-    a temporary generated key has no durable sovereign and does not vouch.
+    stand in for it. Served to the same source allowlist as the bootstrap
+    route (loopback, the Docker gateway, ``KESTREL_BOOTSTRAP_ALLOWED_HOSTS``),
+    which already hands out the key itself; an HMAC over a caller-chosen
+    nonce reveals nothing about the key. A host running on a temporary
+    generated key has no durable sovereign and does not vouch.
     """
     from kestrel_sovereign.security.operator_lane import (
         is_valid_nonce,
@@ -3974,7 +3976,7 @@ async def vouch_for_operator_lane(request: Request, nonce: str):
 
     client_host = request.client.host if request.client else None
     if not is_bootstrap_host_allowed(client_host):
-        raise HTTPException(status_code=403, detail="Vouching only over loopback")
+        raise HTTPException(status_code=403, detail="Vouching only from the bootstrap allowlist")
     if not is_valid_nonce(nonce):
         raise HTTPException(status_code=400, detail="nonce must be 32 hex characters")
     key = get_api_key()

@@ -63,14 +63,18 @@ def test_vouch_answers_the_nonce_under_the_stable_key_over_loopback_only():
 
 def test_an_ephemeral_key_does_not_vouch():
     """A host that generated its own key has no durable sovereign."""
-    from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
+    from kestrel_sovereign.security import sovereign_key
 
     app, original = _prepare_app()
+    before = sovereign_key._ephemeral_key_fingerprint
     try:
-        mark_ephemeral_sovereign_key("generated-at-boot")
+        # Marked INSIDE the env patch and reset after: the mark is process-
+        # global provenance and must not leak into later tests.
         with patch.dict("os.environ", {"KESTREL_API_KEY": "generated-at-boot", "KESTREL_REQUIRE_OAUTH": "false"}):
+            sovereign_key.mark_ephemeral_sovereign_key("generated-at-boot")
             with TestClient(app, client=("127.0.0.1", 55000)) as client:
                 response = client.get("/api/auth/vouch", params={"nonce": NONCE})
         assert response.status_code == 404
     finally:
+        sovereign_key._ephemeral_key_fingerprint = before
         _restore_app(app, original)

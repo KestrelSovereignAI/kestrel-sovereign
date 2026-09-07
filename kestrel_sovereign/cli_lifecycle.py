@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+from kestrel_sovereign.security.operator_lane import OperatorLaneRefused
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
     PidStatus,
@@ -450,12 +451,27 @@ def _reap_orphans_on_port(
             return PortReapResult.STILL_HELD
         return PortReapResult.NOTHING_FOUND
     print(f"   {label}: orphan listener(s) on :{port} {orphans} — killing")
+    # A listener that does not vouch for the operator lane (#3233) is left
+    # alone and named; the others are still signalled, and the port decides
+    # the result as before.
+    from kestrel_sovereign.security.operator_lane import OperatorLaneRefused
+
+    refused: set[int] = set()
     for opid in orphans:
-        ProcessManager.kill_process(opid, force=force)
+        try:
+            ProcessManager.kill_process(opid, force=force)
+        except OperatorLaneRefused as error:
+            refused.add(opid)
+            print(f"   {label}: {error}")
     if _await_port_release(port, bind):
         return PortReapResult.RELEASED
     for opid in orphans:
-        ProcessManager.kill_process(opid, force=True)
+        if opid in refused:
+            continue
+        try:
+            ProcessManager.kill_process(opid, force=True)
+        except OperatorLaneRefused as error:
+            print(f"   {label}: {error}")
     if _await_port_release(port, bind):
         return PortReapResult.RELEASED
     return PortReapResult.STILL_HELD
@@ -494,7 +510,12 @@ def cmd_terminate(args) -> int:
         ap = pm._agents.get(args.name)
         if ap and ap.pid:
             print(f"   Terminating {args.name} (PID: {ap.pid})...")
-            if not pm.terminate_agent(args.name):
+            try:
+                terminated = pm.terminate_agent(args.name)
+            except OperatorLaneRefused as error:
+                print(f"   {args.name}: {error}")
+                return 1
+            if not terminated:
                 print(
                     f"   {args.name}: PID {ap.pid} is still running after "
                     f"SIGKILL — not reporting {args.name} as terminated"
@@ -533,7 +554,16 @@ def cmd_terminate(args) -> int:
         ap = pm._agents.get(name)
         if ap and ap.pid:
             print(f"   Terminating {name} (PID: {ap.pid})...")
-            if not pm.terminate_agent(name):
+            try:
+                terminated = pm.terminate_agent(name)
+            except OperatorLaneRefused as error:
+                # Named, counted, and the verb goes on to its other targets:
+                # a refusal must neither abort the rest nor vanish from the
+                # summary (#3233).
+                print(f"   {name}: {error}")
+                unterminated.append(name)
+                continue
+            if not terminated:
                 print(
                     f"   {name}: PID {ap.pid} is still running after SIGKILL"
                 )
@@ -564,14 +594,17 @@ def cmd_terminate(args) -> int:
         # signalled — the exact protection being asked for. None for a legacy
         # record, which signals as before.
         started_at = host_record.started_at
-        pm.kill_process(host_pid, force=force, started_at=started_at)
-        for _ in range(10):
-            if not pm.is_process_running(host_pid):
-                break
-            time.sleep(0.5)
-        if pm.is_process_running(host_pid):
-            pm.kill_process(host_pid, force=True, started_at=started_at)
-            time.sleep(0.5)
+        try:
+            pm.kill_process(host_pid, force=force, started_at=started_at)
+            for _ in range(10):
+                if not pm.is_process_running(host_pid):
+                    break
+                time.sleep(0.5)
+            if pm.is_process_running(host_pid):
+                pm.kill_process(host_pid, force=True, started_at=started_at)
+                time.sleep(0.5)
+        except OperatorLaneRefused as error:
+            print(f"   host: {error}")
         # Two independent facts, both required before claiming a stop: the
         # process is gone, and the port it served is free. Neither implies the
         # other — a host that failed to bind leaves the port free while still
