@@ -91,18 +91,37 @@ permission each time.
 
 ### 1. Review your own full diff before asking anyone else to
 
+The gate is **a full-diff review against `main` that printed a verdict**. Which
+reviewer produced it is not part of the requirement — name the tool you used.
+Two satisfy it:
+
 ```bash
 cd <worktree> && codex review --base main
 ```
+
+```bash
+cd <worktree> && git diff main...HEAD > /tmp/d.patch
+claude -p --model claude-opus-5 "Review this branch for correctness defects.
+Run \`git diff main...HEAD\`. Be adversarial: name failure scenarios with
+file:line, and say plainly if you find nothing real rather than inventing
+style points."
+```
+
+**As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
+is why the gate names the requirement and not a command: an outage in one
+reviewer must not make the merge gate unsatisfiable, and a rule written around
+one tool's argv stops being true the moment that tool changes or goes away.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
 seen whole by anything. Every defect a human reviewer found in agent-authored
 PRs through 2026-08-25 lived across exactly that boundary.
 
-It takes 10–45 minutes and **buffers its output**, so silence is not a hang. A
-review that times out exits 0 with no verdict — no findings printed is not the
-same as no findings, and only the second means clean.
+Either form takes 10–45 minutes and **buffers its output**, so silence is not a
+hang. A review that times out exits 0 with no verdict — no findings printed is
+not the same as no findings, and only the second means clean. Redirect to a file
+and read it; do not pipe the review into `tail`, or the exit status you check
+belongs to `tail`.
 
 ### 2. Act on what it finds, and verify by mutation
 
@@ -126,8 +145,8 @@ demonstrate is worth less than an honest boundary.
 Squash-merge your own PR when **all** of these hold:
 
 - CI green (every required check, not just unit tests)
-- a full-diff `codex review --base main` came back with **a printed verdict**
-  and no unaddressed P1
+- a full-diff review against `main` (codex or claude — see above) came back
+  with **a printed verdict** and no unaddressed P1
 - every finding you fixed has a test that fails without the fix
 
 If a gate is not met, say which one and what you need. Do not sit silently on a
@@ -137,7 +156,7 @@ because a blocker nobody reads is a blocker nobody acts on.
 ### What you already have
 
 Unrestricted `shell` (arbitrary `timeout`, no upper clamp), `git`, `gh`, and
-`codex` on PATH. Almost nothing here is a capability you lack; it is a procedure
+both `codex` and `claude` on PATH. Almost nothing here is a capability you lack; it is a procedure
 that has to survive the turn boundary, which is why it is written down here
 rather than remembered.
 
