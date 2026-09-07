@@ -100,11 +100,24 @@ cd <worktree> && codex review --base main
 ```
 
 ```bash
-cd <worktree> && claude -p --model claude-opus-5 "Review this branch for
+cd <worktree> && claude -p --model <model> -- "Review this branch for
 correctness defects. Run: git diff main...HEAD. Be adversarial: name failure
 scenarios with file:line, and say plainly if you find nothing real rather than
-inventing style points."
+inventing style points." </dev/null
 ```
+
+Two details in that line are load-bearing, both found the hard way:
+
+* **`</dev/null`** — `claude -p` blocks forever on inherited stdin. Without it
+  the run never starts and never fails, and the "silence is not a hang" advice
+  below turns a five-second mistake into a 45-minute wait for an empty result.
+  Probe it for five seconds before committing to the long form.
+* **`--` before the prompt** — `--allowed-tools` is variadic and will silently
+  swallow the prompt as one more tool name. The review then runs with no
+  instructions and returns something plausible.
+
+Check the model is one the CLI actually serves before relying on it; a name
+that is right for the host catalog is not automatically right here.
 
 **As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
 is why the gate names the requirement and not a command: an outage in one
