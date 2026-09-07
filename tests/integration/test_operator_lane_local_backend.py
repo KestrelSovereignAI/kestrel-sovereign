@@ -24,6 +24,16 @@ from kestrel_sovereign.features.computer_use.backends.local import LocalSandboxB
 from kestrel_sovereign.security.operator_lane import LIFECYCLE_VERBS
 
 KEY = "stable-sovereign-key-3233"
+# A literal list, not `sorted(LIFECYCLE_VERBS)`: a test that derives its
+# cases from the set under test shrinks with the set, so dropping a verb
+# from the lane would drop its case too.
+THE_FIVE_VERBS = ["create", "start", "terminate", "restart", "update"]
+
+
+def test_the_lane_covers_exactly_the_five_verbs():
+    assert set(LIFECYCLE_VERBS) == set(THE_FIVE_VERBS)
+
+
 VERB_ARGV = {
     "create": ["create", "Nobody"],
     "start": ["start"],
@@ -41,7 +51,7 @@ def project(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verb", sorted(LIFECYCLE_VERBS))
+@pytest.mark.parametrize("verb", THE_FIVE_VERBS)
 async def test_agent_shell_cannot_reach_a_lifecycle_verb(project, verb):
     backend = LocalSandboxBackend({"shell_execution_host", "shell_execution_sandboxed"})
     # The agent process holds the key (the host loaded .env at boot); the

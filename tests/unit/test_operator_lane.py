@@ -72,6 +72,16 @@ def test_the_reference_is_the_env_file_not_the_process_environment(project, monk
 # Dispatch: one gate before any handler
 # ---------------------------------------------------------------------------
 
+# A literal list, not `sorted(LIFECYCLE_VERBS)`: a test that derives its
+# cases from the set under test shrinks with the set, so dropping a verb
+# from the lane would drop its case too.
+THE_FIVE_VERBS = ["create", "start", "terminate", "restart", "update"]
+
+
+def test_the_lane_covers_exactly_the_five_verbs():
+    assert set(LIFECYCLE_VERBS) == set(THE_FIVE_VERBS)
+
+
 VERB_ARGV = {
     "create": ["create", "Nobody"],
     "start": ["start"],
@@ -81,7 +91,7 @@ VERB_ARGV = {
 }
 
 
-@pytest.mark.parametrize("verb", sorted(LIFECYCLE_VERBS))
+@pytest.mark.parametrize("verb", THE_FIVE_VERBS)
 def test_every_lifecycle_verb_is_refused_before_its_handler_runs(verb, project, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["kestrel", *VERB_ARGV[verb]])
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
@@ -94,7 +104,7 @@ def test_every_lifecycle_verb_is_refused_before_its_handler_runs(verb, project, 
     assert "refused" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("verb", sorted(LIFECYCLE_VERBS))
+@pytest.mark.parametrize("verb", THE_FIVE_VERBS)
 def test_every_lifecycle_verb_runs_for_the_operator(verb, project, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["kestrel", *VERB_ARGV[verb]])
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
