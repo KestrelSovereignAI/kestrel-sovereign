@@ -7921,6 +7921,7 @@ class TestAgentManagerBasics:
         warm_did = "did:web:example.test:agent:warm"
         warm_keypair = generate_hybrid_keypair()
         warm = SimpleNamespace(
+            did=warm_did,  # a bare agent_id is not an identity (#3246)
             agent_id=warm_did,
             identity=SimpleNamespace(
                 is_hybrid=True,

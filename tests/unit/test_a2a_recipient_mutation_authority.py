@@ -190,8 +190,15 @@ async def test_unauthorized_failure_does_not_write_victim_observability(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_agent_id_only_host_can_authorize_response_and_artifact(tmp_path):
-    """A supported durable identity must not degrade to the host class name."""
+async def test_agent_id_only_host_is_not_a_durable_identity(tmp_path):
+    """A bare ``agent_id`` is not an identity, and neither is the host class
+    name: both fail closed, and nothing is persisted.
+
+    Until #3246 this shape authorized. On every real agent ``agent_id`` is
+    a property returning the DID, so accepting it alone only ever admitted a
+    test double — the shape the shared guard refuses at every other
+    self-scoped site over the same table.
+    """
 
     manager = await create_task_manager(str(tmp_path / "agent-id-only.db"))
     try:
@@ -222,8 +229,18 @@ async def test_agent_id_only_host_can_authorize_response_and_artifact(tmp_path):
             "persist this",
         )
 
-        assert response.status is ToolResultStatus.OK
-        assert artifact.status is ToolResultStatus.OK
+        assert response.status is ToolResultStatus.ERROR
+        assert artifact.status is ToolResultStatus.ERROR
+        assert "durable identity" in response.error
+        assert "durable identity" in artifact.error
+        response_task = await manager.task_store._get_unscoped(
+            "agent-id-only-response"
+        )
+        artifact_task = await manager.task_store._get_unscoped(
+            "agent-id-only-artifact"
+        )
+        assert response_task.status.state is TaskState.SUBMITTED
+        assert not artifact_task.artifacts
     finally:
         await manager.close()
 
@@ -1072,5 +1089,6 @@ def test_task_feature_binds_mutations_to_durable_runtime_identity():
 
     source = inspect.getsource(TaskFeature)
     assert source.count("recipient_agent_id=actor_agent_id") >= 4
-    assert 'for attribute in ("did", "agent_id")' in source
+    assert "resolve_scoped_agent_did(self.agent)" in source
+    assert '"agent_id"' not in source.split("def _durable_agent_id")[1].split("def ")[0]
     assert "type(self.agent).__name__" not in source

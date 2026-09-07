@@ -290,11 +290,20 @@ class RecipientA2ASenderAuthorizer:
 
     @staticmethod
     def _stable_agent_id(agent: Any) -> Optional[str]:
-        for attribute in ("agent_id", "did"):
-            value = getattr(agent, attribute, None)
-            if isinstance(value, str) and value:
-                return value
-        return None
+        """The recipient's DID through the shared guard, or None (#3246).
+
+        This read ``agent_id`` before ``did``; the inbound-scope gate must
+        name the same identity the task routes scope by.
+        """
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        try:
+            return resolve_scoped_agent_did(agent)
+        except AgentIdentityUnavailable:
+            return None
 
 
 def install_a2a_inbound_sender_authorizer(
@@ -313,9 +322,7 @@ def install_a2a_inbound_sender_authorizer(
     logger.info(
         "Inbound A2A sender authorizer installed for recipient %r "
         "(scoped=%s)",
-        getattr(recipient, "agent_id", None)
-        or getattr(recipient, "did", None)
-        or "unknown",
+        RecipientA2ASenderAuthorizer._stable_agent_id(recipient) or "unknown",
         authorizer.requires_verified_sender,
     )
     return authorizer

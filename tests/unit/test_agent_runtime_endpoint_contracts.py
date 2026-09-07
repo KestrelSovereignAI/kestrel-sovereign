@@ -934,6 +934,9 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
     agent.sleep_hooks = [object()]
     agent.features = {"SchedulerFeature": scheduler}
     agent._raw_storage = SimpleNamespace(db=db)
+    # The reflection route reads ``agent_id`` first (its own inline
+    # resolution, outside #3246): a MagicMock without it would bind a
+    # fabricated attribute as a SQL parameter.
     agent.agent_id = "did:test:agent"
 
     app, original = _prepare_app(agent)
@@ -971,7 +974,7 @@ def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values():
     task_store.list_tasks = AsyncMock(return_value=[working_task])
     task_manager = MagicMock(task_store=task_store)
     agent = MagicMock(task_manager=task_manager)
-    agent.agent_id = "did:test:agent"
+    agent.did = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -1015,7 +1018,7 @@ def test_task_detail_endpoint_returns_task_with_artifacts():
     task_manager = MagicMock()
     task_manager.get_task_for_recipient = AsyncMock(return_value=task)
     agent = MagicMock(task_manager=task_manager)
-    agent.agent_id = "did:test:agent"
+    agent.did = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -1042,7 +1045,7 @@ def test_task_detail_endpoint_returns_404_when_task_missing():
     task_manager = MagicMock()
     task_manager.get_task_for_recipient = AsyncMock(return_value=None)
     agent = MagicMock(task_manager=task_manager)
-    agent.agent_id = "did:test:agent"
+    agent.did = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
