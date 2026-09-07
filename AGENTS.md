@@ -116,8 +116,24 @@ Two details in that line are load-bearing, both found the hard way:
   swallow the prompt as one more tool name. The review then runs with no
   instructions and returns something plausible.
 
-Check the model is one the CLI actually serves before relying on it; a name
-that is right for the host catalog is not automatically right here.
+**Run the review on the strongest model available, and prove it.** A gate is
+only as strong as its reviewer, and substituting a weaker one silently makes
+the gate weaker without making it look weaker. Probe first — five seconds:
+
+```bash
+claude -p --model <model> -- "Reply with exactly: PROBE_OK" </dev/null
+```
+
+An unavailable model fails loudly and distinctively
+(`[claude-code:unrecognized_model]`), so a probe that returns `PROBE_OK`
+settles it and a probe that does not tells you to escalate, not to downgrade.
+Do not infer availability from the host's model catalog: that answers a
+different question, the two have disagreed, and on 2026-09-07 a 1269-line diff
+was reviewed on `claude-opus-4-6` because `claude-opus-5` was believed
+unavailable when a probe would have returned `PROBE_OK` for it.
+
+If you do end up on a weaker model, that is a gate condition to declare in the
+turn output alongside the verdict — not a detail to mention afterwards.
 
 **As of 2026-09-06 the Codex CLI is unavailable, so use the Claude form.** This
 is why the gate names the requirement and not a command: an outage in one
