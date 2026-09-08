@@ -600,6 +600,7 @@ contract therefore also fails on a new live WebSocket until it is classified.
 | `kestrel_sovereign/endpoints/models.py::DELETE /api/keys/user/{provider}` | Authenticated-user-scoped BYOK mutation keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/keys/platform` | Host-authenticated read of the platform-global key catalog; the routed agent supplies PostgreSQL connectivity only. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/keys/user` | Authenticated-user-scoped BYOK read keyed by `request.state.user_id`; the routed agent supplies PostgreSQL connectivity only. |
+| `kestrel_sovereign/endpoints/models.py::GET /api/ipfs/node` | H — sovereign/delegated host view; the canonical route has no selected-agent context and grants no agent relation authority. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/ipfs/status` | A — shared daemon health plus only the routed agent's receipt-owned pins; no hierarchy grant. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/keys/available-sources` | A/U/H — mixed selected-agent key presence, authenticated-user BYOK presence, and platform-global availability/margin. |
 | `kestrel_sovereign/endpoints/models.py::GET /api/models` | A/H — selected-agent route/default metadata plus the process-wide shared model catalog; selection grants no relation authority. |

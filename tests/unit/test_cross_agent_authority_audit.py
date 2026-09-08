@@ -170,6 +170,7 @@ HTTP_EXACT_ROUTES = {
     # These reads cross the selected-agent boundary: IPFS and model discovery
     # use process-wide state, while available-sources combines agent, user, and
     # platform principals.
+    "/api/ipfs/node",
     "/api/ipfs/status",
     "/api/keys/available-sources",
     "/api/models",
@@ -7591,6 +7592,11 @@ def test_ipfs_reads_are_split_by_owner_and_host_authority_after_3226() -> None:
     assert "sovereign/delegated" in action_row
     assert "[#3226]" in action_row
 
+    assert (
+        "kestrel_sovereign/endpoints/models.py::GET /api/ipfs/node"
+        in _discovered_http_surfaces()
+    )
+
     for route in (
         "/api/ipfs/status",
         "/api/agents/{selected_agent_name}/api/ipfs/status",
@@ -7603,15 +7609,20 @@ def test_ipfs_reads_are_split_by_owner_and_host_authority_after_3226() -> None:
         assert "| A —" in row
         assert "receipt-owned pins" in row
 
-    host_row = next(
-        line
-        for line in audit.splitlines()
-        if "endpoints/models.py::GET "
-        "/api/agents/{selected_agent_name}/api/ipfs/node`" in line
-    )
-    assert "| H —" in host_row
-    assert "sovereign/delegated" in host_row
-    assert "selected-agent prefix grants no host authority" in host_row
+    for route, boundary in {
+        "/api/ipfs/node": "canonical route has no selected-agent context",
+        "/api/agents/{selected_agent_name}/api/ipfs/node": (
+            "selected-agent prefix grants no host authority"
+        ),
+    }.items():
+        host_row = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/models.py::GET {route}`" in line
+        )
+        assert "| H —" in host_row
+        assert "sovereign/delegated" in host_row
+        assert boundary in host_row
 
 
 def test_canonical_phoenix_asset_redirects_are_inventoried() -> None:
@@ -7910,6 +7921,25 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
 )
 
 
+_CROSS_AGENT_TARGETED_CONTROL_ACTIONS = frozenset(
+    {
+        "ask",
+        "delegate",
+        "dispatch",
+        "execute",
+        "invoke",
+        "list",
+        "message",
+        "read",
+        "send",
+        "spawn",
+        "submit",
+        "subscribe",
+        "verify",
+    }
+)
+
+
 def _is_cross_agent_lifecycle_action(name: str) -> bool:
     """Recognize exact lifecycle verbs and conventional async variants."""
 
@@ -7928,6 +7958,21 @@ def _is_cross_agent_lifecycle_action(name: str) -> bool:
     if len(parts) > 1:
         candidates.extend((parts[0], parts[-1]))
     return any(candidate in _CROSS_AGENT_LIFECYCLE_ACTIONS for candidate in candidates)
+
+
+def _is_cross_agent_targeted_control_action(name: str) -> bool:
+    """Recognize operations that cross authority only with an agent target."""
+
+    normalized = name.casefold()
+    candidates = {normalized}
+    if normalized.startswith("async_"):
+        candidates.add(normalized.removeprefix("async_"))
+    if normalized.startswith("a"):
+        candidates.add(normalized[1:])
+    for suffix in ("_async", "_now", "_sync"):
+        if normalized.endswith(suffix):
+            candidates.add(normalized.removesuffix(suffix))
+    return bool(candidates.intersection(_CROSS_AGENT_TARGETED_CONTROL_ACTIONS))
 
 
 def _cross_agent_state_object_aliases(
@@ -9226,11 +9271,23 @@ def _control_reference_sources(
     factory_name = _call_name(node).casefold()
     if factory_name in (control_return_helpers or set()):
         return {factory_name}
-    if factory_name == "getattr":
-        attribute = (
-            node.args[1]
-            if len(node.args) > 1
-            else next(
+    if factory_name in {"getattr", "__getattribute__", "methodcaller"}:
+        if factory_name == "getattr":
+            attribute = node.args[1] if len(node.args) > 1 else None
+        elif factory_name == "__getattribute__":
+            # Bound ``peer.__getattribute__('stop')`` has one argument while
+            # unbound ``object.__getattribute__(peer, 'stop')`` has two.
+            attribute = (
+                node.args[1]
+                if len(node.args) > 1
+                else node.args[0]
+                if node.args
+                else None
+            )
+        else:
+            attribute = node.args[0] if node.args else None
+        if attribute is None:
+            attribute = next(
                 (
                     keyword.value
                     for keyword in node.keywords
@@ -9238,7 +9295,6 @@ def _control_reference_sources(
                 ),
                 None,
             )
-        )
         if attribute is None:
             return set()
         resolved = _resolved_string(attribute)
@@ -9427,11 +9483,31 @@ def _is_cross_agent_control_call(
             node.args[0], state_object_aliases
         )
     )
+    targeted_agent_control = _is_cross_agent_targeted_control_action(
+        call_name
+    ) and (
+        (
+            isinstance(node.func, ast.Attribute)
+            and _is_cross_agent_state_object_reference(
+                node.func.value, state_object_aliases
+            )
+        )
+        or any(
+            _is_cross_agent_state_object_reference(
+                argument, state_object_aliases
+            )
+            for argument in [
+                *node.args,
+                *(keyword.value for keyword in node.keywords),
+            ]
+        )
+    )
     return (
         _CALLABLE_CONTROL in _callable_semantics(node.func)
         or _is_unambiguous_control_sink(node, control_aliases)
         or _shell_adapter_invokes_kestrel_lifecycle(node)
         or kills_agent_process
+        or targeted_agent_control
         or call_name in (control_aliases or set())
         or any(
             _is_unambiguous_control_token(source)
@@ -16795,6 +16871,41 @@ def test_provenance_scanner_follows_callable_control_factories() -> None:
     assert _authority_provenance_lines(wrapped_callback) == {3}
     assert _authority_provenance_lines(keyword_wrapped_callback) == {3}
     assert _authority_provenance_lines(decorator_wrapped_callback) == {3}
+
+
+def test_provenance_scanner_follows_reflective_lifecycle_dispatch() -> None:
+    tree = ast.parse(
+        "def via_dunder(request, peer):\n"
+        "    if request.causation_chain:\n"
+        "        peer.__getattribute__('terminate')()\n\n"
+        "def via_method_factory(request, peer):\n"
+        "    if request.orchestrator:\n"
+        "        operator.methodcaller('stop')(peer)\n\n"
+        "def benign(request, peer):\n"
+        "    if request.causation_chain:\n"
+        "        operator.methodcaller('format')(peer)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6}
+
+
+def test_provenance_scanner_recognizes_peer_targeted_control_calls() -> None:
+    tree = ast.parse(
+        "def route_request(request, router, requester, peer, message):\n"
+        "    if request.causation_chain:\n"
+        "        router.invoke(requester, peer, message)\n\n"
+        "def deliver(request, peer):\n"
+        "    if request.orchestrator:\n"
+        "        peer.send('continue')\n\n"
+        "def inspect(request, store, peer):\n"
+        "    if request.causation_chain:\n"
+        "        store.read(peer)\n\n"
+        "def benign(request, metrics):\n"
+        "    if request.causation_chain:\n"
+        "        metrics.read()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6, 10}
 
 
 def test_provenance_scanner_follows_control_return_helpers(
