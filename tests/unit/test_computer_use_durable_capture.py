@@ -1849,9 +1849,16 @@ def test_the_size_measured_is_the_size_the_orchestrator_receives():
 
 
 @pytest.mark.asyncio
-async def test_an_uncaptured_result_fits_once_wrapped(workspace: Path, queue):
-    """The boundary the wrapper moved: a result sized to the cap unwrapped
-    exceeds it wrapped."""
+async def test_no_output_length_slips_past_the_wrapped_cap(workspace: Path, queue):
+    """The window the wrapper opens is only as wide as ``tool`` and
+    ``success`` — about 34 characters — so a test that guesses a few output
+    sizes walks straight past it. The first version tried four fixed sizes
+    and a mutant dropping ``tool_name`` survived it.
+
+    This sweeps the boundary instead of guessing at it: every length across a
+    span wider than the window, so some length must land inside it. Driven
+    through a stub backend rather than real subprocesses, because 200 spawns
+    to test an arithmetic boundary is a slow way to be thorough."""
     from kestrel_sovereign.features.base import (
         orchestrator_result_cap,
         serialized_result_len,
@@ -1860,12 +1867,25 @@ async def test_an_uncaptured_result_fits_once_wrapped(workspace: Path, queue):
     f = await _feature(workspace, queue)
     cap = orchestrator_result_cap()
 
-    for size in (3700, 3790, 3900, 5000):
-        env = await f.shell(
-            command=f"python3 -c \"print('p' * {size})\"", timeout=60
-        )
+    # Locate the length whose BARE size first exceeds the cap; the wrapper's
+    # window sits just below it.
+    def bare(n: int) -> int:
+        return serialized_result_len(ToolResult.ok("c", data={"stdout": "p" * n}))
+
+    lo, hi = 0, cap
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if bare(mid) <= cap:
+            lo = mid + 1
+        else:
+            hi = mid
+    boundary = lo
+
+    for n in range(max(0, boundary - 120), boundary + 40):
+        f._backend = _StubBackend(_run(stdout="p" * n, stderr=""))
+        env = await f.shell(command="echo hi")
         wrapped = serialized_result_len(env, tool_name="shell")
-        assert wrapped <= cap, f"{size} chars of output -> {wrapped} wrapped"
+        assert wrapped <= cap, f"{n} chars of stdout -> {wrapped} wrapped"
 
 
 @pytest.mark.asyncio
