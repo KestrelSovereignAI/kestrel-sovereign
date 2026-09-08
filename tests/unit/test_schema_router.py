@@ -18,7 +18,6 @@ from kestrel_sovereign.storage.schema_router import (
     ActionItemExtractor,
     DecisionExtractor,
     DECISION_NODE_TYPE,
-    PersonMatch,
     PersonResolver,
     SchemaRouter,
     extract_interaction_sentiment,
@@ -416,7 +415,6 @@ class TestSchemaRouterOrchestration:
         """Regression guard: if get_node is called with the new action's id
         and the store has no such node, preservation must not accidentally
         inherit from some other action item."""
-        from kestrel_sovereign.storage.async_graph_store import GraphNode as GN
 
         async def _get_node(node_id):
             # Unrelated existing node with a different id
