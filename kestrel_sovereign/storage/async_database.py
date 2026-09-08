@@ -831,47 +831,52 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes(json_extract(properties, '$.status'))
   WHERE node_type = 'action_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
-  ON graph_nodes(json_extract(properties, '$.created_at'))
-  WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
   ON graph_nodes(json_extract(properties, '$.status'))
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
   ON graph_nodes(json_extract(properties, '$.scope'))
   WHERE node_type = 'todo_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
-  ON graph_nodes(json_extract(properties, '$.created_at'))
-  WHERE node_type = 'todo_item';
 """
 
-# The two created-at partial indexes are stored DESC NULLS LAST on Postgres so
-# they match the created-ordered graph query exactly (#3255): on Postgres a
-# plain ``ORDER BY expr DESC`` is DESC NULLS FIRST, which a backward scan of
-# an ASC index serves, but ``DESC NULLS LAST`` matches neither direction of
-# that index and the planner falls back to a sequential scan. SQLite's DESC
-# is already NULLS LAST, so its indexes are unchanged. The old ASC indexes are
-# dropped by name on every schema init (a no-op once gone) because
-# ``CREATE INDEX IF NOT EXISTS`` would otherwise keep the stale definition.
+#: The two created-at partial indexes on ``graph_nodes``, as (index family,
+#: node_type). They are NOT in the DDL blocks below: their definition is
+#: computed per backend and goes through ``ensure_index``, which fingerprints
+#: the name, serializes initializers, creates before it retires, and retires
+#: the bare legacy index as a member of the same family (#3255).
+_GRAPH_CREATED_AT_INDEXES = (
+    ("idx_graph_nodes_action_created", "action_item"),
+    ("idx_graph_nodes_todo_created", "todo_item"),
+)
+
+
+def graph_created_at_index_columns(backend_type: str) -> str:
+    """The created-at index expression that matches the created-ordered
+    graph query (``ORDER BY created_at DESC NULLS LAST``) on ``backend_type``.
+
+    On Postgres a plain ``ORDER BY expr DESC`` is DESC NULLS FIRST, which a
+    backward scan of an ASC index serves, but ``DESC NULLS LAST`` matches
+    neither direction of that index and the planner falls back to a
+    sequential scan (measured at 200k rows: 0.04 ms to 122 ms), so the index
+    is stored DESC NULLS LAST. SQLite's DESC is already NULLS LAST and its
+    ``CREATE INDEX`` rejects a NULLS clause, so its expression carries none.
+    """
+    if backend_type == "postgres":
+        return "((properties::jsonb->>'created_at')) DESC NULLS LAST"
+    return "json_extract(properties, '$.created_at')"
+
+
 _POSTGRES_JSON_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
   ON graph_nodes(node_type, (properties::jsonb->>'agent_id'));
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'action_item';
-DROP INDEX IF EXISTS idx_graph_nodes_action_created;
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created_desc
-  ON graph_nodes(((properties::jsonb->>'created_at')) DESC NULLS LAST)
-  WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
   ON graph_nodes((properties::jsonb->>'scope'))
-  WHERE node_type = 'todo_item';
-DROP INDEX IF EXISTS idx_graph_nodes_todo_created;
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created_desc
-  ON graph_nodes(((properties::jsonb->>'created_at')) DESC NULLS LAST)
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
@@ -1077,6 +1082,17 @@ class AsyncDatabase:
             statement = statement.strip()
             if statement:
                 await self._backend.execute(statement)
+        # The created-at partial indexes go through ensure_index: the bare
+        # DDL above is idempotent in sequence but not in parallel, and the
+        # definition is computed per backend, so the fingerprinted name is
+        # what tells a changed ordering from the index that served the old
+        # one (#3255).
+        created_at_columns = graph_created_at_index_columns(self.backend_type)
+        for family, node_type in _GRAPH_CREATED_AT_INDEXES:
+            await self.ensure_index(
+                family, "graph_nodes", created_at_columns,
+                where=f"node_type = '{node_type}'",
+            )
 
         # Cache-effectiveness observability (#3019). Existing model_usage
         # databases predate these provider-reported counters, so the greenfield

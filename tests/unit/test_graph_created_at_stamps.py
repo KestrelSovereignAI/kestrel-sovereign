@@ -16,7 +16,6 @@ given writer.
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -47,18 +46,6 @@ def _sources():
     # not a clean tree.
     assert len(sources) > 500, len(sources)
     return sources
-
-
-@pytest.fixture
-def new_york_clock(monkeypatch):
-    """A non-UTC process zone, undone in the right order: ``monkeypatch``
-    restores ``TZ`` at teardown but ``tzset()`` is what the C library reads,
-    and on glibc the cached zone outlives the variable."""
-    monkeypatch.setenv("TZ", "America/New_York")
-    time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
 
 
 def test_scanner_recognises_the_removed_shape():

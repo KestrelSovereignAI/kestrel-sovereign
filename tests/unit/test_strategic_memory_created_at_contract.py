@@ -16,7 +16,6 @@ empty-string rows are rewritten.
 
 from __future__ import annotations
 
-import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -46,20 +45,6 @@ from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNo
 
 AGENT = "did:test:strategy-stamps"
 MIDNIGHT = "2026-07-01T00:00:00+00:00"
-
-
-@pytest.fixture
-def new_york_clock(monkeypatch):
-    """A non-UTC process zone, so "a naive datetime is UTC" is a rule this
-    table can see fail: under CI's UTC runners a naive value read as local
-    time is indistinguishable from one read as UTC. Undone in the right
-    order: ``monkeypatch`` restores ``TZ`` but ``tzset()`` is what the C
-    library reads."""
-    monkeypatch.setenv("TZ", "America/New_York")
-    time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
 
 
 @pytest.mark.parametrize(

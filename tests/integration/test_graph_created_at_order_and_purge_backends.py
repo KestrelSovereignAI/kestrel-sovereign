@@ -61,24 +61,29 @@ async def test_midnight_stamp_is_timed_by_the_scoped_purge(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_created_ordered_action_items_stay_an_index_walk(db_backend):
-    """``DESC NULLS LAST`` must keep the created-at partial index in play.
+@pytest.mark.parametrize(
+    "node_type, family",
+    [("action_item", "idx_graph_nodes_action_created"), ("todo_item", "idx_graph_nodes_todo_created")],
+)
+async def test_created_ordered_reads_stay_an_index_walk(db_backend, node_type, family):
+    """``DESC NULLS LAST`` must keep the created-at partial indexes in play.
     On Postgres a plain DESC is a backward scan of an ASC index, but DESC
     NULLS LAST matches neither direction of it and the planner falls back
-    to a sequential scan; the index is therefore stored DESC NULLS LAST.
-    SQLite's DESC is already NULLS LAST and its index serves both ways."""
+    to a sequential scan; the index is therefore stored DESC NULLS LAST, for
+    the action-item and the todo reads alike. SQLite's DESC is already NULLS
+    LAST and its index serves both ways."""
     db = await _database(db_backend)
     agent = f"did:test:index-{uuid.uuid4().hex}"
     graph = AsyncGraphStore(db, agent_id=agent)
     for n in range(30):
-        await graph.add_node(_node(agent, f"{agent}:a{n}", "action_item", status="pending", created_at=f"2026-07-{1 + n % 28:02d}T00:00:00+00:00"))
+        await graph.add_node(_node(agent, f"{agent}:a{n}", node_type, status="pending", created_at=f"2026-07-{1 + n % 28:02d}T00:00:00+00:00"))
     je = graph._json_extract
     # The partial index's own predicate and the store's ordering, nothing
     # else, so the only index that can serve the ORDER BY is the created-at
     # one: a plan that sorts is a plan the index did not serve.
     body = (
         "SELECT node_id, node_type, label, properties FROM graph_nodes "
-        "WHERE node_type = 'action_item' "
+        f"WHERE node_type = '{node_type}' "
         f"ORDER BY {je('properties', 'created_at')} DESC NULLS LAST LIMIT 25"
     )
     if db.backend_type == "postgres":
@@ -94,7 +99,9 @@ async def test_created_ordered_action_items_stay_an_index_walk(db_backend):
                 await db.execute(f"SET LOCAL {setting} = off")
             rows = await db.fetchall("EXPLAIN " + body)
         plan = " ".join(str(r) for r in rows)
-        assert "Index Scan using idx_graph_nodes_action_created_desc" in plan and "Sort" not in plan, plan
+        # The name carries ensure_index's definition fingerprint; the family
+        # prefix is the stable part.
+        assert f"Index Scan using {family}_" in plan and "Sort" not in plan, plan
     else:
         # SQLite's DESC is already NULLS LAST, so the words must not change
         # the plan: the same index (whichever the planner picks at this
