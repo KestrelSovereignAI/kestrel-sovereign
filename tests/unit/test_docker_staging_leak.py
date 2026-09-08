@@ -179,7 +179,7 @@ async def test_a_successful_run_promotes_staged_entries_and_removes_dir_and_reco
 
 @pytest.mark.asyncio
 async def test_a_symlink_planted_in_the_bind_is_never_promoted_or_followed(
-    executor_with_trash, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog,
 ):
     """The review's reproduction: the container's only action is one
     ``os.symlink("../agent_data", staging / ".staging-pwned")``. Before, the
@@ -203,17 +203,23 @@ async def test_a_symlink_planted_in_the_bind_is_never_promoted_or_followed(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
 
-    await asyncio.wait_for(executor.execute(_script()), timeout=2)  # plants
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(executor.execute(_script()), timeout=2)  # plants
     assert not (trash_root / ".staging-pwned").exists()
     assert not (trash_root / ".staging-pwned").is_symlink()
+    assert "Refusing to promote symlink" in caplog.text, "promotion removed the link and said so"
+    caplog.clear()
 
-    # Even a link that somehow sits in the root is not a sweep candidate.
+    # Even a link that somehow sits in the root is not a sweep candidate: the
+    # sweep itself must skip it, not hand it to promotion for refusal there.
     os.symlink(str(victim), trash_root / ".staging-planted")
     _age(victim, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 3600)
-    await asyncio.wait_for(executor.execute(_script()), timeout=2)  # sweeps
+    with caplog.at_level("DEBUG"):
+        await asyncio.wait_for(executor.execute(_script()), timeout=2)  # sweeps
 
     assert sorted(p.name for p in victim.iterdir()) == ["keys", "memory.db"]
     assert (trash_root / ".staging-planted").is_symlink()
+    assert "Refusing to promote" not in caplog.text, "the sweep followed the link"
 
 
 def test_the_promotion_refuses_a_staging_path_that_is_a_symlink(tmp_path: Path, caplog):
@@ -366,13 +372,17 @@ def test_the_loser_of_a_promotion_race_does_not_cry_stranded(tmp_path: Path, cap
     entries = list(stale.iterdir())
 
     class _Replay:
-        """B's view: the listing it took before A promoted."""
+        """B's view of the interleaving: it checked the directory and listed
+        it BEFORE A promoted, and its renames run after."""
 
         def __init__(self, path):
             self._path = path
 
         def __getattr__(self, name):
             return getattr(self._path, name)
+
+        def lstat(self):
+            return trash_root.lstat()  # a directory, as B saw it
 
         def iterdir(self):
             return iter(entries)
