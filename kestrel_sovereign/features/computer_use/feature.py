@@ -1533,6 +1533,25 @@ class ComputerUseFeature(Feature):
                     break
                 chars = max(_MIN_PREVIEW_CHARS, chars // 2)
                 envelope, run_incomplete = await _build(chars)
+            if serialized_result_len(envelope) > cap:
+                # Still too big with no preview left: a very small configured
+                # cap (KESTREL_MAX_TOOL_RESULT_CHARS is settable, and 1000 is
+                # supported) or artifact paths long enough to dominate on
+                # their own. Measured at cap=1000: 1,250 chars with the
+                # previews already gone, because three absolute paths and the
+                # flags do not shrink.
+                #
+                # Fail closed to the irreducible facts rather than hand the
+                # orchestrator something it will replace with a generic
+                # preview that hides the completeness flag AND the pointer.
+                # The manifest names both streams and everything else about
+                # the run, so one path is enough to find the rest — which is
+                # the whole premise of having an artifact.
+                envelope, run_incomplete = await _build(0)
+                if serialized_result_len(envelope) > cap:
+                    envelope = _minimal_envelope(
+                        envelope, manifest_path, run_incomplete
+                    )
 
             await self._audit_run(
                 tool_name="shell",
@@ -1540,7 +1559,14 @@ class ComputerUseFeature(Feature):
                     **payload,
                     "returncode": result.returncode,
                     "timed_out": result.timed_out,
-                    "truncated": clipped,
+                    # The envelope's view, not the backend's: an uncaptured
+                    # stream trimmed to fit is truncation too, and auditing
+                    # the backend flag alone recorded ``truncated: false``
+                    # beside ``complete: false`` with nothing saying why.
+                    "truncated": bool(
+                        (envelope.data or {}).get("truncated_stdout")
+                        or (envelope.data or {}).get("truncated_stderr")
+                    ),
                     "writers_remaining": result.writers_remaining,
                     "complete": not run_incomplete,
                     "manifest_path": manifest_path,
@@ -1570,6 +1596,31 @@ class ComputerUseFeature(Feature):
                 error=str(exc),
             )
             return ToolResult.failed(error=str(exc))
+
+
+def _minimal_envelope(
+    envelope: ToolResult, manifest_path: Optional[str], incomplete: bool
+) -> ToolResult:
+    """Strip a result to what a caller cannot act without.
+
+    The exit status, whether the run was whole, and where to read it. Paths
+    for the individual streams go too: the manifest carries them, and one
+    pointer that survives beats three that do not.
+    """
+    data = {
+        "returncode": (envelope.data or {}).get("returncode"),
+        "complete": not incomplete,
+        "manifest_path": manifest_path,
+    }
+    summary = (
+        f"Result too large for this agent's tool-result cap; "
+        f"facts only. Full output: {manifest_path}"
+    )
+    if incomplete:
+        return ToolResult.partial(
+            summary, envelope.error or "run did not complete", data=data
+        )
+    return ToolResult.ok(summary, data=data)
 
 
 def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str:

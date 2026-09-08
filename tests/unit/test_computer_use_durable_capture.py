@@ -441,7 +441,8 @@ async def test_the_docker_backend_reads_truncation_off_the_record():
                 exit_code = 0
                 stdout = "a review" + _OUTPUT_TRUNCATED_SUFFIX
                 stderr = "clean"
-                output_truncated = True
+                stdout_truncated = True
+                stderr_truncated = False
 
             return _Rec()
 
@@ -477,7 +478,8 @@ async def test_output_that_merely_looks_truncated_is_not(monkeypatch):
                 exit_code = 0
                 stdout = "here is a log I am quoting" + _OUTPUT_TRUNCATED_SUFFIX
                 stderr = ""
-                output_truncated = False
+                stdout_truncated = False
+                stderr_truncated = False
 
             return _Rec()
 
@@ -489,12 +491,22 @@ async def test_output_that_merely_looks_truncated_is_not(monkeypatch):
     assert result.stdout.endswith(_OUTPUT_TRUNCATED_SUFFIX)
 
 
-def test_the_executor_records_truncation_as_a_field():
-    """The other end: the record must carry the fact, or the backend has
-    nothing to read and falls back to guessing from prose."""
+def test_the_record_tracks_each_stream_separately():
+    """One flag for both streams reported a clipped stdout as a clipped
+    stderr — a different claim from the true one, and the caveat then named
+    a stream that was whole. The streams are capped independently, so the
+    record carries them independently."""
     from kestrel_sovereign.features.compute.models import ExecutionRecord
 
-    assert "output_truncated" in ExecutionRecord.__dataclass_fields__
+    fields = ExecutionRecord.__dataclass_fields__
+    assert "stdout_truncated" in fields and "stderr_truncated" in fields
+
+    only_out = ExecutionRecord(id="a", script_id="b", stdout_truncated=True)
+    assert only_out.stdout_truncated is True
+    assert only_out.stderr_truncated is False
+    # The convenience view stays, because most callers only care that
+    # something was lost.
+    assert only_out.output_truncated is True
 
 
 # ---------------------------------------------------------------------------
@@ -1504,13 +1516,14 @@ def test_the_executor_populates_the_truncation_field():
         exit_code=0,
         stdout="x",
         stderr="",
-        output_truncated=True,
+        stdout_truncated=True,
     )
     whole = probe._build_record(
         subject=_Subject(), context=ctx, exit_code=0, stdout="x", stderr=""
     )
 
-    assert clipped.output_truncated is True
+    assert clipped.stdout_truncated is True
+    assert clipped.stderr_truncated is False
     assert whole.output_truncated is False
 
 
@@ -1551,4 +1564,204 @@ async def test_the_run_path_carries_truncation_into_the_record():
         _Subject(), temp_dir_prefix="probe-", runner=runner
     )
 
-    assert record.output_truncated is True
+    assert record.stdout_truncated is True
+    assert record.stderr_truncated is False
+
+
+# ---------------------------------------------------------------------------
+# Review round 5
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_command_that_reads_stdin_does_not_hang(workspace: Path, queue):
+    """Review round 5, and the trap this ticket's own text names. Stdin was
+    inherited from the server, so a command that reads it waits for input no
+    one will send — ``claude -p`` blocks forever on an inherited stdin, which
+    the merge-gate doctrine spells ``</dev/null`` and which this surface
+    cannot express, the redirect being shell grammar. The reviewer the
+    feature exists to run is the exact program that hangs."""
+    import asyncio as _a
+
+    f = await _feature(workspace, queue)
+
+    env = await _a.wait_for(
+        f.shell(
+            command="python3 -c \"import sys; print(repr(sys.stdin.read()))\"",
+            timeout=30,
+        ),
+        timeout=20,
+    )
+
+    assert env.status is ToolResultStatus.OK
+    assert env.data["stdout"].strip() == "''"
+
+
+@pytest.mark.asyncio
+async def test_a_capture_whose_close_fails_is_not_complete(
+    tmp_path: Path, monkeypatch
+):
+    """A close flushes, and a flush can fail — a full disk surfaces there
+    rather than at any write. Swallowing it discarded the buffered tail and
+    called the file complete, the same shape as the unread pump exception."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+
+    def open_with_failing_close(cap):
+        out_fh, err_fh = real_open(cap)
+
+        class _Failing:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def write(self, b):
+                return self._inner.write(b)
+
+            def fileno(self):
+                return self._inner.fileno()
+
+            def close(self):
+                self._inner.close()
+                raise OSError("No space left on device")
+
+        return _Failing(out_fh), err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", open_with_failing_close)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('body')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True
+    assert "No space left on device" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_a_tiny_cap_still_produces_a_readable_envelope(
+    workspace: Path, queue, monkeypatch
+):
+    """The fit loop gave up after five halvings without re-checking, so a
+    small configured cap — KESTREL_MAX_TOOL_RESULT_CHARS is settable and
+    1,000 is supported — left an oversized envelope for the orchestrator to
+    replace with a generic preview that hides both the verdict and the
+    completeness flag. It now fails closed: previews go, facts and paths
+    stay, because that is what a caller needs in order to go and read the
+    artifact."""
+    import kestrel_sovereign.features.base as base_mod
+    from kestrel_sovereign.features.base import serialized_result_len
+
+    monkeypatch.setattr(base_mod, "orchestrator_result_cap", lambda: 1000)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 1000,
+    )
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command="python3 -c \"print('q' * 100000)\"",
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert serialized_result_len(env) <= 1000, serialized_result_len(env)
+    assert env.data["manifest_path"]
+    assert "complete" in env.data
+
+
+@pytest.mark.asyncio
+async def test_the_audit_calls_feature_level_clipping_truncation(
+    workspace: Path, queue
+):
+    """The audit read the backend's flag, so an uncaptured stream trimmed to
+    fit recorded ``truncated: false`` beside ``complete: false`` — the
+    canonical row saying the run failed and not saying why."""
+    f = await _feature(workspace, queue)
+
+    await f.shell(command="python3 -c \"print('z' * 40000)\"", timeout=60)
+
+    rows = [
+        json.loads(line)
+        for line in (workspace / "audit.jsonl").read_text().splitlines()
+    ]
+    row = [r for r in rows if r["tool"] == "shell"][-1]
+    assert row["args"]["complete"] is False
+    assert row["args"]["truncated"] is True
+
+
+def test_the_truncation_flags_survive_a_round_trip():
+    """A clipped record reconstructed from storage that reported itself whole
+    would defeat the point of moving the fact off the text."""
+    from kestrel_sovereign.features.compute.models import ExecutionRecord
+
+    original = ExecutionRecord(
+        id="e", script_id="s", stdout_truncated=True, stderr_truncated=False
+    )
+
+    restored = ExecutionRecord.from_dict(original.to_dict())
+
+    assert restored.stdout_truncated is True
+    assert restored.stderr_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_the_execution_store_persists_the_truncation_flags(tmp_path: Path):
+    """And through SQL. ``CREATE TABLE IF NOT EXISTS`` is the whole schema
+    story in that store, so a database made before the column existed never
+    gains it — the additive migration is what stops a restored record from
+    quietly reporting itself whole."""
+    from kestrel_sovereign.features.compute.models import ComputeScript, ExecutionRecord
+    from kestrel_sovereign.features.compute.script_store import ScriptStore
+
+    store = ScriptStore(db_path=str(tmp_path / "compute.db"))
+    await store.initialize()
+
+    script = ComputeScript(
+        id="s1", name="n", language="python", content="print(1)", purpose="p"
+    )
+    await store.save(script)
+    await store.save_execution(
+        ExecutionRecord(
+            id="e1", script_id="s1", stdout_truncated=True, stderr_truncated=False
+        )
+    )
+
+    restored = await store.get_execution("e1")
+
+    assert restored is not None
+    assert restored.stdout_truncated is True
+    assert restored.stderr_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_an_older_database_gains_the_columns(tmp_path: Path):
+    """The migration half, driven against a table built without them."""
+    import aiosqlite
+
+    from kestrel_sovereign.features.compute.script_store import ScriptStore
+
+    db_path = tmp_path / "old.db"
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "CREATE TABLE compute_executions ("
+            "id TEXT PRIMARY KEY, script_id TEXT NOT NULL, started_at TIMESTAMP,"
+            " completed_at TIMESTAMP, exit_code INTEGER, stdout TEXT,"
+            " stderr TEXT, executor TEXT, container_id TEXT,"
+            " resource_usage TEXT, dry_run INTEGER, workdir TEXT)"
+        )
+        await db.commit()
+
+    await ScriptStore(db_path=str(db_path)).initialize()
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("PRAGMA table_info(compute_executions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+
+    assert {"stdout_truncated", "stderr_truncated"} <= columns

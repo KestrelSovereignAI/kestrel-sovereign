@@ -185,12 +185,15 @@ class DockerSandboxBackend(SandboxBackend):
             )
         duration_ms = int((time.monotonic() - started) * 1000)
 
-        truncated = bool(getattr(record, "output_truncated", False))
         stdout, out_trunc = _split_truncation_marker(
-            record.stdout, _OUTPUT_TRUNCATED_SUFFIX, truncated
+            record.stdout,
+            _OUTPUT_TRUNCATED_SUFFIX,
+            bool(getattr(record, "stdout_truncated", False)),
         )
         stderr, err_trunc = _split_truncation_marker(
-            record.stderr, _OUTPUT_TRUNCATED_SUFFIX, truncated
+            record.stderr,
+            _OUTPUT_TRUNCATED_SUFFIX,
+            bool(getattr(record, "stderr_truncated", False)),
         )
 
         stdout_path = stderr_path = None

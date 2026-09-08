@@ -232,9 +232,8 @@ class BaseExecutor(ABC):
                 stdout=self._decode_output(result.stdout),
                 stderr=self._decode_output(result.stderr),
                 container_id=result.container_id,
-                output_truncated=bool(
-                    result.stdout.truncated or result.stderr.truncated
-                ),
+                stdout_truncated=bool(result.stdout.truncated),
+                stderr_truncated=bool(result.stderr.truncated),
             )
             logger.info(
                 "Execution %s... completed with exit code %s in %.2fs",
@@ -501,7 +500,8 @@ class BaseExecutor(ABC):
         stdout: str,
         stderr: str,
         container_id: Optional[str] = None,
-        output_truncated: bool = False,
+        stdout_truncated: bool = False,
+        stderr_truncated: bool = False,
     ) -> ExecutionRecord:
         return ExecutionRecord(
             id=context.execution_id,
@@ -511,7 +511,8 @@ class BaseExecutor(ABC):
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
-            output_truncated=output_truncated,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
             executor=self.name,
             container_id=container_id,
             workdir=context.workdir,

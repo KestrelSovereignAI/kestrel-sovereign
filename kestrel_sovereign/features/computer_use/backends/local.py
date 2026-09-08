@@ -123,6 +123,13 @@ class LocalSandboxBackend(SandboxBackend):
         which is reported rather than waited on: a command that legitimately
         daemonizes should not hold the tool open for its whole timeout, and a
         capture it may still append to must not be called final.
+
+        Stdin is ``/dev/null``. Inherited, it is the server's, and a command
+        that reads it waits for input no one will send: ``claude -p`` blocks
+        forever on an inherited stdin, which is the trap the merge-gate
+        doctrine spells ``</dev/null`` and which this surface cannot express,
+        since the redirect is shell grammar. The reviewer this feature exists
+        to run is the exact program that hangs.
         """
         if not argv:
             raise ValueError("empty argv")
@@ -131,6 +138,7 @@ class LocalSandboxBackend(SandboxBackend):
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
 
+        close_error: OSError | None = None
         out_fh = err_fh = None
         if capture is not None:
             try:
@@ -151,6 +159,7 @@ class LocalSandboxBackend(SandboxBackend):
                     *full_argv,
                     cwd=str(cwd) if cwd else None,
                     env=sanitized_subprocess_env(env),
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     **new_process_group_kwargs(),
@@ -227,12 +236,16 @@ class LocalSandboxBackend(SandboxBackend):
                 )
                 stdout_bytes = stderr_bytes = b""
         finally:
+            # A close flushes, and a flush can fail — a full disk surfaces
+            # here rather than at any write. Swallowing it discarded the
+            # buffered tail of a capture and called the file complete, the
+            # same shape as the unread pump exception.
             for fh in (out_fh, err_fh):
                 if fh is not None:
                     try:
                         fh.close()
-                    except OSError:  # pragma: no cover - defensive
-                        pass
+                    except OSError as exc:  # pragma: no cover - disk-full path
+                        close_error = close_error or exc
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
@@ -240,12 +253,16 @@ class LocalSandboxBackend(SandboxBackend):
             # A failed pump is lost output, which is what ``truncated_*``
             # already means and already folds into completeness — a second
             # field for the same fact would be a second thing to forget.
-            lost = pump_error is not None
+            lost = pump_error is not None or close_error is not None
             return CompletedRun(
                 argv=list(argv),
                 returncode=proc.returncode if proc.returncode is not None else -1,
                 stdout="",
-                stderr=f"capture write failed: {pump_error}" if lost else "",
+                stderr=(
+                    f"capture write failed: {pump_error or close_error}"
+                    if lost
+                    else ""
+                ),
                 duration_ms=duration_ms,
                 truncated_stdout=lost,
                 truncated_stderr=lost,
