@@ -118,6 +118,7 @@ PROVENANCE_SOURCE_MARKERS = (
     "current_chain",
     *TRACE_PARENT_MARKERS,
 )
+SOURCE_IDENTIFIER_CHAIN = re.compile(r"[a-z_][a-z0-9_.-]*", re.IGNORECASE)
 HTTP_SEGMENTS = {
     # Every request-routed agent endpoint is addressable through the host's
     # /api/agents/{name}/... alias in multi-agent mode.  Inventory the complete
@@ -590,7 +591,7 @@ def _module_string_constants(
 
 def _module_strings_at_definition(
     tree: ast.Module,
-    definition: ast.FunctionDef | ast.AsyncFunctionDef,
+    definition: ast.AST,
     source_path: Path | None = None,
 ) -> dict[str, str]:
     """Resolve globals as they existed when a decorator executed.
@@ -1899,6 +1900,110 @@ def _is_indirect_tool_dispatcher(
     )
 
 
+def _imperatively_decorated_tool_names(
+    tree: ast.Module,
+    decorator_aliases: dict[str, ast.Call | None],
+    source_path: Path | None = None,
+) -> set[str]:
+    """Return SDK tools published by assigning a decorated callable."""
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+
+        decorator = value.func
+        decorator_name = (
+            decorator.id
+            if isinstance(decorator, ast.Name)
+            else decorator.attr
+            if isinstance(decorator, ast.Attribute)
+            else ""
+        )
+        applies_stored_factory = (
+            decorator_name in decorator_aliases
+            and decorator_aliases[decorator_name] is not None
+        )
+        if not isinstance(decorator, ast.Call) and not applies_stored_factory:
+            continue
+        target_names = {
+            name
+            for target in targets
+            for name in (
+                {target.id}
+                if isinstance(target, ast.Name)
+                else {target.attr}
+                if isinstance(target, ast.Attribute)
+                else set()
+            )
+        }
+        if not target_names:
+            continue
+        constants = _module_strings_at_definition(tree, node, source_path)
+        for target_name in target_names:
+            public_name = _public_tool_name(
+                decorator,
+                target_name,
+                constants,
+                decorator_aliases,
+            )
+            if public_name is not None:
+                if len(value.args) != 1 or value.keywords:
+                    raise AssertionError(
+                        "Unresolved imperative @tool application: "
+                        f"{ast.unparse(value)}"
+                    )
+                names.add(public_name)
+    return names
+
+
+def _tool_surfaces_from_module(
+    tree: ast.Module,
+    relative_path: str,
+    source_path: Path | None = None,
+) -> set[str]:
+    """Inventory declarative and imperative SDK tool registrations."""
+
+    surfaces: set[str] = set()
+    decorator_aliases = _tool_decorator_aliases(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        string_constants = _module_strings_at_definition(
+            tree, node, source_path
+        )
+        for decorator in node.decorator_list:
+            public_name = _public_tool_name(
+                decorator,
+                node.name,
+                string_constants,
+                decorator_aliases,
+            )
+            if public_name is not None:
+                surfaces.add(f"{relative_path}::{public_name}")
+    imperative_surfaces = {
+        f"{relative_path}::{public_name}"
+        for public_name in _imperatively_decorated_tool_names(
+            tree,
+            decorator_aliases,
+            source_path,
+        )
+    }
+    surfaces.update(imperative_surfaces)
+    return surfaces
+
+
 @lru_cache(maxsize=None)
 def _discovered_tool_surfaces() -> frozenset[str]:
     """Return every core feature tool, including generated dispatch boundaries.
@@ -1913,22 +2018,8 @@ def _discovered_tool_surfaces() -> frozenset[str]:
     feature_root = REPO_ROOT / "kestrel_sovereign/features"
     for path in feature_root.rglob("*.py"):
         tree = _parsed_module(path)
-        decorator_aliases = _tool_decorator_aliases(tree)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            string_constants = _module_strings_at_definition(tree, node, path)
-            for decorator in node.decorator_list:
-                public_name = _public_tool_name(
-                    decorator,
-                    node.name,
-                    string_constants,
-                    decorator_aliases,
-                )
-                if public_name is None:
-                    continue
-                relative = path.relative_to(REPO_ROOT).as_posix()
-                surfaces.add(f"{relative}::{public_name}")
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        surfaces.update(_tool_surfaces_from_module(tree, relative, path))
     return frozenset(surfaces | _discovered_runtime_generated_tool_surfaces())
 
 
@@ -6780,6 +6871,31 @@ def test_call_produced_tool_decorators_are_inventoried() -> None:
     ) == "terminate_child"
 
 
+def test_imperatively_decorated_tools_are_inventoried() -> None:
+    tree = ast.parse(
+        "class Feature:\n"
+        "    def direct(self, target):\n"
+        "        pass\n"
+        "    direct = tool('terminate_child', 'Terminate child')(direct)\n\n"
+        "    publish = tool('stop_peer', 'Stop peer')\n"
+        "    def aliased(self, target):\n"
+        "        pass\n"
+        "    aliased = publish(aliased)\n\n"
+        "    def ordinary(self):\n"
+        "        pass\n"
+        "    ordinary = unrelated(ordinary)\n"
+    )
+
+    assert _imperatively_decorated_tool_names(
+        tree,
+        _tool_decorator_aliases(tree),
+    ) == {"stop_peer", "terminate_child"}
+    assert _tool_surfaces_from_module(tree, "feature.py") == {
+        "feature.py::stop_peer",
+        "feature.py::terminate_child",
+    }
+
+
 def test_repository_scans_reuse_parsed_trees_and_analysis_summaries(
     tmp_path: Path,
 ) -> None:
@@ -8104,6 +8220,18 @@ def _is_trace_parent_token(token: str) -> bool:
     )
 
 
+def _source_text_may_expose_provenance(source: str) -> bool:
+    """Apply the same trace-parent grammar to the cheap source prefilter."""
+
+    source = source.casefold()
+    return any(
+        marker in source for marker in PROVENANCE_SOURCE_MARKERS
+    ) or any(
+        _is_trace_parent_token(token)
+        for token in SOURCE_IDENTIFIER_CHAIN.findall(source)
+    )
+
+
 def _has_provenance_token(node: ast.AST, aliases: set[str] | None = None) -> bool:
     tokens = set(_identifier_tokens(node))
     # The bare string ``"ORCHESTRATOR"`` is also a provider role label in
@@ -8466,11 +8594,32 @@ def _cross_agent_control_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     control_helpers: set[str] | None = None,
     control_return_helpers: set[str] | None = None,
+    parameter_return_flows: dict[str, _ParameterReturnFlow] | None = None,
 ) -> set[str]:
     """Resolve local names that reference cross-agent control callables."""
 
     assignments: list[tuple[str, str]] = []
     container_aliases = _mutable_container_alias_snapshots(function)
+    callable_alias_edges = _scope_callable_alias_edges(function)
+
+    def reference_sources(value: ast.AST) -> set[str]:
+        sources = set(
+            _control_reference_sources(value, control_return_helpers)
+        )
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        if not isinstance(value, ast.Call):
+            return sources
+        for source_name in _expanded_callable_sources(
+            _call_name(value),
+            callable_alias_edges,
+        ):
+            flow = (parameter_return_flows or {}).get(source_name)
+            if flow is None:
+                continue
+            for argument in _bound_parameter_flow_arguments(value, flow):
+                sources.update(reference_sources(argument))
+        return sources
 
     def expand_container_aliases(
         names: set[str], node: ast.AST
@@ -8503,9 +8652,7 @@ def _cross_agent_control_aliases(
     for parameter, default in default_bindings:
         assignments.extend(
             (parameter.arg.casefold(), source)
-            for source in _control_reference_sources(
-                default, control_return_helpers
-            )
+            for source in reference_sources(default)
         )
 
     for node in _walk_lexical_scope(function):
@@ -8530,9 +8677,7 @@ def _cross_agent_control_aliases(
             if mutation is not None:
                 target_names, value = mutation
                 target_names = expand_container_aliases(target_names, node)
-                sources = _control_reference_sources(
-                    value, control_return_helpers
-                )
+                sources = reference_sources(value)
                 assignments.extend(
                     (target_name, source)
                     for target_name in target_names
@@ -8541,7 +8686,7 @@ def _cross_agent_control_aliases(
             continue
         if value is None:
             continue
-        sources = _control_reference_sources(value, control_return_helpers)
+        sources = reference_sources(value)
         if not sources:
             continue
         for target in targets:
@@ -9105,6 +9250,9 @@ def _provenance_aliases(
     parameter_mutation_flows: dict[
         str, tuple[_ParameterMutationFlow, ...]
     ] | None = None,
+    control_parameter_return_flows: dict[
+        str, _ParameterReturnFlow
+    ] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -9235,7 +9383,10 @@ def _provenance_aliases(
     )
     control_aliases = (
         _cross_agent_control_aliases(
-            function, control_helpers, control_return_helpers
+            function,
+            control_helpers,
+            control_return_helpers,
+            control_parameter_return_flows,
         )
         if authority_analysis
         else set()
@@ -9948,6 +10099,13 @@ def _local_control_helpers(
     function_imported_control_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] | None = None,
+    function_callback_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] | None = None,
+    function_parameter_return_flows: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ] | None = None,
 ) -> set[str]:
     """Find local helpers that eventually invoke a control sink.
 
@@ -9985,12 +10143,19 @@ def _local_control_helpers(
         for node in _walk_lexical_scope(caller)
         if isinstance(node, ast.Call)
     ]
+    callable_alias_edges = {
+        function: _scope_callable_alias_edges(function)
+        for function in functions
+    }
+    callback_aliases = function_callback_control_aliases
+    if callback_aliases is None:
+        callback_aliases = {function: set() for function in functions}
 
-    def callback_arguments(
+    def callback_parameter_bindings(
         call: ast.Call,
         callee: ast.FunctionDef | ast.AsyncFunctionDef,
         callback_parameters: set[str],
-    ) -> list[ast.AST]:
+    ) -> list[tuple[str, ast.AST]]:
         positional_parameters = [
             *callee.args.posonlyargs,
             *callee.args.args,
@@ -10004,13 +10169,13 @@ def _local_control_helpers(
             and positional_parameters[0].arg.casefold() in {"self", "cls"}
         ):
             positional_parameters = positional_parameters[1:]
-        values = [
-            value
+        bindings = [
+            (parameter.arg.casefold(), value)
             for parameter, value in zip(positional_parameters, call.args)
             if parameter.arg.casefold() in callback_parameters
         ]
-        values.extend(
-            keyword.value
+        bindings.extend(
+            (keyword.arg.casefold(), keyword.value)
             for keyword in call.keywords
             if keyword.arg is not None
             and keyword.arg.casefold() in callback_parameters
@@ -10019,15 +10184,20 @@ def _local_control_helpers(
         # invokes any callback parameter, conservatively inspect the expanded
         # value rather than treating the ambiguity as evidence of safety.
         if callback_parameters:
-            values.extend(
+            ambiguous_values = [
                 argument.value
                 for argument in call.args
                 if isinstance(argument, ast.Starred)
-            )
-            values.extend(
+            ]
+            ambiguous_values.extend(
                 keyword.value for keyword in call.keywords if keyword.arg is None
             )
-        return values
+            bindings.extend(
+                (parameter, value)
+                for parameter in callback_parameters
+                for value in ambiguous_values
+            )
+        return bindings
 
     def is_control_reference(node: ast.AST, aliases: set[str]) -> bool:
         sources = set(_control_reference_sources(node))
@@ -10043,10 +10213,12 @@ def _local_control_helpers(
         changed = False
         for function in functions:
             function_name = function.name.casefold()
-            if function_name in helper_names:
-                continue
-            visible_control_aliases = helper_names | set(
-                (function_imported_control_aliases or {}).get(function, ())
+            visible_control_aliases = (
+                helper_names
+                | set(
+                    (function_imported_control_aliases or {}).get(function, ())
+                )
+                | callback_aliases[function]
             )
             scope_nodes = _walk_lexical_scope(function)
             state_object_aliases = _cross_agent_state_object_aliases(function)
@@ -10074,15 +10246,17 @@ def _local_control_helpers(
                 for node in scope_nodes
             )
             if invokes_control or mutates_cross_agent_state:
-                helper_names.add(function_name)
-                changed = True
-                continue
+                if function_name not in helper_names:
+                    helper_names.add(function_name)
+                    changed = True
 
             callback_parameters = invoked_parameters.get(function, set())
             if not callback_parameters:
                 continue
             for caller, call in call_sites:
-                if _call_name(call).casefold() != function_name:
+                if function_name not in _expanded_callable_sources(
+                    _call_name(call), callable_alias_edges[caller]
+                ):
                     continue
                 caller_aliases = _cross_agent_control_aliases(
                     caller,
@@ -10091,17 +10265,28 @@ def _local_control_helpers(
                         (function_imported_control_aliases or {}).get(
                             caller, ()
                         )
+                    )
+                    | callback_aliases[caller],
+                    parameter_return_flows=(
+                        (function_parameter_return_flows or {}).get(caller)
                     ),
                 )
-                if any(
-                    is_control_reference(argument, caller_aliases)
-                    for argument in callback_arguments(
+                discovered_parameters = {
+                    parameter
+                    for parameter, argument in callback_parameter_bindings(
                         call, function, callback_parameters
                     )
-                ):
+                    if is_control_reference(argument, caller_aliases)
+                }
+                new_parameters = (
+                    discovered_parameters - callback_aliases[function]
+                )
+                if new_parameters:
+                    callback_aliases[function].update(new_parameters)
+                    changed = True
+                if discovered_parameters and function_name not in helper_names:
                     helper_names.add(function_name)
                     changed = True
-                    break
     return helper_names
 
 
@@ -11856,8 +12041,8 @@ def _source_or_imports_may_expose_provenance(source_path: Path) -> bool:
         if candidate in seen:
             continue
         seen.add(candidate)
-        source = _source_text(candidate).casefold()
-        if any(marker in source for marker in PROVENANCE_SOURCE_MARKERS):
+        source = _source_text(candidate)
+        if _source_text_may_expose_provenance(source):
             return True
         pending.extend(_repository_import_paths(candidate) - seen)
     return False
@@ -11869,25 +12054,7 @@ def _scope_or_imports_may_expose_provenance(
 ) -> bool:
     """Bound deep helper resolution to scopes that can consume provenance."""
 
-    lexical_nodes = _walk_lexical_scope(scope)
-    lexical_values = {
-        node.id.casefold()
-        for node in lexical_nodes
-        if isinstance(node, ast.Name)
-    } | {
-        node.attr.casefold()
-        for node in lexical_nodes
-        if isinstance(node, ast.Attribute)
-    } | {
-        node.value.casefold()
-        for node in lexical_nodes
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    if any(
-        marker in value
-        for value in lexical_values
-        for marker in PROVENANCE_SOURCE_MARKERS
-    ):
+    if _has_provenance_token(scope):
         return True
     if source_path is None:
         return False
@@ -11979,9 +12146,14 @@ def _functions_reachable_by_local_calls(
     pending = list(reachable)
     while pending:
         function = pending.pop()
+        callable_alias_edges = _scope_callable_alias_edges(function)
         called_names = {
-            _call_name(call).casefold()
+            source_name
             for call in _lexical_scope_calls(function)
+            for source_name in _expanded_callable_sources(
+                _call_name(call),
+                callable_alias_edges,
+            )
         }
         for name in called_names:
             for callee in by_name.get(name, ()):
@@ -12913,6 +13085,25 @@ def _authority_provenance_lines(
         function_parents,
         eligible_functions=parameter_flow_functions,
     )
+    local_parameter_return_flows = _local_parameter_return_flows(
+        functions,
+        function_parameter_return_flows,
+    )
+    local_parameter_return_flows_by_name = _merged_parameter_flow_map(
+        [
+            (function.name, local_parameter_return_flows[function])
+            for function in functions
+        ]
+    )
+    function_control_parameter_return_flows = {
+        function: _merged_parameter_flow_map(
+            [
+                *local_parameter_return_flows_by_name.items(),
+                *function_parameter_return_flows[function].items(),
+            ]
+        )
+        for function in functions
+    }
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_accessor_aliases(tree)
@@ -12968,10 +13159,15 @@ def _authority_provenance_lines(
         function_parents,
         eligible_functions=control_import_functions,
     )
+    function_callback_control_aliases = {
+        function: set() for function in functions
+    }
     control_helpers = _local_control_helpers(
         functions,
         module_control_aliases,
         function_control_imports,
+        function_callback_control_aliases,
+        function_control_parameter_return_flows,
     )
     control_return_helpers: set[str] = set()
     class_control_aliases: dict[
@@ -12988,6 +13184,7 @@ def _authority_provenance_lines(
         visible_control_aliases = {
             function: function_control_imports[function]
             | class_control_aliases.get(function, set())
+            | function_callback_control_aliases[function]
             for function in functions
         }
         control_return_helpers.update(
@@ -13002,6 +13199,8 @@ def _authority_provenance_lines(
                 functions,
                 module_control_aliases | control_helpers,
                 visible_control_aliases,
+                function_callback_control_aliases,
+                function_control_parameter_return_flows,
             )
         )
         class_control_aliases = _class_control_state_aliases(
@@ -13125,7 +13324,8 @@ def _authority_provenance_lines(
             | function_imported_provenance_helpers[function],
             control_helpers
             | function_control_imports[function]
-            | class_control_aliases.get(function, set()),
+            | class_control_aliases.get(function, set())
+            | function_callback_control_aliases[function],
             module_provenance_aliases
             | class_provenance_aliases.get(function, set())
             | inherited,
@@ -13136,6 +13336,9 @@ def _authority_provenance_lines(
             state_object_aliases=function_state_objects[function],
             provenance_accessor_aliases=function_accessor_aliases[function],
             parameter_mutation_flows=parameter_mutation_flows,
+            control_parameter_return_flows=(
+                function_control_parameter_return_flows[function]
+            ),
         )
         function_provenance[function] = resolved
         return resolved
@@ -13153,8 +13356,10 @@ def _authority_provenance_lines(
             function,
             control_helpers
             | function_control_imports[function]
-            | class_control_aliases.get(function, set()),
+            | class_control_aliases.get(function, set())
+            | function_callback_control_aliases[function],
             control_return_helpers | function_control_imports[function],
+            function_control_parameter_return_flows[function],
         )
         state_object_aliases = function_state_objects[function]
         provenance_aliases, provenance_selected_targets = (
@@ -13513,9 +13718,9 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     """Reuse one module's parsed tree and complete authority summary."""
 
     source_path = source_path.resolve()
-    source = _source_text(source_path).casefold()
-    if not any(
-        marker in source for marker in PROVENANCE_SOURCE_MARKERS
+    source = _source_text(source_path)
+    if not _source_text_may_expose_provenance(
+        source
     ) and not _source_or_imports_may_expose_provenance(
         source_path
     ) and not _source_references_repository_reexport(
@@ -15818,6 +16023,21 @@ def test_provenance_scanner_classifies_trace_parent_metadata(
         {2, 6}
     )
 
+    contextual_source = (
+        "def nested(request, target):\n"
+        "    if request.trace_context.parent:\n"
+        "        target.shutdown()\n\n"
+        "def inverse(request, target):\n"
+        "    if request.parent_context.span:\n"
+        "        terminate_child(target)\n"
+    )
+    contextual_path = tmp_path / "contextual_lineage_controller.py"
+    contextual_path.write_text(contextual_source, encoding="utf-8")
+
+    assert _cached_authority_provenance_lines(
+        contextual_path
+    ) == frozenset({2, 6})
+
 
 def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> None:
     tree = ast.parse(
@@ -15932,6 +16152,88 @@ def test_provenance_scanner_classifies_deferred_callback_dispatch(
     )
 
     assert _authority_provenance_lines(tree) == {2}
+
+
+def test_provenance_scanner_binds_local_control_callback_parameters() -> None:
+    positional = ast.parse(
+        "def choose(request, callback, target):\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    choose(request, terminate_child, target)\n"
+    )
+    keyword = ast.parse(
+        "def choose(request, callback, target):\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    choose(request, callback=terminate_child, target=target)\n"
+    )
+    benign = ast.parse(
+        "def choose(request, callback, target):\n"
+        "    if request.causation_chain:\n"
+        "        callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    choose(request, record_metric, target)\n"
+    )
+
+    assert _authority_provenance_lines(positional) == {2}
+    assert _authority_provenance_lines(keyword) == {2}
+    assert _authority_provenance_lines(benign) == set()
+
+
+def test_provenance_scanner_follows_local_control_helper_call_aliases() -> None:
+    controlled = ast.parse(
+        "def apply(callback, target):\n"
+        "    callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    alias = apply\n"
+        "    if request.causation_chain:\n"
+        "        alias(terminate_child, target)\n"
+    )
+    benign = ast.parse(
+        "def apply(callback, target):\n"
+        "    callback(target)\n\n"
+        "def dispatch(request, target):\n"
+        "    alias = apply\n"
+        "    if request.causation_chain:\n"
+        "        alias(record_metric, target)\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {6}
+    assert _authority_provenance_lines(benign) == set()
+
+
+def test_provenance_scanner_follows_neutral_control_return_wrappers() -> None:
+    direct = ast.parse(
+        "def passthrough(fn):\n"
+        "    return fn\n\n"
+        "def dispatch(request, target):\n"
+        "    operation = passthrough(terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        operation(target)\n"
+    )
+    aliased = ast.parse(
+        "def passthrough(fn):\n"
+        "    return fn\n\n"
+        "def dispatch(request, target):\n"
+        "    alias = passthrough\n"
+        "    operation = alias(terminate_child)\n"
+        "    if request.causation_chain:\n"
+        "        operation(target)\n"
+    )
+    benign = ast.parse(
+        "def passthrough(fn):\n"
+        "    return fn\n\n"
+        "def dispatch(request, target):\n"
+        "    operation = passthrough(record_metric)\n"
+        "    if request.causation_chain:\n"
+        "        operation(target)\n"
+    )
+
+    assert _authority_provenance_lines(direct) == {6}
+    assert _authority_provenance_lines(aliased) == {7}
+    assert _authority_provenance_lines(benign) == set()
 
 
 @pytest.mark.parametrize(
