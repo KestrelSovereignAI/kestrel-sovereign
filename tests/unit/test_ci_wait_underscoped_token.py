@@ -128,7 +128,10 @@ async def test_fetch_classifies_pr_ok_then_every_check_endpoint_403_as_underscop
     async def fake_get(url, *, token, timeout, ref):
         if "/pulls/" in url:
             return {"head": {"sha": "deadbeef"}}
-        raise PRWatchAuthError(f"GitHub returned 403 for {ref}")
+        # ``status_code`` is load-bearing: only a 403 is an endpoint refusing
+        # a valid token, and only that becomes _UnderscopedToken. A 401 would
+        # mean the credential itself is finished and stays plain auth.
+        raise PRWatchAuthError(f"GitHub returned 403 for {ref}", status_code=403)
 
     monkeypatch.setattr(
         "kestrel_sovereign.signals.sources.github_pr_watch._github_get", fake_get
@@ -146,7 +149,7 @@ async def test_fetch_leaves_a_failing_pr_read_as_plain_auth(monkeypatch):
     bad or expired — that is the transient class, and must not be relabelled
     as a permission gap."""
     async def fake_get(url, *, token, timeout, ref):
-        raise PRWatchAuthError(f"GitHub returned 401 for {ref}")
+        raise PRWatchAuthError(f"GitHub returned 401 for {ref}", status_code=401)
 
     monkeypatch.setattr(
         "kestrel_sovereign.signals.sources.github_pr_watch._github_get", fake_get

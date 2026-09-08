@@ -265,12 +265,14 @@ class _UnderscopedToken(Exception):
     gate that is merely slow — which is how a wait sat blind for 920 seconds
     on 2026-09-07 while ``gh`` read the same check runs without trouble.
 
-    Narrower than it once was. A refused Checks API alone no longer reaches
-    here: :func:`fetch_check_rollup` falls back to the Actions API and the
-    wait proceeds on a caveated rollup. What still reaches here is a refusal
-    it cannot route around — Checks and Actions both refused, or the status
-    endpoint refused — i.e. there is no verdict to caveat, only a credential
-    to fix.
+    Narrower than it once was, twice over. A refused Checks API alone no
+    longer reaches here: :func:`fetch_check_rollup` falls back to the Actions
+    API and the wait proceeds on a caveated rollup. And it is a **403** only —
+    a permission this credential lacks. A 401 means the credential itself is
+    finished, which is a different remedy and stays on the plain
+    ``blocked="auth"`` path. What is left is a valid token refused by an
+    endpoint it cannot route around: no verdict to caveat, only a permission
+    to grant.
     """
 
 
@@ -340,6 +342,15 @@ class CIWaitable:
                     base, head_sha, token=token, timeout=10, ref=ref
                 )
             except PRWatchAuthError as exc:
+                if exc.status_code != 403:
+                    # A 401 is the credential itself — expired or revoked
+                    # between the PR read and this one — not an endpoint
+                    # refusing a valid token. It belongs on the plain
+                    # ``blocked="auth"`` path: wrapping it here would tell an
+                    # operator to grant repository permissions when what they
+                    # need is a new credential, and a remedy that cannot work
+                    # is its own way of being stuck.
+                    raise
                 raise _UnderscopedToken(
                     f"{ref}: the PR read succeeded but a check endpoint "
                     f"returned an authorization error ({exc}). The token "

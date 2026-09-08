@@ -795,3 +795,39 @@ async def test_legacy_statuses_alone_are_still_a_rollup(monkeypatch):
     assert prw._check_verdict(rollup.check_runs, rollup.combined_status) == "success"
     # Still caveated: a pass read this way is not an unqualified pass.
     assert "all check runs" in rollup.caveat()
+
+
+@pytest.mark.asyncio
+async def test_a_mid_poll_401_reports_auth_not_a_permission_gap(monkeypatch, _token):
+    """Review round 5, and the other end of round 4's fix. Teaching
+    ``fetch_check_rollup`` to propagate a 401 accomplishes nothing if the
+    provider's catch still converts every auth error into a permission block:
+    the operator is told to grant 'Actions' read when what they need is a new
+    credential, and a remedy that cannot work is its own way of being stuck."""
+    st = await _poll(monkeypatch, {
+        "/pulls/": {"state": "open", "merged": False, "head": {"sha": SHA}},
+        "/check-runs": PRWatchAuthError("GitHub returned 401", status_code=401),
+        "/actions/runs": {"total_count": 1, "workflow_runs": [GREEN_RUN]},
+        "/status": EMPTY_STATUS,
+    })
+
+    assert st.outcome is Outcome.PENDING
+    assert st.data["blocked"] == "auth"
+    assert st.data.get("actionable") is not True
+    assert "BLIND" not in st.summary
+    assert "Actions" not in st.summary
+
+
+@pytest.mark.asyncio
+async def test_a_403_still_reaches_the_permission_block(monkeypatch, _token):
+    """Control for the pair: the narrowing must be on the status code, not a
+    blanket demotion of every auth error to a blip."""
+    st = await _poll(monkeypatch, {
+        "/pulls/": {"state": "open", "merged": False, "head": {"sha": SHA}},
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": PRWatchAuthError("403", status_code=403),
+    })
+
+    assert st.data["blocked"] == "permission"
+    assert st.data["actionable"] is True
