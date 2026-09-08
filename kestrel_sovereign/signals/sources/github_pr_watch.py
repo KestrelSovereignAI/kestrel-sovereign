@@ -581,19 +581,50 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
     }
 
 
+def _is_permission_refusal(code: int, headers: Any) -> bool:
+    """Whether a 401/403 *proves* the credential itself is the problem.
+
+    Positive identification, deliberately — rather than ruling out the rate
+    limits one at a time. GitHub's own retry guidance ends "Otherwise, wait
+    for at least one minute before retrying", which is to say a secondary
+    limit may arrive carrying **neither** ``retry-after`` nor
+    ``x-ratelimit-remaining: 0``. Any enumeration of throttle markers is
+    therefore open-ended and will keep missing one; a refusal, by contrast,
+    names what it wanted. Measured 2026-09-08::
+
+        403  x-accepted-github-permissions: checks=read   fine-grained PAT
+        403  x-accepted-oauth-scopes: ...                 classic token
+        401  (no headers)                                 bad credential
+
+    The asymmetry is the point. Read a refusal as transient and the wait sits
+    pending on a gate that will never clear — visible, and already the
+    condition #3248 reports. Read a throttle as a refusal and a green PR
+    settles terminally off a rollup that was merely slowed, which is a wrong
+    answer nobody sees. Only one of those is safe to be wrong about, so an
+    unattributed 403 is not treated as a refusal.
+    """
+    if code == 401:
+        # No credential accepted at all. Never a throttle, and the one 401
+        # this module can act on.
+        return True
+    if headers is None:
+        return False
+    try:
+        return bool(
+            str(headers.get("x-accepted-github-permissions", "") or "").strip()
+            or str(headers.get("x-accepted-oauth-scopes", "") or "").strip()
+        )
+    except Exception:  # pragma: no cover - defensive; headers are mapping-like
+        return False
+
+
 def _is_rate_limited(headers: Any) -> bool:
-    """Whether a 401/403 response is an exhausted rate limit, not a refusal.
+    """Whether a 403 positively identifies itself as an exhausted rate limit.
 
-    GitHub reports both with the same status code, so the body's status alone
-    cannot tell them apart; the headers can. ``x-ratelimit-remaining: 0`` is
-    the primary limit and ``retry-after`` the secondary one, while a genuine
-    permission refusal arrives with the budget untouched (measured: 4999 of
-    5000 remaining) and an ``x-accepted-github-permissions`` header naming
-    what it wanted.
-
-    Absent headers read as *not* rate limited, which keeps the pre-existing
-    classification: an unrecognised 403 stays an auth error, as it was before
-    this discrimination existed.
+    Only used to make the error *message* precise once
+    :func:`_is_permission_refusal` has already declined the response: both
+    this and an unattributed 403 are handled as transient, so being wrong
+    here changes what an operator reads, not what the wait does.
     """
     if headers is None:
         return False
@@ -610,16 +641,18 @@ async def _github_get(
 ) -> Any:
     """GET + JSON-decode one GitHub API URL.
 
-    Raises :class:`PRWatchAuthError` on a 401/403 the credential caused,
-    :class:`PRWatchRateLimitError` on a 401/403/429 the rate limit caused, and
-    :class:`PRWatchNetworkError` on any other transport/HTTP/parse failure, so
-    the caller can report ``blocked: auth`` / ``blocked: network`` distinctly
-    from a no-change poll. ``ref`` is only used to label errors.
+    Raises :class:`PRWatchAuthError` only on a 401/403 that *identifies
+    itself* as a credential problem, :class:`PRWatchRateLimitError` on one
+    that identifies itself as a throttle, and :class:`PRWatchNetworkError` on
+    everything else — an unattributed 403 included — so the caller can report
+    ``blocked: auth`` / ``blocked: network`` distinctly from a no-change poll.
+    ``ref`` is only used to label errors.
 
-    The rate-limit split is load-bearing downstream: an auth error is what
+    Which of the three is load-bearing downstream: the auth error is what
     :func:`fetch_check_rollup` degrades a rollup on, and degrading on a
-    transient would turn a five-minute limit into a terminal verdict read off
-    half the evidence.
+    transient would turn a five-minute throttle into a terminal verdict read
+    off half the evidence. That is why the auth class requires proof rather
+    than being the default.
     """
     req = urllib.request.Request(
         url,
@@ -637,12 +670,26 @@ async def _github_get(
         resp = await asyncio.to_thread(_do)
     except urllib.error.HTTPError as e:
         headers = getattr(e, "headers", None)
-        if e.code == 429 or (e.code in (401, 403) and _is_rate_limited(headers)):
+        if e.code in (401, 403):
+            if _is_permission_refusal(e.code, headers):
+                raise PRWatchAuthError(
+                    f"GitHub returned {e.code} for {ref}"
+                ) from e
+            if _is_rate_limited(headers):
+                raise PRWatchRateLimitError(
+                    f"GitHub rate limit hit ({e.code}) for {ref}"
+                ) from e
+            # Neither proven. GitHub documents a secondary limit that carries
+            # no marker at all, so this must not fall through to the refusal
+            # branch — that is the one misreading that settles a wait.
+            raise PRWatchNetworkError(
+                f"GitHub returned {e.code} for {ref} without identifying "
+                f"either a permission or a rate limit; treated as transient"
+            ) from e
+        if e.code == 429:
             raise PRWatchRateLimitError(
                 f"GitHub rate limit hit ({e.code}) for {ref}"
             ) from e
-        if e.code in (401, 403):
-            raise PRWatchAuthError(f"GitHub returned {e.code} for {ref}") from e
         raise PRWatchNetworkError(f"GitHub HTTP {e.code} for {ref}") from e
     except urllib.error.URLError as e:
         raise PRWatchNetworkError(f"network error for {ref}: {e}") from e

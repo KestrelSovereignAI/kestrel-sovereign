@@ -511,17 +511,23 @@ async def test_a_real_permission_403_is_still_an_auth_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_403_with_no_rate_limit_headers_keeps_its_old_classification(
-    monkeypatch,
-):
-    """An unrecognised 403 must not drift into the transient class just
-    because a discrimination was added around it."""
-    _raise_from_urlopen(monkeypatch, _http_error(403))
+async def test_a_secondary_limit_with_neither_marker_is_not_a_refusal(monkeypatch):
+    """Review round 2, and the reason the test above it exists in this shape.
 
-    with pytest.raises(PRWatchAuthError) as caught:
+    GitHub's retry guidance ends "Otherwise, wait for at least one minute
+    before retrying" — i.e. a secondary limit may carry NEITHER ``retry-after``
+    NOR ``x-ratelimit-remaining: 0``. Ruling throttles out one marker at a
+    time therefore cannot terminate; the classification has to require proof
+    of a *refusal* instead, and this is the response that has none."""
+    _raise_from_urlopen(monkeypatch, _http_error(
+        403, x_ratelimit_limit="5000", x_ratelimit_remaining="4999",
+    ))
+
+    with pytest.raises(PRWatchNetworkError) as caught:
         await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
-    assert not isinstance(caught.value, PRWatchRateLimitError)
+    assert not isinstance(caught.value, PRWatchAuthError)
+    assert "without identifying" in str(caught.value)
 
 
 @pytest.mark.asyncio
@@ -573,16 +579,91 @@ async def test_a_throttled_poll_stays_pending_instead_of_settling_partial(
 
 
 @pytest.mark.asyncio
-async def test_a_403_carrying_no_headers_at_all_is_still_an_auth_error(monkeypatch):
-    """Surviving mutant, 2026-09-08: flipping the ``headers is None`` default
-    to "rate limited" was killed by nothing. The direction is load-bearing in
-    the direction this whole change exists for — read as transient, a
-    headerless 403 would never reach the fallback and the gate would stay
-    blind forever, reporting ``network`` at it. Unprovable is not transient."""
+async def test_a_403_carrying_no_headers_at_all_is_not_a_refusal(monkeypatch):
+    """This assertion was the other way round for one commit, and the reason
+    it flipped is worth keeping. Both directions are wrong in some scenario;
+    they are not equally wrong. Read a real refusal as transient and the wait
+    sits pending on a gate that never clears — visible, and already what
+    #3248 reports. Read a throttle as a refusal and a green PR settles
+    terminally off a rollup that was merely slowed. Only the first is safe to
+    be wrong about, so proof is required for the refusal, not for the
+    throttle."""
     err = urllib.error.HTTPError("https://api.github.com/x", 403, "err", None, None)
     _raise_from_urlopen(monkeypatch, err)
 
-    with pytest.raises(PRWatchAuthError) as caught:
+    with pytest.raises(PRWatchNetworkError) as caught:
         await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
-    assert not isinstance(caught.value, PRWatchRateLimitError)
+    assert not isinstance(caught.value, PRWatchAuthError)
+
+
+@pytest.mark.asyncio
+async def test_a_401_is_always_a_credential_problem(monkeypatch):
+    """The one status GitHub never uses for a throttle. Measured: a bad token
+    answers 401 with no headers at all, so it cannot prove itself by header
+    and is classified by status instead."""
+    err = urllib.error.HTTPError("https://api.github.com/x", 401, "err", None, None)
+    _raise_from_urlopen(monkeypatch, err)
+
+    with pytest.raises(PRWatchAuthError):
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+
+@pytest.mark.asyncio
+async def test_a_classic_tokens_scope_refusal_is_also_a_refusal(monkeypatch):
+    """A classic token names the scope it wanted in a different header."""
+    _raise_from_urlopen(monkeypatch, _http_error(
+        403, x_accepted_oauth_scopes="admin:org", x_ratelimit_remaining="4999",
+    ))
+
+    with pytest.raises(PRWatchAuthError):
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+
+@pytest.mark.asyncio
+async def test_the_measured_permission_403_still_reaches_the_fallback(monkeypatch):
+    """The over-correction guard. Requiring proof of a refusal must not have
+    made the refusal this whole change exists for unprovable: these are the
+    exact headers the live fine-grained PAT returns for check-runs."""
+    def fake_urlopen(req, timeout=None):
+        if "/check-runs" in req.full_url:
+            raise _http_error(
+                403,
+                x_accepted_github_permissions="checks=read",
+                x_ratelimit_limit="5000",
+                x_ratelimit_remaining="4994",
+            )
+        import json as _json
+
+        class _Resp:
+            @staticmethod
+            def read():
+                if "/actions/runs" in req.full_url:
+                    return _json.dumps(
+                        {"total_count": 1, "workflow_runs": [GREEN_RUN]}
+                    ).encode()
+                return _json.dumps(EMPTY_STATUS).encode()
+
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert rollup.source == CHECKS_SOURCE_WORKFLOW_RUNS
+    assert rollup.unreadable == ("check-runs",)
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_403_does_not_degrade_the_rollup(monkeypatch):
+    """Same route as the rate-limit case, through the real classification
+    rather than a pre-decided injected exception."""
+    def fake_urlopen(req, timeout=None):
+        raise _http_error(403, x_ratelimit_remaining="4999")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(PRWatchNetworkError) as caught:
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert not isinstance(caught.value, PRWatchAuthError)
