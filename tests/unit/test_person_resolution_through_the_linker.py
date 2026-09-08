@@ -224,3 +224,21 @@ async def test_a_node_with_associations_but_no_recorded_answer_is_not_exact(pipe
 async def test_run_boundaries(pipeline, text, people):
     linker, router, _graph = pipeline
     assert (await _say(linker, router, "m1", text))[0] == people
+
+
+@pytest.mark.asyncio
+async def test_a_mention_stamps_the_category_on_an_existing_node(pipeline):
+    """The refresh on every mention is what lets a node written before
+    categories were stored acquire one; classify-on-read covers the
+    resolver, this covers the record."""
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    linker, router, graph = pipeline
+    await graph.add_node(GraphNode(
+        node_id=f"concept:{AGENT}:alice", node_type="concept", label="alice",
+        properties={"agent_id": AGENT, "mention_count": 1},
+    ))
+    await _say(linker, router, "m1", "I talked to Alice about the project.")
+    node = await graph.get_node(f"concept:{AGENT}:alice")
+    assert node.properties["category"] == "proper_noun"
+    assert node.properties["mention_count"] == 2

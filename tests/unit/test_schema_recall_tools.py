@@ -501,3 +501,35 @@ class TestRecallInteractionsAgentScope:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestConfirmPersonMatchRecordingFailure:
+    @pytest.mark.asyncio
+    async def test_a_recording_failure_is_partial_and_the_cleanup_still_runs(self, feature):
+        """The canonical edge is in place, so a failure to record the answer
+        for future mentions is PARTIAL, not failed, and the ambiguous-edge
+        removal is still attempted (#3259 round 2)."""
+        nodes = {
+            "concept:did:test:recall-agent:alice-smith": GraphNode(
+                node_id="concept:did:test:recall-agent:alice-smith",
+                node_type="concept", label="Alice Smith", properties={},
+            ),
+            "concept:did:test:recall-agent:alice": GraphNode(
+                node_id="concept:did:test:recall-agent:alice",
+                node_type="concept", label="alice", properties={"category": "proper_noun"},
+            ),
+        }
+        feature.agent.storage.graph.get_node = AsyncMock(side_effect=lambda node_id: nodes.get(node_id))
+        feature.agent.storage.graph.add_node = AsyncMock(side_effect=RuntimeError("node write refused"))
+        feature.agent.storage.graph.delete_edge = AsyncMock()
+        result = await feature.confirm_person_match(
+            message_id="msg-1",
+            mentioned_label="alice",
+            concept_id="concept:did:test:recall-agent:alice-smith",
+        )
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "will ask again" in result.error and "node write refused" in result.error
+        assert result.data["future_mentions_recorded"] is False
+        assert result.data["ambiguous_remove_attempted"] is True
+        feature.agent.storage.graph.delete_edge.assert_awaited_once()
+        assert [c.args[2] for c in feature.agent.storage.graph.add_edge.await_args_list] == ["mentions"]
