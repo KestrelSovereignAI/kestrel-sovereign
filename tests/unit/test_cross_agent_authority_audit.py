@@ -9774,6 +9774,15 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
     ):
         return False
 
+    return _is_kestrel_lifecycle_command(command)
+
+
+def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
+    """Whether an expression statically denotes a Kestrel lifecycle command."""
+
+    if getattr(command, "_authority_shell_lifecycle", False):
+        return True
+
     def literal_tokens(node: ast.AST) -> list[str]:
         return [
             token
@@ -9798,6 +9807,33 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
     if resolved_command is None:
         # Preserve a statically visible command prefix when later f-string
         # fields are dynamic (for example ``f"kestrel restart {name}"``).
+        prefix = ""
+        if isinstance(command, ast.JoinedStr):
+            prefix = "".join(
+                value.value
+                for value in command.values
+                if isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            )
+        if prefix:
+            try:
+                words = shlex.split(prefix)
+            except ValueError:
+                words = []
+            if len(words) >= 2:
+                executable = SOURCE_IDENTIFIER_CHAIN.findall(
+                    words[0].casefold()
+                )
+                operation = SOURCE_IDENTIFIER_CHAIN.findall(
+                    words[1].casefold()
+                )
+                if (
+                    executable
+                    and executable[-1] == "kestrel"
+                    and operation
+                    and _is_cross_agent_lifecycle_action(operation[0])
+                ):
+                    return True
         tokens = literal_tokens(command)
         return bool(
             len(tokens) >= 2
@@ -9818,6 +9854,52 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
         and operation
         and _is_cross_agent_lifecycle_action(operation[0])
     )
+
+
+def _annotate_shell_lifecycle_command_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> None:
+    """Propagate statically known lifecycle command values through aliases."""
+
+    assignments: list[tuple[set[str], ast.AST]] = []
+    aliases: set[str] = set()
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        target_names = {
+            name
+            for target in targets
+            for name in _binding_target_names(target)
+        }
+        assignments.append((target_names, value))
+        if _is_kestrel_lifecycle_command(value):
+            aliases.update(target_names)
+
+    changed = True
+    while changed:
+        changed = False
+        for target_names, value in assignments:
+            if not _identifier_tokens(value).intersection(aliases):
+                continue
+            new_aliases = target_names - aliases
+            if new_aliases:
+                aliases.update(new_aliases)
+                changed = True
+
+    for node in _walk_lexical_scope(function):
+        if _identifier_tokens(node).intersection(aliases):
+            setattr(node, "_authority_shell_lifecycle", True)
 
 
 def _is_unambiguous_control_token(token: str) -> bool:
@@ -14313,6 +14395,290 @@ def _direct_parameter_return_flow_summaries(
     return tuple(sorted(merged.items()))
 
 
+def _local_callback_invocation_flows(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    imported_flows: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ]
+    | None = None,
+) -> dict[ast.FunctionDef | ast.AsyncFunctionDef, _ParameterReturnFlow]:
+    """Summarize formal parameters eventually invoked as callbacks."""
+
+    functions_by_name: dict[
+        str, list[ast.FunctionDef | ast.AsyncFunctionDef]
+    ] = {}
+    for function in functions:
+        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+    parameters = {
+        function: {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+                *(
+                    [function.args.vararg]
+                    if function.args.vararg is not None
+                    else []
+                ),
+                *(
+                    [function.args.kwarg]
+                    if function.args.kwarg is not None
+                    else []
+                ),
+            ]
+        }
+        for function in functions
+    }
+    invoked: dict[ast.FunctionDef | ast.AsyncFunctionDef, set[str]] = {
+        function: set() for function in functions
+    }
+    alias_edges = {
+        function: _scope_callable_alias_edges(function) for function in functions
+    }
+
+    changed = True
+    while changed:
+        changed = False
+        summaries = {
+            function: _parameter_return_flow(function, invoked[function])
+            for function in functions
+        }
+        for function in functions:
+            discovered = set(invoked[function])
+            for call in _lexical_scope_calls(function):
+                source_names = _expanded_callable_sources(
+                    _call_name(call), alias_edges[function]
+                )
+                if isinstance(call.func, ast.Name):
+                    discovered.update(
+                        source_names.intersection(parameters[function])
+                    )
+                flows = [
+                    summaries[callee]
+                    for source_name in source_names
+                    for callee in functions_by_name.get(source_name, ())
+                ]
+                visible_imports = (imported_flows or {}).get(function, {})
+                flows.extend(
+                    visible_imports[source_name]
+                    for source_name in source_names.intersection(visible_imports)
+                )
+                for flow in flows:
+                    for argument in _bound_parameter_flow_arguments(call, flow):
+                        discovered.update(
+                            _identifier_tokens(argument).intersection(
+                                parameters[function]
+                            )
+                        )
+            new_parameters = discovered - invoked[function]
+            if new_parameters:
+                invoked[function].update(new_parameters)
+                changed = True
+    return {
+        function: _parameter_return_flow(function, invoked[function])
+        for function in functions
+    }
+
+
+@lru_cache(maxsize=None)
+def _direct_callback_invocation_flow_summaries(
+    source_path: Path,
+) -> tuple[tuple[str, _ParameterReturnFlow], ...]:
+    """Summarize callback-parameter effects within one repository module."""
+
+    tree = _parsed_module(source_path.resolve())
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    flows = _local_callback_invocation_flows(functions)
+    merged = _merged_parameter_flow_map(
+        [(function.name, flows[function]) for function in functions]
+    )
+    return tuple(sorted(merged.items()))
+
+
+def _repository_callback_invocation_flows(
+    source_path: Path,
+    requested_names: set[str],
+    seen: frozenset[tuple[Path, str]],
+) -> dict[str, _ParameterReturnFlow]:
+    """Resolve callback-invocation summaries through local reexports."""
+
+    source_path = source_path.resolve()
+    requested = {
+        name.casefold()
+        for name in requested_names
+        if (source_path, name.casefold()) not in seen
+    }
+    if not requested:
+        return {}
+    direct = dict(_direct_callback_invocation_flow_summaries(source_path))
+    resolved = {name: direct[name] for name in requested.intersection(direct)}
+    active = seen | {(source_path, name) for name in requested - set(resolved)}
+    for local_name, imported_path, remote_name in _repository_reexport_bindings(
+        source_path,
+        requested - set(resolved),
+    ):
+        imported = _repository_callback_invocation_flows(
+            imported_path,
+            {remote_name},
+            active,
+        )
+        if remote_name in imported:
+            resolved[local_name] = imported[remote_name]
+    return resolved
+
+
+def _scope_imported_callback_invocation_flows(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None,
+    seen: frozenset[tuple[Path, str]] | None = None,
+    calls: list[ast.Call] | None = None,
+) -> dict[str, _ParameterReturnFlow]:
+    """Return called repository-local callback summaries in one scope."""
+
+    if source_path is None:
+        return {}
+    source_path = source_path.resolve()
+    seen = seen or frozenset()
+    visible_calls = calls if calls is not None else _lexical_scope_calls(scope)
+    alias_edges = _scope_callable_alias_edges(scope)
+    called_names = {
+        source_name
+        for call in visible_calls
+        for source_name in _expanded_callable_sources(
+            _call_name(call), alias_edges
+        )
+    }
+    entries: list[tuple[str, _ParameterReturnFlow]] = []
+    for node in _lexical_scope_imports(scope):
+        if isinstance(node, ast.ImportFrom) and node.module is None:
+            for imported in node.names:
+                child_path = _resolved_repository_import_path(
+                    source_path,
+                    imported.name,
+                    node.level,
+                )
+                if child_path is None:
+                    continue
+                qualifier = (imported.asname or imported.name).casefold()
+                members = _module_attribute_call_names(
+                    visible_calls,
+                    qualifier,
+                    scope if isinstance(scope, ast.Module) else None,
+                )
+                remote = _repository_callback_invocation_flows(
+                    child_path,
+                    members,
+                    seen,
+                )
+                entries.extend(remote.items())
+            continue
+        if isinstance(node, ast.ImportFrom):
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            bindings = {
+                (imported.asname or imported.name).casefold(): (
+                    imported.name.casefold()
+                )
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold() in called_names
+            }
+            star_names = called_names if any(
+                imported.name == "*" for imported in node.names
+            ) else set()
+            remote = _repository_callback_invocation_flows(
+                imported_path,
+                set(bindings.values()) | star_names,
+                seen,
+            )
+            entries.extend(
+                (local_name, remote[remote_name])
+                for local_name, remote_name in bindings.items()
+                if remote_name in remote
+            )
+            entries.extend(
+                (name, remote[name]) for name in star_names.intersection(remote)
+            )
+            continue
+        if not isinstance(node, ast.Import):
+            continue
+        for imported in node.names:
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                imported.name,
+            )
+            if imported_path is None:
+                continue
+            qualifier = (imported.asname or imported.name).casefold()
+            members = _module_attribute_call_names(
+                visible_calls,
+                qualifier,
+                scope if isinstance(scope, ast.Module) else None,
+            )
+            remote = _repository_callback_invocation_flows(
+                imported_path,
+                members,
+                seen,
+            )
+            entries.extend(remote.items())
+    return _merged_parameter_flow_map(entries)
+
+
+def _function_callback_invocation_flow_imports(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    module_flows: dict[str, _ParameterReturnFlow],
+    source_path: Path | None,
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ],
+    seen: frozenset[tuple[Path, str]] | None = None,
+) -> dict[
+    ast.FunctionDef | ast.AsyncFunctionDef,
+    dict[str, _ParameterReturnFlow],
+]:
+    """Resolve callback summaries visible to each lexical function."""
+
+    visible: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, _ParameterReturnFlow],
+    ] = {}
+
+    def analyze(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, _ParameterReturnFlow]:
+        cached = visible.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = analyze(parent) if parent is not None else module_flows
+        local = _scope_imported_callback_invocation_flows(
+            function,
+            source_path,
+            seen,
+        )
+        resolved = _merged_parameter_flow_map(
+            [*inherited.items(), *local.items()]
+        )
+        visible[function] = resolved
+        return resolved
+
+    for function in functions:
+        analyze(function)
+    return visible
+
+
 def _repository_parameter_return_flows(
     source_path: Path,
     requested_names: set[str],
@@ -15012,11 +15378,16 @@ def _permission_mutation_uses_provenance(
     values: list[ast.AST],
     provenance_aliases: set[str],
     provenance_return_helpers: set[str],
+    permission_store_aliases: set[str] | None = None,
 ) -> bool:
     """Whether provenance selects a permission write's subject or value."""
 
     if not any(
         _is_permission_name(token)
+        or (
+            isinstance(target, (ast.Attribute, ast.Subscript))
+            and token in (permission_store_aliases or set())
+        )
         for target in targets
         for token in _identifier_tokens(target)
     ):
@@ -15040,6 +15411,86 @@ def _permission_mutation_uses_provenance(
     )
 
 
+def _permission_store_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Propagate permission-store identity through ordinary local aliases."""
+
+    aliases = {
+        token
+        for node in _walk_lexical_scope(function)
+        for token in _identifier_tokens(node)
+        if _is_permission_name(token)
+    }
+    assignments: list[tuple[set[str], set[str]]] = []
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        assignments.append(
+            (
+                {
+                    name
+                    for target in targets
+                    for name in _binding_target_names(target)
+                },
+                set(_identifier_tokens(value)),
+            )
+        )
+
+    changed = True
+    while changed:
+        changed = False
+        for targets, sources in assignments:
+            if not sources.intersection(aliases):
+                continue
+            new_aliases = targets - aliases
+            if new_aliases:
+                aliases.update(new_aliases)
+                changed = True
+    return aliases
+
+
+def _permission_store_call_uses_provenance(
+    call: ast.Call,
+    permission_store_aliases: set[str],
+    provenance_aliases: set[str],
+    provenance_return_helpers: set[str],
+) -> bool:
+    """Whether a mutator call writes provenance through a permission alias."""
+
+    receiver: ast.AST | None = None
+    if (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold() in _MUTABLE_CONTAINER_WRITE_ARGUMENTS
+    ):
+        receiver = call.func.value
+    elif _call_name(call).casefold().strip("_") in {"delitem", "setitem"}:
+        receiver = call.args[0] if call.args else None
+    if receiver is None or not _identifier_tokens(receiver).intersection(
+        permission_store_aliases
+    ):
+        return False
+    return any(
+        _has_provenance_value(
+            candidate,
+            provenance_aliases,
+            provenance_return_helpers,
+        )
+        for candidate in [*call.args, *(item.value for item in call.keywords)]
+    )
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -15051,6 +15502,8 @@ def _authority_provenance_lines(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     functions.extend(_executable_body_functions(tree))
+    for function in functions:
+        _annotate_shell_lifecycle_command_aliases(function)
     module_control_aliases = _module_imported_control_aliases(tree)
     function_parents = _nested_function_parents(tree)
     parameter_flow_functions = {
@@ -15162,6 +15615,40 @@ def _authority_provenance_lines(
         function_parents,
         eligible_functions=control_import_functions,
     )
+    module_callback_flows = _scope_imported_callback_invocation_flows(
+        tree,
+        source_path,
+        calls=relevant_control_calls,
+    )
+    function_callback_flows = _function_callback_invocation_flow_imports(
+        functions,
+        module_callback_flows,
+        source_path,
+        function_parents,
+    )
+    for function in functions:
+        alias_edges = _scope_callable_alias_edges(function)
+        visible_aliases = module_control_aliases | function_control_imports[function]
+        discovered: set[str] = set()
+        for call in _lexical_scope_calls(function):
+            source_names = _expanded_callable_sources(
+                _call_name(call), alias_edges
+            )
+            for source_name in source_names.intersection(
+                function_callback_flows[function]
+            ):
+                flow = function_callback_flows[function][source_name]
+                if any(
+                    any(
+                        _is_unambiguous_control_token(token)
+                        or token in visible_aliases
+                        for token in _control_reference_sources(argument)
+                    )
+                    for argument in _bound_parameter_flow_arguments(call, flow)
+                ):
+                    discovered.update(source_names)
+                    discovered.add(_call_name(call).casefold())
+        function_control_imports[function].update(discovered)
     function_callback_control_aliases = {
         function: set() for function in functions
     }
@@ -15489,6 +15976,7 @@ def _authority_provenance_lines(
             function_control_parameter_return_flows[function],
         )
         state_object_aliases = function_state_objects[function]
+        permission_store_aliases = _permission_store_aliases(function)
         provenance_aliases, provenance_selected_targets = (
             function_provenance[function]
         )
@@ -15572,6 +16060,13 @@ def _authority_provenance_lines(
                     for candidate in [node.func, *arguments]
                 ):
                     lines.add(node.lineno)
+                if _permission_store_call_uses_provenance(
+                    node,
+                    permission_store_aliases,
+                    provenance_aliases,
+                    decision_provenance_helpers,
+                ):
+                    lines.add(node.lineno)
                 is_control_call = _is_cross_agent_control_call(
                     node, control_aliases, state_object_aliases
                 )
@@ -15634,6 +16129,7 @@ def _authority_provenance_lines(
                     [assignment_value],
                     provenance_aliases,
                     decision_provenance_helpers,
+                    permission_store_aliases,
                 ):
                     lines.add(node.lineno)
                 if any(
@@ -15659,6 +16155,7 @@ def _authority_provenance_lines(
                         [],
                         provenance_aliases,
                         decision_provenance_helpers,
+                        permission_store_aliases,
                     )
                 ) or (
                     _is_cross_agent_state_mutation_target(
@@ -15686,6 +16183,7 @@ def _authority_provenance_lines(
                     [],
                     provenance_aliases,
                     decision_provenance_helpers,
+                    permission_store_aliases,
                 ) or any(
                     _is_cross_agent_state_mutation_target(
                         target,
@@ -19025,6 +19523,126 @@ def test_shell_lifecycle_recognizes_kestrel_executable_basenames(
     )
 
     assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize(
+    "setup, mutation",
+    (
+        (
+            "store = permissions",
+            "store[request.causation_chain[-1].agent_id] = True",
+        ),
+        (
+            "store = policies\n    alias = store",
+            "alias.update({request.causation_chain[-1].agent_id: True})",
+        ),
+        (
+            "store = authorities",
+            "operator.setitem("
+            "store, request.causation_chain[-1].agent_id, True)",
+        ),
+    ),
+)
+def test_permission_store_identity_survives_aliases(
+    setup: str,
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "def configure(request, permissions, policies, authorities):\n"
+        f"    {setup}\n"
+        f"    {mutation}\n"
+    )
+
+    mutation_line = max(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Assign, ast.Call))
+    )
+    assert _authority_provenance_lines(tree) == {mutation_line}
+
+
+@pytest.mark.parametrize(
+    "setup, command",
+    (
+        ('command = ["kestrel", "restart", target]', "command"),
+        (
+            'command = ["kestrel", "stop", target]\n    alias = command',
+            "alias",
+        ),
+        ('command = f"/usr/local/bin/kestrel shutdown {target}"', "command"),
+    ),
+)
+def test_shell_lifecycle_command_values_survive_aliases(
+    setup: str,
+    command: str,
+) -> None:
+    tree = ast.parse(
+        "def govern(request, target):\n"
+        f"    {setup}\n"
+        "    if request.causation_chain:\n"
+        f"        subprocess.run({command})\n"
+    )
+
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+@pytest.mark.parametrize(
+    "wrapper_body",
+    (
+        "    callback(target)\n",
+        "    invoke = callback\n    invoke(target)\n",
+        "    inner(callback, target)\n",
+    ),
+)
+def test_imported_wrapper_callback_effects_reach_control_callers(
+    tmp_path: Path,
+    wrapper_body: str,
+) -> None:
+    wrappers_path = tmp_path / "wrappers.py"
+    prefix = (
+        "def inner(callback, target):\n"
+        "    callback(target)\n\n"
+        if "inner(" in wrapper_body
+        else ""
+    )
+    wrappers_path.write_text(
+        prefix
+        + "def apply(callback, target):\n"
+        + wrapper_body,
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from .wrappers import apply as invoke\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        invoke(terminate_child, target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
+
+
+def test_imported_wrapper_callback_summary_requires_invocation(
+    tmp_path: Path,
+) -> None:
+    wrappers_path = tmp_path / "wrappers.py"
+    wrappers_path.write_text(
+        "def retain(callback, target):\n"
+        "    return target\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "controller.py"
+    source_path.write_text(
+        "from .wrappers import retain\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        retain(terminate_child, target)\n",
+        encoding="utf-8",
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset()
 
 
 @pytest.mark.parametrize(
