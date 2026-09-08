@@ -589,7 +589,10 @@ async def _run_shell(agent_dir: Path, args) -> int:
         initialize_with_bound_hold_context,
     )
 
-    hold_context = await initialize_with_bound_hold_context(agent)
+    hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=agent_dir,
+    )
 
     # Load extension if requested
     if hasattr(args, 'app') and args.app:

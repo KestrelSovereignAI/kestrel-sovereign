@@ -97,8 +97,9 @@ async def test_get_agent_by_did_uses_atomic_hold_initialization(
         def __init__(self, **_kwargs) -> None:
             pass
 
-    async def initialize_with_hold(agent):
+    async def initialize_with_hold(agent, *, agent_data_root=None):
         assert isinstance(agent, _Agent)
+        assert agent_data_root is not None
         events.append("initialized")
         return context
 
@@ -141,6 +142,45 @@ async def test_bound_hold_initialization_closes_context_on_failure(monkeypatch) 
         )
 
     close_context.assert_awaited_once_with(context)
+
+
+@pytest.mark.asyncio
+async def test_bound_hold_context_uses_selected_agent_data_root(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A positional/shell root cannot inherit Hold from a stale ambient root."""
+    import kestrel_sovereign.hold.enforcement as enforcement
+    import kestrel_sovereign.host_features.context as context_module
+
+    selected_root = tmp_path / "selected-agent"
+    stale_root = tmp_path / "stale-agent"
+    context = SimpleNamespace(hold_store=object())
+    observed: dict[str, object] = {}
+
+    async def build_context(**kwargs):
+        observed.update(kwargs)
+        return context
+
+    monkeypatch.setenv("KESTREL_DB_PATH", str(stale_root))
+    monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+    monkeypatch.setattr(context_module, "build_host_context", build_context)
+    agent = SimpleNamespace()
+
+    result = await enforcement.build_bound_host_context(
+        agent,
+        config={"mode": "test"},
+        agent_data_root=selected_root,
+    )
+
+    assert result is context
+    assert observed == {
+        "config": {"mode": "test"},
+        "db_path": str(
+            selected_root.resolve() / "host-data" / "host-features.db"
+        ),
+    }
+    assert agent._hold_store is context.hold_store
 
 
 @pytest.mark.asyncio
@@ -192,8 +232,8 @@ def test_standalone_entrypoints_use_atomic_hold_initialization_wiring() -> None:
 
     cli_source = inspect.getsource(cli_module._run_shell)
     main_source = inspect.getsource(main_module.main)
-    assert "initialize_with_bound_hold_context(agent)" in cli_source
-    assert "initialize_with_bound_hold_context(agent)" in main_source
+    assert "agent_data_root=agent_dir" in cli_source
+    assert "agent_data_root=storage_dir" in main_source
     assert "build_bound_host_context(agent)" not in cli_source
     assert "build_bound_host_context(agent)" not in main_source
 
@@ -212,6 +252,7 @@ async def test_cli_shell_prints_typed_hold_refusal(
 
     refusal = _held_refusal()
     context = SimpleNamespace(hold_store=object())
+    initialize_with_hold = AsyncMock(return_value=context)
 
     class _Storage:
         def __init__(self, _path: str) -> None:
@@ -243,7 +284,7 @@ async def test_cli_shell_prints_typed_hold_refusal(
     monkeypatch.setattr(
         hold_module,
         "initialize_with_bound_hold_context",
-        AsyncMock(return_value=context),
+        initialize_with_hold,
     )
     monkeypatch.setattr(hold_module, "close_bound_host_context", close_context)
     monkeypatch.setattr(builtins, "input", lambda _prompt: next(inputs))
@@ -251,6 +292,7 @@ async def test_cli_shell_prints_typed_hold_refusal(
     result = await cli_module._run_shell(tmp_path, SimpleNamespace(app=None))
 
     assert result == 0
+    initialize_with_hold.assert_awaited_once_with(agent, agent_data_root=tmp_path)
     assert refusal.wire_json() in capsys.readouterr().out
     close_context.assert_awaited_once_with(context)
 

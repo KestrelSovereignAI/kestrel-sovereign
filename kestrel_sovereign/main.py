@@ -153,7 +153,10 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     agent = KestrelAgent(did=did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import initialize_with_bound_hold_context
 
-    agent._standalone_hold_context = await initialize_with_bound_hold_context(agent)
+    agent._standalone_hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=storage_path,
+    )
     return agent
 
 async def main():
@@ -214,7 +217,10 @@ async def main():
         initialize_with_bound_hold_context,
     )
 
-    hold_context = await initialize_with_bound_hold_context(agent)
+    hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=storage_dir,
+    )
 
     if args.app:
         extension_class = None

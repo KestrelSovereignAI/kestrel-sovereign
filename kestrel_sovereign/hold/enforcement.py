@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from .state import EffectiveHoldState, HoldState, HoldStateError
@@ -137,12 +139,30 @@ def require_context_hold_store(context: Any) -> Any:
     )
 
 
-async def build_bound_host_context(agent: Any, *, config: Any = None) -> Any:
+async def build_bound_host_context(
+    agent: Any,
+    *,
+    config: Any = None,
+    agent_data_root: str | Path | None = None,
+) -> Any:
     """Open a standalone host context and bind its Hold store to ``agent``."""
 
     from kestrel_sovereign.host_features.context import build_host_context
 
-    context = await build_host_context(config=config)
+    context_kwargs: dict[str, Any] = {"config": config}
+    if agent_data_root is not None:
+        from kestrel_sovereign.host_features.storage import host_database_path
+
+        # A standalone launcher may select an agent root without exporting it
+        # as KESTREL_DB_PATH. Resolve Hold from that exact launch description,
+        # while retaining an explicit KESTREL_HOST_DB_PATH as operator
+        # authority. Passing the resolved host DB path also binds PostgreSQL's
+        # local custody witness to the selected root.
+        launch_env = dict(os.environ)
+        launch_env["KESTREL_DB_PATH"] = str(agent_data_root)
+        context_db_path, _uses_default = host_database_path(env=launch_env)
+        context_kwargs["db_path"] = str(context_db_path)
+    context = await build_host_context(**context_kwargs)
     try:
         store = require_context_hold_store(context)
     except BaseException as binding_failure:
@@ -200,10 +220,14 @@ async def initialize_with_bound_hold_context(
     agent: Any,
     *,
     config: Any = None,
+    agent_data_root: str | Path | None = None,
 ) -> Any:
     """Bind Hold and initialize one standalone agent as one owned lifecycle."""
 
-    context = await build_bound_host_context(agent, config=config)
+    binding_kwargs: dict[str, Any] = {"config": config}
+    if agent_data_root is not None:
+        binding_kwargs["agent_data_root"] = agent_data_root
+    context = await build_bound_host_context(agent, **binding_kwargs)
     try:
         await agent.initialize()
     except BaseException as startup_failure:
