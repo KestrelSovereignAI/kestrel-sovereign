@@ -246,6 +246,11 @@ class AssociativeLinker:
         # without a lexicon the honest reading is the existing one, so a
         # sentence-initial name loses its first token ("Jon Doe helped" ->
         # "doe"); put the name mid-sentence to keep it whole.
+        # Only a keyword-classified word ends a run; ``seen`` goes on
+        # collecting proper nouns below, and a name whose first token was
+        # already mentioned on its own ("Jon ... Jon Doe") must still be
+        # kept whole.
+        keyworded = set(seen)
         words = content.split()
         i = 0
         while i < len(words):
@@ -260,7 +265,7 @@ class AssociativeLinker:
                 # "Christmas") is its own concept, never part of a name:
                 # "Robert Monday" is Robert, on Monday. A stop word ends a
                 # run the same way.
-                if token in seen or token in _RUN_STOP_WORDS:
+                if token in keyworded or token in _RUN_STOP_WORDS:
                     break
                 run.append(words[j])
                 if words[j][-1] in ".!?,;:":

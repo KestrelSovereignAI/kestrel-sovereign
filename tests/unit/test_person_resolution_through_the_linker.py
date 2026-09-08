@@ -242,3 +242,58 @@ async def test_a_mention_stamps_the_category_on_an_existing_node(pipeline):
     node = await graph.get_node(f"concept:{AGENT}:alice")
     assert node.properties["category"] == "proper_noun"
     assert node.properties["mention_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_two_full_names_sharing_a_first_name_are_never_merged(pipeline):
+    """Review round 3 P1: the fuzzy pass compares first tokens, so it is for
+    a bare first-name mention only. Jon Lee's message must not be filed
+    under Jon Doe, and a fully named mention is never ambiguous."""
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    _people, summary = await _say(linker, router, "m2", "I called Jon Lee about the sink.")
+    assert summary["pending_person_matches"] == [] and summary["interactions"] == 1
+    doe_in = {e.source_id for e in await graph.get_edges(f"concept:{AGENT}:jon doe", direction="in") if e.label == "mentions"}
+    lee_in = {e.source_id for e in await graph.get_edges(f"concept:{AGENT}:jon lee", direction="in") if e.label == "mentions"}
+    assert doe_in == {f"message:{AGENT}:m1"} and lee_in == {f"message:{AGENT}:m2"}
+    await _say(linker, router, "m3", "Thanks Jon for everything.")  # a bare first name: ambiguous
+    _people, summary = await _say(linker, router, "m4", "I helped Jon Doe again.")
+    assert summary["pending_person_matches"] == []
+    match = await router.person_resolver.resolve("jon doe", AGENT, self_node_id=f"concept:{AGENT}:jon doe")
+    assert (match.status, match.concept_id) == ("new", None)
+
+
+@pytest.mark.asyncio
+async def test_interactions_count_matches_the_edges_when_a_message_names_both(pipeline):
+    """Review round 3 P2: add_edge upserts, so a message that mentions the
+    label and the person it resolves to writes one edge per person."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    await _say(linker, router, "m2", "I called Jon Lee about the sink.")
+    await _say(linker, router, "m3", "Thanks Jon for everything.")
+    feature = SimpleNamespace(agent=SimpleNamespace(storage=SimpleNamespace(graph=graph)), agent_id=AGENT)
+    confirm = getattr(MemoryFeature.confirm_person_match, "__wrapped__", MemoryFeature.confirm_person_match)
+    await confirm(feature, message_id="m3", mentioned_label="jon", concept_id=f"concept:{AGENT}:jon doe")
+    _people, summary = await _say(linker, router, "m4", "I met Jon Doe and later Jon called.")
+    out = {e.target_id for e in await graph.get_edges(f"message:{AGENT}:m4", direction="out") if e.label == "mentions"}
+    assert out == {f"concept:{AGENT}:jon", f"concept:{AGENT}:jon doe"}
+    assert summary["interactions"] == len(out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, people",
+    [
+        ("I called Jon and then I met Jon Doe.", ["jon", "jon doe"]),
+        ("I talked with Marcus about Marcus Aurelius.", ["marcus", "marcus aurelius"]),
+        ("Lunch with Robert Monday was great.", ["robert"]),
+    ],
+)
+async def test_an_earlier_proper_noun_does_not_end_a_run(pipeline, text, people):
+    """Review round 3 P2: only a keyword-classified word ends a run."""
+    linker, router, _graph = pipeline
+    assert (await _say(linker, router, "m1", text))[0] == people

@@ -626,7 +626,8 @@ five categories:
 Proper nouns are also extracted as potential concepts: a run of consecutive
 capitalized words mid-sentence is one concept ("jon doe"), a word that starts
 a sentence is never part of a name, and a run stops at a word the keyword
-passes already classified ("Robert Monday" is Robert, on Monday). Concept
+passes classified ("Robert Monday" is Robert, on Monday) but not at a name
+already seen on its own ("Jon ... Jon Doe" keeps "jon doe" whole). Concept
 nodes carry the category they were extracted with, and the person resolver
 offers only people as candidates; a node written before categories were
 stored is classified on read with the same keyword passes over its label. A

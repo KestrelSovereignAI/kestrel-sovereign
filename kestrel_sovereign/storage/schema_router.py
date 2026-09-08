@@ -206,7 +206,14 @@ class PersonResolver:
         if exact_id:
             return PersonMatch(concept_id=exact_id, status="exact", candidates=[])
 
-        # Pass 2/3 — first-name fuzzy + collision
+        # Pass 2/3 — first-name fuzzy + collision, for a BARE first-name
+        # mention only. The predicate compares first tokens, so a fully named
+        # "jon lee" would otherwise fuzzy-match "jon doe" and, now that the
+        # router writes the resolved edge, file one person's message under
+        # the other; a full name that matched nothing exactly is a new
+        # person (#3259 round 3).
+        if " " in normalized:
+            return PersonMatch(concept_id=None, status="new", candidates=[])
         first = normalized.split()[0] if normalized else ""
         if not first:
             return PersonMatch(concept_id=None, status="new", candidates=[])
@@ -802,6 +809,7 @@ class SchemaRouter:
         message_node = f"message:{self.agent_id}:{message_id}"
         _person_categories = {"person", "proper_noun"}
         people = [c for c in concepts if c.category in _person_categories]
+        mentioned_nodes = {c.node_id for c in people}
 
         # Resolve every person BEFORE writing any edge. A resolution that
         # raises then leaves nothing behind, and the caller's zero summary is
@@ -844,7 +852,10 @@ class SchemaRouter:
             # this edge a confirmed person stopped accumulating mentions after
             # the one confirmation (#3259).
             canonical = resolved.get(concept.node_id)
-            if canonical:
+            # A message that mentions both the label and the person it
+            # resolves to already wrote that edge above; add_edge upserts,
+            # so counting it again would overstate what is in the graph.
+            if canonical and canonical not in mentioned_nodes:
                 await self.graph.add_edge(
                     message_node, canonical, "mentions",
                     properties={**properties, "resolved_from": concept.label},
