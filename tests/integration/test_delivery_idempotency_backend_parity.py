@@ -122,6 +122,123 @@ async def test_distinct_replay_keys_share_content_dedup_gate(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_keyed_and_plain_enqueues_share_content_gate(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-mixed:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+
+    try:
+        entry_ids = await asyncio.gather(
+            *(
+                queue.enqueue(
+                    "email",
+                    "mixed@example.com",
+                    {"body": "same"},
+                    idempotency_key=(f"mixed-{index}" if index % 2 else None),
+                )
+                for index in range(12)
+            )
+        )
+
+        assert len(set(entry_ids)) == 1
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (owner,),
+        ) == (1,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_dead_letter_retry_reconciles_residual_live_row(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-dual-state:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+
+    try:
+        original_id = await queue.enqueue(
+            "email",
+            "dual-state@example.com",
+            {"body": "same"},
+            idempotency_key="dual-state",
+        )
+        dead_letter_id = str(uuid4())
+        await database.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries)
+            SELECT ?, id, agent_id, channel_type, recipient, content_json,
+                   ?, attempts, created_at, max_retries
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            (dead_letter_id, "injected transition failure", original_id, owner),
+        )
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert retried["entry_id"] != original_id
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (owner,),
+        ) == (1,)
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_dead_letter WHERE agent_id = ?",
+            (owner,),
+        ) == (0,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_enqueue_repairs_runtime_legacy_writer_hash(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-rolling:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+
+    try:
+        original_id = await queue.enqueue(
+            "email",
+            "rolling@example.com",
+            {"subject": "hello", "body": "world"},
+        )
+        await database.execute(
+            "UPDATE delivery_queue SET canonical_content_hash = NULL WHERE id = ?",
+            (original_id,),
+        )
+
+        assert await queue.enqueue(
+            "email",
+            "rolling@example.com",
+            {"body": "world", "subject": "hello"},
+        ) == original_id
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_delivery_idempotency_lifecycle_backend_parity(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-lifecycle:{uuid4().hex}"

@@ -32,12 +32,13 @@ disclosure but does not make a guessable key confidential. The
 the ledger, its retention index, and SQLite's explicitly marked compensation
 trigger. Queue rows retain the historical `content_hash` representation for
 readers from a rolling deployment and store the semantic JSON identity in
-`canonical_content_hash`. Current readers consult both identities. Keyed
-PostgreSQL enqueues also take a transaction-scoped lock on owner, recipient,
-and canonical content so distinct replay keys cannot race past short-window
-deduplication. Schema initialization backfills a missing canonical identity and
-keeps an indexed null probe for rows written by an older process during a
-rolling deployment.
+`canonical_content_hash`. Current readers consult both identities. Every
+PostgreSQL enqueue takes a transaction-scoped lock on owner, recipient, and
+canonical content, while SQLite uses its immediate writer transaction, so keyed
+and plain requests cannot race past short-window deduplication. Schema
+initialization backfills a missing canonical identity, and each enqueue checks
+the indexed null set so rows written later by an older rolling-deployment
+process are reconciled before deduplication.
 
 `delivery_purge` expires successful replay claims with their delivered queue
 rows. Its age threshold is therefore also the completed-delivery replay-safety
@@ -54,4 +55,5 @@ marker written by failed enqueue compensation invokes the SQLite cleanup
 trigger. The move into dead letter uses the same recoverable ordering: it writes
 the tombstone before deleting the live row, while queue processing and keyed
 replay treat any temporary dual-row state as terminal until the transition is
-resumed.
+resumed. Explicit retry checks the tombstone first, removes any residual live
+original, and only then consumes the tombstone and exposes the single retry row.

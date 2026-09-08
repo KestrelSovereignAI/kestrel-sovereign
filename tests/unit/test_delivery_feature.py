@@ -46,7 +46,7 @@ from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 def _make_mock_db():
     """Create a mock AsyncDatabase with standard methods."""
     db = MagicMock()
-    db.execute = AsyncMock()
+    db.execute = AsyncMock(return_value=1)
     db.fetchall = AsyncMock(return_value=[])
     db.fetchone = AsyncMock(return_value=None)
     db.fetchval = AsyncMock(return_value=0)
@@ -1310,6 +1310,76 @@ class TestQueueIdempotency:
         ) == (0,)
 
     @pytest.mark.asyncio
+    async def test_retry_reconciles_live_dead_letter_intermediate_state(
+        self, real_queue
+    ):
+        queue, deliveries = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "dual-state@example.com",
+            {"body": "hello"},
+            idempotency_key="dual-state",
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries)
+            SELECT ?, id, agent_id, channel_type, recipient, content_json,
+                   ?, attempts, created_at, max_retries
+            FROM delivery_queue WHERE id = ?
+            """,
+            ("dual-state-dl", "injected transition failure", original_id),
+        )
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert retried["entry_id"] != original_id
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+        assert await queue.process_pending() == 1
+        assert len(deliveries) == 1
+
+    @pytest.mark.asyncio
+    async def test_new_key_does_not_adopt_tombstoned_live_row(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "tombstone-dedup@example.com",
+            {"body": "hello"},
+            idempotency_key="first-key",
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries)
+            SELECT ?, id, agent_id, channel_type, recipient, content_json,
+                   ?, attempts, created_at, max_retries
+            FROM delivery_queue WHERE id = ?
+            """,
+            ("tombstone-dedup-dl", "injected transition failure", original_id),
+        )
+
+        fresh_id = await queue.enqueue(
+            "email",
+            "tombstone-dedup@example.com",
+            {"body": "hello"},
+            idempotency_key="second-key",
+        )
+
+        assert fresh_id != original_id
+        assert await queue.enqueue(
+            "email",
+            "tombstone-dedup@example.com",
+            {"body": "hello"},
+            idempotency_key="second-key",
+        ) == fresh_id
+
+    @pytest.mark.asyncio
     async def test_dead_letter_retry_preserves_policy_and_legacy_json(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
@@ -1653,6 +1723,63 @@ class TestQueueIdempotency:
             {"body": "world", "subject": "hello"},
         ) == original_id
 
+    @pytest.mark.asyncio
+    async def test_enqueue_reconciles_runtime_legacy_writer_hash(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "runtime-legacy@example.com",
+            {"subject": "hello", "body": "world"},
+        )
+        await queue._db.execute(
+            "UPDATE delivery_queue SET canonical_content_hash = NULL WHERE id = ?",
+            (original_id,),
+        )
+
+        assert await queue.enqueue(
+            "email",
+            "runtime-legacy@example.com",
+            {"body": "world", "subject": "hello"},
+        ) == original_id
+        assert await queue._db.fetchone(
+            "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
+            (original_id,),
+        ) != (None,)
+
+    @pytest.mark.asyncio
+    async def test_keyed_and_plain_enqueues_share_sqlite_content_gate(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        path = str(tmp_path / "mixed-enqueue.db")
+        first_db = await AsyncDatabase.sqlite(path)
+        second_db = await AsyncDatabase.sqlite(path)
+        first = DeliveryQueue(first_db, "did:test:mixed-enqueue")
+        second = DeliveryQueue(second_db, "did:test:mixed-enqueue")
+        await first._ensure_tables()
+        try:
+            calls = []
+            for index in range(20):
+                queue = first if index % 2 == 0 else second
+                key = f"mixed-{index}" if index % 3 else None
+                calls.append(
+                    queue.enqueue(
+                        "email",
+                        "mixed@example.com",
+                        {"body": "same"},
+                        idempotency_key=key,
+                    )
+                )
+            entry_ids = await asyncio.gather(*calls)
+
+            assert len(set(entry_ids)) == 1
+            assert await first_db.fetchone(
+                "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+                ("did:test:mixed-enqueue",),
+            ) == (1,)
+        finally:
+            await first_db.close()
+            await second_db.close()
+
     def test_unrelated_exception_context_is_not_reported_as_conflict(self):
         try:
             raise DeliveryIdempotencyConflict("original conflict")
@@ -1823,6 +1950,7 @@ class TestQueueRetry:
     @pytest.mark.asyncio
     async def test_retry_failed_entry(self, queue):
         row = _make_queue_row(entry_id="e1", status="failed")
+        queue._db.execute = AsyncMock(side_effect=[0, 1, 1])
         queue._db.fetchone = AsyncMock(return_value=row)
 
         result = await queue.retry("e1")
@@ -1832,6 +1960,7 @@ class TestQueueRetry:
     @pytest.mark.asyncio
     async def test_retry_already_delivered(self, queue):
         row = _make_queue_row(entry_id="e1", status="delivered")
+        queue._db.execute = AsyncMock(side_effect=[0, 1])
         queue._db.fetchone = AsyncMock(return_value=row)
 
         result = await queue.retry("e1")
@@ -1841,6 +1970,7 @@ class TestQueueRetry:
     @pytest.mark.asyncio
     async def test_retry_in_flight(self, queue):
         row = _make_queue_row(entry_id="e1", status="in_flight")
+        queue._db.execute = AsyncMock(side_effect=[0, 1])
         queue._db.fetchone = AsyncMock(return_value=row)
 
         result = await queue.retry("e1")
@@ -1849,10 +1979,8 @@ class TestQueueRetry:
 
     @pytest.mark.asyncio
     async def test_retry_from_dead_letter(self, queue):
-        # First call (main queue lookup) returns None
-        # Second call (dead letter lookup) returns a dead letter row
         dl_row = _make_dead_letter_row(dl_id="dl-1", original_id="e1")
-        queue._db.fetchone = AsyncMock(side_effect=[None, dl_row])
+        queue._db.fetchone = AsyncMock(return_value=dl_row)
 
         result = await queue.retry("e1")
         assert result["success"] is True
@@ -1865,18 +1993,20 @@ class TestQueueRetry:
 
     @pytest.mark.asyncio
     async def test_lost_dead_letter_claim_does_not_insert(self, queue):
-        dl_row = _make_dead_letter_row(dl_id="dl-1", original_id="e1")
-        queue._db.fetchone = AsyncMock(side_effect=[None, dl_row])
         queue._db.execute = AsyncMock(return_value=0)
 
         result = await queue.retry("e1")
 
-        assert result == {"success": False, "error": "Message was already retried"}
+        assert result == {
+            "success": False,
+            "error": "Entry e1 not found or already retried",
+        }
         sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
         assert "INSERT INTO delivery_queue" not in sql
 
     @pytest.mark.asyncio
     async def test_retry_not_found(self, queue):
+        queue._db.execute = AsyncMock(return_value=0)
         queue._db.fetchone = AsyncMock(return_value=None)
 
         result = await queue.retry("nonexistent")
