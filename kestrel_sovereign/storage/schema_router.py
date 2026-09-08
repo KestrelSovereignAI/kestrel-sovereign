@@ -186,15 +186,23 @@ class PersonResolver:
         return PersonMatch(concept_id=None, status="new", candidates=[])
 
     async def _list_person_concepts(self, agent_id: str) -> List[Tuple[str, str]]:
-        """Return list of (concept_id, label) for person concepts of this agent."""
-        rows = await self.graph.db.fetchall(
-            """
-            SELECT node_id, label FROM graph_nodes
-            WHERE node_type = 'concept' AND node_id LIKE ?
-            """,
-            (f"concept:{agent_id}:%",),
-        )
-        return [(row[0], row[1]) for row in rows]
+        """Return list of (concept_id, label) for person concepts of this agent.
+
+        Read through the graph facade's own typed query, never a raw ``db``
+        handle: the privacy-governing graph proxy forwards
+        ``get_nodes_by_type`` and refuses ``db`` (#2672), and a tenant-bound
+        store scopes that query to the agent's own nodes. Reaching for
+        ``graph.db`` made every resolution fail on a real agent, silently,
+        as a logged warning (#3228). The ``concept:{agent_id}:`` prefix is
+        the same selection the SQL ``LIKE`` made.
+        """
+        prefix = f"concept:{agent_id}:"
+        nodes = await self.graph.get_nodes_by_type("concept")
+        return [
+            (node.node_id, node.label)
+            for node in nodes
+            if isinstance(node.node_id, str) and node.node_id.startswith(prefix)
+        ]
 
 
 def _normalize_person_name(name: str) -> str:
@@ -721,16 +729,26 @@ class SchemaRouter:
             return 0, []
 
         sentiment, topics = extract_interaction_sentiment(content)
-        enriched_count = 0
         pending: List[Dict[str, Any]] = []
-
         message_node = f"message:{self.agent_id}:{message_id}"
-
         _person_categories = {"person", "proper_noun"}
-        for concept in concepts:
-            if concept.category not in _person_categories:
-                continue
+        people = [c for c in concepts if c.category in _person_categories]
 
+        # Resolve every person BEFORE writing any edge. A resolution that
+        # raises then leaves nothing behind, and the caller's zero summary is
+        # the truth; resolving between edge writes left a multi-person
+        # message half-enriched under a summary that said zero (#3228).
+        for concept in people:
+            match = await self.person_resolver.resolve(concept.label, self.agent_id)
+            if match.status == "pending":
+                pending.append({
+                    "mentioned_label": concept.label,
+                    "candidates": match.candidates,
+                    "message_id": message_id,
+                })
+
+        enriched_count = 0
+        for concept in people:
             # Attach interaction properties to the existing mentions edge.
             properties = {
                 "sentiment": sentiment,
@@ -741,15 +759,6 @@ class SchemaRouter:
                 message_node, concept.node_id, "mentions", properties=properties
             )
             enriched_count += 1
-
-            # 3-pass resolution against other person concepts of this agent.
-            match = await self.person_resolver.resolve(concept.label, self.agent_id)
-            if match.status == "pending":
-                pending.append({
-                    "mentioned_label": concept.label,
-                    "candidates": match.candidates,
-                    "message_id": message_id,
-                })
 
         return enriched_count, pending
 
