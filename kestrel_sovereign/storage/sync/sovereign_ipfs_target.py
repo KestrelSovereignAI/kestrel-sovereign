@@ -121,14 +121,18 @@ class SovereignIPFSTarget(ManifestManagerMixin, SyncTarget):
             )
 
         except Exception as e:
-            logger.error(f"Failed to sync snapshot to sovereign IPFS: {e}")
+            # ``str(e)`` is empty for an httpx timeout; the type is the
+            # diagnosis, so it travels with the message (#3189).
+            logger.error(
+                "Failed to sync snapshot to sovereign IPFS: %s: %s", type(e).__name__, e
+            )
             return SyncResult(
                 success=False,
                 target_name=self.name,
                 bytes_synced=0,
                 frames_synced=0,
                 timestamp=timestamp,
-                error=str(e),
+                error=f"{type(e).__name__}: {e}",
             )
 
     async def sync_wal(self, wal_path: Path, position: int) -> SyncResult:

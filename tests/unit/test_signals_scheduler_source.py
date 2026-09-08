@@ -24,10 +24,9 @@ from kestrel_sdk.signals import (
     Signal,
     SignalMode,
     Status,
-    Trust,
-    Visibility,
 )
 from kestrel_sdk.tools.result import ToolResult
+
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
@@ -50,7 +49,6 @@ from kestrel_sovereign.signals.sources.scheduler import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -787,10 +785,18 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
 ):
     """A configured backup is successful only when every target succeeds."""
     agent, registry, dispatcher, _ = dispatcher_components
+    from kestrel_sovereign.storage.sync.targets import SyncResult
+
+    def failed(name):
+        return SyncResult(
+            success=False, target_name=name, bytes_synced=0, frames_synced=0,
+            timestamp=datetime.now(timezone.utc), error="ReadTimeout: ", kind="",
+        )
+
     agent._sync_service = SimpleNamespace(
         snapshot_if_changed=AsyncMock(return_value={
-            "gcs": SimpleNamespace(success=False, bytes_synced=0),
-            "ipfs": SimpleNamespace(success=False, bytes_synced=0),
+            "gcs": failed("gcs"),
+            "ipfs": failed("ipfs"),
         })
     )
     feature = SchedulerFeature(agent)

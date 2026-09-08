@@ -307,19 +307,28 @@ async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_res
     eighteen days every Lighthouse upload timed out with an empty message.
     The read and write budgets are sized by the payload at the floor rate;
     connect and pool stay at the default."""
+    import builtins
+
     import httpx
 
     resp = mock_response(json_data={"data": {"Hash": "QmBig", "Size": "1"}})
     size = 1_209_462_784
-    payload = bytearray(1)  # never sent: post is a mock
+    payload = b"x"  # never sent: post is a mock; only ITS length is faked
+
+    def sized(obj):
+        return size if obj is payload else builtins.len(obj)
+
     with patch.object(client, "_get_client") as mock_get:
         mock_http = AsyncMock()
         mock_http.post = AsyncMock(return_value=resp)
         mock_get.return_value = mock_http
         with patch("kestrel_sovereign.storage.providers.lighthouse_rest.len", create=True) as fake_len:
-            fake_len.return_value = size
-            await client.upload_car(bytes(payload), tag="t", filename="big.car")
+            fake_len.side_effect = sized
+            await client.upload_car(payload, tag="t", filename="big.car")
 
+    assert any(call.args == (payload,) for call in fake_len.call_args_list), (
+        "the budget must be sized from the CAR payload, not another len()"
+    )
     budget = mock_http.post.await_args.kwargs["timeout"]
     assert isinstance(budget, httpx.Timeout)
     expected = size / client.UPLOAD_FLOOR_BYTES_PER_SECOND

@@ -139,7 +139,7 @@ def backup_target_failure_code(kind: str) -> str:
     the kind-less code, so a third-party target still reports as a failed
     target rather than as nothing.
     """
-    token = kind.strip().upper()
+    token = kind.strip().upper() if isinstance(kind, str) else ""
     return f"BACKUP_TARGET_FAILED_{token}" if token else "BACKUP_TARGET_FAILED"
 
 
@@ -1383,8 +1383,7 @@ class SchedulerFeature(Feature):
                 target: {
                     "success": result.success,
                     "bytes": result.bytes_synced,
-                    "kind": getattr(result, "kind", "") or "",
-                    "error": getattr(result, "error", None),
+                    "kind": result.kind,
                 }
                 for target, result in results.items()
             }
@@ -1396,38 +1395,37 @@ class SchedulerFeature(Feature):
                     }
                 )
             failed = {
-                name: entry
-                for name, entry in targets.items()
-                if entry["success"] is not True
+                name: result
+                for name, result in results.items()
+                if result.success is not True
             }
-            success = not failed
             payload: dict[str, Any] = {
-                "success": success,
-                # A pass with a failed target still has a snapshot on every
-                # target that succeeded; that is a different condition from
-                # no snapshot at all, and readers of the local artifact should
-                # not have to recompute it from the map (#3189).
-                "outcome": (
-                    "ok" if success
-                    else "failed" if len(failed) == len(targets)
-                    else "partial"
-                ),
+                "success": not failed,
                 "targets": targets,
             }
-            if not success:
-                # The error names the failed targets by kind (the bounded part
-                # of their identity); the reason_code carries the same fact
-                # across the signal boundary, where a bare "failed" said
-                # nothing for eighty consecutive runs (#3189).
-                kinds = sorted(entry["kind"] or "undeclared" for entry in failed.values())
-                payload["error"] = "backup_snapshot_failed: " + ", ".join(kinds)
-                if len(failed) == len(targets):
+            if failed:
+                # On failure the signal boundary raises and discards this
+                # payload; two things survive it. The ``error`` string is
+                # logged at the local diagnostic boundary, so it names each
+                # failed target by kind with the error its target recorded
+                # (type and message). The ``reason_code`` crosses into
+                # signal_log.error, so it is one bounded token per shape,
+                # where a bare "failed" said nothing for eighty consecutive
+                # runs (#3189).
+                described = sorted(
+                    f"{result.kind or 'undeclared'} ({result.error})"
+                    if result.error
+                    else (result.kind or "undeclared")
+                    for result in failed.values()
+                )
+                payload["error"] = "backup_snapshot_failed: " + ", ".join(described)
+                if len(failed) == len(results):
                     payload["reason_code"] = "BACKUP_ALL_TARGETS_FAILED"
                 elif len(failed) > 1:
                     payload["reason_code"] = "BACKUP_TARGETS_FAILED"
                 else:
-                    (entry,) = failed.values()
-                    payload["reason_code"] = backup_target_failure_code(entry["kind"])
+                    (result,) = failed.values()
+                    payload["reason_code"] = backup_target_failure_code(result.kind)
             return json.dumps(payload, default=str)
         return json.dumps({
             "skipped": True,
