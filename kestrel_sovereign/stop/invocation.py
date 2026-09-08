@@ -1029,11 +1029,11 @@ class DistributedInvocationRegistry:
                 now = asyncio.get_running_loop().time()
                 self._last_heartbeat_monotonic = now
                 live = set(polled.live_generation_ids)
-                lease_owned_generation_ids = tuple(
-                    generation_id
-                    for generation_id in self._active
-                    if generation_id not in self._completing_generation_ids
-                )
+                # ``polled`` can describe only the durable snapshot taken for
+                # the inventory captured above. A concurrent admission may be
+                # published locally after that SQL snapshot; comparing it to
+                # this older reply would falsely declare the healthy owner
+                # lease lost. The fresh row is covered by the next poll.
                 if any(
                     generation_id not in live
                     for generation_id in lease_owned_generation_ids

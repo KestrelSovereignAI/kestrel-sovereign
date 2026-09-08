@@ -438,10 +438,11 @@ def bind_async_invocation(
                                 ):
                                     variable.set(child_value)
                     return await function(*bound.args, **bound.kwargs)
-                except InvocationCancelledError:
-                    # The isolated child cooperatively unwound after Stop. Its
-                    # cancellation is a successful lifecycle completion, not a
-                    # cleanup failure.
+                except (InvocationCancelledError, InvocationSelfFencedError):
+                    # The isolated child cooperatively unwound after Stop or a
+                    # lease self-fence. Its cancellation is a successful
+                    # lifecycle cleanup, not abandonment. Keep the typed errors
+                    # distinct so callers retry only the infrastructure case.
                     raise
                 except BaseException as error:
                     if registered:

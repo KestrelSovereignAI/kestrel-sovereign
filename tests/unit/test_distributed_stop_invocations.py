@@ -11,7 +11,10 @@ from kestrel_sovereign.agent.invocation import (
     InvocationSelfFencedError,
     bind_async_invocation,
 )
-from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
+)
 from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
@@ -69,6 +72,12 @@ async def test_owner_lease_self_fence_has_distinct_cancellation_provenance(
 
         with pytest.raises(InvocationSelfFencedError):
             await turn
+        assert (
+            await agent.wait_for_request_completion("lease-owned-turn")
+            is RequestCompletionDisposition.COMPLETED
+        )
+        assert getattr(agent, "_abandoned_request_generations", {}) == {}
+        assert agent.cancel_current_request("lease-owned-turn") is False
     finally:
         agent.release_operation.set()
         await registry.close()
@@ -584,6 +593,49 @@ async def test_single_row_admission_does_not_refresh_owner_wide_lease(tmp_path):
             await registry.register(agent, "third-turn", 3)
         assert registry._lease_lost is True
     finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
+    """A row admitted after the SQL snapshot cannot look lease-lost."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-admission-race.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=1.0,
+    )
+    agent = _ReplicaAgent("did:test:relay-admission-race")
+    original_poll = store.poll_owner
+    snapshot_taken = asyncio.Event()
+    release_snapshot = asyncio.Event()
+
+    async def pause_after_snapshot(*args, **kwargs):
+        result = await original_poll(*args, **kwargs)
+        snapshot_taken.set()
+        await release_snapshot.wait()
+        return result
+
+    try:
+        assert await registry.register(agent, "older-turn", 1)
+        store.poll_owner = pause_after_snapshot
+        registry.start()
+        await asyncio.wait_for(snapshot_taken.wait(), timeout=1)
+
+        assert await registry.register(agent, "newer-turn", 2)
+        release_snapshot.set()
+        await asyncio.sleep(0.05)
+
+        assert registry._lease_lost is False
+    finally:
+        release_snapshot.set()
+        store.poll_owner = original_poll
         await registry.close()
         await db.close()
 
