@@ -145,14 +145,29 @@ class PersonResolver:
     def __init__(self, graph: AsyncGraphStore):
         self.graph = graph
 
-    async def resolve(self, name: str, agent_id: str) -> PersonMatch:
-        """Resolve a mentioned person name to a concept_id or a pending flag."""
+    async def resolve(
+        self, name: str, agent_id: str, *, self_node_id: Optional[str] = None
+    ) -> PersonMatch:
+        """Resolve a mentioned person name to a concept_id or a pending flag.
+
+        ``self_node_id`` is the mention's OWN concept node. The linker creates
+        that node before the router runs, so without excluding it pass 1
+        always matched the mention to itself and the fuzzy and pending passes
+        were unreachable on the production path; ``confirm_person_match``
+        rewrites the ambiguous edge from exactly that node to the chosen
+        candidate, so the candidates must be the OTHER people (#3259).
+        """
         normalized = _normalize_person_name(name)
         if not normalized:
             return PersonMatch(concept_id=None, status="new", candidates=[])
 
-        # Pull all existing person concepts for this agent.
-        existing = await self._list_person_concepts(agent_id)
+        # Pull all existing person concepts for this agent, less the mention's
+        # own node.
+        existing = [
+            (cid, label)
+            for cid, label in await self._list_person_concepts(agent_id)
+            if cid != self_node_id
+        ]
 
         # Pass 1 — exact
         exact_id = next(
@@ -745,7 +760,9 @@ class SchemaRouter:
         # the truth; resolving between edge writes left a multi-person
         # message half-enriched under a summary that said zero (#3228).
         for concept in people:
-            match = await self.person_resolver.resolve(concept.label, self.agent_id)
+            match = await self.person_resolver.resolve(
+                concept.label, self.agent_id, self_node_id=concept.node_id
+            )
             if match.status == "pending":
                 pending.append({
                     "mentioned_label": concept.label,

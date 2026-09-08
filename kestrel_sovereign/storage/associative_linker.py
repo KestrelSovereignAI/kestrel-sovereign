@@ -209,15 +209,35 @@ class AssociativeLinker:
                         seen.add(normalized)
                         results.append((normalized, category))
 
-        # Also extract proper nouns (capitalized words that aren't sentence starters)
+        # Also extract proper nouns. A run of consecutive capitalized words is
+        # ONE name ("Jon Doe"), not one concept per token (#3259). A word that
+        # starts a sentence is capitalized for being first and is never part
+        # of a name: "Thanks Jon" and "Jon Doe" are the same shape there, and
+        # without a lexicon the honest reading is the existing one, so a
+        # sentence-initial name loses its first token ("Jon Doe helped" ->
+        # "doe"); put the name mid-sentence to keep it whole.
         words = content.split()
-        for i, word in enumerate(words):
-            if i > 0 and words[i-1][-1] not in ".!?":
-                if word[0].isupper() and len(word) > 2:
-                    clean = re.sub(r"[^\w]", "", word).lower()
-                    if clean and clean not in ["the", "and", "but", "for"] and clean not in seen:
-                        seen.add(clean)
-                        results.append((clean, "proper_noun"))
+        i = 0
+        while i < len(words):
+            if i == 0 or words[i - 1][-1] in ".!?":
+                i += 1
+                continue
+            run: List[str] = []
+            j = i
+            while j < len(words) and words[j][0].isupper() and len(words[j]) > 2:
+                run.append(words[j])
+                if words[j][-1] in ".!?,;:":
+                    j += 1
+                    break
+                j += 1
+            if run:
+                clean = " ".join(
+                    part for part in (re.sub(r"[^\w]", "", w).lower() for w in run) if part
+                )
+                if clean and clean not in ["the", "and", "but", "for"] and clean not in seen:
+                    seen.add(clean)
+                    results.append((clean, "proper_noun"))
+            i = max(j, i + 1)
 
         return results
 

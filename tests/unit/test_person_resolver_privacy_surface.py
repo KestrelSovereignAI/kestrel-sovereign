@@ -142,11 +142,11 @@ async def test_a_failing_resolution_leaves_no_partial_edges(governed, router_log
     calls = []
     real_resolve = router.person_resolver.resolve
 
-    async def flaky(label, agent_id):
+    async def flaky(label, agent_id, **kwargs):
         calls.append(label)
         if label == "Bob":
             raise RuntimeError("resolver backend hiccup")
-        return await real_resolve(label, agent_id)
+        return await real_resolve(label, agent_id, **kwargs)
 
     monkeypatch.setattr(router.person_resolver, "resolve", flaky)
     summary = await _route(router, "msg-2", "Alice and Bob argued about lunch.", "Alice", "Bob")
