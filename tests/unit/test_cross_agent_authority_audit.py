@@ -703,6 +703,22 @@ def _assignment_target_names(target: ast.AST) -> set[str]:
     return set()
 
 
+def _static_binding_target_names(target: ast.AST) -> set[str]:
+    """Return stable keys for local names and object-attribute bindings."""
+
+    if isinstance(target, ast.Attribute):
+        return {ast.unparse(target)}
+    if isinstance(target, ast.Starred):
+        return _static_binding_target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        return {
+            name
+            for element in target.elts
+            for name in _static_binding_target_names(element)
+        }
+    return _assignment_target_names(target)
+
+
 _StaticBinding = tuple[str, str]
 
 
@@ -825,6 +841,8 @@ class _StaticBindingFlow:
             ) or self.resolve(value.value, supplemental_resolver)
         if isinstance(value, ast.Name):
             return self.bindings.get(value.id)
+        if isinstance(value, ast.Attribute):
+            return self.bindings.get(ast.unparse(value))
         if isinstance(value, ast.IfExp):
             return self._merge_values([
                 self.resolve(value.body, supplemental_resolver),
@@ -883,7 +901,7 @@ class _StaticBindingFlow:
         return {
             name: unresolved
             for target in targets
-            for name in _assignment_target_names(target)
+            for name in _static_binding_target_names(target)
         }
 
     def assign(
@@ -906,7 +924,7 @@ class _StaticBindingFlow:
         rebound = {
             name
             for target in targets
-            for name in _assignment_target_names(target)
+            for name in _static_binding_target_names(target)
         }
         for name in rebound:
             self.bindings.pop(name, None)
@@ -1615,7 +1633,7 @@ def _call_produced_decorator_bindings(
 def _tool_decorator_aliases(
     tree: ast.Module,
 ) -> dict[str, ast.Call | None]:
-    """Resolve direct and call-produced aliases of the ``tool`` decorator."""
+    """Resolve direct, stored, and higher-order ``tool`` decorators."""
 
     aliases = {"tool"}
     for node in ast.walk(tree):
@@ -1658,7 +1676,134 @@ def _tool_decorator_aliases(
                     f"Ambiguous stored @tool decorator factory: {name}"
                 )
             produced[name] = call
-    return {**dict.fromkeys(aliases), **produced}
+    resolved: dict[str, ast.Call | None] = {
+        **dict.fromkeys(aliases),
+        **produced,
+    }
+
+    # A local decorator may apply a configured ``tool(...)`` factory to its
+    # callable parameter. Runtime discovery observes the resulting schema, so
+    # static discovery must preserve the same higher-order application rather
+    # than keying only on the spelling used at the final ``@decorator`` site.
+    changed = True
+    while changed:
+        changed = False
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            formal_names = {
+                parameter.arg.casefold()
+                for parameter in [
+                    *function.args.posonlyargs,
+                    *function.args.args,
+                    *function.args.kwonlyargs,
+                    *(
+                        [function.args.vararg]
+                        if function.args.vararg is not None
+                        else []
+                    ),
+                    *(
+                        [function.args.kwarg]
+                        if function.args.kwarg is not None
+                        else []
+                    ),
+                ]
+            }
+            assignments: dict[str, ast.AST] = {}
+            for node in _walk_lexical_scope(function):
+                if isinstance(node, ast.Assign):
+                    pairs = [
+                        pair
+                        for target in node.targets
+                        for pair in _static_assignment_pairs(
+                            target, node.value
+                        )
+                    ]
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    pairs = _static_assignment_pairs(node.target, node.value)
+                else:
+                    continue
+                assignments.update(pairs)
+
+            def assigned_value(value: ast.AST) -> ast.AST:
+                seen: set[str] = set()
+                while (
+                    isinstance(value, ast.Name)
+                    and value.id not in seen
+                    and value.id in assignments
+                ):
+                    seen.add(value.id)
+                    value = assignments[value.id]
+                return value
+
+            factories: list[ast.Call | None] = []
+            for node in _walk_lexical_scope(function):
+                if not isinstance(node, ast.Return) or node.value is None:
+                    continue
+                application = assigned_value(node.value)
+                if not isinstance(application, ast.Call):
+                    continue
+                supplied = [
+                    *application.args,
+                    *(keyword.value for keyword in application.keywords),
+                ]
+                if not any(
+                    _identifier_tokens(argument).intersection(formal_names)
+                    for argument in supplied
+                ):
+                    continue
+                factory = application.func
+                public_name = _public_tool_name(
+                    factory,
+                    function.name,
+                    decorator_aliases=resolved,
+                )
+                if public_name is None:
+                    continue
+                factory_name = (
+                    factory.id
+                    if isinstance(factory, ast.Name)
+                    else factory.attr
+                    if isinstance(factory, ast.Attribute)
+                    else ""
+                )
+                factories.append(
+                    resolved.get(factory_name)
+                    if factory_name in resolved
+                    else factory
+                    if isinstance(factory, ast.Call)
+                    else None
+                )
+            if not factories:
+                continue
+            concrete = [factory for factory in factories if factory is not None]
+            if concrete and any(
+                ast.dump(factory, include_attributes=False)
+                != ast.dump(concrete[0], include_attributes=False)
+                for factory in concrete[1:]
+            ):
+                raise AssertionError(
+                    f"Ambiguous higher-order @tool decorator: {function.name}"
+                )
+            wrapper_factory = concrete[0] if concrete else None
+            previous = resolved.get(function.name)
+            if function.name in resolved:
+                if (
+                    previous is not None
+                    and wrapper_factory is not None
+                    and ast.dump(previous, include_attributes=False)
+                    != ast.dump(wrapper_factory, include_attributes=False)
+                ):
+                    raise AssertionError(
+                        "Ambiguous higher-order @tool decorator: "
+                        f"{function.name}"
+                    )
+                continue
+            resolved[function.name] = wrapper_factory
+            changed = True
+    return resolved
 
 
 def test_module_string_constants_follow_source_order_on_reassignment() -> None:
@@ -3167,20 +3312,13 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
     return writers
 
 
-@lru_cache(maxsize=None)
-def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
-    """Find core execution boundaries whose public names are runtime data.
-
-    ``Feature.get_tools`` creates ``DynamicTool`` wrappers for the statically
-    discovered ``@tool`` methods. Isolated features instead advertise arbitrary
-    tool names during their child handshake. Finally every visible Feature can
-    be exposed as one high-level orchestrator tool through
-    ``to_orchestrator_tool``. Their names cannot all be recovered from a
-    decorator, so classify the generic core boundaries themselves.
-    """
+def _runtime_generated_tool_class_surfaces(
+    package_root: Path,
+    repository_root: Path,
+) -> set[str]:
+    """Find concrete runtime-tool boundaries in a complete shipped package."""
 
     surfaces: set[str] = set()
-    feature_root = REPO_ROOT / "kestrel_sovereign/features"
 
     def base_name(base: ast.expr) -> str:
         if isinstance(base, ast.Name):
@@ -3200,11 +3338,15 @@ def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
                 if any(base_name(base) == "AgentTool" for base in node.bases):
                     for member in node.body:
                         if (
-                            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            isinstance(
+                                member,
+                                (ast.FunctionDef, ast.AsyncFunctionDef),
+                            )
                             and member.name == "execute"
                         ):
                             surfaces.add(
-                                f"{relative}::{'.'.join((*qualified, member.name))}"
+                                f"{relative}::"
+                                f"{'.'.join((*qualified, member.name))}"
                             )
                 walk_statements(node.body, relative, qualified)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -3220,12 +3362,32 @@ def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
                 ]
                 walk_statements(nested_statements, relative, parents)
 
-    for path in feature_root.rglob("*.py"):
+    for path in package_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         walk_statements(
             tree.body,
-            path.relative_to(REPO_ROOT).as_posix(),
+            path.relative_to(repository_root).as_posix(),
         )
+    return surfaces
+
+
+@lru_cache(maxsize=None)
+def _discovered_runtime_generated_tool_surfaces() -> frozenset[str]:
+    """Find core execution boundaries whose public names are runtime data.
+
+    ``Feature.get_tools`` creates ``DynamicTool`` wrappers for the statically
+    discovered ``@tool`` methods. Isolated features instead advertise arbitrary
+    tool names during their child handshake. Finally every visible Feature can
+    be exposed as one high-level orchestrator tool through
+    ``to_orchestrator_tool``. Their names cannot all be recovered from a
+    decorator, so classify the generic core boundaries themselves.
+    """
+
+    package_root = REPO_ROOT / "kestrel_sovereign"
+    surfaces = _runtime_generated_tool_class_surfaces(
+        package_root,
+        REPO_ROOT,
+    )
 
     # Non-feature providers such as MCP register arbitrary runtime names in
     # ``_direct_tools``.  Their concrete names cannot be recovered from the
@@ -12588,6 +12750,10 @@ def _local_provenance_return_helpers(
         ast.FunctionDef | ast.AsyncFunctionDef,
         dict[str, _ParameterReturnFlow],
     ] | None = None,
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ] | None = None,
 ) -> set[str]:
     """Find visible helpers whose returned or yielded value is provenance-derived.
 
@@ -12643,6 +12809,64 @@ def _local_provenance_return_helpers(
     changed = True
     while changed:
         changed = False
+        lexical_aliases: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+        ] = {}
+
+        def initial_aliases_for(
+            function: ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> set[str]:
+            """Carry enclosing provenance values into a closure summary."""
+
+            cached = lexical_aliases.get(function)
+            if cached is not None:
+                return cached
+            parent = (function_parents or {}).get(function)
+            if parent is None:
+                inherited = set(module_provenance_aliases or ())
+            else:
+                inherited = initial_aliases_for(parent)
+                parent_helpers = helper_names | set(
+                    (function_imported_provenance_helpers or {}).get(
+                        parent, ()
+                    )
+                )
+                inherited, _selected = _provenance_aliases(
+                    parent,
+                    parent_helpers,
+                    control_helpers,
+                    inherited
+                    | set((function_initial_aliases or {}).get(parent, ())),
+                    authority_analysis=False,
+                )
+
+            # A parameter is a new local binding, not a capture of the same-
+            # named value in the enclosing function. Annotated/defaulted
+            # provenance is reintroduced by ``_provenance_aliases`` itself.
+            shadowed = {
+                parameter.arg.casefold()
+                for parameter in [
+                    *function.args.posonlyargs,
+                    *function.args.args,
+                    *function.args.kwonlyargs,
+                    *(
+                        [function.args.vararg]
+                        if function.args.vararg is not None
+                        else []
+                    ),
+                    *(
+                        [function.args.kwarg]
+                        if function.args.kwarg is not None
+                        else []
+                    ),
+                ]
+            }
+            resolved = (inherited - shadowed) | set(
+                (function_initial_aliases or {}).get(function, ())
+            )
+            lexical_aliases[function] = resolved
+            return resolved
+
         for function in functions:
             if function.name.casefold() in helper_names:
                 continue
@@ -12655,8 +12879,7 @@ def _local_provenance_return_helpers(
                 function,
                 visible_helpers,
                 control_helpers,
-                set(module_provenance_aliases or ())
-                | set((function_initial_aliases or {}).get(function, ())),
+                initial_aliases_for(function),
                 authority_analysis=False,
             )
             returns_provenance = False
@@ -14211,6 +14434,7 @@ def _direct_provenance_helper_names(source_path: Path) -> frozenset[str]:
                     None,
                 )
             ),
+            function_parents=_nested_function_parents(tree),
         )
     )
 
@@ -14327,6 +14551,7 @@ def _repository_provenance_helper_names(
             )
         ),
         function_imported_parameter_return_flows=function_parameter_flows,
+        function_parents=_nested_function_parents(tree),
     )
     return requested_names.intersection(all_helpers)
 
@@ -15752,6 +15977,7 @@ def _authority_provenance_lines(
             class_provenance_aliases,
             function_imported_provenance_helpers,
             function_parameter_return_flows,
+            function_parents,
         )
         module_provenance_aliases = _module_provenance_state_aliases(
             functions,
@@ -15871,6 +16097,7 @@ def _authority_provenance_lines(
             class_provenance_aliases,
             function_imported_provenance_helpers,
             function_parameter_return_flows,
+            function_parents,
         )
         module_provenance_aliases = _module_provenance_state_aliases(
             functions,
@@ -19643,6 +19870,128 @@ def test_imported_wrapper_callback_summary_requires_invocation(
     )
 
     assert _cached_authority_provenance_lines(source_path) == frozenset()
+
+
+def test_nested_return_helper_inherits_enclosing_provenance_value_flow() -> None:
+    tree = ast.parse(
+        "def dispatch(request, target):\n"
+        "    lineage = request.causation_chain\n"
+        "    def derive():\n"
+        "        return lineage\n"
+        "    if derive():\n"
+        "        terminate_child(target)\n"
+    )
+    shadowed = ast.parse(
+        "def dispatch(request, target):\n"
+        "    lineage = request.causation_chain\n"
+        "    def derive(lineage):\n"
+        "        return lineage\n"
+        "    if derive(False):\n"
+        "        terminate_child(target)\n"
+    )
+
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+    assert _authority_provenance_lines(shadowed) == set()
+
+
+@pytest.mark.parametrize(
+    "wrapper_body",
+    (
+        "    return tool(name='terminate_child', description='x')(fn)\n",
+        "    decorated = tool(name='terminate_child', description='x')(fn)\n"
+        "    return decorated\n",
+        "    return configured(fn)\n",
+    ),
+)
+def test_tool_inventory_follows_higher_order_decorator_applications(
+    wrapper_body: str,
+) -> None:
+    prefix = (
+        "configured = tool(name='terminate_child', description='x')\n\n"
+        if "configured" in wrapper_body
+        else ""
+    )
+    tree = ast.parse(
+        prefix
+        + "def expose(fn):\n"
+        + wrapper_body
+        + "\nclass Controls:\n"
+        "    @expose\n"
+        "    def terminate(self, target):\n"
+        "        pass\n"
+    )
+
+    assert _tool_surfaces_from_module(tree, "example.py") == {
+        "example.py::terminate_child"
+    }
+
+
+@pytest.mark.parametrize(
+    "publication",
+    (
+        "self.registry['x'] = tool",
+        "self.registry.update({'x': tool})",
+        "self.publish({'x': tool})",
+    ),
+)
+def test_dynamic_tool_registry_identity_flows_through_attributes(
+    publication: str,
+) -> None:
+    setup = (
+        "        self.publish = self._direct_tools.update\n"
+        if "self.publish" in publication
+        else "        self.registry = self._direct_tools\n"
+    )
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def publish_tool(self, tool):\n"
+        + setup
+        + f"        {publication}\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.publish_tool"
+    }
+
+
+def test_runtime_agent_tool_scan_uses_complete_core_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = tmp_path / "kestrel_sovereign"
+    provider = package_root / "agent" / "provider.py"
+    provider.parent.mkdir(parents=True)
+    provider.write_text(
+        "class OutsideFeatureTool(AgentTool):\n"
+        "    async def execute(self, **kwargs):\n"
+        "        return kwargs\n",
+        encoding="utf-8",
+    )
+
+    assert _runtime_generated_tool_class_surfaces(package_root, tmp_path) == {
+        "kestrel_sovereign/agent/provider.py::OutsideFeatureTool.execute"
+    }
+
+    scanned_roots: list[tuple[Path, Path]] = []
+
+    def record_root(root: Path, repository_root: Path) -> set[str]:
+        scanned_roots.append((root, repository_root))
+        return set()
+
+    monkeypatch.setitem(
+        globals(),
+        "_runtime_generated_tool_class_surfaces",
+        record_root,
+    )
+    _discovered_runtime_generated_tool_surfaces.cache_clear()
+    try:
+        _discovered_runtime_generated_tool_surfaces()
+    finally:
+        _discovered_runtime_generated_tool_surfaces.cache_clear()
+    assert scanned_roots == [
+        (REPO_ROOT / "kestrel_sovereign", REPO_ROOT)
+    ]
 
 
 @pytest.mark.parametrize(
