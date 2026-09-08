@@ -443,17 +443,28 @@ async def test_fetch_pr_state_degrades_rather_than_blocking_the_whole_poll(
 #     secondary limit  403  retry-after: <seconds>
 
 import email.message
+import io
 import urllib.error
 import urllib.request
 
 from kestrel_sovereign.signals.sources.github_pr_watch import PRWatchRateLimitError
 
 
-def _http_error(code, **headers):
+# The two bodies GitHub actually sends, measured 2026-09-08.
+PERMISSION_BODY = b'{"message":"Resource not accessible by personal access token"}'
+SECONDARY_LIMIT_BODY = (
+    b'{"message":"You have exceeded a secondary rate limit. '
+    b'Please wait a few minutes before you try again."}'
+)
+
+
+def _http_error(code, body=b"", **headers):
     hdrs = email.message.Message()
     for k, v in headers.items():
         hdrs[k.replace("_", "-")] = v
-    return urllib.error.HTTPError("https://api.github.com/x", code, "err", hdrs, None)
+    return urllib.error.HTTPError(
+        "https://api.github.com/x", code, "err", hdrs, io.BytesIO(body)
+    )
 
 
 def _raise_from_urlopen(monkeypatch, exc):
@@ -494,11 +505,12 @@ async def test_a_429_is_transient(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_real_permission_403_is_still_an_auth_error(monkeypatch):
-    """Control, with the exact headers the live token returns. If this became
-    a rate-limit error the fallback would never fire at all."""
+async def test_the_measured_permission_403_is_an_auth_error(monkeypatch):
+    """Control, with the exact headers AND body the live token returns. If
+    this became a rate-limit error the fallback would never fire at all."""
     _raise_from_urlopen(monkeypatch, _http_error(
         403,
+        body=PERMISSION_BODY,
         x_accepted_github_permissions="checks=read",
         x_ratelimit_limit="5000",
         x_ratelimit_remaining="4999",
@@ -511,23 +523,49 @@ async def test_a_real_permission_403_is_still_an_auth_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_secondary_limit_with_neither_marker_is_not_a_refusal(monkeypatch):
-    """Review round 2, and the reason the test above it exists in this shape.
+async def test_the_accepted_permissions_header_proves_nothing_by_itself(
+    monkeypatch,
+):
+    """Review round 3. An earlier revision read this header's presence as
+    proof of a refusal; measured, GitHub sends it on 200s too, naming what
+    the ENDPOINT accepts rather than what the caller was denied::
 
-    GitHub's retry guidance ends "Otherwise, wait for at least one minute
-    before retrying" — i.e. a secondary limit may carry NEITHER ``retry-after``
-    NOR ``x-ratelimit-remaining: 0``. Ruling throttles out one marker at a
-    time therefore cannot terminate; the classification has to require proof
-    of a *refusal* instead, and this is the response that has none."""
+        200  /pulls        x-accepted-github-permissions: pull_requests=read
+        403  /check-runs   x-accepted-github-permissions: checks=read
+
+    So a throttle carrying it must still be classified as a throttle."""
     _raise_from_urlopen(monkeypatch, _http_error(
-        403, x_ratelimit_limit="5000", x_ratelimit_remaining="4999",
+        403,
+        body=SECONDARY_LIMIT_BODY,
+        x_accepted_github_permissions="checks=read",
+        x_accepted_oauth_scopes="repo",
+        x_ratelimit_remaining="4999",
     ))
 
-    with pytest.raises(PRWatchNetworkError) as caught:
+    with pytest.raises(PRWatchRateLimitError):
         await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
-    assert not isinstance(caught.value, PRWatchAuthError)
-    assert "without identifying" in str(caught.value)
+
+@pytest.mark.asyncio
+async def test_a_secondary_limit_identified_only_in_the_body_is_transient(
+    monkeypatch,
+):
+    """Review rounds 2 and 3, and the reason this asserts on the BODY.
+
+    GitHub's retry guidance ends "Otherwise, wait for at least one minute
+    before retrying" — a secondary limit may carry NEITHER ``retry-after``
+    NOR ``x-ratelimit-remaining: 0``, and identifies itself in the message
+    instead. Nothing in the headers of this response distinguishes it from a
+    permission refusal; the message does."""
+    _raise_from_urlopen(monkeypatch, _http_error(
+        403,
+        body=SECONDARY_LIMIT_BODY,
+        x_ratelimit_limit="5000",
+        x_ratelimit_remaining="4999",
+    ))
+
+    with pytest.raises(PRWatchRateLimitError):
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
 
 @pytest.mark.asyncio
@@ -579,22 +617,18 @@ async def test_a_throttled_poll_stays_pending_instead_of_settling_partial(
 
 
 @pytest.mark.asyncio
-async def test_a_403_carrying_no_headers_at_all_is_not_a_refusal(monkeypatch):
-    """This assertion was the other way round for one commit, and the reason
-    it flipped is worth keeping. Both directions are wrong in some scenario;
-    they are not equally wrong. Read a real refusal as transient and the wait
-    sits pending on a gate that never clears — visible, and already what
-    #3248 reports. Read a throttle as a refusal and a green PR settles
-    terminally off a rollup that was merely slowed. Only the first is safe to
-    be wrong about, so proof is required for the refusal, not for the
-    throttle."""
+async def test_a_403_with_no_throttle_evidence_at_all_is_a_refusal(monkeypatch):
+    """A 403 that proves nothing is read as a refusal, which is what lets the
+    fallback fire. Safe because the throttle GitHub can send without headers
+    still names itself in the body (the test above), so "no evidence" really
+    does mean no throttle — not merely an unlabelled one."""
     err = urllib.error.HTTPError("https://api.github.com/x", 403, "err", None, None)
     _raise_from_urlopen(monkeypatch, err)
 
-    with pytest.raises(PRWatchNetworkError) as caught:
+    with pytest.raises(PRWatchAuthError) as caught:
         await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
-    assert not isinstance(caught.value, PRWatchAuthError)
+    assert not isinstance(caught.value, PRWatchRateLimitError)
 
 
 @pytest.mark.asyncio
@@ -610,13 +644,12 @@ async def test_a_401_is_always_a_credential_problem(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_classic_tokens_scope_refusal_is_also_a_refusal(monkeypatch):
-    """A classic token names the scope it wanted in a different header."""
-    _raise_from_urlopen(monkeypatch, _http_error(
-        403, x_accepted_oauth_scopes="admin:org", x_ratelimit_remaining="4999",
-    ))
+async def test_a_primary_limit_still_wins_over_an_absent_body(monkeypatch):
+    """The header markers stay authoritative on their own — a body is extra
+    evidence, not a replacement for the two signals GitHub does send."""
+    _raise_from_urlopen(monkeypatch, _http_error(403, x_ratelimit_remaining="0"))
 
-    with pytest.raises(PRWatchAuthError):
+    with pytest.raises(PRWatchRateLimitError):
         await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
 
 
@@ -629,6 +662,7 @@ async def test_the_measured_permission_403_still_reaches_the_fallback(monkeypatc
         if "/check-runs" in req.full_url:
             raise _http_error(
                 403,
+                body=PERMISSION_BODY,
                 x_accepted_github_permissions="checks=read",
                 x_ratelimit_limit="5000",
                 x_ratelimit_remaining="4994",
@@ -655,11 +689,14 @@ async def test_the_measured_permission_403_still_reaches_the_fallback(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_an_unattributed_403_does_not_degrade_the_rollup(monkeypatch):
-    """Same route as the rate-limit case, through the real classification
-    rather than a pre-decided injected exception."""
+async def test_a_body_only_throttle_does_not_degrade_the_rollup(monkeypatch):
+    """End to end through the real classification rather than a pre-decided
+    injected exception: the header-less secondary limit must not mark an
+    endpoint unreadable."""
     def fake_urlopen(req, timeout=None):
-        raise _http_error(403, x_ratelimit_remaining="4999")
+        raise _http_error(
+            403, body=SECONDARY_LIMIT_BODY, x_ratelimit_remaining="4999"
+        )
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
