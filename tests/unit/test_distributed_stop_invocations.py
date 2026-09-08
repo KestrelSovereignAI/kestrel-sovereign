@@ -341,6 +341,33 @@ async def test_public_turn_fence_wins_before_durable_binding(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_request_stop_mark_wins_before_public_turn_binding(tmp_path):
+    """Binding cannot admit cognition after an exact request Stop commits."""
+
+    first_db, second_db, _store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:request-stop-bind-race")
+    replica_a.attach(agent)
+    try:
+        assert await replica_a.register(agent, "private-request", 1)
+        ticket = await replica_b.request_turn(agent.agent_id, "private-request")
+
+        assert ticket.generation_ids
+        assert not await replica_a.bind_public_turn(
+            agent,
+            "public-turn",
+            "private-request",
+            1,
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
 async def test_exact_stop_fence_wins_before_remote_registration(tmp_path):
     first_db, second_db, store, replica_a, replica_b = await _shared_registries(
         tmp_path
@@ -555,13 +582,13 @@ async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
     try:
         generation = agent.register_active_request("abandoned-turn")
         assert await agent.await_durable_request_admission("abandoned-turn")
-        ticket = await replica_b.request_turn(agent.agent_id, "abandoned-turn")
         generation_id = replica_a._by_local_generation[
             (id(agent), "abandoned-turn", generation)
         ]
         with invocation_scope("abandoned-turn"):
             async with agent._turn_lifecycle() as public_turn_id:
                 pass
+        ticket = await replica_b.request_turn(agent.agent_id, "abandoned-turn")
 
         agent._cleanup_cancelled_request(
             "abandoned-turn",
@@ -781,6 +808,149 @@ async def test_registration_that_outlasts_existing_owner_lease_self_fences(
         assert rows == [(older_generation_id,)]
     finally:
         release_insert.set()
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_registration_rejects_row_reaped_during_delayed_reply(
+    tmp_path,
+):
+    """An idle owner cannot derive a fresh lease from a late SQL reply."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    path = tmp_path / "first-admission-lease-race.db"
+    owner_db = await AsyncDatabase.sqlite(str(path))
+    peer_db = await AsyncDatabase.sqlite(str(path))
+    owner_store = DistributedInvocationStore(owner_db)
+    peer_store = DistributedInvocationStore(peer_db)
+    await owner_store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        owner_store,
+        poll_seconds=0.01,
+        owner_lease_seconds=0.03,
+    )
+    agent = _ReplicaAgent("did:test:first-admission-lease-race")
+    original_register = owner_store.register
+    inserted = asyncio.Event()
+    release_reply = asyncio.Event()
+
+    async def delay_committed_reply(**kwargs):
+        admitted = await original_register(**kwargs)
+        inserted.set()
+        await release_reply.wait()
+        return admitted
+
+    owner_store.register = delay_committed_reply
+    admission = asyncio.create_task(registry.register(agent, "first-turn", 1))
+    try:
+        await asyncio.wait_for(inserted.wait(), timeout=1)
+        ticket = await peer_store.mark_turn(agent.agent_id, "first-turn")
+        await asyncio.sleep(0.04)
+        assert await peer_store.reap_expired(
+            ticket.generation_ids,
+            lease_seconds=0.03,
+        ) == ticket.generation_ids
+        release_reply.set()
+
+        with pytest.raises(InvocationSelfFencedError):
+            await admission
+        assert registry._lease_lost is True
+        for _ in range(100):
+            if not await owner_store.remaining(ticket.generation_ids):
+                break
+            await asyncio.sleep(0.01)
+        assert await owner_store.remaining(ticket.generation_ids) == ()
+    finally:
+        release_reply.set()
+        await asyncio.gather(admission, return_exceptions=True)
+        await registry.close()
+        await owner_db.close()
+        await peer_db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_binding_rejects_expired_local_owner_lease(tmp_path):
+    """Waiting for the conversation lock cannot outlive request ownership."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "binding-expired-lease.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=0.03,
+    )
+    agent = _ReplicaAgent("did:test:binding-expired-lease")
+    try:
+        assert await registry.register(agent, "private-request", 1)
+        await asyncio.sleep(0.04)
+
+        with pytest.raises(InvocationSelfFencedError):
+            await registry.bind_public_turn(
+                agent,
+                "public-turn",
+                "private-request",
+                1,
+            )
+        assert registry._lease_lost is True
+        row = await db.fetchone(
+            "SELECT public_turn_digest FROM stop_active_invocations"
+        )
+        assert row == (None,)
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_public_turn_binding_rejects_lease_expiring_during_sql(tmp_path):
+    """A slow binding reply cannot authorize cognition after lease expiry."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "binding-reply-race.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=0.03,
+    )
+    agent = _ReplicaAgent("did:test:binding-reply-race")
+    original_bind = store.bind_public_turn
+    bound = asyncio.Event()
+    release_reply = asyncio.Event()
+
+    async def delay_bound_reply(**kwargs):
+        admitted = await original_bind(**kwargs)
+        bound.set()
+        await release_reply.wait()
+        return admitted
+
+    store.bind_public_turn = delay_bound_reply
+    try:
+        assert await registry.register(agent, "private-request", 1)
+        binding = asyncio.create_task(
+            registry.bind_public_turn(
+                agent,
+                "public-turn",
+                "private-request",
+                1,
+            )
+        )
+        await asyncio.wait_for(bound.wait(), timeout=1)
+        await asyncio.sleep(0.04)
+        release_reply.set()
+
+        with pytest.raises(InvocationSelfFencedError):
+            await binding
+        assert registry._lease_lost is True
+    finally:
+        release_reply.set()
         await registry.close()
         await db.close()
 

@@ -281,11 +281,14 @@ class DistributedInvocationStore:
         async with self._db.transaction(immediate=True):
             await self._lock_agent(agent_id)
             row = await self._db.fetchone(
-                "SELECT public_turn_digest FROM stop_active_invocations "
+                "SELECT public_turn_digest, stop_requested "
+                "FROM stop_active_invocations "
                 "WHERE generation_id = ? AND owner_id = ? AND agent_id = ?",
                 (generation_id, owner_id, agent_id),
             )
             if row is None:
+                return False
+            if int(row[1]) == 1:
                 return False
             if row[0] is not None:
                 if str(row[0]) != digest:
@@ -782,6 +785,43 @@ class DistributedInvocationRegistry:
             else "local-agent"
         )
 
+    async def _renew_owner_lease(
+        self,
+        generation_id: str,
+        *,
+        operation: str,
+    ) -> _OwnerPoll:
+        """Renew the whole durable inventory without reviving an old lease."""
+
+        loop = asyncio.get_running_loop()
+        poll_started = loop.time()
+        try:
+            polled = await self._store.poll_owner(
+                self._owner_id,
+                lease_seconds=self._owner_lease_seconds,
+            )
+        except Exception as error:
+            self._fail_closed_owner()
+            raise InvocationSelfFencedError(
+                f"distributed Stop owner lease could not be renewed {operation}"
+            ) from error
+        # The database heartbeat occurs no earlier than ``poll_started``.
+        # Retaining that lower bound (rather than response time) prevents a
+        # delayed database response from making an already-expired lease look
+        # fresh to this process.
+        if loop.time() - poll_started >= self._owner_lease_seconds:
+            self._fail_closed_owner()
+            raise InvocationSelfFencedError(
+                f"distributed Stop owner lease expired {operation}"
+            )
+        if generation_id not in polled.live_generation_ids:
+            self._fail_closed_owner()
+            raise InvocationSelfFencedError(
+                f"distributed Stop durable generation was lost {operation}"
+            )
+        self._last_heartbeat_monotonic = poll_started
+        return polled
+
     async def register(
         self,
         agent: object,
@@ -821,6 +861,7 @@ class DistributedInvocationRegistry:
                 if key in self._by_local_generation:
                     return True
                 generation_id = uuid4().hex
+                admission_started = asyncio.get_running_loop().time()
                 admitted = await self._store.register(
                     generation_id=generation_id,
                     agent_id=self._agent_id(agent),
@@ -865,12 +906,30 @@ class DistributedInvocationRegistry:
                         "distributed Stop owner lease was lost during admission"
                     )
                 if not had_other_lease_owned_work:
-                    # A single-row insert timestamps only that row. It starts
-                    # an idle owner's lease, but cannot renew older rows or
-                    # prove the health of the complete owner inventory.
-                    self._last_heartbeat_monotonic = (
-                        asyncio.get_running_loop().time()
-                    )
+                    # The insert starts an idle owner's lease, but its reply
+                    # can be delayed past that lease while a peer marks and
+                    # reaps the row. Never use response time as proof of fresh
+                    # ownership, and re-read the durable row before cognition.
+                    if (
+                        asyncio.get_running_loop().time() - admission_started
+                        >= self._owner_lease_seconds
+                    ):
+                        self._fail_closed_owner()
+                        self.complete_soon(agent, turn_id, generation)
+                        raise InvocationSelfFencedError(
+                            "distributed Stop owner lease expired during admission"
+                        )
+                    try:
+                        polled = await self._renew_owner_lease(
+                            generation_id,
+                            operation="during admission",
+                        )
+                    except InvocationSelfFencedError:
+                        self.complete_soon(agent, turn_id, generation)
+                        raise
+                    if generation_id in polled.stop_generation_ids:
+                        self.complete_soon(agent, turn_id, generation)
+                        return False
                 return True
 
         owner = asyncio.create_task(publish(), name="distributed-stop-register")
@@ -892,20 +951,51 @@ class DistributedInvocationRegistry:
 
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
-        if self._lease_lost:
-            raise InvocationSelfFencedError(
-                "distributed Stop owner lease was lost before turn binding"
+        async with self._registration_lock:
+            if self._lease_lost:
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner lease was lost before turn binding"
+                )
+            key = (id(agent), request_id, generation)
+            generation_id = self._by_local_generation.get(key)
+            if (
+                generation_id is None
+                or generation_id in self._completing_generation_ids
+            ):
+                return False
+            last_heartbeat = self._last_heartbeat_monotonic
+            if (
+                last_heartbeat is None
+                or asyncio.get_running_loop().time() - last_heartbeat
+                >= self._owner_lease_seconds
+            ):
+                self._fail_closed_owner()
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner lease expired before turn binding"
+                )
+            polled = await self._renew_owner_lease(
+                generation_id,
+                operation="before turn binding",
             )
-        key = (id(agent), request_id, generation)
-        generation_id = self._by_local_generation.get(key)
-        if generation_id is None:
-            return False
-        return await self._store.bind_public_turn(
-            generation_id=generation_id,
-            owner_id=self._owner_id,
-            agent_id=self._agent_id(agent),
-            turn_id=turn_id,
-        )
+            if generation_id in polled.stop_generation_ids:
+                return False
+            bound = await self._store.bind_public_turn(
+                generation_id=generation_id,
+                owner_id=self._owner_id,
+                agent_id=self._agent_id(agent),
+                turn_id=turn_id,
+            )
+            last_heartbeat = self._last_heartbeat_monotonic
+            if (
+                last_heartbeat is None
+                or asyncio.get_running_loop().time() - last_heartbeat
+                >= self._owner_lease_seconds
+            ):
+                self._fail_closed_owner()
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner lease expired during turn binding"
+                )
+            return bound
 
     def complete_soon(
         self,
@@ -1107,12 +1197,18 @@ class DistributedInvocationRegistry:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             try:
+                poll_started = asyncio.get_running_loop().time()
                 polled = await self._store.poll_owner(
                     self._owner_id,
                     lease_seconds=self._owner_lease_seconds,
                 )
-                now = asyncio.get_running_loop().time()
-                self._last_heartbeat_monotonic = now
+                if (
+                    asyncio.get_running_loop().time() - poll_started
+                    >= self._owner_lease_seconds
+                ):
+                    self._fail_closed_owner()
+                else:
+                    self._last_heartbeat_monotonic = poll_started
                 live = set(polled.live_generation_ids)
                 # ``polled`` can describe only the durable snapshot taken for
                 # the inventory captured above. A concurrent admission may be
