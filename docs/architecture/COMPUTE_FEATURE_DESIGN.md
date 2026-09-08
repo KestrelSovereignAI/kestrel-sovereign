@@ -327,22 +327,29 @@ refused rewrite, a failed script write, a missing docker binary at spawn, or a
 timeout all clean up (#3117).
 
 Beside the directory, outside the bind, sits an **owner record**
-`.staging-<hex>.owner` naming the process that created it. Each script run
-sweeps the trash root before staging its own directory: a staging directory
-whose owner record names a running process is left alone however old it is; one
-whose owner is gone is promoted and removed at once, record included; one with
-no record at all is legacy (older code wrote none) and is swept once older than
-the policy's default maximum script timeout (one hour). This is a host-side
-effect across agents: on a host where several agents share the trash root, any
-agent's run reaps the directories that a crashed or killed process of another
-agent left behind, and the entries inside them become restorable from the
-shared root.
+`.staging-<hex>.owner` naming the process and the container that created it.
+Each script run sweeps the trash root before staging its own directory: a
+staging directory whose record names a running process is left alone however
+old it is; one whose process is gone is left alone while Docker still knows its
+container (`docker run --rm` is a foreground client, so a killed agent's
+container keeps running with the bind until the script ends), and otherwise
+promoted and removed at once, record included; one with no record at all is
+legacy (older code wrote none) and is swept once older than the compute
+policy's configured maximum script timeout. An orphan record whose directory is
+gone is reaped the same way. This is a host-side effect across agents: on a host
+where several agents share the trash root, any agent's run reaps the directories
+that a crashed or killed process of another agent left behind, and the entries
+inside them become restorable from the shared root. The sweep never raises: a
+planted or damaged file must not turn every later run into a failure.
 
 The staging bind is the one writable mount a container gets, so nothing in the
-sweep or the promotion follows a symlink: a link planted in the bind is removed
-rather than promoted, and a link wearing a staging name in the root is never a
-sweep candidate. Hidden `.staging-*` entries are never listed or restorable by
-`trash_list`/`trash_restore` before promotion, by design.
+sweep or the promotion follows a symlink or trusts a hidden name: a link or a
+hidden entry planted in the bind is removed rather than promoted (no
+rewriter-made trash entry is ever hidden, and a promoted `.staging-*` directory
+or `.owner` file would pass for one the sweep trusts), and a link wearing a
+staging name in the root is never a sweep candidate. Hidden `.staging-*`
+entries are never listed or restorable by `trash_list`/`trash_restore` before
+promotion, by design.
 
 ### 3.4 Security Review Patterns
 

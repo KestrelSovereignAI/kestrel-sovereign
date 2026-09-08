@@ -83,6 +83,7 @@ class DockerExecutor(BaseExecutor):
         # parameter mid-list silently remaps every caller that passed
         # one positionally.
         command_image: Optional[str] = None,
+        legacy_staging_age_seconds: Optional[int] = None,
     ):
         """
         Initialize the Docker executor.
@@ -106,6 +107,13 @@ class DockerExecutor(BaseExecutor):
         self._pids_limit = default_pids_limit
         self._policy = DestructiveOperationPolicy(
             current_agent_data_path=current_agent_data_path
+        )
+        # A record-less staging directory (made by code that wrote no record)
+        # is swept once older than the longest a script may run under the
+        # policy this executor serves; the feature passes its configured
+        # maximum, the default is the policy's shipped default.
+        self._legacy_staging_age_seconds = int(
+            legacy_staging_age_seconds or self.LEGACY_STAGING_AGE_SECONDS
         )
 
     @property
@@ -223,21 +231,22 @@ class DockerExecutor(BaseExecutor):
         # read or corrupt entries trashed by previous runs and other agents.
         # Staged entries are promoted into the real trash root host-side
         # after the container exits (same filesystem, atomic renames).
-        self._promote_stale_staging_dirs(host_trash_dir)
+        await self._promote_stale_staging_dirs(host_trash_dir, docker_path)
         staging_dir = host_trash_dir / f".staging-{uuid.uuid4().hex[:12]}"
-        # The owner record lives BESIDE the directory, outside the bind
-        # mount, so the container can neither read nor forge it. It is
-        # written first: a directory with no record is one this code never
-        # owned (see ``_promote_stale_staging_dirs``).
-        self._write_staging_owner(staging_dir)
-        staging_dir.mkdir(mode=0o700)
-        # Guarded from the moment it exists: every exit below (a policy
-        # rewrite that refuses the script, the script write, a docker binary
-        # that is not there when the process is spawned, a timeout) promotes
-        # and removes it. Before this guard began at the process wait, each
-        # failed launch left an empty hidden directory in the trash root
-        # that no listing could see: 589 of them on one host (#3117).
+        # Guarded from the moment anything exists: the owner record, then
+        # the directory, then every exit below (a policy rewrite that
+        # refuses the script, the script write, a docker binary that is not
+        # there when the process is spawned, a timeout) promotes and removes
+        # both. Before this guard began at the process wait, each failed
+        # launch left an empty hidden directory in the trash root that no
+        # listing could see: 589 of them on one host (#3117).
         try:
+            # The record lives BESIDE the directory, outside the bind mount,
+            # so the container cannot read or alter its own; it is written
+            # first, so a directory with no record is one this code never
+            # owned (see ``_promote_stale_staging_dirs``).
+            self._write_staging_owner(staging_dir, container_name)
+            staging_dir.mkdir(mode=0o700)
             return await self._run_staged_script(
                 script,
                 working_dir,
@@ -575,85 +584,158 @@ class DockerExecutor(BaseExecutor):
     #: (``.staging-<hex>.owner``), outside the container's bind mount.
     STAGING_OWNER_SUFFIX = ".owner"
 
-    #: A staging directory with NO owner record was made by code that wrote
-    #: none (the leak this ticket closes, or a run of that older code still
-    #: in flight across an upgrade). It is swept once older than the compute
-    #: policy's default maximum script timeout; a record-bearing directory is
-    #: judged by its owner's liveness, never by age.
+    #: Default for ``legacy_staging_age_seconds``: the compute policy's
+    #: shipped maximum script timeout. A staging directory with NO owner
+    #: record was made by code that wrote none (the leak this ticket closes,
+    #: or a run of that older code still in flight across an upgrade) and is
+    #: swept once older than this; a record-bearing directory is judged by
+    #: its owner, never by age.
     LEGACY_STAGING_AGE_SECONDS = 60 * 60
 
     @classmethod
-    def _write_staging_owner(cls, staging_dir: Path) -> None:
-        """Record which process owns ``staging_dir``: this one, from now."""
+    def _write_staging_owner(cls, staging_dir: Path, container_name: str) -> None:
+        """Record which process and container own ``staging_dir``."""
         record = staging_dir.with_name(staging_dir.name + cls.STAGING_OWNER_SUFFIX)
-        record.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        record.write_text(json.dumps({
+            "pid": os.getpid(),
+            "container": container_name,
+            "started": time.time(),
+        }))
         record.chmod(0o600)
 
     @staticmethod
-    def _owner_is_alive(record: Path) -> Optional[bool]:
-        """Whether the process named in ``record`` is running.
+    def _read_owner_record(record: Path) -> Optional[Dict[str, object]]:
+        """The owner record's fields, or ``None`` when it is not one of ours.
 
-        ``None`` means the record is unreadable (treated as no record).
-        A process this user may not signal is still a live process.
+        A record is a small JSON object with a bounded positive ``pid``;
+        anything else (prose, a forged value that overflows a C int, a
+        symlink) is no record at all.
         """
         try:
-            pid = int(json.loads(record.read_text())["pid"])
-        except (OSError, ValueError, TypeError, KeyError):
+            if record.is_symlink() or not record.is_file():
+                return None
+            data = json.loads(record.read_text(encoding="utf-8", errors="replace")[:4096])
+        except (OSError, ValueError):
             return None
-        if pid <= 0:
+        if not isinstance(data, dict):
             return None
+        pid = data.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid < 2**31:
+            return None
+        container = data.get("container")
+        return {
+            "pid": pid,
+            "container": container if isinstance(container, str) and container else None,
+        }
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        """Whether ``pid`` names a running process; one this user may not
+        signal is still a live process."""
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
         except PermissionError:
             return True
+        except OSError:
+            return False
         return True
 
     @classmethod
-    def _promote_stale_staging_dirs(cls, host_trash_dir: Path) -> None:
+    async def _container_exists(cls, docker_path: Optional[str], container_name: str) -> bool:
+        """Whether Docker still knows ``container_name``.
+
+        ``docker run --rm`` is a foreground client: a killed agent leaves its
+        container running with the staging bind for as long as the script
+        runs, and Docker removes the container when it exits. So "inspect
+        succeeds" means the run is still live; without a docker binary
+        nothing can be running.
+        """
+        if not docker_path:
+            return False
+        try:
+            code = await cls._run_control_command(docker_path, "inspect", container_name)
+        except Exception:  # noqa: BLE001 - a wedged daemon must not fail the sweep
+            logger.debug("docker inspect %s failed", container_name, exc_info=True)
+            return True  # unknown: leave the directory alone
+        return code == 0
+
+    async def _promote_stale_staging_dirs(
+        self, host_trash_dir: Path, docker_path: Optional[str]
+    ) -> None:
         """Promote and remove staging directories no execution still owns.
 
         A failed launch used to leave its ``.staging-*`` directory behind
         (#3117), and the trash listing hides dot-directories by design, so
         nothing in band ever showed the accumulation. Each script run sweeps
         the root before staging its own. "Still owned" is a fact about a
-        process, not an age: a directory whose owner record names a running
-        process is left alone however old it is; one whose owner is gone is
-        promoted (its entries, if any, into the real trash root) and removed
-        at once, and its record with it. A directory with no record is
-        legacy and is swept once older than the default maximum script
-        timeout. Nothing here follows a symlink: the staging bind is the one
-        writable mount a container gets, and a link planted there must never
-        become a promotion source (review of #3117).
+        process and its container, not an age: a directory whose record
+        names a running process is left alone however old it is; one whose
+        process is gone is left alone while Docker still knows its container
+        (the container outlives a killed client), and otherwise promoted
+        (its entries, if any, into the real trash root) and removed at once,
+        record included. A directory with no record is legacy and is swept
+        once older than the executor's legacy floor. A record whose
+        directory is gone is an orphan and is removed the same way. Nothing
+        here follows a symlink or raises: the staging bind is the one
+        writable mount a container gets, and the sweep runs at the head of
+        every script execution, so a planted file must never turn every
+        later run into a failure.
         """
+        try:
+            await self._sweep_staging_dirs(host_trash_dir, docker_path)
+        except Exception:  # noqa: BLE001 - the sweep is best-effort by contract
+            logger.warning(
+                "Sweep of stale staging directories under %s failed; continuing",
+                host_trash_dir,
+                exc_info=True,
+            )
+
+    async def _sweep_staging_dirs(self, host_trash_dir: Path, docker_path: Optional[str]) -> None:
         try:
             candidates = list(host_trash_dir.iterdir())
         except OSError:
             return
-        legacy_cutoff = time.time() - cls.LEGACY_STAGING_AGE_SECONDS
+        legacy_cutoff = time.time() - self._legacy_staging_age_seconds
+        suffix = self.STAGING_OWNER_SUFFIX
         for candidate in candidates:
             name = candidate.name
-            if not name.startswith(".staging-") or name.endswith(cls.STAGING_OWNER_SUFFIX):
+            if not name.startswith(".staging-"):
                 continue
             try:
                 st = candidate.lstat()
             except OSError:
                 continue
+            if name.endswith(suffix):
+                # An orphan record: its directory is gone (a failed mkdir, or
+                # a promotion that did not get to remove it). Reap it once
+                # its owner is, or it is unreadable and past the floor.
+                directory = candidate.with_name(name[: -len(suffix)])
+                if directory.exists() or directory.is_symlink():
+                    continue
+                owner = self._read_owner_record(candidate)
+                if owner is not None and self._pid_is_alive(owner["pid"]):
+                    continue
+                if owner is None and st.st_mtime > legacy_cutoff:
+                    continue
+                self._remove_staging_owner(directory)
+                continue
             if not stat.S_ISDIR(st.st_mode):
                 # A symlink or file wearing a staging name is not a staging
                 # directory; it is never entered, promoted or followed.
                 continue
-            record = candidate.with_name(name + cls.STAGING_OWNER_SUFFIX)
-            if record.is_file() and not record.is_symlink():
-                alive = cls._owner_is_alive(record)
-                if alive:
+            owner = self._read_owner_record(candidate.with_name(name + suffix))
+            if owner is not None:
+                if self._pid_is_alive(owner["pid"]):
                     continue
-                if alive is None and st.st_mtime > legacy_cutoff:
+                if owner["container"] and await self._container_exists(
+                    docker_path, owner["container"]
+                ):
                     continue
             elif st.st_mtime > legacy_cutoff:
                 continue
-            cls._promote_staged_trash(candidate, host_trash_dir)
+            self._promote_staged_trash(candidate, host_trash_dir)
 
     @classmethod
     def _remove_staging_owner(cls, staging_dir: Path) -> None:
@@ -693,16 +775,21 @@ class DockerExecutor(BaseExecutor):
                 )
                 return
             for entry in staging_dir.iterdir():
-                if entry.is_symlink():
-                    # Never promote a link: its target is whatever the
-                    # container chose, and a promoted link would make the
-                    # next sweep treat that target as a staging directory.
+                if entry.is_symlink() or entry.name.startswith("."):
+                    # Never promote a link or a hidden entry. A link's target
+                    # is whatever the container chose; a hidden name is one
+                    # no rewriter-made trash entry ever has, and in the root
+                    # it would pass for a staging directory or an owner
+                    # record the sweep trusts (review of #3117).
                     logger.warning(
-                        "Refusing to promote symlink %s staged by a container; "
-                        "removed.",
+                        "Refusing to promote %s staged by a container "
+                        "(symlink or hidden entry); removed.",
                         entry,
                     )
-                    entry.unlink()
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink()
                     continue
                 destination = host_trash_dir / entry.name
                 suffix = 0
