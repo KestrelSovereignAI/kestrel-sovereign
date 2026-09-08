@@ -520,6 +520,7 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, timeout=0.5)
         assert replica_a._lease_lost is True
+        assert replica_a.owner_lifecycle_status == "self_fenced"
         with pytest.raises(InvocationSelfFencedError):
             await replica_a.register(agent, "later-turn", 2)
     finally:
@@ -527,6 +528,84 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         if not operation.done():
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
+    """ABANDONED is uncertainty, never evidence that remote work stopped."""
+
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:abandoned-generation")
+    replica_a.attach(agent)
+    try:
+        generation = agent.register_active_request("abandoned-turn")
+        assert await agent.await_durable_request_admission("abandoned-turn")
+        ticket = await replica_b.request_turn(agent.agent_id, "abandoned-turn")
+        generation_id = replica_a._by_local_generation[
+            (id(agent), "abandoned-turn", generation)
+        ]
+
+        agent._cleanup_cancelled_request(
+            "abandoned-turn",
+            disposition=RequestCompletionDisposition.ABANDONED,
+        )
+        for _ in range(100):
+            unresolved = await first_db.fetchone(
+                "SELECT generation_id FROM stop_unresolved_invocations "
+                "WHERE generation_id = ?",
+                (generation_id,),
+            )
+            if unresolved is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert unresolved == (generation_id,)
+        assert (
+            await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
+            is StopDisposition.UNREACHABLE
+        )
+
+        # Process teardown may release a healthy owner, but it cannot rewrite
+        # an indeterminate generation into proof of completion.
+        await replica_a.close()
+        assert await store.remaining(ticket.generation_ids)
+        assert (
+            await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
+            is StopDisposition.UNREACHABLE
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_close_preserves_unsettled_generation(tmp_path):
+    """Owner teardown cannot manufacture completion for still-live work."""
+
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:closing-owner")
+    try:
+        assert await replica_a.register(agent, "unsettled-turn", 1)
+        ticket = await replica_b.request_turn(agent.agent_id, "unsettled-turn")
+
+        await replica_a.close()
+
+        assert await store.remaining(ticket.generation_ids)
+        assert (
+            await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
+            is StopDisposition.UNREACHABLE
+        )
+    finally:
         await replica_a.close()
         await replica_b.close()
         await first_db.close()
@@ -705,16 +784,16 @@ async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
     )
     agent = _ReplicaAgent("did:test:completion-inventory")
     replica_a.attach(agent)
-    original_complete = store.complete
+    original_settle = store.settle
     deletion_committed = asyncio.Event()
     release_completion = asyncio.Event()
 
-    async def pause_after_durable_delete(generation_id, owner_id):
-        await original_complete(generation_id, owner_id)
+    async def pause_after_durable_delete(generation_id, owner_id, disposition):
+        await original_settle(generation_id, owner_id, disposition)
         deletion_committed.set()
         await release_completion.wait()
 
-    store.complete = pause_after_durable_delete
+    store.settle = pause_after_durable_delete
     try:
         assert await replica_a.register(agent, "completing-turn", 1)
         assert await replica_a.register(agent, "unrelated-turn", 2)
@@ -730,7 +809,7 @@ async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
         assert unrelated_generation_id in replica_a._active
     finally:
         release_completion.set()
-        store.complete = original_complete
+        store.settle = original_settle
         await replica_a.close()
         await replica_b.close()
         await first_db.close()
@@ -746,17 +825,17 @@ async def test_transient_completion_failure_is_retried_until_row_is_removed(
     )
     agent = _ReplicaAgent("did:test:retry-completion-agent")
     replica_a.attach(agent)
-    original_complete = store.complete
+    original_settle = store.settle
     attempts = 0
 
-    async def flaky_complete(generation_id, owner_id):
+    async def flaky_complete(generation_id, owner_id, disposition):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("transient database outage")
-        await original_complete(generation_id, owner_id)
+        await original_settle(generation_id, owner_id, disposition)
 
-    store.complete = flaky_complete
+    store.settle = flaky_complete
     try:
         assert await replica_a.register(agent, "retry-completion-turn", 1)
         generation_id = replica_a._by_local_generation[
@@ -793,7 +872,7 @@ async def test_lease_loss_after_insert_retries_provisional_generation_cleanup(
     registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
     agent = _ReplicaAgent("did:test:provisional-cleanup")
     original_register = store.register
-    original_complete = store.complete
+    original_settle = store.settle
     attempts = 0
 
     async def lose_lease_after_insert(**kwargs):
@@ -801,15 +880,15 @@ async def test_lease_loss_after_insert_retries_provisional_generation_cleanup(
         registry._lease_lost = True
         return admitted
 
-    async def flaky_complete(generation_id, owner_id):
+    async def flaky_complete(generation_id, owner_id, disposition):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("transient database outage")
-        await original_complete(generation_id, owner_id)
+        await original_settle(generation_id, owner_id, disposition)
 
     store.register = lose_lease_after_insert
-    store.complete = flaky_complete
+    store.settle = flaky_complete
     try:
         with pytest.raises(InvocationSelfFencedError):
             await registry.register(agent, "provisional-turn", 1)

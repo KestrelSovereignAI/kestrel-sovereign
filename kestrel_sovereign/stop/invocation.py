@@ -26,6 +26,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationSelfFencedError,
     validate_invocation_id,
 )
+from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type,
     database_now_sql,
@@ -371,9 +372,24 @@ class DistributedInvocationStore:
                     "distributed Stop public-turn binding exists in multiple states"
                 )
 
-    async def complete(self, generation_id: str, owner_id: str) -> None:
+    async def settle(
+        self,
+        generation_id: str,
+        owner_id: str,
+        disposition: RequestCompletionDisposition,
+    ) -> None:
+        """Apply the only valid terminal transition for one generation.
+
+        A generation may disappear from shared authority only when its owner
+        observed completion.  ``ABANDONED`` means the terminal state is
+        unknown, so it is moved to the unresolved ledger instead.  This is the
+        lifecycle invariant used by local cleanup and remote Stop results.
+        """
+
         generation_id = _required_identity(generation_id, "generation identity")
         owner_id = _required_identity(owner_id, "owner identity")
+        if not isinstance(disposition, RequestCompletionDisposition):
+            raise TypeError("distributed Stop settlement disposition must be typed")
         async with self._db.transaction(immediate=True):
             row = await self._db.fetchone(
                 "SELECT agent_id FROM stop_active_invocations "
@@ -387,6 +403,46 @@ class DistributedInvocationStore:
                 return
             agent_id = _required_identity(row[0], "stored agent identity")
             await self._lock_agent(agent_id)
+            active = await self._db.fetchone(
+                "SELECT agent_id FROM stop_active_invocations "
+                "WHERE generation_id = ? AND owner_id = ?",
+                (generation_id, owner_id),
+            )
+            unresolved = await self._db.fetchone(
+                "SELECT agent_id FROM stop_unresolved_invocations "
+                "WHERE generation_id = ? AND owner_id = ?",
+                (generation_id, owner_id),
+            )
+            if active is not None and unresolved is not None:
+                raise RuntimeError(
+                    "distributed Stop generation exists in multiple lifecycle states"
+                )
+            if disposition is RequestCompletionDisposition.ABANDONED:
+                if unresolved is not None:
+                    return
+                if active is None:
+                    return
+                now_sql = database_now_sql(self._db)
+                inserted = await self._db.execute(
+                    "INSERT INTO stop_unresolved_invocations ("
+                    "generation_id, agent_id, turn_digest, public_turn_digest, "
+                    "request_generation, owner_id, expired_at) "
+                    "SELECT generation_id, agent_id, turn_digest, "
+                    "public_turn_digest, request_generation, owner_id, "
+                    f"{now_sql} FROM stop_active_invocations "
+                    "WHERE generation_id = ? AND owner_id = ?",
+                    (generation_id, owner_id),
+                )
+                deleted = await self._db.execute(
+                    "DELETE FROM stop_active_invocations "
+                    "WHERE generation_id = ? AND owner_id = ?",
+                    (generation_id, owner_id),
+                )
+                if inserted != 1 or deleted != 1:
+                    raise RuntimeError(
+                        "distributed Stop abandonment changed inside its agent lock"
+                    )
+                return
             deleted_active = await self._db.execute(
                 "DELETE FROM stop_active_invocations "
                 "WHERE generation_id = ? AND owner_id = ?",
@@ -401,6 +457,24 @@ class DistributedInvocationStore:
                 raise RuntimeError(
                     "distributed Stop completion changed inside its agent lock"
                 )
+
+    async def complete(self, generation_id: str, owner_id: str) -> None:
+        """Record an owner-observed terminal completion."""
+
+        await self.settle(
+            generation_id,
+            owner_id,
+            RequestCompletionDisposition.COMPLETED,
+        )
+
+    async def abandon(self, generation_id: str, owner_id: str) -> None:
+        """Preserve a generation whose terminal outcome is indeterminate."""
+
+        await self.settle(
+            generation_id,
+            owner_id,
+            RequestCompletionDisposition.ABANDONED,
+        )
 
     async def mark_turn(
         self,
@@ -667,29 +741,17 @@ class DistributedInvocationStore:
         )
         return tuple((str(row[0]), str(row[1])) for row in rows)
 
-    async def delete_owner(self, owner_id: str) -> None:
+    async def abandon_owner(self, owner_id: str) -> None:
+        """Preserve every unsettled generation when an owner exits."""
+
         owner_id = _required_identity(owner_id, "owner identity")
-        async with self._db.transaction(immediate=True):
-            rows = await self._db.fetchall(
-                "SELECT agent_id FROM stop_active_invocations "
-                "WHERE owner_id = ? "
-                "UNION "
-                "SELECT agent_id FROM stop_unresolved_invocations "
-                "WHERE owner_id = ? ORDER BY agent_id",
-                (owner_id, owner_id),
-            )
-            for row in rows:
-                await self._lock_agent(
-                    _required_identity(row[0], "stored agent identity")
-                )
-            await self._db.execute(
-                "DELETE FROM stop_active_invocations WHERE owner_id = ?",
-                (owner_id,),
-            )
-            await self._db.execute(
-                "DELETE FROM stop_unresolved_invocations WHERE owner_id = ?",
-                (owner_id,),
-            )
+        rows = await self._db.fetchall(
+            "SELECT generation_id FROM stop_active_invocations "
+            "WHERE owner_id = ? ORDER BY generation_id",
+            (owner_id,),
+        )
+        for row in rows:
+            await self.abandon(str(row[0]), owner_id)
 
 
 class DistributedInvocationRegistry:
@@ -738,6 +800,12 @@ class DistributedInvocationRegistry:
         if self._lease_lost:
             raise RuntimeError("distributed Stop owner lease was lost")
         agent.__dict__["_distributed_invocation_registry"] = self
+
+    @property
+    def owner_lifecycle_status(self) -> str:
+        """Health-facing status of this process's permanent owner lease."""
+
+        return "self_fenced" if self._lease_lost else "healthy"
 
     @staticmethod
     def _agent_id(agent: object) -> str:
@@ -874,8 +942,20 @@ class DistributedInvocationRegistry:
             turn_id=turn_id,
         )
 
-    def complete_soon(self, agent: object, turn_id: str, generation: int) -> None:
-        """Own durable cleanup from the mixin's synchronous finally path."""
+    def complete_soon(
+        self,
+        agent: object,
+        turn_id: str,
+        generation: int,
+        *,
+        disposition: RequestCompletionDisposition = (
+            RequestCompletionDisposition.COMPLETED
+        ),
+    ) -> None:
+        """Own durable lifecycle settlement from synchronous cleanup."""
+
+        if not isinstance(disposition, RequestCompletionDisposition):
+            raise TypeError("distributed Stop completion disposition must be typed")
 
         key = (id(agent), turn_id, generation)
         generation_id = self._by_local_generation.get(key)
@@ -891,7 +971,11 @@ class DistributedInvocationRegistry:
             try:
                 while not self._closing:
                     try:
-                        await self._store.complete(generation_id, self._owner_id)
+                        await self._store.settle(
+                            generation_id,
+                            self._owner_id,
+                            disposition,
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as error:
@@ -1091,7 +1175,7 @@ class DistributedInvocationRegistry:
             )
         while self._cleanup_tasks:
             await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
-        await self._store.delete_owner(self._owner_id)
+        await self._store.abandon_owner(self._owner_id)
         self._active.clear()
         self._by_local_generation.clear()
         self._cleanup_keys.clear()

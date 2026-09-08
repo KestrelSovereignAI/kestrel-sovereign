@@ -141,6 +141,7 @@ class RequestLifecycleMixin:
         self,
         request_id: str,
         generation: int | None,
+        disposition: RequestCompletionDisposition,
     ) -> None:
         if generation is None:
             return
@@ -150,7 +151,7 @@ class RequestLifecycleMixin:
         complete = getattr(registry, "complete_soon", None)
         if not callable(complete):
             raise TypeError("distributed invocation registry cannot complete")
-        complete(self, request_id, generation)
+        complete(self, request_id, generation, disposition=disposition)
 
     def register_active_request(self, request_id: str) -> int:
         """Track an active delivery and bind its generation to this task."""
@@ -775,7 +776,11 @@ class RequestLifecycleMixin:
                 final_disposition,
                 generation=generation,
             )
-            self._complete_durable_request_generation(request_id, generation)
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                final_disposition,
+            )
             return
 
         cleans_active_generation = (
@@ -821,7 +826,11 @@ class RequestLifecycleMixin:
                 effective_disposition,
                 generation=generation,
             )
-            self._complete_durable_request_generation(request_id, generation)
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                effective_disposition,
+            )
 
     def _release_cancelled_generation(
         self,

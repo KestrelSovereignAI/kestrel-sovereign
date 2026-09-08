@@ -431,6 +431,38 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
         return False
 
 
+def _distributed_invocation_owner_status(agent) -> str:
+    """Read the registry's permanent lifecycle state without invoking proxies."""
+
+    try:
+        namespace = vars(agent)
+    except TypeError:  # pragma: no cover - health must not crash
+        return "self_fenced"
+    registry = namespace.get("_distributed_invocation_registry")
+    if registry is None:
+        return "healthy"
+    try:
+        status = registry.owner_lifecycle_status
+    except Exception:  # pragma: no cover - health must not crash
+        return "self_fenced"
+    return status if status in {"healthy", "self_fenced"} else "self_fenced"
+
+
+def _distributed_invocation_owners_healthy(agent, manager) -> bool:
+    """Whether every loaded agent's shared invocation owner can admit work."""
+
+    candidates = [agent] if agent is not None else []
+    if manager is not None:
+        try:
+            candidates.extend(manager.list_agents().values())
+        except Exception:  # pragma: no cover - public health must not crash
+            return False
+    for candidate in candidates:
+        if _distributed_invocation_owner_status(candidate) != "healthy":
+            return False
+    return True
+
+
 def _constitution_safe_mode_record(agent_name: str, agent) -> Optional[dict]:
     """Return a controlled operator-readiness record for a restricted agent."""
     safe_mode = getattr(agent, "_safe_mode", False) is True
@@ -4257,6 +4289,9 @@ def health_check(request: Request):
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
     )
+    invocation_owners_healthy = _distributed_invocation_owners_healthy(
+        agent, manager
+    )
     scheduler_failures = getattr(
         request.app.state,
         "scheduler_readiness_failures",
@@ -4270,6 +4305,7 @@ def health_check(request: Request):
         or constitution_safe_mode
         or scheduler_failures
         or not scheduler_workers_available
+        or not invocation_owners_healthy
     ):
         return JSONResponse(
             status_code=503,
@@ -4443,7 +4479,29 @@ def _contribution_rejection_records(agent, manager) -> list[dict]:
 
 async def _agent_detailed_health(agent) -> dict:
     """Detailed health for one agent, including any refused contributions."""
-    return _with_contribution_rejections(agent, await _agent_health_result(agent))
+    result = _with_contribution_rejections(
+        agent, await _agent_health_result(agent)
+    )
+    if _distributed_invocation_owner_status(agent) == "healthy":
+        return result
+    merged = dict(result)
+    checks = list(merged.get("checks", []))
+    checks.append(
+        {
+            "name": "distributed_invocation_owner",
+            "status": "fail",
+            "message": "Invocation owner lease was lost; replica is fenced",
+            "duration_ms": 0.0,
+        }
+    )
+    merged.update(
+        {
+            "status": "unhealthy",
+            "overall_healthy": False,
+            "checks": checks,
+        }
+    )
+    return merged
 
 
 async def _agent_health_result(agent) -> dict:
