@@ -2895,6 +2895,235 @@ async def _lifespan_startup(app: FastAPI):
             app.state.multi_agent_config_path = (
                 multi_agent_path if multi_agent_path.exists() else None
             )
+            if app.state.multi_agent_config_path is not None:
+                # Every read-modify-write of multi_agent.toml shares one async
+                # mutation boundary.  In particular, removal resolves the
+                # registered DID asynchronously; without this lock a concurrent
+                # spawn could commit while removal later saved its stale
+                # pre-await snapshot and silently erased the new registration.
+                created_agent_registry_lock = asyncio.Lock()
+
+                async def persist_created_agent_registration(
+                    name,
+                    agent_config,
+                    authority_chain,
+                ):
+                    """Merge a child only beneath a durable authority chain."""
+
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        child_matches = [
+                            existing
+                            for existing in current.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if child_matches and (
+                            child_matches != [name]
+                            or current.agents[name] != agent_config
+                        ):
+                            raise RuntimeError(
+                                f"Agent {name!r} conflicts with the startup registry"
+                            )
+                        if not authority_chain:
+                            raise RuntimeError(
+                                "Persistent child has no restart-registered "
+                                "authority chain"
+                            )
+                        from kestrel_sovereign.multi_agent.config import (
+                            LocalAgentConfig,
+                        )
+
+                        witnessed_registrations = []
+                        seen_names = set()
+                        seen_dids = set()
+                        for authority_name, authority_did in authority_chain:
+                            canonical_authority = authority_name.casefold()
+                            if (
+                                canonical_authority in seen_names
+                                or authority_did in seen_dids
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "chain is ambiguous"
+                                )
+                            seen_names.add(canonical_authority)
+                            seen_dids.add(authority_did)
+                            matches = [
+                                existing
+                                for existing in current.agents
+                                if existing.casefold() == canonical_authority
+                            ]
+                            if len(matches) != 1:
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "is missing or ambiguous"
+                                )
+                            registered_name = matches[0]
+                            registered_config = current.agents[registered_name]
+                            if not isinstance(registered_config, LocalAgentConfig):
+                                raise RuntimeError(
+                                    "Persistent child authority is not a local "
+                                    "restart-registered agent"
+                                )
+                            if registered_config.autostart is not True:
+                                raise RuntimeError(
+                                    "Persistent child authority must autostart so "
+                                    "its signed descendant can verify on cold restart"
+                                )
+                            registered_did = await manager.resolve_registered_agent_id(
+                                registered_name,
+                                registered_config,
+                                require_config_identity=True,
+                            )
+                            if registered_did != authority_did:
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "identity does not match the verified runtime chain"
+                                )
+                            witnessed_registrations.append(
+                                (registered_name, registered_config)
+                            )
+
+                        # DID resolution performs storage I/O. Re-read and CAS
+                        # every witnessed ancestor before adding the child so an
+                        # operator edit cannot swap or remove authority during
+                        # the await and still receive a durable descendant.
+                        fresh = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        for registered_name, registered_config in (
+                            witnessed_registrations
+                        ):
+                            fresh_matches = [
+                                existing
+                                for existing in fresh.agents
+                                if existing.casefold() == registered_name.casefold()
+                            ]
+                            if (
+                                fresh_matches != [registered_name]
+                                or fresh.agents[registered_name] != registered_config
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child restart-registered authority "
+                                    "changed during identity resolution"
+                                )
+                        fresh_child_matches = [
+                            existing
+                            for existing in fresh.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if fresh_child_matches and (
+                            fresh_child_matches != [name]
+                            or fresh.agents[name] != agent_config
+                        ):
+                            raise RuntimeError(
+                                f"Agent {name!r} conflicts with the "
+                                "startup registry"
+                            )
+                        if not fresh_child_matches:
+                            fresh.agents[name] = agent_config
+                            type(fresh).model_validate(fresh.model_dump())
+                            fresh.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = fresh
+
+                async def remove_created_agent_registration(
+                    name,
+                    expected_agent_id,
+                ):
+                    """CAS-remove one persistent child and return compensation."""
+
+                    async with created_agent_registry_lock:
+                        current = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        matches = [
+                            existing
+                            for existing in current.agents
+                            if existing.casefold() == name.casefold()
+                        ]
+                        if len(matches) != 1:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration is "
+                                "missing or ambiguous; destructive offboarding refused"
+                            )
+                        persisted_name = matches[0]
+                        registered_config = current.agents[persisted_name]
+                        from kestrel_sovereign.multi_agent.config import LocalAgentConfig
+
+                        if not isinstance(registered_config, LocalAgentConfig):
+                            raise RuntimeError(
+                                "Persistent spawned child is not a local hosted registration"
+                            )
+                        registered_agent_id = await manager.resolve_registered_agent_id(
+                            persisted_name,
+                            registered_config,
+                            require_config_identity=True,
+                        )
+                        if registered_agent_id != expected_agent_id:
+                            raise RuntimeError(
+                                "Persistent spawned child identity changed before "
+                                "startup-registration removal"
+                            )
+                        # DID resolution performs storage I/O. The in-process
+                        # lock excludes our own hooks but cannot exclude an
+                        # operator or another process editing multi_agent.toml.
+                        # Re-read and CAS the exact registration we witnessed;
+                        # saving the pre-await object would erase unrelated
+                        # concurrent edits.
+                        fresh = MultiAgentConfig.from_file(
+                            app.state.multi_agent_config_path
+                        )
+                        fresh_matches = [
+                            existing
+                            for existing in fresh.agents
+                            if existing.casefold() == persisted_name.casefold()
+                        ]
+                        if len(fresh_matches) != 1:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        fresh_name = fresh_matches[0]
+                        if fresh.agents[fresh_name] != registered_config:
+                            raise RuntimeError(
+                                "Persistent spawned child startup registration "
+                                "changed during identity resolution"
+                            )
+                        current = fresh
+                        persisted_name = fresh_name
+                        removed_config = current.agents.pop(persisted_name)
+                        type(current).model_validate(current.model_dump())
+                        current.save(app.state.multi_agent_config_path)
+                        app.state.multi_agent_config = current
+
+                    async def restore_registration() -> None:
+                        async with created_agent_registry_lock:
+                            fresh = MultiAgentConfig.from_file(
+                                app.state.multi_agent_config_path
+                            )
+                            if any(
+                                existing.casefold() == persisted_name.casefold()
+                                for existing in fresh.agents
+                            ):
+                                raise RuntimeError(
+                                    "Persistent child registration changed concurrently; "
+                                    "refusing compensation overwrite"
+                                )
+                            fresh.agents[persisted_name] = removed_config
+                            type(fresh).model_validate(fresh.model_dump())
+                            fresh.save(app.state.multi_agent_config_path)
+                            app.state.multi_agent_config = fresh
+
+                    return restore_registration
+
+                manager.set_created_agent_persistence_hook(
+                    persist_created_agent_registration
+                )
+                manager.set_created_agent_registration_removal_hook(
+                    remove_created_agent_registration
+                )
             app.state.agent = None  # No single default agent
             # Registration is the one path shared by autostart, runtime
             # creation, spawning, and scheduler cold wakes.  Install the

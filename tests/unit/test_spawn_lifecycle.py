@@ -5,6 +5,7 @@ import os
 import tempfile
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +40,33 @@ def _make_mock_manager():
     manager.get_children = MagicMock(return_value=[])
     manager.get_agent = MagicMock(return_value=None)
     return manager
+
+
+def _make_durable_spawn_agent(
+    agent_did: str,
+    mandate: SpawnMandate,
+    *,
+    private_key=None,
+):
+    """Build the minimum live agent backed by its exact signed receipt."""
+
+    edge = SimpleNamespace(
+        label="spawned_by",
+        source_id=agent_did,
+        target_id=mandate.parent_did,
+        properties=mandate.to_edge_properties(),
+    )
+    return SimpleNamespace(
+        agent_id=agent_did,
+        did=agent_did,
+        identity=None,
+        _private_key=private_key,
+        _persisted_spawn_mandate=mandate,
+        storage=SimpleNamespace(
+            get_edges_from=AsyncMock(return_value=[edge]),
+        ),
+        shutdown=AsyncMock(),
+    )
 
 
 def test_restored_ephemeral_ttl_rearms_after_sync_construction() -> None:
@@ -619,17 +647,24 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     parent_did = "did:test:direct-stopped-parent"
     child_name = "LiveDescendant"
     child_did = "did:test:live-descendant"
-    parent_mandate = SpawnMandate(
-        parent_did=root_did,
-        child_did=parent_did,
-        ttl_seconds=1,
-        parent_signature="signed-direct-stopped-parent",
+    root_private_key, _ = generate_secp256k1_keypair()
+    parent_private_key, _ = generate_secp256k1_keypair()
+    parent_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=parent_did,
+            ttl_seconds=1,
+            max_child_depth=1,
+        ),
+        root_private_key,
     )
-    child_mandate = SpawnMandate(
-        parent_did=parent_did,
-        child_did=child_did,
-        ttl_seconds=3600,
-        parent_signature="signed-live-descendant",
+    child_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=3600,
+        ),
+        parent_private_key,
     )
     registry = SpawnAuthorityRegistry(tmp_path)
     for name, did, mandate, port in (
@@ -654,12 +689,15 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
         "_remaining_ttl_seconds",
         lambda _created_at, _ttl_seconds: 0.01,
     )
-    parent = MagicMock(agent_id=parent_did)
-    parent.agent_id = parent_did
-    parent.shutdown = AsyncMock()
-    child = MagicMock(agent_id=child_did)
-    child.agent_id = child_did
-    child.shutdown = AsyncMock()
+    parent = _make_durable_spawn_agent(
+        parent_did,
+        parent_mandate,
+        private_key=parent_private_key,
+    )
+    child = _make_durable_spawn_agent(
+        child_did,
+        child_mandate,
+    )
     manager._agents.update({parent_name: parent, child_name: child})
     manager._agent_names.update({parent_did: parent_name, child_did: child_name})
     manager._parent_children.update(
@@ -668,6 +706,7 @@ async def test_directly_stopped_parent_expiry_terminates_live_descendant(
     manager._child_mandates.update(
         {parent_name: parent_mandate, child_name: child_mandate}
     )
+    lifecycle.restore_persisted_child(child_name, child_mandate)
     lifecycle.restore_persisted_child(parent_name, parent_mandate)
     expiry_owner = lifecycle._tracked[parent_name].ttl_task
 
@@ -1567,17 +1606,24 @@ class TestResultCollection:
         parent_did = "did:test:terminal-parent"
         descendant_name = "TerminalDescendant"
         descendant_did = "did:test:terminal-descendant"
-        parent_mandate = SpawnMandate(
-            parent_did=root_did,
-            child_did=parent_did,
-            ttl_seconds=0,
-            parent_signature="signed-parent-witness",
+        root_private_key, _ = generate_secp256k1_keypair()
+        parent_private_key, _ = generate_secp256k1_keypair()
+        parent_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=root_did,
+                child_did=parent_did,
+                ttl_seconds=0,
+                max_child_depth=1,
+            ),
+            root_private_key,
         )
-        descendant_mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=descendant_did,
-            ttl_seconds=0,
-            parent_signature="signed-descendant-witness",
+        descendant_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=parent_did,
+                child_did=descendant_did,
+                ttl_seconds=0,
+            ),
+            parent_private_key,
         )
         registry = SpawnAuthorityRegistry(tmp_path)
         for name, did, mandate, port in (
@@ -1595,12 +1641,15 @@ class TestResultCollection:
             )
 
         manager = AgentManager(base_data_dir=tmp_path)
-        parent = MagicMock(agent_id=parent_did)
-        parent.agent_id = parent_did
-        parent.shutdown = AsyncMock()
-        descendant = MagicMock(agent_id=descendant_did)
-        descendant.agent_id = descendant_did
-        descendant.shutdown = AsyncMock()
+        parent = _make_durable_spawn_agent(
+            parent_did,
+            parent_mandate,
+            private_key=parent_private_key,
+        )
+        descendant = _make_durable_spawn_agent(
+            descendant_did,
+            descendant_mandate,
+        )
         manager._agents.update({parent_name: parent, descendant_name: descendant})
         manager._agent_names.update(
             {parent_did: parent_name, descendant_did: descendant_name}
@@ -1651,17 +1700,24 @@ class TestResultCollection:
         parent_did = "did:test:stopped-tree-parent"
         descendant_name = "StoppedTreeDescendant"
         descendant_did = "did:test:stopped-tree-descendant"
-        parent_mandate = SpawnMandate(
-            parent_did=root_did,
-            child_did=parent_did,
-            ttl_seconds=0,
-            parent_signature="signed-stopped-tree-parent",
+        root_private_key, _ = generate_secp256k1_keypair()
+        parent_private_key, _ = generate_secp256k1_keypair()
+        parent_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=root_did,
+                child_did=parent_did,
+                ttl_seconds=0,
+                max_child_depth=1,
+            ),
+            root_private_key,
         )
-        descendant_mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=descendant_did,
-            ttl_seconds=0,
-            parent_signature="signed-stopped-tree-descendant",
+        descendant_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=parent_did,
+                child_did=descendant_did,
+                ttl_seconds=0,
+            ),
+            parent_private_key,
         )
         registry = SpawnAuthorityRegistry(tmp_path)
         for name, did, mandate, port in (
@@ -1679,15 +1735,27 @@ class TestResultCollection:
             )
 
         manager = AgentManager(base_data_dir=tmp_path)
-        parent = MagicMock(agent_id=parent_did)
-        parent.agent_id = parent_did
-        parent.shutdown = AsyncMock()
-        descendant = MagicMock(agent_id=descendant_did)
-        descendant.agent_id = descendant_did
-        descendant.shutdown = AsyncMock()
-        manager._agents.update({parent_name: parent, descendant_name: descendant})
+        root = SimpleNamespace(
+            agent_id=root_did,
+            did=root_did,
+            identity=None,
+            _private_key=root_private_key,
+            shutdown=AsyncMock(),
+        )
+        parent = _make_durable_spawn_agent(
+            parent_did,
+            parent_mandate,
+            private_key=parent_private_key,
+        )
+        descendant = _make_durable_spawn_agent(
+            descendant_did,
+            descendant_mandate,
+        )
+        manager._agents.update(
+            {"Root": root, parent_name: parent, descendant_name: descendant}
+        )
         manager._agent_names.update(
-            {parent_did: parent_name, descendant_did: descendant_name}
+            {root_did: "Root", parent_did: parent_name, descendant_did: descendant_name}
         )
         manager._parent_children.update(
             {root_did: [parent_name], parent_did: [descendant_name]}
@@ -2114,11 +2182,14 @@ class TestExplicitTermination:
         child_name = "stopped-until-expiry"
         child_did = "did:test:stopped-until-expiry"
         parent_did = "did:test:stopped-parent"
-        mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=child_did,
-            ttl_seconds=1,
-            parent_signature="signed-stopped-child",
+        parent_private_key, _ = generate_secp256k1_keypair()
+        mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=parent_did,
+                child_did=child_did,
+                ttl_seconds=1,
+            ),
+            parent_private_key,
         )
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / child_name,
@@ -2132,12 +2203,16 @@ class TestExplicitTermination:
             config=config,
         )
         manager = AgentManager(base_data_dir=tmp_path)
-        child = MagicMock()
-        child.did = child_did
-        child.agent_id = child_did
-        child.shutdown = AsyncMock()
-        manager._agents[child_name] = child
-        manager._agent_names[child_did] = child_name
+        parent = SimpleNamespace(
+            agent_id=parent_did,
+            did=parent_did,
+            identity=None,
+            _private_key=parent_private_key,
+            shutdown=AsyncMock(),
+        )
+        child = _make_durable_spawn_agent(child_did, mandate)
+        manager._agents.update({"Parent": parent, child_name: child})
+        manager._agent_names.update({parent_did: "Parent", child_did: child_name})
         manager._parent_children[parent_did] = [child_name]
         manager._child_mandates[child_name] = mandate
         manager._created_configs[child_name] = config
@@ -2179,17 +2254,24 @@ class TestExplicitTermination:
         parent_did = "did:test:stopped-expiry-parent"
         descendant_name = "StoppedExpiryDescendant"
         descendant_did = "did:test:stopped-expiry-descendant"
-        parent_mandate = SpawnMandate(
-            parent_did=root_did,
-            child_did=parent_did,
-            ttl_seconds=1,
-            parent_signature="signed-stopped-expiry-parent",
+        root_private_key, _ = generate_secp256k1_keypair()
+        parent_private_key, _ = generate_secp256k1_keypair()
+        parent_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=root_did,
+                child_did=parent_did,
+                ttl_seconds=1,
+                max_child_depth=1,
+            ),
+            root_private_key,
         )
-        descendant_mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=descendant_did,
-            ttl_seconds=3600,
-            parent_signature="signed-stopped-expiry-descendant",
+        descendant_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=parent_did,
+                child_did=descendant_did,
+                ttl_seconds=3600,
+            ),
+            parent_private_key,
         )
         registry = SpawnAuthorityRegistry(tmp_path)
         for name, did, mandate, port in (
@@ -2207,15 +2289,27 @@ class TestExplicitTermination:
             )
 
         manager = AgentManager(base_data_dir=tmp_path)
-        parent = MagicMock(agent_id=parent_did)
-        parent.agent_id = parent_did
-        parent.shutdown = AsyncMock()
-        descendant = MagicMock(agent_id=descendant_did)
-        descendant.agent_id = descendant_did
-        descendant.shutdown = AsyncMock()
-        manager._agents.update({parent_name: parent, descendant_name: descendant})
+        root = SimpleNamespace(
+            agent_id=root_did,
+            did=root_did,
+            identity=None,
+            _private_key=root_private_key,
+            shutdown=AsyncMock(),
+        )
+        parent = _make_durable_spawn_agent(
+            parent_did,
+            parent_mandate,
+            private_key=parent_private_key,
+        )
+        descendant = _make_durable_spawn_agent(
+            descendant_did,
+            descendant_mandate,
+        )
+        manager._agents.update(
+            {"Root": root, parent_name: parent, descendant_name: descendant}
+        )
         manager._agent_names.update(
-            {parent_did: parent_name, descendant_did: descendant_name}
+            {root_did: "Root", parent_did: parent_name, descendant_did: descendant_name}
         )
         manager._parent_children.update(
             {root_did: [parent_name], parent_did: [descendant_name]}

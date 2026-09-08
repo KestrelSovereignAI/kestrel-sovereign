@@ -1,6 +1,7 @@
 """Unit tests for the in-process AgentManager."""
 
 import asyncio
+import inspect
 import json
 import os
 import sqlite3
@@ -46,11 +47,13 @@ from kestrel_sovereign.multi_agent.agent_manager import (
     AgentManager,
     ChildTerminationReconciliationError,
     PersistedSpawnParentUnavailableError,
+    QuarantinedShutdownHistory,
     RUNTIME_OFFBOARD_TIMEOUT_S,
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
     RuntimeOffboardingRetainedError,
     HostedIsolatedRuntimeLifecyclePolicy,
+    SpawnAuthorityGraphError,
     _parse_runtime_offboard_timeout,
 )
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
@@ -64,7 +67,12 @@ from kestrel_sovereign.spawn.mandate import (
     verify_mandate,
 )
 from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
-from kestrel_sovereign.spawn.lifecycle import SpawnedAgentLifecycle
+from kestrel_sovereign.spawn.lifecycle import (
+    SpawnedAgentLifecycle,
+    SpawnMode,
+    SpawnStatus,
+    TerminationRefusalState,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
@@ -76,7 +84,34 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
     agent.get_agent_card = AsyncMock()
+
+    async def durable_edges(node_id: str):
+        mandate = vars(agent).get("_persisted_spawn_mandate")
+        if not isinstance(mandate, SpawnMandate):
+            return []
+        return [
+            SimpleNamespace(
+                label="spawned_by",
+                source_id=node_id,
+                target_id=mandate.parent_did,
+                properties=mandate.to_edge_properties(),
+            )
+        ]
+
+    agent.storage = SimpleNamespace(get_edges_from=durable_edges)
     return agent
+
+
+def _register_spawn_parent(
+    manager: AgentManager,
+    parent,
+    *,
+    name: str = "SpawnParent",
+) -> None:
+    """Publish the exact parent binding required by public spawn_agent."""
+
+    manager._agents[name] = parent
+    manager._agent_names[parent.agent_id] = name
 
 
 async def _persist_and_publish_spawn_test_child(
@@ -174,6 +209,39 @@ async def test_signed_receipt_round_trip_preserves_integer_budget_signature():
     assert verify_mandate(restored, public_key)
 
 
+def test_pending_signed_receipt_cannot_restore_governance(tmp_path):
+    """A crash between publication and governance commit restores no authority."""
+
+    parent_did = "did:pkh:eip155:1:0xPendingParent"
+    child_did = "did:pkh:eip155:1:0xPendingChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    mandate.authority_committed = False
+    sign_mandate(mandate, parent._private_key)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("PendingParent", parent)
+
+    with pytest.raises(RuntimeError, match="never completed governance"):
+        manager._register_agent("PendingChild", child)
+
+    assert manager.get_agent("PendingChild") is None
+    assert manager.get_children(parent_did) == []
+
+
+def test_pending_receipt_marker_is_bound_by_parent_signature():
+    private_key, public_key = generate_secp256k1_keypair()
+    mandate = SpawnMandate(
+        parent_did="did:parent-pending",
+        child_did="did:child-pending",
+        authority_committed=False,
+    )
+    sign_mandate(mandate, private_key)
+    mandate.authority_committed = True
+
+    assert verify_mandate(mandate, public_key) is False
+
+
 @pytest.mark.asyncio
 async def test_spawn_refuses_mandate_for_a_different_parent(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
@@ -214,6 +282,7 @@ async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
     parent = _make_mock_agent("did:test:snapshot-parent")
     parent.features = {"AllowedFeature": SimpleNamespace()}
+    _register_spawn_parent(manager, parent)
     original = SpawnMandate(
         parent_did=parent.agent_id,
         features_allowed=["AllowedFeature"],
@@ -264,6 +333,105 @@ async def test_spawn_snapshots_mutable_mandate_before_admission_await(tmp_path):
             ]
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_revalidates_spawned_parent_before_child_inception(tmp_path):
+    """A revoked parent cannot start child identity or feature initialization."""
+
+    root_did = "did:test:preinit-root"
+    parent_did = "did:test:preinit-parent"
+    root, parent_receipt = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=0,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent._persisted_spawn_mandate = parent_receipt
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("SpawnedParent", parent)
+
+    # Another replica withdrew the durable edge; the local projection has not
+    # reconciled yet. The pre-inception read must still see the revocation.
+    parent.storage.get_edges_from = AsyncMock(return_value=[])
+    inception = AsyncMock()
+    manager._initialize_agent = AsyncMock(
+        side_effect=AssertionError("child initialization must not start")
+    )
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        inception,
+    ):
+        with pytest.raises(RuntimeError, match="revoked or expired"):
+            await manager.spawn_agent(
+                "DeniedGrandchild",
+                parent,
+                SpawnMandate(parent_did=parent_did),
+            )
+
+    inception.assert_not_awaited()
+    manager._initialize_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_descendant_rereads_loaded_ancestor_receipt_before_publication(
+    tmp_path,
+):
+    """A cached parent mandate cannot outlive revocation in its durable store."""
+
+    root_did = "did:test:cold-revoked-root"
+    parent_did = "did:test:cold-revoked-parent"
+    child_did = "did:test:cold-revoked-grandchild"
+    root, parent_receipt = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=0,
+        max_child_depth=2,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_receipt
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=0,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("SpawnedParent", parent)
+
+    # A peer host removes the parent's incoming receipt while this process still
+    # retains the previously verified cache projection.
+    parent.storage.get_edges_from = AsyncMock(return_value=[])
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._on_agent_registered = AsyncMock()
+    manager._run_hosted_agent_ready_hooks = AsyncMock()
+
+    with pytest.raises(
+        PersistedSpawnParentUnavailableError,
+        match="durable ancestor authority",
+    ):
+        await manager.load_agent(
+            "DeniedGrandchild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    assert manager.get_agent("DeniedGrandchild") is None
+    manager._on_agent_registered.assert_not_awaited()
+    manager._run_hosted_agent_ready_hooks.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -422,6 +590,114 @@ async def test_load_validates_restored_authority_before_agent_ready(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_spawn_revalidates_parent_at_feature_start_boundary(tmp_path):
+    """Slow child setup cannot spend authority checked only before inception."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    parent = _make_mock_agent("did:test:phase-four-parent")
+    parent_receipt = SpawnMandate(
+        parent_did="did:test:phase-four-root",
+        child_did=parent.agent_id,
+        ttl_seconds=0,
+    )
+    manager._agents["SpawnedParent"] = parent
+    manager._agent_names[parent.agent_id] = "SpawnedParent"
+    manager._child_mandates["SpawnedParent"] = parent_receipt
+    feature_worker_events: list[str] = []
+
+    class HostedGrandchild:
+        def __init__(self, *, did, **_kwargs):
+            self.agent_id = did
+            self.did = did
+            self.identity = None
+
+        async def initialize(self):
+            preflight = vars(self).get("_host_authority_preflight")
+            if preflight is not None:
+                result = preflight(self)
+                if inspect.isawaitable(result):
+                    await result
+            feature_worker_events.append("started")
+
+        async def shutdown(self):
+            return None
+
+    admission, owns = await manager._admit_agent_operation(
+        "Grandchild",
+        kind="spawn",
+    )
+    assert owns
+    admission.spawn_parent_name = "SpawnedParent"
+    admission.spawn_parent_agent = parent
+    admission.spawn_parent_mandate = parent_receipt
+    manager._verify_live_spawn_parent_before_child_start = AsyncMock(
+        side_effect=[
+            None,
+            RuntimeError("spawned parent authority expired at phase four"),
+        ]
+    )
+
+    config = LocalAgentConfig(data_dir=Path("phase-four-child"), port=8801)
+    try:
+        with (
+            patch.object(LocalAgentConfig, "validate_runtime", return_value=[]),
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+                new=AsyncMock(return_value="did:test:phase-four-child"),
+            ),
+            patch(
+                "kestrel_sovereign.multi_agent.agent_manager.KestrelAgent",
+                HostedGrandchild,
+            ),
+            pytest.raises(RuntimeError, match="expired at phase four"),
+        ):
+            await manager.load_agent("Grandchild", config)
+    finally:
+        await manager._release_agent_operation(admission)
+
+    assert manager._verify_live_spawn_parent_before_child_start.await_count == 2
+    assert feature_worker_events == []
+    assert manager.get_agent("Grandchild") is None
+
+
+@pytest.mark.asyncio
+async def test_live_spawn_revalidates_root_registration_before_child_start(tmp_path):
+    """An admitted root spawn cannot start after that root is withdrawn."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    parent = _make_mock_agent("did:test:withdrawn-root")
+    _register_spawn_parent(manager, parent)
+    admission, owns = await manager._admit_agent_operation(
+        "RootChild",
+        kind="spawn",
+    )
+    assert owns
+    admission.spawn_parent_agent = parent
+    admission.spawn_parent_name = "SpawnParent"
+    admission.spawn_parent_mandate = None
+    manager._agents.pop("SpawnParent")
+    manager._agent_names.pop(parent.agent_id)
+    manager.create_agent = AsyncMock(side_effect=AssertionError("child startup ran"))
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="authority .* before child initialization",
+        ):
+            await manager._run_admitted_spawn(
+                "RootChild",
+                parent,
+                SpawnMandate(parent_did=parent.agent_id),
+                admission,
+            )
+    finally:
+        if manager._agent_operations.get(admission.canonical_name) is admission:
+            await manager._release_agent_operation(admission)
+
+    manager.create_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_load_projects_restored_authority_before_ready_and_rolls_it_back(
     tmp_path,
 ):
@@ -508,6 +784,8 @@ async def test_ready_failure_cascades_published_descendant_before_parent_rollbac
     """Post-publication readiness rollback cannot strand a routed orphan."""
 
     parent = _make_mock_agent("did:test:published-ready-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
     descendant = _make_mock_agent("did:test:published-ready-descendant")
     manager = AgentManager(base_data_dir=tmp_path)
     manager._initialize_agent = AsyncMock(return_value=parent)
@@ -516,12 +794,14 @@ async def test_ready_failure_cascades_published_descendant_before_parent_rollbac
 
     async def publish_descendant_then_fail(candidate):
         ready_observations.append(manager.get_agent("PublishedReadyParent"))
-        manager._register_agent("ReadyDescendant", descendant)
-        manager._parent_children[candidate.agent_id] = ["ReadyDescendant"]
-        manager._child_mandates["ReadyDescendant"] = SpawnMandate(
-            parent_did=candidate.agent_id,
-            child_did=descendant.agent_id,
+        descendant._persisted_spawn_mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=candidate.agent_id,
+                child_did=descendant.agent_id,
+            ),
+            parent._private_key,
         )
+        manager._register_agent("ReadyDescendant", descendant)
         raise RuntimeError("ready hook failed after descendant publication")
 
     manager._run_hosted_agent_ready_hooks = AsyncMock(
@@ -612,6 +892,165 @@ async def test_spawn_installs_budget_custody_before_ready_hook(tmp_path):
         parent.agent_id,
         "BudgetReadyChild",
     ) is True
+
+
+@pytest.mark.asyncio
+async def test_persistent_spawn_registration_failure_is_owned_by_manager_transaction(
+    tmp_path,
+):
+    """A manager success cannot precede the durable-authority registry gate."""
+
+    parent = _make_mock_agent("did:test:persistent-transaction-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    child = _make_mock_agent("did:test:persistent-transaction-child")
+    child._raw_storage = SimpleNamespace(
+        graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("PersistentTransactionParent", parent)
+    manager._initialize_agent = AsyncMock(return_value=child)
+
+    async def create_through_real_load(name, **kwargs):
+        return await _load_spawn_after_mocked_inception(manager, name, kwargs)
+
+    manager.create_agent = AsyncMock(side_effect=create_through_real_load)
+
+    async def refuse_restart_authority(*_args):
+        witness = manager._spawn_authority_registry.get(child.agent_id)
+        assert witness is not None
+        assert witness.active
+        assert witness.mandate.authority_committed is False
+        raise RuntimeError("restart authority refused")
+
+    persistence_hook = AsyncMock(side_effect=refuse_restart_authority)
+    manager.set_created_agent_persistence_hook(persistence_hook)
+
+    with pytest.raises(RuntimeError, match="restart authority refused"):
+        await manager.spawn_agent(
+            "PersistentTransactionChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id, ttl_seconds=0),
+        )
+
+    persistence_hook.assert_awaited_once()
+    assert manager.get_agent("PersistentTransactionChild") is None
+    witness = manager._spawn_authority_registry.get(child.agent_id)
+    assert witness is None or not witness.active
+    child.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_roster_validation_failure_releases_persistent_spawn_reservation(
+    tmp_path,
+):
+    """A failed final roster reread cannot retain process-local restart custody."""
+
+    parent = _make_mock_agent("did:test:final-roster-parent")
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    child = _make_mock_agent("did:test:final-roster-child")
+    child._raw_storage = SimpleNamespace(
+        graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("FinalRosterParent", parent)
+    manager._initialize_agent = AsyncMock(return_value=child)
+
+    async def create_through_real_load(name, **kwargs):
+        return await _load_spawn_after_mocked_inception(manager, name, kwargs)
+
+    manager.create_agent = AsyncMock(side_effect=create_through_real_load)
+    roster_writes = 0
+    real_persist = manager._persist_spawn_startup_registration
+
+    def fail_final_roster_reread(admission):
+        nonlocal roster_writes
+        roster_writes += 1
+        if roster_writes == 2:
+            raise RuntimeError("final roster reread failed")
+        return real_persist(admission)
+
+    manager._persist_spawn_startup_registration = fail_final_roster_reread
+
+    with pytest.raises(RuntimeError, match="final roster reread failed"):
+        await manager.spawn_agent(
+            "FinalRosterChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id, ttl_seconds=0),
+        )
+
+    canonical_name = manager._canonical_agent_name("FinalRosterChild")
+    assert roster_writes == 2
+    assert manager.get_agent("FinalRosterChild") is None
+    assert canonical_name not in manager._persistent_spawn_registrations
+    assert canonical_name not in manager._persistent_spawn_parent_dids
+    assert canonical_name not in manager._persistent_spawn_mandates
+    assert canonical_name not in manager._persistent_spawn_configs
+
+
+def test_pending_authority_promotion_accepts_two_phase_commit_marker(tmp_path):
+    """Receipt lifecycle state may change without widening mandate scope."""
+
+    registry = SpawnAuthorityRegistry(tmp_path)
+    proposal = SpawnMandate(
+        parent_did="did:test:two-phase-parent",
+        ttl_seconds=60,
+    )
+    config = LocalAgentConfig(data_dir="agent_data/TwoPhaseChild", port=8801)
+    pending = registry.reserve_pending(
+        child_name="TwoPhaseChild",
+        parent_did=proposal.parent_did,
+        mandate=proposal,
+        config=config,
+    )
+    signed = replace(
+        proposal,
+        child_did="did:test:two-phase-child",
+        parent_signature="signed-provisional-receipt",
+        authority_committed=False,
+    )
+
+    witness = registry.promote_pending(
+        reservation_id=pending.reservation_id,
+        child_name="TwoPhaseChild",
+        child_did=signed.child_did,
+        mandate=signed,
+        config=config,
+        proposal_created_at=proposal.created_at,
+    )
+
+    assert witness.mandate.authority_committed is False
+    assert registry.pending() == ()
+    committed = replace(
+        signed,
+        authority_committed=True,
+        parent_signature="signed-committed-receipt",
+    )
+    with pytest.raises(ValueError, match="scope changed"):
+        registry.commit_active_receipt(
+            child_name="TwoPhaseChild",
+            child_did=signed.child_did,
+            expected_mandate=signed,
+            committed_mandate=replace(committed, purpose="widened at commit"),
+        )
+    finalized = registry.commit_active_receipt(
+        child_name="TwoPhaseChild",
+        child_did=signed.child_did,
+        expected_mandate=signed,
+        committed_mandate=committed,
+    )
+    assert finalized.mandate.to_dict() == committed.to_dict()
+    assert registry.get(signed.child_did).mandate.to_dict() == committed.to_dict()
+    with pytest.raises(RuntimeError, match="changed before commit"):
+        registry.commit_active_receipt(
+            child_name="TwoPhaseChild",
+            child_did=signed.child_did,
+            expected_mandate=signed,
+            committed_mandate=committed,
+        )
 
 
 @pytest.mark.asyncio
@@ -778,6 +1217,20 @@ async def test_post_ready_spawn_failure_destructively_cascades_descendant_before
             parent_did=candidate.agent_id,
             child_did=descendant.agent_id,
         )
+        lifecycle = manager._ensure_spawn_lifecycle()
+        await lifecycle.register(
+            "PostReadyDescendant",
+            descendant.agent_id,
+            candidate.agent_id,
+            ttl_seconds=3600,
+            mode=SpawnMode.EPHEMERAL,
+        )
+        lifecycle._tracked["PostReadyDescendant"].termination_refusal = (
+            TerminationRefusalState(
+                automatic_termination_attempts=3,
+                requested_status=SpawnStatus.FAILED,
+            )
+        )
 
     manager.create_agent = AsyncMock(side_effect=create_through_real_load)
     manager._run_hosted_agent_ready_hooks = AsyncMock(
@@ -828,22 +1281,22 @@ async def test_destructive_child_termination_removes_spawn_startup_row(tmp_path)
         base_data_dir=tmp_path,
         startup_config_path=config_path,
     )
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
     child = _make_mock_agent(child_did)
     child.did = child_did
+    child._persisted_spawn_mandate = mandate
     scope = resolve_isolated_runtime_namespace(
         manager._isolated_runtime_root,
         derive_isolated_runtime_namespace(child_did),
     )
     prepare_isolated_runtime_namespace(scope, child_did)
     child.isolated_runtime_scope = scope
+    _register_spawn_parent(manager, parent, name="RosterParent")
     manager._agents[child_name] = child
     manager._agent_names[child_did] = child_name
     manager._created_configs[child_name] = child_config
     manager._parent_children[parent_did] = [child_name]
-    manager._child_mandates[child_name] = SpawnMandate(
-        parent_did=parent_did,
-        child_did=child_did,
-    )
+    manager._child_mandates[child_name] = mandate
 
     assert await manager.terminate_child(
         parent_did,
@@ -871,8 +1324,11 @@ async def test_destructive_storage_child_termination_retires_auto_discovery(
     (child_dir / "kestrel_prime.db").touch()
 
     manager = AgentManager(base_data_dir=tmp_path)
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
     child = _make_mock_agent(child_did)
     child.did = child_did
+    child._persisted_spawn_mandate = mandate
+    _register_spawn_parent(manager, parent, name="StorageRosterParent")
     manager._agents[child_name] = child
     manager._agent_names[child_did] = child_name
     manager._created_configs[child_name] = LocalAgentConfig(
@@ -880,10 +1336,7 @@ async def test_destructive_storage_child_termination_retires_auto_discovery(
         port=8802,
     )
     manager._parent_children[parent_did] = [child_name]
-    manager._child_mandates[child_name] = SpawnMandate(
-        parent_did=parent_did,
-        child_did=child_did,
-    )
+    manager._child_mandates[child_name] = mandate
 
     with pytest.raises(RuntimeOffboardingNotPerformedError) as raised:
         await manager.terminate_child(
@@ -916,17 +1369,17 @@ async def test_refused_child_offboarding_restores_spawn_startup_row(tmp_path):
         base_data_dir=tmp_path,
         startup_config_path=config_path,
     )
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
     child = _make_mock_agent(child_did)
     child.did = child_did
+    child._persisted_spawn_mandate = mandate
     child.shutdown.side_effect = RuntimeError("shutdown refused")
+    _register_spawn_parent(manager, parent, name="RetainedRosterParent")
     manager._agents[child_name] = child
     manager._agent_names[child_did] = child_name
     manager._created_configs[child_name] = child_config
     manager._parent_children[parent_did] = [child_name]
-    manager._child_mandates[child_name] = SpawnMandate(
-        parent_did=parent_did,
-        child_did=child_did,
-    )
+    manager._child_mandates[child_name] = mandate
 
     assert not await manager.terminate_child(
         parent_did,
@@ -1166,7 +1619,7 @@ async def test_prepared_leaf_cannot_spawn_from_ready_hook_before_publication(
 
 
 @pytest.mark.asyncio
-async def test_live_spawn_projects_signed_leaf_authority_before_publication(
+async def test_live_spawn_candidate_cannot_spawn_before_publication(
     tmp_path,
 ):
     """A fresh signed child cannot use its provisional window to spawn."""
@@ -1194,7 +1647,7 @@ async def test_live_spawn_projects_signed_leaf_authority_before_publication(
     try:
         manager._prepare_agent_authority("LiveDepthLeaf", leaf)
 
-        with pytest.raises(ValueError, match="max child depth"):
+        with pytest.raises(ValueError, match="exact agent registered"):
             await manager.spawn_agent(
                 "ForbiddenLiveGrandchild",
                 leaf,
@@ -1255,7 +1708,7 @@ def test_cold_restore_rejects_child_beyond_parent_remaining_depth():
     manager._prepare_agent_authority("DepthRestoreParent", parent)
     manager._register_agent("DepthRestoreParent", parent)
 
-    with pytest.raises(RuntimeError, match="child-depth authority"):
+    with pytest.raises(RuntimeError, match="parent's depth ceiling"):
         manager._prepare_agent_authority("DepthRestoreChild", child)
 
     assert manager.get_mandate("DepthRestoreChild") is None
@@ -1320,6 +1773,42 @@ async def test_live_provisional_authority_reaches_cap_arbitration(tmp_path):
         manager._withdraw_initialized_agent("LiveCapChild", child)
         manager._pending_spawns = 0
         admission.spawn_slot_active = False
+        await manager._release_agent_operation(admission)
+
+
+@pytest.mark.asyncio
+async def test_live_persistent_projection_does_not_claim_restart_slot(tmp_path):
+    """A persistent slot becomes durable only after its startup commit."""
+
+    parent_did = "did:test:live-persistent-parent"
+    child_did = "did:test:live-persistent-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    mandate.authority_committed = False
+    sign_mandate(mandate, parent._private_key)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("LivePersistentParent", parent)
+    admission, owns = await manager._admit_agent_operation(
+        "LivePersistentChild",
+        kind="spawn",
+    )
+    assert owns
+    admission.spawn_parent = parent
+    try:
+        manager._prepare_agent_authority("LivePersistentChild", child)
+
+        canonical_name = manager._canonical_agent_name("LivePersistentChild")
+        assert admission.provisional_spawn_authority is True
+        assert canonical_name not in manager._persistent_spawn_registrations
+        assert canonical_name not in manager._persistent_spawn_parent_dids
+        assert canonical_name not in manager._persistent_spawn_mandates
+    finally:
+        manager._withdraw_initialized_agent("LivePersistentChild", child)
         await manager._release_agent_operation(admission)
 
 
@@ -1509,6 +1998,57 @@ def test_spawn_retirement_preserves_stale_marker_when_database_did_differs(
         )
 
     assert marker.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_restored_ttl_validation_precedes_scheduler_commit(tmp_path):
+    """A rejected restored lifetime cannot publish scheduler execution scope."""
+
+    child = _make_mock_agent("did:pkh:eip155:1:0xExpiredSchedulerChild")
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._commit_dynamic_scheduler_registration = MagicMock()
+    manager._commit_restored_child_ttl = MagicMock(
+        side_effect=RuntimeError("Persisted spawn mandate expired during onboarding")
+    )
+
+    with pytest.raises(RuntimeError, match="expired during onboarding"):
+        await manager.load_agent(
+            "ExpiredSchedulerChild",
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+
+    manager._commit_dynamic_scheduler_registration.assert_not_called()
+    manager._commit_restored_child_ttl.assert_called_once_with(
+        "ExpiredSchedulerChild", child
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_restored_ttl_validation_precedes_scheduler_commit(tmp_path):
+    """Batch startup cannot leave scheduler scope for a rejected child."""
+
+    child = _make_mock_agent("did:pkh:eip155:1:0xExpiredBatchSchedulerChild")
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._initialize_agent = AsyncMock(return_value=child)
+    manager._commit_dynamic_scheduler_registration = MagicMock()
+    manager._commit_restored_child_ttl = MagicMock(
+        side_effect=RuntimeError("Persisted spawn mandate expired during onboarding")
+    )
+    config = MultiAgentConfig(
+        agents={
+            "ExpiredBatchSchedulerChild": LocalAgentConfig(
+                data_dir="unused", port=8801
+            )
+        }
+    )
+
+    assert await manager.load_from_config(config) == 0
+
+    manager._commit_dynamic_scheduler_registration.assert_not_called()
+    manager._commit_restored_child_ttl.assert_called_once_with(
+        "ExpiredBatchSchedulerChild", child
+    )
 
 
 @pytest.mark.asyncio
@@ -2156,6 +2696,7 @@ async def test_spawn_join_tracks_operation_not_callers_later_work(tmp_path):
     manager = AgentManager(base_data_dir=tmp_path)
     parent = _make_mock_agent("did:test:operation-owner-parent")
     parent.features = {}
+    _register_spawn_parent(manager, parent)
     child = _make_mock_agent("did:test:operation-owner-child")
     spawn_entered = asyncio.Event()
     release_spawn = asyncio.Event()
@@ -2200,6 +2741,98 @@ async def test_spawn_join_tracks_operation_not_callers_later_work(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_refuses_spawn_cleanup_owned_by_quarantine(tmp_path):
+    """DELETE cannot race the reaper that owns failed spawn rollback."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:delete-quarantined-spawn")
+    graph = SimpleNamespace(closed=False)
+    child._raw_storage = SimpleNamespace(graph=graph)
+
+    async def shutdown() -> None:
+        graph.closed = True
+
+    child.shutdown = AsyncMock(side_effect=shutdown)
+    spawn_started = asyncio.Event()
+    handoff_complete = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def cleanup_owner() -> None:
+        await release_cleanup.wait()
+        graph.closed = True
+
+    async def failed_spawn_owner() -> None:
+        admission, owns = await manager._admit_agent_operation(
+            "QuarantinedSpawn", kind="spawn"
+        )
+        assert owns
+        admission.spawn_task = asyncio.current_task()
+        manager._agents["QuarantinedSpawn"] = child
+        manager._agent_names[child.agent_id] = "QuarantinedSpawn"
+        spawn_started.set()
+        cleanup = asyncio.create_task(cleanup_owner())
+        manager._retain_quarantined_cleanup(
+            name="QuarantinedSpawn",
+            agent_id=child.agent_id,
+            task=cleanup,
+        )
+        handoff_complete.set()
+        await manager._release_agent_operation(admission)
+
+    spawn_task = asyncio.create_task(failed_spawn_owner())
+    await asyncio.wait_for(spawn_started.wait(), timeout=1)
+    deletion = asyncio.create_task(manager.remove_agent("QuarantinedSpawn"))
+    await asyncio.wait_for(handoff_complete.wait(), timeout=1)
+    await asyncio.wait_for(spawn_task, timeout=1)
+
+    try:
+        with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
+            await asyncio.wait_for(deletion, timeout=1)
+        assert graph.closed is False
+        child.shutdown.assert_not_awaited()
+    finally:
+        release_cleanup.set()
+        await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1)
+    assert graph.closed is True
+
+
+@pytest.mark.asyncio
+async def test_settled_quarantine_failure_allows_exact_cleanup_retry(tmp_path):
+    """Unsafe history reserves name reuse without denying remediation."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child_name = "RetainedRefund"
+    canonical = manager._canonical_agent_name(child_name)
+    manager._unsafe_quarantined_shutdown_failures["1:RetainedRefund"] = (
+        QuarantinedShutdownHistory(
+            reaper_id="1:RetainedRefund",
+            agent_name=child_name,
+            canonical_agent_name=canonical,
+            agent_id="did:test:retained-refund",
+            started_monotonic=1.0,
+            completed_monotonic=2.0,
+            failure="RuntimeError: refund failed",
+        )
+    )
+    delegated = SimpleNamespace(
+        allocation=SimpleNamespace(child_did="did:test:retained-refund")
+    )
+    manager._child_budgets[child_name] = (delegated, object())
+
+    async def succeed_on_retry(name):
+        assert name == child_name
+        manager._child_budgets.pop(name)
+        return False
+
+    manager._release_child_budget_cancellation_safe = succeed_on_retry
+
+    assert await manager.remove_agent(child_name) is True
+    assert child_name not in manager._child_budgets
+    with pytest.raises(RuntimeError, match="unresolved quarantined cleanup"):
+        await manager._admit_agent_operation(child_name, kind="create")
+
+
+@pytest.mark.asyncio
 async def test_spawn_revokes_ambiguous_receipt_before_child_storage_closes(tmp_path):
     """A post-commit write error must not close the only revocation handle."""
 
@@ -2236,6 +2869,7 @@ async def test_spawn_revokes_ambiguous_receipt_before_child_storage_closes(tmp_p
     parent.identity = None
     parent.features = {}
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
     manager._initialize_agent = AsyncMock(return_value=child)
 
     async def create_through_real_load(name, **kwargs):
@@ -2289,6 +2923,7 @@ async def test_failed_published_spawn_retains_cleanup_when_receipt_revocation_fa
     parent.identity = None
     parent.features = {}
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
 
     async def create_child(name, **kwargs):
         await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
@@ -2353,6 +2988,7 @@ async def test_failed_spawn_quarantine_retains_cap_slot_until_child_is_removed(
     parent.identity = None
     parent.features = {}
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
     manager._max_spawned_agents = 1
 
     async def create_child(name, **kwargs):
@@ -2388,6 +3024,39 @@ async def test_failed_spawn_quarantine_retains_cap_slot_until_child_is_removed(
     allow_revocation.set()
     await asyncio.wait_for(manager.drain_quarantined_shutdowns(), timeout=1.0)
     assert manager._pending_spawns == 0
+
+
+@pytest.mark.asyncio
+async def test_unpublished_spawn_rollback_offboards_initialized_runtime(tmp_path):
+    """A withdrawn onboarding failure still owns its isolated namespace."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    child = _make_mock_agent("did:test:unpublished-onboarding-failure")
+    child.did = child.agent_id
+    scope = resolve_isolated_runtime_namespace(
+        manager._isolated_runtime_root,
+        derive_isolated_runtime_namespace(child.agent_id),
+    )
+    prepare_isolated_runtime_namespace(scope, child.agent_id)
+    (scope.path / "credential").write_text("must not be orphaned")
+    child.isolated_runtime_scope = scope
+    admission = AgentOperationAdmission(
+        name="FailedChild",
+        canonical_name="failedchild",
+        kind="spawn",
+        registration_epoch=0,
+        owner_task=asyncio.current_task(),
+        child=child,
+        unpublished_cleanup_deferred_to_spawn=True,
+    )
+
+    assert await manager._rollback_uncommitted_spawn_runtime(
+        admission, child
+    ) is False
+
+    child.shutdown.assert_awaited_once_with()
+    assert not scope.path.exists()
+    assert admission.unpublished_cleanup_deferred_to_spawn is False
 
 
 @pytest.mark.asyncio
@@ -2731,6 +3400,7 @@ async def test_over_cap_rejected_spawn_keeps_slot_if_rollback_is_quarantined(
     parent._private_key, _ = generate_secp256k1_keypair()
     parent.identity = None
     parent.features = {}
+    _register_spawn_parent(manager, parent)
     graph = BlockedRevocationGraph()
     child = _make_mock_agent("did:test:over-cap-quarantine-child")
     child._raw_storage = SimpleNamespace(graph=graph)
@@ -2811,10 +3481,10 @@ async def test_spawned_by_registration_rehydrates_parent_authority_after_restart
 
 
 @pytest.mark.asyncio
-async def test_retained_child_does_not_block_unrelated_registration_after_parent_stop(
+async def test_signed_child_blocks_direct_parent_removal_without_cascade(
     tmp_path,
 ):
-    """A verified projection remains usable after non-cascading withdrawal."""
+    """A durable child must not lose its parent authority through direct DELETE."""
 
     parent_did = "did:pkh:eip155:1:0xStoppedParent"
     child_did = "did:pkh:eip155:1:0xRetainedChild"
@@ -2825,7 +3495,9 @@ async def test_retained_child_does_not_block_unrelated_registration_after_parent
     manager._register_agent("StoppedParent", parent)
     manager._register_agent("RetainedChild", child)
 
-    assert await manager.remove_agent("StoppedParent") is True
+    with pytest.raises(RuntimeError, match="active spawned descendants"):
+        await manager.remove_agent("StoppedParent", offboard_runtime=True)
+    assert manager.get_agent("StoppedParent") is parent
     assert manager.get_agent("RetainedChild") is child
     assert manager.get_mandate("RetainedChild") is mandate
 
@@ -2835,6 +3507,44 @@ async def test_retained_child_does_not_block_unrelated_registration_after_parent
     assert manager.get_agent("Unrelated") is unrelated
     assert manager.get_children(parent_did) == ["RetainedChild"]
     assert manager.get_mandate("RetainedChild") is mandate
+
+
+@pytest.mark.asyncio
+async def test_signed_child_blocks_direct_parent_removal_without_cache_projection(
+    tmp_path,
+):
+    """Direct removal must re-prove descendants instead of trusting its cache."""
+
+    parent_did = "did:pkh:eip155:1:0xCachelessRemovalParent"
+    child_did = "did:pkh:eip155:1:0xCachelessRemovalChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("CachelessParent", parent)
+    manager._register_agent("CachelessChild", child)
+
+    manager._parent_children.clear()
+
+    with pytest.raises(ValueError, match="signed child agents"):
+        await manager.remove_agent("CachelessParent")
+    assert manager.get_agent("CachelessParent") is parent
+    assert manager.get_agent("CachelessChild") is child
+
+
+@pytest.mark.asyncio
+async def test_forged_child_cache_cannot_block_direct_parent_removal(tmp_path):
+    """A projection without a verified signed receipt has no control effect."""
+
+    parent_did = "did:pkh:eip155:1:0xForgedRemovalParent"
+    parent = _make_mock_agent(parent_did)
+    parent._persisted_spawn_mandate = None
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("ForgedParent", parent)
+    manager._parent_children[parent_did] = ["ForgedChild"]
+
+    assert await manager.remove_agent("ForgedParent") is True
+    assert manager.get_agent("ForgedParent") is None
 
 
 def test_signed_child_is_not_published_before_parent_authority(tmp_path):
@@ -3110,6 +3820,35 @@ async def test_pre_registry_finite_restore_keeps_expiry_owner_after_boot_failure
     assert witness is not None and witness.retired
 
 
+def test_stopped_cold_restored_persistent_child_keeps_spawn_cap_slot(tmp_path):
+    """Restart restoration must rebuild the durable registration reservation."""
+
+    parent_did = "did:pkh:eip155:1:0xRestoredPersistentParent"
+    child_did = "did:pkh:eip155:1:0xRestoredPersistentChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+    manager._register_agent("RestoredPersistentParent", parent)
+    manager._register_agent("RestoredPersistentChild", child)
+
+    # Model a cooperative/non-destructive stop after restart. The live
+    # parent/mandate indexes are pruned, but the startup registration remains.
+    manager._agents.pop("RestoredPersistentChild")
+    manager._agent_names.pop(child_did)
+    manager._prune_child_relationship_and_mandate(
+        parent_did,
+        "RestoredPersistentChild",
+    )
+
+    assert manager._committed_spawn_cap_slots() == 1
+
+
 def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
     from kestrel_sovereign.identity.did_web import build_verification_methods
     from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
@@ -3152,7 +3891,8 @@ def test_hybrid_parent_signing_alias_restores_to_stable_parent(tmp_path):
     assert manager.get_mandate("HybridChild") is mandate
 
 
-def test_cold_restore_rejects_unwitnessed_receipt_claiming_pre_rotation(
+@pytest.mark.asyncio
+async def test_cold_restore_rejects_unwitnessed_receipt_claiming_pre_rotation(
     tmp_path,
     post_ceremony_material,
 ):
@@ -3193,6 +3933,7 @@ def test_cold_restore_rejects_unwitnessed_receipt_claiming_pre_rotation(
 
     assert manager.get_children(identity.legacy_did) == []
     assert manager.get_mandate("PersistentChild") is None
+    assert await manager.get_authoritative_children(identity.legacy_did) == []
 
 
 @pytest.mark.asyncio
@@ -3208,6 +3949,7 @@ async def test_new_spawn_accepts_hybrid_parent_signing_alias(tmp_path):
     parent.features = {}
     child = _make_mock_agent("did:test:normalized-child")
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
     manager._do_spawn = AsyncMock(return_value=child)
     mandate = SpawnMandate(parent_did=signing_did)
 
@@ -3349,6 +4091,1476 @@ def test_tampered_signed_lineage_fails_closed_and_rolls_back_parent_load(tmp_pat
     assert manager.get_children(parent_did) == []
 
 
+@pytest.mark.asyncio
+async def test_authoritative_descendants_rebuild_from_signed_receipts_not_cache(
+    tmp_path,
+):
+    root_did = "did:pkh:eip155:1:0xGraphRoot"
+    alpha_did = "did:pkh:eip155:1:0xGraphAlpha"
+    zeta_did = "did:pkh:eip155:1:0xGraphZeta"
+    leaf_did = "did:pkh:eip155:1:0xGraphLeaf"
+    root_private, _ = generate_secp256k1_keypair()
+    zeta_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    root._persisted_spawn_mandate = None
+    alpha = _make_mock_agent(alpha_did)
+    alpha._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(parent_did=root_did, child_did=alpha_did, ttl_seconds=0),
+        root_private,
+    )
+    zeta = _make_mock_agent(zeta_did)
+    zeta._private_key = zeta_private
+    zeta.identity = None
+    zeta._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=zeta_did,
+            ttl_seconds=0,
+            max_child_depth=1,
+        ),
+        root_private,
+    )
+    leaf = _make_mock_agent(leaf_did)
+    leaf._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(parent_did=zeta_did, child_did=leaf_did, ttl_seconds=0),
+        zeta_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (
+        ("Root", root),
+        ("Zeta", zeta),
+        ("Alpha", alpha),
+        ("Leaf", leaf),
+    ):
+        manager._register_agent(name, agent)
+
+    # This is the mutation that used to erase all parental control after a
+    # restart: the unsigned runtime projection is deliberately unavailable.
+    manager._parent_children.clear()
+
+    assert await manager.get_authoritative_children(root_did) == ["Alpha", "Zeta"]
+    assert await manager.get_authoritative_descendants(root_did) == [
+        "Alpha",
+        "Zeta",
+        "Leaf",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authority_query_withdraws_descendant_of_expired_spawned_parent(
+    tmp_path,
+    monkeypatch,
+):
+    """A spawned parent cannot become a new root when its own edge expires."""
+
+    root_did = "did:pkh:eip155:1:0xLiveQueryRoot"
+    parent_did = "did:pkh:eip155:1:0xExpiredQueryParent"
+    child_did = "did:pkh:eip155:1:0xDisconnectedQueryChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=111,
+        max_child_depth=2,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=222,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    child._persisted_spawn_mandate = child_mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (("Root", root), ("Parent", parent), ("Child", child)):
+        manager._register_agent(name, agent)
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+        lambda _created_at, ttl_seconds, **_kwargs: (
+            0 if ttl_seconds == 111 else 999
+        ),
+    )
+
+    assert await manager.get_authoritative_children(root_did) == []
+    assert await manager.get_authoritative_children(parent_did) == []
+    assert await manager.get_authoritative_spawn_relations() == {}
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_reverifies_projected_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xQueryParent"
+    child_did = "did:pkh:eip155:1:0xQueryChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+    manager._register_agent("Child", child)
+
+    mandate.purpose = "tampered after projection"
+
+    with pytest.raises(SpawnAuthorityGraphError, match="invalid mandate"):
+        await manager.get_authoritative_children(parent_did)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_rejects_deleted_durable_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xRevokedParent"
+    child_did = "did:pkh:eip155:1:0xRevokedChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+    manager._register_agent("Child", child)
+
+    child.storage.get_edges_from = AsyncMock(return_value=[])
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_rejects_expired_signed_receipt(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xExpiredQueryParent"
+    child_did = "did:pkh:eip155:1:0xExpiredQueryChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"Parent": parent, "Child": child})
+    manager._agent_names.update({parent_did: "Parent", child_did: "Child"})
+    manager._child_mandates["Child"] = mandate
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_excludes_mandate_without_runtime_custody(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xMandateOnlyParent"
+    child_did = "did:pkh:eip155:1:0xMandateOnlyChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Parent"] = parent
+    manager._agent_names[parent_did] = "Parent"
+    manager._child_mandates["RemovedChild"] = mandate
+
+    assert await manager.get_authoritative_children(parent_did) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_receipt_read_holds_topology_execution_lease(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xLeaseQueryParent"
+    child_did = "did:pkh:eip155:1:0xLeaseQueryChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    writer_entered = asyncio.Event()
+
+    async def delayed_durable_edges(node_id: str):
+        read_started.set()
+        await release_read.wait()
+        if vars(child.storage).get("closed") is True:
+            raise RuntimeError("storage closed during authority read")
+        return [
+            SimpleNamespace(
+                label="spawned_by",
+                source_id=node_id,
+                target_id=mandate.parent_did,
+                properties=mandate.to_edge_properties(),
+            )
+        ]
+
+    child.storage.get_edges_from = delayed_durable_edges
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"Parent": parent, "Child": child})
+    manager._agent_names.update({parent_did: "Parent", child_did: "Child"})
+    manager._child_mandates["Child"] = mandate
+
+    query = asyncio.create_task(manager.get_authoritative_children(parent_did))
+    await asyncio.wait_for(read_started.wait(), timeout=1)
+
+    async def withdraw_child() -> None:
+        async with manager.a2a_lifecycle_lease():
+            writer_entered.set()
+            child.storage.closed = True
+            manager._agents.pop("Child", None)
+            manager._agent_names.pop(child_did, None)
+
+    withdrawal = asyncio.create_task(withdraw_child())
+    await asyncio.sleep(0)
+    writer_crossed_receipt_read = writer_entered.is_set()
+    release_read.set()
+    query_result, withdrawal_result = await asyncio.gather(
+        query,
+        withdrawal,
+        return_exceptions=True,
+    )
+
+    assert writer_crossed_receipt_read is False
+    assert query_result == ["Child"]
+    assert withdrawal_result is None
+
+
+def test_cold_restore_rejects_features_beyond_parent_ceiling(tmp_path):
+    root_did = "did:pkh:eip155:1:0xCeilingRoot"
+    parent_did = "did:pkh:eip155:1:0xCeilingParent"
+    child_did = "did:pkh:eip155:1:0xCeilingChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        features_allowed=["MemoryFeature"],
+        max_child_depth=2,
+    )
+    root.features = {"MemoryFeature": object()}
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent.features = {"MemoryFeature": object()}
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            features_allowed=["WebSearchFeature"],
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+
+    with pytest.raises(RuntimeError, match="feature ceiling"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
+def test_cold_restore_rejects_descendant_through_expired_loaded_parent(
+    tmp_path,
+    monkeypatch,
+):
+    root_did = "did:pkh:eip155:1:0xExpiryRoot"
+    parent_did = "did:pkh:eip155:1:0xExpiryParent"
+    child_did = "did:pkh:eip155:1:0xExpiryChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=111,
+        max_child_depth=2,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=222,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+        lambda _created_at, ttl_seconds, **_kwargs: (
+            0 if ttl_seconds == 111 else 999
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="parent spawn mandate has expired"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
+def test_cold_restore_rejects_non_decreasing_depth(tmp_path):
+    root_did = "did:pkh:eip155:1:0xDepthRoot"
+    parent_did = "did:pkh:eip155:1:0xDepthParent"
+    child_did = "did:pkh:eip155:1:0xDepthChild"
+    root, parent_mandate = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent_private, _ = generate_secp256k1_keypair()
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            max_child_depth=1,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("Parent", parent)
+
+    with pytest.raises(RuntimeError, match="depth ceiling"):
+        manager._register_agent("Child", child)
+
+    assert manager.get_agent("Child") is None
+
+
+@pytest.mark.asyncio
+async def test_authoritative_query_rejects_signed_cycle(tmp_path):
+    first_did = "did:pkh:eip155:1:0xQueryCycleFirst"
+    second_did = "did:pkh:eip155:1:0xQueryCycleSecond"
+    first_private, _ = generate_secp256k1_keypair()
+    second_private, _ = generate_secp256k1_keypair()
+    first = _make_mock_agent(first_did)
+    first._private_key = first_private
+    first.identity = None
+    second = _make_mock_agent(second_did)
+    second._private_key = second_private
+    second.identity = None
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"First": first, "Second": second})
+    manager._agent_names.update({first_did: "First", second_did: "Second"})
+    first_mandate = sign_mandate(
+        SpawnMandate(parent_did=second_did, child_did=first_did),
+        second_private,
+    )
+    second_mandate = sign_mandate(
+        SpawnMandate(parent_did=first_did, child_did=second_did),
+        first_private,
+    )
+    first._persisted_spawn_mandate = first_mandate
+    second._persisted_spawn_mandate = second_mandate
+    manager._child_mandates.update(
+        {"First": first_mandate, "Second": second_mandate}
+    )
+
+    with pytest.raises(SpawnAuthorityGraphError, match="cycle"):
+        await manager.get_authoritative_descendants(first_did)
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_ignores_forged_runtime_projection(tmp_path):
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._parent_children["did:test:parent"] = ["Forged"]
+    manager.remove_agent = AsyncMock(return_value=True)
+
+    assert await manager.terminate_child("did:test:parent", "Forged") is False
+    manager.remove_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminate_child_binds_signed_snapshot_to_exact_live_did(tmp_path):
+    """A same-name replacement cannot inherit an awaited termination grant."""
+
+    parent_did = "did:test:replacement-race-parent"
+    original_did = "did:test:replacement-race-original"
+    replacement = _make_mock_agent("did:test:replacement-race-new")
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Child"] = _make_mock_agent(original_did)
+    manager._agent_names[original_did] = "Child"
+
+    async def replace_after_snapshot():
+        manager._agents["Child"] = replacement
+        manager._agent_names.pop(original_did, None)
+        manager._agent_names[replacement.agent_id] = "Child"
+        return {original_did: (parent_did, "Child")}
+
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        side_effect=replace_after_snapshot
+    )
+    manager.remove_agent = AsyncMock(return_value=True)
+
+    with pytest.raises(ValueError, match="exact loaded agent"):
+        await manager.terminate_child(parent_did, "Child")
+
+    replacement.shutdown.assert_not_awaited()
+    manager.remove_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cleanup_survives_expired_parent_unload(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xUnloadedCleanupParent"
+    child_did = "did:pkh:eip155:1:0xUnloadedCleanupChild"
+    _parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=1,
+        created_at=(datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat(),
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Child"] = child
+    manager._agent_names[child_did] = "Child"
+    manager._child_mandates["Child"] = mandate
+    manager._parent_children[parent_did] = ["Child"]
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+
+    async def remove_child(name: str, **kwargs) -> bool:
+        assert name == "Child"
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child_did
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child_did, None)
+        manager._child_mandates.pop(name, None)
+        manager._parent_children[parent_did].remove(name)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    result = await lifecycle.terminate("Child", reason="expired mandate cleanup")
+
+    assert result is not None
+    assert result.child_did == child_did
+    manager.remove_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_includes_cleanup_owned_expired_descendant(tmp_path):
+    parent_did = "did:test:cleanup-cascade-parent"
+    child_did = "did:test:cleanup-cascade-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["CleanupChild"] = child
+    manager._agent_names[child_did] = "CleanupChild"
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    await lifecycle.register(
+        "CleanupChild",
+        child_did,
+        parent_did,
+        ttl_seconds=3600,
+    )
+    lifecycle._claim_finalization("CleanupChild", child_did)
+
+    async def remove_child(name: str, **kwargs: object) -> bool:
+        assert name == "CleanupChild"
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child_did
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child_did, None)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+    try:
+        assert await manager.get_authoritative_children(parent_did) == []
+        assert await manager.terminate_children(parent_did) == 1
+        manager.remove_agent.assert_awaited_once()
+    finally:
+        lifecycle._release_finalization("CleanupChild", child_did)
+        lifecycle.withdraw_persisted_child(
+            "CleanupChild",
+            expected_child_did=child_did,
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_parent_cleanup_authority_cascades_through_retained_subtree(
+    tmp_path,
+):
+    """Expiry withdraws governance without making descendants immortal."""
+
+    root_did = "did:test:cleanup-subtree-root"
+    parent_did = "did:test:cleanup-subtree-parent"
+    child_did = "did:test:cleanup-subtree-child"
+    root_private, _ = generate_secp256k1_keypair()
+    parent_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    parent = _make_mock_agent(parent_did)
+    parent._private_key = parent_private
+    parent.identity = None
+    parent_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=parent_did,
+            ttl_seconds=1,
+            created_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=2)
+            ).isoformat(),
+            max_child_depth=1,
+        ),
+        root_private,
+    )
+    parent._persisted_spawn_mandate = parent_mandate
+    child = _make_mock_agent(child_did)
+    child_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=0,
+        ),
+        parent_private,
+    )
+    child._persisted_spawn_mandate = child_mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents.update({"Root": root, "Parent": parent, "Child": child})
+    manager._agent_names.update(
+        {root_did: "Root", parent_did: "Parent", child_did: "Child"}
+    )
+    manager._child_mandates.update(
+        {"Parent": parent_mandate, "Child": child_mandate}
+    )
+    manager._parent_children.update(
+        {root_did: ["Parent"], parent_did: ["Child"]}
+    )
+    manager._lifecycle = SpawnedAgentLifecycle(manager)
+    removal_order: list[str] = []
+
+    async def remove_exact_child(name: str, **kwargs: object) -> bool:
+        if name == "Parent" and "Child" in manager._agents:
+            raise ValueError("descendant still published")
+        expected = parent_did if name == "Parent" else child_did
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == expected
+        removal_order.append(name)
+        agent = manager._agents.pop(name)
+        manager._agent_names.pop(agent.agent_id, None)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_exact_child)
+
+    assert await manager.get_authoritative_children(root_did) == []
+    assert await manager.terminate_children(root_did) == 1
+    assert removal_order == ["Child", "Parent"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_all_uses_signed_descendant_first_order(tmp_path):
+    parent_did = "did:test:fleet-order-parent"
+    child_did = "did:test:fleet-order-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    order: list[str] = []
+    parent.shutdown.side_effect = lambda: order.append("Parent")
+    child.shutdown.side_effect = lambda: order.append("Child")
+    manager = AgentManager(base_data_dir=tmp_path)
+    # Deliberately publish parent first: insertion order is not authority order.
+    manager._agents.update({"Parent": parent, "Child": child})
+    manager._agent_names.update({parent_did: "Parent", child_did: "Child"})
+    manager._child_mandates["Child"] = mandate
+    # Deliberately omit the non-authoritative relationship cache.  The signed
+    # live + durable receipt is the ordering source.
+
+    await manager.shutdown_all()
+
+    assert order == ["Child", "Parent"]
+    assert manager._agents == {}
+
+
+@pytest.mark.asyncio
+async def test_stopped_persistent_registration_keeps_spawn_cap_slot(tmp_path):
+    parent_did = "did:test:persistent-cap-parent"
+    child_did = "did:test:persistent-cap-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    parent.features = {}
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._max_spawned_agents = 1
+    _register_spawn_parent(manager, parent)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child.agent_id] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = mandate
+    manager._parent_children[parent.agent_id] = ["PersistentChild"]
+    manager._created_configs["PersistentChild"] = LocalAgentConfig(
+        data_dir=Path("agent_data") / "PersistentChild",
+        port=8801,
+        autostart=True,
+    )
+    persistence_hook = AsyncMock()
+    manager.set_created_agent_persistence_hook(persistence_hook)
+
+    await manager.persist_created_agent_registration("PersistentChild")
+    persistence_hook.assert_awaited_once_with(
+        "PersistentChild",
+        manager._created_configs["PersistentChild"],
+        (("SpawnParent", parent_did),),
+    )
+    assert await manager.remove_agent("PersistentChild")
+
+    assert manager._committed_spawn_cap_slots() == 1
+    assert manager.get_children(parent.agent_id) == ["PersistentChild"]
+    assert manager.get_mandate("PersistentChild") is mandate
+    # Repeating the non-destructive parent cascade sees a cold child as already
+    # stopped. It must not pass destructive-only identity arguments into the
+    # ordinary retained-state removal seam.
+    assert await manager.terminate_children(parent.agent_id) == 1
+    with pytest.raises(ValueError, match="signed child agents"):
+        await manager.remove_agent("SpawnParent")
+    manager.create_agent = AsyncMock()
+    with pytest.raises(ValueError, match="spawned-agent cap"):
+        await manager.spawn_agent(
+            "SecondChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id),
+        )
+    manager.create_agent.assert_not_awaited()
+
+    # Only the exact completed destructive-offboarding admission retires it.
+    manager._persistent_spawn_offboarding.add(
+        (manager._canonical_agent_name("PersistentChild"), child.agent_id)
+    )
+    manager._retire_persistent_spawn_registration(
+        "PersistentChild",
+        child.agent_id,
+    )
+    assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_all_allows_parent_with_stopped_persistent_child(tmp_path):
+    """Host shutdown retains a cold child and still quiesces its parent."""
+
+    parent_did = "did:test:shutdown-retained-parent"
+    child_did = "did:test:shutdown-retained-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent, name="Parent")
+    manager._agents["Child"] = child
+    manager._agent_names[child_did] = "Child"
+    manager._child_mandates["Child"] = mandate
+    manager._parent_children[parent_did] = ["Child"]
+    canonical_name = manager._canonical_agent_name("Child")
+    config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "Child",
+        port=8801,
+        autostart=True,
+    )
+    manager._created_configs["Child"] = config
+    manager._persistent_spawn_registrations[canonical_name] = ("Child", child_did)
+    manager._persistent_spawn_parent_dids[canonical_name] = (child_did, parent_did)
+    manager._persistent_spawn_mandates[canonical_name] = mandate
+    manager._persistent_spawn_configs[canonical_name] = (child_did, config)
+
+    assert await manager.remove_agent("Child") is True
+    await manager.shutdown_all()
+
+    assert manager._agents == {}
+    assert parent.shutdown.await_count == 1
+    assert manager._persistent_spawn_registrations[canonical_name] == (
+        "Child",
+        child_did,
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_destructively_offboards_stopped_persistent_child(
+    tmp_path,
+):
+    """A cold durable child remains reachable as exact cleanup capability."""
+
+    parent_did = "did:test:cold-cascade-parent"
+    child_did = "did:test:cold-cascade-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child_did] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = mandate
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    child_config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "PersistentChild",
+        port=8801,
+        autostart=True,
+    )
+    manager._created_configs["PersistentChild"] = child_config
+    manager._persistent_spawn_registrations[
+        manager._canonical_agent_name("PersistentChild")
+    ] = ("PersistentChild", child_did)
+    manager._persistent_spawn_parent_dids[
+        manager._canonical_agent_name("PersistentChild")
+    ] = (child_did, parent_did)
+    manager._persistent_spawn_mandates[
+        manager._canonical_agent_name("PersistentChild")
+    ] = mandate
+    manager._persistent_spawn_configs[
+        manager._canonical_agent_name("PersistentChild")
+    ] = (child_did, child_config)
+
+    assert await manager.remove_agent("PersistentChild")
+    remove_registration = AsyncMock(return_value=AsyncMock())
+    manager.set_created_agent_registration_removal_hook(remove_registration)
+    manager._start_agent_runtime_offboarding_identity = MagicMock(
+        return_value=SimpleNamespace()
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, None)
+    )
+
+    assert await manager.terminate_children(
+        parent_did,
+        offboard_runtime=True,
+    ) == 1
+    remove_registration.assert_awaited_once_with("PersistentChild", child_did)
+    manager._start_agent_runtime_offboarding_identity.assert_called_once_with(
+        name="PersistentChild",
+        agent_id=child_did,
+        config=child_config,
+        retire_persistent_registration=True,
+    )
+    assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_parent_removal_refuses_registry_only_committed_child(tmp_path):
+    """The loaded verifier cannot disappear before its crash witness is cleaned."""
+
+    parent_did = "did:test:registry-only-interlock-parent"
+    child_did = "did:test:registry-only-interlock-child"
+    child_name = "RegistryOnlyChild"
+    parent, mandate = _signed_restored_mandate(parent_did, child_did)
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+    manager._spawn_authority_registry.record_active(
+        child_name=child_name,
+        child_did=child_did,
+        mandate=mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8801,
+            autostart=False,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="signed child agents"):
+        await manager.remove_agent("SpawnParent")
+
+    assert manager.get_agent("SpawnParent") is parent
+    parent.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_retires_registry_only_committed_child(tmp_path):
+    """A pre-projection crash witness cannot make its parent undeletable."""
+
+    parent_did = "did:test:registry-only-cascade-parent"
+    child_did = "did:test:registry-only-cascade-child"
+    child_name = "RegistryOnlyChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    parent.features = {}
+    config = LocalAgentConfig(
+        data_dir=Path("agent_data") / child_name,
+        port=8801,
+        autostart=False,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+    manager._spawn_authority_registry.record_active(
+        child_name=child_name,
+        child_did=child_did,
+        mandate=mandate,
+        config=config,
+    )
+    manager._start_agent_runtime_offboarding_identity = MagicMock(
+        return_value=SimpleNamespace()
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, None)
+    )
+
+    assert await manager.get_authoritative_children(parent_did) == []
+    assert manager._persistent_spawn_cleanup_children(parent_did) == ()
+    assert manager._spawned_descendant_names({parent_did}) == {child_name}
+
+    assert await manager.terminate_children(
+        parent_did,
+        offboard_runtime=True,
+    ) == 1
+
+    manager._start_agent_runtime_offboarding_identity.assert_called_once_with(
+        name=child_name,
+        agent_id=child_did,
+        config=config,
+        retire_persistent_registration=False,
+    )
+    witness = manager._spawn_authority_registry.get(child_did)
+    assert witness is not None and witness.retired
+    assert manager._spawned_descendant_names({parent_did}) == set()
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_denies_cold_registry_only_grandchild(tmp_path):
+    """A cold registry chain stays intact when its signer cannot be verified."""
+
+    root_did = "did:test:registry-only-tree-root"
+    child_did = "did:test:registry-only-tree-child"
+    grandchild_did = "did:test:registry-only-tree-grandchild"
+    root, child_mandate = _signed_restored_mandate(
+        root_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    _child, grandchild_mandate = _signed_restored_mandate(
+        child_did,
+        grandchild_did,
+        ttl_seconds=0,
+    )
+    root.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, root)
+    manager._spawn_authority_registry.record_active(
+        child_name="ColdChild",
+        child_did=child_did,
+        mandate=child_mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / "ColdChild",
+            port=8801,
+            autostart=False,
+        ),
+    )
+    manager._spawn_authority_registry.record_active(
+        child_name="ColdGrandchild",
+        child_did=grandchild_did,
+        mandate=grandchild_mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / "ColdGrandchild",
+            port=8802,
+            autostart=False,
+        ),
+    )
+    manager._start_agent_runtime_offboarding_identity = MagicMock(
+        return_value=SimpleNamespace()
+    )
+
+    with pytest.raises(SpawnAuthorityGraphError, match="cold descendants"):
+        await manager.terminate_children(root_did, offboard_runtime=True)
+
+    manager._start_agent_runtime_offboarding_identity.assert_not_called()
+    assert manager._spawn_authority_registry.get(child_did).active
+    assert manager._spawn_authority_registry.get(grandchild_did).active
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_refuses_forged_registry_only_child(tmp_path):
+    """Cleanup-only custody still requires the exact parent's signature."""
+
+    parent_did = "did:test:forged-registry-cascade-parent"
+    child_did = "did:test:forged-registry-cascade-child"
+    child_name = "ForgedRegistryChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    attacker_private, _ = generate_secp256k1_keypair()
+    sign_mandate(mandate, attacker_private)
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+    manager._spawn_authority_registry.record_active(
+        child_name=child_name,
+        child_did=child_did,
+        mandate=mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8801,
+            autostart=False,
+        ),
+    )
+
+    with pytest.raises(SpawnAuthorityGraphError, match="invalid mandate"):
+        await manager.terminate_children(parent_did, offboard_runtime=True)
+
+    witness = manager._spawn_authority_registry.get(child_did)
+    assert witness is not None and witness.active
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_does_not_adopt_provisional_registry_child(tmp_path):
+    """A pre-governance host denial is not parental cleanup custody."""
+
+    parent_did = "did:test:provisional-registry-cascade-parent"
+    child_did = "did:test:provisional-registry-cascade-child"
+    child_name = "ProvisionalRegistryChild"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    mandate.authority_committed = False
+    sign_mandate(mandate, parent._private_key)
+    parent.features = {}
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+    manager._spawn_authority_registry.record_active(
+        child_name=child_name,
+        child_did=child_did,
+        mandate=mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8801,
+            autostart=False,
+        ),
+    )
+
+    assert await manager.terminate_children(parent_did, offboard_runtime=True) == 0
+
+    witness = manager._spawn_authority_registry.get(child_did)
+    assert witness is not None and witness.active
+
+
+@pytest.mark.asyncio
+async def test_deferred_cold_persistent_offboarding_retires_exact_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    """The cold identity worker owns reservation retirement after timeout."""
+
+    parent_did = "did:test:deferred-cold-parent"
+    child_did = "did:test:deferred-cold-child"
+    _parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    canonical_name = manager._canonical_agent_name("PersistentChild")
+    child_config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "PersistentChild",
+        port=8801,
+        autostart=True,
+    )
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    manager._child_mandates["PersistentChild"] = mandate
+    manager._persistent_spawn_registrations[canonical_name] = (
+        "PersistentChild",
+        child_did,
+    )
+    manager._persistent_spawn_parent_dids[canonical_name] = (
+        child_did,
+        parent_did,
+    )
+    manager._persistent_spawn_mandates[canonical_name] = mandate
+    manager._persistent_spawn_configs[canonical_name] = (
+        child_did,
+        child_config,
+    )
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
+    manager.set_created_agent_registration_removal_hook(
+        AsyncMock(return_value=AsyncMock())
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_cleanup(_scope, exact_child_did, _legacy_root):
+        assert exact_child_did == child_did
+        started.set()
+        release.wait(timeout=5)
+        return RuntimeNamespaceCleanupOutcome.REMOVED
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://host/kestrel")
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.isolated_runtime.remove_runtime_namespace",
+        slow_cleanup,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.multi_agent.agent_manager.RUNTIME_OFFBOARD_TIMEOUT_S",
+        0.01,
+    )
+
+    deletion = asyncio.create_task(
+        manager.terminate_child(
+            parent_did,
+            "PersistentChild",
+            offboard_runtime=True,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        with pytest.raises(RuntimeOffboardingRetainedError):
+            await deletion
+    finally:
+        release.set()
+
+    await manager.drain_quarantined_shutdowns()
+
+    assert canonical_name not in manager._persistent_spawn_registrations
+    assert manager._committed_spawn_cap_slots() == 0
+    assert manager.get_mandate("PersistentChild") is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_registration_witnesses_complete_verified_authority_chain(
+    tmp_path,
+):
+    """The config hook must be able to reject any non-durable ancestor."""
+
+    root_did = "did:test:persistence-chain-root"
+    parent_did = "did:test:persistence-chain-parent"
+    child_did = "did:test:persistence-chain-child"
+    root_private, _ = generate_secp256k1_keypair()
+    parent_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    parent = _make_mock_agent(parent_did)
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=parent_did,
+            ttl_seconds=0,
+            max_child_depth=1,
+        ),
+        root_private,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=0,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (("Root", root), ("Parent", parent), ("Child", child)):
+        manager._register_agent(name, agent)
+    child_config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "Child",
+        port=8802,
+        autostart=True,
+    )
+    manager._created_configs["Child"] = child_config
+    persistence_hook = AsyncMock()
+    manager.set_created_agent_persistence_hook(persistence_hook)
+
+    await manager.persist_created_agent_registration("Child")
+
+    persistence_hook.assert_awaited_once_with(
+        "Child",
+        child_config,
+        (("Parent", parent_did), ("Root", root_did)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_persistent_registration_rejects_ephemeral_spawned_ancestor(tmp_path):
+    """A config entry cannot turn an expiring parent edge into durable authority."""
+
+    root_did = "did:test:ephemeral-chain-root"
+    parent_did = "did:test:ephemeral-chain-parent"
+    child_did = "did:test:ephemeral-chain-child"
+    root_private, _ = generate_secp256k1_keypair()
+    parent_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    parent = _make_mock_agent(parent_did)
+    parent._private_key = parent_private
+    parent.identity = None
+    parent._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=root_did,
+            child_did=parent_did,
+            ttl_seconds=3600,
+            max_child_depth=1,
+        ),
+        root_private,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=0,
+        ),
+        parent_private,
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    for name, agent in (("Root", root), ("Parent", parent), ("Child", child)):
+        manager._register_agent(name, agent)
+    # A fresh spawn defers this reservation until the persistence hook commits;
+    # direct test registration restores it eagerly as if it came from disk.
+    manager._persistent_spawn_registrations.pop(
+        manager._canonical_agent_name("Child"),
+        None,
+    )
+    manager._created_configs["Child"] = LocalAgentConfig(
+        data_dir=Path("agent_data") / "Child",
+        port=8802,
+        autostart=True,
+    )
+    persistence_hook = AsyncMock()
+    manager.set_created_agent_persistence_hook(persistence_hook)
+
+    with pytest.raises(RuntimeError, match="ephemeral spawned ancestor"):
+        await manager.persist_created_agent_registration("Child")
+
+    persistence_hook.assert_not_awaited()
+    assert manager._persistent_spawn_registrations.get(
+        manager._canonical_agent_name("Child")
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_restart_registry_witness_binds_loaded_name_to_config_anchor(tmp_path):
+    """A same-name config pointing at another DID cannot durable-parent a child."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    parent = _make_mock_agent("did:test:live-parent")
+    _register_spawn_parent(manager, parent, name="Parent")
+    config = LocalAgentConfig(data_dir=Path("agent_data/Parent"), port=8801)
+
+    with patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new=AsyncMock(return_value="did:test:different-config-parent"),
+    ):
+        with pytest.raises(ValueError, match="identity changed"):
+            await manager.resolve_registered_agent_id(
+                "Parent",
+                config,
+                require_config_identity=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_loaded_registration_identity_uses_live_storage_slot_with_sqlite_wal(
+    tmp_path,
+):
+    """A live SQLite tenant is its config witness; immutable cold reads miss WAL."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    parent = _make_mock_agent("did:test:live-wal-parent")
+    config = LocalAgentConfig(data_dir=Path("agent_data/Parent"), port=8801)
+    parent.storage_path = str(
+        config.resolve_data_dir(tmp_path) / "kestrel_prime.db"
+    )
+    _register_spawn_parent(manager, parent, name="Parent")
+
+    with patch(
+        "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+        new=AsyncMock(
+            side_effect=sqlite3.OperationalError(
+                "immutable cold read cannot see the live WAL identity"
+            )
+        ),
+    ) as cold_read:
+        resolved = await manager.resolve_registered_agent_id(
+            "Parent",
+            config,
+            require_config_identity=True,
+        )
+
+    assert resolved == parent.agent_id
+    cold_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_loaded_registration_identity_refuses_replacement_config_slot(tmp_path):
+    """A same-name config replacement cannot delete the loaded generation."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    parent = _make_mock_agent("did:test:loaded-original-generation")
+    original = LocalAgentConfig(data_dir=Path("agent_data/Original"), port=8801)
+    replacement = LocalAgentConfig(
+        data_dir=Path("agent_data/Replacement"),
+        port=8801,
+    )
+    parent.storage_path = str(
+        original.resolve_data_dir(tmp_path) / "kestrel_prime.db"
+    )
+    _register_spawn_parent(manager, parent, name="Parent")
+
+    with pytest.raises(ValueError, match="live storage slot"):
+        await manager.resolve_registered_agent_id(
+            "Parent",
+            replacement,
+            require_config_identity=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_persistent_registration_reserves_name_from_new_spawn(tmp_path):
+    """A stopped persistent child may cold-load, but cannot be replaced."""
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    canonical_name = manager._canonical_agent_name("PersistentChild")
+    manager._persistent_spawn_registrations[canonical_name] = (
+        "PersistentChild",
+        "did:test:persistent-name-owner",
+    )
+
+    with pytest.raises(ValueError, match="persistent spawn registration"):
+        await manager._admit_agent_operation("persistentchild", kind="spawn")
+
+    assert manager._agent_operations == {}
+
+
+def test_persistent_preflight_reserves_cap_before_feature_initialization(tmp_path):
+    """Verified startup authority consumes its slot even if initialize fails."""
+
+    parent_did = "did:test:preflight-reservation-parent"
+    child_did = "did:test:preflight-reservation-child"
+    parent, mandate = _signed_restored_mandate(
+        parent_did,
+        child_did,
+        ttl_seconds=0,
+    )
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = mandate
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Parent", parent)
+
+    manager._restore_persisted_spawn_authority(
+        "PersistentChild",
+        child,
+        child_did,
+        project=False,
+    )
+
+    assert manager._persistent_spawn_registrations[
+        manager._canonical_agent_name("PersistentChild")
+    ] == ("PersistentChild", child_did)
+    assert manager.get_mandate("PersistentChild") is None
+    assert manager._committed_spawn_cap_slots() == 1
+
+
+@pytest.mark.asyncio
+async def test_endpoint_offboarding_retires_persistent_spawn_cap_slot(tmp_path):
+    """A successful general DELETE must retire its durable child reservation."""
+
+    parent_did = "did:test:endpoint-offboard-parent"
+    child_did = "did:test:endpoint-offboard-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child_did] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+        ttl_seconds=0,
+    )
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    manager._persistent_spawn_registrations[
+        manager._canonical_agent_name("PersistentChild")
+    ] = ("PersistentChild", child_did)
+    config = LocalAgentConfig(
+        data_dir=Path("agent_data") / "PersistentChild",
+        port=8801,
+        autostart=True,
+    )
+    manager._start_agent_runtime_offboarding = MagicMock(
+        return_value=SimpleNamespace()
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, None)
+    )
+    admission = RuntimeOffboardingAdmission()
+
+    assert await manager.remove_agent(
+        "PersistentChild",
+        offboard_runtime=True,
+        known_agent_id=child_did,
+        known_agent_config=config,
+        offboarding_admission=admission,
+    )
+    assert admission.started is True
+    assert manager._committed_spawn_cap_slots() == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_persistent_runtime_offboarding_keeps_registration_slot(tmp_path):
+    """Removing the startup row is not proof that runtime deletion succeeded."""
+
+    parent_did = "did:test:retained-persistent-parent"
+    child_did = "did:test:retained-persistent-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["PersistentChild"] = child
+    manager._agent_names[child_did] = "PersistentChild"
+    manager._child_mandates["PersistentChild"] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+        ttl_seconds=0,
+    )
+    manager._parent_children[parent_did] = ["PersistentChild"]
+    canonical_name = manager._canonical_agent_name("PersistentChild")
+    manager._persistent_spawn_registrations[canonical_name] = (
+        "PersistentChild",
+        child_did,
+    )
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child_did: (parent_did, "PersistentChild")}
+    )
+
+    async def remove_registration(_name, _child_did):
+        return AsyncMock()
+
+    manager.set_created_agent_registration_removal_hook(remove_registration)
+    retained = RuntimeOffboardingRetainedError(
+        agent_name="PersistentChild",
+        agent_id=child_did,
+        runtime_path=Path("operator/runtime/persistent-child"),
+        cause=IsolatedRuntimeNamespaceError("foreign owner"),
+    )
+    manager._finish_agent_runtime_offboarding = AsyncMock(
+        return_value=(False, retained)
+    )
+
+    with pytest.raises(RuntimeOffboardingRetainedError):
+        await manager.terminate_child(
+            parent_did,
+            "PersistentChild",
+            offboard_runtime=True,
+        )
+
+    assert manager._persistent_spawn_registrations[canonical_name] == (
+        "PersistentChild",
+        child_did,
+    )
+    assert manager._committed_spawn_cap_slots() == 1
+
+
+@pytest.mark.asyncio
+async def test_parent_cascade_includes_child_retained_after_ttl_refusal(tmp_path):
+    """Exhausted automatic retries remain reachable by a later cascade."""
+
+    parent_did = "did:test:refusal-cascade-parent"
+    child_did = "did:test:refusal-cascade-child"
+    child = _make_mock_agent(child_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["RefusedChild"] = child
+    manager._agent_names[child_did] = "RefusedChild"
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    await lifecycle.register(
+        "RefusedChild",
+        child_did,
+        parent_did,
+        ttl_seconds=3600,
+        mode=SpawnMode.EPHEMERAL,
+    )
+    lifecycle._tracked["RefusedChild"].termination_refusal = (
+        TerminationRefusalState(
+            automatic_termination_attempts=3,
+            requested_status=SpawnStatus.TIMED_OUT,
+        )
+    )
+
+    async def remove_child(name: str, **kwargs: object) -> bool:
+        assert name == "RefusedChild"
+        assert kwargs["_lifecycle_cleanup_expected_agent_id"] == child_did
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child_did, None)
+        return True
+
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    assert lifecycle.cleanup_authority_children(parent_did=parent_did) == (
+        ("RefusedChild", child_did),
+    )
+    assert await manager.terminate_children(parent_did) == 1
+    manager.remove_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_spawn_refuses_parent_not_exactly_registered_in_manager(tmp_path):
+    parent_did = "did:test:unregistered-spawn-parent"
+    registered = _make_mock_agent(parent_did)
+    imposter = _make_mock_agent(parent_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._agents["Parent"] = registered
+    manager._agent_names[parent_did] = "Parent"
+    manager.create_agent = AsyncMock()
+
+    with pytest.raises(ValueError, match="exact agent registered"):
+        await manager.spawn_agent(
+            "RefusedChild",
+            imposter,
+            SpawnMandate(parent_did=parent_did),
+        )
+
+    manager.create_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_cleanup_witness_refuses_same_name_replacement(tmp_path):
+    parent_did = "did:pkh:eip155:1:0xReplacementCleanupParent"
+    expired_child_did = "did:pkh:eip155:1:0xExpiredCleanupChild"
+    replacement_did = "did:pkh:eip155:1:0xReplacementCleanupChild"
+    replacement = _make_mock_agent(replacement_did)
+    manager = AgentManager(base_data_dir=tmp_path)
+    lifecycle = SpawnedAgentLifecycle(manager)
+    manager._lifecycle = lifecycle
+    await lifecycle.register(
+        "ReusableChild",
+        expired_child_did,
+        parent_did,
+        ttl_seconds=3600,
+    )
+    manager._agents["ReusableChild"] = replacement
+    manager._agent_names[replacement_did] = "ReusableChild"
+    lifecycle._claim_finalization("ReusableChild", expired_child_did)
+    try:
+        with pytest.raises(ValueError, match="loaded agent"):
+            await manager.terminate_child(parent_did, "ReusableChild")
+    finally:
+        lifecycle._release_finalization("ReusableChild", expired_child_did)
+        lifecycle.withdraw_persisted_child(
+            "ReusableChild",
+            expected_child_did=expired_child_did,
+        )
+
+    assert manager.get_agent("ReusableChild") is replacement
+    replacement.shutdown.assert_not_awaited()
+
+
 def test_failed_onboarding_rolls_back_rehydrated_parent_authority(tmp_path):
     parent_did = "did:pkh:eip155:1:0xRollbackParent"
     child_did = "did:pkh:eip155:1:0xRollbackChild"
@@ -3453,6 +5665,7 @@ async def test_spawn_commit_rechecks_cap_after_concurrent_authority_restore(tmp_
     manager = AgentManager(base_data_dir=tmp_path)
     manager._max_spawned_agents = 1
     manager._register_agent("OtherParent", other_parent)
+    _register_spawn_parent(manager, parent)
 
     async def create_after_restore(name, **kwargs):
         manager._register_agent("RestoredChild", restored)
@@ -3500,6 +5713,7 @@ async def test_spawn_cap_wait_expires_at_signed_deadline(tmp_path):
     restored._persisted_spawn_mandate = restored_mandate
     manager = AgentManager(base_data_dir=tmp_path)
     manager._max_spawned_agents = 2
+    _register_spawn_parent(manager, parent)
     manager._register_agent("DeadlineWaitOtherParent", other_parent)
     children = {
         "DeadlineWaitFirst": first,
@@ -3579,6 +5793,7 @@ async def test_failed_spawn_rollback_revokes_authority_but_keeps_restrictions(tm
     child = _make_mock_agent("did:test:rollback-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
 
     async def create_child(name, **kwargs):
         await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
@@ -3624,6 +5839,7 @@ async def test_spawn_restamps_proposal_at_final_child_identity(tmp_path):
     child = _make_mock_agent("did:test:ttl-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
 
     async def create_child(name, **kwargs):
         await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
@@ -3659,6 +5875,7 @@ async def test_live_spawn_owns_signed_deadline_before_delegated_budget(tmp_path)
     child = _make_mock_agent("did:test:live-deadline-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
     deadline_owned_during_budget = []
 
     async def create_child(name, **kwargs):
@@ -3696,6 +5913,7 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
     child = _make_mock_agent("did:test:stalled-budget-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
     budget_cancelled = asyncio.Event()
 
     async def create_child(name, **kwargs):
@@ -3740,6 +5958,134 @@ async def test_live_signed_deadline_cancels_stalled_budget_and_retires(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_live_signed_deadline_cancels_stalled_final_receipt_write(tmp_path):
+    """The final graph CAS cannot hold topology past the signed lifetime."""
+
+    private_key, _ = generate_secp256k1_keypair()
+    parent = _make_mock_agent("did:test:stalled-final-receipt-parent")
+    parent._private_key = private_key
+    parent.identity = None
+    parent.features = {}
+    final_write_cancelled = asyncio.Event()
+    write_count = 0
+
+    async def write_receipt(*_args, **_kwargs):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                final_write_cancelled.set()
+
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(side_effect=write_receipt),
+        delete_edge=AsyncMock(),
+    )
+    child = _make_mock_agent("did:test:stalled-final-receipt-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+
+    async def create_child(name, **kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    with patch(
+        "kestrel_sovereign.kestrel_agent.remaining_spawn_ttl_seconds",
+        return_value=0.03,
+    ):
+        spawn = asyncio.create_task(
+            manager.spawn_agent(
+                "StalledFinalReceiptChild",
+                parent,
+                SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+            )
+        )
+        with pytest.raises(PersistedSpawnMandateExpiredError):
+            await asyncio.wait_for(spawn, timeout=0.5)
+
+    assert final_write_cancelled.is_set()
+    witness = manager._spawn_authority_registry.get(child.agent_id)
+    assert witness is not None and witness.retired
+
+
+@pytest.mark.asyncio
+async def test_final_receipt_primitive_enforces_child_deadline_itself(tmp_path):
+    """The topology-write primitive stays bounded outside its usual owner task."""
+
+    parent_private_key, _ = generate_secp256k1_keypair()
+    child_did = "did:test:direct-final-receipt-child"
+    parent_did = "did:test:direct-final-receipt-parent"
+    provisional = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=1,
+            authority_committed=False,
+        ),
+        parent_private_key,
+    )
+    final = replace(provisional)
+    config = LocalAgentConfig(data_dir="agent_data/direct-final", port=8801)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._spawn_authority_registry.record_active(
+        child_name="DirectFinalReceiptChild",
+        child_did=child_did,
+        mandate=provisional,
+        config=config,
+    )
+    write_cancelled = asyncio.Event()
+
+    async def stalled_write(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            write_cancelled.set()
+
+    child = _make_mock_agent(child_did)
+    child._persisted_spawn_mandate = provisional
+    child._host_authority_deadline_monotonic = (
+        asyncio.get_running_loop().time() + 0.03
+    )
+    admission = AgentOperationAdmission(
+        name="DirectFinalReceiptChild",
+        canonical_name="directfinalreceiptchild",
+        kind="spawn",
+        registration_epoch=0,
+        owner_task=asyncio.current_task(),
+        spawn_receipt_graph=SimpleNamespace(
+            add_trusted_cross_agent_edge=AsyncMock(side_effect=stalled_write)
+        ),
+        spawn_receipt_source_id=child_did,
+        spawn_receipt_target_id=parent_did,
+        spawn_authority_witness_mandate=provisional,
+    )
+
+    with pytest.raises(PersistedSpawnMandateExpiredError):
+        await asyncio.wait_for(
+            manager._commit_spawn_receipt_authority(
+                admission,
+                child,
+                final,
+                parent_private_key=parent_private_key,
+                parent_identity=None,
+            ),
+            timeout=0.2,
+        )
+
+    assert write_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_live_signed_deadline_maps_grouped_readiness_cancellation_to_expiry(
     tmp_path,
 ):
@@ -3754,6 +6100,7 @@ async def test_live_signed_deadline_maps_grouped_readiness_cancellation_to_expir
     child = _make_mock_agent("did:test:grouped-readiness-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
 
     async def expire_during_readiness(name, **kwargs):
         await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
@@ -3795,6 +6142,7 @@ async def test_spawn_expired_before_commit_rolls_back_signed_receipt(tmp_path):
     child = _make_mock_agent("did:test:deadline-child")
     child._raw_storage = SimpleNamespace(graph=graph)
     manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
 
     async def create_child(name, **kwargs):
         await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
@@ -3824,6 +6172,132 @@ async def test_spawn_expired_before_commit_rolls_back_signed_receipt(tmp_path):
     assert revoked.kwargs["properties"]["parent_signature"] is None
     assert revoked.kwargs["properties"]["created_at"] == proposal_created_at
     assert child._persisted_spawn_mandate.created_at == proposal_created_at
+
+
+@pytest.mark.asyncio
+async def test_spawn_expired_during_final_receipt_write_rolls_back_authority(
+    tmp_path,
+):
+    """The receipt write cannot consume the last instant of child authority."""
+
+    private_key, _ = generate_secp256k1_keypair()
+    parent = _make_mock_agent("did:test:post-write-deadline-parent")
+    parent._private_key = private_key
+    parent.identity = None
+    parent.features = {}
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(),
+        delete_edge=AsyncMock(),
+    )
+    child = _make_mock_agent("did:test:post-write-deadline-child")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    _register_spawn_parent(manager, parent)
+
+    async def create_child(name, **kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    with (
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+            side_effect=[1, 0],
+        ),
+        pytest.raises(RuntimeError, match="expired while its durable receipt committed"),
+    ):
+        await manager.spawn_agent(
+            "PostWriteDeadlineChild",
+            parent,
+            SpawnMandate(parent_did=parent.agent_id, ttl_seconds=1),
+        )
+
+    assert graph.add_trusted_cross_agent_edge.await_count == 3
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.kwargs["properties"]["parent_signature"] is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_parent_expired_during_child_receipt_write_rolls_back_authority(
+    tmp_path,
+):
+    """A child cannot commit after its spawned parent's authority expires."""
+
+    root_did = "did:test:post-write-root"
+    parent_did = "did:test:post-write-spawned-parent"
+    root, parent_receipt = _signed_restored_mandate(
+        root_did,
+        parent_did,
+        ttl_seconds=1,
+        max_child_depth=1,
+    )
+    parent = _make_mock_agent(parent_did)
+    parent._persisted_spawn_mandate = parent_receipt
+    parent._private_key, _ = generate_secp256k1_keypair()
+    parent.identity = None
+    parent.features = {}
+    final_child_receipt_written = False
+    child_receipt_writes = 0
+
+    async def write_child_receipt(_source, _target, _label, *, properties):
+        nonlocal child_receipt_writes, final_child_receipt_written
+        child_receipt_writes += 1
+        if child_receipt_writes == 2:
+            final_child_receipt_written = True
+
+    graph = SimpleNamespace(
+        add_trusted_cross_agent_edge=AsyncMock(side_effect=write_child_receipt),
+        delete_edge=AsyncMock(),
+    )
+    child = _make_mock_agent("did:test:post-write-grandchild")
+    child._raw_storage = SimpleNamespace(graph=graph)
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+    manager._register_agent("SpawnedParent", parent)
+
+    async def create_child(name, **kwargs):
+        await _persist_and_publish_spawn_test_child(manager, name, child, kwargs)
+        return child
+
+    async def remove_child(name, **_kwargs):
+        manager._agents.pop(name, None)
+        manager._agent_names.pop(child.agent_id, None)
+        return True
+
+    manager.create_agent = AsyncMock(side_effect=create_child)
+    manager.remove_agent = AsyncMock(side_effect=remove_child)
+
+    def remaining(created_at, _ttl_seconds):
+        if created_at == parent_receipt.created_at and final_child_receipt_written:
+            return 0
+        return 1
+
+    with (
+        patch(
+            "kestrel_sovereign.multi_agent.agent_manager.remaining_spawn_ttl_seconds",
+            side_effect=remaining,
+        ),
+        pytest.raises(
+            RuntimeError,
+            match="parent durable authority was revoked or expired while child receipt committed",
+        ),
+    ):
+        await manager.spawn_agent(
+            "PostWriteGrandchild",
+            parent,
+            SpawnMandate(parent_did=parent_did, ttl_seconds=1),
+        )
+
+    assert graph.add_trusted_cross_agent_edge.await_count == 3
+    revoked = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+    assert revoked.kwargs["properties"]["parent_signature"] is None
 
 
 @pytest.mark.asyncio
@@ -3968,6 +6442,7 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
     )
     restored._persisted_spawn_mandate = restored_mandate
     manager._register_agent("OtherParent", other_parent)
+    _register_spawn_parent(manager, parent)
     fresh = {
         "FirstFresh": _make_mock_agent("did:pkh:eip155:1:0xFirstFresh"),
         "SecondFresh": _make_mock_agent("did:pkh:eip155:1:0xSecondFresh"),
@@ -5463,6 +7938,223 @@ class TestAgentManagerBasics:
         assert completed
         assert all(record["pending"] is False for record in completed)
         assert all(record["failure"] is None for record in completed)
+
+    @pytest.mark.asyncio
+    async def test_deferred_persistent_offboarding_retires_exact_reservation(
+        self, monkeypatch
+    ):
+        """A successful retained worker must finish durable name/cap cleanup."""
+
+        parent_did = "did:test:deferred-persistent-parent"
+        child_did = "did:test:deferred-persistent-child"
+        manager = AgentManager()
+        child = _make_mock_agent(child_did)
+        manager._agents["PersistentChild"] = child
+        manager._agent_names[child_did] = "PersistentChild"
+        manager._parent_children[parent_did] = ["PersistentChild"]
+        manager._child_mandates["PersistentChild"] = SpawnMandate(
+            parent_did=parent_did,
+            child_did=child_did,
+            ttl_seconds=0,
+        )
+        canonical_name = manager._canonical_agent_name("PersistentChild")
+        manager._persistent_spawn_registrations[canonical_name] = (
+            "PersistentChild",
+            child_did,
+        )
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={child_did: (parent_did, "PersistentChild")}
+        )
+        remove_registration = AsyncMock(return_value=AsyncMock())
+        manager.set_created_agent_registration_removal_hook(remove_registration)
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_cleanup(_agent):
+            started.set()
+            release.wait(timeout=5)
+            return RuntimeNamespaceCleanupOutcome.REMOVED
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
+            slow_cleanup,
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.RUNTIME_OFFBOARD_TIMEOUT_S",
+            0.01,
+        )
+
+        deletion = asyncio.create_task(
+            manager.terminate_child(
+                parent_did,
+                "PersistentChild",
+                offboard_runtime=True,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            with pytest.raises(RuntimeOffboardingRetainedError):
+                await deletion
+            assert manager._persistent_spawn_registrations[canonical_name] == (
+                "PersistentChild",
+                child_did,
+            )
+            assert (canonical_name, child_did) in (
+                manager._persistent_spawn_offboarding
+            )
+        finally:
+            release.set()
+
+        await manager.drain_quarantined_shutdowns()
+
+        assert canonical_name not in manager._persistent_spawn_registrations
+        assert (canonical_name, child_did) not in (
+            manager._persistent_spawn_offboarding
+        )
+        assert manager._committed_spawn_cap_slots() == 0
+
+    @pytest.mark.asyncio
+    async def test_persistent_offboarding_retry_reuses_removed_registration(
+        self, monkeypatch, tmp_path
+    ):
+        """A terminal cleanup result must not make the one-shot hook a retry gate."""
+
+        parent_did = "did:test:persistent-retry-parent"
+        child_did = "did:test:persistent-retry-child"
+        child_name = "PersistentRetryChild"
+        parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
+            ttl_seconds=0,
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        _register_spawn_parent(manager, parent, name="PersistentRetryParent")
+        manager._agents[child_name] = child
+        manager._agent_names[child_did] = child_name
+        manager._parent_children[parent_did] = [child_name]
+        manager._child_mandates[child_name] = mandate
+        canonical_name = manager._canonical_agent_name(child_name)
+        manager._persistent_spawn_registrations[canonical_name] = (
+            child_name,
+            child_did,
+        )
+        manager._persistent_spawn_parent_dids[canonical_name] = (
+            child_did,
+            parent_did,
+        )
+        manager._persistent_spawn_mandates[canonical_name] = mandate
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={child_did: (parent_did, child_name)}
+        )
+        registration_rollback = AsyncMock()
+        remove_registration = AsyncMock(
+            side_effect=(
+                registration_rollback,
+                RuntimeError("startup registration was already removed"),
+            )
+        )
+        manager.set_created_agent_registration_removal_hook(remove_registration)
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
+            lambda _agent: RuntimeNamespaceCleanupOutcome.NOT_HOSTED,
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.isolated_runtime.remove_runtime_namespace",
+            lambda _scope, _agent_id, _legacy_root: (
+                RuntimeNamespaceCleanupOutcome.REMOVED
+            ),
+        )
+
+        with pytest.raises(RuntimeOffboardingNotPerformedError):
+            await manager.terminate_child(
+                parent_did,
+                child_name,
+                offboard_runtime=True,
+            )
+
+        assert (canonical_name, child_did) in manager._persistent_spawn_offboarding
+        assert await manager.terminate_child(
+            parent_did,
+            child_name,
+            offboard_runtime=True,
+        )
+        remove_registration.assert_awaited_once_with(child_name, child_did)
+        registration_rollback.assert_not_awaited()
+        assert canonical_name not in manager._persistent_spawn_registrations
+        assert (canonical_name, child_did) not in (
+            manager._persistent_spawn_offboarding
+        )
+
+    @pytest.mark.asyncio
+    async def test_configless_deferred_offboarding_retires_exact_reservation(
+        self, tmp_path, monkeypatch
+    ):
+        """Auto-discovery cleanup owns reservation retirement without a TOML hook."""
+
+        parent_did = "did:test:configless-deferred-parent"
+        child_did = "did:test:configless-deferred-child"
+        _parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
+            ttl_seconds=0,
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent(child_did)
+        manager._agents["ConfiglessChild"] = child
+        manager._agent_names[child_did] = "ConfiglessChild"
+        manager._parent_children[parent_did] = ["ConfiglessChild"]
+        manager._child_mandates["ConfiglessChild"] = mandate
+        canonical_name = manager._canonical_agent_name("ConfiglessChild")
+        manager._persistent_spawn_registrations[canonical_name] = (
+            "ConfiglessChild",
+            child_did,
+        )
+        manager._persistent_spawn_parent_dids[canonical_name] = (
+            child_did,
+            parent_did,
+        )
+        manager._persistent_spawn_mandates[canonical_name] = mandate
+        manager._persistent_spawn_configs[canonical_name] = (
+            child_did,
+            LocalAgentConfig(data_dir="unused", port=8801),
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_cleanup(_agent):
+            started.set()
+            release.wait(timeout=5)
+            return RuntimeNamespaceCleanupOutcome.REMOVED
+
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.isolated_runtime.remove_agent_runtime_namespace",
+            slow_cleanup,
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.multi_agent.agent_manager.RUNTIME_OFFBOARD_TIMEOUT_S",
+            0.01,
+        )
+
+        deletion = asyncio.create_task(
+            manager.remove_agent("ConfiglessChild", offboard_runtime=True)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            with pytest.raises(RuntimeOffboardingRetainedError):
+                await deletion
+            assert canonical_name in manager._persistent_spawn_registrations
+        finally:
+            release.set()
+
+        await manager.drain_quarantined_shutdowns()
+
+        assert canonical_name not in manager._persistent_spawn_registrations
+        assert canonical_name not in manager._persistent_spawn_parent_dids
+        assert canonical_name not in manager._persistent_spawn_mandates
+        assert canonical_name not in manager._persistent_spawn_configs
+        assert manager._committed_spawn_cap_slots() == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -7282,6 +9974,9 @@ class TestAgentManagerBasics:
         manager._parent_children[parent_did] = ["Child"]
         mandate = SpawnMandate(parent_did=parent_did, purpose="offboard")
         manager._child_mandates["Child"] = mandate
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={child.agent_id: (parent_did, "Child")}
+        )
         retained = RuntimeOffboardingRetainedError(
             agent_name="Child",
             agent_id=child.agent_id,
@@ -7314,6 +10009,17 @@ class TestAgentManagerBasics:
             manager._child_mandates[name] = SpawnMandate(
                 parent_did=parent_did, purpose="cascade"
             )
+        relation_dids = {
+            "First": "did:pkh:first",
+            "Second": "did:pkh:second",
+            "Third": "did:pkh:third",
+        }
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={
+                child_did: (parent_did, name)
+                for name, child_did in relation_dids.items()
+            }
+        )
         retained = RuntimeOffboardingRetainedError(
             agent_name="First",
             agent_id="did:pkh:first",
@@ -7341,9 +10047,27 @@ class TestAgentManagerBasics:
             )
 
         assert manager.remove_agent.await_args_list == [
-            (("First",), {"offboard_runtime": True}),
-            (("Second",), {"offboard_runtime": True}),
-            (("Third",), {"offboard_runtime": True}),
+            (
+                ("First",),
+                {
+                    "offboard_runtime": True,
+                    "_lifecycle_cleanup_expected_agent_id": "did:pkh:first",
+                },
+            ),
+            (
+                ("Second",),
+                {
+                    "offboard_runtime": True,
+                    "_lifecycle_cleanup_expected_agent_id": "did:pkh:second",
+                },
+            ),
+            (
+                ("Third",),
+                {
+                    "offboard_runtime": True,
+                    "_lifecycle_cleanup_expected_agent_id": "did:pkh:third",
+                },
+            ),
         ]
         assert _exception_group_contains(
             raised.value, RuntimeOffboardingRetainedError
@@ -7364,6 +10088,9 @@ class TestAgentManagerBasics:
         manager._child_mandates["Child"] = SpawnMandate(
             parent_did=parent_did, purpose="cascade"
         )
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={child.agent_id: (parent_did, "Child")}
+        )
         descendant_retained = RuntimeOffboardingRetainedError(
             agent_name="Grandchild",
             agent_id="did:pkh:grandchild",
@@ -7372,9 +10099,15 @@ class TestAgentManagerBasics:
         )
         manager.terminate_children = AsyncMock(side_effect=descendant_retained)
 
-        async def remove_child(name: str, *, offboard_runtime: bool) -> bool:
+        async def remove_child(
+            name: str,
+            *,
+            offboard_runtime: bool,
+            _lifecycle_cleanup_expected_agent_id: str,
+        ) -> bool:
             assert name == "Child"
             assert offboard_runtime is True
+            assert _lifecycle_cleanup_expected_agent_id == child.agent_id
             manager._agents.pop(name)
             manager._agent_names.pop(child.agent_id)
             return True
@@ -7389,7 +10122,9 @@ class TestAgentManagerBasics:
             )
 
         manager.remove_agent.assert_awaited_once_with(
-            "Child", offboard_runtime=True
+            "Child",
+            offboard_runtime=True,
+            _lifecycle_cleanup_expected_agent_id=child.agent_id,
         )
         assert manager.get_children(parent_did) == []
 
@@ -7398,6 +10133,9 @@ class TestAgentManagerBasics:
         manager = AgentManager()
         parent_did = "did:pkh:reconcile-parent"
         manager._parent_children[parent_did] = ["Child"]
+        manager.get_authoritative_spawn_relations = AsyncMock(
+            return_value={"did:pkh:reconcile-child": (parent_did, "Child")}
+        )
         manager.remove_agent = AsyncMock(return_value=True)
         cause = OSError("private reconciliation path /operator/runtime")
         manager._prune_child_tracking_if_fully_removed = AsyncMock(
@@ -7419,7 +10157,9 @@ class TestAgentManagerBasics:
         }
         assert "/operator/runtime" not in str(raised.value)
         manager.remove_agent.assert_awaited_once_with(
-            "Child", offboard_runtime=True
+            "Child",
+            offboard_runtime=True,
+            _lifecycle_cleanup_expected_agent_id="did:pkh:reconcile-child",
         )
 
     @pytest.mark.asyncio
@@ -8233,6 +10973,59 @@ class TestAgentManagerBasics:
         assert manager.get_agent("B") is None
         agent1.shutdown.assert_awaited_once()
         agent2.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_all_attempts_every_agent_when_authority_read_fails(self):
+        """Unreadable topology is reported only after the conservative fleet sweep."""
+
+        manager = AgentManager()
+        first = _make_mock_agent("did:test:shutdown-unreadable-first")
+        second = _make_mock_agent("did:test:shutdown-unreadable-second")
+        manager._agents.update({"First": first, "Second": second})
+        manager._agent_names.update(
+            {first.agent_id: "First", second.agent_id: "Second"}
+        )
+        manager._verified_spawn_relations = AsyncMock(
+            side_effect=RuntimeError("signed topology unreadable")
+        )
+
+        with pytest.raises(ExceptionGroup, match="fleet agents failed") as raised:
+            await manager.shutdown_all()
+
+        assert any(
+            "signed topology unreadable" in str(error)
+            for error in raised.value.exceptions
+        )
+        first.shutdown.assert_awaited_once()
+        second.shutdown.assert_awaited_once()
+        assert manager._agents == {}
+
+    @pytest.mark.asyncio
+    async def test_shutdown_all_retries_parent_after_unreadable_topology(self):
+        """A conservative parent-first sweep retries ancestors after leaf removal."""
+
+        parent_did = "did:test:shutdown-retry-parent"
+        child_did = "did:test:shutdown-retry-child"
+        parent, mandate = _signed_restored_mandate(parent_did, child_did)
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        manager = AgentManager()
+        manager._register_agent("Parent", parent)
+        manager._register_agent("Child", child)
+        manager._verified_spawn_relations = AsyncMock(
+            side_effect=RuntimeError("signed topology unreadable")
+        )
+
+        with pytest.raises(ExceptionGroup, match="fleet agents failed") as raised:
+            await manager.shutdown_all()
+
+        assert any(
+            "signed topology unreadable" in str(error)
+            for error in raised.value.exceptions
+        )
+        parent.shutdown.assert_awaited_once()
+        child.shutdown.assert_awaited_once()
+        assert manager._agents == {}
 
 
 class TestLoadFromConfig:
@@ -10638,6 +13431,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
         inception_wrote_identity = asyncio.Event()
         hold_inception = asyncio.Event()
         reserved_caps: list[int | None] = []
@@ -10700,6 +13494,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
 
         async def fail_inception(**_kwargs):
             raise RuntimeError("identity was not created")
@@ -10745,6 +13540,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
         inception = AsyncMock(side_effect=FileExistsError("identity already exists"))
         monkeypatch.setattr(
             "kestrel_sovereign.inception_service.create_kestrel_identity_async",
@@ -10775,6 +13571,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
         original_mkdir = Path.mkdir
 
         def fail_child_directory(path, *args, **kwargs):
@@ -10805,6 +13602,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
 
         async def partially_fail(*, output_dir, **_kwargs):
             (Path(output_dir) / "kestrel_prime.db").touch()
@@ -10847,6 +13645,7 @@ class TestCreateAgent:
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
         parent.features = {}
+        _register_spawn_parent(manager, parent)
         original_stat = Path.stat
         original_exists = os.path.exists
 
@@ -11012,6 +13811,7 @@ class TestSpawnAgent:
         manager = AgentManager(base_data_dir=tmp_path)
         manager._do_spawn = AsyncMock(return_value=_make_mock_agent("did:test:child"))
         parent = _make_mock_agent("did:test:parent")
+        _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(
             parent_did=parent.agent_id,
             max_child_depth=invalid_depth,
@@ -11056,6 +13856,7 @@ class TestSpawnAgent:
         parent = _make_mock_agent("did:test:crash-safe-parent")
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
+        _register_spawn_parent(manager, parent, name="CrashSafeParent")
         original_register = manager._register_agent
 
         def assert_restart_selection_then_publish(name, agent, **kwargs):
@@ -11254,6 +14055,220 @@ class TestSpawnAgent:
         assert evidence_visible_during_repair == [False]
         assert active_boot_crossings == [(child_did, True)]
         assert manager.get_agent(child_name) is child
+
+    @pytest.mark.asyncio
+    async def test_host_witness_repairs_interrupted_signed_provisional_receipt(
+        self,
+        tmp_path,
+    ):
+        """A crash after host commit upgrades the exact signed graph receipt."""
+
+        child_name = "CommittedHostProvisionalGraphChild"
+        child_did = "did:test:committed-host-provisional-graph-child"
+        parent_did = "did:test:committed-host-provisional-graph-parent"
+        parent, committed = _signed_restored_mandate(parent_did, child_did)
+        provisional = replace(
+            committed,
+            authority_committed=False,
+            parent_signature=None,
+        )
+        sign_mandate(provisional, parent._private_key)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8802,
+        )
+        SpawnAuthorityRegistry(tmp_path).record_active(
+            child_name=child_name,
+            child_did=child_did,
+            mandate=committed,
+            config=config,
+        )
+        graph = SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = provisional
+        child._raw_storage = SimpleNamespace(graph=graph)
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._register_agent("CommittedHostProvisionalGraphParent", parent)
+        manager._created_configs[child_name] = config
+
+        await manager._recover_interrupted_spawn_receipt(child_name, child)
+
+        assert child._persisted_spawn_mandate.to_dict() == committed.to_dict()
+        graph.add_trusted_cross_agent_edge.assert_awaited_once_with(
+            child_did,
+            parent_did,
+            "spawned_by",
+            properties=committed.to_edge_properties(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_host_witness_refuses_forged_signed_provisional_receipt(
+        self,
+        tmp_path,
+    ):
+        """The committed host scope does not bless unsigned child graph bytes."""
+
+        child_name = "ForgedProvisionalGraphChild"
+        child_did = "did:test:forged-provisional-graph-child"
+        parent_did = "did:test:forged-provisional-graph-parent"
+        parent, committed = _signed_restored_mandate(parent_did, child_did)
+        provisional = replace(
+            committed,
+            authority_committed=False,
+            parent_signature=None,
+        )
+        attacker_private, _ = generate_secp256k1_keypair()
+        sign_mandate(provisional, attacker_private)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8802,
+        )
+        SpawnAuthorityRegistry(tmp_path).record_active(
+            child_name=child_name,
+            child_did=child_did,
+            mandate=committed,
+            config=config,
+        )
+        graph = SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = provisional
+        child._raw_storage = SimpleNamespace(graph=graph)
+        manager = AgentManager(base_data_dir=tmp_path)
+        manager._register_agent("ForgedProvisionalGraphParent", parent)
+        manager._created_configs[child_name] = config
+
+        with pytest.raises(RuntimeError, match="signature is invalid"):
+            await manager._recover_interrupted_spawn_receipt(child_name, child)
+
+        assert child._persisted_spawn_mandate is provisional
+        graph.add_trusted_cross_agent_edge.assert_not_awaited()
+
+    def test_restart_retires_active_provisional_host_witness(self, tmp_path):
+        """A crash before governance commit releases roster, name, and cap."""
+
+        child_name = "AbandonedProvisionalChild"
+        child_did = "did:test:abandoned-provisional-child"
+        parent_did = "did:test:abandoned-provisional-parent"
+        parent, provisional = _signed_restored_mandate(parent_did, child_did)
+        provisional.authority_committed = False
+        sign_mandate(provisional, parent._private_key)
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8802,
+        )
+        registry = SpawnAuthorityRegistry(tmp_path)
+        registry.record_active(
+            child_name=child_name,
+            child_did=child_did,
+            mandate=provisional,
+            config=config,
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+
+        with patch(
+            "kestrel_sovereign.multi_agent.agent_manager."
+            "read_anchor_agent_did_sync",
+            return_value=child_did,
+        ):
+            reconciled = manager._reconcile_spawn_authority_restart_roster(
+                MultiAgentConfig(agents={child_name: config})
+            )
+
+        assert reconciled.agents == {}
+        witness = registry.get(child_did)
+        assert witness is not None and witness.retired
+        assert manager._committed_spawn_cap_slots() == 0
+
+    def test_restart_preserves_live_cross_process_provisional_host_witness(
+        self,
+        tmp_path,
+    ):
+        """A sibling reconciler cannot retire a producer's live governance CAS."""
+
+        child_name = "LiveProvisionalChild"
+        child_did = "did:test:live-provisional-child"
+        parent_did = "did:test:live-provisional-parent"
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8802,
+        )
+        proposal = SpawnMandate(parent_did=parent_did, ttl_seconds=0)
+        producer = SpawnAuthorityRegistry(tmp_path)
+        pending = producer.reserve_pending(
+            child_name=child_name,
+            parent_did=parent_did,
+            mandate=proposal,
+            config=config,
+        )
+        provisional = replace(
+            proposal,
+            child_did=child_did,
+            parent_signature="signed-provisional-receipt",
+            authority_committed=False,
+        )
+        producer.promote_pending(
+            reservation_id=pending.reservation_id,
+            child_name=child_name,
+            child_did=child_did,
+            mandate=provisional,
+            config=config,
+            proposal_created_at=proposal.created_at,
+        )
+        consumer = AgentManager(base_data_dir=tmp_path)
+        try:
+            reconciled = consumer._reconcile_spawn_authority_restart_roster(
+                MultiAgentConfig(agents={child_name: config})
+            )
+            assert child_name not in reconciled.agents
+            witness = producer.get(child_did)
+            assert witness is not None and witness.active
+        finally:
+            producer.close()
+
+    def test_terminal_retirement_releases_owned_provisional_lock(self, tmp_path):
+        """A finalized provisional receipt leaves no producer FD or sidecar."""
+
+        child_name = "TerminalProvisionalChild"
+        child_did = "did:test:terminal-provisional-child"
+        parent_did = "did:test:terminal-provisional-parent"
+        config = LocalAgentConfig(
+            data_dir=Path("agent_data") / child_name,
+            port=8802,
+        )
+        proposal = SpawnMandate(parent_did=parent_did, ttl_seconds=0)
+        registry = SpawnAuthorityRegistry(tmp_path)
+        pending = registry.reserve_pending(
+            child_name=child_name,
+            parent_did=parent_did,
+            mandate=proposal,
+            config=config,
+        )
+        provisional = replace(
+            proposal,
+            child_did=child_did,
+            parent_signature="signed-provisional-receipt",
+            authority_committed=False,
+        )
+        registry.promote_pending(
+            reservation_id=pending.reservation_id,
+            child_name=child_name,
+            child_did=child_did,
+            mandate=provisional,
+            config=config,
+            proposal_created_at=proposal.created_at,
+        )
+        lock_path = registry._provisional_owner_lock_path(child_did)
+
+        assert child_did in registry._owned_provisional_locks
+        assert lock_path.exists()
+        assert registry.begin_retirement(
+            child_name=child_name,
+            child_did=child_did,
+        )
+        assert registry.retire(child_name=child_name, child_did=child_did)
+
+        assert child_did not in registry._owned_provisional_locks
+        assert not lock_path.exists()
 
     @pytest.mark.parametrize("candidate_name", ["BoundChild", "RenamedChild"])
     def test_host_spawn_witness_refuses_replacement_did_in_bound_slot(
@@ -12408,11 +15423,14 @@ class TestSpawnAgent:
         signing_parent_did = "did:web:example.test:standalone-rotated-parent"
         child_name = "StandaloneRotatedChild"
         child_did = "did:test:standalone-rotated-child"
-        mandate = SpawnMandate(
-            parent_did=signing_parent_did,
-            child_did=child_did,
-            ttl_seconds=3600,
-            parent_signature="signed-standalone-rotated-child",
+        private_key, _ = generate_secp256k1_keypair()
+        mandate = sign_mandate(
+            SpawnMandate(
+                parent_did=signing_parent_did,
+                child_did=child_did,
+                ttl_seconds=3600,
+            ),
+            private_key,
         )
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / child_name,
@@ -12431,6 +15449,7 @@ class TestSpawnAgent:
             startup_roster_enabled=False,
         )
         child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
         manager._agents[child_name] = child
         manager._agent_names[child_did] = child_name
         manager._parent_children[stable_parent_did] = [child_name]
@@ -12445,6 +15464,7 @@ class TestSpawnAgent:
                 legacy_did=stable_parent_did,
                 new_did=signing_parent_did,
             ),
+            _private_key=private_key,
         )
 
         await manager.shutdown_spawn_authority_tree(root)
@@ -12498,6 +15518,47 @@ class TestSpawnAgent:
         assert manager.reconcile_spawn_authority_restart_roster(
             MultiAgentConfig(agents={})
         ).agents == {}
+
+    @pytest.mark.asyncio
+    async def test_retired_spawn_witness_does_not_own_later_routing_name(
+        self,
+        tmp_path,
+    ):
+        """A tombstone cannot veto ordinary cleanup through its old alias."""
+
+        retired_name = "RetiredAlias"
+        current_name = "CurrentAlias"
+        child_did = "did:test:reused-retired-identity"
+        mandate = SpawnMandate(
+            parent_did="did:test:retired-alias-parent",
+            child_did=child_did,
+            parent_signature="retired-alias-signature",
+        )
+        registry = SpawnAuthorityRegistry(tmp_path)
+        registry.record_active(
+            child_name=retired_name,
+            child_did=child_did,
+            mandate=mandate,
+            config=LocalAgentConfig(
+                data_dir=Path("agent_data") / retired_name,
+                port=8802,
+            ),
+        )
+        registry.retire(child_name=retired_name, child_did=child_did)
+        manager = AgentManager(base_data_dir=tmp_path)
+        child = _make_mock_agent(child_did)
+        manager._agents[current_name] = child
+        manager._agent_names[child_did] = current_name
+
+        admission = await manager._begin_destructive_spawn_retirement(
+            current_name,
+            known_agent_id=child_did,
+        )
+
+        assert admission is not None
+        assert admission.witness.retired is True
+        assert admission.transitioned is False
+        assert registry.get(child_did).retired is True
 
     @pytest.mark.asyncio
     async def test_destructive_parent_removal_refuses_nonbudgeted_descendants(
@@ -12781,11 +15842,10 @@ class TestSpawnAgent:
         )
         config_path = tmp_path / "multi_agent.toml"
         MultiAgentConfig(agents={child_name: local}).save(config_path)
-        mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=child_did,
+        parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
             ttl_seconds=0,
-            parent_signature="signed-ordered-offboard",
         )
         registry = SpawnAuthorityRegistry(tmp_path)
         registry.record_active(
@@ -12799,11 +15859,21 @@ class TestSpawnAgent:
             startup_config_path=config_path,
         )
         child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        _register_spawn_parent(manager, parent, name="OrderedOffboardParent")
         manager._agents[child_name] = child
         manager._agent_names[child_did] = child_name
         manager._parent_children[parent_did] = [child_name]
         manager._child_mandates[child_name] = mandate
         observed_states = []
+
+        async def remove_registration_after_retirement(*_args, **_kwargs):
+            assert registry.get(child_did).state == "retiring"
+            return AsyncMock()
+
+        manager.set_created_agent_registration_removal_hook(
+            remove_registration_after_retirement
+        )
 
         def crash_after_observing_retirement(*_args, **_kwargs):
             observed_states.append(registry.get(child_did).state)
@@ -12833,11 +15903,10 @@ class TestSpawnAgent:
         parent_did = "did:test:refused-offboard-parent"
         child_name = "RefusedOffboardChild"
         child_did = "did:test:refused-offboard-child"
-        mandate = SpawnMandate(
-            parent_did=parent_did,
-            child_did=child_did,
+        parent, mandate = _signed_restored_mandate(
+            parent_did,
+            child_did,
             ttl_seconds=0,
-            parent_signature="signed-refused-offboard",
         )
         registry = SpawnAuthorityRegistry(tmp_path)
         registry.record_active(
@@ -12851,6 +15920,11 @@ class TestSpawnAgent:
         )
         manager = AgentManager(base_data_dir=tmp_path)
         child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        _register_spawn_parent(manager, parent, name="RefusedOffboardParent")
+        manager.set_created_agent_registration_removal_hook(
+            AsyncMock(return_value=AsyncMock())
+        )
         manager._agents[child_name] = child
         manager._agent_names[child_did] = child_name
         manager._parent_children[parent_did] = [child_name]
@@ -13326,6 +16400,7 @@ class TestSpawnAgent:
         parent = _make_mock_agent("did:parent-xyz")
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
+        _register_spawn_parent(manager, parent)
 
         mandate = SpawnMandate(
             parent_did="did:parent-xyz",
@@ -13379,7 +16454,25 @@ class TestSpawnAgent:
         mock_get_did.return_value = child.agent_id
         mock_agent_cls.return_value = child
         manager = AgentManager(base_data_dir=tmp_path)
+        _register_spawn_parent(manager, parent)
         mandate = SpawnMandate(parent_did=parent.agent_id, purpose="signed")
+        events = []
+
+        async def record_receipt(*_args, properties):
+            events.append(
+                (
+                    "receipt",
+                    properties.get("authority_committed", True),
+                    properties["parent_signature"],
+                )
+            )
+
+        graph.add_trusted_cross_agent_edge.side_effect = record_receipt
+
+        async def apply_budget(*_args, **_kwargs):
+            events.append(("budget", None, None))
+
+        manager._apply_delegated_budget = AsyncMock(side_effect=apply_budget)
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
             await manager.spawn_agent("SignedChild", parent, mandate)
@@ -13389,12 +16482,24 @@ class TestSpawnAgent:
         assert persisted is not mandate
         assert persisted.child_did == child.agent_id
         assert verify_mandate(persisted, public_key)
-        graph.add_trusted_cross_agent_edge.assert_awaited_once_with(
+        assert graph.add_trusted_cross_agent_edge.await_count == 2
+        final_receipt_write = graph.add_trusted_cross_agent_edge.await_args_list[-1]
+        assert final_receipt_write.args == (
             child.agent_id,
             parent.agent_id,
             "spawned_by",
-            properties=persisted.to_edge_properties(),
         )
+        assert final_receipt_write.kwargs == {
+            "properties": persisted.to_edge_properties(),
+        }
+        assert [event[:2] for event in events] == [
+            ("receipt", False),
+            ("budget", None),
+            ("receipt", True),
+        ]
+        assert events[0][2]
+        assert events[2][2]
+        assert events[0][2] != events[2][2]
         assert child._persisted_spawn_mandate is persisted
         assert child.spawn_mandate is runtime_projection
         assert manager._spawn_authority_registry.pending() == ()
@@ -13431,6 +16536,7 @@ class TestSpawnAgent:
         parent = _make_mock_agent("did:parent-feat")
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
+        _register_spawn_parent(manager, parent)
 
         mandate = SpawnMandate(
             parent_did="did:parent-feat",
@@ -13467,6 +16573,7 @@ class TestSpawnAgent:
         parent = _make_mock_agent("did:parent-open")
         parent._private_key, _ = generate_secp256k1_keypair()
         parent.identity = None
+        _register_spawn_parent(manager, parent)
 
         # No features_allowed → default empty list → load all features.
         mandate = SpawnMandate(parent_did="did:parent-open", purpose="open child")
@@ -13492,6 +16599,7 @@ class TestSpawnAgent:
         parent = _make_mock_agent("did:parent")
         parent._private_key = None
         parent.identity = None
+        _register_spawn_parent(manager, parent)
 
         mandate = SpawnMandate(parent_did="did:parent", purpose="dupe test")
 

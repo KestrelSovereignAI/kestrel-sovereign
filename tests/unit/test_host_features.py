@@ -327,6 +327,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
     class FakeManager:
         init_failures = []
         readiness_sweep_calls = 0
+        persistence_hook = None
 
         def set_host_context_publication_gate(self, gate) -> None:
             self.host_context_publication_gate = gate
@@ -335,6 +336,12 @@ async def test_server_lifespan_wires_and_closes_host_features(
             return config
 
         def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        def set_created_agent_persistence_hook(self, hook) -> None:
+            self.persistence_hook = hook
+
+        def set_created_agent_registration_removal_hook(self, _hook) -> None:
             return None
 
         async def load_from_config(
@@ -478,6 +485,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert fake_config.host.port == 9090
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
+        assert callable(fake_manager.persistence_hook)
         assert fake_manager.host_context_publication_gate.is_set()
         assert events == [
             "agents-load",
