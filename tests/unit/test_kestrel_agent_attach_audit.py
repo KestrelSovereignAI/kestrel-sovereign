@@ -13,7 +13,6 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
