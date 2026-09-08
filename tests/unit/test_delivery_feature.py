@@ -120,6 +120,7 @@ def _make_dead_letter_row(
     attempts=5,
     created_at=None,
     max_retries=5,
+    retry_entry_id=None,
 ):
     """Create a mock dead letter row tuple."""
     if created_at is None:
@@ -135,6 +136,7 @@ def _make_dead_letter_row(
         attempts,
         created_at,
         max_retries,
+        retry_entry_id,
     )
 
 
@@ -574,7 +576,7 @@ class TestQueueTableCreation:
         # 3 tables + 5 indexes + the one-time v2 trigger cleanup + the scoped
         # SQLite atomic-compensation trigger. The v2 index is not rebuilt on an
         # already-v3 schema.
-        assert queue._db.execute.call_count == 10
+        assert queue._db.execute.call_count == 11
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1129,7 +1131,7 @@ class TestQueueIdempotency:
 
         queue._db.transaction = transaction
         queue._db.fetchone = AsyncMock(
-            side_effect=[None, QueryError("injected aborted transaction")]
+            side_effect=[None, None, QueryError("injected aborted transaction")]
         )
 
         with pytest.raises(QueryError, match="injected aborted transaction"):
@@ -1314,6 +1316,67 @@ class TestQueueIdempotency:
         ) == successes[0]["entry_id"]
 
     @pytest.mark.asyncio
+    async def test_failed_nested_dead_letter_retry_remains_resumable(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "retry-failure@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-failure",
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_dead_letter_retry
+            BEFORE INSERT ON delivery_queue
+            BEGIN SELECT RAISE(ABORT, 'retry insert failed'); END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="retry insert failed"):
+                await queue.retry(original_id)
+
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_dead_letter
+            WHERE original_id = ? AND agent_id = ?
+            """,
+            (original_id, queue._agent_id),
+        ) == (1,)
+        await queue._db.execute("DROP TRIGGER reject_dead_letter_retry")
+        retried = await queue.retry(original_id)
+        assert retried["success"] is True
+        assert await queue.enqueue(
+            "email",
+            "retry-failure@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-failure",
+        ) == retried["entry_id"]
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_retry_restores_canonical_dedup_hash(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "canonical-retry@example.com",
+            {"subject": "hello", "body": "world"},
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        retried = await queue.retry(original_id)
+        duplicate = await queue.enqueue(
+            "email",
+            "canonical-retry@example.com",
+            {"body": "world", "subject": "hello"},
+        )
+
+        assert retried["success"] is True
+        assert duplicate == retried["entry_id"]
+
+    @pytest.mark.asyncio
     async def test_delivered_purge_expires_replay_claim(self, real_queue):
         queue, _ = real_queue
         request = {
@@ -1344,6 +1407,47 @@ class TestQueueIdempotency:
         ) == (0,)
         replayed_id = await queue.enqueue(**request)
         assert replayed_id != original_id
+
+    @pytest.mark.asyncio
+    async def test_failed_nested_purge_keeps_replay_fail_safe(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "purge-failure@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "purge-failure",
+        }
+        original_id = await queue.enqueue(**request)
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        await queue._db.execute(
+            """
+            UPDATE delivery_queue SET status = ?, delivered_at = ?
+            WHERE id = ? AND agent_id = ?
+            """,
+            (DeliveryStatus.DELIVERED.value, old, original_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_purge_claim_delete
+            BEFORE DELETE ON delivery_idempotency
+            BEGIN SELECT RAISE(ABORT, 'purge claim failed'); END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="purge claim failed"):
+                await queue.purge_delivered(older_than_hours=24)
+
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ?", (original_id,)
+        ) == (0,)
+        await queue._db.execute("DROP TRIGGER reject_purge_claim_delete")
+        repaired_id = await queue.enqueue(**request)
+        assert repaired_id != original_id
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
 
     @pytest.mark.asyncio
     async def test_ordinary_ledger_delete_does_not_delete_live_queue(
@@ -1460,6 +1564,31 @@ class TestQueueIdempotency:
         assert await queue.enqueue(
             "email", "legacy-hash@example.com", content
         ) == entry_id
+
+    @pytest.mark.asyncio
+    async def test_new_rows_keep_legacy_hash_for_rolling_readers(self, real_queue):
+        queue, _ = real_queue
+        content = {"subject": "hello", "body": "world"}
+        recipient = "rolling-reader@example.com"
+        entry_id = await queue.enqueue(
+            "email", recipient, content, idempotency_key="rolling-reader"
+        )
+
+        row = await queue._db.fetchone(
+            """
+            SELECT content_hash, canonical_content_hash
+            FROM delivery_queue WHERE id = ?
+            """,
+            (entry_id,),
+        )
+        assert row == (
+            QueueEntry.compute_content_hash(
+                recipient, json.dumps(content, default=str)
+            ),
+            QueueEntry.compute_content_hash(
+                recipient, json.dumps(content, sort_keys=True, separators=(",", ":"))
+            ),
+        )
 
     def test_unrelated_exception_context_is_not_reported_as_conflict(self):
         try:
@@ -1765,25 +1894,24 @@ class TestQueuePurge:
 
     @pytest.mark.asyncio
     async def test_purge_delivered(self, queue):
-        queue._db.fetchone = AsyncMock(return_value=(7,))
+        queue._db.fetchall = AsyncMock(
+            return_value=[(f"delivered-{index}",) for index in range(7)]
+        )
 
         purged = await queue.purge_delivered(older_than_hours=24)
         assert purged == 7
 
-        # Should have called DELETE
-        execute_calls = queue._db.execute.call_args_list
-        assert any("DELETE FROM delivery_queue" in str(c) for c in execute_calls)
+        assert "DELETE FROM delivery_queue" in queue._db.fetchall.call_args.args[0]
 
     @pytest.mark.asyncio
     async def test_purge_nothing_to_purge(self, queue):
-        queue._db.fetchone = AsyncMock(return_value=(0,))
+        queue._db.fetchall = AsyncMock(return_value=[])
 
         purged = await queue.purge_delivered()
         assert purged == 0
 
         # Ledger retention still runs, but no queue row is deleted.
-        execute_calls = queue._db.execute.call_args_list
-        assert not any("DELETE FROM delivery_queue" in str(c) for c in execute_calls)
+        assert "DELETE FROM delivery_queue" in queue._db.fetchall.call_args.args[0]
 
 
 # =========================================================================

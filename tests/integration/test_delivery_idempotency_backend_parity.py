@@ -83,6 +83,45 @@ async def test_delivery_enqueue_idempotency_backend_parity(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_distinct_replay_keys_share_content_dedup_gate(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-dedup:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+
+    try:
+        entry_ids = await asyncio.gather(
+            *(
+                queue.enqueue(
+                    "email",
+                    "person@example.com",
+                    {"subject": "Check-in", "body": "Are you okay?"},
+                    idempotency_key=f"workflow-action-{index}",
+                )
+                for index in range(12)
+            )
+        )
+
+        assert len(set(entry_ids)) == 1
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (owner,),
+        ) == (1,)
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (owner,),
+        ) == (12,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_delivery_idempotency_lifecycle_backend_parity(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-lifecycle:{uuid4().hex}"
