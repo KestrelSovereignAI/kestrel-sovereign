@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import runpy
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -24,6 +25,15 @@ UV_RUNTIME_DOCKERFILES = (
 
 def _read(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _entrypoint_python_body(function_name: str) -> str:
+    """Extract one single-quoted Python heredoc from the entrypoint."""
+
+    entrypoint = _read("docker/multi_agent_entrypoint.sh")
+    function = entrypoint.split(f"{function_name}() {{", 1)[1]
+    heredoc = function.split("<<'PY'", 1)[1]
+    return heredoc.split("\nPY\n", 1)[0].lstrip("\n")
 
 
 def test_runtime_images_install_uv_hold_filesystem_sandbox():
@@ -67,6 +77,46 @@ def test_multi_agent_image_persists_host_control_database_on_agent_volume():
         'export KESTREL_DERIVED_HOST_DB_PATH="$KESTREL_HOST_DB_PATH"'
         in entrypoint
     )
+    assert "paths_overlap_by_filesystem_identity" in entrypoint
+    assert 'local first="${1%/}/"' not in entrypoint
+
+
+def test_multi_agent_entrypoint_executes_filesystem_identity_overlap(
+    tmp_path: Path,
+):
+    """The shell's actual heredoc rejects an unresolved case-fold alias."""
+
+    body = _entrypoint_python_body("paths_overlap")
+    parent = tmp_path / "agent-data"
+    parent.mkdir()
+
+    overlap = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(parent / "host-data"),
+            str(parent / "HOST-DATA" / "agent"),
+        ],
+        input=body,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    separate = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(parent / "host-data"),
+            str(parent / "ordinary-agent"),
+        ],
+        input=body,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+
+    assert overlap.returncode == 0
+    assert separate.returncode == 1
 
 
 def test_compose_mount_and_env_point_to_same_agent_data_dir():

@@ -31,29 +31,44 @@ def _alternate_case(name: str) -> str | None:
 
 
 def _filesystem_is_case_insensitive(path: Path) -> bool | None:
-    """Probe existing ancestors without creating filesystem state.
+    """Probe the nearest existing directory without creating filesystem state.
 
-    ``None`` means no existing ancestor supplied a case-bearing component that
-    could prove the volume's behavior.  Custody comparisons preserve that
-    uncertainty and treat a case-folded match as a possible alias.
+    A mount point or Linux casefold-enabled directory may have different case
+    semantics from its parent.  Changing the directory's *own* spelling tests
+    the parent filesystem and can therefore grant a false case-sensitive
+    result.  Probe an entry inside the directory instead.  ``None`` means no
+    readable, case-bearing entry proved the directory's behavior; custody
+    comparisons preserve that uncertainty and treat a case-folded match as a
+    possible alias.
     """
 
     if os.name == "nt":
         return True
     existing = _nearest_existing_path(path)
-    for candidate in (existing, *existing.parents):
-        alternate_name = _alternate_case(candidate.name)
-        if alternate_name is None:
-            continue
-        alternate = candidate.with_name(alternate_name)
+    if existing.is_dir():
         try:
-            return candidate.samefile(alternate)
-        except FileNotFoundError:
-            # The candidate itself exists.  A differently-cased spelling that
-            # does not resolve therefore proves this volume is case-sensitive.
-            return False
+            candidates = existing.iterdir()
         except OSError:
-            continue
+            return None
+    else:
+        # An existing file's spelling is interpreted by its containing
+        # directory, which is exactly the filesystem boundary being probed.
+        candidates = iter((existing,))
+    try:
+        for candidate in candidates:
+            alternate_name = _alternate_case(candidate.name)
+            if alternate_name is None:
+                continue
+            alternate = candidate.with_name(alternate_name)
+            try:
+                return candidate.samefile(alternate)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                continue
+    except OSError:
+        # Directory iteration itself can fail after it has begun.
+        return None
     return None
 
 

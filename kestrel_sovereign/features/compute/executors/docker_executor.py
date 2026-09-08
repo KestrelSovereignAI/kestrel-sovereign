@@ -171,9 +171,12 @@ class DockerExecutor(BaseExecutor):
 
         Args:
             script: The ComputeScript to execute
-            working_dir: Optional working directory (mounted read-only)
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
             network: Whether to allow network access (default: False)
-            mounts: Additional mounts [{"src": "/host/path", "dst": "/container/path", "ro": True}]
+            mounts: Reserved compatibility parameter. Additional host mounts
+                are refused because even a read-only bind can expose a Unix
+                service socket.
 
         Returns:
             ExecutionRecord with execution results
@@ -220,33 +223,72 @@ class DockerExecutor(BaseExecutor):
         self,
         mounts: Optional[List[Dict[str, str]]],
     ) -> None:
-        """Keep caller-selected host paths read-only inside compute containers.
+        """Reject caller-selected host mounts at the sandbox boundary.
 
-        Path containment cannot prove that a writable source is independent of
-        Hold custody: a file anywhere below it may be a hard-link alias of a
-        protected inode, and another same-user process can add such an alias
-        after a recursive preflight scan.  The executor-owned per-run trash
-        staging directory is the sole writable host bind and is assembled
-        internally, so arbitrary additional mounts have no safe writable mode.
+        Read-only bind mounts prevent regular-file writes but do not prevent
+        ``connect(2)`` to a Unix socket.  A Docker/Podman socket, PostgreSQL
+        socket, or a directory in which one can appear would let compute cross
+        Hold custody through a host service.  A recursive scan is raceable, so
+        no arbitrary additional host mount is safe.  The executor-owned script,
+        workspace, and per-run trash binds are assembled internally instead.
         """
 
-        for mount in mounts or []:
-            src = mount.get("src")
-            dst = mount.get("dst")
-            if not src or not dst:
-                continue
-            if dst == _CONTAINER_TRASH_DIR or dst.startswith(
-                f"{_CONTAINER_TRASH_DIR}/"
-            ):
-                raise ExecutionError(
-                    f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
-                )
-            if not mount.get("ro", True):
-                raise ExecutionEnvironmentError(
-                    "Refusing writable Docker mount because an arbitrary host "
-                    "path cannot prove separation from host Hold custody; "
-                    f"additional mounts must be read-only: {src}"
-                )
+        if mounts:
+            raise ExecutionEnvironmentError(
+                "Refusing additional Docker mounts because read-only bind "
+                "mounts still expose host service sockets and cannot prove "
+                "separation from host Hold custody"
+            )
+
+    @staticmethod
+    def _snapshot_working_directory(source: str, destination: Path) -> str:
+        """Copy a host cwd into executor custody without importing live sockets.
+
+        A read-only bind of the caller's directory would still expose Unix
+        sockets, including one created after a recursive preflight.  Copying
+        into the already-private execution directory gives the container a
+        stable regular-file snapshot; ``copytree`` rejects sockets/FIFOs and
+        preserves symlinks without following them into ambient host paths.
+        """
+
+        try:
+            source_path = Path(source).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionEnvironmentError(
+                f"Cannot snapshot Docker working directory {source}: {exc}"
+            ) from exc
+        if not source_path.is_dir():
+            raise ExecutionEnvironmentError(
+                f"Docker working directory is not a directory: {source_path}"
+            )
+        try:
+            shutil.copytree(
+                source_path,
+                destination,
+                symlinks=True,
+                ignore_dangling_symlinks=True,
+            )
+            for entry in destination.rglob("*"):
+                mode = entry.lstat().st_mode
+                if not (
+                    stat.S_ISREG(mode)
+                    or stat.S_ISDIR(mode)
+                    or stat.S_ISLNK(mode)
+                ):
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory contains a host service "
+                        f"socket or other special file: {entry}"
+                    )
+        except ExecutionEnvironmentError:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        except (OSError, shutil.Error) as exc:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise ExecutionEnvironmentError(
+                "Docker working directory contains a host service socket, "
+                f"special file, or unreadable entry: {source_path}: {exc}"
+            ) from exc
+        return str(destination)
 
     async def _execute_script(
         self,
@@ -260,6 +302,14 @@ class DockerExecutor(BaseExecutor):
         network: bool,
         mounts: Optional[List[Dict[str, str]]],
     ) -> _ExecutionResult:
+        isolated_working_dir = (
+            self._snapshot_working_directory(
+                working_dir,
+                Path(context.workdir) / "workspace",
+            )
+            if working_dir
+            else None
+        )
         host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Mount a PER-EXECUTION staging directory, never the shared trash
@@ -285,7 +335,7 @@ class DockerExecutor(BaseExecutor):
             staging_dir.mkdir(mode=0o700)
             return await self._run_staged_script(
                 script,
-                working_dir,
+                isolated_working_dir,
                 context,
                 docker_path=docker_path,
                 image=image,
@@ -513,7 +563,8 @@ class DockerExecutor(BaseExecutor):
 
         Args:
             command: The :class:`ComputeCommand` to execute
-            working_dir: Optional working directory (mounted read-only)
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
 
         Returns:
             ExecutionRecord with execution results
@@ -524,9 +575,17 @@ class DockerExecutor(BaseExecutor):
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
+            isolated_working_dir = (
+                self._snapshot_working_directory(
+                    working_dir,
+                    Path(context.workdir) / "workspace",
+                )
+                if working_dir
+                else None
+            )
             return await self._execute_argv(
                 command,
-                working_dir,
+                isolated_working_dir,
                 docker_path=docker_path,
                 container_name=container_name,
             )

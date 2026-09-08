@@ -100,7 +100,10 @@ class UvExecutor(BaseExecutor):
             if path is None:
                 return False
             base_python_path = self._get_base_python_path()
-            sandbox_prefix = self._get_filesystem_sandbox_prefix()
+            sandbox_prefix = self._get_filesystem_sandbox_prefix(
+                uv_path=path,
+                base_python_path=base_python_path,
+            )
             return self._filesystem_sandbox_is_operational(
                 sandbox_prefix,
                 base_python_path,
@@ -191,16 +194,20 @@ class UvExecutor(BaseExecutor):
     def _get_filesystem_sandbox_prefix(
         self,
         writable_workspace: Optional[str] = None,
+        *,
+        uv_path: Optional[str] = None,
+        base_python_path: Optional[str] = None,
     ) -> list[str]:
         """Build a fail-closed OS boundary around host Hold custody.
 
         Python-level ``open`` patches cannot mediate C extensions such as
         ``sqlite3`` or a dependency that issues raw syscalls. The UV executor
-        therefore runs only when the platform can make the entire host-control
-        directory non-writable for the child process. Linux starts from a
-        read-only view of the complete host and reopens only the freshly
-        allocated executor workspace for writes, so an external hard-link
-        alias cannot bypass the protected directory's canonical path.
+        therefore runs only when the platform can omit host-control state and
+        every ambient credential/service path from the child's mount namespace.
+        Linux constructs a minimal filesystem from trusted interpreter/runtime
+        roots and the freshly allocated executor workspace. It also creates new
+        network and IPC namespaces, so filesystem sockets and remote Hold
+        services are not alternate mutation channels.
         """
 
         protected = self._policy.host_control_data_path.resolve(strict=False)
@@ -242,31 +249,93 @@ class UvExecutor(BaseExecutor):
                         "UvExecutor writable workspace overlaps host Hold custody"
                     )
 
+            selected_uv = uv_path or self._get_uv_path()
+            if not selected_uv:
+                raise ExecutionEnvironmentError(
+                    "UvExecutor cannot construct a sandbox without the uv binary"
+                )
+            resolved_uv = Path(selected_uv).resolve(strict=False)
+            resolved_python = Path(
+                base_python_path or self._get_base_python_path()
+            ).resolve(strict=False)
+
             # Explicitly discard capabilities even when Kestrel itself runs as
-            # UID 0 in a service container; otherwise CAP_SYS_ADMIN could
-            # remount a read-only bind inside the new namespace. The root must
-            # be read-only, not merely the canonical custody directory: an
-            # existing hard-link alias has a different pathname but the same
-            # inode. Only this run's newly-created workspace is reopened.
+            # UID 0 in a service container. Start with an empty root rather
+            # than importing ``/``: a read-only host bind still exposes .env
+            # files and permits connect(2) through Unix service sockets.
             prefix = [
                 bubblewrap,
                 "--die-with-parent",
                 "--new-session",
-                "--unshare-user",
-                # Do not import host procfs through the root bind. A private
-                # PID namespace and proc mount prevent caller code from
-                # resolving the parent Kestrel process's root or descriptors
-                # back into its writable mount namespace.
-                "--unshare-pid",
+                "--unshare-all",
                 "--cap-drop",
                 "ALL",
-                "--ro-bind",
+                "--tmpfs",
                 "/",
-                "/",
+                "--dev",
+                "/dev",
                 "--proc",
                 "/proc",
+                "--tmpfs",
+                "/tmp",
             ]
+
+            created_directories: set[Path] = set()
+
+            def ensure_parent_directories(destination: Path) -> None:
+                for parent in reversed(destination.parents):
+                    if parent == Path("/") or parent in created_directories:
+                        continue
+                    prefix.extend(["--dir", str(parent)])
+                    created_directories.add(parent)
+
+            runtime_roots: list[Path] = []
+
+            def add_runtime_root(candidate: Path) -> None:
+                candidate = candidate.resolve(strict=False)
+                if any(
+                    candidate == existing or candidate.is_relative_to(existing)
+                    for existing in runtime_roots
+                ):
+                    return
+                runtime_roots[:] = [
+                    existing
+                    for existing in runtime_roots
+                    if not existing.is_relative_to(candidate)
+                ]
+                runtime_roots.append(candidate)
+
+            # The base interpreter prefix is explicitly outside Kestrel's venv.
+            # Standard ELF runtime roots are system-owned and contain the
+            # loader/shared libraries needed by that interpreter and uv. No
+            # project, home, run, or var directory is imported.
+            add_runtime_root(Path(sys.base_prefix))
+            for candidate in (Path("/lib"), Path("/lib64"), Path("/usr/lib")):
+                if candidate.exists():
+                    add_runtime_root(candidate)
+            add_runtime_root(resolved_uv)
+            add_runtime_root(resolved_python)
+            for source in sorted(runtime_roots, key=lambda item: len(item.parts)):
+                ensure_parent_directories(source)
+                prefix.extend(["--ro-bind", str(source), str(source)])
+
+            # Dynamic executables may need these public loader/time files, but
+            # importing /etc wholesale would reintroduce ambient credentials.
+            for public_runtime_file in (
+                Path("/etc/ld.so.cache"),
+                Path("/etc/localtime"),
+            ):
+                if public_runtime_file.is_file():
+                    ensure_parent_directories(public_runtime_file)
+                    prefix.extend(
+                        [
+                            "--ro-bind",
+                            str(public_runtime_file),
+                            str(public_runtime_file),
+                        ]
+                    )
             if workspace is not None:
+                ensure_parent_directories(workspace)
                 prefix.extend(
                     [
                         "--bind",
@@ -274,14 +343,7 @@ class UvExecutor(BaseExecutor):
                         str(workspace),
                     ]
                 )
-            prefix.extend(
-                [
-                    "--ro-bind",
-                    str(protected),
-                    str(protected),
-                    "--",
-                ]
-            )
+            prefix.append("--")
             return prefix
 
         raise ExecutionEnvironmentError(
@@ -336,6 +398,12 @@ class UvExecutor(BaseExecutor):
         """
         if script.language != "python":
             raise ExecutionError(f"UvExecutor only supports Python, got {script.language}")
+        if working_dir is not None:
+            raise ExecutionEnvironmentError(
+                "UvExecutor does not expose host working directories inside its "
+                "minimal Hold-safe namespace; place required inputs in the script "
+                "or use the Docker executor"
+            )
         
         uv_path = self._get_uv_path()
         if not uv_path:
@@ -345,7 +413,6 @@ class UvExecutor(BaseExecutor):
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             return await self._execute_script(
                 script,
-                working_dir,
                 context,
                 uv_path,
                 base_python_path,
@@ -360,7 +427,6 @@ class UvExecutor(BaseExecutor):
     async def _execute_script(
         self,
         script: ComputeScript,
-        working_dir: Optional[str],
         context: _ExecutionContext,
         uv_path: str,
         base_python_path: str,
@@ -382,10 +448,15 @@ class UvExecutor(BaseExecutor):
 
         # Only pass safe host variables; never leak host credentials to scripts.
         env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_VARS}
-        # Avoid uv falling back to an inaccessible cache beneath host HOME.
-        env["UV_CACHE_DIR"] = str(Path(context.workdir) / ".uv-cache")
         # Apply script-supplied overrides, then enforce Python isolation below.
         env.update(script.environment)
+        # The minimal namespace does not import host HOME or TMPDIR. Pin every
+        # runtime-owned writable/cache path into this execution's sole bind;
+        # caller overrides cannot name an ambient host location.
+        env["HOME"] = context.workdir
+        env["TMPDIR"] = str(Path(context.workdir) / "tmp")
+        env["UV_CACHE_DIR"] = str(Path(context.workdir) / ".uv-cache")
+        Path(env["TMPDIR"]).mkdir(mode=0o700)
         # PYTHONPATH bypasses uv's interpreter/environment boundary entirely.
         env.pop("PYTHONPATH", None)
         # The subprocess environment is installed on the sandbox process
@@ -408,7 +479,11 @@ class UvExecutor(BaseExecutor):
             uv_cmd.extend(["--with", requirement])
         uv_cmd.append(str(script_path))
         cmd = [
-            *self._get_filesystem_sandbox_prefix(context.workdir),
+            *self._get_filesystem_sandbox_prefix(
+                context.workdir,
+                uv_path=uv_path,
+                base_python_path=base_python_path,
+            ),
             *uv_cmd,
         ]
 
@@ -416,7 +491,7 @@ class UvExecutor(BaseExecutor):
         logger.debug("Command: %s", " ".join(cmd))
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=working_dir or context.workdir,
+            cwd=context.workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,

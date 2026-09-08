@@ -342,6 +342,7 @@ async def build_host_context(
             validate_hold_backend_custody,
         )
         from kestrel_sovereign.host_features.storage import (
+            host_database_path,
             prepare_host_database,
             validate_sqlite_family_private,
         )
@@ -403,6 +404,12 @@ async def build_host_context(
                 ),
             )
 
+        # Surviving custody evidence is authoritative even when the selected
+        # SQLite file is absent or old.  Resolve and validate it before
+        # preparation can create, harden, migrate, or initialize host storage.
+        preflight_path, _uses_default = host_database_path(db_path)
+        validate_hold_backend_custody(preflight_path, hold_backend)
+
         resolved = prepare_host_database(db_path)
         db = await AsyncDatabase.sqlite(str(resolved))
         validate_sqlite_family_private(resolved)
@@ -410,6 +417,8 @@ async def build_host_context(
         session_factory = FleetSessionFactory(inner)
 
         if hold_backend == "postgres":
+            # Repeat beneath the preparation boundary so a concurrent custody
+            # publication cannot race the read-only preflight.
             validate_hold_backend_custody(resolved, hold_backend)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding

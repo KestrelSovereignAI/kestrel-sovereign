@@ -5,10 +5,13 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import venv
 import zipfile
 from pathlib import Path
@@ -239,7 +242,10 @@ def _make_executor(monkeypatch: pytest.MonkeyPatch, name: str, max_bytes: int = 
         monkeypatch.setattr(
             executor,
             "_get_filesystem_sandbox_prefix",
-            lambda _writable_workspace=None: ["/fake/filesystem-sandbox", "--"],
+            lambda _writable_workspace=None, **_kwargs: [
+                "/fake/filesystem-sandbox",
+                "--",
+            ],
         )
         return executor
     if name == "docker":
@@ -433,7 +439,7 @@ def test_uv_macos_sandbox_rejects_preexisting_hard_link_aliases(
     assert executor.is_available is False
 
 
-def test_uv_linux_sandbox_remounts_host_custody_read_only(
+def test_uv_linux_sandbox_exposes_only_runtime_and_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -445,8 +451,16 @@ def test_uv_linux_sandbox_remounts_host_custody_read_only(
     os.link(database, external_alias)
     workspace = tmp_path / "kestrel_compute_fresh"
     workspace.mkdir()
+    base_runtime = tmp_path / "trusted-base-runtime"
+    base_python = base_runtime / "bin" / "python"
+    base_python.parent.mkdir(parents=True)
+    base_python.touch()
+    uv_path = tmp_path / "trusted-tools" / "uv"
+    uv_path.parent.mkdir()
+    uv_path.touch()
     monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
     monkeypatch.setattr(uv_executor_module.sys, "platform", "linux")
+    monkeypatch.setattr(uv_executor_module.sys, "base_prefix", str(base_runtime))
     monkeypatch.setattr(
         uv_executor_module.shutil,
         "which",
@@ -454,27 +468,34 @@ def test_uv_linux_sandbox_remounts_host_custody_read_only(
     )
 
     assert database.stat().st_ino == external_alias.stat().st_ino
-    assert UvExecutor()._get_filesystem_sandbox_prefix(str(workspace)) == [
+    prefix = UvExecutor()._get_filesystem_sandbox_prefix(
+        str(workspace),
+        uv_path=str(uv_path),
+        base_python_path=str(base_python),
+    )
+
+    assert prefix[:4] == [
         "/usr/bin/bwrap",
         "--die-with-parent",
         "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--cap-drop",
-        "ALL",
-        "--ro-bind",
-        "/",
-        "/",
-        "--proc",
-        "/proc",
-        "--bind",
-        str(workspace.resolve()),
-        str(workspace.resolve()),
-        "--ro-bind",
-        str(custody.resolve()),
-        str(custody.resolve()),
-        "--",
+        "--unshare-all",
     ]
+    assert ["--tmpfs", "/"] == prefix[
+        prefix.index("--tmpfs") : prefix.index("--tmpfs") + 2
+    ]
+    assert ["--bind", str(workspace.resolve()), str(workspace.resolve())] == (
+        prefix[prefix.index("--bind") : prefix.index("--bind") + 3]
+    )
+    read_only_sources = {
+        prefix[index + 1]
+        for index, value in enumerate(prefix[:-2])
+        if value == "--ro-bind"
+    }
+    assert "/" not in read_only_sources
+    assert str(custody.resolve()) not in read_only_sources
+    assert str(base_runtime.resolve()) in read_only_sources
+    assert str(uv_path.resolve()) in read_only_sources
+    assert prefix[-1] == "--"
 
 
 def test_uv_sandbox_fails_closed_without_platform_boundary(
@@ -513,7 +534,7 @@ def test_uv_sandbox_fails_closed_when_present_but_forbidden(
     monkeypatch.setattr(
         executor,
         "_get_filesystem_sandbox_prefix",
-        lambda: ["/fake/sandbox-exec", "--"],
+        lambda **_kwargs: ["/fake/sandbox-exec", "--"],
     )
     commands: list[list[str]] = []
 
@@ -549,7 +570,10 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     subprocess_options: dict[str, object] = {}
     sandbox_workspaces: list[Optional[str]] = []
 
-    def sandbox_prefix(writable_workspace: Optional[str] = None) -> list[str]:
+    def sandbox_prefix(
+        writable_workspace: Optional[str] = None,
+        **_kwargs: object,
+    ) -> list[str]:
         sandbox_workspaces.append(writable_workspace)
         return ["/fake/filesystem-sandbox", "--"]
 
@@ -571,7 +595,7 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     )
     script.requirements = ["declared-one==1.0", "/path with spaces/two.whl"]
 
-    record = await executor.execute(script, working_dir=str(tmp_path / "nested cwd"))
+    record = await executor.execute(script)
 
     script_path = str(created[0] / "script.py")
     assert sandbox_workspaces == [str(created[0])]
@@ -596,6 +620,8 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     assert "UV_PROJECT_ENVIRONMENT" not in child_env
     assert "UV_INDEX_URL" not in child_env
     assert child_env["UV_OFFLINE"] == "1"
+    assert child_env["HOME"] == str(created[0])
+    assert child_env["TMPDIR"] == str(created[0] / "tmp")
     assert child_env["UV_CACHE_DIR"] == str(created[0] / ".uv-cache")
     assert record.stdout == "ok"
     assert record.exit_code == 0
@@ -708,7 +734,7 @@ async def test_docker_rejects_writable_alias_of_host_hold_custody_before_launch(
 
     with pytest.raises(
         executor_base.ExecutionEnvironmentError,
-        match="writable Docker mount.*host Hold custody",
+        match="additional Docker mounts.*host service sockets",
     ):
         await executor.execute(
             _script(),
@@ -747,7 +773,7 @@ async def test_docker_rejects_writable_mount_with_hard_link_to_hold_before_launc
 
     with pytest.raises(
         executor_base.ExecutionEnvironmentError,
-        match="writable Docker mount.*host Hold custody.*read-only",
+        match="additional Docker mounts.*host service sockets",
     ):
         await executor.execute(
             _script(),
@@ -760,22 +786,65 @@ async def test_docker_rejects_writable_mount_with_hard_link_to_hold_before_launc
     assert launched is False
 
 
-def test_docker_allows_read_only_host_hold_custody_mount(
-    monkeypatch: pytest.MonkeyPatch,
+def test_docker_rejects_read_only_unix_service_socket_mount() -> None:
+    with tempfile.TemporaryDirectory(prefix="ks-", dir="/tmp") as socket_root:
+        socket_path = Path(socket_root) / "docker.sock"
+        service = socket.socket(socket.AF_UNIX)
+        service.bind(str(socket_path))
+        executor = DockerExecutor()
+
+        try:
+            with pytest.raises(
+                executor_base.ExecutionEnvironmentError,
+                match="read-only bind mounts still expose host service sockets",
+            ):
+                executor._validate_additional_mounts(
+                    [
+                        {
+                            "src": str(socket_path),
+                            "dst": "/run/docker.sock",
+                            "ro": True,
+                        }
+                    ]
+                )
+        finally:
+            service.close()
+
+
+def test_docker_rejects_read_only_directory_that_can_gain_service_socket(
     tmp_path: Path,
 ) -> None:
-    custody = tmp_path / "host-data"
-    custody.mkdir()
-    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
-    executor = DockerExecutor()
+    mount_source = tmp_path / "runtime"
+    mount_source.mkdir()
 
-    executor._validate_additional_mounts(
-        [{"src": str(custody), "dst": "/data", "ro": True}]
-    )
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="cannot prove separation from host Hold custody",
+    ):
+        DockerExecutor()._validate_additional_mounts(
+            [{"src": str(mount_source), "dst": "/run/host", "ro": True}]
+        )
 
 
 @pytest.mark.asyncio
-async def test_uv_real_process_isolated_from_nested_host_workspace(
+async def test_uv_refuses_ambient_host_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(monkeypatch, "uv")
+    working_dir = tmp_path / "host-project"
+    working_dir.mkdir()
+    (working_dir / ".env").write_text("HOLD_DSN=secret\n")
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="does not expose host working directories",
+    ):
+        await executor.execute(_script(), working_dir=str(working_dir))
+
+
+@pytest.mark.asyncio
+async def test_uv_real_process_isolated_from_ambient_host_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -864,10 +933,12 @@ async def test_uv_real_process_isolated_from_nested_host_workspace(
     workspace_pyproject_before = (workspace / "pyproject.toml").read_bytes()
     member_pyproject_before = (member / "pyproject.toml").read_bytes()
     execution_dir = workspace / "executor temporary directory with spaces"
+    sandbox_wheel = execution_dir / explicit_wheel.name
 
     def make_temp_dir(*, prefix: str) -> str:
         assert prefix == "kestrel_compute_"
         execution_dir.mkdir()
+        shutil.copy2(explicit_wheel, sandbox_wheel)
         return str(execution_dir)
 
     monkeypatch.setattr(executor_base.tempfile, "mkdtemp", make_temp_dir)
@@ -908,11 +979,11 @@ async def test_uv_real_process_isolated_from_nested_host_workspace(
             "}))\n"
         ),
         purpose="prove the uv project and interpreter boundary",
-        requirements=[str(explicit_wheel)],
+        requirements=[str(sandbox_wheel)],
         environment={"UV_OFFLINE": "1"},
     )
 
-    record = await executor.execute(script, working_dir=str(nested_working_dir))
+    record = await executor.execute(script)
 
     assert _tree_manifest(host_venv) == host_venv_before
     assert (workspace / "pyproject.toml").read_bytes() == workspace_pyproject_before
@@ -956,10 +1027,7 @@ async def test_uv_real_process_isolated_from_nested_host_workspace(
         environment={"UV_OFFLINE": "1"},
     )
 
-    no_requirements_record = await executor.execute(
-        no_requirements_script,
-        working_dir=str(nested_working_dir),
-    )
+    no_requirements_record = await executor.execute(no_requirements_script)
 
     assert _tree_manifest(host_venv) == host_venv_before
     assert (workspace / "pyproject.toml").read_bytes() == workspace_pyproject_before
@@ -1694,6 +1762,38 @@ async def test_docker_script_mode_mounts_the_script_and_the_trash_staging(
 
 
 @pytest.mark.asyncio
+async def test_docker_script_mode_mounts_a_private_working_directory_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The post-staging launch must not reintroduce the live host directory."""
+
+    workspace = tmp_path / "caller cwd"
+    workspace.mkdir()
+    (workspace / "input.txt").write_text("stable input", encoding="utf-8")
+
+    script_cmd, _ = await _capture_container_argv(
+        monkeypatch,
+        tmp_path,
+        run=lambda executor: executor.execute(
+            _script(),
+            working_dir=str(workspace),
+        ),
+    )
+
+    workspace_binds = [
+        script_cmd[index + 1]
+        for index, argument in enumerate(script_cmd[:-1])
+        if argument == "-v" and script_cmd[index + 1].endswith(":/workspace:ro")
+    ]
+    assert len(workspace_binds) == 1
+    snapshot_source = Path(workspace_binds[0].removesuffix(":/workspace:ro"))
+    assert snapshot_source != workspace
+    assert snapshot_source.name == "workspace"
+    assert script_cmd[script_cmd.index("-w") + 1] == "/workspace"
+
+
+@pytest.mark.asyncio
 async def test_docker_command_mode_stands_in_the_directory_it_mounted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1721,10 +1821,61 @@ async def test_docker_command_mode_stands_in_the_directory_it_mounted(
         run=lambda executor: executor.execute_command(_command(argv=["ls", "."])),
     )
 
-    assert f"{workspace}:/workspace:ro" in with_cwd
+    workspace_binds = [
+        with_cwd[index + 1]
+        for index, argument in enumerate(with_cwd[:-1])
+        if argument == "-v" and with_cwd[index + 1].endswith(":/workspace:ro")
+    ]
+    assert len(workspace_binds) == 1
+    snapshot_source = Path(workspace_binds[0].removesuffix(":/workspace:ro"))
+    assert snapshot_source != workspace
+    assert snapshot_source.name == "workspace"
     assert with_cwd[with_cwd.index("-w") + 1] == "/workspace"
     assert without_cwd[without_cwd.index("-w") + 1] == "/"
     assert "-v" not in without_cwd
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("script", "command"))
+async def test_docker_working_directory_socket_never_reaches_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    executor = _make_executor(monkeypatch, "docker")
+    launched = False
+
+    async def reject_launch(*_args: object, **_kwargs: object):
+        nonlocal launched
+        launched = True
+        raise AssertionError("unsafe Docker command reached process launch")
+
+    async def cleanup_without_process(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="ks-", dir="/tmp") as socket_root:
+        _track_temp_dirs(monkeypatch, tmp_path)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_launch)
+        monkeypatch.setattr(executor, "_remove_container", cleanup_without_process)
+        service = socket.socket(socket.AF_UNIX)
+        service.bind(str(Path(socket_root) / "docker.sock"))
+        try:
+            if mode == "script":
+                record = await executor.execute(
+                    _script(),
+                    working_dir=socket_root,
+                )
+            else:
+                record = await executor.execute_command(
+                    _command(argv=["true"]),
+                    working_dir=socket_root,
+                )
+        finally:
+            service.close()
+
+    assert record.exit_code == -1
+    assert "host service socket" in record.stderr
+    assert launched is False
 
 
 @pytest.mark.asyncio

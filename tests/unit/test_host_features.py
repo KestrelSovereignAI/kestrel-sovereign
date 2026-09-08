@@ -728,10 +728,10 @@ async def test_invalid_hold_configuration_precedes_host_database_preparation(
     for name, value in settings.items():
         monkeypatch.setenv(name, value)
 
-    preparation_calls: list[Optional[str]] = []
+    preparation_calls: list[str | None] = []
     real_prepare = host_storage.prepare_host_database
 
-    def record_prepare(db_path: Optional[str] = None):
+    def record_prepare(db_path: str | None = None):
         preparation_calls.append(db_path)
         return real_prepare(db_path)
 
@@ -745,6 +745,47 @@ async def test_invalid_hold_configuration_precedes_host_database_preparation(
     assert preparation_calls == []
     assert not database.exists()
     assert tuple(tmp_path.iterdir()) == ()
+
+
+@pytest.mark.asyncio
+async def test_surviving_backend_custody_precedes_sqlite_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A rejected switch cannot create a missing host SQLite database."""
+
+    from uuid import uuid4
+
+    from kestrel_sovereign.hold.state import claim_hold_backend_custody
+    from kestrel_sovereign.host_features import storage as host_storage
+
+    database = tmp_path / "host.db"
+    claim_hold_backend_custody(
+        database,
+        "postgres",
+        postgres_pair_id=uuid4(),
+        postgres_primary_cluster_identity="primary-cluster",
+        postgres_evidence_cluster_identity="evidence-cluster",
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+
+    preparation_calls: list[str | None] = []
+    real_prepare = host_storage.prepare_host_database
+
+    def record_prepare(db_path: str | None = None):
+        preparation_calls.append(db_path)
+        return real_prepare(db_path)
+
+    monkeypatch.setattr(host_storage, "prepare_host_database", record_prepare)
+
+    ctx = await build_host_context(db_path=str(database))
+
+    assert ctx.hold_store is None
+    assert "backend switch" in ctx.backend_error
+    assert preparation_calls == []
+    assert not database.exists()
 
 
 @pytest.mark.asyncio

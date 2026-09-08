@@ -447,15 +447,15 @@ environment, `--no-project` prevents project/workspace discovery, and a
 concrete base-interpreter path anchors interpreter selection outside Kestrel's
 runtime as defense-in-depth against uv resolver changes. The real-process test
 demonstrates the fresh and project-free behavior; the explicit pin makes that
-choice independent of the caller-selected working directory rather than
-depending on uv's future interpreter-resolution semantics.
+choice independent of uv's future interpreter-resolution semantics.
 On Linux the child command is additionally wrapped in a mandatory bubblewrap
-(`bwrap`) filesystem sandbox. It imports the host filesystem read-only and
-reopens only the executor-owned workspace for writes, so native modules such as
-`sqlite3` cannot bypass the Python safe-delete runtime or mutate Hold through a
-pre-existing external hard-link alias. Its private procfs and PID namespace
-also prevent caller code from using a host process's root or file descriptors
-to re-enter the parent mount namespace. The UV executor is unavailable on
+(`bwrap`) sandbox. Its mount namespace starts empty and imports only the trusted
+base-interpreter runtime, the `uv` executable, and the executor-owned workspace;
+the project, home, host-control, `/run`, and `/var` trees are absent rather than
+merely read-only. New network, IPC, PID, UTS, user, and cgroup namespaces close
+service sockets and remote databases as alternate Hold mutation channels.
+External host working directories are refused for the same reason. The UV
+executor is unavailable on
 macOS because Seatbelt (`sandbox-exec`) path filters do not make an inode
 read-only when it is reached through a pre-existing alias outside the protected
 directory. The executor fails unavailable if the verified Linux sandbox cannot

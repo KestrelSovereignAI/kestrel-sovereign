@@ -136,3 +136,36 @@ def test_equal_identity_uses_aliased_ancestor_suffixes(tmp_path, monkeypatch):
         real / "future",
         alias / "future" / "control",
     )
+
+
+@pytest.mark.parametrize(
+    "module",
+    (path_identity, python_delete_runtime),
+)
+def test_case_probe_uses_entry_inside_mount_root(tmp_path, monkeypatch, module):
+    """A mount root's parent cannot dictate the mounted directory's semantics."""
+
+    mount_root = tmp_path / "casefold-root"
+    mount_root.mkdir()
+    probe_entry = mount_root / "probe-entry"
+    original_iterdir = Path.iterdir
+    original_samefile = Path.samefile
+
+    def iterdir(candidate):
+        if Path(candidate) == mount_root:
+            return iter((probe_entry,))
+        return original_iterdir(candidate)
+
+    def samefile(candidate, other):
+        first = Path(candidate)
+        second = Path(other)
+        if first == probe_entry and second.parent == mount_root:
+            return first.name.casefold() == second.name.casefold()
+        if first == mount_root and second.parent == mount_root.parent:
+            raise FileNotFoundError(second)
+        return original_samefile(first, second)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(Path, "samefile", samefile)
+
+    assert module._filesystem_is_case_insensitive(mount_root / "future") is True

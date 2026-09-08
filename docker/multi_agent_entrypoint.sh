@@ -37,15 +37,20 @@ print(Path(sys.argv[1]).expanduser().resolve(strict=False))
 PY
 }
 paths_overlap() {
-    local first="${1%/}/"
-    local second="${2%/}/"
-    case "$first" in
-        "$second"*) return 0 ;;
-    esac
-    case "$second" in
-        "$first"*) return 0 ;;
-    esac
-    return 1
+    /app/.venv/bin/python - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+from kestrel_sovereign.security.path_identity import (
+    paths_overlap_by_filesystem_identity,
+)
+
+raise SystemExit(
+    0
+    if paths_overlap_by_filesystem_identity(Path(sys.argv[1]), Path(sys.argv[2]))
+    else 1
+)
+PY
 }
 AGENT_DATA_DIR="$(canonicalize_path "$AGENT_DATA_DIR")"
 if [ -n "${KESTREL_HOST_DB_PATH:-}" ]; then

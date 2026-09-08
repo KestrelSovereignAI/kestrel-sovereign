@@ -47,17 +47,27 @@ def _filesystem_is_case_insensitive(path: _Path) -> bool | None:
     if _os.name == "nt":
         return True
     existing = _nearest_existing_path(path)
-    for candidate in (existing, *existing.parents):
-        alternate_name = _alternate_case(candidate.name)
-        if alternate_name is None:
-            continue
-        alternate = candidate.with_name(alternate_name)
+    if existing.is_dir():
         try:
-            return candidate.samefile(alternate)
-        except FileNotFoundError:
-            return False
+            candidates = existing.iterdir()
         except OSError:
-            continue
+            return None
+    else:
+        candidates = iter((existing,))
+    try:
+        for candidate in candidates:
+            alternate_name = _alternate_case(candidate.name)
+            if alternate_name is None:
+                continue
+            alternate = candidate.with_name(alternate_name)
+            try:
+                return candidate.samefile(alternate)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                continue
+    except OSError:
+        return None
     return None
 
 

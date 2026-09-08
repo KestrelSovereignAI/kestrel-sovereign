@@ -115,20 +115,21 @@ Compute mutation guards also refuse multiply-linked regular files because an
 outside pathname cannot prove which protected directory owns the same inode.
 Python hard-link creation is guarded at its source and destination boundary;
 existing aliases remain non-writable even if another process created them.
-The Linux UV executor makes the complete host filesystem read-only at the OS
-boundary with bubblewrap. Python API patches alone are not a custody boundary
-because native modules such as `sqlite3` can open and mutate files without
-calling them. Bubblewrap reopens only the fresh per-execution workspace for
-writes and replaces imported host procfs with a private proc mount inside a PID
-namespace. The read-only root is load-bearing: remounting only the canonical
-control directory would leave an existing hard-link alias elsewhere writable.
-These controls prevent native code from creating or using a writable alias or
-reaching the parent process's writable mount namespace. UV execution is
+The Linux UV executor builds a minimal mount namespace with bubblewrap. Python
+API patches alone are not a custody boundary because native modules such as
+`sqlite3` can open and mutate files without calling them. Only the trusted base
+interpreter runtime, the `uv` executable, and the fresh per-execution workspace
+are imported; the host project, home, control data, `/run`, and `/var` trees are
+absent. Private network, IPC, PID, UTS, user, and cgroup namespaces prevent
+native code from reaching host services or the parent process's writable mount
+namespace. External host working directories are refused rather than turning a
+Unix service socket into an implicit capability. UV execution is
 unavailable on macOS because Seatbelt path filters cannot make an inode reached
 through a pre-existing external hard-link alias read-only. It also fails
 unavailable whenever the Linux kernel-enforced boundary cannot be established;
-the Docker executor is the fallback. Docker likewise permits only read-only
-caller-selected bind mounts; its sole writable host bind is an executor-owned
+the Docker executor is the fallback. Docker refuses arbitrary caller-selected
+bind mounts—even read-only ones, because `connect(2)` still crosses such a mount
+to a Unix service socket. Its sole writable host bind is an executor-owned
 per-run trash staging directory.
 
 ## Two host databases, two responsibilities
