@@ -7,6 +7,7 @@ like rate limiting (429) and server errors (5xx).
 import asyncio
 import logging
 import random
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,63 @@ NON_RETRYABLE_PATTERNS = [
 T = TypeVar('T')
 
 
+class AdvisedWaitExceedsRetryBudget(Exception):
+    """The server said how long until a request can succeed, and it is longer
+    than this retry loop is willing to wait.
+
+    Raised by :func:`with_retry` instead of sleeping, so a turn does not spend
+    its whole throttle budget on attempts that cannot succeed (a 429 advising
+    a 13-hour wait was retried 8 times at 120 s each, 112 times out of 130
+    advised waits on one host; #3127). The wait is fact, not guess: retrying
+    before ``retry_at`` is futile by the server's own account.
+
+    It classifies as the throttle it stands for at every downstream door:
+    ``status_code`` is 429, ``retry_after`` is the advised wait, ``response``
+    is the provider's, and the message names the reset time. It is not itself
+    retryable: :func:`is_retryable_error` refuses it, so an outer loop cannot
+    re-enter the wait the inner one declined.
+    """
+
+    status_code = 429
+
+    def __init__(
+        self,
+        cause: Exception,
+        *,
+        advised_seconds: float,
+        budget_seconds: float,
+        retry_at: datetime,
+    ) -> None:
+        self.advised_seconds = float(advised_seconds)
+        self.budget_seconds = float(budget_seconds)
+        self.retry_at = retry_at
+        self.retry_after = self.advised_seconds
+        self.response = getattr(cause, "response", None)
+        super().__init__(
+            f"429 rate limit: the provider advised waiting {self.advised_seconds:.0f}s "
+            f"(until {retry_at.isoformat(timespec='seconds')}), more than the "
+            f"{self.budget_seconds:.0f}s this call could still wait; not retrying"
+        )
+        self.__cause__ = cause
+
+
+def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitExceedsRetryBudget]:
+    """The :class:`AdvisedWaitExceedsRetryBudget` in ``error``'s cause chain, if any.
+
+    Callers between the retry loop and the HTTP surface wrap provider errors
+    (``RuntimeError(f"Model ... failed: {e}") from e``); the reset time survives
+    in the chain, and a surface that can say "come back at" reads it here.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, AdvisedWaitExceedsRetryBudget):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
 def retry_after_seconds(error: Exception) -> Optional[float]:
     """Extract the server-advised cool-down from a provider exception.
 
@@ -227,6 +285,10 @@ def is_retryable_error(error: Exception) -> bool:
         return True
 
     # 0b. Structured status code from the SDK exception (most authoritative).
+    # The retry loop's own verdict: it has already declined to wait this out.
+    if isinstance(error, AdvisedWaitExceedsRetryBudget):
+        return False
+
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         if status_code in NON_RETRYABLE_STATUS_CODES:
@@ -311,11 +373,21 @@ async def with_retry(
     plan-route budget; every other retryable error (5xx/timeout/unavailable) gets
     the tight default so failover to a healthy route isn't stalled for minutes.
 
+    A server-advised cool-down (``Retry-After``) is a fact about when the next
+    attempt can succeed, so it is honoured as one wait when it fits the budget
+    the loop has left (the remaining attempts times the delay cap), and the
+    loop stops at once with :class:`AdvisedWaitExceedsRetryBudget` when it does
+    not: eight capped waits against advice to come back in hours are attempts
+    that cannot succeed, and they held a turn's conversation lock for the
+    whole budget before failing anyway (#3127). Only a guessed delay (no
+    advice) is clamped to the per-attempt cap.
+
     Returns:
         The result of the function call
 
     Raises:
-        The last exception if all retries fail
+        The last exception if all retries fail, or
+        AdvisedWaitExceedsRetryBudget when the advised wait cannot fit.
     """
     attempt = 0
 
@@ -351,7 +423,24 @@ async def with_retry(
             # backoff + jitter. Both are capped at the effective max delay.
             advised = retry_after_seconds(e)
             if advised is not None:
-                delay = min(advised + random.uniform(0, 1), eff_max_delay)
+                # Advice is not clamped: a wait that fits what the loop could
+                # still spend is taken whole; one that does not ends the loop.
+                remaining_budget = eff_max_delay * (eff_max_retries - attempt - 1)
+                if advised > remaining_budget:
+                    retry_at = datetime.now(timezone.utc) + timedelta(seconds=advised)
+                    logger.warning(
+                        "LLM retry declined: advised wait %.0fs exceeds the %.0fs "
+                        "this call could still wait (status=%s, retry_at=%s): %s: %s",
+                        advised, remaining_budget, getattr(e, "status_code", None),
+                        retry_at.isoformat(timespec="seconds"), type(e).__name__, e,
+                    )
+                    raise AdvisedWaitExceedsRetryBudget(
+                        e,
+                        advised_seconds=advised,
+                        budget_seconds=remaining_budget,
+                        retry_at=retry_at,
+                    ) from e
+                delay = advised + random.uniform(0, 1)
             else:
                 delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), eff_max_delay)
 

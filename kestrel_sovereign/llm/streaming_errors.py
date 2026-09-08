@@ -74,8 +74,37 @@ def _is_llm_streaming_error(exc: BaseException) -> bool:
     return isinstance(exc, LLMStreamingError)
 
 
+def _declined_wait(exc: BaseException):
+    """The retry loop's declined advised wait in ``exc``'s cause chain, if any
+    (imported lazily for the same reason as :func:`_is_llm_streaming_error`)."""
+    try:
+        from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
+    except Exception:  # pragma: no cover - defensive import guard
+        return None
+    return advised_wait_exceeding_budget(exc)
+
+
+def _rate_limited_message(declined) -> tuple[str, str]:
+    """The route is rate limited until a time the provider named (#3127).
+
+    The only interpolated value is that reset time: a number the provider
+    returned, not caller content, provider prose, or the route's free-string
+    name. The guidance stays constant and mirrors ``_ROUTE_ERROR``.
+    """
+    reset = declined.retry_at.isoformat(timespec="seconds")
+    return (
+        "Your selected model route is rate limited.",
+        f"The provider asked to wait until {reset}. No fallback response was "
+        "generated — retry after that time, or pick a different model/route "
+        "from the dropdown.",
+    )
+
+
 def _classify(exc: BaseException):
     """Map ``exc`` to its ``(header, body)`` safe message pair."""
+    declined = _declined_wait(exc)
+    if declined is not None:
+        return _rate_limited_message(declined)
     return _ROUTE_ERROR if _is_llm_streaming_error(exc) else _GENERIC_ERROR
 
 

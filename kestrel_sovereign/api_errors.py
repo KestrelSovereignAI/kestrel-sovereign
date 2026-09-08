@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from http import HTTPStatus
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -12,6 +13,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.llm.retry import AdvisedWaitExceedsRetryBudget
 
 from kestrel_sovereign.logging_config import (
     correlation_id_var,
@@ -39,6 +43,26 @@ class ApiHTTPException(HTTPException):
         self.code = code
         self.message = message
         self.details = details
+
+
+def rate_limited_until(declined: "AdvisedWaitExceedsRetryBudget") -> ApiHTTPException:
+    """The 429 an invocation returns when its model route declined to wait.
+
+    The retry loop stopped because the provider's advised cool-down exceeds
+    what the call could wait (#3127). The reset time is the provider's number,
+    so it may cross to the caller as ``Retry-After`` (whole seconds, rounded
+    up) and in the message; provider prose stays behind the boundary.
+    """
+    seconds = max(1, math.ceil(declined.advised_seconds))
+    return ApiHTTPException(
+        status_code=429,
+        code="rate_limited",
+        message=(
+            "The selected model route is rate limited until "
+            f"{declined.retry_at.isoformat(timespec='seconds')}; retry after that time."
+        ),
+        headers={"Retry-After": str(seconds)},
+    )
 
 
 def _default_message(status_code: int) -> str:
