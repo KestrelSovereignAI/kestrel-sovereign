@@ -145,12 +145,21 @@ class LocalSandboxBackend(SandboxBackend):
                 out_fh, err_fh = await asyncio.to_thread(_open_capture, capture)
             except OSError as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
+                # Defaults here would have said "nothing truncated, no
+                # writers, no paths" — and the feature would then write a
+                # manifest calling the run complete while previewing a file
+                # that was never opened. The failure is total loss of the
+                # capture, so it is reported as such.
                 return CompletedRun(
                     argv=list(argv),
                     returncode=-1,
                     stdout="",
                     stderr=f"could not open capture file: {exc}",
                     duration_ms=duration_ms,
+                    truncated_stdout=True,
+                    truncated_stderr=True,
+                    writers_remaining=None,
+                    cwd=str(cwd) if cwd else os.getcwd(),
                 )
 
         try:
@@ -217,7 +226,18 @@ class LocalSandboxBackend(SandboxBackend):
                 # itself exits, independent of the pipes, so polling it
                 # separates "the command finished" from "nothing can write
                 # any more" — the two facts this needs to tell apart.
-                timed_out = not await _await_exit(proc, timeout)
+                try:
+                    timed_out = not await _await_exit(proc, timeout)
+                except asyncio.CancelledError:
+                    # The tool task was cancelled — a shutdown, a client
+                    # disconnect, an outer deadline. Without teardown the
+                    # host process runs on with nobody waiting for it, which
+                    # for the long side-effecting commands this feature
+                    # exists to run is worse than the timeout it mirrors.
+                    _kill_tree(proc.pid)
+                    for task in pumps:
+                        task.cancel()
+                    raise
                 if timed_out:
                     _kill_tree(proc.pid)
                     await _await_exit(proc, _REAP_GRACE)

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.features.computer_use import capture
 from kestrel_sovereign.features.computer_use.backends.base import (
@@ -1814,3 +1814,162 @@ async def test_fitting_keeps_a_usable_preview_rather_than_collapsing(
     # reading rather than handing back the facts-only fallback.
     assert len(env.data["stdout"]) > 500, len(env.data["stdout"])
     assert env.data["stdout_path"], "fell through to the minimal envelope"
+
+
+# ---------------------------------------------------------------------------
+# Review round 6
+# ---------------------------------------------------------------------------
+
+
+def test_the_size_measured_is_the_size_the_orchestrator_receives():
+    """Review round 6. ``DynamicTool.execute`` wraps a ToolResult, adding
+    ``tool`` and ``success`` on top of ``to_dict()``, so measuring the bare
+    result is short by those keys. Invisible until a result lands in the gap
+    — measured, 7,967 unwrapped against an 8,000 cap became 8,001 wrapped and
+    the orchestrator discarded output from a result calling itself
+    complete."""
+    from kestrel_sovereign.features.base import (
+        _serialize_tool_result,
+        serialized_result_len,
+    )
+    import json as _json
+
+    result = ToolResult.ok("conf", data={"stdout": "x" * 100})
+
+    bare = len(_json.dumps(_serialize_tool_result(result)))
+    measured = serialized_result_len(result, tool_name="shell")
+
+    assert measured > bare
+    wrapped = {
+        **_serialize_tool_result(result),
+        "tool": "shell",
+        "success": True,
+    }
+    assert measured == len(_json.dumps(wrapped))
+
+
+@pytest.mark.asyncio
+async def test_an_uncaptured_result_fits_once_wrapped(workspace: Path, queue):
+    """The boundary the wrapper moved: a result sized to the cap unwrapped
+    exceeds it wrapped."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    f = await _feature(workspace, queue)
+    cap = orchestrator_result_cap()
+
+    for size in (3700, 3790, 3900, 5000):
+        env = await f.shell(
+            command=f"python3 -c \"print('p' * {size})\"", timeout=60
+        )
+        wrapped = serialized_result_len(env, tool_name="shell")
+        assert wrapped <= cap, f"{size} chars of output -> {wrapped} wrapped"
+
+
+@pytest.mark.asyncio
+async def test_clipping_is_reported_for_the_stream_it_happened_to(
+    workspace: Path, queue
+):
+    """Review round 6. The feature-level clip check combined both streams and
+    ORed the result into both flags, so oversized stdout with empty stderr
+    reported ``truncated_stderr: true`` — the same false claim the per-stream
+    split was introduced to end, made one round later in the file that
+    introduced it."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="python3 -c \"print('z' * 40000)\"", timeout=60)
+
+    assert env.data["truncated_stdout"] is True
+    assert env.data["truncated_stderr"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_captured_run_kills_the_process(tmp_path: Path):
+    """Review round 6. ``CancelledError`` escaped while awaiting the child and
+    the ``finally`` only closed handles — no kill, no pump teardown — so the
+    host process ran on with nobody waiting for it. For the long
+    side-effecting commands this feature exists to run that is worse than the
+    timeout it now mirrors."""
+    import asyncio as _a
+
+    bundle = capture.allocate(tmp_path / "captures")
+    marker = tmp_path / "still_running.txt"
+    script = tmp_path / "long.py"
+    script.write_text(
+        "import time\n"
+        "time.sleep(4)\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    task = _a.create_task(
+        backend.exec(
+            ["python3", str(script)],
+            cwd=None,
+            env=None,
+            timeout=60,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    )
+    await _a.sleep(0.6)
+    task.cancel()
+    with pytest.raises(_a.CancelledError):
+        await task
+
+    await _a.sleep(5)
+    assert not marker.exists(), "the child outlived the cancelled tool task"
+
+
+@pytest.mark.asyncio
+async def test_a_capture_that_could_not_be_opened_is_not_complete(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 6. If the second capture file fails to open after the
+    first succeeded — descriptor exhaustion, say — the defaults said "nothing
+    truncated, no writers, no paths", and the feature then wrote a manifest
+    calling the run complete while previewing a file that was never
+    opened."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    def failing_open(cap):
+        raise OSError("Too many open files")
+
+    monkeypatch.setattr(local_mod, "_open_capture", failing_open)
+    bundle = capture.allocate(tmp_path / "captures")
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('hi')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True
+    assert result.writers_remaining is None
+    assert "Too many open files" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_the_feature_does_not_call_an_unopenable_capture_complete(
+    workspace: Path, queue, monkeypatch
+):
+    """The end the caller sees."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    def failing_open(cap):
+        raise OSError("Too many open files")
+
+    monkeypatch.setattr(local_mod, "_open_capture", failing_open)
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert env.status is ToolResultStatus.PARTIAL
+    assert env.data["complete"] is False

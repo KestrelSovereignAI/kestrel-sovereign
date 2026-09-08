@@ -1395,10 +1395,13 @@ class ComputerUseFeature(Feature):
                 else:
                     stdout_text = (result.stdout or "")[:chars]
                     stderr_text = (result.stderr or "")[:chars]
-                clipped_here = not bundle and (
-                    len(result.stdout or "") > chars
-                    or len(result.stderr or "") > chars
-                )
+                # Per stream, because the record now tracks them per stream
+                # and a clipped stdout reported as a clipped stderr is the
+                # same false claim the split was introduced to end — made
+                # here, one round later, in the file that introduced it.
+                stdout_clipped = not bundle and len(result.stdout or "") > chars
+                stderr_clipped = not bundle and len(result.stderr or "") > chars
+                clipped_here = stdout_clipped or stderr_clipped
 
                 # A failure to spawn writes its diagnostic to the capture,
                 # but if that write could not happen the message is only on
@@ -1421,8 +1424,8 @@ class ComputerUseFeature(Feature):
                     # since the feature was written and ``shell`` dropped
                     # both, so a caller could not have honoured them even
                     # intending to.
-                    "truncated_stdout": result.truncated_stdout or clipped_here,
-                    "truncated_stderr": result.truncated_stderr or clipped_here,
+                    "truncated_stdout": result.truncated_stdout or stdout_clipped,
+                    "truncated_stderr": result.truncated_stderr or stderr_clipped,
                     "complete": not run_incomplete,
                     "stdout_path": result.stdout_path,
                     "stderr_path": result.stderr_path,
@@ -1520,6 +1523,12 @@ class ComputerUseFeature(Feature):
                 )
 
             cap = orchestrator_result_cap()
+
+            def _size(res: ToolResult) -> int:
+                # ``tool_name`` matters: the wrapper carries it, and this
+                # tool's name is part of what has to fit.
+                return serialized_result_len(res, tool_name="shell")
+
             chars = capture.PREVIEW_CHARS
             envelope, run_incomplete = await _build(chars)
             # Shrink until it actually fits. Measuring beats reserving: what
@@ -1529,11 +1538,11 @@ class ComputerUseFeature(Feature):
             # is guaranteed to correct cannot be tuned wrong, and a constant
             # implying otherwise is a number to maintain and to believe.
             for _ in range(_FIT_ATTEMPTS):
-                if serialized_result_len(envelope) <= cap:
+                if _size(envelope) <= cap:
                     break
                 chars = max(_MIN_PREVIEW_CHARS, chars // 2)
                 envelope, run_incomplete = await _build(chars)
-            if serialized_result_len(envelope) > cap:
+            if _size(envelope) > cap:
                 # Still too big with no preview left: a very small configured
                 # cap (KESTREL_MAX_TOOL_RESULT_CHARS is settable, and 1000 is
                 # supported) or artifact paths long enough to dominate on
@@ -1548,7 +1557,7 @@ class ComputerUseFeature(Feature):
                 # the run, so one path is enough to find the rest — which is
                 # the whole premise of having an artifact.
                 envelope, run_incomplete = await _build(0)
-                if serialized_result_len(envelope) > cap:
+                if _size(envelope) > cap:
                     envelope = _minimal_envelope(
                         envelope, manifest_path, run_incomplete
                     )
