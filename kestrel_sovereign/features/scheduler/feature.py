@@ -85,6 +85,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     validate_schedule_idempotency_base,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.storage.sync.targets import SYNC_TARGET_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,36 @@ _SUPERSEDED_AUTOSEEDS = {
 }
 
 
+#: One code per shipped target kind, from ``SYNC_TARGET_KINDS``.
+_BACKUP_TARGET_FAILED_BY_KIND: dict[str, str] = {
+    kind: f"BACKUP_TARGET_FAILED_{kind.upper()}" for kind in SYNC_TARGET_KINDS
+}
+
+
+def backup_target_failure_code(kind: object) -> str:
+    """The ``backup_snapshot`` reason code naming a failed target of ``kind``.
+
+    ``kind`` is a ``SyncTarget.kind`` token. Only a kind in the census has a
+    code of its own; any other kind (empty, unknown to the census, or not a
+    string at all) yields the kind-less code, which is declared, so a
+    third-party target still reports as a failed target rather than being
+    dropped at the membership door into the bare failure this ticket removes.
+    """
+    key = kind.strip().lower() if isinstance(kind, str) else ""
+    return _BACKUP_TARGET_FAILED_BY_KIND.get(key, "BACKUP_TARGET_FAILED")
+
+
+#: The closed vocabulary ``_handle_backup_snapshot`` may return. Every failed
+#: pass is one of: every attempted target failed (there is no current
+#: snapshot), more than one but not every attempted target failed (a snapshot
+#: exists somewhere), or exactly one failed, named by its kind when the census
+#: knows it. A destination a policy denied, or the unchanged-DB placeholder,
+#: was not attempted (``SyncResult.attempted``) and counts on neither side.
+BACKUP_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
+    {"BACKUP_ALL_TARGETS_FAILED", "BACKUP_TARGETS_FAILED", "BACKUP_TARGET_FAILED"}
+) | frozenset(_BACKUP_TARGET_FAILED_BY_KIND.values())
+
+
 class SchedulerFeature(Feature):
     """
     Cron/scheduler system for running agent tasks on a schedule.
@@ -148,6 +179,7 @@ class SchedulerFeature(Feature):
     #: not in the core signals module.
     tool_reason_codes = {
         "sleep": frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS,
+        "backup_snapshot": BACKUP_SNAPSHOT_REASON_CODES,
     }
 
     @property
@@ -1358,6 +1390,12 @@ class SchedulerFeature(Feature):
                 target: {
                     "success": result.success,
                     "bytes": result.bytes_synced,
+                    "kind": result.kind,
+                    # A destination a policy denied, or the unchanged-DB
+                    # placeholder, was never called; it must not read as
+                    # backed up. (A target whose content was already current
+                    # was called and is a success.)
+                    "attempted": result.attempted,
                 }
                 for target, result in results.items()
             }
@@ -1368,15 +1406,43 @@ class SchedulerFeature(Feature):
                         "reason": "no sync targets configured",
                     }
                 )
-            success = all(
-                target["success"] is True for target in targets.values()
-            )
+            attempted = {
+                name: result
+                for name, result in results.items()
+                if result.attempted
+            }
+            failed = {
+                name: result
+                for name, result in attempted.items()
+                if result.success is not True
+            }
             payload: dict[str, Any] = {
-                "success": success,
+                "success": not failed,
                 "targets": targets,
             }
-            if not success:
-                payload["error"] = "backup_snapshot_failed"
+            if failed:
+                # On failure the signal boundary raises and discards this
+                # payload; two things survive it. The ``error`` string is
+                # logged at the local diagnostic boundary, so it names each
+                # failed target by kind with the error its target recorded
+                # (type and message). The ``reason_code`` crosses into
+                # signal_log.error, so it is one bounded token per shape,
+                # where a bare "failed" said nothing for eighty consecutive
+                # runs (#3189).
+                described = sorted(
+                    f"{result.kind or 'undeclared'} ({result.error})"
+                    if result.error
+                    else (result.kind or "undeclared")
+                    for result in failed.values()
+                )
+                payload["error"] = "backup_snapshot_failed: " + ", ".join(described)
+                if len(failed) == len(attempted):
+                    payload["reason_code"] = "BACKUP_ALL_TARGETS_FAILED"
+                elif len(failed) > 1:
+                    payload["reason_code"] = "BACKUP_TARGETS_FAILED"
+                else:
+                    (result,) = failed.values()
+                    payload["reason_code"] = backup_target_failure_code(result.kind)
             return json.dumps(payload, default=str)
         return json.dumps({
             "skipped": True,
