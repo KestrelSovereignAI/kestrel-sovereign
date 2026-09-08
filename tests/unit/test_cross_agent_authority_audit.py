@@ -7044,15 +7044,15 @@ def test_routed_rasa_target_mismatch_is_recorded() -> None:
     assert "target binding" in row
 
 
-def test_shared_sovereignty_cache_reads_are_recorded_as_3225() -> None:
+def test_sovereignty_cache_reads_are_owner_scoped_after_3225() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
         line
         for line in audit.splitlines()
         if line.startswith("| Browse sovereignty export cache |")
     )
-    assert "Self for agent artifacts" in action_row
-    assert "sovereign/delegated" in action_row
+    assert "| Self |" in action_row
+    assert "durable receipts" in action_row
     assert "[#3225]" in action_row
 
     for suffix in (
@@ -7066,11 +7066,12 @@ def test_shared_sovereignty_cache_reads_are_recorded_as_3225() -> None:
             if "endpoints/sovereignty.py::GET " in line
             and suffix in line
         )
-        assert "D-3225" in row
-        assert "shared host export-cache" in row
+        assert "| A —" in row
+        assert "receipt-scoped" in row
+        assert "routed agent's own" in row
 
 
-def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
+def test_ipfs_reads_are_split_by_owner_and_host_authority_after_3226() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
         line
@@ -7090,9 +7091,18 @@ def test_shared_ipfs_pin_read_is_recorded_as_3226() -> None:
             for line in audit.splitlines()
             if f"endpoints/models.py::GET {route}`" in line
         )
-        assert "D-3226" in row
-        assert "shared IPFS daemon" in row
-        assert "recursive pins" in row
+        assert "| A —" in row
+        assert "receipt-owned pins" in row
+
+    host_row = next(
+        line
+        for line in audit.splitlines()
+        if "endpoints/models.py::GET "
+        "/api/agents/{selected_agent_name}/api/ipfs/node`" in line
+    )
+    assert "| H —" in host_row
+    assert "sovereign/delegated" in host_row
+    assert "selected-agent prefix grants no host authority" in host_row
 
 
 def test_canonical_phoenix_asset_redirects_are_inventoried() -> None:
