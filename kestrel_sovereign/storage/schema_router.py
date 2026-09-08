@@ -130,11 +130,24 @@ class PersonMatch:
 # =============================================================================
 
 
-#: Concept categories the linker gives people; ``None`` is a node written
-#: before categories were stored.
-PERSON_CATEGORIES = frozenset({"person", "proper_noun", None})
-#: Edge from a mention's own concept node to the person the user confirmed.
-ALIAS_EDGE_LABEL = "alias_of"
+#: Concept categories the linker gives people.
+PERSON_CATEGORIES = frozenset({"person", "proper_noun"})
+#: Property on a mention's own concept node naming the person the user
+#: confirmed it means. Single-valued by construction: a later confirmation
+#: overwrites an earlier one, so there is never a second answer to pick
+#: between (#3259).
+RESOLVED_TO_PROPERTY = "resolved_to"
+
+
+def _is_person_node(node: Any) -> bool:
+    """A stamped person, or an unstamped legacy node no keyword pass claims
+    for another category."""
+    from kestrel_sovereign.storage.associative_linker import classify_label
+
+    category = (node.properties or {}).get("category")
+    if category is not None:
+        return category in PERSON_CATEGORIES
+    return classify_label(node.label) in (None, "person")
 
 
 class PersonResolver:
@@ -169,11 +182,11 @@ class PersonResolver:
             return PersonMatch(concept_id=None, status="new", candidates=[])
 
         # Pass 0: a mention the user already resolved. ``confirm_person_match``
-        # records an ``alias_of`` edge from the mention's own node to the
-        # chosen person, and that answer stands for every later mention;
-        # without it the same ambiguity re-prompted forever (#3259).
+        # records ``resolved_to`` on the mention's own node, and that answer
+        # stands for every later mention; without it the same ambiguity
+        # re-prompted forever (#3259).
         if self_node_id:
-            canonical = await self._confirmed_alias(self_node_id)
+            canonical = await self._confirmed_resolution(self_node_id)
             if canonical:
                 return PersonMatch(concept_id=canonical, status="exact", candidates=[])
 
@@ -216,20 +229,23 @@ class PersonResolver:
 
         return PersonMatch(concept_id=None, status="new", candidates=[])
 
-    async def _confirmed_alias(self, node_id: str) -> Optional[str]:
+    async def _confirmed_resolution(self, node_id: str) -> Optional[str]:
         """The person a mention node was confirmed to mean, or ``None``."""
-        for edge in await self.graph.get_edges(node_id, direction="out"):
-            if edge.label == ALIAS_EDGE_LABEL:
-                return edge.target_id
-        return None
+        node = await self.graph.get_node(node_id)
+        if node is None:
+            return None
+        value = (node.properties or {}).get(RESOLVED_TO_PROPERTY)
+        return value if isinstance(value, str) and value and value != node_id else None
 
     async def _list_person_concepts(self, agent_id: str) -> List[Tuple[str, str]]:
         """Return list of (concept_id, label) for person concepts of this agent.
 
         Only nodes the linker categorised as ``person`` or ``proper_noun``
         are candidates; a month or a place is never a person. A node written
-        before the linker stored categories carries none and is admitted
-        until its next mention stamps it (#3259).
+        before the linker stored categories carries none: it is classified
+        on read with the linker's own keyword passes over its label, and
+        admitted only when they do not claim it for another category, so a
+        legacy "march" is refused without waiting for a re-mention (#3259).
 
         Read through the graph facade's own typed query, never a raw ``db``
         handle: the privacy-governing graph proxy forwards
@@ -244,8 +260,7 @@ class PersonResolver:
         return [
             (node.node_id, node.label)
             for node in nodes
-            if node.node_id.startswith(prefix)
-            and (node.properties or {}).get("category", None) in PERSON_CATEGORIES
+            if node.node_id.startswith(prefix) and _is_person_node(node)
         ]
 
 
@@ -792,6 +807,7 @@ class SchemaRouter:
         # raises then leaves nothing behind, and the caller's zero summary is
         # the truth; resolving between edge writes left a multi-person
         # message half-enriched under a summary that said zero (#3228).
+        resolved: Dict[str, str] = {}
         for concept in people:
             match = await self.person_resolver.resolve(
                 concept.label, self.agent_id, self_node_id=concept.node_id
@@ -802,6 +818,8 @@ class SchemaRouter:
                     "candidates": match.candidates,
                     "message_id": message_id,
                 })
+            elif match.concept_id and match.concept_id != concept.node_id:
+                resolved[concept.node_id] = match.concept_id
         if summary is not None:
             summary["pending_person_matches"] = pending
 
@@ -821,6 +839,19 @@ class SchemaRouter:
             enriched_count += 1
             if summary is not None:
                 summary["interactions"] = enriched_count
+            # A mention that resolved to another person (confirmed, or an
+            # exact/fuzzy match) is that person's interaction too: without
+            # this edge a confirmed person stopped accumulating mentions after
+            # the one confirmation (#3259).
+            canonical = resolved.get(concept.node_id)
+            if canonical:
+                await self.graph.add_edge(
+                    message_node, canonical, "mentions",
+                    properties={**properties, "resolved_from": concept.label},
+                )
+                enriched_count += 1
+                if summary is not None:
+                    summary["interactions"] = enriched_count
 
         return enriched_count, pending
 

@@ -26,6 +26,31 @@ ConceptCategory = Literal[
 #: A capitalised stop word ends a proper-noun run: "Jon And Doe" is not one name.
 _RUN_STOP_WORDS = frozenset({"the", "and", "but", "for"})
 
+
+def classify_label(label: str) -> Optional[str]:
+    """The keyword category the linker would give ``label`` on its own, or
+    ``None`` when no keyword pass claims it (a proper noun, or nothing).
+
+    The same pattern tables the extraction uses, run over the label alone,
+    so a concept node written before categories were stored can be told
+    apart on read: "march" is ``time``, "brooklyn" is ``place``, "mom" is
+    ``person``, "alice" is ``None`` (#3259).
+    """
+    text = str(label or "").strip().lower()
+    if not text:
+        return None
+    for category, patterns in (
+        ("person", AssociativeLinker.PERSON_PATTERNS),
+        ("place", AssociativeLinker.PLACE_PATTERNS),
+        ("time", AssociativeLinker.TIME_PATTERNS),
+        ("activity", AssociativeLinker.ACTIVITY_PATTERNS),
+        ("emotion", AssociativeLinker.EMOTION_PATTERNS),
+    ):
+        for pattern in patterns:
+            if re.search(pattern, text, re.I):
+                return category
+    return None
+
 @dataclass
 class LinkedConcept:
     """A concept extracted by AssociativeLinker with its graph node ID and category.

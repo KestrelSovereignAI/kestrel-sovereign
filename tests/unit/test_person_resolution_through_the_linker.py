@@ -118,22 +118,6 @@ async def test_candidates_are_people_never_a_month(pipeline):
 
 
 @pytest.mark.asyncio
-async def test_a_legacy_node_without_a_category_is_admitted_until_stamped(pipeline):
-    from kestrel_sovereign.storage.async_graph_store import GraphNode
-
-    linker, router, graph = pipeline
-    await graph.add_node(GraphNode(
-        node_id=f"concept:{AGENT}:march", node_type="concept", label="march",
-        properties={"agent_id": AGENT, "mention_count": 1},
-    ))
-    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
-    assert match.concept_id == f"concept:{AGENT}:march"  # legacy, unstamped: admitted
-    await _say(linker, router, "m1", "It all happened in March.")  # stamped as time
-    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
-    assert match.status == "new"
-
-
-@pytest.mark.asyncio
 async def test_a_confirmed_match_converges(pipeline):
     """Review round 1 P2: after the user confirms who "Jon" is, the next
     mention resolves to that person and does not ask again."""
@@ -156,3 +140,87 @@ async def test_a_confirmed_match_converges(pipeline):
     assert summary["pending_person_matches"] == []
     match = await router.person_resolver.resolve("jon", AGENT, self_node_id=f"concept:{AGENT}:jon")
     assert (match.status, match.concept_id) == ("exact", f"concept:{AGENT}:jon doe")
+
+
+@pytest.mark.asyncio
+async def test_a_later_confirmation_overwrites_the_earlier_one(pipeline):
+    """Review round 2 P1: a correction must take. The answer is a
+    single-valued property on the mention's node, so there is never a second
+    answer to pick between."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    await _say(linker, router, "m2", "I called Jon Lee about the sink.")
+    await _say(linker, router, "m3", "Thanks Jon for everything.")
+    feature = SimpleNamespace(agent=SimpleNamespace(storage=SimpleNamespace(graph=graph)), agent_id=AGENT)
+    confirm = getattr(MemoryFeature.confirm_person_match, "__wrapped__", MemoryFeature.confirm_person_match)
+    own = f"concept:{AGENT}:jon"
+    assert (await confirm(feature, message_id="m3", mentioned_label="jon", concept_id=f"concept:{AGENT}:jon doe")).error is None
+    assert (await router.person_resolver.resolve("jon", AGENT, self_node_id=own)).concept_id == f"concept:{AGENT}:jon doe"
+    assert (await confirm(feature, message_id="m3", mentioned_label="jon", concept_id=f"concept:{AGENT}:jon lee")).error is None
+    assert (await router.person_resolver.resolve("jon", AGENT, self_node_id=own)).concept_id == f"concept:{AGENT}:jon lee"
+    assert (await graph.get_node(own)).properties["resolved_to"] == f"concept:{AGENT}:jon lee"
+
+
+@pytest.mark.asyncio
+async def test_the_resolved_person_keeps_accumulating_mentions(pipeline):
+    """Review round 2 P2: after a confirmation, later mentions of the label
+    are the confirmed person's interactions too."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    await _say(linker, router, "m2", "I called Jon Lee about the sink.")
+    await _say(linker, router, "m3", "Thanks Jon for everything.")
+    feature = SimpleNamespace(agent=SimpleNamespace(storage=SimpleNamespace(graph=graph)), agent_id=AGENT)
+    confirm = getattr(MemoryFeature.confirm_person_match, "__wrapped__", MemoryFeature.confirm_person_match)
+    await confirm(feature, message_id="m3", mentioned_label="jon", concept_id=f"concept:{AGENT}:jon doe")
+    _people, summary = await _say(linker, router, "m4", "Thanks Jon again.")
+    assert summary["pending_person_matches"] == [] and summary["interactions"] == 2
+    into_doe = {e.source_id for e in await graph.get_edges(f"concept:{AGENT}:jon doe", direction="in") if e.label == "mentions"}
+    assert f"message:{AGENT}:m4" in into_doe
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_month_is_refused_on_read_without_a_re_mention(pipeline):
+    """Review round 2 P2: a node written before categories were stored is
+    classified on read with the linker's own keyword passes."""
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    linker, router, graph = pipeline
+    for label in ("march", "brooklyn", "marcus"):
+        await graph.add_node(GraphNode(
+            node_id=f"concept:{AGENT}:{label}", node_type="concept", label=label,
+            properties={"agent_id": AGENT, "mention_count": 1},
+        ))
+    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
+    assert (match.status, match.concept_id) == ("fuzzy", f"concept:{AGENT}:marcus")
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_associations_but_no_recorded_answer_is_not_exact(pipeline):
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "Lunch with Alice was happy and calm.")
+    edges = [e.label for e in await graph.get_edges(f"concept:{AGENT}:alice", direction="out")]
+    assert "associated_with" in edges
+    match = await router.person_resolver.resolve("alice", AGENT, self_node_id=f"concept:{AGENT}:alice")
+    assert match.status == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, people",
+    [
+        ("I saw Jon And Doe yesterday.", ["doe", "jon"]),  # a capitalised stop word ends a run
+        ("Waiting For Godot was long.", ["godot"]),
+        ("I saw Alice, Bob went home.", ["alice", "bob"]),  # trailing punctuation ends a run
+    ],
+)
+async def test_run_boundaries(pipeline, text, people):
+    linker, router, _graph = pipeline
+    assert (await _say(linker, router, "m1", text))[0] == people

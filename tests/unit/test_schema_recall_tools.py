@@ -328,12 +328,17 @@ class TestConfirmPersonMatch:
 
     @pytest.mark.asyncio
     async def test_resolves_ambiguous_match(self, feature):
-        feature.agent.storage.graph.get_node = AsyncMock(return_value=GraphNode(
-            node_id="concept:did:test:recall-agent:alice-smith",
-            node_type="concept",
-            label="Alice Smith",
-            properties={},
-        ))
+        nodes = {
+            "concept:did:test:recall-agent:alice-smith": GraphNode(
+                node_id="concept:did:test:recall-agent:alice-smith",
+                node_type="concept", label="Alice Smith", properties={},
+            ),
+            "concept:did:test:recall-agent:alice": GraphNode(
+                node_id="concept:did:test:recall-agent:alice",
+                node_type="concept", label="alice", properties={"category": "proper_noun"},
+            ),
+        }
+        feature.agent.storage.graph.get_node = AsyncMock(side_effect=lambda node_id: nodes.get(node_id))
         feature.agent.storage.graph.delete_edge = AsyncMock()
         result = await feature.confirm_person_match(
             message_id="msg-1",
@@ -345,15 +350,19 @@ class TestConfirmPersonMatch:
         # the answer recorded as an alias from the ambiguous node so the
         # next mention resolves without asking again (#3259).
         writes = feature.agent.storage.graph.add_edge.await_args_list
-        assert [c.args[2] for c in writes] == ["mentions", "alias_of"]
-        canonical, alias = writes
+        assert [c.args[2] for c in writes] == ["mentions"]
+        (canonical,) = writes
         assert canonical.args[1] == "concept:did:test:recall-agent:alice-smith"
         props = canonical.kwargs.get("properties") or {}
         assert props.get("confirmed") is True
         assert props.get("resolved_from") == "alice"
-        assert alias.args[0] == "concept:did:test:recall-agent:alice"
-        assert alias.args[1] == "concept:did:test:recall-agent:alice-smith"
-        assert (alias.kwargs.get("properties") or {}).get("confirmed_from_message") == "msg-1"
+        # The answer is recorded on the mention's own node, single-valued,
+        # so the next mention resolves without asking and a correction
+        # overwrites (#3259).
+        recorded = feature.agent.storage.graph.add_node.await_args.args[0]
+        assert recorded.node_id == "concept:did:test:recall-agent:alice"
+        assert recorded.properties["resolved_to"] == "concept:did:test:recall-agent:alice-smith"
+        assert recorded.properties["category"] == "proper_noun"  # the rest of the node is kept
 
     @pytest.mark.asyncio
     async def test_attempts_to_remove_ambiguous_edge(self, feature):
