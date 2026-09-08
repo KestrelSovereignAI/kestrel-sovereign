@@ -1004,6 +1004,11 @@ async def stream_agent_response(request: Request):
                     stop_notice_emitted = True
             except InvocationSelfFencedError:
                 yield self_fenced_notice
+            except InvocationCancelledError:
+                # A durable public-turn fence can win before the nested stream
+                # has yielded. Its typed unwind is acknowledged Stop even if
+                # nested cleanup already consumed the cancellation marker.
+                yield stop_notice
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
@@ -1303,7 +1308,7 @@ async def stop_agent_request(request: Request):
                     distributed_ticket = await distributed_stop.request_agent(
                         agent_id
                     )
-            cancelled_request_ids: list[Optional[str]] = []
+            cancelled_requests: list[tuple[str | None, int | None]] = []
             if stop_request.scope is StopScope.TURN:
                 # A public turn absent from this replica's local index is
                 # resolved exclusively by its shared durable UUID. Treating
@@ -1323,7 +1328,12 @@ async def stop_agent_request(request: Request):
                         )
                     canceled = agent.cancel_current_request(**cancel_kwargs)
                 if canceled:
-                    cancelled_request_ids.append(stop_request.target)
+                    cancelled_requests.append(
+                        (
+                            stop_request.target,
+                            stop_request.request_generation,
+                        )
+                    )
                 else:
                     # The matching invoke/stream may have been dispatched by
                     # the client but not yet reached lifecycle registration.
@@ -1342,23 +1352,45 @@ async def stop_agent_request(request: Request):
                     ):
                         reserve(agent, stop_request.target)
             else:
-                # Receipt load/claim may await after the endpoint's inventory
-                # snapshot. Re-read at the cancellation linearization point so
-                # a turn registered during those awaits cannot outlive an
-                # agent-wide STOPPED receipt.
-                turns_to_cancel = active_request_ids | live_request_ids()
                 canceled = False
-                for active_request_id in sorted(turns_to_cancel):
-                    request_cancelled = agent.cancel_current_request(
-                        request_id=active_request_id
+                cancel_local_ticket = getattr(
+                    type(distributed_stop),
+                    "cancel_local_ticket",
+                    None,
+                )
+                if distributed_ticket is not None and callable(
+                    cancel_local_ticket
+                ):
+                    # The durable ticket is the fleet-wide linearization
+                    # point. Cancel exactly its local UUID-backed generations;
+                    # an agent-wide live-set re-read would kill later work on
+                    # this replica while equivalent work elsewhere survived.
+                    ticketed_local = cancel_local_ticket(
+                        distributed_stop,
+                        distributed_ticket,
                     )
-                    if request_cancelled:
-                        cancelled_request_ids.append(active_request_id)
-                    canceled = request_cancelled or canceled
-                if not turns_to_cancel:
-                    canceled = agent.cancel_current_request(request_id=None)
-                    if canceled:
-                        cancelled_request_ids.append(None)
+                    cancelled_requests.extend(ticketed_local)
+                    canceled = bool(ticketed_local)
+                else:
+                    # A non-distributed host linearizes locally at this re-read.
+                    # Test/compatibility registries without the typed local
+                    # ticket mapper retain the endpoint's initial inventory.
+                    turns_to_cancel = (
+                        active_request_ids | live_request_ids()
+                        if distributed_ticket is None
+                        else active_request_ids
+                    )
+                    for active_request_id in sorted(turns_to_cancel):
+                        request_cancelled = agent.cancel_current_request(
+                            request_id=active_request_id
+                        )
+                        if request_cancelled:
+                            cancelled_requests.append((active_request_id, None))
+                        canceled = request_cancelled or canceled
+                    if not turns_to_cancel:
+                        canceled = agent.cancel_current_request(request_id=None)
+                        if canceled:
+                            cancelled_requests.append((None, None))
             if canceled:
                 wait_for_completion = getattr(
                     agent,
@@ -1374,15 +1406,12 @@ async def stop_agent_request(request: Request):
                 # once. STOPPED is returned only after each one has run its
                 # endpoint cleanup; CancellationAuthority bounds this wait.
                 abandoned = False
-                for cancelled_request_id in cancelled_request_ids:
+                for cancelled_request_id, cancelled_generation in (
+                    cancelled_requests
+                ):
                     wait_kwargs = {}
-                    if (
-                        stop_request.scope is StopScope.TURN
-                        and stop_request.request_generation is not None
-                    ):
-                        wait_kwargs["generation"] = (
-                            stop_request.request_generation
-                        )
+                    if cancelled_generation is not None:
+                        wait_kwargs["generation"] = cancelled_generation
                     completion_disposition = await wait_for_completion(
                         cancelled_request_id,
                         **wait_kwargs,

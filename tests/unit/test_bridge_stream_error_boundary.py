@@ -206,6 +206,22 @@ def test_bridge_stream_reports_owner_self_fence_as_retryable_error():
     assert events[0]["request_id"]
 
 
+def test_bridge_stream_renders_typed_admission_refusal_as_stopped():
+    """A durable Stop unwind must not be relabeled as a model-route failure."""
+
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    async def _durably_stopped(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+        raise InvocationCancelledError("durable public-turn Stop won")
+
+    response = _post_stream(_durably_stopped)
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
+
+
 @pytest.mark.asyncio
 async def test_bridge_stop_interrupts_producer_blocked_before_first_event():
     """Bridge binds the same blocked producer owner to its request generation."""

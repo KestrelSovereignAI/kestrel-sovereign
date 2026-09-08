@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+)
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
@@ -1065,6 +1068,62 @@ def test_public_turn_distributed_stop_preserves_captured_generation():
     remote.request_public_turn.assert_awaited_once_with(
         "did:test:agent",
         "public-turn",
+    )
+
+
+def test_distributed_agent_stop_excludes_post_snapshot_local_turn():
+    """Local cancellation must use the same durable snapshot as peer replicas."""
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"snapshot-turn"}
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(
+        return_value=RequestCompletionDisposition.COMPLETED
+    )
+
+    class SnapshotRegistry:
+        async def request_agent(self, agent_id):
+            assert agent_id == agent.agent_id
+            # This turn begins after the durable agent-wide snapshot. It must
+            # survive here just as it would on any other replica.
+            agent._active_request_ids.add("post-snapshot-turn")
+            return DistributedStopTicket(("snapshot-generation",))
+
+        def cancel_local_ticket(self, ticket):
+            assert ticket.generation_ids == ("snapshot-generation",)
+            assert agent.cancel_current_request(
+                request_id="snapshot-turn",
+                generation=7,
+            )
+            return (("snapshot-turn", 7),)
+
+        async def wait_for_stop(self, ticket):
+            assert ticket.generation_ids == ("snapshot-generation",)
+            return StopDisposition.STOPPED
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = _EndpointReplayStore()
+    app.state.distributed_invocation_registry = SnapshotRegistry()
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop", json={})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    agent.cancel_current_request.assert_called_once_with(
+        request_id="snapshot-turn",
+        generation=7,
+    )
+    agent.wait_for_request_completion.assert_awaited_once_with(
+        "snapshot-turn",
+        generation=7,
     )
 
 

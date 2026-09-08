@@ -468,6 +468,11 @@ def get_router() -> APIRouter:
                 )
             except InvocationSelfFencedError:
                 yield self_fenced_event()
+            except InvocationCancelledError:
+                # Durable admission refusal is an acknowledged Stop. The
+                # nested lifecycle may consume its marker before the exception
+                # crosses the owned iterator, so preserve the typed outcome.
+                yield stopped_event()
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging

@@ -2959,6 +2959,43 @@ class TestStopEndpoint:
         assert "retry the request" in response.text
         assert "Request stopped" not in response.text
 
+    def test_stream_endpoint_renders_typed_admission_refusal_as_stopped(self):
+        """A durable Stop unwind must not become a generic stream failure."""
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.agent.invocation import InvocationCancelledError
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+
+        async def _durably_stopped(*_args, **_kwargs):
+            if False:
+                yield "unreachable"
+            raise InvocationCancelledError("durable public-turn Stop won")
+
+        agent = MagicMock()
+        agent.register_active_request = MagicMock()
+        agent.process_input_streaming = _durably_stopped
+        agent.is_request_cancelled = MagicMock(return_value=False)
+        agent.is_request_self_fenced = MagicMock(return_value=False)
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        app.state.agent = agent
+
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            json={"input": "work", "request_id": "durably-stopped-stream"},
+        )
+
+        assert response.status_code == 200
+        assert response.text.count("Request stopped") == 1
+        assert "could not be completed" not in response.text
+
     @pytest.mark.asyncio
     async def test_stream_endpoint_reuses_client_request_id_for_turn_provenance(self):
         """A stream retry id is validated, echoed, and passed to the turn."""

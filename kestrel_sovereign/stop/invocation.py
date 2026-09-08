@@ -840,6 +840,25 @@ class DistributedInvocationRegistry:
                 # fail, so complete_soon can retry transient deletion errors.
                 self._by_local_generation[key] = generation_id
                 self._active[generation_id] = (agent, turn_id, generation)
+                lease_expired_during_admission = bool(
+                    lease_owned_generation_ids
+                    and last_heartbeat is not None
+                    and any(
+                        owned_generation_id in self._active
+                        and owned_generation_id
+                        not in self._completing_generation_ids
+                        for owned_generation_id in lease_owned_generation_ids
+                    )
+                    and asyncio.get_running_loop().time() - last_heartbeat
+                    >= self._owner_lease_seconds
+                )
+                if lease_expired_during_admission:
+                    # The durable insert awaited outside the process clock's
+                    # lease window. A relay stalled on the same database may
+                    # not have observed this yet, while another replica is
+                    # already entitled to reap the older rows. The new row is
+                    # provisional, never authority to revive that owner.
+                    self._fail_closed_owner()
                 if self._lease_lost:
                     self.complete_soon(agent, turn_id, generation)
                     raise InvocationSelfFencedError(
@@ -991,6 +1010,35 @@ class DistributedInvocationRegistry:
 
     async def request_agent(self, agent_id: str) -> DistributedStopTicket:
         return await self._store.mark_agent(agent_id)
+
+    def cancel_local_ticket(
+        self,
+        ticket: DistributedStopTicket,
+    ) -> tuple[tuple[str, int], ...]:
+        """Cancel only local generations captured by a durable Stop ticket.
+
+        Agent-wide Stop deliberately has no fence against work admitted after
+        its database snapshot. Mapping the ticket's server-owned generation
+        UUIDs back to this process's exact request generations preserves that
+        same linearization point locally; re-reading an agent-wide live set
+        here would widen Stop to later work on this replica only.
+        """
+
+        if not isinstance(ticket, DistributedStopTicket):
+            raise TypeError("distributed Stop cancellation requires a typed ticket")
+        cancelled: list[tuple[str, int]] = []
+        for generation_id in ticket.generation_ids:
+            target = self._active.get(generation_id)
+            if target is None:
+                continue
+            agent, turn_id, generation = target
+            cancel = getattr(agent, "cancel_current_request", None)
+            if callable(cancel) and cancel(
+                request_id=turn_id,
+                generation=generation,
+            ):
+                cancelled.append((turn_id, generation))
+        return tuple(cancelled)
 
     async def wait_for_stop(
         self,

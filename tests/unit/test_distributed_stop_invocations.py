@@ -725,6 +725,67 @@ async def test_single_row_admission_does_not_refresh_owner_wide_lease(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_registration_that_outlasts_existing_owner_lease_self_fences(
+    tmp_path,
+):
+    """A slow insert cannot revive an owner whose prior lease expired."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "admission-lease-race.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=0.2,
+    )
+    agent = _ReplicaAgent("did:test:admission-lease-race")
+    original_register = store.register
+    inserted = asyncio.Event()
+    release_insert = asyncio.Event()
+
+    try:
+        assert await registry.register(agent, "older-turn", 1)
+        older_generation_id = registry._by_local_generation[
+            (id(agent), "older-turn", 1)
+        ]
+
+        async def delayed_register(**kwargs):
+            admitted = await original_register(**kwargs)
+            inserted.set()
+            await release_insert.wait()
+            return admitted
+
+        store.register = delayed_register
+        admission = asyncio.create_task(
+            registry.register(agent, "provisional-turn", 2)
+        )
+        await asyncio.wait_for(inserted.wait(), timeout=1)
+        await asyncio.sleep(0.25)
+        release_insert.set()
+
+        with pytest.raises(InvocationSelfFencedError):
+            await admission
+        assert registry._lease_lost is True
+
+        for _ in range(100):
+            rows = await db.fetchall(
+                "SELECT generation_id FROM stop_active_invocations "
+                "WHERE owner_id = ?",
+                (registry._owner_id,),
+            )
+            if len(rows) == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert rows == [(older_generation_id,)]
+    finally:
+        release_insert.set()
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
     """A row admitted after the SQL snapshot cannot look lease-lost."""
 
