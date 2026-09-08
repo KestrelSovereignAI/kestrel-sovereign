@@ -337,6 +337,35 @@ async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_res
     assert budget.connect == client.timeout and budget.pool == client.timeout
 
 
+@pytest.mark.asyncio
+async def test_upload_budget_is_sized_from_the_content_too(client, mock_response):
+    """The sibling door: ``upload()`` carries arbitrary user content through
+    the same client and had the flat default."""
+    import builtins
+
+    import httpx
+
+    resp = mock_response(json_data={"data": {"Hash": "QmFile", "Size": "1"}})
+    size = 600 * 1024 * 1024
+    content = b"y"
+
+    def sized(obj):
+        return size if obj is content else builtins.len(obj)
+
+    with patch.object(client, "_get_client") as mock_get:
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=resp)
+        mock_get.return_value = mock_http
+        with patch("kestrel_sovereign.storage.providers.lighthouse_rest.len", create=True) as fake_len:
+            fake_len.side_effect = sized
+            await client.upload(content, filename="big.bin")
+
+    assert any(call.args == (content,) for call in fake_len.call_args_list)
+    budget = mock_http.post.await_args.kwargs["timeout"]
+    assert isinstance(budget, httpx.Timeout)
+    assert budget.write == pytest.approx(size / client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+
+
 def test_a_small_upload_keeps_the_default_budget(client):
     budget = client.upload_timeout(1024)
     assert budget.read == client.timeout and budget.write == client.timeout

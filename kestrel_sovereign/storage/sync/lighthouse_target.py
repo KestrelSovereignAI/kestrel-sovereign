@@ -197,7 +197,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
         except Exception as e:
             # Manifest upload failure is non-fatal -- snapshot is already safe
-            logger.warning(f"Failed to upload manifest (snapshot is safe): {e}")
+            logger.warning(
+                "Failed to upload manifest (snapshot is safe): %s: %s", type(e).__name__, e
+            )
             self._save_local_manifest(manifest)
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:

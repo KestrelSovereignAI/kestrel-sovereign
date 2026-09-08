@@ -92,9 +92,10 @@ def _create_consistent_snapshot(db_path: Path) -> bytes:
 #: ``name`` is a URL that carries bucket and prefix, so it may not). The
 #: scheduler declares one ``backup_snapshot`` reason code per kind listed
 #: here; ``tests/unit/test_backup_snapshot_failed_target.py`` imports every
-#: module of this package and asserts the set equals the kinds every
-#: ``SyncTarget`` subclass found there declares, so a new shipped target
-#: cannot ship without its code.
+#: module of this package, subpackages included, and asserts the set equals
+#: the kinds every ``SyncTarget`` subclass found there declares, so a new
+#: shipped target cannot ship without its code. A kind outside this census
+#: reports with the kind-less code rather than being dropped.
 SYNC_TARGET_KINDS: frozenset[str] = frozenset(
     {"gcs", "s3", "lighthouse", "sovereign_ipfs"}
 )

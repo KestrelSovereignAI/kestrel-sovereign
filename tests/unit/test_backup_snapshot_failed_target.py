@@ -64,7 +64,9 @@ from kestrel_sovereign.storage.sync.targets import (
 from tests.unit.test_signals_scheduler_source import _FakeAgent
 
 
-def _result(name: str, success: bool, kind: str = "", error: str | None = None) -> SyncResult:
+def _result(
+    name: str, success: bool, kind: str = "", error: str | None = None, *, skipped: bool = False,
+) -> SyncResult:
     """A real result, as ``SyncService.force_snapshot`` hands them back."""
     return SyncResult(
         success=success,
@@ -73,12 +75,19 @@ def _result(name: str, success: bool, kind: str = "", error: str | None = None) 
         frames_synced=0,
         timestamp=datetime.now(UTC),
         error=error,
+        metadata={"skipped": True, "policy_denied": True} if skipped else None,
         kind=kind,
     )
 
 
-def _results(*specs: tuple) -> dict[str, SyncResult]:
-    return {spec[0]: _result(*spec) for spec in specs}
+def _skipped(name: str, kind: str) -> SyncResult:
+    """A target the policy denied (or the unchanged-DB marker): not attempted."""
+    return _result(name, True, kind, skipped=True)
+
+
+def _results(*specs) -> dict[str, SyncResult]:
+    made = [spec if isinstance(spec, SyncResult) else _result(*spec) for spec in specs]
+    return {r.target_name: r for r in made}
 
 
 @pytest.fixture
@@ -142,8 +151,8 @@ def test_the_kinds_census_equals_what_every_shipped_target_declares():
     package. Every module there is imported and every ``SyncTarget`` subclass
     it defines must declare a kind that the census lists, so a new shipped
     target cannot land without the reason code that names it."""
-    for module in pkgutil.iter_modules(sync_package.__path__):
-        importlib.import_module(f"{sync_package.__name__}.{module.name}")
+    for module in pkgutil.walk_packages(sync_package.__path__, f"{sync_package.__name__}."):
+        importlib.import_module(module.name)
     shipped = {
         cls for cls in _all_subclasses(SyncTarget)
         if cls.__module__.startswith(f"{sync_package.__name__}.")
@@ -165,12 +174,82 @@ def test_every_backup_code_is_declared_and_passes_the_token_fence():
         assert _bounded_token(code) == code, code
 
 
-def test_an_undeclared_or_unbounded_kind_yields_the_kind_less_code():
+def test_a_kind_outside_the_census_yields_the_declared_kind_less_code():
+    """Declaring a kind the census does not know must not be worse than
+    declaring none: the per-kind code would fail the membership door and
+    drop to the bare failure this ticket removes."""
     assert backup_target_failure_code("") == "BACKUP_TARGET_FAILED"
     assert backup_target_failure_code("  ") == "BACKUP_TARGET_FAILED"
-    assert backup_target_failure_code(None) == "BACKUP_TARGET_FAILED"  # type: ignore[arg-type]
-    assert backup_target_failure_code(42) == "BACKUP_TARGET_FAILED"  # type: ignore[arg-type]
+    assert backup_target_failure_code(None) == "BACKUP_TARGET_FAILED"
+    assert backup_target_failure_code(42) == "BACKUP_TARGET_FAILED"
+    assert backup_target_failure_code("azure") == "BACKUP_TARGET_FAILED"
     assert backup_target_failure_code("lighthouse") == "BACKUP_TARGET_FAILED_LIGHTHOUSE"
+    assert backup_target_failure_code(" Lighthouse ") == "BACKUP_TARGET_FAILED_LIGHTHOUSE"
+    for kind in SYNC_TARGET_KINDS:
+        assert backup_target_failure_code(kind) in BACKUP_SNAPSHOT_REASON_CODES
+
+
+@pytest.mark.asyncio
+async def test_a_failed_target_of_a_kind_the_census_does_not_know_still_crosses(
+    dispatcher_components,
+):
+    result = await _dispatch(dispatcher_components, _results(
+        ("gs://bucket/prefix/agent", True, "gcs"),
+        ("azure://container", False, "azure", "HttpResponseError: 503"),
+    ))
+    assert result.status == Status.FAILED
+    assert result.error.endswith("failed (BACKUP_TARGET_FAILED)")
+
+
+@pytest.mark.asyncio
+async def test_a_policy_denied_target_counts_on_neither_side(dispatcher_components):
+    """A destination the policy denied wrote nothing: with every attempted
+    target failing there is no snapshot anywhere, so the code says ALL."""
+    result = await _dispatch(dispatcher_components, _results(
+        _skipped("lighthouse://agent", "lighthouse"),
+        ("gs://bucket/prefix/agent", False, "gcs", "Forbidden: 403"),
+        ("s3://bucket/prefix", False, "s3", "ClientError: AccessDenied"),
+    ))
+    assert result.status == Status.FAILED
+    assert result.error.endswith("failed (BACKUP_ALL_TARGETS_FAILED)")
+
+
+@pytest.mark.asyncio
+async def test_the_only_attempted_target_failing_means_no_snapshot_anywhere(
+    dispatcher_components,
+):
+    """Skipped plus one failed: the one attempted target failed, so ALL."""
+    result = await _dispatch(dispatcher_components, _results(
+        _skipped("lighthouse://agent", "lighthouse"),
+        ("gs://bucket/prefix/agent", False, "gcs", "Forbidden: 403"),
+    ))
+    assert result.status == Status.FAILED
+    assert result.error.endswith("failed (BACKUP_ALL_TARGETS_FAILED)")
+
+
+@pytest.mark.asyncio
+async def test_a_policy_denied_target_does_not_make_one_failure_several(dispatcher_components):
+    """Skipped, one succeeded, one failed: a snapshot exists on the succeeded
+    target, and exactly one attempted target failed, named by kind."""
+    result = await _dispatch(dispatcher_components, _results(
+        _skipped("lighthouse://agent", "lighthouse"),
+        ("s3://bucket/prefix", True, "s3"),
+        ("gs://bucket/prefix/agent", False, "gcs", "Forbidden: 403"),
+    ))
+    assert result.status == Status.FAILED
+    assert result.error.endswith("failed (BACKUP_TARGET_FAILED_GCS)")
+
+
+@pytest.mark.asyncio
+async def test_a_pass_where_nothing_was_attempted_is_not_a_failure(dispatcher_components):
+    """Every target policy-denied, or the unchanged-DB marker: nothing failed."""
+    result = await _dispatch(dispatcher_components, _results(
+        _skipped("lighthouse://agent", "lighthouse"),
+    ))
+    assert result.status == Status.OK
+    payload = json.loads(result.action_result)
+    assert payload["success"] is True
+    assert payload["targets"]["lighthouse://agent"]["skipped"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +336,7 @@ async def test_a_fully_successful_pass_is_ok_and_its_artifact_carries_each_kind(
     assert payload["success"] is True
     assert "reason_code" not in payload and "error" not in payload
     assert payload["targets"]["lighthouse://agent"] == {
-        "success": True, "bytes": 0, "kind": "lighthouse",
+        "success": True, "bytes": 0, "kind": "lighthouse", "skipped": False,
     }
 
 
@@ -284,7 +363,7 @@ async def test_the_error_string_names_kinds_and_recorded_errors_sorted():
         "backup_snapshot_failed: gcs (Forbidden: 403), lighthouse (ReadTimeout: ), undeclared"
     )
     assert "outcome" not in payload
-    assert set(payload["targets"]["gs://bucket/prefix/agent"]) == {"success", "bytes", "kind"}
+    assert set(payload["targets"]["gs://bucket/prefix/agent"]) == {"success", "bytes", "kind", "skipped"}
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +483,45 @@ async def test_lighthouse_target_records_the_exception_type_when_its_message_is_
     assert result.success is False
     assert result.error == "ReadTimeout: "
     assert "Failed to sync to Lighthouse: ReadTimeout: " in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_manifest_upload_warning_names_the_exception_type(
+    tmp_path, monkeypatch, caplog,
+):
+    """The manifest upload is one function below the snapshot upload and
+    swallows the same empty-message timeout into a warning."""
+    import sqlite3
+
+    from kestrel_sovereign.storage.providers import lighthouse_rest
+
+    db = tmp_path / "agent.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
+
+    class _ManifestTimesOut:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def upload_car(self, **kwargs):
+            return {"Hash": "QmSnap", "Size": "10"}
+
+        async def upload(self, *args, **kwargs):
+            raise httpx.ReadTimeout("")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(lighthouse_rest, "LighthouseRestClient", _ManifestTimesOut)
+    target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
+
+    with caplog.at_level("WARNING"):
+        result = await target.sync_snapshot(db)
+
+    assert result.success is True
+    assert "Failed to upload manifest (snapshot is safe): ReadTimeout: " in caplog.text
 
 
 def _timing_out(*_args, **_kwargs):

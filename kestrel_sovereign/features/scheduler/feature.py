@@ -132,27 +132,42 @@ _SUPERSEDED_AUTOSEEDS = {
 }
 
 
-def backup_target_failure_code(kind: str) -> str:
+#: One code per shipped target kind, from ``SYNC_TARGET_KINDS``.
+_BACKUP_TARGET_FAILED_BY_KIND: dict[str, str] = {
+    kind: f"BACKUP_TARGET_FAILED_{kind.upper()}" for kind in SYNC_TARGET_KINDS
+}
+
+
+def backup_target_failure_code(kind: object) -> str:
     """The ``backup_snapshot`` reason code naming a failed target of ``kind``.
 
-    ``kind`` is a ``SyncTarget.kind`` token; an empty (undeclared) kind yields
-    the kind-less code, so a third-party target still reports as a failed
-    target rather than as nothing.
+    ``kind`` is a ``SyncTarget.kind`` token. Only a kind in the census has a
+    code of its own; any other kind (empty, unknown to the census, or not a
+    string at all) yields the kind-less code, which is declared, so a
+    third-party target still reports as a failed target rather than being
+    dropped at the membership door into the bare failure this ticket removes.
     """
-    token = kind.strip().upper() if isinstance(kind, str) else ""
-    return f"BACKUP_TARGET_FAILED_{token}" if token else "BACKUP_TARGET_FAILED"
+    key = kind.strip().lower() if isinstance(kind, str) else ""
+    return _BACKUP_TARGET_FAILED_BY_KIND.get(key, "BACKUP_TARGET_FAILED")
 
 
 #: The closed vocabulary ``_handle_backup_snapshot`` may return. Every failed
-#: pass is one of: every target failed (there is no current snapshot), more
-#: than one but not every target failed (a snapshot exists somewhere), or
-#: exactly one target failed, named by its kind. A code per shipped kind is
-#: declared up front from ``SYNC_TARGET_KINDS``; the signal boundary admits a
-#: code only by membership here, so a kind not listed there falls to the
-#: undeclared-code path and is dropped with a warning naming the task.
+#: pass is one of: every attempted target failed (there is no current
+#: snapshot), more than one but not every attempted target failed (a snapshot
+#: exists somewhere), or exactly one failed, named by its kind when the census
+#: knows it. Targets a policy denied or an unchanged fingerprint skipped were
+#: not attempted and count on neither side.
 BACKUP_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
     {"BACKUP_ALL_TARGETS_FAILED", "BACKUP_TARGETS_FAILED", "BACKUP_TARGET_FAILED"}
-) | frozenset(backup_target_failure_code(kind) for kind in SYNC_TARGET_KINDS)
+) | frozenset(_BACKUP_TARGET_FAILED_BY_KIND.values())
+
+
+def _sync_result_skipped(result: Any) -> bool:
+    """Whether a sync result records that its target was not attempted
+    (``SyncService`` marks policy-denied targets and the unchanged-DB
+    placeholder with ``metadata["skipped"]``)."""
+    metadata = getattr(result, "metadata", None)
+    return bool(isinstance(metadata, dict) and metadata.get("skipped"))
 
 
 class SchedulerFeature(Feature):
@@ -1384,6 +1399,9 @@ class SchedulerFeature(Feature):
                     "success": result.success,
                     "bytes": result.bytes_synced,
                     "kind": result.kind,
+                    # A destination a policy denied, or the unchanged-DB
+                    # marker, wrote nothing; it must not read as backed up.
+                    "skipped": _sync_result_skipped(result),
                 }
                 for target, result in results.items()
             }
@@ -1394,9 +1412,14 @@ class SchedulerFeature(Feature):
                         "reason": "no sync targets configured",
                     }
                 )
-            failed = {
+            attempted = {
                 name: result
                 for name, result in results.items()
+                if not _sync_result_skipped(result)
+            }
+            failed = {
+                name: result
+                for name, result in attempted.items()
                 if result.success is not True
             }
             payload: dict[str, Any] = {
@@ -1419,7 +1442,7 @@ class SchedulerFeature(Feature):
                     for result in failed.values()
                 )
                 payload["error"] = "backup_snapshot_failed: " + ", ".join(described)
-                if len(failed) == len(results):
+                if len(failed) == len(attempted):
                     payload["reason_code"] = "BACKUP_ALL_TARGETS_FAILED"
                 elif len(failed) > 1:
                     payload["reason_code"] = "BACKUP_TARGETS_FAILED"

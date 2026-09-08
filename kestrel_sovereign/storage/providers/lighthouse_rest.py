@@ -62,9 +62,10 @@ class LighthouseRestClient:
     """Async HTTP client for Lighthouse storage REST API."""
 
     UPLOAD_URL = "https://upload.lighthouse.storage"
-    #: The slowest link an upload budget is sized for. The budget for a
-    #: payload is ``max(timeout, size / this)``, so a 60 s default still
-    #: applies to small requests and a 1.2 GB snapshot gets ~2400 s.
+    #: Payload per second of patience an upload is granted, per socket
+    #: operation. The budget for a payload is ``max(timeout, size / this)``,
+    #: so a 60 s default still applies to small requests and a 1.2 GB
+    #: snapshot gets ~2300 s for the server's post-upload processing.
     UPLOAD_FLOOR_BYTES_PER_SECOND = 512 * 1024
     API_URL = "https://api.lighthouse.storage"
 
@@ -137,6 +138,7 @@ class LighthouseRestClient:
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
+            timeout=self.upload_timeout(len(content)),
         )
         response.raise_for_status()
 
@@ -149,15 +151,16 @@ class LighthouseRestClient:
     def upload_timeout(self, payload_bytes: int) -> "httpx.Timeout":
         """The request budget for uploading ``payload_bytes``.
 
-        The client's default ``timeout`` is a flat per-operation budget. A
-        multipart POST of an agent snapshot is bounded by the link, not by
-        the server: at ``UPLOAD_FLOOR_BYTES_PER_SECOND`` a 1.2 GB snapshot
-        needs about forty minutes to send, and Lighthouse then hashes the
-        CAR before answering, so the read budget matches the write budget.
-        Under the flat 60 s default every snapshot larger than the link could
-        carry in a minute timed out, and did so for eighteen days (#3189).
-        The connect and pool budgets stay at the default: they are not
-        proportional to the payload.
+        httpx applies ``read`` and ``write`` per socket operation, not per
+        transfer: each chunk written and each read of the response headers
+        gets the full budget again. What fired for eighteen days was the
+        read after the body was sent: Lighthouse hashes and stores a 1.2 GB
+        CAR before it answers, and that wait grows with the payload, so the
+        budget is sized by the payload (``payload_bytes /
+        UPLOAD_FLOOR_BYTES_PER_SECOND``, never below the default) and given
+        to both operations. The floor is a rate of payload per second of
+        patience, not a link speed. Connect and pool stay at the default:
+        they are not proportional to the payload (#3189).
         """
         budget = max(
             float(self.timeout), payload_bytes / self.UPLOAD_FLOOR_BYTES_PER_SECOND
