@@ -259,8 +259,10 @@ class DockerExecutor(BaseExecutor):
         A read-only bind of the caller's directory would still expose Unix
         sockets, including one created after a recursive preflight.  Copying
         into the already-private execution directory gives the container a
-        stable regular-file snapshot; ``copytree`` rejects sockets/FIFOs and
-        preserves symlinks without following them into ambient host paths.
+        stable regular-file snapshot.  Inspect source types before copytree can
+        open them, then re-check every regular file through its open descriptor
+        so a raced device/FIFO replacement still cannot be read. Symlinks are
+        preserved without following them into ambient host paths.
         """
 
         try:
@@ -273,14 +275,93 @@ class DockerExecutor(BaseExecutor):
             raise ExecutionEnvironmentError(
                 f"Docker working directory is not a directory: {source_path}"
             )
+        destination_path = destination.expanduser().resolve(strict=False)
+        if destination_path == source_path or destination_path.is_relative_to(
+            source_path
+        ):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot would contain its own "
+                f"destination: {source_path}"
+            )
+
+        def reject_special(path: Path) -> None:
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                raise ExecutionEnvironmentError(
+                    "Docker working directory contains an unreadable entry: "
+                    f"{path}: {exc}"
+                ) from exc
+            if not (
+                stat.S_ISREG(mode)
+                or stat.S_ISDIR(mode)
+                or stat.S_ISLNK(mode)
+            ):
+                raise ExecutionEnvironmentError(
+                    "Docker working directory contains a host service socket "
+                    f"or other special file: {path}"
+                )
+
+        def copy_regular_file(source_name: str, destination_name: str) -> str:
+            """Copy one path only while its opened object is still regular."""
+
+            source_file = Path(source_name)
+            reject_special(source_file)
+            before = source_file.lstat()
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                descriptor = os.open(source_file, flags)
+            except OSError as exc:
+                raise ExecutionEnvironmentError(
+                    "Docker working directory file changed during snapshot: "
+                    f"{source_file}: {exc}"
+                ) from exc
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)
+                ):
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory file changed during snapshot: "
+                        f"{source_file}"
+                    )
+                with os.fdopen(descriptor, "rb") as source_stream:
+                    descriptor = -1
+                    with open(destination_name, "xb") as destination_stream:
+                        shutil.copyfileobj(source_stream, destination_stream)
+                shutil.copystat(
+                    source_file,
+                    destination_name,
+                    follow_symlinks=False,
+                )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            return destination_name
+
         try:
+            for root, directory_names, file_names in os.walk(
+                source_path,
+                topdown=True,
+                followlinks=False,
+            ):
+                for name in (*directory_names, *file_names):
+                    reject_special(Path(root) / name)
             shutil.copytree(
                 source_path,
-                destination,
+                destination_path,
                 symlinks=True,
                 ignore_dangling_symlinks=True,
+                copy_function=copy_regular_file,
             )
-            for entry in destination.rglob("*"):
+            for entry in destination_path.rglob("*"):
                 mode = entry.lstat().st_mode
                 if not (
                     stat.S_ISREG(mode)
@@ -292,15 +373,15 @@ class DockerExecutor(BaseExecutor):
                         f"socket or other special file: {entry}"
                     )
         except ExecutionEnvironmentError:
-            shutil.rmtree(destination, ignore_errors=True)
+            shutil.rmtree(destination_path, ignore_errors=True)
             raise
         except (OSError, shutil.Error) as exc:
-            shutil.rmtree(destination, ignore_errors=True)
+            shutil.rmtree(destination_path, ignore_errors=True)
             raise ExecutionEnvironmentError(
                 "Docker working directory contains a host service socket, "
                 f"special file, or unreadable entry: {source_path}: {exc}"
             ) from exc
-        return str(destination)
+        return str(destination_path)
 
     async def _execute_script(
         self,

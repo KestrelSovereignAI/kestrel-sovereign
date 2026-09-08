@@ -28,7 +28,11 @@ from kestrel_sovereign.features.compute.executors import (
 )
 from kestrel_sovereign.features.compute.executors import (
     base as executor_base,
+)
+from kestrel_sovereign.features.compute.executors import (
     docker_executor as docker_executor_module,
+)
+from kestrel_sovereign.features.compute.executors import (
     uv_executor as uv_executor_module,
 )
 from kestrel_sovereign.features.compute.models import (
@@ -36,7 +40,6 @@ from kestrel_sovereign.features.compute.models import (
     ComputeScript,
     ExecutionRecord,
 )
-
 
 EXECUTOR_NAMES = ("local", "uv", "docker")
 TRUNCATED_SUFFIX = "\n... [output truncated]"
@@ -1884,6 +1887,102 @@ async def test_docker_script_mode_mounts_a_private_working_directory_snapshot(
     assert snapshot_source != workspace
     assert snapshot_source.name == "workspace"
     assert script_cmd[script_cmd.index("-w") + 1] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_docker_rejects_working_directory_that_contains_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A broad source such as /tmp must not recursively copy its own output."""
+
+    executor = _make_executor(monkeypatch, "docker")
+    _track_temp_dirs(monkeypatch, tmp_path)
+    copied = False
+
+    def reject_copy(*_args: object, **_kwargs: object) -> None:
+        nonlocal copied
+        copied = True
+        raise AssertionError("recursive snapshot reached copytree")
+
+    monkeypatch.setattr(docker_executor_module.shutil, "copytree", reject_copy)
+
+    record = await executor.execute(_script(), working_dir=str(tmp_path))
+
+    assert record.exit_code == -1
+    assert "would contain its own destination" in record.stderr
+    assert copied is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO creation is POSIX-only")
+@pytest.mark.asyncio
+async def test_docker_rejects_special_source_entry_before_copying(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Source inspection must reject devices/FIFOs before opening their data."""
+
+    executor = _make_executor(monkeypatch, "docker")
+    source = tmp_path / "caller cwd"
+    source.mkdir()
+    os.mkfifo(source / "unbounded-device")
+    execution_root = tmp_path / "execution roots"
+    execution_root.mkdir()
+    _track_temp_dirs(monkeypatch, execution_root)
+    copied = False
+
+    def reject_copy(*_args: object, **_kwargs: object) -> None:
+        nonlocal copied
+        copied = True
+        raise AssertionError("special source entry reached copytree")
+
+    monkeypatch.setattr(docker_executor_module.shutil, "copytree", reject_copy)
+
+    record = await executor.execute(_script(), working_dir=str(source))
+
+    assert record.exit_code == -1
+    assert "host service socket or other special file" in record.stderr
+    assert copied is False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO creation is POSIX-only")
+def test_docker_rechecks_regular_source_at_copy_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A file raced after preflight must not be opened as snapshot content."""
+
+    source = tmp_path / "caller cwd"
+    source.mkdir()
+    raced = source / "input.txt"
+    raced.write_text("regular during preflight", encoding="utf-8")
+    destination = tmp_path / "isolated" / "workspace"
+
+    def replace_before_copy(
+        _source: Path,
+        target: Path,
+        *,
+        copy_function,
+        **_kwargs: object,
+    ) -> None:
+        target.mkdir(parents=True)
+        raced.unlink()
+        os.mkfifo(raced)
+        copy_function(str(raced), str(target / raced.name))
+
+    monkeypatch.setattr(
+        docker_executor_module.shutil,
+        "copytree",
+        replace_before_copy,
+    )
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="host service socket or other special file",
+    ):
+        DockerExecutor._snapshot_working_directory(str(source), destination)
+
+    assert not destination.exists()
 
 
 @pytest.mark.asyncio
