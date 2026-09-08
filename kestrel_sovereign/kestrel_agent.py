@@ -1464,14 +1464,17 @@ class KestrelAgent(
         # USER_DENIED gets misclassified as SANDBOX_BLOCKED from
         # the raw "rejected by user" pattern alone. Best-effort:
         # adapters that don't expose ``attach_agent_for_audit``
-        # (legacy / external) are silently skipped.
+        # (legacy / external) are silently skipped, and an adapter whose
+        # attach raises is logged and skipped too: this module binds no
+        # ``logger`` name, so the old ``logger.debug`` here raised NameError
+        # out of __init__ and the agent never constructed (#3261).
         for provider in getattr(self.llm_service, "providers", []):
             adapter = provider.get("adapter")
             if adapter is not None and hasattr(adapter, "attach_agent_for_audit"):
                 try:
                     adapter.attach_agent_for_audit(self)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug(
+                    logging.getLogger(__name__).debug(
                         "attach_agent_for_audit failed on %s: %s",
                         type(adapter).__name__, exc,
                     )
