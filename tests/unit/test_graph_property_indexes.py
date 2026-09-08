@@ -84,14 +84,17 @@ class TestJsonPathIndexes:
 
     @pytest.mark.asyncio
     async def test_indexes_exist_after_init(self, db):
-        """The three JSON-path indexes must be created during _init_schema."""
+        """The JSON-path indexes must be created during _init_schema."""
         rows = await db.fetchall(
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_graph_nodes_%'",
         )
         names = {r[0] for r in rows}
         assert "idx_graph_nodes_agent" in names
         assert "idx_graph_nodes_action_status" in names
-        assert "idx_graph_nodes_action_created" in names
+        # The created-at indexes carry ensure_index's definition fingerprint
+        # (#3255): assert the family, not one spelling of its name.
+        for family in ("idx_graph_nodes_action_created", "idx_graph_nodes_todo_created"):
+            assert any(n.startswith(family + "_") for n in names), (family, sorted(names))
 
     @pytest.mark.asyncio
     async def test_idempotent_schema_init(self, db):
@@ -110,18 +113,30 @@ class TestJsonPathIndexes:
 
 class TestPostgresIndexParity:
     """Verify that _POSTGRES_JSON_INDEXES defines the same logical indexes
-    as the SQLite block, including the created_at expression index."""
+    as the SQLite block. The created-at expression indexes are declared
+    apart from both blocks and go through ``ensure_index`` (#3255)."""
 
-    def test_postgres_has_created_at_index(self):
-        from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
-        assert "idx_graph_nodes_action_created" in _POSTGRES_JSON_INDEXES
+    def test_created_at_indexes_are_declared_once_for_both_node_types(self):
+        from kestrel_sovereign.storage.async_database import (
+            _GRAPH_CREATED_AT_INDEXES,
+            _POSTGRES_JSON_INDEXES,
+            _SQLITE_JSON_INDEXES,
+        )
+        # Both families go through ensure_index, not the DDL blocks (#3255).
+        assert dict(_GRAPH_CREATED_AT_INDEXES) == {
+            "idx_graph_nodes_action_created": "action_item",
+            "idx_graph_nodes_todo_created": "todo_item",
+        }
+        for block in (_POSTGRES_JSON_INDEXES, _SQLITE_JSON_INDEXES):
+            assert "created_at" not in block
 
-    def test_postgres_created_at_targets_action_item(self):
-        from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
-        # The index should be a partial index filtered to action_item
-        assert "node_type = 'action_item'" in _POSTGRES_JSON_INDEXES.split(
-            "idx_graph_nodes_action_created"
-        )[1].split(";")[0]
+    def test_postgres_created_at_index_matches_the_ordering(self):
+        from kestrel_sovereign.storage.async_database import graph_created_at_index_columns
+        # Postgres: DESC NULLS LAST matches the created-ordered query; a plain
+        # ASC index would leave it a sequential scan. SQLite: no NULLS clause
+        # (its CREATE INDEX rejects one, and its DESC is already NULLS LAST).
+        assert graph_created_at_index_columns("postgres") == "((properties::jsonb->>'created_at')) DESC NULLS LAST"
+        assert graph_created_at_index_columns("sqlite") == "json_extract(properties, '$.created_at')"
 
 
 # =====================================================================

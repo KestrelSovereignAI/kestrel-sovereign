@@ -16,7 +16,6 @@ given writer.
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -27,10 +26,17 @@ ROOT = Path(__file__).resolve().parents[2]
 SCAN_ROOT = ROOT / "kestrel_sovereign"
 
 # A naive stamp assigned to a created_at key, allowing whitespace/newlines:
-# a bare now(), a naive utcnow(), or str() of either.
+# a bare now(), a naive utcnow(), or str() of either, in the dict-literal or
+# keyword form; and, in the dict-literal form only, str() of a looked-up
+# value (a ledger's day-granular date or an empty string copied verbatim;
+# #3255). A graph property dict is always a literal here; the keyword form
+# is a dataclass constructor (a model-catalog record carries a created_at
+# that is not a graph property), so the stringified-lookup shape is not
+# scanned there. A value in the contract goes through a helper, never str().
 _NAIVE_CREATED_AT = re.compile(
-    r"(?:[\"']created_at[\"']\s*:|\bcreated_at\s*=)\s*"
+    r"(?:(?:[\"']created_at[\"']\s*:|\bcreated_at\s*=)\s*"
     r"(?:datetime\.(?:now|utcnow)\(\)\.isoformat\(\)|str\(datetime\.(?:now|utcnow)\(\)\))"
+    r"|[\"']created_at[\"']\s*:\s*str\(\s*\w+(?:\.get)?\()"
 )
 
 
@@ -42,18 +48,6 @@ def _sources():
     return sources
 
 
-@pytest.fixture
-def new_york_clock(monkeypatch):
-    """A non-UTC process zone, undone in the right order: ``monkeypatch``
-    restores ``TZ`` at teardown but ``tzset()`` is what the C library reads,
-    and on glibc the cached zone outlives the variable."""
-    monkeypatch.setenv("TZ", "America/New_York")
-    time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
-
-
 def test_scanner_recognises_the_removed_shape():
     """Positive control: the exact text this ticket removed is caught, and
     the sibling naive shapes with it."""
@@ -61,6 +55,11 @@ def test_scanner_recognises_the_removed_shape():
     assert _NAIVE_CREATED_AT.search('created_at=datetime.now().isoformat()')
     assert _NAIVE_CREATED_AT.search('"created_at": datetime.utcnow().isoformat()')
     assert _NAIVE_CREATED_AT.search('"created_at": str(datetime.now())')
+    assert _NAIVE_CREATED_AT.search('        "created_at": str(entry.get("date") or ""),')
+    assert _NAIVE_CREATED_AT.search('"created_at": str(row.get("blocked_since") or "")')
+    assert not _NAIVE_CREATED_AT.search('"created_at": contract_created_at(row.get("recorded_at"))')
+    # A constructor keyword is not a graph property: outside the lookup scan.
+    assert not _NAIVE_CREATED_AT.search('created_at=str(m.get("created")) if m.get("created") else None')
     assert not _NAIVE_CREATED_AT.search('"created_at": datetime.now(timezone.utc).isoformat()')
 
 
