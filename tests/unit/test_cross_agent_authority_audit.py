@@ -7555,6 +7555,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "shutdown",
         "start",
         "stop",
+        "suspend",
         "terminate",
         "unregister",
         "withdraw",
@@ -7783,11 +7784,24 @@ def _is_cross_agent_state_mutation_call(
             call.func.value, state_object_aliases
         )
     )
-    lifecycle_mutation = (
-        isinstance(call.func, ast.Attribute)
-        and _is_cross_agent_lifecycle_action(call.func.attr)
-        and _is_cross_agent_state_object_reference(
-            call.func.value, state_object_aliases
+    lifecycle_target_arguments = [
+        *call.args,
+        *(keyword.value for keyword in call.keywords),
+    ]
+    lifecycle_mutation = _is_cross_agent_lifecycle_action(
+        _call_name(call)
+    ) and (
+        (
+            isinstance(call.func, ast.Attribute)
+            and _is_cross_agent_state_object_reference(
+                call.func.value, state_object_aliases
+            )
+        )
+        or any(
+            _is_cross_agent_state_object_reference(
+                argument, state_object_aliases
+            )
+            for argument in lifecycle_target_arguments
         )
     )
     return (
@@ -15704,7 +15718,16 @@ def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> N
 
 @pytest.mark.parametrize(
     "method",
-    ["start", "pause", "resume", "disable", "enable", "delete", "retire"],
+    [
+        "start",
+        "pause",
+        "resume",
+        "disable",
+        "enable",
+        "delete",
+        "retire",
+        "suspend",
+    ],
 )
 def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
     method: str,
@@ -15739,6 +15762,32 @@ def test_provenance_scanner_classifies_async_lifecycle_method_variants(
         "async def dispatch(request, metrics):\n"
         "    if request.causation_chain:\n"
         f"        await metrics.{method}()\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {2}
+    assert _authority_provenance_lines(benign) == set()
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "manager.start(child)",
+        "manager.suspend(target=peer)",
+        "restart(child)",
+    ],
+)
+def test_provenance_scanner_classifies_generic_lifecycle_target_arguments(
+    dispatch: str,
+) -> None:
+    controlled = ast.parse(
+        "def dispatch(request, manager, child, peer):\n"
+        "    if request.causation_chain:\n"
+        f"        {dispatch}\n"
+    )
+    benign = ast.parse(
+        "def dispatch(request, manager, metrics):\n"
+        "    if request.causation_chain:\n"
+        "        manager.start(metrics)\n"
     )
 
     assert _authority_provenance_lines(controlled) == {2}
