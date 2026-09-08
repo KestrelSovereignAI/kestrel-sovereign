@@ -104,7 +104,10 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     package for those shapes and fails when one appears or disappears. A
     single-attribute copy (``getattr(agent, "did", …)`` plus its own type
     check, or a scope taken from a manager's ``host_agent_id``) is NOT in
-    that scan; several exist over other tables (#3251). Before adding a
+    that scan. The other-table copies #3251 named (the reflection-status
+    route, the wait reconciler, the scheduler's notice retention sweep, the
+    restart coordinator, the memory reflection hook, the scheduler liveness
+    check, and the service-key resolver) are routed here. Before adding a
     copy of either kind, route through here; if a site genuinely cannot,
     register it in that test with its reason.
 

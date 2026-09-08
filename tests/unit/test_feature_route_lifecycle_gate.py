@@ -17,6 +17,20 @@ actual server/app path, asserting:
   feature's receiver — a disabled feature's webhook stops dispatching (404) and
   resumes on re-enable — proving the receiver set is live, not a stale startup
   snapshot.
+
+Mutation notes (#3258). The match gate (``_gated_matches`` in ``server.py``)
+and the dispatch gate (``_feature_route_gone_response``) refuse the same
+routes with outcomes a plain 404 or a bare disconnect cannot tell apart.
+The assertions that pin the MATCH gate specifically are the websocket close
+code (1000 from the match gate, 1008 from dispatch) and the wrong-method
+requests to a refused path (404 from the match gate; a neutered match gate
+lets Starlette answer 405). Mutants that must fail this module:
+``_gated_matches`` returning Starlette's match unconditionally; its
+live-route check dropped; ``_resolve_live_route_agent`` rebinding with
+more than one survivor (``if survivors:``) or keeping a scoped agent the
+manager no longer lists (``return scoped_agent``). Its ``agent is None``
+guards are redundant with ``_live_feature_route(None, ...) -> None`` and
+are equivalent mutants: dropping one changes nothing observable.
 """
 
 import os
@@ -25,7 +39,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from anyio import ClosedResourceError
 from fastapi import APIRouter, Depends, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -431,11 +444,16 @@ def test_disabled_websocket_feature_route_is_not_matched():
                 assert websocket.receive_text() == "enabled"
 
             feature.enabled = False
-            with pytest.raises((WebSocketDisconnect, ClosedResourceError)):
+            # Refused at the MATCH gate: Starlette's not-found close is 1000.
+            # The dispatch gate closes with 1008, so a neutered match gate
+            # that let the route match and then refused at dispatch would
+            # fail here (#3258).
+            with pytest.raises(WebSocketDisconnect) as refused:
                 with client.websocket_connect(
                     "/test-feature-lifecycle/ws", headers=headers
                 ):
                     pass
+            assert refused.value.code == 1000, refused.value.code
     finally:
         restore()
 
@@ -1125,6 +1143,11 @@ def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_
                 _reorder(agents, *order)
                 response = client.get(path, headers=headers)
                 assert response.status_code == 404, order
+                # The MATCH gate refuses the ambiguous path, not only
+                # dispatch: a wrong-method request is Starlette's PARTIAL
+                # match, which only the match gate can turn into 404 (a
+                # neutered match gate answers 405 here) (#3258).
+                assert client.post(path, headers=headers).status_code == 404, order
                 assert bob.served == 0 and carol.served == 0, order
 
             assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
@@ -1182,6 +1205,8 @@ def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
         with TestClient(app) as client:
             agents.pop("alice")
             assert client.get(path, headers=headers).status_code == 404
+            # Refused at the match gate: wrong method is 404, never 405 (#3258).
+            assert client.post(path, headers=headers).status_code == 404
 
             bob.enabled = False
             assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
@@ -1189,6 +1214,7 @@ def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
 
             bob.enabled = True
             assert client.get(path, headers=headers).status_code == 404
+            assert client.post(path, headers=headers).status_code == 404
 
             agents["bob"].features.pop("ProxyFeature")
             assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
