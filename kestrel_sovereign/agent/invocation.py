@@ -66,6 +66,15 @@ class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
 
 
+class InvocationSelfFencedError(InvocationCancelledError):
+    """An invocation stopped because its infrastructure lease became unsafe.
+
+    Unlike ``InvocationCancelledError``, this is not evidence that an operator
+    requested or received an acknowledged Stop. Durable ingress must therefore
+    keep the work retryable instead of consuming it as a terminal no-op.
+    """
+
+
 def validate_invocation_id(value: object) -> str:
     """Return a bounded opaque invocation id or reject an invalid one."""
     if not isinstance(value, str) or not (1 <= len(value) <= MAX_INVOCATION_ID_LENGTH):
@@ -365,7 +374,20 @@ def bind_async_invocation(
                             if callable(is_cancelled) and is_cancelled(
                                 lifecycle_owner, invocation_id
                             ):
-                                raise InvocationCancelledError(
+                                is_self_fenced = getattr(
+                                    type(lifecycle_owner),
+                                    "is_request_self_fenced",
+                                    None,
+                                )
+                                cancellation_error = (
+                                    InvocationSelfFencedError
+                                    if callable(is_self_fenced)
+                                    and is_self_fenced(
+                                        lifecycle_owner, invocation_id
+                                    )
+                                    else InvocationCancelledError
+                                )
+                                raise cancellation_error(
                                     "isolated invocation was stopped after "
                                     "operation completion "
                                     f"({invocation_log_correlation(invocation_id)})"
@@ -378,7 +400,20 @@ def bind_async_invocation(
                                 > caller_cancellation_baseline
                             ):
                                 raise
-                            raise InvocationCancelledError(
+                            is_self_fenced = getattr(
+                                type(lifecycle_owner),
+                                "is_request_self_fenced",
+                                None,
+                            )
+                            cancellation_error = (
+                                InvocationSelfFencedError
+                                if callable(is_self_fenced)
+                                and is_self_fenced(
+                                    lifecycle_owner, invocation_id
+                                )
+                                else InvocationCancelledError
+                            )
+                            raise cancellation_error(
                                 "isolated invocation was cancelled "
                                 f"({invocation_log_correlation(invocation_id)})"
                             ) from error

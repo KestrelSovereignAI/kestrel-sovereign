@@ -48,7 +48,10 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
 )
-from kestrel_sovereign.agent.invocation import InvocationCancelledError
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    InvocationSelfFencedError,
+)
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
@@ -2001,6 +2004,48 @@ async def test_acknowledged_stop_terminalizes_durable_cognition(tmp_path):
         ).disposition is DurableAdmissionDisposition.TERMINAL
         assert (await retry.wait()).status is Status.COALESCED
         stopped_turn.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_self_fence_keeps_durable_cognition_retryable(
+    tmp_path,
+):
+    """Lease loss is not durable evidence that an operator requested Stop."""
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "self-fenced-cognition-retries.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    agent.process_input = AsyncMock(
+        side_effect=InvocationSelfFencedError(
+            "distributed Stop owner self-fenced after lease loss"
+        )
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        initial = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "self-fenced-cognition"),
+            source_event_id="telegram:update:self-fenced-cognition",
+            consumer_id=consumer.consumer_id,
+        )
+        result = await initial.wait()
+        [delivery] = await dispatcher.list_durable_deliveries()
+
+        assert result.status is Status.FAILED
+        assert delivery.status == RETRY
+        assert delivery.attempts == 1
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)

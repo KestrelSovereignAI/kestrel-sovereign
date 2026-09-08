@@ -6,6 +6,10 @@ from uuid import uuid4
 
 import pytest
 
+from kestrel_sovereign.agent.invocation import (
+    InvocationSelfFencedError,
+    bind_async_invocation,
+)
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
@@ -22,6 +26,46 @@ class _ReplicaAgent(RequestLifecycleMixin):
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
         self._current_request_id = None
+
+
+class _SelfFencingReplicaAgent(_ReplicaAgent):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id)
+        self.operation_started = asyncio.Event()
+        self.release_operation = asyncio.Event()
+
+    @bind_async_invocation("request_id", track_request_lifecycle=True)
+    async def run_turn(self, request_id: str) -> str:
+        self.operation_started.set()
+        await self.release_operation.wait()
+        return request_id
+
+
+@pytest.mark.asyncio
+async def test_owner_lease_self_fence_has_distinct_cancellation_provenance(
+    tmp_path,
+):
+    """A lease failure cancels work without forging acknowledged Stop."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "self-fence-provenance.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store)
+    agent = _SelfFencingReplicaAgent("did:test:self-fence-provenance")
+    registry.attach(agent)
+    turn = asyncio.create_task(agent.run_turn("lease-owned-turn"))
+    try:
+        await agent.operation_started.wait()
+        registry._fail_closed_owner()
+
+        with pytest.raises(InvocationSelfFencedError):
+            await turn
+    finally:
+        agent.release_operation.set()
+        await registry.close()
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -460,7 +504,8 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, timeout=0.5)
         assert replica_a._lease_lost is True
-        assert await replica_a.register(agent, "later-turn", 2) is False
+        with pytest.raises(InvocationSelfFencedError):
+            await replica_a.register(agent, "later-turn", 2)
     finally:
         store.poll_owner = original_poll
         if not operation.done():
@@ -578,7 +623,8 @@ async def test_lease_loss_after_insert_retries_provisional_generation_cleanup(
     store.register = lose_lease_after_insert
     store.complete = flaky_complete
     try:
-        assert await registry.register(agent, "provisional-turn", 1) is False
+        with pytest.raises(InvocationSelfFencedError):
+            await registry.register(agent, "provisional-turn", 1)
         for _ in range(100):
             rows = await db.fetchall(
                 "SELECT generation_id FROM stop_active_invocations"

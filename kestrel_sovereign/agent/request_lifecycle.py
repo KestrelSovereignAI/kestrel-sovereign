@@ -163,6 +163,11 @@ class RequestLifecycleMixin:
             set,
         ):
             self._cancelled_request_generations = set()
+        if not isinstance(
+            getattr(self, "_self_fenced_request_generations", None),
+            set,
+        ):
+            self._self_fenced_request_generations = set()
         if not isinstance(getattr(self, "_active_request_counts", None), dict):
             self._active_request_counts = {}
         counts = self._active_request_counts
@@ -496,6 +501,43 @@ class RequestLifecycleMixin:
         )
         return True
 
+    def self_fence_current_request(
+        self,
+        request_id: str,
+        *,
+        generation: int,
+    ) -> bool:
+        """Cancel one generation while preserving infrastructure provenance."""
+
+        fenced = getattr(self, "_self_fenced_request_generations", None)
+        if not isinstance(fenced, set):
+            fenced = set()
+            self._self_fenced_request_generations = fenced
+        key = (request_id, generation)
+        fenced.add(key)
+        try:
+            cancelled = self.cancel_current_request(
+                request_id=request_id,
+                generation=generation,
+            )
+        except BaseException:
+            fenced.discard(key)
+            raise
+        if not cancelled:
+            fenced.discard(key)
+        return cancelled
+
+    def is_request_self_fenced(self, request_id: str) -> bool:
+        """Whether this task's generation was cancelled by lease self-fencing."""
+
+        generation = self._request_generation_for_current_task(request_id)
+        fenced = getattr(self, "_self_fenced_request_generations", None)
+        return bool(
+            generation is not None
+            and isinstance(fenced, set)
+            and (request_id, generation) in fenced
+        )
+
     def is_request_cancelled(self, request_id: Optional[str] = None) -> bool:
         """Check if a request has been cancelled."""
         rid = request_id or self._current_request_id
@@ -799,6 +841,13 @@ class RequestLifecycleMixin:
                 self._cancelled_requests.discard(request_id)
         else:
             self._cancelled_requests.discard(request_id)
+        self_fenced = getattr(
+            self,
+            "_self_fenced_request_generations",
+            None,
+        )
+        if isinstance(self_fenced, set) and generation is not None:
+            self_fenced.discard((request_id, generation))
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.

@@ -3901,7 +3901,10 @@ class SignalDispatcher:
         from kestrel_sovereign.agent.context_manager import (
             reset_injection_tracking,
         )
-        from kestrel_sovereign.agent.invocation import InvocationCancelledError
+        from kestrel_sovereign.agent.invocation import (
+            InvocationCancelledError,
+            InvocationSelfFencedError,
+        )
 
         reset_injection_tracking()
 
@@ -3957,6 +3960,18 @@ class SignalDispatcher:
                         "kestrel.signal.status", result.status.value
                     )
                 return result
+        except InvocationSelfFencedError as error:
+            # Losing the distributed owner lease is a fail-closed
+            # infrastructure decision, not receipt-backed evidence that an
+            # operator requested Stop. Keep durable ingress retryable.
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"invocation_self_fenced: {error}",
+                registration=registration,
+                audit=audit,
+            )
         except InvocationCancelledError as error:
             # Cooperative Stop is neither a provider failure nor retry
             # authority. Preserve the ordinary route audit while carrying a

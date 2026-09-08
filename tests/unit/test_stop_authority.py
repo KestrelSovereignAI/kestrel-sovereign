@@ -1093,6 +1093,67 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
     assert "in-transit-turn" in agent._pending_request_cancellations
 
 
+def test_stop_endpoint_declares_and_enforces_an_admission_rate_limit(
+    isolated_process_rate_limiter,
+) -> None:
+    """Fresh caller-controlled receipt IDs must not bypass HTTP admission."""
+
+    from slowapi.errors import RateLimitExceeded
+    from starlette.requests import Request
+
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import stop_agent_request
+    from kestrel_sovereign.rate_limit import limiter
+
+    endpoint_key = (
+        f"{stop_agent_request.__module__}.{stop_agent_request.__name__}"
+    )
+
+    assert endpoint_key in limiter._route_limits
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/agent/stop",
+            "headers": [],
+            "query_string": b"",
+            "scheme": "https",
+            "server": ("kestrel.test", 443),
+            "client": ("10.0.0.1", 1234),
+        }
+    )
+    request.state.caller = CallerContext.authenticated("one@example.test")
+    unwrapped_endpoint = stop_agent_request.__wrapped__
+    for _ in range(120):
+        limiter._check_request_limit(request, unwrapped_endpoint, False)
+    with pytest.raises(RateLimitExceeded):
+        limiter._check_request_limit(request, unwrapped_endpoint, False)
+
+
+def test_stop_admission_bucket_is_principal_scoped_and_opaque() -> None:
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import _stop_rate_limit_key
+
+    def request_for(identity: str, host: str):
+        return SimpleNamespace(
+            state=SimpleNamespace(
+                caller=CallerContext.authenticated(identity)
+            ),
+            client=SimpleNamespace(host=host),
+        )
+
+    first = _stop_rate_limit_key(request_for("one@example.test", "10.0.0.1"))
+    same_principal = _stop_rate_limit_key(
+        request_for("one@example.test", "10.0.0.2")
+    )
+    second = _stop_rate_limit_key(request_for("two@example.test", "10.0.0.1"))
+
+    assert first == same_principal
+    assert first != second
+    assert "one@example.test" not in first
+
+
 def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
     from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 

@@ -22,7 +22,10 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     raise_owned_outcome,
 )
-from kestrel_sovereign.agent.invocation import validate_invocation_id
+from kestrel_sovereign.agent.invocation import (
+    InvocationSelfFencedError,
+    validate_invocation_id,
+)
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type,
     database_now_sql,
@@ -753,13 +756,17 @@ class DistributedInvocationRegistry:
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
         if self._lease_lost:
-            return False
+            raise InvocationSelfFencedError(
+                "distributed Stop owner lease was already lost"
+            )
         key = (id(agent), turn_id, generation)
 
         async def publish() -> bool:
             async with self._registration_lock:
                 if self._lease_lost:
-                    return False
+                    raise InvocationSelfFencedError(
+                        "distributed Stop owner lease was lost before admission"
+                    )
                 last_heartbeat = self._last_heartbeat_monotonic
                 if (
                     self._active
@@ -768,7 +775,9 @@ class DistributedInvocationRegistry:
                     >= self._owner_lease_seconds
                 ):
                     self._fail_closed_owner()
-                    return False
+                    raise InvocationSelfFencedError(
+                        "distributed Stop owner lease expired before admission"
+                    )
                 if key in self._by_local_generation:
                     return True
                 generation_id = uuid4().hex
@@ -788,7 +797,9 @@ class DistributedInvocationRegistry:
                 self._active[generation_id] = (agent, turn_id, generation)
                 if self._lease_lost:
                     self.complete_soon(agent, turn_id, generation)
-                    return False
+                    raise InvocationSelfFencedError(
+                        "distributed Stop owner lease was lost during admission"
+                    )
                 self._last_heartbeat_monotonic = (
                     asyncio.get_running_loop().time()
                 )
@@ -814,7 +825,9 @@ class DistributedInvocationRegistry:
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
         if self._lease_lost:
-            return False
+            raise InvocationSelfFencedError(
+                "distributed Stop owner lease was lost before turn binding"
+            )
         key = (id(agent), request_id, generation)
         generation_id = self._by_local_generation.get(key)
         if generation_id is None:
@@ -946,10 +959,22 @@ class DistributedInvocationRegistry:
             return
         self._lease_lost = True
         for agent, turn_id, generation in tuple(self._active.values()):
+            self_fence = getattr(
+                type(agent),
+                "self_fence_current_request",
+                None,
+            )
             cancel = getattr(agent, "cancel_current_request", None)
-            if callable(cancel):
+            if callable(self_fence) or callable(cancel):
                 try:
-                    cancel(request_id=turn_id, generation=generation)
+                    if callable(self_fence):
+                        self_fence(
+                            agent,
+                            request_id=turn_id,
+                            generation=generation,
+                        )
+                    else:
+                        cancel(request_id=turn_id, generation=generation)
                 except Exception:
                     logger.exception(
                         "Distributed Stop owner self-fence cancellation failed"
