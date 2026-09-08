@@ -1554,7 +1554,7 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
     monkeypatch,
     tmp_path,
 ):
-    """A missing rollback witness is named and no host store is handed off."""
+    """A missing rollback witness is named before any host storage is opened."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.sqla import session as session_module
@@ -1574,7 +1574,12 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
             events.append("factory-close")
 
     async def _sqlite(_cls, _path):
+        events.append("db-open")
         return _DB()
+
+    def _make_session_factory(_db):
+        events.append("factory-open")
+        return _InnerFactory()
 
     async def _postgres_hold_initializer(
         _primary_dsn,
@@ -1595,15 +1600,17 @@ async def test_postgres_hold_without_independent_evidence_fails_closed_at_boot(
     monkeypatch.setattr(
         session_module,
         "make_session_factory",
-        lambda _db: _InnerFactory(),
+        _make_session_factory,
     )
 
-    context = await build_host_context(db_path=str(tmp_path / "host.db"))
+    database = tmp_path / "host.db"
+    context = await build_host_context(db_path=str(database))
 
     assert context.db is None
     assert context.hold_store is None
     assert "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required" in context.backend_error
-    assert events == ["factory-close", "db-close"]
+    assert events == []
+    assert not database.exists()
 
 
 @pytest.mark.asyncio
