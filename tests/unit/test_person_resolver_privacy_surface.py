@@ -91,10 +91,17 @@ def router_log():
 
 
 def test_the_governed_facade_still_refuses_the_raw_handle(governed):
-    """The proxy's default-deny boundary is intact; the fix is the reader."""
-    wrapper, _storage = governed
+    """The proxy's default-deny boundary is intact; the fix is the reader.
+    The router hands its resolver the very facade it was given, so the
+    resolver's graph refuses the raw handle too (a resolver built over the
+    underlying store would answer the same reads but bypass the boundary)."""
+    wrapper, storage = governed
     with pytest.raises(PrivacyViolationError, match="refuses to forward 'db'"):
         wrapper.graph.db
+    router = SchemaRouter(graph=wrapper.graph, db=storage.db, agent_id=AGENT)
+    assert router.person_resolver.graph is router.graph
+    with pytest.raises(PrivacyViolationError, match="refuses to forward 'db'"):
+        router.person_resolver.graph.db
 
 
 @pytest.mark.asyncio
