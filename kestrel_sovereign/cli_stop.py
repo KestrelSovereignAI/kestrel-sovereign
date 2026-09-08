@@ -11,6 +11,8 @@ import uuid
 from typing import Any
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+
+
 _CONFIRMED_DISPOSITIONS = frozenset({"stopped", "already_complete"})
 
 
@@ -139,7 +141,8 @@ def cmd_stop(args) -> int:
 
     resolved = _stop_endpoint(args)
     if resolved is None:
-        print(f"Stop target '{args.name}' is not configured or is unreachable.")
+        target = "all agents" if args.all else f"'{args.name}'"
+        print(f"Stop target {target} is not configured or is unreachable.")
         return 1
     url, api_key = resolved
     if not api_key:

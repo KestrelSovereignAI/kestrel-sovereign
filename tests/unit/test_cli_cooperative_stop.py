@@ -55,6 +55,18 @@ def test_stop_requires_exactly_one_agent_or_all(capsys):
     assert "exactly one" in capsys.readouterr().out
 
 
+def test_unreachable_fleet_stop_names_all_agents_not_none(capsys):
+    with patch(
+        "kestrel_sovereign.cli_stop._stop_endpoint",
+        return_value=None,
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 1
+
+    output = capsys.readouterr().out
+    assert "all agents" in output
+    assert "None" not in output
+
+
 def test_host_stop_resolution_probes_live_host_for_accepted_sovereign_key(tmp_path):
     from kestrel_sovereign import cli
 
