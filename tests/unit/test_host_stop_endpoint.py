@@ -126,6 +126,37 @@ def test_host_stop_requires_sovereign_not_merely_authenticated_identity():
     agent.cancel_current_request.assert_not_called()
 
 
+def test_host_stop_status_is_caller_scoped_and_counts_live_agents():
+    active = _agent("did:test:active", {"turn-a", "turn-b"})
+    idle = _agent("did:test:idle")
+    app, manager = _app(
+        agents={"Active": active, "Idle": idle},
+        caller=CallerContext.sovereign(identity="sovereign-key"),
+    )
+
+    response = TestClient(app).get("/api/host/stop/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"can_stop": True, "in_flight_count": 1}
+    manager.list_agents.assert_called_once_with()
+    active.cancel_current_request.assert_not_called()
+    idle.cancel_current_request.assert_not_called()
+
+
+def test_host_stop_status_denies_control_without_hiding_live_inventory():
+    active = _agent("did:test:active", {"turn"})
+    app, _manager = _app(
+        agents={"Active": active},
+        caller=CallerContext.authenticated("operator@example.test"),
+    )
+
+    response = TestClient(app).get("/api/host/stop/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"can_stop": False, "in_flight_count": 1}
+    active.cancel_current_request.assert_not_called()
+
+
 def test_host_stop_preserves_partial_outcomes_and_continues_later_targets():
     broken = _agent("did:test:a-broken", {"broken-turn"})
     healthy = _agent("did:test:z-healthy", {"healthy-turn"})
@@ -257,9 +288,15 @@ def test_host_stop_rechecks_work_admitted_during_receipt_preflight():
 def test_server_mounts_host_stop_and_implementation_has_no_process_lifecycle():
     from kestrel_sovereign import server
     from kestrel_sovereign.endpoints import host_stop
+    from kestrel_sovereign.rate_limit import limiter
 
     paths = {getattr(route, "path", None) for route in server.app.routes}
     assert "/api/host/stop" in paths
+    assert "/api/host/stop/status" in paths
+    endpoint_key = (
+        f"{host_stop.stop_host.__module__}.{host_stop.stop_host.__name__}"
+    )
+    assert endpoint_key in limiter._route_limits
     source = inspect.getsource(host_stop)
     assert "process_manager" not in source
     assert ".terminate" not in source

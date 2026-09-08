@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
@@ -55,13 +56,18 @@ def _turn_request_bindings(
         for turn_id, binding in raw_bindings.items():
             if (
                 not isinstance(turn_id, str)
-                or not turn_id.strip()
                 or not isinstance(binding, tuple)
                 or len(binding) != 2
                 or not isinstance(binding[0], str)
-                or not binding[0].strip()
             ):
                 raise TypeError("agent turn binding inventory is malformed")
+            try:
+                validate_invocation_id(turn_id)
+                validate_invocation_id(binding[0])
+            except ValueError as error:
+                raise TypeError(
+                    "agent turn binding inventory is malformed"
+                ) from error
             request_ids[turn_id] = binding[0]
             generation = binding[1]
             if generation is not None:
@@ -82,12 +88,16 @@ def _turn_request_bindings(
         raw_index = class_index(agent) if callable(class_index) else {}
     if not isinstance(raw_index, dict) or any(
         not isinstance(turn_id, str)
-        or not turn_id.strip()
         or not isinstance(request_id, str)
-        or not request_id.strip()
         for turn_id, request_id in raw_index.items()
     ):
         raise TypeError("agent turn request inventory is malformed")
+    try:
+        for turn_id, request_id in raw_index.items():
+            validate_invocation_id(turn_id)
+            validate_invocation_id(request_id)
+    except ValueError as error:
+        raise TypeError("agent turn request inventory is malformed") from error
     return dict(raw_index), {}
 
 
@@ -96,6 +106,7 @@ def build_runtime_stop_target(
     *,
     agent_id: str,
     explicit_request_id: str | None = None,
+    explicit_turn_id: str | None = None,
     distributed_registry: Any | None = None,
 ) -> CooperativeStopTarget:
     """Snapshot one agent and bind its typed cooperative cancellation action."""
@@ -106,6 +117,10 @@ def build_runtime_stop_target(
         not isinstance(explicit_request_id, str) or not explicit_request_id
     ):
         raise ValueError("explicit Stop request identity must be concrete")
+    if explicit_turn_id is not None and (
+        not isinstance(explicit_turn_id, str) or not explicit_turn_id
+    ):
+        raise ValueError("explicit Stop turn identity must be concrete")
 
     active_at_resolution = _active_request_snapshot(
         agent,
@@ -113,15 +128,29 @@ def build_runtime_stop_target(
     )
     turn_request_ids, turn_request_generations = _turn_request_bindings(agent)
     turn_addresses = active_at_resolution.union(turn_request_ids)
+    if explicit_turn_id is not None and distributed_registry is not None:
+        turn_addresses = turn_addresses.union((explicit_turn_id,))
 
     async def cancel(stop_request: StopRequest) -> StopDisposition:
         distributed_ticket = None
         if distributed_registry is not None:
             if stop_request.scope is StopScope.TURN:
-                distributed_ticket = await distributed_registry.request_turn(
-                    agent_id,
-                    stop_request.target,
+                is_public_turn = (
+                    stop_request.target_is_turn_id
+                    or stop_request.turn_id != stop_request.target
                 )
+                if is_public_turn:
+                    distributed_ticket = (
+                        await distributed_registry.request_public_turn(
+                            agent_id,
+                            stop_request.turn_id,
+                        )
+                    )
+                else:
+                    distributed_ticket = await distributed_registry.request_turn(
+                        agent_id,
+                        stop_request.target,
+                    )
             else:
                 distributed_ticket = await distributed_registry.request_agent(
                     agent_id
@@ -130,48 +159,80 @@ def build_runtime_stop_target(
         cancel_current = getattr(agent, "cancel_current_request", None)
         if not callable(cancel_current):
             raise RuntimeError("agent has no cooperative request cancellation seam")
-        cancelled_request_ids: list[str | None] = []
+        cancelled_requests: list[tuple[str | None, int | None]] = []
         if stop_request.scope is StopScope.TURN:
-            cancel_kwargs: dict[str, object] = {"request_id": stop_request.target}
-            if stop_request.request_generation is not None:
-                cancel_kwargs["generation"] = stop_request.request_generation
-            cancelled = bool(cancel_current(**cancel_kwargs))
+            public_turn_is_remote = (
+                stop_request.target_is_turn_id
+                and stop_request.turn_id == stop_request.target
+            )
+            if public_turn_is_remote:
+                cancelled = False
+            else:
+                cancel_kwargs: dict[str, object] = {
+                    "request_id": stop_request.target
+                }
+                if stop_request.request_generation is not None:
+                    cancel_kwargs["generation"] = (
+                        stop_request.request_generation
+                    )
+                cancelled = bool(cancel_current(**cancel_kwargs))
             if cancelled:
-                cancelled_request_ids.append(stop_request.target)
+                cancelled_requests.append(
+                    (stop_request.target, stop_request.request_generation)
+                )
             else:
                 reserve = getattr(type(agent), "reserve_request_cancellation", None)
-                if stop_request.request_generation is None and callable(reserve):
+                if (
+                    not public_turn_is_remote
+                    and stop_request.request_generation is None
+                    and callable(reserve)
+                ):
                     reserve(agent, stop_request.target)
         else:
-            # Receipt preflight and claim I/O happen after the inventory
-            # snapshot. Re-read at cancellation linearization so an admitted
-            # turn cannot outlive an agent- or host-wide STOPPED receipt.
-            turns_to_cancel = active_at_resolution.union(
-                _active_request_snapshot(agent)
-            )
             cancelled = False
-            for request_id in sorted(turns_to_cancel):
-                request_cancelled = bool(cancel_current(request_id=request_id))
-                if request_cancelled:
-                    cancelled_request_ids.append(request_id)
-                cancelled = request_cancelled or cancelled
-            if not turns_to_cancel:
-                cancelled = bool(cancel_current(request_id=None))
-                if cancelled:
-                    cancelled_request_ids.append(None)
+            cancel_local_ticket = getattr(
+                type(distributed_registry),
+                "cancel_local_ticket",
+                None,
+            )
+            if distributed_ticket is not None and callable(cancel_local_ticket):
+                ticketed_local = cancel_local_ticket(
+                    distributed_registry,
+                    distributed_ticket,
+                )
+                cancelled_requests.extend(ticketed_local)
+                cancelled = bool(ticketed_local)
+            else:
+                # A local host re-reads at cancellation linearization so work
+                # admitted during receipt preflight cannot escape. A
+                # compatibility registry without UUID mapping uses the
+                # original durable snapshot and never widens after it.
+                turns_to_cancel = (
+                    active_at_resolution.union(_active_request_snapshot(agent))
+                    if distributed_ticket is None
+                    else active_at_resolution
+                )
+                for request_id in sorted(turns_to_cancel):
+                    request_cancelled = bool(
+                        cancel_current(request_id=request_id)
+                    )
+                    if request_cancelled:
+                        cancelled_requests.append((request_id, None))
+                    cancelled = request_cancelled or cancelled
+                if not turns_to_cancel:
+                    cancelled = bool(cancel_current(request_id=None))
+                    if cancelled:
+                        cancelled_requests.append((None, None))
 
         if cancelled:
             wait_for_completion = getattr(agent, "wait_for_request_completion", None)
             if not callable(wait_for_completion):
                 raise RuntimeError("agent cannot confirm request lifecycle completion")
             abandoned = False
-            for request_id in cancelled_request_ids:
+            for request_id, generation in cancelled_requests:
                 wait_kwargs: dict[str, object] = {}
-                if (
-                    stop_request.scope is StopScope.TURN
-                    and stop_request.request_generation is not None
-                ):
-                    wait_kwargs["generation"] = stop_request.request_generation
+                if generation is not None:
+                    wait_kwargs["generation"] = generation
                 completion = await wait_for_completion(request_id, **wait_kwargs)
                 abandoned = abandoned or (
                     completion is RequestCompletionDisposition.ABANDONED
@@ -197,6 +258,7 @@ def build_runtime_stop_target(
         turn_ids=frozenset(turn_addresses),
         turn_request_ids=turn_request_ids,
         turn_request_generations=turn_request_generations,
+        resolves_public_turns_durably=distributed_registry is not None,
     )
 
 

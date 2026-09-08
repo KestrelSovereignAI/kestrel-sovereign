@@ -1301,11 +1301,11 @@ def test_live_endpoint_bounds_durable_admissions_per_authenticated_caller():
                 "correlation_id": f"bounded-stop-{index}-{uuid4()}",
             },
         ).status_code
-        for index in range(61)
+        for index in range(121)
     ]
 
-    assert statuses[:60] == [200] * 60
-    assert statuses[60] == 429
+    assert statuses[:120] == [200] * 120
+    assert statuses[120] == 429
     assert client.post(
         "/api/agent/stop",
         headers={"X-Test-Caller": f"caller-b-{uuid4()}"},

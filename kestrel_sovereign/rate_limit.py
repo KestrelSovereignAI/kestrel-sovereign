@@ -13,7 +13,7 @@ from slowapi.util import get_remote_address
 from starlette.requests import Request
 
 
-STOP_ADMISSION_RATE_LIMIT = "60/minute"
+STOP_ADMISSION_RATE_LIMIT = "120/minute"
 _STOP_RATE_KEY_DOMAIN = b"kestrel:durable-stop-rate-limit:v1\0"
 
 

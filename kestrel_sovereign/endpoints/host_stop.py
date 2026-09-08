@@ -16,6 +16,7 @@ from kestrel_sovereign.rate_limit import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
+    CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopCleanupRegistry,
     StopDisposition,
@@ -76,6 +77,11 @@ def _sovereign_actor(request: Request) -> str:
     return identity if isinstance(identity, str) and identity.strip() else "api_key"
 
 
+def _caller_can_stop_host(request: Request) -> bool:
+    caller = getattr(request.state, "caller", None)
+    return isinstance(caller, CallerContext) and caller.is_sovereign
+
+
 def _host_agents(request: Request) -> tuple[tuple[str, object], ...]:
     manager = getattr(request.app.state, "agent_manager", None)
     if manager is not None:
@@ -101,6 +107,42 @@ def _host_agents(request: Request) -> tuple[tuple[str, object], ...]:
     return tuple(resolved)
 
 
+def _host_targets(request: Request) -> tuple[CooperativeStopTarget, ...]:
+    """Resolve the one live runtime snapshot shared by status and Stop."""
+
+    distributed_registry = getattr(
+        request.app.state,
+        "distributed_invocation_registry",
+        None,
+    )
+    return tuple(
+        build_runtime_stop_target(
+            candidate,
+            agent_id=agent_id,
+            distributed_registry=distributed_registry,
+        )
+        for agent_id, candidate in _host_agents(request)
+    )
+
+
+@router.get("/stop/status")
+async def host_stop_status(request: Request):
+    """Expose caller authority and authoritative live-agent work count."""
+
+    try:
+        targets = _host_targets(request)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="host_stop_inventory_unavailable",
+            message="Host Stop target inventory is unavailable.",
+        ) from error
+    return {
+        "can_stop": _caller_can_stop_host(request),
+        "in_flight_count": sum(bool(target.turn_ids) for target in targets),
+    }
+
+
 @router.post("/stop")
 @limiter.limit(
     STOP_ADMISSION_RATE_LIMIT,
@@ -114,21 +156,8 @@ async def stop_host(
     """Cooperatively stop every currently loaded agent; never stop a process."""
 
     actor_id = _sovereign_actor(request)
-    distributed_registry = getattr(
-        request.app.state,
-        "distributed_invocation_registry",
-        None,
-    )
     try:
-        candidates = _host_agents(request)
-        targets = tuple(
-            build_runtime_stop_target(
-                candidate,
-                agent_id=agent_id,
-                distributed_registry=distributed_registry,
-            )
-            for agent_id, candidate in candidates
-        )
+        targets = _host_targets(request)
     except (TypeError, ValueError, RuntimeError) as error:
         raise ApiHTTPException(
             status_code=503,
@@ -181,7 +210,15 @@ async def stop_host(
         if outcome.disposition
         in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
     )
-    if not targets:
+    empty_inventory = (
+        len(outcomes) == 1
+        and outcomes[0].scope is StopScope.HOST
+        and outcomes[0].requested_target is None
+        and outcomes[0].resolved_target == StopScope.HOST.value
+        and outcomes[0].agent_id == StopScope.HOST.value
+    )
+    target_count = 0 if empty_inventory else len(outcomes)
+    if empty_inventory:
         state = "empty"
     elif confirmed and unconfirmed:
         state = "partial"
@@ -190,9 +227,9 @@ async def stop_host(
     else:
         state = "confirmed"
     return {
-        "success": bool(targets) and not unconfirmed,
+        "success": target_count > 0 and not unconfirmed,
         "state": state,
-        "target_count": len(targets),
+        "target_count": target_count,
         "confirmed_count": len(confirmed),
         "unconfirmed_count": len(unconfirmed),
         "correlation_id": stop_request.correlation_id,
@@ -200,4 +237,4 @@ async def stop_host(
     }
 
 
-__all__ = ["HostStopBody", "router", "stop_host"]
+__all__ = ["HostStopBody", "host_stop_status", "router", "stop_host"]
