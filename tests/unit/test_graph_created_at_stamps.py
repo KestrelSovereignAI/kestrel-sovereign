@@ -5,36 +5,62 @@
 range filters, ordering and the scoped EPHEMERAL purge compare it
 lexicographically, so a naive local-time stamp sorts hours away from the UTC
 watermark on any non-UTC host. Two writers stamped ``datetime.now()`` bare;
-this module pins both and scans the tree so a third cannot land silently.
+this module pins both and scans the package for the literal naive shapes
+(``datetime.now().isoformat()``, ``datetime.utcnow().isoformat()``,
+``str(datetime.now())``) assigned to a ``created_at`` key, so a third copy of
+that shape cannot land silently. A stamp routed through a variable is
+outside the scan; the two site tests, not the scan, are the proof for a
+given writer.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCAN_ROOTS = [ROOT / "kestrel_sovereign", ROOT / "features"]
+# The feature packages live under the core package; there is no second root.
+SCAN_ROOT = ROOT / "kestrel_sovereign"
 
-# A naive stamp assigned to a created_at key, allowing whitespace/newlines.
+# A naive stamp assigned to a created_at key, allowing whitespace/newlines:
+# a bare now(), a naive utcnow(), or str() of either.
 _NAIVE_CREATED_AT = re.compile(
-    r"(?:[\"']created_at[\"']\s*:|\bcreated_at\s*=)\s*datetime\.now\(\)\.isoformat\(\)"
+    r"(?:[\"']created_at[\"']\s*:|\bcreated_at\s*=)\s*"
+    r"(?:datetime\.(?:now|utcnow)\(\)\.isoformat\(\)|str\(datetime\.(?:now|utcnow)\(\)\))"
 )
 
 
 def _sources():
-    for root in SCAN_ROOTS:
-        if root.exists():
-            yield from root.rglob("*.py")
+    sources = sorted(SCAN_ROOT.rglob("*.py"))
+    # The register must be able to fail: an empty walk is a broken scan,
+    # not a clean tree.
+    assert len(sources) > 500, len(sources)
+    return sources
+
+
+@pytest.fixture
+def new_york_clock(monkeypatch):
+    """A non-UTC process zone, undone in the right order: ``monkeypatch``
+    restores ``TZ`` at teardown but ``tzset()`` is what the C library reads,
+    and on glibc the cached zone outlives the variable."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
 
 
 def test_scanner_recognises_the_removed_shape():
-    """Positive control: the exact text this ticket removed is caught."""
+    """Positive control: the exact text this ticket removed is caught, and
+    the sibling naive shapes with it."""
     assert _NAIVE_CREATED_AT.search('                    "created_at": datetime.now().isoformat(),')
     assert _NAIVE_CREATED_AT.search('created_at=datetime.now().isoformat()')
+    assert _NAIVE_CREATED_AT.search('"created_at": datetime.utcnow().isoformat()')
+    assert _NAIVE_CREATED_AT.search('"created_at": str(datetime.now())')
     assert not _NAIVE_CREATED_AT.search('"created_at": datetime.now(timezone.utc).isoformat()')
 
 
@@ -55,7 +81,7 @@ def _assert_utc_iso(value: str):
 
 
 @pytest.mark.asyncio
-async def test_spawned_agent_node_created_at_is_utc(monkeypatch, tmp_path):
+async def test_spawned_agent_node_created_at_is_utc(monkeypatch, tmp_path, new_york_clock):
     """The spawn tool's SovereignAgent node carries a UTC stamp, whatever the
     host's local zone is."""
     from types import SimpleNamespace
@@ -68,9 +94,6 @@ async def test_spawned_agent_node_created_at_is_utc(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_module, "TRUSTED_AGENTS_DIR", str(tmp_path / "trusted"))
     monkeypatch.setattr(inception, "generate_kestrel_identity", lambda: ({"id": "did:kestrel:child"}, object()))
     monkeypatch.setattr(inception, "save_kestrel_identity", lambda doc, keys, path: None)
-    monkeypatch.setenv("TZ", "America/New_York")
-    import time
-    time.tzset()
 
     stored = []
     stub = SimpleNamespace(storage=SimpleNamespace(graph_store=SimpleNamespace(add_node=AsyncMock(side_effect=stored.append))))
@@ -82,17 +105,13 @@ async def test_spawned_agent_node_created_at_is_utc(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sovereignty_receipt_created_at_is_utc(monkeypatch):
+async def test_sovereignty_receipt_created_at_is_utc(monkeypatch, new_york_clock):
     from copy import deepcopy
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from kestrel_sovereign.features.sovereignty.feature import SovereigntyFeature
     from kestrel_sovereign.storage.providers.base import StorageResult, StorageTier
-
-    monkeypatch.setenv("TZ", "America/New_York")
-    import time
-    time.tzset()
 
     stored = []
     storage = MagicMock()
