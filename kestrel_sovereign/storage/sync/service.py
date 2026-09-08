@@ -270,6 +270,7 @@ class SyncService:
             frames_synced=0,
             timestamp=datetime.now(timezone.utc),
             metadata={"skipped": True, "policy_denied": True, "reason": reason},
+            attempted=False,
         )
 
     def _current_policy_context(self) -> Optional[RemoteTierPolicyContext]:
@@ -394,6 +395,7 @@ class SyncService:
                     bytes_synced=0,
                     frames_synced=0,
                     timestamp=datetime.now(timezone.utc),
+                    attempted=False,
                 )
             }
         results = await self.force_snapshot()

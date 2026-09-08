@@ -366,12 +366,38 @@ async def test_upload_budget_is_sized_from_the_content_too(client, mock_response
     assert budget.write == pytest.approx(size / client.UPLOAD_FLOOR_BYTES_PER_SECOND)
 
 
+@pytest.mark.asyncio
+async def test_download_is_given_the_transfer_budget_when_the_size_is_known(client):
+    """A cold-start restore of the same 1.2 GB CAR: the gateway assembles the
+    object before the first byte, so a known size buys the same patience."""
+    import httpx
+
+    resp = MagicMock()
+    resp.content = b"car"
+    resp.raise_for_status = MagicMock()
+    with patch.object(client, "_get_client") as mock_get:
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=resp)
+        mock_get.return_value = mock_http
+        await client.download("QmBig", expected_bytes=1_209_462_784)
+        sized = mock_http.get.await_args.kwargs["timeout"]
+        await client.download("QmSmall")
+        flat = mock_http.get.await_args.kwargs["timeout"]
+        await client.download("QmSmall", timeout=7.0, expected_bytes=1_209_462_784)
+        explicit = mock_http.get.await_args.kwargs["timeout"]
+
+    assert isinstance(sized, httpx.Timeout)
+    assert sized.read == pytest.approx(1_209_462_784 / client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+    assert flat == 120.0
+    assert explicit == 7.0
+
+
 def test_a_small_upload_keeps_the_default_budget(client):
-    budget = client.upload_timeout(1024)
+    budget = client.transfer_timeout(1024)
     assert budget.read == client.timeout and budget.write == client.timeout
 
 
 def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client):
     at_floor = int(client.timeout * client.UPLOAD_FLOOR_BYTES_PER_SECOND)
-    assert client.upload_timeout(at_floor).write == pytest.approx(client.timeout)
-    assert client.upload_timeout(at_floor * 3).write == pytest.approx(client.timeout * 3)
+    assert client.transfer_timeout(at_floor).write == pytest.approx(client.timeout)
+    assert client.transfer_timeout(at_floor * 3).write == pytest.approx(client.timeout * 3)

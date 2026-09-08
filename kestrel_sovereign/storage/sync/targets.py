@@ -116,6 +116,12 @@ class SyncResult:
     #: (the scheduled backup handler) can still say which kind of target
     #: failed without the URL-shaped ``target_name``.
     kind: str = ""
+    #: Whether the service called the target at all. ``False`` only for a
+    #: destination a policy denied and for the unchanged-DB placeholder the
+    #: change-aware snapshot returns; a target that found its content already
+    #: current was attempted and succeeded. Readers must not infer this from
+    #: ``metadata["skipped"]``, which the targets also set for that dedup.
+    attempted: bool = True
 
 
 class SyncTarget(ABC):

@@ -138,7 +138,7 @@ class LighthouseRestClient:
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
-            timeout=self.upload_timeout(len(content)),
+            timeout=self.transfer_timeout(len(content)),
         )
         response.raise_for_status()
 
@@ -148,8 +148,8 @@ class LighthouseRestClient:
             return data["data"]
         return data
 
-    def upload_timeout(self, payload_bytes: int) -> "httpx.Timeout":
-        """The request budget for uploading ``payload_bytes``.
+    def transfer_timeout(self, payload_bytes: int) -> "httpx.Timeout":
+        """The request budget for transferring ``payload_bytes`` either way.
 
         httpx applies ``read`` and ``write`` per socket operation, not per
         transfer: each chunk written and each read of the response headers
@@ -202,7 +202,7 @@ class LighthouseRestClient:
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
-            timeout=self.upload_timeout(len(car_bytes)),
+            timeout=self.transfer_timeout(len(car_bytes)),
         )
         response.raise_for_status()
 
@@ -211,7 +211,13 @@ class LighthouseRestClient:
             return data["data"]
         return data
 
-    async def download(self, cid: str, timeout: Optional[float] = None) -> bytes:
+    async def download(
+        self,
+        cid: str,
+        timeout: Optional[float] = None,
+        *,
+        expected_bytes: Optional[int] = None,
+    ) -> bytes:
         """
         Download content from IPFS gateway.
 
@@ -225,7 +231,16 @@ class LighthouseRestClient:
         client = await self._get_client()
         response = await client.get(
             f"{self.gateway_url}/{cid}",
-            timeout=timeout or 120.0,
+            # The gateway assembles the whole object before the first byte, so
+            # a known size buys the same payload-proportional patience as an
+            # upload; an explicit timeout wins, then the flat default.
+            timeout=(
+                timeout
+                if timeout is not None
+                else self.transfer_timeout(expected_bytes)
+                if expected_bytes
+                else 120.0
+            ),
         )
         response.raise_for_status()
         return response.content

@@ -155,19 +155,11 @@ def backup_target_failure_code(kind: object) -> str:
 #: pass is one of: every attempted target failed (there is no current
 #: snapshot), more than one but not every attempted target failed (a snapshot
 #: exists somewhere), or exactly one failed, named by its kind when the census
-#: knows it. Targets a policy denied or an unchanged fingerprint skipped were
-#: not attempted and count on neither side.
+#: knows it. A destination a policy denied, or the unchanged-DB placeholder,
+#: was not attempted (``SyncResult.attempted``) and counts on neither side.
 BACKUP_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
     {"BACKUP_ALL_TARGETS_FAILED", "BACKUP_TARGETS_FAILED", "BACKUP_TARGET_FAILED"}
 ) | frozenset(_BACKUP_TARGET_FAILED_BY_KIND.values())
-
-
-def _sync_result_skipped(result: Any) -> bool:
-    """Whether a sync result records that its target was not attempted
-    (``SyncService`` marks policy-denied targets and the unchanged-DB
-    placeholder with ``metadata["skipped"]``)."""
-    metadata = getattr(result, "metadata", None)
-    return bool(isinstance(metadata, dict) and metadata.get("skipped"))
 
 
 class SchedulerFeature(Feature):
@@ -1400,8 +1392,10 @@ class SchedulerFeature(Feature):
                     "bytes": result.bytes_synced,
                     "kind": result.kind,
                     # A destination a policy denied, or the unchanged-DB
-                    # marker, wrote nothing; it must not read as backed up.
-                    "skipped": _sync_result_skipped(result),
+                    # placeholder, was never called; it must not read as
+                    # backed up. (A target whose content was already current
+                    # was called and is a success.)
+                    "attempted": result.attempted,
                 }
                 for target, result in results.items()
             }
@@ -1415,7 +1409,7 @@ class SchedulerFeature(Feature):
             attempted = {
                 name: result
                 for name, result in results.items()
-                if not _sync_result_skipped(result)
+                if result.attempted
             }
             failed = {
                 name: result

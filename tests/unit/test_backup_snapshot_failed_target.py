@@ -65,7 +65,8 @@ from tests.unit.test_signals_scheduler_source import _FakeAgent
 
 
 def _result(
-    name: str, success: bool, kind: str = "", error: str | None = None, *, skipped: bool = False,
+    name: str, success: bool, kind: str = "", error: str | None = None, *,
+    attempted: bool = True, metadata: dict | None = None,
 ) -> SyncResult:
     """A real result, as ``SyncService.force_snapshot`` hands them back."""
     return SyncResult(
@@ -75,14 +76,22 @@ def _result(
         frames_synced=0,
         timestamp=datetime.now(UTC),
         error=error,
-        metadata={"skipped": True, "policy_denied": True} if skipped else None,
+        metadata=metadata,
         kind=kind,
+        attempted=attempted,
     )
 
 
 def _skipped(name: str, kind: str) -> SyncResult:
-    """A target the policy denied (or the unchanged-DB marker): not attempted."""
-    return _result(name, True, kind, skipped=True)
+    """A target the policy denied: never called, as ``_record_policy_skip`` records it."""
+    return _result(name, True, kind, attempted=False,
+                   metadata={"skipped": True, "policy_denied": True, "reason": "tier"})
+
+
+def _current(name: str, kind: str) -> SyncResult:
+    """A target that found its content already uploaded: called, and a success.
+    The targets mark this with ``metadata["skipped"]`` too."""
+    return _result(name, True, kind, metadata={"skipped": True, "cid": "QmCurrent"})
 
 
 def _results(*specs) -> dict[str, SyncResult]:
@@ -249,7 +258,35 @@ async def test_a_pass_where_nothing_was_attempted_is_not_a_failure(dispatcher_co
     assert result.status == Status.OK
     payload = json.loads(result.action_result)
     assert payload["success"] is True
-    assert payload["targets"]["lighthouse://agent"]["skipped"] is True
+    assert payload["targets"]["lighthouse://agent"]["attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_target_whose_content_was_already_current_counts_as_a_success(
+    dispatcher_components,
+):
+    """The ticket's own idle-DB shape: GCS found its content current (the
+    targets mark that with metadata["skipped"] too) and Lighthouse timed out.
+    GCS was called and holds a snapshot: one failed target, named by kind,
+    never 'no snapshot anywhere'."""
+    result = await _dispatch(dispatcher_components, _results(
+        _current("gs://bucket/prefix/agent", "gcs"),
+        ("lighthouse://agent", False, "lighthouse", "ReadTimeout: "),
+    ))
+    assert result.status == Status.FAILED
+    assert result.error.endswith("failed (BACKUP_TARGET_FAILED_LIGHTHOUSE)")
+
+
+@pytest.mark.asyncio
+async def test_the_artifact_marks_a_current_target_as_attempted(dispatcher_components):
+    result = await _dispatch(dispatcher_components, _results(
+        _current("gs://bucket/prefix/agent", "gcs"),
+        _skipped("lighthouse://agent", "lighthouse"),
+    ))
+    assert result.status == Status.OK
+    payload = json.loads(result.action_result)
+    assert payload["targets"]["gs://bucket/prefix/agent"]["attempted"] is True
+    assert payload["targets"]["lighthouse://agent"]["attempted"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +373,7 @@ async def test_a_fully_successful_pass_is_ok_and_its_artifact_carries_each_kind(
     assert payload["success"] is True
     assert "reason_code" not in payload and "error" not in payload
     assert payload["targets"]["lighthouse://agent"] == {
-        "success": True, "bytes": 0, "kind": "lighthouse", "skipped": False,
+        "success": True, "bytes": 0, "kind": "lighthouse", "attempted": True,
     }
 
 
@@ -363,7 +400,7 @@ async def test_the_error_string_names_kinds_and_recorded_errors_sorted():
         "backup_snapshot_failed: gcs (Forbidden: 403), lighthouse (ReadTimeout: ), undeclared"
     )
     assert "outcome" not in payload
-    assert set(payload["targets"]["gs://bucket/prefix/agent"]) == {"success", "bytes", "kind", "skipped"}
+    assert set(payload["targets"]["gs://bucket/prefix/agent"]) == {"success", "bytes", "kind", "attempted"}
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +478,78 @@ async def test_force_snapshot_stamps_the_targets_kind_on_a_copy_of_each_result(
     assert results["lighthouse://raised"].error == "TimeoutError: "
     assert results["lighthouse://raised"].success is False
     assert "Snapshot failed for lighthouse://raised: TimeoutError: " in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_service_marks_only_denied_targets_and_the_unchanged_pass_as_not_attempted(
+    tmp_path,
+):
+    """The two real producers of ``attempted=False``, and a called target
+    that stays attempted."""
+    import sqlite3
+
+    from kestrel_sovereign.storage.sync.service import (
+        RemoteTierPolicyContext,
+        RemoteTierPolicyDecision,
+    )
+
+    db = tmp_path / "agent.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
+    service = SyncService(db_path=str(db), state_file=str(tmp_path / "sync.state"))
+    called = _KindedTarget("lighthouse://called")
+    service.add_target(called)
+    await service.start()
+    results = await service.snapshot_if_changed()  # first pass: a real call
+    assert results["lighthouse://called"].attempted is True
+
+    # An unchanged DB on the next change-aware pass: the placeholder, not a call.
+    again = await service.snapshot_if_changed()
+    assert set(again) == {"__unchanged__"}
+    assert again["__unchanged__"].attempted is False and again["__unchanged__"].success is True
+
+    # A policy-denied remote target is recorded without a call.
+    service._record_policy_skip("gs://denied", "tier not allowed")
+    denied = service._policy_skips["gs://denied"]
+    assert denied.attempted is False and denied.success is True
+    assert denied.metadata == {"skipped": True, "policy_denied": True, "reason": "tier not allowed"}
+    assert RemoteTierPolicyContext is not None and RemoteTierPolicyDecision is not None
+    await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_lighthouse_restore_gives_the_download_the_manifests_size(
+    tmp_path, monkeypatch,
+):
+    from kestrel_sovereign.storage.providers import lighthouse_rest
+
+    seen: dict = {}
+
+    class _Recording:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def download(self, cid, timeout=None, *, expected_bytes=None):
+            seen["cid"], seen["expected_bytes"] = cid, expected_bytes
+            return b"not a real snapshot"
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(lighthouse_rest, "LighthouseRestClient", _Recording)
+    target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
+    target._save_local_manifest({
+        "agent_id": "agent", "snapshot_cid": "QmSnap", "snapshot_size": 1_209_462_784,
+        "content_hash": "x", "uploaded_at": "2026-08-31T12:01:32+00:00",
+    })
+    monkeypatch.setattr(target, "_resolve_latest_cid", AsyncMock(return_value="QmSnap"))
+
+    await target.restore_snapshot(tmp_path / "restored.db")
+
+    assert seen["cid"] == "QmSnap"
+    assert seen["expected_bytes"] == 1_209_462_784
 
 
 # ---------------------------------------------------------------------------

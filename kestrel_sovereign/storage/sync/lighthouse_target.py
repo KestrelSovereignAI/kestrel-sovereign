@@ -22,8 +22,8 @@ from kestrel_sovereign.storage.sync.retention import (
     parse_timestamp,
 )
 from kestrel_sovereign.storage.sync.targets import (
-    SyncTarget,
     SyncResult,
+    SyncTarget,
     TrustTier,
     _create_consistent_snapshot,
 )
@@ -91,7 +91,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import (
+                LighthouseRestClient,
+            )
 
             # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
             content = _create_consistent_snapshot(db_path)
@@ -227,10 +229,21 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             logger.info(f"Restoring snapshot from Lighthouse: {snapshot_cid}")
 
-            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import (
+                LighthouseRestClient,
+            )
 
             client = LighthouseRestClient(api_key=self.api_key)
-            content = await client.download(snapshot_cid)
+            # The local manifest records the size of the snapshot it names;
+            # a known size buys the gateway the patience a 1.2 GB CAR needs
+            # before its first byte (#3189).
+            manifest = self._load_local_manifest() or {}
+            expected_bytes = (
+                int(manifest.get("snapshot_size") or 0) or None
+                if manifest.get("snapshot_cid") == snapshot_cid
+                else None
+            )
+            content = await client.download(snapshot_cid, expected_bytes=expected_bytes)
             await client.close()
 
             if not content:
@@ -376,7 +389,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def _query_uploads_api(self) -> Optional[str]:
         """Query Lighthouse uploads API to find the latest snapshot."""
         try:
-            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import (
+                LighthouseRestClient,
+            )
 
             client = LighthouseRestClient(api_key=self.api_key)
             try:
@@ -419,7 +434,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def _read_manifest_cid(self, manifest_cid: str) -> Optional[str]:
         """Download a manifest file and extract the snapshot CID."""
         try:
-            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import (
+                LighthouseRestClient,
+            )
 
             client = LighthouseRestClient(api_key=self.api_key)
             content = await client.download(manifest_cid)
@@ -464,7 +481,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
     async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
         """Prune Lighthouse upload records when the API can enumerate/delete."""
-        from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+        from kestrel_sovereign.storage.providers.lighthouse_rest import (
+            LighthouseRestClient,
+        )
 
         client = LighthouseRestClient(api_key=self.api_key)
         try:
@@ -558,7 +577,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""
         try:
-            from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+            from kestrel_sovereign.storage.providers.lighthouse_rest import (
+                LighthouseRestClient,
+            )
 
             client = LighthouseRestClient(api_key=self.api_key)
             await client.get_balance()
