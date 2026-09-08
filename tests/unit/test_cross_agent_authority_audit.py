@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -8077,7 +8078,14 @@ def _cross_agent_state_object_aliases(
             return reference_sources(node.body) | reference_sources(node.orelse)
         if isinstance(node, ast.Call):
             call_name = _call_name(node).casefold()
-            return {call_name} if semantic_name(call_name) else set()
+            sources = {call_name} if semantic_name(call_name) else set()
+            # A method call on a tracked registry may select one of its agent
+            # objects. Preserve the receiver as may-flow instead of relying on
+            # an ever-growing list of selector spellings such as ``get`` and
+            # ``lookup``.
+            if isinstance(node.func, ast.Attribute):
+                sources.update(reference_sources(node.func.value))
+            return sources
         return set()
 
     aliases: set[str] = set(initial_aliases or ())
@@ -8300,12 +8308,12 @@ def _is_cross_agent_state_mutation_call(
 ) -> bool:
     """Whether a mutator call writes through an agent registry or object."""
 
+    item_mutation_actions = {"delitem", "setitem"}
     attribute_mutation = (
         isinstance(call.func, ast.Attribute)
-        and call.func.attr.casefold()
+        and call.func.attr.casefold().strip("_")
         in {
-            "__delitem__",
-            "__setitem__",
+            *item_mutation_actions,
             "add",
             "append",
             "clear",
@@ -8323,6 +8331,31 @@ def _is_cross_agent_state_mutation_call(
         )
     )
     call_name = _call_name(call).casefold()
+    functional_item_receiver = (
+        call.args[0]
+        if call.args
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"container", "mapping", "obj", "object"}
+            ),
+            None,
+        )
+    )
+    functional_item_form = call_name.strip("_") in item_mutation_actions and (
+        not isinstance(call.func, ast.Attribute)
+        or not _is_cross_agent_state_mutation_target(
+            call.func.value, state_object_aliases
+        )
+    )
+    functional_item_mutation = functional_item_form and (
+        functional_item_receiver is not None
+    ) and (
+        _is_cross_agent_state_mutation_target(
+            functional_item_receiver, state_object_aliases
+        )
+    )
     named_mutation_receiver = (
         call.args[0]
         if call.args
@@ -8423,6 +8456,7 @@ def _is_cross_agent_state_mutation_call(
     )
     return (
         attribute_mutation
+        or functional_item_mutation
         or named_mutation
         or bound_dunder_mutation
         or lifecycle_mutation
@@ -9760,11 +9794,29 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
             and _is_cross_agent_lifecycle_action(operation[0])
         )
 
-    tokens = literal_tokens(command)
+    resolved_command = _resolved_string(command)
+    if resolved_command is None:
+        # Preserve a statically visible command prefix when later f-string
+        # fields are dynamic (for example ``f"kestrel restart {name}"``).
+        tokens = literal_tokens(command)
+        return bool(
+            len(tokens) >= 2
+            and tokens[0] == "kestrel"
+            and _is_cross_agent_lifecycle_action(tokens[1])
+        )
+    try:
+        words = shlex.split(resolved_command)
+    except ValueError:
+        return False
+    if len(words) < 2:
+        return False
+    executable = SOURCE_IDENTIFIER_CHAIN.findall(words[0].casefold())
+    operation = SOURCE_IDENTIFIER_CHAIN.findall(words[1].casefold())
     return bool(
-        len(tokens) >= 2
-        and tokens[0] == "kestrel"
-        and _is_cross_agent_lifecycle_action(tokens[1])
+        executable
+        and executable[-1] == "kestrel"
+        and operation
+        and _is_cross_agent_lifecycle_action(operation[0])
     )
 
 
@@ -12067,6 +12119,30 @@ def _annotate_static_callable_semantics(
     parameter_semantics: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, dict[str, set[str]]
     ] = {function: {} for function in functions}
+    method_descriptors: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, tuple[str, str]
+    ] = {}
+    for class_node in (
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    ):
+        for statement in class_node.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorators = {
+                _decorator_terminal_name(decorator).casefold()
+                for decorator in statement.decorator_list
+            }
+            descriptor = (
+                "static"
+                if "staticmethod" in decorators
+                else "class"
+                if "classmethod" in decorators
+                else "instance"
+            )
+            method_descriptors[statement] = (
+                class_node.name,
+                descriptor,
+            )
 
     def bound_arguments(
         call: ast.Call,
@@ -12075,6 +12151,22 @@ def _annotate_static_callable_semantics(
         """Bind supplied values to parameters for higher-order may-flow."""
 
         positional = [*callee.args.posonlyargs, *callee.args.args]
+        method_descriptor = method_descriptors.get(callee)
+        if (
+            positional
+            and isinstance(call.func, ast.Attribute)
+            and method_descriptor is not None
+            and method_descriptor[1] != "static"
+        ):
+            owner, descriptor = method_descriptor
+            receiver = call.func.value
+            explicit_instance = (
+                descriptor == "instance"
+                and isinstance(receiver, ast.Name)
+                and receiver.id == owner
+            )
+            if not explicit_instance:
+                positional = positional[1:]
         bound: dict[str, list[ast.AST]] = {}
         for parameter, argument in zip(positional, call.args):
             bound.setdefault(parameter.arg.casefold(), []).append(argument)
@@ -18835,6 +18927,104 @@ def test_provenance_callable_semantics_flow_through_parameters(
     )
 
     assert _authority_provenance_lines(tree) == {5}
+
+
+@pytest.mark.parametrize(
+    "setup, invocation",
+    (
+        ("", "Controller().choose(derive, request, target)"),
+        (
+            "controller = Controller()\n    ",
+            "controller.choose(derive, request, target)",
+        ),
+        ("", "Controller.choose(Controller(), derive, request, target)"),
+    ),
+)
+def test_provenance_callable_parameter_binding_accounts_for_method_receivers(
+    setup: str,
+    invocation: str,
+) -> None:
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    return request.causation_chain\n\n"
+        "class Controller:\n"
+        "    def choose(self, check, request, target):\n"
+        "        if check(request):\n"
+        "            target.shutdown()\n\n"
+        "def dispatch(request, target):\n"
+        f"    {setup}{invocation}\n"
+    )
+
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+@pytest.mark.parametrize(
+    "selection",
+    (
+        "agent_registry.get(agent_name)",
+        "manager._agents.lookup(agent_name)",
+        "child_registry.resolve(agent_name)",
+    ),
+)
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "target.enabled = False",
+        "target.delete()",
+    ),
+)
+def test_registry_receiver_semantics_flow_through_agent_selection_calls(
+    selection: str,
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "def govern(request, agent_registry, child_registry, manager, agent_name):\n"
+        f"    target = {selection}\n"
+        "    if request.causation_chain:\n"
+        f"        {mutation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {3}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "operator.setitem(agent_registry, agent_name, replacement)",
+        "operator.delitem(agent_registry, agent_name)",
+    ),
+)
+def test_functional_item_mutators_preserve_registry_write_semantics(
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "def govern(request, agent_registry, agent_name, replacement):\n"
+        "    if request.causation_chain:\n"
+        f"        {mutation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "/usr/local/bin/kestrel restart Bob",
+        "'/opt/Kestrel Tools/kestrel' stop Bob",
+        "kestrel shutdown Bob",
+    ),
+)
+def test_shell_lifecycle_recognizes_kestrel_executable_basenames(
+    command: str,
+) -> None:
+    tree = ast.parse(
+        "def govern(request):\n"
+        "    if request.causation_chain:\n"
+        f"        subprocess.run({command!r}, shell=True)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
 
 
 @pytest.mark.parametrize(
