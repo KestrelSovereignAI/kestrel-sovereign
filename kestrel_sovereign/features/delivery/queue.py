@@ -8,19 +8,22 @@ retries are exceeded.
 Retry backoff formula: base_delay * (5 ** attempt), capped at 1 hour.
 Default: 5s -> 25s -> 2m5s -> 10m25s -> 52m5s
 
-Deduplication: content_hash + recipient within a 60-second window prevents
-duplicate enqueues of the same message.
+Deduplication: a canonical content hash + recipient within a 60-second window
+prevents duplicate enqueues of the same JSON message, whether or not the caller
+also supplies an idempotency key.
 
 Callers that need durable replay safety can additionally supply an opaque
 idempotency key. Its SHA-256 digest is scoped to the owning agent in a separate
-ledger, so safe replays adopt the canonical queue ID without persisting workflow
-identity. Reusing the key for a different request fails closed.
+ledger, which avoids storing the raw key but is not a confidentiality boundary.
+Safe replays adopt the canonical queue ID; reusing the key for a different
+request fails closed.
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -52,8 +55,66 @@ DeliveryCallback = Callable[[str, str, Dict[str, Any]], Coroutine[Any, Any, Deli
 MAX_IDEMPOTENCY_KEY_BYTES = 4096
 
 
-class DeliveryIdempotencyConflict(ValueError):
+class DeliveryIdempotencyError(RuntimeError):
+    """Base class for durable delivery idempotency failures."""
+
+
+class DeliveryIdempotencyConflict(DeliveryIdempotencyError):
     """Raised when an idempotency key is replayed with a different request."""
+
+
+class DeliveryIdempotencyTerminal(DeliveryIdempotencyError):
+    """Raised when a replay targets a delivery that is in dead-letter state."""
+
+
+class DeliveryIdempotencyStateError(DeliveryIdempotencyError):
+    """Raised when the durable replay ledger cannot be reconciled safely."""
+
+
+def _canonical_content_json(
+    content: Dict[str, Any], *, allow_string_fallback: bool
+) -> str:
+    """Return stable JSON for deduplication and durable request identity."""
+    if not allow_string_fallback:
+        _validate_json_value(content, path="content")
+    try:
+        return json.dumps(
+            content,
+            default=str if allow_string_fallback else None,
+            allow_nan=allow_string_fallback,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "idempotent delivery content must contain only JSON-serializable values"
+        ) from error
+
+
+def _validate_json_value(value: Any, *, path: str) -> None:
+    """Reject lossy Python-to-JSON coercions and name the invalid value path."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ValueError(f"idempotent delivery {path} must be a finite JSON number")
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, path=f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"idempotent delivery {path} has non-string JSON key {key!r}"
+                )
+            _validate_json_value(item, path=f"{path}.{key}")
+        return
+    raise ValueError(
+        f"idempotent delivery {path} contains non-JSON value "
+        f"of type {type(value).__name__}"
+    )
 
 
 def _compute_backoff(attempt: int) -> float:
@@ -207,11 +268,19 @@ class DeliveryQueue:
             content: Message payload (will be JSON-serialized).
             max_retries: Override default max retries for this entry.
             idempotency_key: Optional opaque, owner-scoped replay key. Only its
-                SHA-256 digest is persisted. A replay with a different delivery
-                request fails closed.
+                SHA-256 digest is persisted (this avoids storing the raw value,
+                but does not make a guessable key secret). A replay must preserve
+                whether ``max_retries`` was omitted or explicitly supplied; a
+                different request fails closed.
 
         Returns:
             The queue entry ID (existing if deduplicated, new otherwise).
+
+        Raises:
+            ValueError: The key is empty/oversized or keyed content is not JSON.
+            DeliveryIdempotencyConflict: The key names a different request.
+            DeliveryIdempotencyTerminal: The keyed delivery is dead-lettered.
+            DeliveryIdempotencyStateError: Durable state cannot be reconciled.
         """
         retries = max_retries if max_retries is not None else self._max_retries
 
@@ -226,7 +295,10 @@ class DeliveryQueue:
             )
 
         content_json = json.dumps(content, default=str)
-        content_hash = QueueEntry.compute_content_hash(recipient, content_json)
+        canonical_content = _canonical_content_json(
+            content, allow_string_fallback=True
+        )
+        content_hash = QueueEntry.compute_content_hash(recipient, canonical_content)
 
         # Deduplication check
         dedup_cutoff = (
@@ -295,11 +367,8 @@ class DeliveryQueue:
                 f"idempotency_key must be at most {MAX_IDEMPOTENCY_KEY_BYTES} UTF-8 bytes"
             )
 
-        content_json = json.dumps(
-            content,
-            default=str,
-            sort_keys=True,
-            separators=(",", ":"),
+        content_json = _canonical_content_json(
+            content, allow_string_fallback=False
         )
         key_digest = hashlib.sha256(key_bytes).hexdigest()
         payload_json = json.dumps(
@@ -316,12 +385,33 @@ class DeliveryQueue:
         )
         payload_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
         entry_id = str(uuid.uuid4())
+        candidate_id = entry_id
         now_iso = datetime.now(timezone.utc).isoformat()
         content_hash = QueueEntry.compute_content_hash(recipient, content_json)
+        dedup_cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=DEDUP_WINDOW_SECONDS)
+        ).isoformat()
+        nesting_strategy = getattr(self._db, "nested_transaction_strategy", None)
+        if nesting_strategy not in {"savepoint", "joined"}:
+            raise DeliveryIdempotencyStateError(
+                "database backend does not declare safe nested transaction semantics"
+            )
 
         try:
             async with self._db.transaction(immediate=True):
                 try:
+                    deduplicated = await self._db.fetchone(
+                        """
+                        SELECT id FROM delivery_queue
+                        WHERE agent_id = ? AND content_hash = ? AND recipient = ?
+                              AND created_at >= ?
+                        """,
+                        (self._agent_id, content_hash, recipient, dedup_cutoff),
+                    )
+                    # Always claim with a fresh unguessable candidate. That lets
+                    # ambiguous INSERT completion compensate by exact entry ID
+                    # without risking a pre-existing claim that merely shares a
+                    # 60-second dedup target.
                     await self._db.execute(
                         """
                         INSERT INTO delivery_idempotency
@@ -333,10 +423,20 @@ class DeliveryQueue:
                         (
                             self._agent_id,
                             key_digest,
-                            entry_id,
+                            candidate_id,
                             payload_digest,
                             now_iso,
                         ),
+                    )
+                    # Lock the canonical ledger row portably. SQLite already
+                    # owns the sole writer slot; PostgreSQL's no-op UPDATE waits
+                    # for and locks a concurrently inserted claim.
+                    await self._db.execute(
+                        """
+                        UPDATE delivery_idempotency SET entry_id = entry_id
+                        WHERE agent_id = ? AND idempotency_key_digest = ?
+                        """,
+                        (self._agent_id, key_digest),
                     )
                     existing = await self._db.fetchone(
                         """
@@ -347,7 +447,7 @@ class DeliveryQueue:
                         (self._agent_id, key_digest),
                     )
                     if existing is None:
-                        raise RuntimeError(
+                        raise DeliveryIdempotencyStateError(
                             "delivery idempotency record was not persisted"
                         )
                     if existing[1] != payload_digest:
@@ -355,11 +455,76 @@ class DeliveryQueue:
                             "idempotency_key was already used for a different "
                             "delivery request"
                         )
-                    if existing[0] != entry_id:
+
+                    canonical_id = existing[0]
+                    queue_row = await self._db.fetchone(
+                        """
+                        SELECT status FROM delivery_queue
+                        WHERE id = ? AND agent_id = ?
+                        """,
+                        (canonical_id, self._agent_id),
+                    )
+                    if queue_row is not None:
                         logger.debug(
-                            "Adopted idempotent delivery entry: %s", existing[0]
+                            "Adopted idempotent delivery entry: %s", canonical_id
                         )
-                        return existing[0]
+                        return canonical_id
+
+                    dead_letter = await self._db.fetchone(
+                        """
+                        SELECT id FROM delivery_dead_letter
+                        WHERE original_id = ? AND agent_id = ?
+                        """,
+                        (canonical_id, self._agent_id),
+                    )
+                    if dead_letter is not None:
+                        raise DeliveryIdempotencyTerminal(
+                            "idempotent delivery is in the dead-letter queue; "
+                            "retry that entry explicitly before replaying it"
+                        )
+
+                    if deduplicated is not None:
+                        await self._db.execute(
+                            """
+                            UPDATE delivery_idempotency
+                            SET entry_id = ?, created_at = ?, compensating = 0
+                            WHERE agent_id = ? AND idempotency_key_digest = ?
+                                  AND entry_id = ?
+                            """,
+                            (
+                                deduplicated[0],
+                                now_iso,
+                                self._agent_id,
+                                key_digest,
+                                canonical_id,
+                            ),
+                        )
+                        logger.debug(
+                            "Mapped idempotent delivery claim to deduplicated "
+                            "entry: %s",
+                            deduplicated[0],
+                        )
+                        return deduplicated[0]
+
+                    if canonical_id != candidate_id:
+                        # The queue row was removed independently of its ledger
+                        # (or by a pre-v0.53.12 purge). Repair the claim under the
+                        # row lock and recreate the logical delivery.
+                        await self._db.execute(
+                            """
+                            UPDATE delivery_idempotency
+                            SET entry_id = ?, created_at = ?, compensating = 0
+                            WHERE agent_id = ? AND idempotency_key_digest = ?
+                                  AND entry_id = ?
+                            """,
+                            (
+                                candidate_id,
+                                now_iso,
+                                self._agent_id,
+                                key_digest,
+                                canonical_id,
+                            ),
+                        )
 
                     await self._db.execute(
                         """
@@ -370,7 +535,7 @@ class DeliveryQueue:
                         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
                         """,
                         (
-                            entry_id,
+                            candidate_id,
                             self._agent_id,
                             channel_type,
                             recipient,
@@ -383,27 +548,25 @@ class DeliveryQueue:
                         ),
                     )
                 except BaseException:
-                    if self._db.backend_type == "sqlite":
-                        # SQLite joins a same-task outer transaction without a
-                        # savepoint. The ledger delete trigger removes the queue
-                        # row in this same atomic SQLite statement, so even an
-                        # ambiguously reported cancellation cannot commit only
-                        # half the compensation. PostgreSQL uses a real
-                        # savepoint and cleanup DML would be invalid once that
-                        # savepoint is aborted.
+                    if nesting_strategy == "joined":
+                        # A joined nested transaction cannot roll back only this
+                        # call when its caller catches the error and commits the
+                        # outer scope. One marker UPDATE invokes a scoped trigger
+                        # that removes this candidate queue row and ledger claim
+                        # atomically. Savepoint backends roll back normally.
                         await self._db.execute(
                             """
-                            DELETE FROM delivery_idempotency
+                            UPDATE delivery_idempotency SET compensating = 1
                             WHERE agent_id = ? AND idempotency_key_digest = ?
-                                  AND entry_id = ?
+                                  AND entry_id = ? AND compensating = 0
                             """,
-                            (self._agent_id, key_digest, entry_id),
+                            (self._agent_id, key_digest, candidate_id),
                         )
                     raise
         except Exception as error:
-            conflict = self._find_idempotency_conflict(error)
-            if conflict is not None:
-                raise conflict
+            public_error = self._find_idempotency_error(error)
+            if public_error is not None:
+                raise public_error
             raise
 
         logger.info(
@@ -412,20 +575,20 @@ class DeliveryQueue:
             channel_type,
             recipient,
         )
-        return entry_id
+        return candidate_id
 
     @staticmethod
-    def _find_idempotency_conflict(
+    def _find_idempotency_error(
         error: BaseException,
-    ) -> Optional[DeliveryIdempotencyConflict]:
-        """Recover the public conflict from backend transaction wrappers."""
+    ) -> Optional[DeliveryIdempotencyError]:
+        """Recover a public idempotency error from explicit backend causes."""
         seen: set[int] = set()
         current: Optional[BaseException] = error
         while current is not None and id(current) not in seen:
-            if isinstance(current, DeliveryIdempotencyConflict):
+            if isinstance(current, DeliveryIdempotencyError):
                 return current
             seen.add(id(current))
-            current = current.__cause__ or current.__context__
+            current = current.__cause__
         return None
 
     async def process_pending(self) -> int:
@@ -521,35 +684,49 @@ class DeliveryQueue:
             # Re-enqueue from dead letter
             now_iso = datetime.now(timezone.utc).isoformat()
             new_id = str(uuid.uuid4())
-            content_hash = QueueEntry.compute_content_hash(dl_row[4], dl_row[5])
-
-            await self._db.execute(
-                """
-                INSERT INTO delivery_queue
-                    (id, agent_id, channel_type, recipient, content_json, content_hash,
-                     status, attempts, max_retries, next_retry_at, last_error,
-                     created_at, delivered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
-                """,
-                (
-                    new_id,
-                    self._agent_id,
-                    dl_row[3],  # channel_type
-                    dl_row[4],  # recipient
-                    dl_row[5],  # content_json
-                    content_hash,
-                    DeliveryStatus.PENDING.value,
-                    self._max_retries,
-                    now_iso,  # next_retry_at
-                    now_iso,  # created_at
-                ),
+            content = json.loads(dl_row[5]) if dl_row[5] else {}
+            canonical_content = _canonical_content_json(
+                content, allow_string_fallback=False
+            )
+            content_hash = QueueEntry.compute_content_hash(
+                dl_row[4], canonical_content
             )
 
-            # Remove from dead letter
-            await self._db.execute(
-                "DELETE FROM delivery_dead_letter WHERE id = ? AND agent_id = ?",
-                (dl_row[0], self._agent_id),
-            )
+            async with self._db.transaction(immediate=True):
+                await self._db.execute(
+                    """
+                    INSERT INTO delivery_queue
+                        (id, agent_id, channel_type, recipient, content_json,
+                         content_hash, status, attempts, max_retries,
+                         next_retry_at, last_error, created_at, delivered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, NULL)
+                    """,
+                    (
+                        new_id,
+                        self._agent_id,
+                        dl_row[3],  # channel_type
+                        dl_row[4],  # recipient
+                        dl_row[5],  # content_json
+                        content_hash,
+                        DeliveryStatus.PENDING.value,
+                        self._max_retries,
+                        now_iso,  # next_retry_at
+                        now_iso,  # created_at
+                    ),
+                )
+                # Keep every replay key attached to the new canonical queue ID.
+                await self._db.execute(
+                    """
+                    UPDATE delivery_idempotency
+                    SET entry_id = ?, created_at = ?, compensating = 0
+                    WHERE agent_id = ? AND entry_id = ?
+                    """,
+                    (new_id, now_iso, self._agent_id, dl_row[1]),
+                )
+                await self._db.execute(
+                    "DELETE FROM delivery_dead_letter WHERE id = ? AND agent_id = ?",
+                    (dl_row[0], self._agent_id),
+                )
 
             return {
                 "success": True,
@@ -714,7 +891,12 @@ class DeliveryQueue:
         return results
 
     async def purge_delivered(self, older_than_hours: int = 24) -> int:
-        """Delete delivered entries older than the given threshold.
+        """Delete delivered entries and their replay claims after retention.
+
+        The threshold is also the idempotency replay-safety window for completed
+        deliveries. Reusing a key after its delivered row is purged creates a
+        new logical delivery. Dead-letter claims remain retained with their
+        dead-letter record until an explicit retry moves the claim.
 
         Args:
             older_than_hours: Remove entries delivered more than this many hours ago.
@@ -736,14 +918,53 @@ class DeliveryQueue:
         )
         count = row[0] if row else 0
 
-        if count > 0:
+        async with self._db.transaction(immediate=True):
+            # Remove claims first while their queue rows still identify exactly
+            # which completed deliveries have crossed the retention boundary.
             await self._db.execute(
                 """
-                DELETE FROM delivery_queue
-                WHERE agent_id = ? AND status = ? AND delivered_at < ?
+                DELETE FROM delivery_idempotency
+                WHERE agent_id = ? AND entry_id IN (
+                    SELECT id FROM delivery_queue
+                    WHERE agent_id = ? AND status = ? AND delivered_at < ?
+                )
                 """,
-                (self._agent_id, DeliveryStatus.DELIVERED.value, cutoff),
+                (
+                    self._agent_id,
+                    self._agent_id,
+                    DeliveryStatus.DELIVERED.value,
+                    cutoff,
+                ),
             )
+            if count > 0:
+                await self._db.execute(
+                    """
+                    DELETE FROM delivery_queue
+                    WHERE agent_id = ? AND status = ? AND delivered_at < ?
+                    """,
+                    (self._agent_id, DeliveryStatus.DELIVERED.value, cutoff),
+                )
+            # Clean pre-v0.53.12 or independently orphaned claims only after the
+            # same retention period, while preserving dead-letter tombstones.
+            await self._db.execute(
+                """
+                DELETE FROM delivery_idempotency
+                WHERE agent_id = ? AND created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_queue
+                      WHERE delivery_queue.agent_id = delivery_idempotency.agent_id
+                        AND delivery_queue.id = delivery_idempotency.entry_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_idempotency.agent_id
+                        AND delivery_dead_letter.original_id = delivery_idempotency.entry_id
+                  )
+                """,
+                (self._agent_id, cutoff),
+            )
+
+        if count > 0:
             logger.info("Purged %d delivered entries older than %dh", count, older_than_hours)
 
         return count
@@ -911,14 +1132,14 @@ class DeliveryQueue:
 
     async def _ensure_tables(self):
         """Create the delivery tables under one concurrency-safe migration."""
-        async with self._db.migration_lock("delivery_queue_schema_v2"):
+        async with self._db.migration_lock("delivery_queue_schema_v3"):
             # Every existence check is performed by the IF NOT EXISTS DDL only
             # after the lock is held. This makes the statements both the probe
             # and the re-probe and keeps the complete schema change atomic.
             await self._ensure_tables_locked()
 
     async def _ensure_tables_locked(self) -> None:
-        """Create delivery schema while ``delivery_queue_schema_v2`` is held."""
+        """Create delivery schema while ``delivery_queue_schema_v3`` is held."""
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS delivery_queue (
@@ -958,24 +1179,56 @@ class DeliveryQueue:
                 entry_id TEXT NOT NULL,
                 payload_digest TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                compensating INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, idempotency_key_digest)
             )
             """
         )
+        if not await self._db.column_exists(
+            "delivery_idempotency", "compensating"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_idempotency
+                ADD COLUMN compensating INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        # v2 accidentally made ledger deletion cascade into the live queue on
+        # SQLite. Remove that schema-wide behavior before installing the v3
+        # marker trigger used only by a failed joined-transaction enqueue.
+        if self._db.backend_type == "sqlite":
+            await self._db.execute(
+                "DROP TRIGGER IF EXISTS trg_delivery_idempotency_delete"
+            )
+        await self._db.execute(
+            "DROP INDEX IF EXISTS idx_delivery_idempotency_entry"
+        )
         await self._db.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_idempotency_entry
+            CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_entry
             ON delivery_idempotency(agent_id, entry_id)
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_retention
+            ON delivery_idempotency(agent_id, created_at)
             """
         )
         if self._db.backend_type == "sqlite":
             await self._db.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS trg_delivery_idempotency_delete
-                AFTER DELETE ON delivery_idempotency
+                CREATE TRIGGER IF NOT EXISTS trg_delivery_idempotency_compensate
+                AFTER UPDATE OF compensating ON delivery_idempotency
+                WHEN NEW.compensating = 1
                 BEGIN
                     DELETE FROM delivery_queue
-                    WHERE id = OLD.entry_id AND agent_id = OLD.agent_id;
+                    WHERE id = NEW.entry_id AND agent_id = NEW.agent_id;
+                    DELETE FROM delivery_idempotency
+                    WHERE agent_id = NEW.agent_id
+                      AND idempotency_key_digest = NEW.idempotency_key_digest
+                      AND entry_id = NEW.entry_id
+                      AND compensating = 1;
                 END
                 """
             )

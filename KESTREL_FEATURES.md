@@ -347,6 +347,23 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - Source: [`kestrel_sovereign/features/delivery/feature.py`](kestrel_sovereign/features/delivery/feature.py)
 - Enablement state: `enabled`
 
+Programmatic callers may pass an optional owner-scoped `idempotency_key` to
+`DeliveryFeature.enqueue_message`. A safe replay returns the canonical queue
+entry ID; a changed request raises `DeliveryIdempotencyConflict`, and a replay
+of a dead-lettered entry raises `DeliveryIdempotencyTerminal` until the entry is
+explicitly retried. Whether `max_retries` was omitted is part of request
+identity. Keyed payloads must be JSON-serializable without string fallbacks.
+
+The raw key is not stored. `delivery_idempotency` retains its SHA-256 digest and
+payload digest under the delivery owner's DID. This minimizes accidental raw-key
+disclosure but does not make a guessable key confidential. The
+`delivery_queue_schema_v3` migration lock serializes creation/upgrades of the
+ledger, its retention index, and SQLite's explicitly marked compensation
+trigger. `delivery_purge` expires successful replay claims with their delivered
+queue rows; its age threshold is therefore also the completed-delivery replay
+safety window. Dead-letter claims remain with their dead-letter record and move
+to the new queue ID on explicit retry.
+
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
 | `delivery_failed` | `!delivery failed` | `communication` | `limit` | 58 | `enabled` |

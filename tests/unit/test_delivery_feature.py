@@ -28,6 +28,8 @@ from kestrel_sovereign.features.delivery.models import (
 )
 from kestrel_sovereign.features.delivery.queue import (
     DeliveryIdempotencyConflict,
+    DeliveryIdempotencyStateError,
+    DeliveryIdempotencyTerminal,
     DeliveryQueue,
     _compute_backoff,
     BASE_DELAY_SECONDS,
@@ -49,12 +51,21 @@ def _make_mock_db():
     db.fetchone = AsyncMock(return_value=None)
     db.fetchval = AsyncMock(return_value=0)
     db.backend_type = "sqlite"
+    db.nested_transaction_strategy = "joined"
+    db.column_exists = AsyncMock(return_value=True)
 
     @asynccontextmanager
     async def migration_lock(_name):
         yield
 
     db.migration_lock = migration_lock
+
+    @asynccontextmanager
+    async def transaction(*, immediate=False):
+        del immediate
+        yield
+
+    db.transaction = transaction
     return db
 
 
@@ -548,8 +559,9 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 4 indexes + the SQLite atomic-compensation trigger.
-        assert queue._db.execute.call_count == 8
+        # 3 tables + 5 indexes + 2 v2 cleanup statements + the scoped
+        # SQLite atomic-compensation trigger.
+        assert queue._db.execute.call_count == 11
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -558,7 +570,7 @@ class TestQueueTableCreation:
         @asynccontextmanager
         async def migration_lock(name):
             nonlocal entered
-            assert name == "delivery_queue_schema_v2"
+            assert name == "delivery_queue_schema_v3"
             entered = True
             yield
 
@@ -628,6 +640,17 @@ class TestQueueEnqueue:
 
 
 class TestQueueIdempotency:
+    def test_public_package_exports_idempotency_errors(self):
+        from kestrel_sovereign.features.delivery import (
+            DeliveryIdempotencyConflict as PublicConflict,
+            DeliveryIdempotencyStateError as PublicStateError,
+            DeliveryIdempotencyTerminal as PublicTerminal,
+        )
+
+        assert PublicConflict is DeliveryIdempotencyConflict
+        assert PublicStateError is DeliveryIdempotencyStateError
+        assert PublicTerminal is DeliveryIdempotencyTerminal
+
     @pytest_asyncio.fixture
     async def real_queue(self, tmp_path):
         from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -793,6 +816,27 @@ class TestQueueIdempotency:
         assert replay == first
 
     @pytest.mark.asyncio
+    async def test_explicit_default_is_distinct_from_omitted_default(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="omission-is-request-identity",
+        )
+
+        with pytest.raises(DeliveryIdempotencyConflict):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"body": "hello"},
+                max_retries=queue._max_retries,
+                idempotency_key="omission-is-request-identity",
+            )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["", "x" * 4097])
     async def test_invalid_idempotency_key_is_rejected(self, real_queue, key):
         queue, _ = real_queue
@@ -852,6 +896,55 @@ class TestQueueIdempotency:
             "SELECT COUNT(*) FROM delivery_idempotency",
         )
         assert row == (0,)
+
+    @pytest.mark.asyncio
+    async def test_v3_upgrade_removes_unscoped_v2_delete_trigger(self, real_queue):
+        queue, _ = real_queue
+        await queue._db.execute(
+            "DROP TRIGGER IF EXISTS trg_delivery_idempotency_compensate"
+        )
+        await queue._db.execute(
+            """
+            CREATE TRIGGER trg_delivery_idempotency_delete
+            AFTER DELETE ON delivery_idempotency
+            BEGIN
+                DELETE FROM delivery_queue
+                WHERE id = OLD.entry_id AND agent_id = OLD.agent_id;
+            END
+            """
+        )
+
+        await queue._ensure_tables()
+        entry_id = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="post-v2-upgrade",
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+
+        assert await queue._db.fetchone(
+            "SELECT id FROM delivery_queue WHERE id = ?",
+            (entry_id,),
+        ) == (entry_id,)
+
+    @pytest.mark.asyncio
+    async def test_schema_has_retention_and_scoped_compensation_indexes(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        indexes = await queue._db.fetchall(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index' AND tbl_name = 'delivery_idempotency'
+            """
+        )
+        names = {row[0] for row in indexes}
+        assert "idx_delivery_idempotency_entry" in names
+        assert "idx_delivery_idempotency_retention" in names
 
     @pytest.mark.asyncio
     async def test_queue_insert_failure_rolls_back_idempotency_claim(self, real_queue):
@@ -957,6 +1050,7 @@ class TestQueueIdempotency:
     @pytest.mark.asyncio
     async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
         queue._db.backend_type = "postgres"
+        queue._db.nested_transaction_strategy = "savepoint"
 
         @asynccontextmanager
         async def transaction(*, immediate=False):
@@ -965,7 +1059,7 @@ class TestQueueIdempotency:
 
         queue._db.transaction = transaction
         queue._db.fetchone = AsyncMock(
-            side_effect=QueryError("injected aborted transaction")
+            side_effect=[None, QueryError("injected aborted transaction")]
         )
 
         with pytest.raises(QueryError, match="injected aborted transaction"):
@@ -1036,7 +1130,10 @@ class TestQueueIdempotency:
             if "INSERT INTO delivery_queue" in sql and phase == "queue":
                 phase = "cleanup"
                 raise asyncio.CancelledError("queue cancellation")
-            if "DELETE FROM delivery_idempotency" in sql and phase == "cleanup":
+            if (
+                "UPDATE delivery_idempotency SET compensating = 1" in sql
+                and phase == "cleanup"
+            ):
                 phase = "done"
                 raise asyncio.CancelledError("cleanup cancellation")
             return result
@@ -1067,6 +1164,171 @@ class TestQueueIdempotency:
             {"body": "hello"},
             idempotency_key="cancel-during-compensation",
         )
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_replay_is_terminal_until_explicit_retry(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "person@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "dead-letter-stage",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        with pytest.raises(DeliveryIdempotencyTerminal, match="dead-letter"):
+            await queue.enqueue(**request)
+
+        retried = await queue.retry(original_id)
+        assert retried["success"] is True
+        assert retried["entry_id"] != original_id
+        assert await queue.enqueue(**request) == retried["entry_id"]
+        ledger = await queue._db.fetchone(
+            """
+            SELECT entry_id FROM delivery_idempotency
+            WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        )
+        assert ledger == (retried["entry_id"],)
+
+    @pytest.mark.asyncio
+    async def test_delivered_purge_expires_replay_claim(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "person@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "purged-stage",
+        }
+        original_id = await queue.enqueue(**request)
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        await queue._db.execute(
+            """
+            UPDATE delivery_queue SET status = ?, delivered_at = ?
+            WHERE id = ? AND agent_id = ?
+            """,
+            (
+                DeliveryStatus.DELIVERED.value,
+                old,
+                original_id,
+                queue._agent_id,
+            ),
+        )
+
+        assert await queue.purge_delivered(older_than_hours=24) == 1
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+        replayed_id = await queue.enqueue(**request)
+        assert replayed_id != original_id
+
+    @pytest.mark.asyncio
+    async def test_ordinary_ledger_delete_does_not_delete_live_queue(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        entry_id = await queue.enqueue(
+            "email",
+            "person@example.com",
+            {"body": "hello"},
+            idempotency_key="prunable-ledger",
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+
+        assert await queue._db.fetchone(
+            "SELECT id FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (entry_id, queue._agent_id),
+        ) == (entry_id,)
+
+    @pytest.mark.asyncio
+    async def test_keyed_content_requires_stable_json_values(self, real_queue):
+        queue, _ = real_queue
+
+        with pytest.raises(ValueError, match="content.when.*datetime"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"when": datetime(2026, 1, 1)},
+                idempotency_key="strict-json",
+            )
+        with pytest.raises(ValueError, match="content.value.*object"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"value": object()},
+                idempotency_key="strict-object-json",
+            )
+        with pytest.raises(ValueError, match="non-string JSON key"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {1: "coerces-to-string"},
+                idempotency_key="strict-json-keys",
+            )
+
+    @pytest.mark.asyncio
+    async def test_keyed_and_plain_enqueues_share_dedup_identity(self, real_queue):
+        queue, _ = real_queue
+        content = {"subject": "hello", "body": "world"}
+
+        plain_id = await queue.enqueue("email", "first@example.com", content)
+        keyed_after = await queue.enqueue(
+            "email",
+            "first@example.com",
+            {"body": "world", "subject": "hello"},
+            idempotency_key="keyed-after-plain",
+        )
+        assert keyed_after == plain_id
+        second_key = await queue.enqueue(
+            "email",
+            "first@example.com",
+            content,
+            idempotency_key="second-key-same-dedup-entry",
+        )
+        assert second_key == plain_id
+
+        keyed_id = await queue.enqueue(
+            "email",
+            "second@example.com",
+            content,
+            idempotency_key="keyed-before-plain",
+        )
+        plain_after = await queue.enqueue(
+            "email",
+            "second@example.com",
+            {"body": "world", "subject": "hello"},
+        )
+        assert plain_after == keyed_id
+
+    def test_unrelated_exception_context_is_not_reported_as_conflict(self):
+        try:
+            raise DeliveryIdempotencyConflict("original conflict")
+        except DeliveryIdempotencyConflict:
+            try:
+                raise QueryError("write connection unavailable")
+            except QueryError as database_error:
+                assert DeliveryQueue._find_idempotency_error(database_error) is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_nested_transaction_semantics_fail_closed(self, queue):
+        queue._db.nested_transaction_strategy = None
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="does not declare"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                {"body": "hello"},
+                idempotency_key="unknown-backend",
+            )
+        queue._db.execute.assert_not_called()
 
 
 # =========================================================================
@@ -1352,9 +1614,9 @@ class TestQueuePurge:
         purged = await queue.purge_delivered()
         assert purged == 0
 
-        # Should NOT have called DELETE (count was 0)
+        # Ledger retention still runs, but no queue row is deleted.
         execute_calls = queue._db.execute.call_args_list
-        assert not any("DELETE" in str(c) for c in execute_calls)
+        assert not any("DELETE FROM delivery_queue" in str(c) for c in execute_calls)
 
 
 # =========================================================================

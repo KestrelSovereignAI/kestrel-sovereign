@@ -1043,6 +1043,19 @@ class AsyncDatabase:
     def backend_type(self) -> str:
         """Get backend type: 'sqlite' or 'postgres'."""
         return self._backend.backend_type
+
+    @property
+    def nested_transaction_strategy(self) -> str | None:
+        """How this backend isolates a same-task nested transaction.
+
+        ``savepoint`` means an inner failure rolls back independently;
+        ``joined`` means the inner scope shares its caller's transaction and
+        must compensate any partial work before propagating an error.
+        Unknown backends return ``None`` so durability-sensitive callers fail
+        closed instead of guessing from a backend name.
+        """
+        strategy = getattr(self._backend, "nested_transaction_strategy", None)
+        return strategy if strategy in {"savepoint", "joined"} else None
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
@@ -3315,6 +3328,10 @@ class AsyncDatabase:
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""
         return await self._backend.table_exists(table_name)
+
+    async def column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check whether a column exists using backend-safe catalog lookup."""
+        return await self._column_exists(table_name, column_name)
 
     async def table_exists_diagnostic(self, table_name: str) -> bool:
         """Check schema state without waiting on SQLite cleanup."""
