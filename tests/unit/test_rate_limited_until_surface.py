@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,7 +30,8 @@ from kestrel_sovereign.llm.streaming_errors import (
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 PROVIDER_PROSE = "Error code: 429 - rate_limit_error WITHHELD-PROVIDER-TEXT-4c1d"
-RESET = datetime(2026, 8, 26, 21, 14, 5, tzinfo=UTC)
+NOW = datetime(2026, 8, 26, 19, 20, 12, tzinfo=UTC)
+RESET = datetime(2026, 8, 26, 21, 14, 5, tzinfo=UTC)  # 6833 s after NOW
 
 
 class _Throttle(Exception):
@@ -60,16 +61,30 @@ def _wrapped(declined: AdvisedWaitExceedsRetryBudget) -> RuntimeError:
 
 
 def test_rate_limited_until_is_a_429_with_retry_after_rounded_up():
-    exc = rate_limited_until(_declined(6832.4))
+    exc = rate_limited_until(_declined(6832.4), now=NOW)
     assert exc.status_code == 429
     assert exc.code == "rate_limited"
     assert exc.headers == {"Retry-After": "6833"}
-    assert "2026-08-26T21:14:05+00:00" in exc.message
+    assert exc.message.startswith("The model route is rate limited until 2026-08-26T21:14:05+00:00")
     assert PROVIDER_PROSE not in exc.message
 
 
 def test_retry_after_is_at_least_one_second():
-    assert rate_limited_until(_declined(0.2)).headers == {"Retry-After": "1"}
+    assert rate_limited_until(_declined(0.2), now=RESET).headers == {"Retry-After": "1"}
+
+
+def test_an_overload_that_advised_a_wait_is_a_503_not_a_rate_limit():
+    class _Overloaded(Exception):
+        status_code = 503
+
+    declined = AdvisedWaitExceedsRetryBudget(
+        _Overloaded(PROVIDER_PROSE), advised_seconds=300, budget_seconds=240, retry_at=RESET,
+    )
+    exc = rate_limited_until(declined, now=NOW)
+    assert exc.status_code == 503 and exc.code == "route_unavailable"
+    assert exc.message.startswith("The model route is unavailable until")
+    assert exc.headers == {"Retry-After": "6833"}
+    assert safe_streaming_error_message(_wrapped(declined)).startswith("The model route is unavailable.")
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +94,7 @@ def test_retry_after_is_at_least_one_second():
 
 def test_the_stream_message_names_the_reset_time_and_nothing_from_the_provider():
     message = safe_streaming_error_message(_wrapped(_declined()))
-    assert message.startswith("Your selected model route is rate limited.")
+    assert message.startswith("The model route is rate limited.")
     assert "wait until 2026-08-26T21:14:05+00:00" in message
     assert PROVIDER_PROSE not in message
     assert "WITHHELD" not in message
@@ -88,7 +103,7 @@ def test_the_stream_message_names_the_reset_time_and_nothing_from_the_provider()
 def test_the_agent_stream_block_and_bridge_event_carry_the_same_message():
     wrapped = _wrapped(_declined())
     block = agent_stream_error_block(wrapped)
-    assert block.startswith("\n\n---\n⚠️ **Your selected model route is rate limited.**")
+    assert block.startswith("\n\n---\n⚠️ **The model route is rate limited.**")
     assert "2026-08-26T21:14:05+00:00" in block
 
     event = bridge_sse_error_event(wrapped)
@@ -155,16 +170,20 @@ def _invoke(app):
 def test_invoke_answers_429_with_retry_after_when_the_route_declined_to_wait():
     """Emma's instance: advised 6832 s; before this the caller got
     ``500 invoke_failed`` after sixteen minutes."""
-    app, restore = _boot_app(_wrapped(_declined(6832.4)))
+    live = AdvisedWaitExceedsRetryBudget(
+        _Throttle(PROVIDER_PROSE), advised_seconds=6832.4, budget_seconds=840,
+        retry_at=datetime.now(UTC) + timedelta(seconds=6832.4),
+    )
+    app, restore = _boot_app(_wrapped(live))
     try:
         response = _invoke(app)
     finally:
         restore()
     assert response.status_code == 429
-    assert response.headers["Retry-After"] == "6833"
+    assert int(response.headers["Retry-After"]) in (6832, 6833)
     body = response.json()
     assert body["error"]["code"] == "rate_limited"
-    assert "2026-08-26T21:14:05+00:00" in body["detail"]
+    assert live.retry_at.isoformat(timespec="seconds") in body["detail"]
     assert PROVIDER_PROSE not in response.text and "WITHHELD" not in response.text
 
 

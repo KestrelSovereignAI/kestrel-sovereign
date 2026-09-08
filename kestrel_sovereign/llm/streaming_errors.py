@@ -85,14 +85,17 @@ def _declined_wait(exc: BaseException):
 
 
 def _rate_limited_message(declined) -> tuple[str, str]:
-    """The route is rate limited until a time the provider named (#3127).
+    """The route declined to wait for a reset the provider named (#3127).
 
     The only interpolated value is that reset time: a number the provider
     returned, not caller content, provider prose, or the route's free-string
-    name. The guidance stays constant and mirrors ``_ROUTE_ERROR``.
+    name. The guidance stays constant and mirrors ``_ROUTE_ERROR``; a
+    throttle and an overload that advised a cool-down are told apart so an
+    outage is not read as a quota problem.
     """
+    condition = "rate limited" if declined.throttled else "unavailable"
     return (
-        "Your selected model route is rate limited.",
+        f"The model route is {condition}.",
         (
             f"The provider asked to wait {declined.reset_phrase()}. No fallback "
             "response was generated — retry after that time, or pick a different "

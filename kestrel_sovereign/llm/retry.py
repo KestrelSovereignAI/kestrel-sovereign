@@ -148,14 +148,14 @@ class AdvisedWaitExceedsRetryBudget(Exception):
     advised waits on one host; #3127). The wait is fact, not guess: retrying
     before ``retry_at`` is futile by the server's own account.
 
-    It classifies as the throttle it stands for at every downstream door:
-    ``status_code`` is 429, ``retry_after`` is the advised wait, ``response``
-    is the provider's, and the message names the reset time. It is not itself
+    It classifies as the error it stands for at every downstream door:
+    ``status_code`` is the cause's (429 for a throttle; a 503 that advised a
+    cool-down stays a 503, so an overload is never reported as a quota
+    problem), ``retry_after`` is the advised wait, ``response`` is the
+    provider's, and the message names the reset time. It is not itself
     retryable: :func:`is_retryable_error` refuses it, so an outer loop cannot
     re-enter the wait the inner one declined.
     """
-
-    status_code = 429
 
     def __init__(
         self,
@@ -165,6 +165,9 @@ class AdvisedWaitExceedsRetryBudget(Exception):
         budget_seconds: float,
         retry_at: datetime,
     ) -> None:
+        self.throttled = _is_throttle_error(cause)
+        cause_status = getattr(cause, "status_code", None)
+        self.status_code = cause_status if isinstance(cause_status, int) else (429 if self.throttled else 503)
         self.advised_seconds = float(advised_seconds)
         self.budget_seconds = float(budget_seconds)
         #: When a retry can succeed, computed from the advice clamped to
@@ -174,9 +177,10 @@ class AdvisedWaitExceedsRetryBudget(Exception):
         self.beyond_horizon = self.advised_seconds > ADVISED_WAIT_HORIZON_SECONDS
         self.retry_after = self.advised_seconds
         self.response = getattr(cause, "response", None)
+        what = "rate limit" if self.throttled else f"{type(cause).__name__}"
         super().__init__(
-            f"429 rate limit: the provider advised waiting {self.advised_seconds:.0f}s "
-            f"({self.reset_phrase()}), more than the "
+            f"{self.status_code} {what}: the provider advised waiting "
+            f"{self.advised_seconds:.0f}s ({self.reset_phrase()}), more than the "
             f"{self.budget_seconds:.0f}s this call could still wait; not retrying"
         )
         self.__cause__ = cause
@@ -193,12 +197,18 @@ class AdvisedWaitExceedsRetryBudget(Exception):
             return f"for more than {days} days, until at least {stamp}"
         return f"until {stamp}"
 
-    @property
-    def retry_after_header_seconds(self) -> int:
-        """Whole seconds for ``Retry-After``: the advice, clamped to the
-        horizon, rounded up, at least one."""
-        bounded = min(self.advised_seconds, float(ADVISED_WAIT_HORIZON_SECONDS))
-        return max(1, math.ceil(bounded))
+    def retry_after_header_seconds(self, now: Optional[datetime] = None) -> int:
+        """Whole seconds for ``Retry-After`` as of ``now``: what remains until
+        ``retry_at``, rounded up, at least one.
+
+        The decline is raised on the first route that declines and may
+        surface only after the remaining routes spent their own budgets, so
+        the header is measured when the response is built, not at decline
+        time; it agrees with the reset time in the message.
+        """
+        now = now or datetime.now(UTC)
+        remaining = (self.retry_at - now).total_seconds()
+        return max(1, math.ceil(min(remaining, float(ADVISED_WAIT_HORIZON_SECONDS))))
 
 
 def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitExceedsRetryBudget]:
@@ -231,19 +241,26 @@ def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitE
     return None
 
 
-def earliest_declined_wait(
+def common_declined_wait(
     errors: Iterable[BaseException],
 ) -> Optional[AdvisedWaitExceedsRetryBudget]:
-    """Among several routes' errors, the decline whose reset comes first.
+    """The decline an aggregate of several routes' errors may carry, if any.
 
-    When every route failed and some declined an advised wait, the soonest
-    reset is the earliest any retry could succeed, so it is the one an
-    aggregate error carries as its cause.
+    Only when EVERY route declined an advised wait is "come back at" honest
+    advice for the whole call; then the soonest reset is the earliest any
+    retry could succeed. If some route failed for another reason (a reset
+    connection, a 5xx without advice) a retry may succeed there at once, so
+    the aggregate carries no reset time.
     """
+    errors = list(errors)
+    if not errors:
+        return None
     earliest: Optional[AdvisedWaitExceedsRetryBudget] = None
     for error in errors:
         declined = advised_wait_exceeding_budget(error)
-        if declined is not None and (earliest is None or declined.retry_at < earliest.retry_at):
+        if declined is None:
+            return None
+        if earliest is None or declined.retry_at < earliest.retry_at:
             earliest = declined
     return earliest
 
@@ -268,18 +285,23 @@ def retry_after_seconds(error: Exception) -> Optional[float]:
             ms = getter("retry-after-ms")
             if ms:
                 try:
-                    return _finite_wait(float(ms) / 1000.0)
+                    wait = _finite_wait(float(ms) / 1000.0)
                 except (TypeError, ValueError):
-                    pass
+                    wait = None
+                if wait is not None:
+                    return wait
             secs = getter("retry-after")
             if secs:
                 try:
                     # Numeric seconds. (An HTTP-date form is rare here and not
                     # worth parsing — exponential backoff covers that case.)
-                    return _finite_wait(float(secs))
+                    wait = _finite_wait(float(secs))
                 except (TypeError, ValueError):
-                    pass
-    # Some SDKs surface a parsed attribute directly.
+                    wait = None
+                if wait is not None:
+                    return wait
+    # Some SDKs surface a parsed attribute directly. A source that is absent
+    # or unusable (``nan``, ``inf``, prose) never hides the next one.
     attr = getattr(error, "retry_after", None)
     if isinstance(attr, (int, float)) and not isinstance(attr, bool):
         return _finite_wait(float(attr))
@@ -522,6 +544,16 @@ async def with_retry(
                     ) from e
                 delay = advised + random.uniform(0, 1)
             else:
+                # A spent budget ends the loop: an attempt without a wait is
+                # a request fired back-to-back at a provider that just
+                # refused, with no backoff and no jitter. (Advice beyond the
+                # budget is declined above, with its reset time.)
+                if remaining_budget <= 0:
+                    logger.warning(
+                        "LLM retry budget spent after %.0fs of waits (status=%s): %s: %s",
+                        waited, getattr(e, "status_code", None), type(e).__name__, e,
+                    )
+                    raise
                 delay = min(
                     base_delay * (2 ** attempt) + random.uniform(0, 1),
                     eff_max_delay,

@@ -16,7 +16,7 @@ import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
-from kestrel_sovereign.llm.retry import earliest_declined_wait
+from kestrel_sovereign.llm.retry import common_declined_wait
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -4721,7 +4721,7 @@ No other text or formatting.
 
         # A route that declined an advised wait is the soonest any retry can
         # succeed; carry the earliest as the cause so the surface can say when.
-        raise LLMAllProvidersFailedError(errors) from earliest_declined_wait(errors.values())
+        raise LLMAllProvidersFailedError(errors) from common_declined_wait(errors.values())
 
     async def get_response_with_model(
         self,
@@ -5358,7 +5358,7 @@ No other text or formatting.
         raise LLMServiceError(
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
-        ) from (earliest_declined_wait(route_errors) or last_error)
+        ) from (common_declined_wait(route_errors) or last_error)
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin

@@ -22,10 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from kestrel_sovereign.api_errors import rate_limited_until
-from kestrel_sovereign.llm.error_handling import (
-    LLMAllProvidersFailedError,
-    LLMProviderQuotaError,
-)
+from kestrel_sovereign.llm.error_handling import LLMProviderQuotaError
 from kestrel_sovereign.llm.retry import (
     ADVISED_WAIT_HORIZON_SECONDS,
     MAX_DELAY,
@@ -34,7 +31,8 @@ from kestrel_sovereign.llm.retry import (
     THROTTLE_MAX_RETRIES,
     AdvisedWaitExceedsRetryBudget,
     advised_wait_exceeding_budget,
-    earliest_declined_wait,
+    common_declined_wait,
+    is_retryable_error,
     retry_after_seconds,
     with_retry,
 )
@@ -176,6 +174,9 @@ async def test_the_budget_follows_the_error_type_per_attempt():
     with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
         await _drive([_throttle(200), _Overloaded(50), "ok"])
     assert info.value.budget_seconds == TIGHT_BUDGET - 200
+    # An overload that advised a cool-down stays an overload.
+    assert info.value.status_code == 503 and info.value.throttled is False
+    assert str(info.value).startswith("503 _Overloaded: the provider advised waiting 50s")
 
 
 # ---------------------------------------------------------------------------
@@ -216,20 +217,35 @@ async def test_a_huge_header_declines_with_a_horizon_floor_instead_of_overflowin
     assert (err.retry_at - before).total_seconds() == pytest.approx(
         ADVISED_WAIT_HORIZON_SECONDS, abs=5
     )
-    assert err.retry_after_header_seconds == ADVISED_WAIT_HORIZON_SECONDS
+    assert err.retry_after_header_seconds(before) == ADVISED_WAIT_HORIZON_SECONDS
     assert "for more than 7 days, until at least" in str(err)
 
 
 def test_advice_within_the_horizon_is_an_exact_time():
+    now = datetime(2026, 8, 26, 19, 20, 13, tzinfo=UTC)
     err = AdvisedWaitExceedsRetryBudget(
         _throttle(6832), advised_seconds=6832, budget_seconds=840,
         retry_at=datetime(2026, 8, 26, 21, 14, 5, tzinfo=UTC),
     )
     assert err.beyond_horizon is False
     assert err.reset_phrase() == "until 2026-08-26T21:14:05+00:00"
-    assert err.retry_after_header_seconds == 6832
-    assert rate_limited_until(err).headers == {"Retry-After": "6832"}
-    assert "until 2026-08-26T21:14:05+00:00" in rate_limited_until(err).message
+    assert err.retry_after_header_seconds(now) == 6832
+    assert rate_limited_until(err, now=now).headers == {"Retry-After": "6832"}
+    assert "until 2026-08-26T21:14:05+00:00" in rate_limited_until(err, now=now).message
+
+
+def test_retry_after_is_measured_when_the_response_is_built_not_at_decline_time():
+    """The decline is raised on the first route and surfaces after the other
+    routes spent their budgets; the header must agree with the reset time."""
+    now = datetime(2026, 8, 26, 20, 0, tzinfo=UTC)
+    err = AdvisedWaitExceedsRetryBudget(
+        _throttle(900), advised_seconds=900, budget_seconds=840,
+        retry_at=now + timedelta(seconds=300),  # declined 600 s ago
+    )
+    assert err.retry_after_header_seconds(now) == 300
+    assert rate_limited_until(err, now=now).headers == {"Retry-After": "300"}
+    # Already past: at least one second, never zero or negative.
+    assert err.retry_after_header_seconds(now + timedelta(seconds=400)) == 1
 
 
 def test_the_surfaces_say_at_least_when_the_advice_exceeded_the_horizon():
@@ -237,7 +253,7 @@ def test_the_surfaces_say_at_least_when_the_advice_exceeded_the_horizon():
     err = AdvisedWaitExceedsRetryBudget(
         _throttle(1756241645), advised_seconds=1756241645, budget_seconds=840, retry_at=floor,
     )
-    http = rate_limited_until(err)
+    http = rate_limited_until(err, now=floor - timedelta(seconds=ADVISED_WAIT_HORIZON_SECONDS))
     assert http.headers == {"Retry-After": str(ADVISED_WAIT_HORIZON_SECONDS)}
     assert "for more than 7 days, until at least 2026-09-15T00:00:00+00:00" in http.message
     assert "2082" not in http.message
@@ -302,25 +318,131 @@ def test_explicit_links_are_followed():
         assert advised_wait_exceeding_budget(wrapped) is declined
 
 
-def test_earliest_declined_wait_picks_the_soonest_reset():
+def test_common_declined_wait_is_the_soonest_reset_only_when_every_route_declined():
     late = _declined()
     soon = AdvisedWaitExceedsRetryBudget(
         _throttle(900), advised_seconds=900, budget_seconds=840,
         retry_at=late.retry_at - timedelta(hours=1),
     )
-    errors = [RuntimeError("unrelated"), late, LLMProviderQuotaError("p", "Quota exceeded", soon)]
-    assert earliest_declined_wait(errors) is soon
-    assert earliest_declined_wait([RuntimeError("a"), ValueError("b")]) is None
+    assert common_declined_wait([late, LLMProviderQuotaError("p", "Quota exceeded", soon)]) is soon
+    # One route that failed for another reason may succeed at once: no reset time.
+    assert common_declined_wait([late, ConnectionError("reset by peer")]) is None
+    assert common_declined_wait([RuntimeError("a"), ValueError("b")]) is None
+    assert common_declined_wait([]) is None
 
 
-def test_the_all_providers_aggregate_carries_the_earliest_decline():
-    soon = _declined()
-    late = AdvisedWaitExceedsRetryBudget(
-        _throttle(90000), advised_seconds=90000, budget_seconds=840,
-        retry_at=soon.retry_at + timedelta(days=1),
+# ---------------------------------------------------------------------------
+# Round 3: a spent budget ends the loop; sources fall through; status mirrors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_spent_budget_ends_the_loop_instead_of_firing_zero_second_attempts():
+    """The review's scripts: 300 s advised then a 500 with no advice slept
+    [300, 0, 0, 0]; 840 s advised then six advice-less 429s slept
+    [840, 0, 0, 0, 0, 0, 0]. Now the loop stops when the budget is spent and
+    raises the error it just saw."""
+
+    class _Server(Exception):
+        status_code = 500
+
+        def __init__(self):
+            super().__init__("500 internal")
+
+    slept: list[float] = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    seq = [_throttle(300)] + [_Server()] * 4
+    calls = {"n": 0}
+
+    async def op():
+        i = calls["n"]
+        calls["n"] += 1
+        raise seq[i]
+
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(_Server),
+    ):
+        await with_retry(op)
+    assert slept == [300.0]
+    assert calls["n"] == 2
+
+    slept.clear()
+    calls["n"] = 0
+    seq = [_throttle(THROTTLE_BUDGET)] + [_FakeRateLimit()] * 6
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(_FakeRateLimit),
+    ):
+        await with_retry(op)
+    assert slept == [THROTTLE_BUDGET]
+    assert calls["n"] == 2
+    assert 0.0 not in slept
+
+
+@pytest.mark.asyncio
+async def test_no_wait_is_ever_zero_seconds():
+    """Whatever the advice sequence, no attempt runs without a wait."""
+    seq = [_throttle(800), _throttle(30), _FakeRateLimit(), _FakeRateLimit(), "ok"]
+    calls = {"n": 0}
+    slept: list[float] = []
+
+    async def op():
+        i = calls["n"]
+        calls["n"] += 1
+        item = seq[i]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(_FakeRateLimit),
+    ):
+        await with_retry(op, base_delay=100.0)
+    assert slept == [800.0, 30.0, 10.0]  # 10 s left, then the budget is spent
+    assert all(d > 0 for d in slept)
+
+
+def test_an_unusable_first_source_never_hides_the_next_one():
+    err = _FakeRateLimit(headers={"retry-after-ms": "nan", "retry-after": "30"})
+    assert retry_after_seconds(err) == 30.0
+    err = _FakeRateLimit(headers={"retry-after": "inf"})
+    err.retry_after = 42
+    assert retry_after_seconds(err) == 42.0
+    err = _FakeRateLimit(headers={"retry-after-ms": "not a number", "retry-after": "1e999"})
+    err.retry_after = 7.5
+    assert retry_after_seconds(err) == 7.5
+
+
+def test_the_decline_mirrors_its_causes_status_and_names_a_throttle_only_when_it_was_one():
+    throttle = _declined()
+    assert throttle.status_code == 429 and throttle.throttled is True
+    assert str(throttle).startswith("429 rate limit: the provider advised waiting 6832s")
+
+    class _Overloaded(Exception):
+        status_code = 503
+
+    overload = AdvisedWaitExceedsRetryBudget(
+        _Overloaded("503 overloaded"), advised_seconds=300, budget_seconds=240,
+        retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
     )
-    errors = {"a": RuntimeError("boom"), "b": late, "c": soon}
-    try:
-        raise LLMAllProvidersFailedError(errors) from earliest_declined_wait(errors.values())
-    except LLMAllProvidersFailedError as aggregate:
-        assert advised_wait_exceeding_budget(aggregate) is soon
+    assert overload.status_code == 503 and overload.throttled is False
+    assert str(overload).startswith("503 _Overloaded: the provider advised waiting 300s")
+    assert is_retryable_error(overload) is False
+
+    # A throttle recognised by message alone, with no status code, is a 429.
+    by_message = AdvisedWaitExceedsRetryBudget(
+        Exception("rate limit exceeded"), advised_seconds=300, budget_seconds=240,
+        retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+    )
+    assert by_message.status_code == 429 and by_message.throttled is True

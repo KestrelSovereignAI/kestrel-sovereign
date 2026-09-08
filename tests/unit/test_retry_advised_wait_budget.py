@@ -174,7 +174,8 @@ async def test_a_non_throttle_transient_with_advice_uses_the_tight_budget():
     with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
         await _run([_Overloaded()])
     assert info.value.budget_seconds == 60.0 * 4
-    assert info.value.status_code == 429  # it stands for a wait, classified as a throttle
+    assert info.value.status_code == 503  # it stands for the overload it declined
+    assert info.value.throttled is False
 
 
 # ---------------------------------------------------------------------------

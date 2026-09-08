@@ -48,7 +48,7 @@ from kestrel_sdk.llm import (
     ToolCallStarted,
 )
 
-from kestrel_sovereign.llm.retry import earliest_declined_wait
+from kestrel_sovereign.llm.retry import common_declined_wait
 from .adapter import (
     LLMResponse,
     ThinkingDelta,
@@ -1347,7 +1347,7 @@ class StreamingMixin:
             f"All {provider_type} providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from earliest_declined_wait(route_errors)
+        ) from common_declined_wait(route_errors)
 
     async def generate_stream(
         self,
@@ -1608,7 +1608,7 @@ class StreamingMixin:
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from earliest_declined_wait(route_errors)
+        ) from common_declined_wait(route_errors)
 
     @staticmethod
     def _adapter_supports_vision(adapter: Any) -> bool:
@@ -1988,4 +1988,4 @@ class StreamingMixin:
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from earliest_declined_wait(route_errors)
+        ) from common_declined_wait(route_errors)
