@@ -1661,14 +1661,28 @@ class SchedulerFeature(Feature):
         db = getattr(raw_storage, "db", None)
         if db is None:
             return None
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+
+        # Resolved outside the sweep's catch-all: a missing identity is a
+        # named refusal, not an empty scope that purges nothing and is
+        # reported as a failed sweep (#3251).
+        try:
+            agent_did = resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable:
+            logger.warning(
+                "[retention] operator notice audit cleanup skipped: "
+                "agent identity unavailable"
+            )
+            return None
         try:
             from kestrel_sovereign.storage.operator_notice_store import (
                 OperatorNoticeAuditStore,
             )
 
-            store = OperatorNoticeAuditStore(
-                db, str(getattr(self.agent, "did", "") or "")
-            )
+            store = OperatorNoticeAuditStore(db, agent_did)
             return await store.purge_expired()
         except Exception as exc:  # noqa: BLE001 - never block the sweep
             logger.warning(

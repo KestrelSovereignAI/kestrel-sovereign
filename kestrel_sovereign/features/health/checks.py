@@ -516,6 +516,25 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             "duration_ms": _elapsed(start),
         }
 
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    # The scheduler-status scope is the agent's DID through the shared
+    # guard, resolved outside the inspection try so a missing identity is
+    # its own named state rather than an empty scope that reads no reports
+    # and fails liveness for the wrong reason (#3251).
+    try:
+        agent_did = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return {
+            "name": "scheduler_liveness",
+            "status": "fail",
+            "message": "Scheduler liveness inspection requires the agent's durable identity",
+            "details": {"state": "identity_unavailable"},
+            "duration_ms": _elapsed(start),
+        }
     try:
         from kestrel_sovereign.features.scheduler.status import (
             scheduler_status,
@@ -524,7 +543,7 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
         parameters = scheduler_status_parameters(scheduler)
         status = await scheduler_status(
             db,
-            agent_id=str(getattr(agent, "did", "") or getattr(agent, "agent_id", "")),
+            agent_id=agent_did,
             **parameters,
         )
     except Exception as error:

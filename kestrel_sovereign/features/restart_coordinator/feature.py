@@ -37,7 +37,11 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_feature_database,
+    resolve_scoped_agent_did,
+)
 from kestrel_sovereign.storage.database_clock import database_clock
 from kestrel_sovereign.storage.db.interface import TransactionError
 
@@ -379,6 +383,15 @@ class RestartCoordinatorFeature(Feature):
             "explicit and audited, never an implicit side effect of restart."
         )
 
+
+    def _scoped_agent_did(self) -> str:
+        """This agent's DID through the shared guard, the scope every
+        restart-coordinator read and write is bound to (#3251). Raises
+        ``AgentIdentityUnavailable``; callers turn that into their own
+        refusal rather than binding an empty subject.
+        """
+        return resolve_scoped_agent_did(self.agent)
+
     async def initialize(self):
         # Request ids whose restart.completed wake is currently being
         # supervised by a background ack task in THIS process. Guards the
@@ -553,7 +566,13 @@ class RestartCoordinatorFeature(Feature):
                 "subject_agent_did must be an explicit DID",
                 data={"created": False},
             )
-        local_agent_did = str(getattr(self.agent, "did", "") or "")
+        try:
+            local_agent_did = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity",
+                data={"created": False},
+            )
         if subject_agent_did != local_agent_did:
             return ToolResult.failed(
                 "subject_agent_did must identify this agent; restart "
@@ -665,9 +684,14 @@ class RestartCoordinatorFeature(Feature):
     async def list_restart_delegations(self) -> ToolResult:
         if self._db is None:
             return ToolResult.failed("Restart coordinator storage unavailable")
-        subject = getattr(self.agent, "did", "") or ""
+        try:
+            subject = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity"
+            )
         delegations = await list_restart_delegations(
-            self._db, subject_agent_did=str(subject)
+            self._db, subject_agent_did=subject
         )
         return ToolResult.ok(
             confirmation=f"Found {len(delegations)} restart delegation(s)",
@@ -805,7 +829,13 @@ class RestartCoordinatorFeature(Feature):
                 "Restart coordinator storage unavailable",
                 data={"created": False},
             )
-        agent_id = str(getattr(self.agent, "did", "") or "")
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            return ToolResult.failed(
+                "Restart coordinator requires the agent's durable identity",
+                data={"created": False},
+            )
         delegation_id = (delegation_id or "").strip()
         if not delegation_id:
             # Authority is checked before update-mode path discovery or checkout
@@ -1771,7 +1801,14 @@ class RestartCoordinatorFeature(Feature):
         non-instructional state (#1562). The persistence is the audit
         primary; the SSE emit is the live-paint side-channel.
         """
-        agent_did = getattr(self.agent, "did", "") or ""
+        try:
+            agent_did = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
+            logger.warning(
+                "restart status event for %s not emitted: agent identity unavailable",
+                getattr(req, "request_id", "?"),
+            )
+            return
         requested_by_agent = str(
             getattr(req, "requested_by_agent", "") or agent_did
         )
@@ -3102,8 +3139,9 @@ class RestartCoordinatorFeature(Feature):
         """
         if self._db is None:
             return
-        agent_id = getattr(self.agent, "did", "") or ""
-        if not agent_id:
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return
         stuck = await list_requests(
             self._db, status="updating", agent_id=str(agent_id),
@@ -3186,8 +3224,9 @@ class RestartCoordinatorFeature(Feature):
         """
         if self._db is None:
             return []
-        agent_id = getattr(self.agent, "did", "") or ""
-        if not agent_id:
+        try:
+            agent_id = self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return []
         needing_wake = await list_requests_needing_wake(
             self._db, agent_id=str(agent_id),

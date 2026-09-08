@@ -2335,8 +2335,11 @@ async def reflection_status(request: Request):
     if hasattr(agent, "_raw_storage") and hasattr(agent._raw_storage, "db"):
         db = agent._raw_storage.db
     if db:
+        # The scope is the agent's DID through the shared guard, resolved
+        # outside the history try/except so a missing identity is a refusal,
+        # not a swallowed warning over an empty-string scope (#3251).
+        agent_id = _scoped_agent_did_or_503(agent, "reflection status requires")
         try:
-            agent_id = getattr(agent, "agent_id", "") or getattr(agent, "did", "")
             rows = await db.fetchall(
                 """
                 SELECT tel.task_id, st.task_name, tel.status, tel.duration_ms, tel.executed_at,
@@ -2359,6 +2362,25 @@ async def reflection_status(request: Request):
             logger.warning(f"Failed to get execution history: {e}")
 
     return result
+
+
+def _scoped_agent_did_or_503(agent, verb: str) -> str:
+    """The agent's own DID through the shared guard, or a 503 refusal.
+
+    ``verb`` names the caller in the detail (``"reflection status requires"``).
+    """
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{verb} the agent's durable identity",
+        ) from None
 
 
 def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:

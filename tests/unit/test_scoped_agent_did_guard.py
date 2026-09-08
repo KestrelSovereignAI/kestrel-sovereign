@@ -622,20 +622,12 @@ def _count_inline(text: str) -> int:
 KNOWN_INLINE_RESOLUTIONS = {
     # #3251: other shared tables, filed separately from the a2a_tasks work.
     "endpoints/agent.py": (
-        2,
-        "the reflection-status route scopes task_execution_log (#3251); the "
-        "local-witness loop resolves the SENDER's stable identity from a "
+        1,
+        "the local-witness loop resolves the SENDER's stable identity from a "
         "witnessed peer object, not this agent's own scope",
     ),
-    "features/memory/reflection_hook.py": (1, "memory table scope (#3251)"),
-    "features/health/checks.py": (1, "scheduler status scope (#3251)"),
-    "services/key_resolution.py": (1, "service-key storage scope (#3251)"),
     "features/todo/feature.py": (1, "todo table scope, falls back to 'default' (#3251)"),
-    "waits/reconciler.py": (
-        2,
-        "the wait-signal store scope ('' is the documented solo-agent legacy "
-        "scope) and a signal's target agent (#3251)",
-    ),
+    "waits/reconciler.py": (1, "a signal's TARGET agent, not this agent's own scope"),
     "features/skills/feature.py": (1, "reflection_insights scope, '' fallback (#3251)"),
     "features/bootstrap/feature.py": (
         1,
@@ -738,6 +730,13 @@ ROUTED_MODULES = {
     "features/tasks/feature.py",
     "features/tasks/wait_provider.py",
     "server.py",  # the feature-route mount owner's stable identity (#3240)
+    # #3251: the other-table self-scoped reads.
+    "features/health/checks.py",
+    "features/memory/reflection_hook.py",
+    "features/restart_coordinator/feature.py",
+    "features/scheduler/feature.py",
+    "services/key_resolution.py",
+    "waits/reconciler.py",
 }
 
 
