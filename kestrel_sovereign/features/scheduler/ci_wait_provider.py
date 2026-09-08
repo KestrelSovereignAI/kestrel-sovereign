@@ -267,9 +267,10 @@ class _UnderscopedToken(Exception):
 
     Narrower than it once was. A refused Checks API alone no longer reaches
     here: :func:`fetch_check_rollup` falls back to the Actions API and the
-    wait proceeds on a caveated rollup. This is now the case where *every*
-    endpoint was refused, i.e. there is no verdict to caveat, only a
-    credential to fix.
+    wait proceeds on a caveated rollup. What still reaches here is a refusal
+    it cannot route around — Checks and Actions both refused, or the status
+    endpoint refused — i.e. there is no verdict to caveat, only a credential
+    to fix.
     """
 
 
@@ -328,24 +329,26 @@ class CIWaitable:
         rollup = CheckRollup()
         if head_sha:
             # Reaching here means the PR read SUCCEEDED with this token, so a
-            # 401/403 from the rollup is not a bad credential — it is a valid
-            # one that cannot see CI. ``fetch_check_rollup`` only raises once
-            # every endpoint has refused; a partial refusal comes back as a
-            # caveated rollup instead. ``_UnderscopedToken`` carries the total
-            # case up to ``poll``, which cannot otherwise tell it from a blip.
+            # surviving auth error from the rollup is a credential that cannot
+            # see CI rather than one GitHub rejects outright.
+            # ``fetch_check_rollup`` degrades the Checks read on its own; what
+            # reaches this handler is a gate class it could not route around.
+            # ``_UnderscopedToken`` carries that up to ``poll``, which cannot
+            # otherwise tell it from a blip.
             try:
                 rollup = await fetch_check_rollup(
                     base, head_sha, token=token, timeout=10, ref=ref
                 )
             except PRWatchAuthError as exc:
                 raise _UnderscopedToken(
-                    f"{ref}: the PR read succeeded but every check endpoint "
-                    f"was refused ({exc}). The token is valid and cannot see "
-                    f"CI at all; this will not resolve on its own. Grant it "
-                    f"'Actions' and 'Commit statuses' read. Note that 'Checks' "
-                    f"is a GitHub App permission with no fine-grained PAT "
-                    f"equivalent, so /commits/{{sha}}/check-runs is readable "
-                    f"only by a classic token with 'repo' or by a GitHub App."
+                    f"{ref}: the PR read succeeded but a check endpoint "
+                    f"returned an authorization error ({exc}). The token "
+                    f"cannot see CI; this will not resolve on its own. Grant "
+                    f"it 'Actions' and 'Commit statuses' read. Note that "
+                    f"'Checks' is a GitHub App permission with no fine-grained "
+                    f"PAT equivalent, so /commits/{{sha}}/check-runs is "
+                    f"readable only by a classic token with 'repo' or by a "
+                    f"GitHub App."
                 ) from exc
         return pr_raw, rollup
 

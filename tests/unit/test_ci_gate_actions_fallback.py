@@ -77,7 +77,7 @@ def _live_shape(*, runs=(GREEN_RUN,), status=EMPTY_STATUS, pr=None):
     return {
         "/pulls/": pr if pr is not None else {"state": "open", "merged": False,
                                               "head": {"sha": SHA}},
-        "/check-runs": PRWatchAuthError("GitHub returned 403 for check-runs"),
+        "/check-runs": PRWatchAuthError("GitHub returned 403 for check-runs", status_code=403),
         "/actions/runs": {"total_count": len(runs), "workflow_runs": list(runs)},
         "/status": status,
     }
@@ -150,12 +150,12 @@ async def test_a_network_failure_on_checks_does_not_take_the_fallback(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_every_endpoint_refused_is_still_a_hard_auth_failure(monkeypatch):
+async def test_both_check_endpoints_refused_is_a_hard_auth_failure(monkeypatch):
     """Nothing readable is not a caveated verdict — it is a credential to fix."""
     monkeypatch.setattr(prw, "_github_get", _router({
-        "/check-runs": PRWatchAuthError("403"),
-        "/actions/runs": PRWatchAuthError("403"),
-        "/status": PRWatchAuthError("403"),
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": PRWatchAuthError("403", status_code=403),
     }))
 
     with pytest.raises(PRWatchAuthError):
@@ -163,20 +163,89 @@ async def test_every_endpoint_refused_is_still_a_hard_auth_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_refused_status_alone_keeps_the_check_runs_it_did_read(monkeypatch):
-    """One refused endpoint must not discard the evidence from the others."""
+async def test_a_refused_status_propagates_instead_of_degrading(monkeypatch):
+    """Removed capability, deliberately. Tolerating a refused status read was
+    an addition beyond what the Checks fallback needs, and review found two
+    separate ways for it to convert a transient into a terminal. Measured
+    against the credential this exists for it buys nothing — that token holds
+    ``statuses=read`` and answers 200 — so the legacy-status half is
+    all-or-nothing again, exactly as it was before the fallback."""
     monkeypatch.setattr(prw, "_github_get", _router({
         "/check-runs": {"total_count": 1, "check_runs": [GREEN_RUN]},
-        "/status": PRWatchAuthError("403"),
+        "/status": PRWatchAuthError("403", status_code=403),
     }))
 
-    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+    with pytest.raises(PRWatchAuthError):
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
 
-    assert rollup.source == CHECKS_SOURCE_CHECK_RUNS
-    assert rollup.unreadable == ("status",)
-    assert rollup.complete is False
-    assert rollup.check_runs["check_runs"] == [GREEN_RUN]
-    assert "legacy commit statuses" in rollup.caveat()
+
+@pytest.mark.asyncio
+async def test_a_401_on_the_checks_read_does_not_degrade(monkeypatch):
+    """Review round 4. A token revoked or expired MID-POLL answers 401 after
+    the PR read already succeeded. That is the credential failing, not this
+    endpoint refusing: nothing else is readable either, so answering from the
+    half already in hand would settle a verdict for a token that can no
+    longer see the repository."""
+    seen: list = []
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchAuthError("GitHub returned 401", status_code=401),
+        "/actions/runs": {"total_count": 1, "workflow_runs": [GREEN_RUN]},
+        "/status": EMPTY_STATUS,
+    }, seen=seen))
+
+    with pytest.raises(PRWatchAuthError) as caught:
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert caught.value.status_code == 401
+    assert not [u for u in seen if "/actions/runs" in u]
+
+
+@pytest.mark.asyncio
+async def test_a_401_on_the_actions_fallback_does_not_degrade_either(monkeypatch):
+    """The same rule on the second endpoint: a credential that dies between
+    the two reads must not leave a caveated rollup behind."""
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("GitHub returned 401", status_code=401),
+        "/status": EMPTY_STATUS,
+    }))
+
+    with pytest.raises(PRWatchAuthError) as caught:
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert caught.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_an_auth_error_of_unknown_status_does_not_unlock_the_degrade(
+    monkeypatch,
+):
+    """``status_code`` defaults to None — "not known to be a 403" — so a
+    caller that constructs an auth error without saying cannot accidentally
+    reach the fallback."""
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchAuthError("no status recorded"),
+        "/actions/runs": {"total_count": 1, "workflow_runs": [GREEN_RUN]},
+        "/status": EMPTY_STATUS,
+    }))
+
+    with pytest.raises(PRWatchAuthError):
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+
+@pytest.mark.asyncio
+async def test_the_status_code_is_recorded_by_the_real_classifier(monkeypatch):
+    """The wiring behind the two tests above: the code must come off the real
+    HTTP response, not only from hand-built exceptions."""
+    _raise_from_urlopen(monkeypatch, _http_error(401))
+    with pytest.raises(PRWatchAuthError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+    assert caught.value.status_code == 401
+
+    _raise_from_urlopen(monkeypatch, _http_error(403, body=PERMISSION_BODY))
+    with pytest.raises(PRWatchAuthError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+    assert caught.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -192,7 +261,7 @@ async def test_the_actions_fallback_follows_pages(monkeypatch):
         if "/pulls/" in url:
             return {"state": "open", "merged": False, "head": {"sha": SHA}}
         if "/check-runs" in url:
-            raise PRWatchAuthError("403")
+            raise PRWatchAuthError("403", status_code=403)
         if "/actions/runs" in url:
             return page2 if "page=2" in url else page1
         return EMPTY_STATUS
@@ -211,7 +280,7 @@ async def test_a_short_read_of_the_fallback_lowers_success_to_pending(monkeypatc
     protection keeps applying to Actions runs."""
     async def fake_get(url, *, token, timeout, ref):
         if "/check-runs" in url:
-            raise PRWatchAuthError("403")
+            raise PRWatchAuthError("403", status_code=403)
         if "/actions/runs" in url:
             # Claims 9, sends 1, and page two comes back empty.
             return ({"total_count": 9, "workflow_runs": [GREEN_RUN]}
@@ -350,9 +419,9 @@ async def test_total_blindness_is_still_the_actionable_permission_block(
     """#3248's behaviour survives, narrowed: it now takes every endpoint."""
     st = await _poll(monkeypatch, {
         "/pulls/": {"state": "open", "merged": False, "head": {"sha": SHA}},
-        "/check-runs": PRWatchAuthError("403"),
-        "/actions/runs": PRWatchAuthError("403"),
-        "/status": PRWatchAuthError("403"),
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": PRWatchAuthError("403", status_code=403),
     })
 
     assert st.outcome is Outcome.PENDING
@@ -370,9 +439,9 @@ async def test_the_permission_message_states_the_remedy_that_actually_exists(
     type. An unfollowable instruction is a different way of being stuck."""
     st = await _poll(monkeypatch, {
         "/pulls/": {"state": "open", "merged": False, "head": {"sha": SHA}},
-        "/check-runs": PRWatchAuthError("403"),
-        "/actions/runs": PRWatchAuthError("403"),
-        "/status": PRWatchAuthError("403"),
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": PRWatchAuthError("403", status_code=403),
     })
 
     assert "Actions" in st.summary and "Commit statuses" in st.summary

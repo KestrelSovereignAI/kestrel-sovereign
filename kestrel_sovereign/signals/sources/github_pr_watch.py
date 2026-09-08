@@ -112,7 +112,19 @@ class PRWatchError(Exception):
 
 
 class PRWatchAuthError(PRWatchError):
-    """Auth/permission failure (401/403) — distinct from a no-change poll."""
+    """Auth/permission failure (401/403) — distinct from a no-change poll.
+
+    ``status_code`` carries which one, because the two are not
+    interchangeable downstream: a 403 is *this endpoint* refusing a valid
+    credential, while a 401 is the credential itself failing and says nothing
+    about any endpoint. Only the former may degrade a rollup. It defaults to
+    ``None`` — "not known to be a 403" — so a caller that constructs one
+    without saying cannot accidentally unlock the degrade path.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class PRWatchNetworkError(PRWatchError):
@@ -680,13 +692,17 @@ async def _github_get(
         if e.code == 401:
             # Never a throttle: GitHub answers 401 only for a credential it
             # would not accept at all (measured: "Bad credentials").
-            raise PRWatchAuthError(f"GitHub returned {e.code} for {ref}") from e
+            raise PRWatchAuthError(
+                f"GitHub returned {e.code} for {ref}", status_code=e.code
+            ) from e
         if e.code == 429 or (e.code == 403 and _is_rate_limited(headers, body)):
             raise PRWatchRateLimitError(
                 f"GitHub rate limit hit ({e.code}) for {ref}"
             ) from e
         if e.code == 403:
-            raise PRWatchAuthError(f"GitHub returned {e.code} for {ref}") from e
+            raise PRWatchAuthError(
+                f"GitHub returned {e.code} for {ref}", status_code=e.code
+            ) from e
         raise PRWatchNetworkError(f"GitHub HTTP {e.code} for {ref}") from e
     except urllib.error.URLError as e:
         raise PRWatchNetworkError(f"network error for {ref}: {e}") from e
@@ -746,8 +762,6 @@ class CheckRollup:
             )
         elif "check-runs" in self.unreadable:
             holes.append("all check runs (the Checks API was refused)")
-        if "status" in self.unreadable:
-            holes.append("legacy commit statuses (the Statuses API was refused)")
         if not holes:
             holes.append("part of the rollup (" + ",".join(self.unreadable) + ")")
         return "this verdict cannot see " + "; ".join(holes)
@@ -785,7 +799,24 @@ async def fetch_check_rollup(
     rather than being silently promoted to a full read. Callers must not turn
     an incomplete rollup into an unqualified pass.
 
-    Raises :class:`PRWatchAuthError` only when *no* check evidence at all is
+    Two things it deliberately does NOT degrade on.
+
+    A **401** is the credential itself failing — expired or revoked, possibly
+    mid-poll, after the earlier reads succeeded. It says nothing about any
+    one endpoint, nothing else will be readable either, and answering from
+    the half already in hand would settle a verdict for a token that can no
+    longer see the repository. Only a 403 degrades.
+
+    A refused **status** read propagates rather than being marked unreadable.
+    Tolerating it was an addition beyond what the Checks fallback needs, and
+    review found two separate ways for it to convert a transient into a
+    terminal; measured against the credential this exists for, it buys
+    nothing, because that token holds ``statuses=read`` and answers 200. So
+    the legacy-status half is all-or-nothing again, exactly as it was before
+    the fallback, and the only degradation this function can produce is the
+    Checks-to-Actions one it was written for.
+
+    Raises :class:`PRWatchAuthError` when no check evidence at all is
     readable — the genuinely blind case, which no amount of waiting fixes.
     """
     unreadable: List[str] = []
@@ -796,6 +827,8 @@ async def fetch_check_rollup(
             base, head_sha, token=token, timeout=timeout, ref=f"{ref} check-runs"
         )
     except PRWatchAuthError as exc:
+        if exc.status_code != 403:
+            raise
         checks_error = exc
         unreadable.append("check-runs")
         check_runs = None
@@ -807,24 +840,25 @@ async def fetch_check_rollup(
                 )
             )
             source = CHECKS_SOURCE_WORKFLOW_RUNS
-        except PRWatchAuthError:
+        except PRWatchAuthError as actions_exc:
+            if actions_exc.status_code != 403:
+                raise
             unreadable.append("actions-runs")
 
-    try:
-        combined_status: Any = await _github_get(
-            f"{base}/commits/{head_sha}/status",
-            token=token, timeout=timeout, ref=f"{ref} status",
-        )
-    except PRWatchAuthError:
-        unreadable.append("status")
-        combined_status = None
+    # Not wrapped: a refused status read is not a degradable gate class.
+    combined_status: Any = await _github_get(
+        f"{base}/commits/{head_sha}/status",
+        token=token, timeout=timeout, ref=f"{ref} status",
+    )
 
     if check_runs is None and combined_status is None:
-        # Nothing at all was readable: no check runs, no workflow runs, no
-        # statuses. There is no verdict to caveat, only a credential to fix.
+        # Neither Checks nor Actions was readable and the status endpoint
+        # answered with nothing. There is no verdict to caveat, only a
+        # credential to fix.
         raise PRWatchAuthError(
-            f"{ref}: no check evidence is readable — check-runs, "
-            f"actions-runs and status were all refused ({checks_error})"
+            f"{ref}: no check evidence is readable — check-runs and "
+            f"actions-runs were both refused ({checks_error})",
+            status_code=403,
         )
 
     return CheckRollup(
