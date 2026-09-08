@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -479,10 +480,20 @@ def test_the_loser_of_a_promotion_race_does_not_cry_stranded(tmp_path: Path, cap
     DockerExecutor._promote_staged_trash(stale, trash_root)  # A wins
     assert (trash_root / "rm_00000001" / "f").read_text() == "x"
 
+    caplog.clear()
     with caplog.at_level("DEBUG"):
         DockerExecutor._promote_staged_trash(_Replay(stale), trash_root)  # B loses
 
+    # B must take the race branch by name, and say so at debug. Asserting only
+    # that the outer handler's phrase is absent missed the sibling handler:
+    # FileNotFoundError is an OSError, so without its own `except` the vanished
+    # entry falls into `except OSError as move_error` one line below and B
+    # warns that a promotion failed and the directory will be moved aside --
+    # the very cry this test is named for, at WARNING, over a won race.
+    assert "already promoted by another process" in caplog.text
     assert "NOT visible" not in caplog.text
+    cries = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert cries == [], cries
     assert (trash_root / "rm_00000001" / "f").read_text() == "x"
 
 
