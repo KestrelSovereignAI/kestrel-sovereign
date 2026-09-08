@@ -275,7 +275,9 @@ def test_a_directory_whose_owner_is_gone_is_swept_at_once_with_its_record(tmp_pa
     orphan = trash_root / ".staging-bbbbbbbbbbbb"
     (orphan / "rm_cafe0001").mkdir(parents=True)
     (orphan / "rm_cafe0001" / "kept.txt").write_text("k")
-    record = _write_owner(trash_root, orphan.name, _dead_pid())
+    # The record names a container too: with no docker binary on the host
+    # nothing can be running, so the directory is reaped at once.
+    record = _write_owner(trash_root, orphan.name, _dead_pid(), container="kestrel_compute_dead0000")
 
     _sweep(trash_root)
 
