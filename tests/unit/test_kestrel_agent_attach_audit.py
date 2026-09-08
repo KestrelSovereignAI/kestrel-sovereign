@@ -13,7 +13,6 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 
@@ -39,7 +38,8 @@ def _llm_service(*adapters):
 
 def test_a_raising_audit_attach_is_logged_and_the_agent_still_constructs(tmp_path, caplog):
     raising, recording = _RaisingAdapter(), _RecordingAdapter()
-    with caplog.at_level(logging.DEBUG, logger="kestrel_sovereign.kestrel_agent"):
+    # INFO is the default configuration: the record must be visible there.
+    with caplog.at_level(logging.INFO, logger="kestrel_sovereign.kestrel_agent"):
         agent = KestrelAgent(
             did="did:test:attach-audit",
             storage_path=str(tmp_path / "kestrel.db"),
@@ -49,8 +49,12 @@ def test_a_raising_audit_attach_is_logged_and_the_agent_still_constructs(tmp_pat
     assert agent.did == "did:test:attach-audit"
     # The adapter after the raising one is still attached: the loop went on.
     assert recording.attached is agent
-    messages = [r.getMessage() for r in caplog.records if "attach_agent_for_audit failed" in r.getMessage()]
-    assert messages == ["attach_agent_for_audit failed on _RaisingAdapter: audit attach refused"]
+    records = [
+        (r.levelname, r.getMessage())
+        for r in caplog.records
+        if "attach_agent_for_audit failed" in r.getMessage()
+    ]
+    assert records == [("WARNING", "attach_agent_for_audit failed on _RaisingAdapter: audit attach refused")]
 
 
 def test_adapters_without_the_hook_are_skipped_silently(tmp_path, caplog):
