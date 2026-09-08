@@ -49,6 +49,7 @@ MAX_DELAY_SECONDS = 3600  # 1 hour cap
 
 # Deduplication window
 DEDUP_WINDOW_SECONDS = 60
+CANONICAL_BACKFILL_BATCH_SIZE = 500
 
 # Type alias for the delivery callback
 DeliveryCallback = Callable[[str, str, Dict[str, Any]], Coroutine[Any, Any, DeliveryResult]]
@@ -246,7 +247,18 @@ class DeliveryQueue:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         row = await self._db.fetchone(
-            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ? AND status = ?",
+            """
+            SELECT COUNT(*) FROM delivery_queue
+            WHERE agent_id = ? AND status = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND (
+                        delivery_dead_letter.original_id = delivery_queue.id
+                        OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                    )
+              )
+            """,
             (self._agent_id, DeliveryStatus.IN_FLIGHT.value),
         )
         count = row[0] if row else 0
@@ -257,6 +269,14 @@ class DeliveryQueue:
                 UPDATE delivery_queue
                 SET status = ?, next_retry_at = ?
                 WHERE agent_id = ? AND status = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                        AND (
+                            delivery_dead_letter.original_id = delivery_queue.id
+                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                        )
+                  )
                 """,
                 (
                     DeliveryStatus.PENDING.value,
@@ -403,34 +423,68 @@ class DeliveryQueue:
         canonical_content_hash: str,
         legacy_content_hash: str,
         dedup_cutoff: str,
+        channel_type: Optional[str] = None,
+        max_retries: Optional[int] = None,
     ) -> Optional[str]:
         """Find an eligible recent duplicate and repair rolling-writer hashes."""
+        request_filter = ""
+        request_params: tuple[Any, ...] = ()
+        if channel_type is not None and max_retries is not None:
+            request_filter = (
+                " AND delivery_queue.channel_type = ?"
+                " AND delivery_queue.max_retries = ?"
+            )
+            request_params = (channel_type, max_retries)
         existing = await self._db.fetchone(
-            """
-            SELECT delivery_queue.id FROM delivery_queue
-            WHERE delivery_queue.agent_id = ?
-                  AND (delivery_queue.content_hash IN (?, ?)
-                       OR delivery_queue.canonical_content_hash = ?)
-                  AND delivery_queue.recipient = ?
-                  AND delivery_queue.created_at >= ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM delivery_dead_letter
-                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                        AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                        )
-                  )
-            ORDER BY delivery_queue.created_at DESC
+            f"""
+            SELECT id FROM (
+                SELECT delivery_queue.id, delivery_queue.created_at
+                FROM delivery_queue
+                WHERE delivery_queue.agent_id = ?
+                      AND delivery_queue.content_hash IN (?, ?)
+                      AND delivery_queue.recipient = ?
+                      AND delivery_queue.created_at >= ?
+                      {request_filter}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_dead_letter
+                          WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                            AND (
+                                delivery_dead_letter.original_id = delivery_queue.id
+                                OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                            )
+                      )
+                UNION ALL
+                SELECT delivery_queue.id, delivery_queue.created_at
+                FROM delivery_queue
+                WHERE delivery_queue.agent_id = ?
+                      AND delivery_queue.canonical_content_hash = ?
+                      AND delivery_queue.recipient = ?
+                      AND delivery_queue.created_at >= ?
+                      {request_filter}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_dead_letter
+                          WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                            AND (
+                                delivery_dead_letter.original_id = delivery_queue.id
+                                OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                            )
+                      )
+            ) AS candidates
+            ORDER BY created_at DESC
             LIMIT 1
             """,
             (
                 self._agent_id,
                 canonical_content_hash,
                 legacy_content_hash,
+                recipient,
+                dedup_cutoff,
+                *request_params,
+                self._agent_id,
                 canonical_content_hash,
                 recipient,
                 dedup_cutoff,
+                *request_params,
             ),
         )
         if existing is not None:
@@ -440,13 +494,14 @@ class DeliveryQueue:
         # hash after startup backfill. Reconcile relevant rows on every enqueue;
         # the partial index keeps this bounded to legacy-writer residue.
         missing = await self._db.fetchall(
-            """
+            f"""
             SELECT delivery_queue.id, delivery_queue.content_json
             FROM delivery_queue
             WHERE delivery_queue.agent_id = ?
                   AND delivery_queue.recipient = ?
                   AND delivery_queue.created_at >= ?
                   AND delivery_queue.canonical_content_hash IS NULL
+                  {request_filter}
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
                       WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
@@ -457,7 +512,7 @@ class DeliveryQueue:
                   )
             ORDER BY delivery_queue.created_at DESC
             """,
-            (self._agent_id, recipient, dedup_cutoff),
+            (self._agent_id, recipient, dedup_cutoff, *request_params),
         )
         for missing_id, persisted_json in missing:
             _, repaired_hash = _persisted_content_hashes(
@@ -540,6 +595,8 @@ class DeliveryQueue:
                         canonical_content_hash=canonical_content_hash,
                         legacy_content_hash=legacy_content_hash,
                         dedup_cutoff=dedup_cutoff,
+                        channel_type=channel_type,
+                        max_retries=retries,
                     )
                     # Always claim with a fresh unguessable candidate. That lets
                     # ambiguous INSERT completion compensate by exact entry ID
@@ -621,7 +678,8 @@ class DeliveryQueue:
                         await self._db.execute(
                             """
                             UPDATE delivery_idempotency
-                            SET entry_id = ?, created_at = ?, compensating = 0
+                            SET entry_id = ?, created_at = ?, compensating = 0,
+                                previous_entry_id = NULL
                             WHERE agent_id = ? AND idempotency_key_digest = ?
                                   AND entry_id = ?
                             """,
@@ -647,13 +705,15 @@ class DeliveryQueue:
                         await self._db.execute(
                             """
                             UPDATE delivery_idempotency
-                            SET entry_id = ?, created_at = ?, compensating = 0
+                            SET entry_id = ?, created_at = ?, compensating = 0,
+                                previous_entry_id = ?
                             WHERE agent_id = ? AND idempotency_key_digest = ?
                                   AND entry_id = ?
                             """,
                             (
                                 candidate_id,
                                 now_iso,
+                                canonical_id,
                                 self._agent_id,
                                 key_digest,
                                 canonical_id,
@@ -682,6 +742,19 @@ class DeliveryQueue:
                             now_iso,
                             now_iso,
                         ),
+                    )
+                    # Commit the stale-claim repair only after the replacement
+                    # queue row exists. Until this marker is cleared, SQLite's
+                    # joined-transaction compensation trigger can restore the
+                    # prior fail-closed claim atomically.
+                    await self._db.execute(
+                        """
+                        UPDATE delivery_idempotency
+                        SET previous_entry_id = NULL
+                        WHERE agent_id = ? AND idempotency_key_digest = ?
+                              AND entry_id = ?
+                        """,
+                        (self._agent_id, key_digest, candidate_id),
                     )
                 except BaseException:
                     if nesting_strategy == "joined":
@@ -781,7 +854,21 @@ class DeliveryQueue:
 
         Returns:
             Dict with status information.
+
+        Raises:
+            DeliveryIdempotencyStateError: A durable retry transition cannot
+                be reconciled safely.
         """
+        try:
+            return await self._retry_entry(entry_id)
+        except Exception as error:
+            public_error = self._find_idempotency_error(error)
+            if public_error is not None:
+                raise public_error
+            raise
+
+    async def _retry_entry(self, entry_id: str) -> Dict[str, Any]:
+        """Execute a retry while allowing the public wrapper to unwrap errors."""
         # A dead-letter tombstone is authoritative even if a joined SQLite
         # caller committed the recoverable live+tombstone intermediate state.
         # Check and lock it before considering the main queue row.
@@ -887,7 +974,8 @@ class DeliveryQueue:
                 await self._db.execute(
                     """
                     UPDATE delivery_idempotency
-                    SET entry_id = ?, created_at = ?, compensating = 0
+                    SET entry_id = ?, created_at = ?, compensating = 0,
+                        previous_entry_id = NULL
                     WHERE agent_id = ? AND entry_id = ?
                     """,
                     (new_id, now_iso, self._agent_id, dl_row[1]),
@@ -1032,6 +1120,14 @@ class DeliveryQueue:
             """
             SELECT status, COUNT(*) FROM delivery_queue
             WHERE agent_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND (
+                        delivery_dead_letter.original_id = delivery_queue.id
+                        OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                    )
+              )
             GROUP BY status
             """,
             (self._agent_id,),
@@ -1401,14 +1497,18 @@ class DeliveryQueue:
         await self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_queue_missing_canonical
-            ON delivery_queue(id) WHERE canonical_content_hash IS NULL
+            ON delivery_queue(agent_id, id)
+            WHERE canonical_content_hash IS NULL
             """
         )
         missing_canonical_hashes = await self._db.fetchall(
             """
             SELECT id, recipient, content_json FROM delivery_queue
-            WHERE canonical_content_hash IS NULL
-            """
+            WHERE agent_id = ? AND canonical_content_hash IS NULL
+            ORDER BY id
+            LIMIT ?
+            """,
+            (self._agent_id, CANONICAL_BACKFILL_BATCH_SIZE),
         )
         for entry_id, recipient, content_json in missing_canonical_hashes:
             _, canonical_hash = _persisted_content_hashes(
@@ -1417,9 +1517,10 @@ class DeliveryQueue:
             await self._db.execute(
                 """
                 UPDATE delivery_queue SET canonical_content_hash = ?
-                WHERE id = ? AND canonical_content_hash IS NULL
+                WHERE id = ? AND agent_id = ?
+                      AND canonical_content_hash IS NULL
                 """,
-                (canonical_hash, entry_id),
+                (canonical_hash, entry_id, self._agent_id),
             )
         await self._db.execute(
             """
@@ -1450,6 +1551,7 @@ class DeliveryQueue:
                 payload_digest TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 compensating INTEGER NOT NULL DEFAULT 0,
+                previous_entry_id TEXT,
                 PRIMARY KEY (agent_id, idempotency_key_digest)
             )
             """
@@ -1464,10 +1566,24 @@ class DeliveryQueue:
                 ADD COLUMN compensating INTEGER NOT NULL DEFAULT 0
                 """
             )
+        needs_v4_upgrade = not await self._db.column_exists(
+            "delivery_idempotency", "previous_entry_id"
+        )
+        if needs_v4_upgrade:
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_idempotency
+                ADD COLUMN previous_entry_id TEXT
+                """
+            )
         # v2 accidentally made ledger deletion cascade into the live queue on
         # SQLite. Remove that schema-wide behavior before installing the v3
         # marker trigger used only by a failed joined-transaction enqueue.
         if self._db.backend_type == "sqlite":
+            if needs_v4_upgrade:
+                await self._db.execute(
+                    "DROP TRIGGER IF EXISTS trg_delivery_idempotency_compensate"
+                )
             await self._db.execute(
                 "DROP TRIGGER IF EXISTS trg_delivery_idempotency_delete"
             )
@@ -1500,11 +1616,21 @@ class DeliveryQueue:
                 BEGIN
                     DELETE FROM delivery_queue
                     WHERE id = NEW.entry_id AND agent_id = NEW.agent_id;
+                    UPDATE delivery_idempotency
+                    SET entry_id = previous_entry_id,
+                        previous_entry_id = NULL,
+                        compensating = 0
+                    WHERE agent_id = NEW.agent_id
+                      AND idempotency_key_digest = NEW.idempotency_key_digest
+                      AND entry_id = NEW.entry_id
+                      AND compensating = 1
+                      AND previous_entry_id IS NOT NULL;
                     DELETE FROM delivery_idempotency
                     WHERE agent_id = NEW.agent_id
                       AND idempotency_key_digest = NEW.idempotency_key_digest
                       AND entry_id = NEW.entry_id
-                      AND compensating = 1;
+                      AND compensating = 1
+                      AND previous_entry_id IS NULL;
                 END
                 """
             )

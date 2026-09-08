@@ -1198,6 +1198,51 @@ class TestQueueIdempotency:
         ) == (0,)
 
     @pytest.mark.asyncio
+    async def test_failed_stale_claim_repair_restores_original_claim(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "stale-claim@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "stale-claim-key",
+        }
+        original_id = await queue.enqueue(**request)
+        original_claim = await queue._db.fetchone(
+            """
+            SELECT payload_digest FROM delivery_idempotency
+            WHERE agent_id = ? AND entry_id = ?
+            """,
+            (queue._agent_id, original_id),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_stale_claim_queue_insert
+            BEFORE INSERT ON delivery_queue
+            BEGIN SELECT RAISE(ABORT, 'stale repair failed'); END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="stale repair failed"):
+                await queue.enqueue(**request)
+
+        assert await queue._db.fetchone(
+            """
+            SELECT entry_id, payload_digest, compensating, previous_entry_id
+            FROM delivery_idempotency WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        ) == (original_id, original_claim[0], 0, None)
+        with pytest.raises(DeliveryIdempotencyConflict):
+            await queue.enqueue(**{**request, "content": {"body": "changed"}})
+
+    @pytest.mark.asyncio
     async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
         queue._db.backend_type = "postgres"
         queue._db.nested_transaction_strategy = "savepoint"
@@ -1378,6 +1423,9 @@ class TestQueueIdempotency:
         ) == (1,)
         assert await queue.process_pending() == 0
         assert deliveries == []
+        counts = await queue.get_status_counts()
+        assert counts["pending"] == 0
+        assert counts["dead_letter"] == 1
         with pytest.raises(DeliveryIdempotencyTerminal):
             await queue.enqueue(**request)
 
@@ -1553,6 +1601,27 @@ class TestQueueIdempotency:
             "SELECT max_retries FROM delivery_queue WHERE id = ?",
             (retried["entry_id"],),
         ) == (7,)
+
+    @pytest.mark.asyncio
+    async def test_retry_unwraps_public_state_error(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email", "unwrap@example.com", {"body": "hello"}
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        original_execute = queue._db.execute
+
+        async def lose_locked_tombstone(sql, params=()):
+            if sql.strip().startswith("DELETE FROM delivery_dead_letter"):
+                return 0
+            return await original_execute(sql, params)
+
+        with patch.object(queue._db, "execute", side_effect=lose_locked_tombstone):
+            with pytest.raises(
+                DeliveryIdempotencyStateError,
+                match="lost its locked source row",
+            ):
+                await queue.retry(original_id)
 
     @pytest.mark.asyncio
     async def test_failed_nested_dead_letter_retry_remains_resumable(
@@ -1819,6 +1888,67 @@ class TestQueueIdempotency:
         assert plain_after == keyed_id
 
     @pytest.mark.asyncio
+    async def test_keyed_adoption_requires_matching_delivery_semantics(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        content = {"body": "hello"}
+        plain_channel = await queue.enqueue(
+            "webhook", "channel@example.com", content
+        )
+        keyed_channel = await queue.enqueue(
+            "email",
+            "channel@example.com",
+            content,
+            idempotency_key="channel-key",
+        )
+        plain_policy = await queue.enqueue(
+            "email", "policy@example.com", content
+        )
+        keyed_policy = await queue.enqueue(
+            "email",
+            "policy@example.com",
+            content,
+            max_retries=99,
+            idempotency_key="policy-key",
+        )
+
+        assert keyed_channel != plain_channel
+        assert keyed_policy != plain_policy
+        assert await queue._db.fetchone(
+            "SELECT channel_type FROM delivery_queue WHERE id = ?",
+            (keyed_channel,),
+        ) == ("email",)
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (keyed_policy,),
+        ) == (99,)
+
+    @pytest.mark.asyncio
+    async def test_dedup_lookup_uses_both_content_indexes(self, real_queue):
+        queue, _ = real_queue
+        original_fetchone = queue._db.fetchone
+        captured = {}
+
+        async def capture_dedup_query(sql, params=()):
+            if "AS candidates" in sql:
+                captured["sql"] = sql
+                captured["params"] = params
+            return await original_fetchone(sql, params)
+
+        with patch.object(queue._db, "fetchone", side_effect=capture_dedup_query):
+            await queue.enqueue(
+                "email", "query-plan@example.com", {"body": "hello"}
+            )
+
+        plan = await queue._db.fetchall(
+            f"EXPLAIN QUERY PLAN {captured['sql']}", captured["params"]
+        )
+        details = "\n".join(str(column) for row in plan for column in row)
+        assert "idx_delivery_queue_dedup" in details
+        assert "idx_delivery_queue_canonical_dedup" in details
+
+    @pytest.mark.asyncio
     async def test_pre_upgrade_legacy_hash_still_deduplicates(self, real_queue):
         queue, _ = real_queue
         entry_id = "pre-upgrade-entry"
@@ -1898,6 +2028,56 @@ class TestQueueIdempotency:
             "upgrade-hash@example.com",
             {"body": "world", "subject": "hello"},
         ) == original_id
+
+    @pytest.mark.asyncio
+    async def test_startup_hash_backfill_is_owner_scoped_and_bounded(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        now = datetime.now(timezone.utc).isoformat()
+        await queue._db.execute(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 501
+            )
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            SELECT 'backfill-' || value, ?, 'email', 'bulk@example.com',
+                   '{"body":"hello"}', 'legacy', NULL, 'pending', 0, 5, ?, ?
+            FROM sequence
+            """,
+            (queue._agent_id, now, now),
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            VALUES ('other-owner-backfill', 'did:test:other-owner', 'email',
+                    'bulk@example.com', '{"body":"hello"}', 'legacy', NULL,
+                    'pending', 0, 5, ?, ?)
+            """,
+            (now, now),
+        )
+
+        await queue._ensure_tables()
+
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_queue
+            WHERE agent_id = ? AND canonical_content_hash IS NOT NULL
+            """,
+            (queue._agent_id,),
+        ) == (500,)
+        assert await queue._db.fetchone(
+            """
+            SELECT canonical_content_hash FROM delivery_queue
+            WHERE id = 'other-owner-backfill'
+            """
+        ) == (None,)
 
     @pytest.mark.asyncio
     async def test_enqueue_reconciles_runtime_legacy_writer_hash(self, real_queue):
@@ -2511,6 +2691,36 @@ class TestQueueReclaimInFlight:
         status, attempts = await self._status_attempts(real_queue, "stuck")
         assert status == DeliveryStatus.PENDING.value
         assert attempts == 2  # attempts preserved
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_in_flight_row_is_not_reclaimed(self, real_queue):
+        await self._insert(real_queue, "tombstoned", DeliveryStatus.IN_FLIGHT.value, 2)
+        now = datetime.now(timezone.utc).isoformat()
+        await real_queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tombstoned-dl",
+                "tombstoned",
+                real_queue._agent_id,
+                "webhook",
+                "https://example.com/hook",
+                '{"text":"hi"}',
+                "interrupted move",
+                2,
+                now,
+                5,
+            ),
+        )
+
+        assert await real_queue._reclaim_in_flight() == 0
+        assert (await self._status_attempts(real_queue, "tombstoned"))[0] == (
+            DeliveryStatus.IN_FLIGHT.value
+        )
 
     @pytest.mark.asyncio
     async def test_start_reclaims_in_flight(self, real_queue):

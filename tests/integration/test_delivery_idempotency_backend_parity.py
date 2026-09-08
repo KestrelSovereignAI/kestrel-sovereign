@@ -157,6 +157,55 @@ async def test_keyed_and_plain_enqueues_share_content_gate(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_keyed_adoption_requires_matching_delivery_semantics(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-semantics:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+
+    try:
+        content = {"body": "same"}
+        plain_channel = await queue.enqueue(
+            "webhook", "channel@example.com", content
+        )
+        keyed_channel = await queue.enqueue(
+            "email",
+            "channel@example.com",
+            content,
+            idempotency_key="channel-key",
+        )
+        plain_policy = await queue.enqueue(
+            "email", "policy@example.com", content
+        )
+        keyed_policy = await queue.enqueue(
+            "email",
+            "policy@example.com",
+            content,
+            max_retries=99,
+            idempotency_key="policy-key",
+        )
+
+        assert keyed_channel != plain_channel
+        assert keyed_policy != plain_policy
+        assert await database.fetchone(
+            "SELECT channel_type FROM delivery_queue WHERE id = ?",
+            (keyed_channel,),
+        ) == ("email",)
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (keyed_policy,),
+        ) == (99,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_dead_letter_retry_reconciles_residual_live_row(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-dual-state:{uuid4().hex}"

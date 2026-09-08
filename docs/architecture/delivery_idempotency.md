@@ -35,10 +35,13 @@ readers from a rolling deployment and store the semantic JSON identity in
 `canonical_content_hash`. Current readers consult both identities. Every
 PostgreSQL enqueue takes a transaction-scoped lock on owner, recipient, and
 canonical content, while SQLite uses its immediate writer transaction, so keyed
-and plain requests cannot race past short-window deduplication. Schema
-initialization backfills a missing canonical identity, and each enqueue checks
-the indexed null set so rows written later by an older rolling-deployment
-process are reconciled before deduplication.
+and plain requests cannot race past short-window deduplication. A keyed request
+adopts a short-window row only when its delivery channel and effective retry
+policy also match; otherwise its durable replay claim would point at different
+delivery semantics. Schema initialization backfills at most 500 missing
+canonical identities for the current owner, and each enqueue checks the indexed
+null set so rows written later by an older rolling-deployment process are
+reconciled before deduplication without an unbounded startup migration.
 
 `delivery_purge` expires successful replay claims with their delivered queue
 rows. Its age threshold is therefore also the completed-delivery replay-safety
@@ -52,10 +55,16 @@ operators race. Purge removes delivered rows before their replay claims, so a
 partially committed joined operation leaves a safe stale claim rather than two
 deliveries. Ordinary ledger deletion never deletes a live queue row; only a
 marker written by failed enqueue compensation invokes the SQLite cleanup
-trigger. The move into dead letter uses the same recoverable ordering: it writes
+trigger. A stale replay claim records its prior queue ID while a replacement is
+being created, so failed joined-transaction compensation restores that claim
+instead of deleting its fail-closed conflict history. The move into dead letter
+uses the same recoverable ordering: it writes
 the tombstone before deleting the live row, while queue processing and keyed
 replay treat any temporary dual-row state as terminal until the transition is
 resumed. Explicit retry checks the tombstone first, removes any residual live
 original, and only then consumes the tombstone and exposes the single retry row.
 While retry is resumable, both `original_id` and `retry_entry_id` remain
 tombstoned for processing, deduplication, replay, listing, and retention.
+Legacy dead-letter rows added before retry policy persistence keep a nullable
+policy marker and fall back to the active queue configuration; new rows always
+persist their original policy.
