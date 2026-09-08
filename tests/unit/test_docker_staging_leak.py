@@ -835,3 +835,114 @@ async def test_one_sweep_spends_a_bounded_time_asking_docker(
     assert len(remaining) == 5 - len(inspected)
     for d in remaining:
         assert (trash_root / f"{d.name}{OWNER}").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Round 6: an entry the host cannot move, bounded inspects, no-replace moves
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unmovable_ordinary_entry_does_not_strand_the_others(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    """The review's P2: a root-owned `rm_` directory cannot be moved (moving a
+    directory rewrites its own '..'); before, the PermissionError escaped the
+    loop, every later entry was stranded, and the staging directory and its
+    record stayed in the root forever."""
+    executor, trash_root = executor_with_trash
+    made: dict = {}
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "rm"):
+            return _CompletedProcess()
+        staging = _staging_from(command)
+        stuck = staging / "rm_aaaa0000"  # sorts first
+        (stuck / "inner").mkdir(parents=True)
+        os.chmod(stuck / "inner", 0o500)
+        os.chmod(stuck, 0o500)
+        (staging / "rm_zzzz0001").mkdir()
+        (staging / "rm_zzzz0001" / "victim.txt").write_text("v")
+        made["staging"] = staging
+        return _SuccessfulProcess(b"ok", b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    try:
+        record = await asyncio.wait_for(executor.execute(_script()), timeout=2)
+        assert record.exit_code == 0
+        assert (trash_root / "rm_zzzz0001" / "victim.txt").read_text() == "v"
+        assert not made["staging"].exists()
+        assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
+        quarantine = trash_root / DockerExecutor.QUARANTINE_DIR_NAME
+        assert any(p.name == made["staging"].name for p in quarantine.iterdir())
+    finally:
+        for root, dirs, _files in os.walk(trash_root):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o700)
+
+
+def test_a_move_never_replaces_a_concurrently_created_target(tmp_path: Path):
+    """Two promoters settle on the same name: the second must land beside,
+    never on top of, the first."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    staging = trash_root / ".staging-move0000000"
+    (staging / "rm_same").mkdir(parents=True)
+    (staging / "rm_same" / "mine.txt").write_text("mine")
+    (trash_root / "rm_same").mkdir()
+    (trash_root / "rm_same" / "theirs.txt").write_text("theirs")
+
+    moved = DockerExecutor._move_noreplace(staging / "rm_same", trash_root, "rm_same")
+
+    assert moved == trash_root / "rm_same.1"
+    assert (trash_root / "rm_same" / "theirs.txt").read_text() == "theirs"
+    assert (trash_root / "rm_same.1" / "mine.txt").read_text() == "mine"
+
+
+def test_the_promotion_moves_entries_without_replacing(tmp_path: Path, monkeypatch):
+    """The promotion goes through the no-replace move, not a plain rename."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    staging = trash_root / ".staging-wire0000000"
+    (staging / "rm_one").mkdir(parents=True)
+    calls: list[tuple] = []
+    real = DockerExecutor._move_noreplace
+
+    def spy(entry, into, label):
+        calls.append((entry.name, into, label))
+        return real(entry, into, label)
+
+    monkeypatch.setattr(DockerExecutor, "_move_noreplace", staticmethod(spy))
+    DockerExecutor._promote_staged_trash(staging, trash_root)
+    assert calls == [("rm_one", trash_root, "rm_one")]
+    assert (trash_root / "rm_one").is_dir() and not staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_inspect_cannot_hold_the_sweep_past_its_budget(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    executor, trash_root = executor_with_trash
+    trash_root.mkdir()
+    d = trash_root / ".staging-hangdaemon00"
+    d.mkdir()
+    _write_owner(trash_root, d.name, _dead_pid(), container="kestrel_compute_hang")
+    monkeypatch.setattr(DockerExecutor, "SWEEP_INSPECT_BUDGET_SECONDS", 0.2)
+
+    class _Never:
+        returncode = None
+
+        async def wait(self):
+            await asyncio.sleep(30)
+            return 1
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "inspect"):
+            return _Never()
+        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    started = time.monotonic()
+    await asyncio.wait_for(executor.execute(_script()), timeout=10)
+    assert time.monotonic() - started < 5
+    assert d.is_dir(), "an inconclusive inspect leaves the directory alone"

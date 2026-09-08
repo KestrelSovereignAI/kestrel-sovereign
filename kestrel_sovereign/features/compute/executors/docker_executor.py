@@ -21,6 +21,7 @@ from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
 from ..destructive_policy import DestructiveOperationPolicy
 from ..models import ComputeCommand, ComputeScript, ExecutionRecord
+from ..trash_manager import _rename_noreplace
 from .base import (
     BaseExecutor,
     ExecutionEnvironmentError,
@@ -770,7 +771,15 @@ class DockerExecutor(BaseExecutor):
                             "Sweep inspect budget spent; %s left for the next run", candidate
                         )
                         continue
-                    if await self._container_exists(docker_path, owner["container"]):
+                    remaining = inspect_deadline - time.monotonic()
+                    try:
+                        exists = await asyncio.wait_for(
+                            self._container_exists(docker_path, owner["container"]),
+                            timeout=max(0.5, remaining),
+                        )
+                    except TimeoutError:
+                        exists = True  # inconclusive: leave the directory alone
+                    if exists:
                         continue
                 if expired:
                     logger.warning(
@@ -794,6 +803,43 @@ class DockerExecutor(BaseExecutor):
         bound = max(self.OWNER_MAX_AGE_SECONDS, 2 * self._legacy_staging_age_seconds)
         return time.time() - started > bound
 
+    #: How many collision suffixes a move tries before giving up.
+    MOVE_SUFFIX_LIMIT = 1000
+
+    @classmethod
+    def _move_noreplace(cls, entry: Path, into: Path, label: str) -> Path:
+        """Move ``entry`` into ``into`` under ``label`` (a suffix is added on
+        collision) without ever replacing a concurrently created target.
+
+        Two promoters (two sweeps, or a sweep and a live promotion) may settle
+        on the same destination before either renames; a plain rename would
+        make the second replace the first and destroy a restorable entry.
+        The rename is anchored on directory descriptors and refused when the
+        target exists (``_rename_noreplace``), so a collision is retried with
+        the next suffix rather than clobbered.
+        """
+        source_fd = os.open(entry.parent, os.O_RDONLY)
+        try:
+            dest_fd = os.open(into, os.O_RDONLY)
+            try:
+                expected = os.stat(entry.name, dir_fd=source_fd, follow_symlinks=False)
+                for suffix in range(cls.MOVE_SUFFIX_LIMIT):
+                    name = label if suffix == 0 else f"{label}.{suffix}"
+                    try:
+                        _rename_noreplace(
+                            entry.name, name,
+                            source_dir_fd=source_fd, destination_dir_fd=dest_fd,
+                            expected_source_stat=expected,
+                        )
+                    except FileExistsError:
+                        continue
+                    return into / name
+                raise OSError(f"no free name for {entry.name} under {into}")
+            finally:
+                os.close(dest_fd)
+        finally:
+            os.close(source_fd)
+
     #: Where container-made hidden entries go. Not a ``.staging-`` name, so
     #: the sweep never treats it or its contents as staging directories or
     #: owner records; hidden, so the trash listing never shows it.
@@ -806,12 +852,16 @@ class DockerExecutor(BaseExecutor):
         quarantine = host_trash_dir / cls.QUARANTINE_DIR_NAME
         quarantine.mkdir(mode=0o700, exist_ok=True)
         label = staging_dir.name if entry == staging_dir else f"{staging_dir.name}-{entry.name}"
-        destination = quarantine / label
-        suffix = 0
-        while destination.exists() or destination.is_symlink():
-            suffix += 1
-            destination = quarantine / f"{label}.{suffix}"
-        entry.rename(destination)
+        destination = cls._move_noreplace(entry, quarantine, label)
+        try:
+            held = sum(1 for _ in quarantine.iterdir())
+        except OSError:
+            held = -1
+        logger.warning(
+            "Quarantine %s now holds %s entries; container-made entries the host "
+            "user cannot delete need an operator's attention.",
+            quarantine, held,
+        )
         return destination
 
     @classmethod
@@ -898,17 +948,22 @@ class DockerExecutor(BaseExecutor):
                         entry, quarantined,
                     )
                     continue
-                destination = host_trash_dir / entry.name
-                suffix = 0
-                while destination.exists() or destination.is_symlink():
-                    suffix += 1
-                    destination = host_trash_dir / f"{entry.name}.{suffix}"
                 try:
-                    entry.rename(destination)
+                    cls._move_noreplace(entry, host_trash_dir, entry.name)
                 except FileNotFoundError:
                     # Another sweep promoted this stale directory first.
                     logger.debug(
                         "Staged entry %s already promoted by another process", entry
+                    )
+                except OSError as move_error:
+                    # An entry the host user cannot move (a root-owned
+                    # directory from a root container: moving it rewrites
+                    # its own '..'). Keep promoting the rest; the ENOTEMPTY
+                    # fallback below moves this directory aside whole.
+                    logger.warning(
+                        "Staged entry %s could not be promoted (%s: %s); the "
+                        "staging directory will be moved aside whole.",
+                        entry, type(move_error).__name__, move_error,
                     )
             try:
                 staging_dir.rmdir()
