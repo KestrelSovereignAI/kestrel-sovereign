@@ -102,11 +102,15 @@ TRACE_PARENT_MARKERS = (
     "parent_span",
     "parent-span",
     "parentspan",
+    "parent.span",
     "trace_parent",
     "trace-parent",
     "traceparent",
+    "trace.parent",
     "parent_trace",
+    "parent.trace",
     "span_parent",
+    "span.parent",
 )
 PROVENANCE_SOURCE_MARKERS = (
     "causation",
@@ -8738,6 +8742,27 @@ def _control_reference_sources(
                 element, control_return_helpers
             )
         }
+    if isinstance(
+        node,
+        (ast.DictComp, ast.GeneratorExp, ast.ListComp, ast.SetComp),
+    ):
+        elements = (
+            [node.key, node.value]
+            if isinstance(node, ast.DictComp)
+            else [node.elt]
+        )
+        elements.extend(
+            expression
+            for generator in node.generators
+            for expression in [generator.iter, *generator.ifs]
+        )
+        return {
+            source
+            for element in elements
+            for source in _control_reference_sources(
+                element, control_return_helpers
+            )
+        }
     if isinstance(node, ast.IfExp):
         return _control_reference_sources(
             node.body, control_return_helpers
@@ -8803,6 +8828,44 @@ def _control_reference_sources(
         return sources
     if factory_name in {"partial", "partialmethod"} and node.args:
         return _control_reference_sources(node.args[0], control_return_helpers)
+    # Collection/iterator adapters preserve or select their input members.
+    # Follow the input references so a control callback does not become opaque
+    # merely because ordinary iteration adds an index, view, or lazy wrapper.
+    iterable_adapter_names = {
+        "chain",
+        "deque",
+        "enumerate",
+        "filter",
+        "frozenset",
+        "iter",
+        "list",
+        "map",
+        "next",
+        "reversed",
+        "set",
+        "sorted",
+        "tuple",
+        "zip",
+    }
+    collection_view_names = {"items", "keys", "values"}
+    if factory_name in iterable_adapter_names:
+        return {
+            source
+            for argument in [
+                *node.args,
+                *(keyword.value for keyword in node.keywords),
+            ]
+            for source in _control_reference_sources(
+                argument, control_return_helpers
+            )
+        }
+    if (
+        factory_name in collection_view_names
+        and isinstance(node.func, ast.Attribute)
+    ):
+        return _control_reference_sources(
+            node.func.value, control_return_helpers
+        )
     # Type adapters and decorator helpers preserve a callable argument in
     # their return value.  Do not generalize this to every call: an ordinary
     # consumer may accept a callback without returning it, and treating that
@@ -14144,6 +14207,44 @@ def test_provenance_scanner_follows_loop_bound_control_callbacks() -> None:
     assert _authority_provenance_lines(tree) == {2, 8}
 
 
+@pytest.mark.parametrize(
+    "loop",
+    (
+        "for _, callback in enumerate(callbacks):",
+        "for callback in iter(callbacks):",
+        "for callback in map(identity, callbacks):",
+        "for callback in callbacks.values():",
+        "for _, callback in callbacks.items():",
+        "for callback in (item for item in callbacks):",
+    ),
+)
+def test_provenance_scanner_preserves_controls_through_iterable_adapters(
+    loop: str,
+) -> None:
+    setup = (
+        "callbacks = {'stop': target.shutdown}"
+        if ".values()" in loop or ".items()" in loop
+        else "callbacks = [target.shutdown]"
+    )
+    tree = ast.parse(
+        "def dispatch(request, target):\n"
+        f"    {setup}\n"
+        f"    {loop}\n"
+        "        if request.causation_chain:\n"
+        "            callback()\n"
+    )
+    benign_tree = ast.parse(
+        "def dispatch(request, target):\n"
+        f"    {setup.replace('target.shutdown', 'record_metric')}\n"
+        f"    {loop}\n"
+        "        if request.causation_chain:\n"
+        "            callback()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {4}
+    assert _authority_provenance_lines(benign_tree) == set()
+
+
 def test_provenance_scanner_follows_conditionally_selected_controls() -> None:
     tree = ast.parse(
         "def dispatch(request, target, enabled):\n"
@@ -15699,6 +15800,23 @@ def test_provenance_scanner_classifies_trace_parent_metadata(
     assert _cached_authority_provenance_lines(
         parent_span_path
     ) == frozenset({2})
+
+    dotted_source = (
+        "def nested(request, target):\n"
+        "    if request.trace.parent:\n"
+        "        target.shutdown()\n\n"
+        "def inverse(request, target):\n"
+        "    if request.parent.span:\n"
+        "        terminate_child(target)\n"
+    )
+    dotted_tree = ast.parse(dotted_source)
+    dotted_path = tmp_path / "dotted_trace_parent_controller.py"
+    dotted_path.write_text(dotted_source, encoding="utf-8")
+
+    assert _authority_provenance_lines(dotted_tree) == {2, 6}
+    assert _cached_authority_provenance_lines(dotted_path) == frozenset(
+        {2, 6}
+    )
 
 
 def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> None:
