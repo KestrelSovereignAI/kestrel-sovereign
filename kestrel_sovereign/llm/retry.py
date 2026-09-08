@@ -148,13 +148,14 @@ class AdvisedWaitExceedsRetryBudget(Exception):
     advised waits on one host; #3127). The wait is fact, not guess: retrying
     before ``retry_at`` is futile by the server's own account.
 
-    It classifies as the error it stands for at every downstream door:
-    ``status_code`` is the cause's (429 for a throttle; a 503 that advised a
-    cool-down stays a 503, so an overload is never reported as a quota
-    problem), ``retry_after`` is the advised wait, ``response`` is the
-    provider's, and the message names the reset time. It is not itself
-    retryable: :func:`is_retryable_error` refuses it, so an outer loop cannot
-    re-enter the wait the inner one declined.
+    Only a throttle is declined (a 5xx carrying ``Retry-After`` is clamped
+    and retried as before), so it classifies as the throttle it stands for
+    at every downstream door: ``status_code`` is the cause's (429, or 429
+    when the throttle was recognised by message alone), ``retry_after`` is
+    the advised wait, ``response`` is the provider's, and the message names
+    the reset time. It is not itself retryable: :func:`is_retryable_error`
+    refuses it, so an outer loop cannot re-enter the wait the inner one
+    declined.
     """
 
     def __init__(
@@ -476,12 +477,16 @@ async def with_retry(
 
     A server-advised cool-down (``Retry-After``) is a fact about when the next
     attempt can succeed, so it is honoured as one wait when it fits the budget
-    the loop has left (the remaining attempts times the delay cap), and the
-    loop stops at once with :class:`AdvisedWaitExceedsRetryBudget` when it does
-    not: eight capped waits against advice to come back in hours are attempts
-    that cannot succeed, and they held a turn's conversation lock for the
-    whole budget before failing anyway (#3127). Only a guessed delay (no
-    advice) is clamped to the per-attempt cap.
+    the loop has left (its classic worst case, the delay cap times the
+    attempts after the first, less the sum of waits already taken), and for
+    a throttle the loop stops at once with :class:`AdvisedWaitExceedsRetryBudget`
+    when it does not: eight capped waits against advice to come back in hours
+    are attempts that cannot succeed, and they held a turn's conversation lock
+    for the whole budget before failing anyway (#3127). A non-throttle error
+    that advises more than the tight budget keeps the old behaviour, a wait
+    clamped to what is left and a retry: a proxy that stamps a fixed
+    ``Retry-After`` on every 502 is not a reset time. A guessed delay (no
+    advice) is clamped to the per-attempt cap and to what is left.
 
     Returns:
         The result of the function call
@@ -548,6 +553,12 @@ async def with_retry(
                         waited, getattr(e, "status_code", None), type(e).__name__, e,
                     )
                     raise
+                if advised > remaining_budget and not _is_throttle_error(e):
+                    # Not a throttle: the advice is not a reset time to
+                    # report, so it is clamped to what is left, as before.
+                    if remaining_budget <= 0:
+                        raise
+                    advised = remaining_budget
                 if advised > remaining_budget:
                     retry_at = datetime.now(UTC) + timedelta(
                         seconds=min(advised, float(ADVISED_WAIT_HORIZON_SECONDS))
@@ -564,8 +575,6 @@ async def with_retry(
                         budget_seconds=remaining_budget,
                         retry_at=retry_at,
                     ) from e
-                if attempts_left <= 0:
-                    raise
                 delay = advised + random.uniform(0, 1)
             else:
                 if attempts_left <= 0:

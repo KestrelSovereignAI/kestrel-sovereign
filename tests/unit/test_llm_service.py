@@ -748,6 +748,60 @@ class TestCoreGeneration:
         assert advised_wait_exceeding_budget(info.value) is None
 
     @pytest.mark.asyncio
+    async def test_every_exhausted_routes_raise_states_the_common_verdict(
+        self, llm_service, mock_adapter,
+    ):
+        """The three remaining raise sites: get_response, generate_stream
+        (behind _get_streaming_response_frozen) and stream_with_tool_detection."""
+        from datetime import UTC, datetime
+        from unittest.mock import Mock
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+
+        def arm():
+            llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+            mock_adapter.get_response = AsyncMock(side_effect=[
+                LLMProviderError("openai", "Connection reset by peer"),
+                LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+            ])
+
+        arm()
+        with pytest.raises(Exception) as info:
+            await llm_service.get_response(system_prompt="Test", user_prompt="Test prompt")
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        arm()
+        mock_adapter.get_streaming_response = None
+        with pytest.raises(Exception) as info:
+            async for _chunk in llm_service.generate_stream(system_prompt="Test", user_prompt="Hello"):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        arm()
+        mock_adapter.get_streaming_response_with_tools = None
+        tools = [{"name": "noop", "description": "a tool", "parameters": {"type": "object"}}]
+        with pytest.raises(Exception) as info:
+            async for _chunk in llm_service.stream_with_tool_detection(
+                messages=[{"role": "user", "content": "Hello"}], tools=tools
+            ):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
     async def test_generate_stream_aggregate_carries_the_common_decline(
         self, llm_service, mock_adapter,
     ):

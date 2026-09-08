@@ -171,12 +171,11 @@ async def test_the_budget_follows_the_error_type_per_attempt():
             if advised is not None:
                 self.response = _FakeResponse({"retry-after": str(advised)})
 
-    with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
-        await _drive([_throttle(200), _Overloaded(50), "ok"])
-    assert info.value.budget_seconds == TIGHT_BUDGET - 200
-    # An overload that advised a cool-down stays an overload.
-    assert info.value.status_code == 503 and info.value.throttled is False
-    assert str(info.value).startswith("503 _Overloaded: the provider advised waiting 50s")
+    result, sleeps = await _drive([_throttle(200), _Overloaded(50), "ok"])
+    assert result == "ok"
+    # The 503's advice exceeds the tight budget less the 200 s already spent
+    # (40 s left), so it is clamped there and retried; never declined.
+    assert sleeps == [200.0, TIGHT_BUDGET - 200]
 
 
 # ---------------------------------------------------------------------------
@@ -424,21 +423,12 @@ def test_an_unusable_first_source_never_hides_the_next_one():
     assert retry_after_seconds(err) == 7.5
 
 
-def test_the_decline_mirrors_its_causes_status_and_names_a_throttle_only_when_it_was_one():
+def test_the_decline_mirrors_its_cause_and_is_always_a_throttle():
     throttle = _declined()
     assert throttle.status_code == 429 and throttle.throttled is True
     assert str(throttle).startswith("429 rate limit: the provider advised waiting 6832s")
 
-    class _Overloaded(Exception):
-        status_code = 503
-
-    overload = AdvisedWaitExceedsRetryBudget(
-        _Overloaded("503 overloaded"), advised_seconds=300, budget_seconds=240,
-        retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
-    )
-    assert overload.status_code == 503 and overload.throttled is False
-    assert str(overload).startswith("503 _Overloaded: the provider advised waiting 300s")
-    assert is_retryable_error(overload) is False
+    assert is_retryable_error(throttle) is False
 
     # A throttle recognised by message alone, with no status code, is a 429.
     by_message = AdvisedWaitExceedsRetryBudget(
@@ -524,6 +514,25 @@ async def test_advice_that_arrives_on_the_final_attempt_is_declined_not_discarde
     assert calls["n"] == THROTTLE_MAX_RETRIES
     assert info.value.advised_seconds == 46774.0
     assert info.value.budget_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_non_throttle_never_declines_even_beyond_the_budget():
+    """The scope is a 429: a proxy stamping a fixed Retry-After on every 502
+    is not a reset time, so the old clamp-and-retry stays for those."""
+
+    class _Bad(Exception):
+        status_code = 502
+
+        def __init__(self):
+            super().__init__("502 bad gateway")
+            self.response = _FakeResponse({"retry-after": "300"})
+
+    result, sleeps = await _drive([_Bad(), "ok"])
+    assert result == "ok" and sleeps == [TIGHT_BUDGET]
+    # And once the tight budget is spent, the provider error itself.
+    with pytest.raises(_Bad):
+        await _drive([_Bad(), _Bad(), "ok"])
 
 
 @pytest.mark.asyncio

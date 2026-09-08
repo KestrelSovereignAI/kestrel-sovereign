@@ -14,6 +14,8 @@ import uuid
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
+from kestrel_sovereign.api_errors import rate_limited_until
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
@@ -3387,4 +3389,10 @@ async def chat_completions(request: Request, http_response: Response):
         raise
     except Exception as e:
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
+        declined = advised_wait_exceeding_budget(e)
+        if declined is not None:
+            # The route declined a server-advised wait (#3127): tell the
+            # OpenAI-compatible client when, the way it expects (429 with
+            # Retry-After), not a 500 that reads as a server bug.
+            raise rate_limited_until(declined) from e
         raise HTTPException(status_code=500, detail="Internal error in chat completions.")

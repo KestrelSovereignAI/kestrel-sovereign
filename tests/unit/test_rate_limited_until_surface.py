@@ -73,45 +73,6 @@ def test_retry_after_is_at_least_one_second():
     assert rate_limited_until(_declined(0.2), now=RESET).headers == {"Retry-After": "1"}
 
 
-def test_an_overload_that_advised_a_wait_is_a_503_not_a_rate_limit():
-    class _Overloaded(Exception):
-        status_code = 503
-
-    declined = AdvisedWaitExceedsRetryBudget(
-        _Overloaded(PROVIDER_PROSE), advised_seconds=300, budget_seconds=240, retry_at=RESET,
-    )
-    exc = rate_limited_until(declined, now=NOW)
-    assert exc.status_code == 503 and exc.code == "route_unavailable"
-    assert exc.message.startswith("The model route is unavailable until")
-    assert exc.headers == {"Retry-After": "6833"}
-    assert safe_streaming_error_message(_wrapped(declined)).startswith("The model route is unavailable.")
-
-
-def test_the_invoke_endpoint_logs_an_overload_as_unavailable_not_rate_limited():
-    """The endpoint's logger does not always propagate to the root handler
-    once the project's logging is configured, so the line is read at the
-    logger itself."""
-    from kestrel_sovereign.endpoints import agent as agent_endpoints
-
-    class _Overloaded(Exception):
-        status_code = 503
-
-    declined = AdvisedWaitExceedsRetryBudget(
-        _Overloaded(PROVIDER_PROSE), advised_seconds=300, budget_seconds=240,
-        retry_at=datetime.now(UTC) + timedelta(seconds=300),
-    )
-    app, restore = _boot_app(_wrapped(declined))
-    try:
-        with patch.object(agent_endpoints.logger, "error") as log_error:
-            response = _invoke(app)
-    finally:
-        restore()
-    assert response.status_code == 503
-    rendered = [call.args[0] % tuple(call.args[1:]) for call in log_error.call_args_list]
-    assert any(line.startswith("Agent invocation declined: model route unavailable until") for line in rendered)
-    assert not any("rate limited" in line for line in rendered)
-
-
 # ---------------------------------------------------------------------------
 # Streams
 # ---------------------------------------------------------------------------
@@ -220,4 +181,50 @@ def test_invoke_still_answers_500_for_any_other_failure():
         restore()
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "invoke_failed"
+    assert PROVIDER_PROSE not in response.text
+
+
+def test_the_invoke_endpoint_logs_the_decline_at_its_own_logger():
+    """The endpoint's logger does not always propagate to the root handler
+    once the project's logging is configured, so the line is read at the
+    logger itself."""
+    from kestrel_sovereign.endpoints import agent as agent_endpoints
+
+    live = AdvisedWaitExceedsRetryBudget(
+        _Throttle(PROVIDER_PROSE), advised_seconds=300, budget_seconds=240,
+        retry_at=datetime.now(UTC) + timedelta(seconds=300),
+    )
+    app, restore = _boot_app(_wrapped(live))
+    try:
+        with patch.object(agent_endpoints.logger, "error") as log_error:
+            response = _invoke(app)
+    finally:
+        restore()
+    assert response.status_code == 429
+    rendered = [call.args[0] % tuple(call.args[1:]) for call in log_error.call_args_list]
+    assert any(line.startswith("Agent invocation declined: model route rate limited until") for line in rendered)
+    assert not any(PROVIDER_PROSE in line for line in rendered)
+
+
+def test_chat_completions_answers_429_with_retry_after_when_the_route_declined_to_wait():
+    """The OpenAI-compatible surface, whose clients honour Retry-After on a
+    429, answered 500 for the same aggregate."""
+    live = AdvisedWaitExceedsRetryBudget(
+        _Throttle(PROVIDER_PROSE), advised_seconds=6832.4, budget_seconds=840,
+        retry_at=datetime.now(UTC) + timedelta(seconds=6832.4),
+    )
+    app, restore = _boot_app(_wrapped(live))
+    try:
+        with patch.dict(os.environ, {"KESTREL_API_KEY": "test-key"}), TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": "any", "messages": [{"role": "user", "content": "hello"}]},
+                headers={"X-API-Key": "test-key"},
+            )
+    finally:
+        restore()
+    assert response.status_code == 429, response.text
+    assert int(response.headers["Retry-After"]) in (6832, 6833)
+    body = response.json()
+    assert body["error"]["code"] == "rate_limited"
     assert PROVIDER_PROSE not in response.text

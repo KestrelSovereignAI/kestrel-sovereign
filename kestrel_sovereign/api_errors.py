@@ -51,23 +51,18 @@ def rate_limited_until(
     """The response an invocation returns when its model route declined to wait.
 
     The retry loop stopped because the provider's advised cool-down exceeds
-    what the call could wait (#3127). A throttle answers ``429 rate_limited``;
-    an overload that advised a cool-down answers ``503 route_unavailable``,
-    so an outage is never reported as a quota problem. The reset time is
+    what the call could wait (#3127); only a throttle is declined, so this is
+    always ``429 rate_limited``. The reset time is
     derived from the provider's number, clamped to the advice horizon so a
     wrong header cannot name a year decades out; ``Retry-After`` is measured
     when this response is built so it agrees with the time in the message.
     Provider prose and the route's name stay behind the boundary.
     """
-    if declined.throttled:
-        status, code, condition = 429, "rate_limited", "rate limited"
-    else:
-        status, code, condition = 503, "route_unavailable", "unavailable"
     return ApiHTTPException(
-        status_code=status,
-        code=code,
+        status_code=429,
+        code="rate_limited",
         message=(
-            f"The model route is {condition} {declined.reset_phrase()}; "
+            f"The model route is rate limited {declined.reset_phrase()}; "
             "retry after that time."
         ),
         headers={"Retry-After": str(declined.retry_after_header_seconds(now))},

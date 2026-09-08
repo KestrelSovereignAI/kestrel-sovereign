@@ -160,9 +160,9 @@ async def test_the_budget_is_what_the_loop_could_still_wait_not_the_whole_budget
 
 
 @pytest.mark.asyncio
-async def test_a_non_throttle_transient_with_advice_uses_the_tight_budget():
-    """A 503 advising 400 s against 5 x 60 s: does not fit the tight budget, so
-    it is declined at once too; failover is the caller's move."""
+async def test_a_non_throttle_transient_with_advice_is_clamped_not_declined():
+    """A 503 advising 400 s against 5 x 60 s: not a throttle, so the advice is
+    not a reset time to report; it is clamped to what is left and retried."""
 
     class _Overloaded(Exception):
         status_code = 503
@@ -171,11 +171,11 @@ async def test_a_non_throttle_transient_with_advice_uses_the_tight_budget():
             super().__init__("503 overloaded")
             self.response = _FakeResponse({"retry-after": "400"})
 
-    with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
-        await _run([_Overloaded()])
-    assert info.value.budget_seconds == 60.0 * 4
-    assert info.value.status_code == 503  # it stands for the overload it declined
-    assert info.value.throttled is False
+    result, sleeps, _ = await _run([_Overloaded(), "ok"])
+    assert result == "ok"
+    # Not a throttle: no decline; the advice is clamped to the tight budget
+    # and the call is retried, as it always was.
+    assert sleeps == [60.0 * 4]
 
 
 # ---------------------------------------------------------------------------
