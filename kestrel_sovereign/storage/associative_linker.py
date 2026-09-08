@@ -10,7 +10,7 @@ Example: "Mom" triggers "Sunday calls", "Brooklyn", "her garden"
 import re
 import logging
 from dataclasses import dataclass
-from typing import List, Literal, Set, Dict, Any
+from typing import List, Literal, Optional, Set, Dict, Any
 from datetime import datetime, timezone
 
 from .async_graph_store import AsyncGraphStore, GraphNode
@@ -22,6 +22,34 @@ ConceptCategory = Literal[
     "person", "place", "time", "activity", "emotion", "proper_noun"
 ]
 
+
+#: A capitalised stop word ends a proper-noun run: "Jon And Doe" is not one name.
+_RUN_STOP_WORDS = frozenset({"the", "and", "but", "for"})
+
+
+def classify_label(label: str) -> Optional[str]:
+    """The keyword category the linker would give ``label`` on its own, or
+    ``None`` when no keyword pass claims it (a proper noun, or nothing).
+
+    The same pattern tables the extraction uses, run over the label alone,
+    so a concept node written before categories were stored can be told
+    apart on read: "march" is ``time``, "brooklyn" is ``place``, "mom" is
+    ``person``, "alice" is ``None`` (#3259).
+    """
+    text = str(label or "").strip().lower()
+    if not text:
+        return None
+    for category, patterns in (
+        ("person", AssociativeLinker.PERSON_PATTERNS),
+        ("place", AssociativeLinker.PLACE_PATTERNS),
+        ("time", AssociativeLinker.TIME_PATTERNS),
+        ("activity", AssociativeLinker.ACTIVITY_PATTERNS),
+        ("emotion", AssociativeLinker.EMOTION_PATTERNS),
+    ):
+        for pattern in patterns:
+            if re.search(pattern, text, re.I):
+                return category
+    return None
 
 @dataclass
 class LinkedConcept:
@@ -140,9 +168,11 @@ class AssociativeLinker:
 
         labels = [label for label, _ in categorized]
 
-        # Create/update concept nodes
-        for label in labels:
-            await self._ensure_concept_node(label, agent_id)
+        # Create/update concept nodes, stamping the category the extraction
+        # gave each one: the person resolver reads it to keep months and
+        # places out of a person's candidate list (#3259).
+        for label, category in categorized:
+            await self._ensure_concept_node(label, agent_id, category)
 
         # Create message → concept links
         linked: List[LinkedConcept] = []
@@ -209,24 +239,62 @@ class AssociativeLinker:
                         seen.add(normalized)
                         results.append((normalized, category))
 
-        # Also extract proper nouns (capitalized words that aren't sentence starters)
+        # Also extract proper nouns. A run of consecutive capitalized words is
+        # ONE name ("Jon Doe"), not one concept per token (#3259). A word that
+        # starts a sentence is capitalized for being first and is never part
+        # of a name: "Thanks Jon" and "Jon Doe" are the same shape there, and
+        # without a lexicon the honest reading is the existing one, so a
+        # sentence-initial name loses its first token ("Jon Doe helped" ->
+        # "doe"); put the name mid-sentence to keep it whole.
+        # Only a keyword-classified word ends a run; ``seen`` goes on
+        # collecting proper nouns below, and a name whose first token was
+        # already mentioned on its own ("Jon ... Jon Doe") must still be
+        # kept whole.
+        keyworded = set(seen)
         words = content.split()
-        for i, word in enumerate(words):
-            if i > 0 and words[i-1][-1] not in ".!?":
-                if word[0].isupper() and len(word) > 2:
-                    clean = re.sub(r"[^\w]", "", word).lower()
-                    if clean and clean not in ["the", "and", "but", "for"] and clean not in seen:
-                        seen.add(clean)
-                        results.append((clean, "proper_noun"))
+        i = 0
+        while i < len(words):
+            if i == 0 or words[i - 1][-1] in ".!?":
+                i += 1
+                continue
+            run: List[str] = []
+            j = i
+            while j < len(words) and words[j][0].isupper() and len(words[j]) > 2:
+                token = re.sub(r"[^\w]", "", words[j]).lower()
+                # A word the keyword passes already classified ("Monday",
+                # "Christmas") is its own concept, never part of a name:
+                # "Robert Monday" is Robert, on Monday. A stop word ends a
+                # run the same way.
+                if token in keyworded or token in _RUN_STOP_WORDS:
+                    break
+                run.append(words[j])
+                if words[j][-1] in ".!?,;:":
+                    j += 1
+                    break
+                j += 1
+            if run:
+                clean = " ".join(
+                    part for part in (re.sub(r"[^\w]", "", w).lower() for w in run) if part
+                )
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    results.append((clean, "proper_noun"))
+            i = max(j, i + 1)
 
         return results
 
     async def _ensure_concept_node(
         self,
         concept: str,
-        agent_id: str
+        agent_id: str,
+        category: Optional[str] = None,
     ) -> None:
-        """Create or update concept node in graph."""
+        """Create or update concept node in graph.
+
+        ``category`` is recorded on the node (and refreshed on every
+        mention, so a node written before categories were stored acquires
+        one the next time it is mentioned).
+        """
         concept_node_id = f"concept:{agent_id}:{concept}"
 
         existing = await self.graph.get_node(concept_node_id)
@@ -235,6 +303,8 @@ class AssociativeLinker:
             props = existing.properties or {}
             props["mention_count"] = props.get("mention_count", 0) + 1
             props["last_mentioned"] = datetime.now(timezone.utc).isoformat()
+            if category:
+                props["category"] = category
             await self.graph.add_node(GraphNode(
                 node_id=concept_node_id,
                 node_type="concept",
@@ -252,6 +322,7 @@ class AssociativeLinker:
                     "agent_id": agent_id,
                     "first_mentioned": datetime.now(timezone.utc).isoformat(),
                     "last_mentioned": datetime.now(timezone.utc).isoformat(),
+                    **({"category": category} if category else {}),
                 },
             ))
 
