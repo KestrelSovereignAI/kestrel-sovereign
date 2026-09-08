@@ -290,7 +290,7 @@ async def test_monitored_cognition_transfers_resource_lock_generation(
 
     async def lock_aware_process_input(_prompt):
         operation_context = contextvars.copy_context()
-        c.locks.bind_current_task_ownership_to_context(operation_context)
+        c.locks.delegate_current_task_ownership(operation_context)
 
         async def nested_turn():
             owned = c.locks.is_owned_by_current_task(ResourceLock.MEMORY)

@@ -1794,6 +1794,7 @@ def test_unknown_public_turn_cannot_cancel_same_named_private_request() -> None:
     agent.active_turn_request_ids = MagicMock(return_value={})
     agent.cancel_current_request = MagicMock(return_value=True)
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",

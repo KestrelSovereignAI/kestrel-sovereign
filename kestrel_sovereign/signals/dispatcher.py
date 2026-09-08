@@ -4274,9 +4274,7 @@ class SignalDispatcher:
                 # creates its own cancellable invocation child and deliberately
                 # forwards inherited generations again; stale tokens stop
                 # authorizing as soon as this dispatch releases/reacquires.
-                self._locks.bind_current_task_ownership_to_context(
-                    execution_context
-                )
+                self._locks.delegate_current_task_ownership(execution_context)
                 execution_task = asyncio.create_task(
                     execute_with_tracking(),
                     name=f"signal_cognition:{signal.id}",
