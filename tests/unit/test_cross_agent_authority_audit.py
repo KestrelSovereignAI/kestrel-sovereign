@@ -3967,10 +3967,24 @@ def _scope_route_decorator_factories(
 def _route_registration_name(
     call: ast.Call,
     aliases: dict[str, tuple[str, str]] | None = None,
+    string_constants: dict[str, str] | None = None,
+    route_receivers: set[str] | None = None,
 ) -> str | None:
-    member_reference = _static_member_reference(call.func)
+    member_reference = _static_member_reference(call.func, string_constants)
     if member_reference is not None:
         return member_reference[1].casefold()
+    if (
+        isinstance(call.func, ast.Call)
+        and isinstance(call.func.func, ast.Name)
+        and call.func.func.id == "getattr"
+        and call.func.args
+        and isinstance(call.func.args[0], ast.Name)
+        and call.func.args[0].id in (route_receivers or {"app"})
+    ):
+        raise AssertionError(
+            "Unresolved immediate route registration: "
+            f"{ast.unparse(call.func)}"
+        )
     if isinstance(call.func, ast.Name):
         binding = (aliases or {}).get(call.func.id)
         if (
@@ -3988,8 +4002,11 @@ def _route_registration_name(
 def _route_receiver_name(
     decorator: ast.Call,
     aliases: dict[str, tuple[str, str]] | None = None,
+    string_constants: dict[str, str] | None = None,
 ) -> str | None:
-    member_reference = _static_member_reference(decorator.func)
+    member_reference = _static_member_reference(
+        decorator.func, string_constants
+    )
     if member_reference is not None:
         receiver = member_reference[0]
         return receiver.id if isinstance(receiver, ast.Name) else None
@@ -4400,11 +4417,15 @@ def _route_declarations(
                         route_decorator,
                         active_methods,
                         active_route_aliases,
+                        active_strings,
+                        {"app", *prefixes},
                     )
                     if not methods:
                         continue
                     receiver = _route_receiver_name(
-                        route_decorator, active_route_aliases
+                        route_decorator,
+                        active_route_aliases,
+                        active_strings,
                     )
                     if receiver == "app":
                         prefix = ""
@@ -4518,7 +4539,10 @@ def _route_declarations(
                 )
                 factory_registration = (
                     _route_registration_name(
-                        decorator_factory, active_route_aliases
+                        decorator_factory,
+                        active_route_aliases,
+                        active_strings,
+                        {"app", *prefixes},
                     )
                     if decorator_factory is not None
                     else None
@@ -4538,7 +4562,9 @@ def _route_declarations(
                     "websocket_route",
                 }:
                     receiver = _route_receiver_name(
-                        decorator_factory, active_route_aliases
+                        decorator_factory,
+                        active_route_aliases,
+                        active_strings,
                     )
                     if receiver == "app":
                         prefix = ""
@@ -4555,17 +4581,24 @@ def _route_declarations(
                                 decorator_factory,
                                 active_methods,
                                 active_route_aliases,
+                                active_strings,
+                                {"app", *prefixes},
                             ),
                             prefix
                             + _route_path(decorator_factory, active_strings),
                         )
                     )
                 registration = _route_registration_name(
-                    node, active_route_aliases
+                    node,
+                    active_route_aliases,
+                    active_strings,
+                    {"app", *prefixes},
                 )
                 if registration == "include_router":
                     receiver = _route_receiver_name(
-                        node, active_route_aliases
+                        node,
+                        active_route_aliases,
+                        active_strings,
                     )
                     prefix_keyword = next(
                         (
@@ -4625,7 +4658,9 @@ def _route_declarations(
                     "mount",
                 }:
                     receiver = _route_receiver_name(
-                        node, active_route_aliases
+                        node,
+                        active_route_aliases,
+                        active_strings,
                     )
                     if receiver == "app":
                         prefix = ""
@@ -4642,6 +4677,8 @@ def _route_declarations(
                                 node,
                                 active_methods,
                                 active_route_aliases,
+                                active_strings,
+                                {"app", *prefixes},
                             ),
                             prefix
                             + _programmatic_route_path(node, active_strings),
@@ -4744,8 +4781,15 @@ def _route_methods(
     decorator: ast.Call,
     constants: dict[str, tuple[str, ...]] | None = None,
     route_aliases: dict[str, tuple[str, str]] | None = None,
+    string_constants: dict[str, str] | None = None,
+    route_receivers: set[str] | None = None,
 ) -> tuple[str, ...]:
-    method = _route_registration_name(decorator, route_aliases)
+    method = _route_registration_name(
+        decorator,
+        route_aliases,
+        string_constants,
+        route_receivers,
+    )
     if method is None:
         return ()
     if method in {
@@ -6039,6 +6083,37 @@ def test_route_declarations_reject_dynamic_getattr_registration_aliases() -> Non
         AssertionError, match="Unresolved route registration alias"
     ):
         _route_declarations(ast.parse(source), {}, {})
+
+
+def test_route_declarations_resolve_or_reject_immediate_getattr_registrations() -> None:
+    resolved = ast.parse(
+        "router = APIRouter()\n"
+        "method_name = 'add_api_route'\n"
+        "getattr(router, method_name)(\n"
+        "    '/api/agents/{name}', endpoint, methods=['DELETE']\n"
+        ")\n"
+        "method_name = 'get'\n"
+        "getattr(router, method_name)('/api/agents/{name}/status')(status)\n"
+    )
+    unresolved = ast.parse(
+        "router = APIRouter()\n"
+        "getattr(router, method_name)(\n"
+        "    '/api/agents/{name}', endpoint, methods=['DELETE']\n"
+        ")\n"
+    )
+
+    assert _route_declarations(
+        resolved,
+        _module_string_constants(resolved),
+        _module_string_collections(resolved),
+    ) == [
+        (('DELETE',), '/api/agents/{name}'),
+        (('GET',), '/api/agents/{name}/status'),
+    ]
+    with pytest.raises(
+        AssertionError, match="Unresolved immediate route registration"
+    ):
+        _route_declarations(unresolved, {}, {})
 
 
 def test_route_declarations_reject_conditionally_rebound_aliases() -> None:
@@ -7502,10 +7577,18 @@ def _is_cross_agent_state_mutation_call(
         )
     )
     named_mutation = (
-        _call_name(call).casefold() in {"delattr", "setattr"}
+        _call_name(call).casefold()
+        in {"__delattr__", "__setattr__", "delattr", "setattr"}
         and bool(call.args)
         and _is_cross_agent_state_object_reference(
             call.args[0], state_object_aliases
+        )
+    )
+    bound_dunder_mutation = (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold() in {"__delattr__", "__setattr__"}
+        and _is_cross_agent_state_object_reference(
+            call.func.value, state_object_aliases
         )
     )
     lifecycle_mutation = (
@@ -7516,7 +7599,12 @@ def _is_cross_agent_state_mutation_call(
             call.func.value, state_object_aliases
         )
     )
-    return attribute_mutation or named_mutation or lifecycle_mutation
+    return (
+        attribute_mutation
+        or named_mutation
+        or bound_dunder_mutation
+        or lifecycle_mutation
+    )
 
 
 def _is_cross_agent_state_mutation_node(
@@ -8572,6 +8660,7 @@ def _is_cross_agent_control_call(
     if isinstance(node.func, ast.Subscript):
         callable_tokens.update(_identifier_tokens(node.func.slice))
     higher_order_callable_indexes = {
+        "add_done_callback": (0,),
         "apply_async": (0,),
         "call_at": (1,),
         "call_later": (1,),
@@ -8713,6 +8802,9 @@ def _provenance_aliases(
     authority_analysis: bool = True,
     state_object_aliases: set[str] | None = None,
     provenance_accessor_aliases: set[str] | None = None,
+    parameter_mutation_flows: dict[
+        str, tuple[_ParameterMutationFlow, ...]
+    ] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -8882,6 +8974,7 @@ def _provenance_aliases(
     )
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
     container_aliases = _mutable_container_alias_snapshots(function)
+    callable_alias_edges = _scope_callable_alias_edges(function)
 
     def expand_container_aliases(
         names: set[str], node: ast.AST
@@ -8917,6 +9010,40 @@ def _provenance_aliases(
                         statement_owners.get(node, node),
                     )
                 )
+            source_names = _expanded_callable_sources(
+                _call_name(node), callable_alias_edges
+            )
+            for source_name in source_names:
+                for flow in (parameter_mutation_flows or {}).get(
+                    source_name, ()
+                ):
+                    targets = _bound_parameter_flow_arguments(
+                        node, flow.targets
+                    )
+                    values = _bound_parameter_flow_arguments(
+                        node, flow.sources
+                    )
+                    if flow.direct_provenance:
+                        values.append(ast.Constant(value="causation_chain"))
+                    target_names = {
+                        name
+                        for target in targets
+                        for name in expand_container_aliases(
+                            _reference_binding_names(target), node
+                        )
+                    }
+                    if target_names and values:
+                        assignments.append(
+                            (
+                                target_names,
+                                values[0]
+                                if len(values) == 1
+                                else ast.Tuple(
+                                    elts=values, ctx=ast.Load()
+                                ),
+                                statement_owners.get(node, node),
+                            )
+                        )
             continue
         if value is None:
             continue
@@ -9689,6 +9816,14 @@ class _ParameterReturnFlow(NamedTuple):
     implicit_receiver: bool
 
 
+class _ParameterMutationFlow(NamedTuple):
+    """Call-shape summary for provenance written through a parameter."""
+
+    targets: _ParameterReturnFlow
+    sources: _ParameterReturnFlow
+    direct_provenance: bool
+
+
 def _parameter_return_flow(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     flowed_parameters: set[str],
@@ -9793,6 +9928,180 @@ def _bound_parameter_flow_arguments(
             or keyword.arg.casefold() not in flow.accepted_keywords
         )
     return values
+
+
+def _local_parameter_mutation_flows(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> dict[str, tuple[_ParameterMutationFlow, ...]]:
+    """Summarize provenance-bearing writes through local helper arguments.
+
+    A helper can return ``None`` yet still place an authority decision in a
+    caller-owned mapping or object.  Record both direct provenance reads and
+    ordinary formal-parameter flow so the caller can replay that side effect
+    as a normal assignment in its own provenance graph.
+    """
+
+    grouped: dict[str, set[_ParameterMutationFlow]] = {}
+    for function in functions:
+        parameters = {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+                *(
+                    [function.args.vararg]
+                    if function.args.vararg is not None
+                    else []
+                ),
+                *(
+                    [function.args.kwarg]
+                    if function.args.kwarg is not None
+                    else []
+                ),
+            ]
+        }
+        if not parameters:
+            continue
+
+        value_assignments: list[tuple[set[str], ast.AST]] = []
+        identity_assignments: list[tuple[set[str], ast.AST]] = []
+        writes: list[tuple[set[str], ast.AST]] = []
+
+        def mutation_target_names(target: ast.AST) -> set[str]:
+            """Name the mutated reference and its receiver chain, not keys."""
+
+            names = {ast.unparse(target).casefold()}
+            receiver = target
+            while isinstance(receiver, (ast.Attribute, ast.Subscript)):
+                receiver = receiver.value
+                names.add(ast.unparse(receiver).casefold())
+            return names
+
+        for node in _walk_lexical_scope(function):
+            targets: list[ast.AST] = []
+            value: ast.AST | None = None
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+                value = node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets = [node.target]
+                value = node.value
+            elif isinstance(node, ast.NamedExpr):
+                targets = [node.target]
+                value = node.value
+
+            if value is not None:
+                bound_names = {
+                    name
+                    for target in targets
+                    if not isinstance(target, (ast.Attribute, ast.Subscript))
+                    for name in _binding_target_names(target)
+                }
+                if bound_names:
+                    value_assignments.append((bound_names, value))
+                    if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+                        identity_assignments.append((bound_names, value))
+                mutated_names = {
+                    name
+                    for target in targets
+                    if isinstance(target, (ast.Attribute, ast.Subscript))
+                    for name in mutation_target_names(target)
+                }
+                if mutated_names:
+                    writes.append((mutated_names, value))
+                continue
+
+            if isinstance(node, ast.Call):
+                mutation = _mutable_container_write(node)
+                if mutation is not None:
+                    mutated_names, written_value = mutation
+                    writes.append(
+                        (
+                            mutated_names,
+                            written_value,
+                        )
+                    )
+
+        parameter_object_aliases = {
+            parameter: {parameter} for parameter in parameters
+        }
+        for aliases in parameter_object_aliases.values():
+            changed = True
+            while changed:
+                changed = False
+                for target_names, value in identity_assignments:
+                    if not _identifier_tokens(value).intersection(aliases):
+                        continue
+                    new_aliases = target_names - aliases
+                    if new_aliases:
+                        aliases.update(new_aliases)
+                        changed = True
+
+        parameter_value_aliases = {
+            parameter: {parameter} for parameter in parameters
+        }
+        for aliases in parameter_value_aliases.values():
+            changed = True
+            while changed:
+                changed = False
+                for target_names, value in value_assignments:
+                    if not _identifier_tokens(value).intersection(aliases):
+                        continue
+                    new_aliases = target_names - aliases
+                    if new_aliases:
+                        aliases.update(new_aliases)
+                        changed = True
+
+        provenance_aliases: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for target_names, value in value_assignments:
+                if not _has_provenance_token(value, provenance_aliases):
+                    continue
+                new_aliases = target_names - provenance_aliases
+                if new_aliases:
+                    provenance_aliases.update(new_aliases)
+                    changed = True
+
+        flows = grouped.setdefault(function.name.casefold(), set())
+        for target_names, value in writes:
+            target_parameters = {
+                parameter
+                for parameter, aliases in parameter_object_aliases.items()
+                if target_names.intersection(aliases)
+            }
+            if not target_parameters:
+                continue
+            value_tokens = set(_identifier_tokens(value))
+            source_parameters = {
+                parameter
+                for parameter, aliases in parameter_value_aliases.items()
+                if value_tokens.intersection(aliases)
+            }
+            direct_provenance = _has_provenance_token(
+                value, provenance_aliases
+            )
+            if not source_parameters and not direct_provenance:
+                continue
+            flows.add(
+                _ParameterMutationFlow(
+                    targets=_parameter_return_flow(
+                        function, target_parameters
+                    ),
+                    sources=_parameter_return_flow(
+                        function, source_parameters
+                    ),
+                    direct_provenance=direct_provenance,
+                )
+            )
+
+    return {
+        name: tuple(sorted(flows, key=repr))
+        for name, flows in grouped.items()
+        if flows
+    }
 
 
 def _scope_callable_alias_edges(
@@ -12492,6 +12801,8 @@ def _authority_provenance_lines(
     for function in functions:
         analyze_function_state_objects(function)
 
+    parameter_mutation_flows = _local_parameter_mutation_flows(functions)
+
     function_provenance: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, tuple[set[str], set[str]]
     ] = {}
@@ -12524,6 +12835,7 @@ def _authority_provenance_lines(
             ),
             state_object_aliases=function_state_objects[function],
             provenance_accessor_aliases=function_accessor_aliases[function],
+            parameter_mutation_flows=parameter_mutation_flows,
         )
         function_provenance[function] = resolved
         return resolved
@@ -13695,6 +14007,18 @@ def test_provenance_scanner_follows_higher_order_control_dispatch() -> None:
     assert _authority_provenance_lines(delayed_callbacks) == {2, 4}
 
 
+def test_provenance_scanner_follows_future_control_callbacks() -> None:
+    tree = ast.parse(
+        "def stop_child(_future):\n"
+        "    terminate_child('victim')\n\n"
+        "def dispatch(request, future):\n"
+        "    if request.causation_chain:\n"
+        "        future.add_done_callback(stop_child)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {5}
+
+
 def test_provenance_scanner_follows_controls_stored_in_containers() -> None:
     subscript_callback = ast.parse(
         "def dispatch(request, target):\n"
@@ -14004,6 +14328,50 @@ def test_provenance_scanner_follows_neutral_parameter_return_wrappers() -> None:
 
     assert _authority_provenance_lines(wrapped_parameter) == {8}
     assert _authority_provenance_lines(ordinary_parameter) == set()
+
+
+def test_provenance_scanner_follows_provenance_helper_side_effects() -> None:
+    direct = ast.parse(
+        "def populate(state, request):\n"
+        "    state['flag'] = bool(request.causation_chain)\n\n"
+        "def dispatch(request, child):\n"
+        "    state = {}\n"
+        "    populate(state, request)\n"
+        "    if state['flag']:\n"
+        "        child.stop()\n"
+    )
+    parameter_flow = ast.parse(
+        "def populate(state, value):\n"
+        "    alias = state\n"
+        "    alias['flag'] = bool(value)\n\n"
+        "def dispatch(request, child):\n"
+        "    state = {}\n"
+        "    populate(state, request.causation_chain)\n"
+        "    if state['flag']:\n"
+        "        child.stop()\n"
+    )
+    attribute_write = ast.parse(
+        "def populate(context, request):\n"
+        "    context.flag = bool(request.causation_chain)\n\n"
+        "def dispatch(request, child, context):\n"
+        "    populate(context, request)\n"
+        "    if context.flag:\n"
+        "        child.stop()\n"
+    )
+    benign = ast.parse(
+        "def populate(state, configured):\n"
+        "    state['flag'] = bool(configured)\n\n"
+        "def dispatch(request, child, configured):\n"
+        "    state = {}\n"
+        "    populate(state, configured)\n"
+        "    if state['flag']:\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(direct) == {7}
+    assert _authority_provenance_lines(parameter_flow) == {8}
+    assert _authority_provenance_lines(attribute_write) == {6}
+    assert _authority_provenance_lines(benign) == set()
 
 
 def test_provenance_scanner_follows_assignment_inside_return_wrapper() -> None:
@@ -14926,6 +15294,22 @@ def test_provenance_scanner_tracks_direct_agent_object_mutations_and_aliases() -
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 11}
+
+
+def test_provenance_scanner_tracks_dunder_agent_object_mutations() -> None:
+    tree = ast.parse(
+        "def unbound_set(request, child):\n"
+        "    if request.causation_chain:\n"
+        "        object.__setattr__(child, 'enabled', False)\n\n"
+        "def unbound_delete(request, child):\n"
+        "    if request.orchestrator:\n"
+        "        object.__delattr__(child, 'session')\n\n"
+        "def bound_set(request, child):\n"
+        "    if request.causation_chain:\n"
+        "        child.__setattr__('enabled', False)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2, 6, 10}
 
 
 def test_provenance_scanner_tracks_inline_resolved_agent_mutations() -> None:
