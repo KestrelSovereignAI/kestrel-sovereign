@@ -1850,15 +1850,28 @@ def test_the_size_measured_is_the_size_the_orchestrator_receives():
 
 @pytest.mark.asyncio
 async def test_no_output_length_slips_past_the_wrapped_cap(workspace: Path, queue):
-    """The window the wrapper opens is only as wide as ``tool`` and
-    ``success`` — about 34 characters — so a test that guesses a few output
-    sizes walks straight past it. The first version tried four fixed sizes
-    and a mutant dropping ``tool_name`` survived it.
+    """Two tests missed this before it was written correctly, and the reasons
+    are worth keeping.
 
-    This sweeps the boundary instead of guessing at it: every length across a
-    span wider than the window, so some length must land inside it. Driven
-    through a stub backend rather than real subprocesses, because 200 spawns
-    to test an arithmetic boundary is a slow way to be thorough."""
+    The first guessed four output sizes. The window is narrow, and none of
+    them landed in it.
+
+    The second computed the boundary from a synthetic ToolResult — but the
+    feature duplicates stdout into the confirmation for an uncaptured run, so
+    its envelope crosses the cap at roughly HALF the output length that
+    calculation predicted, and the sweep ran a thousand characters past the
+    window.
+
+    It also looked for the bug's signature (``bare <= cap < wrapped``) on the
+    returned envelope, which a working build never produces — the fit loop
+    exists to prevent exactly that. The assertion has to be the invariant,
+    not the symptom.
+
+    So: bisect on THE FEATURE's own measurement to find where its envelope
+    crosses, then sweep either side asserting the invariant. The residual gap
+    is only the tool name — ``serialized_result_len`` counts the wrapper keys
+    even with an empty name — so the window is about five characters wide and
+    has to be found rather than approached."""
     from kestrel_sovereign.features.base import (
         orchestrator_result_cap,
         serialized_result_len,
@@ -1867,21 +1880,22 @@ async def test_no_output_length_slips_past_the_wrapped_cap(workspace: Path, queu
     f = await _feature(workspace, queue)
     cap = orchestrator_result_cap()
 
-    # Locate the length whose BARE size first exceeds the cap; the wrapper's
-    # window sits just below it.
-    def bare(n: int) -> int:
-        return serialized_result_len(ToolResult.ok("c", data={"stdout": "p" * n}))
+    async def size_at(n: int, *, tool_name: str) -> int:
+        f._backend = _StubBackend(_run(stdout="p" * n, stderr=""))
+        env = await f.shell(command="echo hi")
+        return serialized_result_len(env, tool_name=tool_name)
 
+    # Where does the feature's own envelope first exceed the cap, measured
+    # the way the mutant would measure it (no tool name)?
     lo, hi = 0, cap
     while lo < hi:
         mid = (lo + hi) // 2
-        if bare(mid) <= cap:
+        if await size_at(mid, tool_name="") <= cap:
             lo = mid + 1
         else:
             hi = mid
-    boundary = lo
 
-    for n in range(max(0, boundary - 120), boundary + 40):
+    for n in range(max(0, lo - 30), lo + 30):
         f._backend = _StubBackend(_run(stdout="p" * n, stderr=""))
         env = await f.shell(command="echo hi")
         wrapped = serialized_result_len(env, tool_name="shell")
