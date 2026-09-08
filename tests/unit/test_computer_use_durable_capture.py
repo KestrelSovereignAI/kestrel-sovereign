@@ -1462,3 +1462,93 @@ async def test_the_audit_row_names_why_an_incomplete_run_failed(
     assert "timed out" in row["error"]
     assert row["args"]["complete"] is False
     assert "writers_remaining" in row["args"]
+
+
+def test_the_executor_populates_the_truncation_field():
+    """Surviving mutant: hardcoding ``output_truncated=False`` at the point
+    the record is built changed nothing, because the only test asserted the
+    dataclass HAS the field. Testing the shape instead of the wiring is the
+    same door as the fix, again."""
+    from datetime import datetime
+
+    from kestrel_sovereign.features.compute.executors.base import (
+        BaseExecutor,
+        _CapturedOutput,
+        _ExecutionContext,
+    )
+
+    class _Subject:
+        id = "abc12345"
+
+    class _Probe(BaseExecutor):
+        name = "local"
+
+        def __init__(self):
+            pass
+
+        @property
+        def is_available(self):  # pragma: no cover - unused here
+            return True
+
+        async def execute(self, *a, **k):  # pragma: no cover - unused here
+            raise NotImplementedError
+
+    ctx = _ExecutionContext(
+        execution_id="e1", started_at=datetime.now(), workdir="/tmp"
+    )
+    probe = _Probe()
+
+    clipped = probe._build_record(
+        subject=_Subject(),
+        context=ctx,
+        exit_code=0,
+        stdout="x",
+        stderr="",
+        output_truncated=True,
+    )
+    whole = probe._build_record(
+        subject=_Subject(), context=ctx, exit_code=0, stdout="x", stderr=""
+    )
+
+    assert clipped.output_truncated is True
+    assert whole.output_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_the_run_path_carries_truncation_into_the_record():
+    """The wiring the mutant actually sat on: the caller must read the
+    capture's own ``truncated`` flag rather than pass a constant."""
+    from datetime import datetime
+
+    from kestrel_sovereign.features.compute.executors import base as exec_base
+
+    class _Subject:
+        id = "abc12345"
+
+    class _Probe(exec_base.BaseExecutor):
+        name = "local"
+
+        def __init__(self):
+            pass
+
+        @property
+        def is_available(self):  # pragma: no cover - unused here
+            return True
+
+        async def execute(self, *a, **k):  # pragma: no cover - unused here
+            raise NotImplementedError
+
+    class _Result:
+        exit_code = 0
+        container_id = None
+        stdout = exec_base._CapturedOutput(b"body", True)
+        stderr = exec_base._CapturedOutput(b"", False)
+
+    async def runner(context):
+        return _Result()
+
+    record = await _Probe()._execute_with_lifecycle(
+        _Subject(), temp_dir_prefix="probe-", runner=runner
+    )
+
+    assert record.output_truncated is True

@@ -74,13 +74,6 @@ from .policy import (
 
 logger = logging.getLogger(__name__)
 
-# Room left in a captured shell result for everything that is not preview
-# text: three absolute artifact paths, the flags, and JSON escaping. Only a
-# starting guess — the envelope is measured afterwards and the previews
-# shrunk until it really fits, because how much a body expands under
-# ``json.dumps`` is a property of the body, not something a reserve can know.
-_ENVELOPE_RESERVE = 2500
-
 # Halvings allowed while fitting. Five takes a 2,750-char preview to 85,
 # which is past useful; if the envelope still does not fit by then the
 # overflow is not the preview and shrinking further only hides that.
@@ -1527,11 +1520,14 @@ class ComputerUseFeature(Feature):
                 )
 
             cap = orchestrator_result_cap()
-            chars = max(500, (cap - _ENVELOPE_RESERVE) // 2)
+            chars = capture.PREVIEW_CHARS
             envelope, run_incomplete = await _build(chars)
             # Shrink until it actually fits. Measuring beats reserving: what
             # overflows is the serialized form, and only the serialized form
-            # knows how much a body expanded.
+            # knows how much a body expanded — which is also why there is no
+            # reserve constant here any more. A starting budget that the loop
+            # is guaranteed to correct cannot be tuned wrong, and a constant
+            # implying otherwise is a number to maintain and to believe.
             for _ in range(_FIT_ATTEMPTS):
                 if serialized_result_len(envelope) <= cap:
                     break
