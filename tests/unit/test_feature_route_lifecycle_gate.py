@@ -1387,3 +1387,81 @@ def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
             assert bob.served == 1
     finally:
         restore()
+
+
+# ---------------------------------------------------------------------------
+# #3253: the gate consults the live owner and route only for a path it matches
+# ---------------------------------------------------------------------------
+
+
+class _CountingRouterFeature:
+    """Same shape as ``_InstanceBoundRouterFeature``; counts router builds."""
+
+    def __init__(self, owner: str):
+        self.enabled = True
+        self.owner = owner
+        self.router_builds = 0
+        self.served = 0
+
+    def get_router(self):
+        self.router_builds += 1
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/counted")
+        async def counted():
+            self.served += 1
+            return {"owner": self.owner}
+
+        return router
+
+
+def test_unrelated_requests_do_not_build_the_gated_features_routers():
+    """A request to a path this route cannot match never resolves the live
+    owner or route, so no feature router is built for it."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _CountingRouterFeature("alice-v1")
+    bob = _CountingRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            builds_after_mount = (alice.router_builds, bob.router_builds)
+            for path in ("/health", "/api/agents", "/api/agents/alice/test-feature-lifecycle/elsewhere", "/nope"):
+                client.get(path, headers=headers)
+            assert (alice.router_builds, bob.router_builds) == builds_after_mount, (
+                "an unrelated request built a gated feature's router"
+            )
+
+            # A matching request still consults the live route: it must build.
+            resp = client.get("/api/agents/bob/test-feature-lifecycle/counted", headers=headers)
+            assert resp.json() == {"owner": "bob-v1"}
+            assert bob.router_builds > builds_after_mount[1]
+            assert bob.served == 1
+    finally:
+        restore()
+
+
+def test_a_disabled_feature_answers_not_found_even_for_the_wrong_method():
+    """Fail-closed property preserved: the path matches but the method does
+    not (Starlette's PARTIAL); a disabled feature is NONE there, never 405."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _CountingRouterFeature("alice-v1")
+    agents = {"alice": _make_agent({"ProxyFeature": alice})}
+    app, restore = _boot_multi_agent(agents)
+    headers = {"X-API-Key": API_KEY}
+    path = "/api/agents/alice/test-feature-lifecycle/counted"
+    try:
+        with TestClient(app) as client:
+            assert client.post(path, headers=headers).status_code == 405  # enabled: Starlette's answer
+            alice.enabled = False
+            assert client.post(path, headers=headers).status_code == 404
+            assert client.get(path, headers=headers).status_code == 404
+            assert alice.served == 0
+    finally:
+        restore()
