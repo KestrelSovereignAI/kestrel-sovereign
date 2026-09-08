@@ -34,6 +34,7 @@ from .ledger import (
     is_active_pattern,
     pattern_row_id,
 )
+from .timestamps import stamp_created_at
 
 logger = logging.getLogger(__name__)
 
@@ -84,17 +85,19 @@ def _label(text: str, limit: int = 120) -> str:
 def _pattern_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
     """The node properties a pattern row projects to.
 
-    ``agent_id`` and ``created_at`` are load-bearing, not decoration: scoped
-    queries filter on the former and order on the latter, so a node missing
-    either is written but unreachable.
+    ``agent_id`` is load-bearing: scoped queries filter on it, so a node
+    missing it is written but unreachable. ``created_at`` orders the recall;
+    it is stamped under the graph contract from the row's date and left
+    ABSENT when the row has none (#3255), and an unstamped node sorts last on
+    both backends, so it can be pushed off a limited page by stamped ones but
+    is never unreachable.
     """
-    return {
+    properties = {
         "agent_id": agent_id,
         "row_id": str(row.get("id") or ""),
         "text": str(row.get("pattern") or "").strip(),
         "implication": str(row.get("implication") or ""),
         "origin": str(row.get("source") or ""),
-        "created_at": str(row.get("recorded_at") or ""),
         "status": "active" if is_active_pattern(row) else "superseded",
         "superseded_at": str(row.get("superseded_at") or ""),
         "superseded_by": str(row.get("superseded_by") or ""),
@@ -104,10 +107,13 @@ def _pattern_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
         "claim_source": "strategy_ledger_yaml",
         "source": _PROJECTION_SOURCE,
     }
+    # The row's day at midnight UTC, in the graph contract; absent when the
+    # row has no date (#3255).
+    return stamp_created_at(properties, row.get("recorded_at"))
 
 
 def _blocker_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    properties = {
         "agent_id": agent_id,
         "row_id": str(row.get("id") or ""),
         "text": str(row.get("title") or "").strip(),
@@ -120,13 +126,15 @@ def _blocker_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
         "severity": str(row.get("severity") or ""),
         "owner": str(row.get("owner") or ""),
         "notes": str(row.get("notes") or ""),
-        "created_at": str(row.get("blocked_since") or ""),
         "status": "active" if is_active_blocker(row) else "resolved",
         "resolved_at": str(row.get("resolved_at") or ""),
         "resolution": str(row.get("resolution") or ""),
         "claim_source": "strategy_ledger_yaml",
         "source": _PROJECTION_SOURCE,
     }
+    # The row's day at midnight UTC, in the graph contract; absent when the
+    # row has no date (#3255).
+    return stamp_created_at(properties, row.get("blocked_since"))
 
 
 def _row_id(row: Dict[str, Any], minter: Callable[[Dict[str, Any]], str]) -> str:
