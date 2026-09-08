@@ -18,6 +18,8 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 import asyncio
 import inspect
 import logging
+from kestrel_sovereign.storage.async_graph_store import GraphNode
+from kestrel_sovereign.storage.schema_router import RESOLVED_TO_PROPERTY
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -1933,13 +1935,32 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error("confirm_person_match canonical edge write failed: %s", e)
             return ToolResult.failed(str(e))
+        # Record the answer where the resolver reads it, so the next mention
+        # of this label resolves to the confirmed person instead of asking
+        # again (#3259). A single-valued property on the mention's own node:
+        # a later confirmation overwrites this one, so a correction takes.
+        # Its failure is surfaced like the removal's below: the canonical
+        # edge is in place, so the result is partial, not failed.
+        resolution_error: Optional[str] = None
+        if ambiguous_target != concept_id:
+            try:
+                mention_node = await storage.graph.get_node(ambiguous_target)
+                if mention_node is None:
+                    raise LookupError(f"mention node {ambiguous_target} not found")
+                properties = dict(mention_node.properties or {})
+                properties[RESOLVED_TO_PROPERTY] = concept_id
+                properties["resolved_from_message"] = message_id
+                properties["resolved_at"] = _utc_now_iso()
+                await storage.graph.add_node(GraphNode(
+                    node_id=mention_node.node_id,
+                    node_type=mention_node.node_type,
+                    label=mention_node.label,
+                    properties=properties,
+                ))
+            except Exception as e:
+                logger.error("confirm_person_match resolution record failed: %s", e)
+                resolution_error = str(e)
 
-        # Honesty: AsyncGraphStore.delete_edge() is a SQL DELETE that
-        # returns no affected-row count and does not raise when the
-        # edge isn't there. We can't actually verify the ambiguous
-        # edge existed and was removed — the call is best-effort. So
-        # we phrase the field and confirmation as "remove attempted"
-        # rather than "removed" (round 5 codex finding).
         attempted_removal = False
         ambiguous_remove_error: Optional[str] = None
         if ambiguous_target != concept_id:
@@ -1958,21 +1979,30 @@ class MemoryFeature(Feature):
                 )
                 ambiguous_remove_error = str(e)
 
-        if ambiguous_remove_error:
+        if ambiguous_remove_error or resolution_error:
+            problems = []
+            if ambiguous_remove_error:
+                problems.append(
+                    f"orphaned ambiguous edge {ambiguous_target} could not "
+                    f"be removed: {ambiguous_remove_error}"
+                )
+            if resolution_error:
+                problems.append(
+                    "the answer could not be recorded for future mentions, so "
+                    f"this label will ask again: {resolution_error}"
+                )
             return ToolResult.partial(
                 confirmation=(
                     f"Resolved {message_id} → {concept_id}; canonical edge "
                     "written"
                 ),
-                error=(
-                    f"orphaned ambiguous edge {ambiguous_target} could not "
-                    f"be removed: {ambiguous_remove_error}"
-                ),
+                error="; ".join(problems),
                 data={
                     "message_id": message_id,
                     "resolved_to": concept_id,
-                    "ambiguous_remove_attempted": False,
-                    "orphan_edge_target": ambiguous_target,
+                    "ambiguous_remove_attempted": attempted_removal,
+                    "orphan_edge_target": ambiguous_target if ambiguous_remove_error else None,
+                    "future_mentions_recorded": resolution_error is None,
                 },
             )
 
