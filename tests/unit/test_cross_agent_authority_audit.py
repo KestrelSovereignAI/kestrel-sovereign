@@ -1892,7 +1892,29 @@ def _is_cross_agent_control_name(name: str) -> bool:
 
 
 def _is_permission_name(name: str) -> bool:
-    return any(term in name.casefold() for term in PERMISSION_NAME_TERMS)
+    normalized = name.casefold()
+    components = [
+        component
+        for component in re.split(r"[^a-z0-9]+", normalized)
+        if component
+    ]
+    # Permission collections are commonly named with regular English plurals
+    # (``policies``, ``authorities``, ``roles``).  Match the semantic stem
+    # rather than growing a second vocabulary of singular/plural spellings.
+    singularized = {
+        component[:-3] + "y"
+        if component.endswith("ies") and len(component) > 3
+        else component[:-1]
+        if component.endswith("s") and len(component) > 3
+        else component
+        for component in components
+    }
+    candidates = {normalized, *components, *singularized}
+    return any(
+        term in candidate
+        for term in PERMISSION_NAME_TERMS
+        for candidate in candidates
+    )
 
 
 def _call_name(call: ast.Call) -> str:
@@ -9910,6 +9932,18 @@ def _provenance_aliases(
             if _is_provenance_accessor_call(value):
                 return True
             if (
+                isinstance(value.func, ast.Attribute)
+                and _has_provenance_value(
+                    value.func.value,
+                    aliases,
+                    provenance_return_helpers,
+                )
+            ):
+                # Selection/transform methods retain authority provenance from
+                # their receiver (pop/get/index helpers included).  Arguments
+                # alone are insufficient for method-call dataflow.
+                return True
+            if (
                 call_name in (provenance_return_helpers or set())
                 or _CALLABLE_PROVENANCE in _callable_semantics(value)
             ):
@@ -11443,7 +11477,25 @@ class _CallableSemanticFlow(_StaticBindingFlow):
         if isinstance(value, ast.Attribute):
             return self.bindings.get(
                 ast.unparse(value).casefold()
-            ) or self.bindings.get(value.attr.casefold())
+            ) or self.bindings.get(value.attr.casefold()) or self.resolve(
+                value.value, supplemental_resolver
+            )
+        if isinstance(value, ast.Subscript):
+            # A may-analysis must preserve the joined semantics of values
+            # stored in a container when a later static selector retrieves
+            # one.  The container binding is already the conservative join of
+            # its literal members, so no key-specific execution is needed.
+            return self.resolve(value.value, supplemental_resolver)
+        if isinstance(value, ast.Dict):
+            return self._merge_values([
+                self.resolve(member, supplemental_resolver)
+                for member in value.values
+            ])
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            return self._merge_values([
+                self.resolve(member, supplemental_resolver)
+                for member in value.elts
+            ])
         if isinstance(value, ast.IfExp):
             return self._merge_values([
                 self.resolve(value.body),
@@ -11519,6 +11571,42 @@ class _CallableSemanticFlow(_StaticBindingFlow):
         self.bindings.update(
             {name.casefold(): binding for name, binding in assigned.items()}
         )
+        if value is None:
+            return
+        stored = self.resolve(value, supplemental_resolver)
+        if stored is None:
+            return
+        for target in targets:
+            receiver = (
+                target.value
+                if isinstance(target, (ast.Attribute, ast.Subscript))
+                else None
+            )
+            if receiver is None:
+                continue
+            for name in _reference_binding_names(receiver):
+                normalized = name.casefold()
+                existing = self.bindings.get(normalized)
+                self.bindings[normalized] = self._merge_values(
+                    [existing, stored]
+                ) or stored
+
+    def store_container_value(
+        self,
+        names: set[str],
+        value: ast.AST,
+    ) -> None:
+        """Join a mutable-container write into its callable may-binding."""
+
+        stored = self.resolve(value)
+        if stored is None:
+            return
+        for name in names:
+            normalized = name.casefold()
+            existing = self.bindings.get(normalized)
+            self.bindings[normalized] = self._merge_values(
+                [existing, stored]
+            ) or stored
 
     def disturbed_fork(self, statement: ast.stmt) -> _CallableSemanticFlow:
         """Invalidate branch-local names in the normalized namespace."""
@@ -11534,6 +11622,16 @@ class _CallableSemanticFlow(_StaticBindingFlow):
         class SemanticCallVisitor(ast.NodeVisitor):
             def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
                 self.generic_visit(node)
+                for operand in [
+                    node.func,
+                    *node.args,
+                    *(keyword.value for keyword in node.keywords),
+                ]:
+                    binding = flow.resolve(operand)
+                    if binding is not None:
+                        _mark_callable_semantics(
+                            operand, _semantic_binding_flags(binding)
+                        )
                 callee = flow.resolve(node.func)
                 if callee is None:
                     return
@@ -11583,6 +11681,12 @@ class _CallableSemanticFlow(_StaticBindingFlow):
                 (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
             ):
                 self._annotate_expression(statement)
+                for node in ast.walk(statement):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    mutation = _mutable_container_write(node)
+                    if mutation is not None:
+                        self.store_container_value(*mutation)
             super().replay([statement])
 
 
@@ -11951,67 +12055,147 @@ def _annotate_static_callable_semantics(
     if isinstance(tree, ast.Module):
         module_flow.replay(tree.body)
 
-    completed: dict[
-        ast.FunctionDef | ast.AsyncFunctionDef, dict[str, _StaticBinding]
+    functions_by_name: dict[
+        str, list[ast.FunctionDef | ast.AsyncFunctionDef]
     ] = {}
-
-    def analyze(
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
-    ) -> dict[str, _StaticBinding]:
-        cached = completed.get(function)
-        if cached is not None:
-            return cached
-        parent = function_parents.get(function)
-        inherited = (
-            analyze(parent) if parent is not None else module_flow.bindings
-        )
-        bindings = dict(inherited)
-        for name in cycle_bounded_helpers:
-            if name in declarations:
-                bindings[name] = declarations[name]
-        bindings.update({
-            name: _semantic_binding(semantics, _CALLABLE_CLASS)
-            for name, semantics in function_imported_callable_classes[
-                function
-            ].items()
-        })
-        local_semantics: dict[str, set[str]] = {}
-        for name in (
-            function_imported_provenance_helpers.get(function, set())
-            | function_accessor_aliases.get(function, set())
-        ):
-            local_semantics.setdefault(name, set()).add(_CALLABLE_PROVENANCE)
-        for name in function_control_imports.get(function, set()):
-            local_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
-        for name, semantics in local_semantics.items():
-            bindings[name] = _semantic_binding(semantics, _CALLABLE_VALUE)
-        parameters = {
-            parameter.arg.casefold()
-            for parameter in [
-                *function.args.posonlyargs,
-                *function.args.args,
-                *function.args.kwonlyargs,
-                *(
-                    [function.args.vararg]
-                    if function.args.vararg is not None
-                    else []
-                ),
-                *(
-                    [function.args.kwarg]
-                    if function.args.kwarg is not None
-                    else []
-                ),
-            ]
-        }
-        for parameter in parameters:
-            bindings.pop(parameter, None)
-        flow = _CallableSemanticFlow(declarations, classes, bindings)
-        flow.replay(function.body)
-        completed[function] = dict(flow.bindings)
-        return completed[function]
-
     for function in functions:
-        analyze(function)
+        functions_by_name.setdefault(function.name.casefold(), []).append(function)
+    callable_alias_edges = {
+        function: _scope_callable_alias_edges(function)
+        for function in functions
+    }
+    parameter_semantics: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, dict[str, set[str]]
+    ] = {function: {} for function in functions}
+
+    def bound_arguments(
+        call: ast.Call,
+        callee: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, list[ast.AST]]:
+        """Bind supplied values to parameters for higher-order may-flow."""
+
+        positional = [*callee.args.posonlyargs, *callee.args.args]
+        bound: dict[str, list[ast.AST]] = {}
+        for parameter, argument in zip(positional, call.args):
+            bound.setdefault(parameter.arg.casefold(), []).append(argument)
+        if callee.args.vararg is not None:
+            for argument in call.args[len(positional) :]:
+                bound.setdefault(
+                    callee.args.vararg.arg.casefold(), []
+                ).append(argument)
+        named = {
+            parameter.arg.casefold(): parameter
+            for parameter in [*positional, *callee.args.kwonlyargs]
+        }
+        for keyword in call.keywords:
+            if keyword.arg is not None and keyword.arg.casefold() in named:
+                bound.setdefault(keyword.arg.casefold(), []).append(
+                    keyword.value
+                )
+            elif callee.args.kwarg is not None:
+                bound.setdefault(
+                    callee.args.kwarg.arg.casefold(), []
+                ).append(keyword.value)
+        return bound
+
+    # Callable identity crosses the same ordinary dataflow edges as values.
+    # Iterate call-site-to-parameter bindings to a fixed point so callbacks can
+    # traverse wrappers, aliases, and mixed positional/keyword call shapes.
+    changed = True
+    while changed:
+        changed = False
+        completed: dict[
+            ast.FunctionDef | ast.AsyncFunctionDef, dict[str, _StaticBinding]
+        ] = {}
+
+        def analyze(
+            function: ast.FunctionDef | ast.AsyncFunctionDef,
+        ) -> dict[str, _StaticBinding]:
+            cached = completed.get(function)
+            if cached is not None:
+                return cached
+            parent = function_parents.get(function)
+            inherited = (
+                analyze(parent) if parent is not None else module_flow.bindings
+            )
+            bindings = dict(inherited)
+            for name in cycle_bounded_helpers:
+                if name in declarations:
+                    bindings[name] = declarations[name]
+            bindings.update({
+                name: _semantic_binding(semantics, _CALLABLE_CLASS)
+                for name, semantics in function_imported_callable_classes[
+                    function
+                ].items()
+            })
+            local_semantics: dict[str, set[str]] = {}
+            for name in (
+                function_imported_provenance_helpers.get(function, set())
+                | function_accessor_aliases.get(function, set())
+            ):
+                local_semantics.setdefault(name, set()).add(
+                    _CALLABLE_PROVENANCE
+                )
+            for name in function_control_imports.get(function, set()):
+                local_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
+            for name, semantics in local_semantics.items():
+                bindings[name] = _semantic_binding(
+                    semantics, _CALLABLE_VALUE
+                )
+            parameters = {
+                parameter.arg.casefold()
+                for parameter in [
+                    *function.args.posonlyargs,
+                    *function.args.args,
+                    *function.args.kwonlyargs,
+                    *(
+                        [function.args.vararg]
+                        if function.args.vararg is not None
+                        else []
+                    ),
+                    *(
+                        [function.args.kwarg]
+                        if function.args.kwarg is not None
+                        else []
+                    ),
+                ]
+            }
+            for parameter in parameters:
+                bindings.pop(parameter, None)
+            for parameter, semantics in parameter_semantics[function].items():
+                bindings[parameter] = _semantic_binding(
+                    semantics, _CALLABLE_VALUE
+                )
+            flow = _CallableSemanticFlow(declarations, classes, bindings)
+            flow.replay(function.body)
+            completed[function] = dict(flow.bindings)
+            return completed[function]
+
+        for function in functions:
+            analyze(function)
+
+        for caller in functions:
+            for call in _lexical_scope_calls(caller):
+                source_names = _expanded_callable_sources(
+                    _call_name(call), callable_alias_edges[caller]
+                )
+                for source_name in source_names:
+                    for callee in functions_by_name.get(source_name, ()):
+                        for parameter, arguments in bound_arguments(
+                            call, callee
+                        ).items():
+                            semantics = {
+                                semantic
+                                for argument in arguments
+                                for semantic in _callable_semantics(argument)
+                            }
+                            known = parameter_semantics[callee].setdefault(
+                                parameter, set()
+                            )
+                            new_semantics = semantics - known
+                            if new_semantics:
+                                known.update(new_semantics)
+                                changed = True
 
 
 def _local_parameter_return_flows(
@@ -14227,6 +14411,152 @@ def _scope_imported_parameter_return_flows(
     return _merged_parameter_flow_map(entries)
 
 
+def _decorator_terminal_name(decorator: ast.AST) -> str:
+    while isinstance(decorator, ast.Call):
+        decorator = decorator.func
+    if isinstance(decorator, ast.Name):
+        return decorator.id.casefold()
+    if isinstance(decorator, ast.Attribute):
+        return decorator.attr.casefold()
+    return ""
+
+
+@lru_cache(maxsize=None)
+def _direct_provenance_properties(
+    source_path: Path,
+) -> tuple[tuple[str, frozenset[str]], ...]:
+    """Summarize provenance-returning descriptors by their owner class."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    provenance_helpers = set(_direct_provenance_helper_names(source_path))
+    summarized: dict[str, frozenset[str]] = {}
+    for class_node in (
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    ):
+        properties = {
+            method.name.casefold()
+            for method in class_node.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and method.name.casefold() in provenance_helpers
+            and any(
+                marker in _decorator_terminal_name(decorator)
+                for decorator in method.decorator_list
+                for marker in ("property", "descriptor")
+            )
+        }
+        if properties:
+            summarized[class_node.name.casefold()] = frozenset(properties)
+    return tuple(sorted(summarized.items()))
+
+
+def _repository_provenance_property_names(
+    source_path: Path,
+    requested_classes: set[str],
+    seen: frozenset[tuple[Path, str]] = frozenset(),
+) -> set[str]:
+    """Resolve descriptor summaries through repository class re-exports."""
+
+    source_path = source_path.resolve()
+    requested = {
+        name.casefold()
+        for name in requested_classes
+        if (source_path, name.casefold()) not in seen
+    }
+    if not requested:
+        return set()
+    direct = dict(_direct_provenance_properties(source_path))
+    properties = {
+        property_name
+        for class_name in requested.intersection(direct)
+        for property_name in direct[class_name]
+    }
+    unresolved = requested - set(direct)
+    active = seen | {(source_path, name) for name in unresolved}
+    for _local_name, imported_path, remote_name in (
+        _repository_reexport_bindings(source_path, unresolved)
+    ):
+        properties.update(
+            _repository_provenance_property_names(
+                imported_path, {remote_name}, active
+            )
+        )
+    return properties
+
+
+def _scope_imported_provenance_property_names(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None,
+) -> set[str]:
+    """Return imported descriptor names whose reads expose provenance."""
+
+    if source_path is None:
+        return set()
+    source_path = source_path.resolve()
+    scope_nodes = (
+        tuple(ast.walk(scope))
+        if isinstance(scope, ast.Module)
+        else _walk_lexical_scope(scope)
+    )
+    referenced_names = {
+        node.id.casefold()
+        for node in scope_nodes
+        if isinstance(node, ast.Name)
+    }
+    properties: set[str] = set()
+    for node in _lexical_scope_imports(scope):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_path = _resolved_repository_import_path(
+                source_path, node.module, node.level
+            )
+            if imported_path is None:
+                continue
+            requested = {
+                imported.name.casefold()
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold()
+                in referenced_names
+            }
+            if any(imported.name == "*" for imported in node.names):
+                requested.update(
+                    name for name, _values in _direct_provenance_properties(
+                        imported_path
+                    )
+                )
+            properties.update(
+                _repository_provenance_property_names(
+                    imported_path, requested
+                )
+            )
+            continue
+        if not isinstance(node, ast.Import):
+            continue
+        for imported in node.names:
+            imported_path = _resolved_repository_import_path(
+                source_path, imported.name
+            )
+            if imported_path is None:
+                continue
+            qualifier = (
+                imported.asname or imported.name.split(".", 1)[0]
+            ).casefold()
+            requested = {
+                expression[len(qualifier) + 1 :].split(".", 1)[0]
+                for child in scope_nodes
+                if isinstance(child, ast.Attribute)
+                and (
+                    expression := ast.unparse(child).casefold()
+                ).startswith(f"{qualifier}.")
+            }
+            properties.update(
+                _repository_provenance_property_names(
+                    imported_path, requested
+                )
+            )
+    return properties
+
+
 def _scope_imported_provenance_return_helper_aliases(
     scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
     source_path: Path | None,
@@ -14360,6 +14690,9 @@ def _scope_imported_provenance_return_helper_aliases(
                             seen,
                         )
                     )
+    aliases.update(
+        _scope_imported_provenance_property_names(scope, source_path)
+    )
     return aliases
 
 
@@ -18458,7 +18791,17 @@ def test_permission_mutation_targets_are_provenance_inputs(
 
 
 @pytest.mark.parametrize(
-    "store_name", ("acl", "rbac", "policy", "roles", "capabilities")
+    "store_name",
+    (
+        "acl",
+        "rbac",
+        "policy",
+        "policies",
+        "authority",
+        "authorities",
+        "roles",
+        "capabilities",
+    ),
 )
 def test_common_permission_store_mutation_targets_are_provenance_inputs(
     store_name: str,
@@ -18469,6 +18812,99 @@ def test_common_permission_store_mutation_targets_are_provenance_inputs(
     )
 
     assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        "choose(derive, request, target)",
+        "choose(check=derive, request=request, target=target)",
+    ),
+)
+def test_provenance_callable_semantics_flow_through_parameters(
+    invocation: str,
+) -> None:
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    return request.causation_chain\n\n"
+        "def choose(check, request, target):\n"
+        "    if check(request):\n"
+        "        target.shutdown()\n\n"
+        "def dispatch(request, target):\n"
+        f"    {invocation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {5}
+
+
+@pytest.mark.parametrize(
+    "storage",
+    (
+        "checks = {'lineage': derive}\n    check = checks['lineage']",
+        "checks = [derive]\n    check = checks[0]",
+        "checks = {}\n    checks['lineage'] = derive\n"
+        "    check = checks['lineage']",
+        "checks = []\n    checks.append(derive)\n    check = checks[0]",
+    ),
+)
+def test_provenance_callable_semantics_survive_container_selection(
+    storage: str,
+) -> None:
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    return request.causation_chain\n\n"
+        "def dispatch(request, target):\n"
+        f"    {storage}\n"
+        "    if check(request):\n"
+        "        target.shutdown()\n"
+    )
+
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+@pytest.mark.parametrize(
+    "selection",
+    (
+        "request.causation_chain.pop()",
+        "request.causation_chain.__getitem__(-1)",
+    ),
+)
+def test_provenance_method_receivers_taint_selected_control_targets(
+    selection: str,
+) -> None:
+    tree = ast.parse(
+        "def dispatch(request, manager):\n"
+        f"    frame = {selection}\n"
+        "    manager.terminate_agent(frame.agent_id)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {3}
+
+
+@pytest.mark.parametrize("decorator", ("property", "cached_property"))
+def test_imported_provenance_descriptors_guarding_control_are_detected(
+    tmp_path: Path,
+    decorator: str,
+) -> None:
+    authority_path = tmp_path / "authority.py"
+    authority_path.write_text(
+        "class Context:\n"
+        f"    @{decorator}\n"
+        "    def lineage(self):\n"
+        "        return self.request.causation_chain\n",
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "dispatcher.py"
+    source = (
+        "from .authority import Context\n\n"
+        "def dispatch(context: Context, target):\n"
+        "    if context.lineage:\n"
+        "        target.shutdown()\n"
+    )
+    source_path.write_text(source, encoding="utf-8")
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({4})
 
 
 def test_permission_callable_selector_is_a_provenance_input() -> None:
