@@ -51,6 +51,11 @@ from kestrel_sovereign.signals.sources.channels import (
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
+    bind_async_invocation,
+)
+from kestrel_sovereign.agent.request_lifecycle import (
+    RequestCompletionDisposition,
+    RequestLifecycleMixin,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
@@ -79,6 +84,40 @@ class _Agent:
         task = asyncio.create_task(coro, name=name)
         self.tasks.append(task)
         return task
+
+
+class _LifecycleAgent(RequestLifecycleMixin, _Agent):
+    """Minimal production-shaped agent for Stop/durable-settlement races."""
+
+    def __init__(self, did: str):
+        super().__init__(did)
+        self.process_started = asyncio.Event()
+        self._current_request_id = None
+        self._active_request_ids: set[str] = set()
+        self._active_request_counts: dict[str, int] = {}
+        self._active_request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
+        self._active_request_started_at: dict[str, float] = {}
+        self._cancelled_requests: set[str] = set()
+        self._cancelled_request_generations: set[tuple[str, int]] = set()
+        self._self_fenced_request_generations: set[tuple[str, int]] = set()
+        self._pending_request_cancellations: dict[str, float] = {}
+        self._request_completion_events: dict[tuple[str, int], asyncio.Future] = {}
+        self._request_operation_tasks: dict[
+            tuple[str, int], set[asyncio.Task]
+        ] = {}
+
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def process_input(
+        self,
+        prompt: str,
+        *,
+        invocation_id: str | None = None,
+        **_kwargs,
+    ) -> str:
+        self.process_started.set()
+        await asyncio.Future()
+        return prompt
 
 
 def _registration(agent: _Agent, source: str = "provider.message") -> SourceRegistration:
@@ -2005,6 +2044,95 @@ async def test_acknowledged_stop_terminalizes_durable_cognition(tmp_path):
         assert (await retry.wait()).status is Status.COALESCED
         stopped_turn.assert_awaited_once()
     finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminalization_succeeds", (True, False))
+async def test_stop_completion_waits_for_durable_cognition_terminalization(
+    tmp_path,
+    monkeypatch,
+    terminalization_succeeds,
+):
+    """STOPPED cannot commit while the cancelled delivery remains retryable."""
+
+    backend = SQLiteBackend(str(tmp_path / "stop-before-terminal-nack.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _LifecycleAgent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    await dispatcher.initialize_durable_delivery()
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    terminalization_started = asyncio.Event()
+    allow_terminalization = asyncio.Event()
+    original_nack = dispatcher.nack_durable_delivery
+
+    async def delayed_terminal_nack(*args, **kwargs):
+        if kwargs.get("terminal") is True:
+            terminalization_started.set()
+            await allow_terminalization.wait()
+            if not terminalization_succeeds:
+                raise RuntimeError("terminal NACK unavailable")
+        return await original_nack(*args, **kwargs)
+
+    monkeypatch.setattr(dispatcher, "nack_durable_delivery", delayed_terminal_nack)
+    completion = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "stop-terminal-order"),
+            source_event_id="telegram:update:stop-terminal-order",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        assert agent._active_request_ids == {handle.signal_id}
+        request_id = handle.signal_id
+        assert agent.cancel_current_request(request_id) is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion(request_id)
+        )
+
+        await asyncio.wait_for(terminalization_started.wait(), timeout=1)
+        assert completion.done() is False
+
+        allow_terminalization.set()
+        assert (
+            await asyncio.wait_for(completion, timeout=1)
+            is (
+                RequestCompletionDisposition.COMPLETED
+                if terminalization_succeeds
+                else RequestCompletionDisposition.ABANDONED
+            )
+        )
+        assert (await handle.wait()).status is (
+            Status.COALESCED if terminalization_succeeds else Status.FAILED
+        )
+        [delivery] = await dispatcher.list_durable_deliveries()
+        assert delivery.status == (
+            TERMINAL_ACKABLE if terminalization_succeeds else LEASED
+        )
+    finally:
+        allow_terminalization.set()
+        if completion is not None and not completion.done():
+            completion.cancel()
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 

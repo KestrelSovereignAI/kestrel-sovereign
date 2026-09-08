@@ -112,6 +112,7 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
+from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.security.encryption import (
     DecryptionError,
@@ -461,6 +462,16 @@ class _DurableAdmissionReservation:
     """
 
     released: bool = False
+
+
+@dataclass
+class _DurableCognitionSettlementGuard:
+    """Hold Stop completion until one cancelled delivery is terminally settled."""
+
+    request_id: str
+    generation: int
+    stop_observed: bool = False
+    stop_terminalized: bool = False
 
 
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -1101,6 +1112,66 @@ class SignalDispatcher:
             task=task,
             durable_admission=durable_admission,
         )
+
+    def _hold_durable_cognition_stop_completion(
+        self,
+        request_id: str,
+    ) -> _DurableCognitionSettlementGuard | None:
+        """Keep one request generation live through durable delivery settlement.
+
+        ``process_input`` owns the cancellable cognition child, but its lifecycle
+        wrapper necessarily unwinds before this dispatcher can terminalize the
+        selected delivery.  A second registration on the same request generation
+        makes the enclosing dispatch task the settlement owner.  The ordinary
+        process cleanup decrements only its own registration; Stop's completion
+        waiter is released by this task's callback after the durable NACK/ACK
+        boundary has run.
+        """
+
+        if not _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
+            return None
+        register = getattr(type(self._agent), "register_active_request", None)
+        cleanup = getattr(type(self._agent), "_cleanup_cancelled_request", None)
+        if not callable(register) or not callable(cleanup):
+            return None
+        owner = asyncio.current_task()
+        if owner is None:
+            raise RuntimeError("durable cognition settlement requires a task owner")
+        generation = register(self._agent, request_id)
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise RuntimeError("durable cognition settlement has no valid generation")
+        guard = _DurableCognitionSettlementGuard(
+            request_id=request_id,
+            generation=generation,
+        )
+
+        def release_settlement_owner(_owner: asyncio.Task) -> None:
+            disposition = (
+                RequestCompletionDisposition.ABANDONED
+                if guard.stop_observed and not guard.stop_terminalized
+                else RequestCompletionDisposition.COMPLETED
+            )
+            try:
+                cleanup(
+                    self._agent,
+                    guard.request_id,
+                    disposition=disposition,
+                    generation=guard.generation,
+                )
+            except Exception:
+                # A failed release must remain visible as unfinished Stop debt;
+                # never wake a waiter with invented completion evidence.
+                logger.exception(
+                    "Could not release durable cognition settlement owner: signal=%s",
+                    guard.request_id,
+                )
+
+        owner.add_done_callback(release_settlement_owner)
+        return guard
 
     async def enqueue_durable_terminal(
         self,
@@ -3273,6 +3344,9 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        settlement_guard = self._hold_durable_cognition_stop_completion(
+            routing_signal.id
+        )
         routing_task: asyncio.Task[SignalResult] | None = None
         deferred_outcomes: list[_DeferredOutcomeLog] = []
         lease_loss_reason: Optional[str] = None
@@ -3332,6 +3406,11 @@ class SignalDispatcher:
                     signal=routing_signal,
                     start=start,
                 )
+                if (
+                    settlement_guard is not None
+                    and isinstance(result, _StoppedCognitionResult)
+                ):
+                    settlement_guard.stop_observed = True
         except asyncio.CancelledError:
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join
@@ -3486,6 +3565,11 @@ class SignalDispatcher:
         terminal_persisted = (
             terminal and released is not None and released.status == TERMINAL_ACKABLE
         )
+        if (
+            settlement_guard is not None
+            and isinstance(result, _StoppedCognitionResult)
+        ):
+            settlement_guard.stop_terminalized = terminal_persisted
         if (
             terminal_persisted
             and durable_admission is not None
@@ -4500,6 +4584,12 @@ class SignalDispatcher:
                         signal.id,
                     )
         process_input_kwargs: dict[str, Any] = {}
+        # Give signal cognition a known lifecycle address. Durable cognition
+        # holds a second registration for this same generation until its
+        # selected delivery is settled, so cooperative Stop cannot publish a
+        # receipt in the process-input/terminal-NACK crash window.
+        if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
+            process_input_kwargs["invocation_id"] = signal.id
         if addendum is not None and accepts_addendum:
             process_input_kwargs["system_prompt_addendum"] = addendum
         if budget is not None and accepts_budget:

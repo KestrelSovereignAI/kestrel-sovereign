@@ -668,6 +668,7 @@ class RequestLifecycleMixin:
         disposition: RequestCompletionDisposition = (
             RequestCompletionDisposition.COMPLETED
         ),
+        generation: int | None = None,
     ) -> None:
         """Release one delivery after completed or failed nested cleanup."""
 
@@ -675,7 +676,11 @@ class RequestLifecycleMixin:
             raise TypeError("request completion disposition must be typed")
         active_request_ids = getattr(self, "_active_request_ids", None)
         counts = getattr(self, "_active_request_counts", None)
-        generation = self._request_generation_for_cleanup(request_id)
+        generation = (
+            self._request_generation_for_cleanup(request_id)
+            if generation is None
+            else generation
+        )
         active_generations = getattr(self, "_active_request_generations", None)
         active_generation = (
             active_generations.get(request_id)
