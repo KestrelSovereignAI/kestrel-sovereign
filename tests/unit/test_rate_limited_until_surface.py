@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,7 +30,7 @@ from kestrel_sovereign.llm.streaming_errors import (
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 PROVIDER_PROSE = "Error code: 429 - rate_limit_error WITHHELD-PROVIDER-TEXT-4c1d"
-RESET = datetime(2026, 8, 26, 21, 14, 5, tzinfo=timezone.utc)
+RESET = datetime(2026, 8, 26, 21, 14, 5, tzinfo=UTC)
 
 
 class _Throttle(Exception):
@@ -144,13 +144,12 @@ def _boot_app(process_input_error: Exception):
 
 
 def _invoke(app):
-    with patch.dict(os.environ, {"KESTREL_API_KEY": "test-key"}):
-        with TestClient(app) as client:
-            return client.post(
-                "/api/agent/invoke",
-                json={"input": "merge PR #3112"},
-                headers={"X-API-Key": "test-key"},
-            )
+    with patch.dict(os.environ, {"KESTREL_API_KEY": "test-key"}), TestClient(app) as client:
+        return client.post(
+            "/api/agent/invoke",
+            json={"input": "merge PR #3112"},
+            headers={"X-API-Key": "test-key"},
+        )
 
 
 def test_invoke_answers_429_with_retry_after_when_the_route_declined_to_wait():

@@ -17,7 +17,7 @@ The contract now:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -68,8 +68,9 @@ async def _run(error_sequence, **kwargs):
     async def fake_sleep(delay):
         sleeps.append(delay)
 
-    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep), patch(
-        "kestrel_sovereign.llm.retry.random.uniform", return_value=0.0
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
     ):
         result = await with_retry(op, **kwargs)
     return result, sleeps, calls["n"]
@@ -114,7 +115,7 @@ async def test_a_guessed_delay_is_still_clamped_to_the_cap():
 async def test_advice_beyond_the_remaining_budget_raises_immediately_without_sleeping():
     """Emma's instance: advised 6832 s against a 16-minute budget. Zero sleeps,
     one attempt, the reset time on the error."""
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
         await _run([_throttle(6832)])
     err = info.value
@@ -136,9 +137,11 @@ async def test_the_attempt_that_raises_did_not_sleep_first():
     async def fake_sleep(delay):
         slept.append(delay)
 
-    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
-        with pytest.raises(AdvisedWaitExceedsRetryBudget):
-            await with_retry(op)
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        pytest.raises(AdvisedWaitExceedsRetryBudget),
+    ):
+        await with_retry(op)
     assert calls["n"] == 1 and slept == []
 
 
@@ -183,7 +186,7 @@ def _declined() -> AdvisedWaitExceedsRetryBudget:
         _throttle(6832),
         advised_seconds=6832,
         budget_seconds=840,
-        retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=timezone.utc),
+        retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
     )
 
 
@@ -215,9 +218,11 @@ async def test_an_outer_retry_loop_does_not_re_enter_the_declined_wait():
         calls["n"] += 1
         return await outer()
 
-    with patch("kestrel_sovereign.llm.retry.asyncio.sleep") as sleep:
-        with pytest.raises(AdvisedWaitExceedsRetryBudget):
-            await with_retry(counted)
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep") as sleep,
+        pytest.raises(AdvisedWaitExceedsRetryBudget),
+    ):
+        await with_retry(counted)
     assert calls["n"] == 1
     sleep.assert_not_called()
 

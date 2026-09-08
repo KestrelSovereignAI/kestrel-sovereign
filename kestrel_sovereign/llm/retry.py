@@ -7,7 +7,7 @@ like rate limiting (429) and server errors (5xx).
 import asyncio
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -427,7 +427,7 @@ async def with_retry(
                 # still spend is taken whole; one that does not ends the loop.
                 remaining_budget = eff_max_delay * (eff_max_retries - attempt - 1)
                 if advised > remaining_budget:
-                    retry_at = datetime.now(timezone.utc) + timedelta(seconds=advised)
+                    retry_at = datetime.now(UTC) + timedelta(seconds=advised)
                     logger.warning(
                         "LLM retry declined: advised wait %.0fs exceeds the %.0fs "
                         "this call could still wait (status=%s, retry_at=%s): %s: %s",

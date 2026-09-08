@@ -45,7 +45,7 @@ class ApiHTTPException(HTTPException):
         self.details = details
 
 
-def rate_limited_until(declined: "AdvisedWaitExceedsRetryBudget") -> ApiHTTPException:
+def rate_limited_until(declined: AdvisedWaitExceedsRetryBudget) -> ApiHTTPException:
     """The 429 an invocation returns when its model route declined to wait.
 
     The retry loop stopped because the provider's advised cool-down exceeds
