@@ -5067,3 +5067,100 @@ async def test_durable_registration_persistence_handoff_is_atomic_across_instanc
         )
     finally:
         await peer_backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_counter_fence_does_not_raise_for_a_live_writer_racing_a_legacy_advance(db_backend):
+    """#3218, measured before the fix: 22 spurious loss raises in 300
+    concurrent pairs on an otherwise idle database. A legacy primary-only
+    advance and a live persist on one fresh scope, many scopes at once, must
+    never trip the fence: nothing is lost, both writers commit."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL counter-fence snapshot regression")
+    async with _independent_postgres_schema_backend(db_backend) as backend:
+        store = DurableSignalStore(backend)
+        await store.initialize()
+
+        async def pair(agent_id: str, source: str):
+            legacy = live = None
+            try:
+                legacy = await _independent_backend(backend)
+                live = await _independent_backend(backend)
+                return await asyncio.gather(
+                    _legacy_primary_only_advance(legacy, agent_id=agent_id, source=source),
+                    DurableSignalStore(live).persist_signal(
+                        _signal(agent_id), agent_id=agent_id,
+                        source_event_id=f"fence-race:{uuid4()}", retention_days=7,
+                    ),
+                    return_exceptions=True,
+                )
+            finally:
+                for opened in (live, legacy):
+                    if opened is not None:
+                        await opened.close()
+
+        losses = []
+        for _round in range(30):
+            scopes = [(f"did:test:fence-race:{uuid4()}", "provider.message") for _ in range(10)]
+            for outcome in await asyncio.gather(*(pair(a, s) for a, s in scopes)):
+                for item in outcome:
+                    if isinstance(item, BaseException):
+                        assert "both exact counter copies" in str(item), item
+                        losses.append(str(item))
+        assert losses == [], f"{len(losses)} spurious loss raises in 300 pairs"
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_counter_fence_rotation_retires_a_stale_family(db_backend):
+    """#3218 rotated the counter fence's fingerprint for the first time. A
+    stale member on ``durable_signal_source_sequences`` must be retired by
+    the next initialize and the catalog must equal exactly the desired pair;
+    a surviving old BEFORE fence would keep raising the spurious loss error
+    on every already-migrated deployment while a fresh-schema suite stayed
+    green."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL counter-fence family rotation")
+    async with _independent_postgres_schema_backend(db_backend) as backend:
+        store = DurableSignalStore(backend)
+        await store.initialize()
+        assert await store._postgres_source_sequence_counter_fence_valid()
+        stale = {
+            role: (
+                DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FUNCTION_PREFIX + f"{role}_deadbeef",
+                DurableSignalStore.SOURCE_SEQUENCE_COUNTER_TRIGGER_PREFIX + f"{role}_deadbeef",
+            )
+            for role in ("b", "a")
+        }
+        for role, (function_name, trigger_name) in stale.items():
+            await backend.execute(
+                f'CREATE FUNCTION "{function_name}"() RETURNS trigger '
+                "AS $stale$ BEGIN RETURN NEW; END $stale$ LANGUAGE plpgsql"
+            )
+            timing = "BEFORE" if role == "b" else "AFTER"
+            await backend.execute(
+                f'CREATE TRIGGER "{trigger_name}" {timing} INSERT OR UPDATE '
+                "ON durable_signal_source_sequences FOR EACH ROW "
+                f'EXECUTE FUNCTION "{function_name}"()'
+            )
+        assert not await store._postgres_source_sequence_counter_fence_valid()
+
+        await DurableSignalStore(backend).initialize()
+
+        assert await store._postgres_source_sequence_counter_fence_valid()
+        trigger_rows, function_rows = await store._postgres_trigger_function_catalog(
+            relation_name=store.SOURCE_SEQUENCES,
+            trigger_prefix=store.SOURCE_SEQUENCE_COUNTER_TRIGGER_PREFIX,
+            function_prefix=store.SOURCE_SEQUENCE_COUNTER_FUNCTION_PREFIX,
+        )
+        wanted = DurableSignalStore.SOURCE_SEQUENCE_COUNTER_FENCE_DEFINITIONS
+        assert {str(row[0]) for row in trigger_rows} == {d.trigger_name for d in wanted}
+        assert {str(row[0]) for row in function_rows} == {d.function_name for d in wanted}
+        # The fence still works after the rotation: a live write lands.
+        agent_id = f"did:test:fence-rotation:{uuid4()}"
+        event = await store.persist_signal(
+            _signal(agent_id), agent_id=agent_id,
+            source_event_id=f"fence-rotation:{uuid4()}", retention_days=7,
+        )
+        assert event.source_sequence == 1

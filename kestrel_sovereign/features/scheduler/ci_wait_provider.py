@@ -14,9 +14,23 @@ head-commit check runs and combined status to decide a terminal verdict:
   * open + checks still running,
     or the rollup was not read      -> PENDING (keep watching)
 
-The change-detection primitives (``_github_get_check_runs``/``_check_verdict``) are reused
-from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`, which is pure
-core — this provider does NOT depend on the out-of-tree GitHub feature.
+The change-detection primitives (``fetch_check_rollup``/``_check_verdict``)
+are reused from :mod:`kestrel_sovereign.signals.sources.github_pr_watch`,
+which is pure core — this provider does NOT depend on the out-of-tree GitHub
+feature.
+
+A third rule joins the two below, from the same root: a rollup that could not
+be read in full may still produce a verdict, but never an unqualified pass.
+``fetch_check_rollup`` degrades from the Checks API to the Actions API when a
+credential cannot read the former (permanent for a fine-grained PAT, which
+has no ``checks`` permission to grant), which recovers the verdict for an
+Actions-and-statuses repository while staying blind to third-party apps that
+report only through check runs. So an incomplete rollup that reads
+``success`` settles PARTIAL with a caveat naming the blind spot, not DONE —
+"everything I could see passed" is a weaker claim than "everything passed",
+and collapsing them is the false green this module exists to refuse. An
+observed *failure* is unaffected: a gate that was seen to fail is a real
+failure however much else was invisible.
 
 Transient failures (no token, auth error, network blip) return
 :class:`Outcome.PENDING`, never a terminal failure: a durable
@@ -64,8 +78,9 @@ from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sovereign.signals.sources.github_pr_watch import (
+    CHECKS_SOURCE_CHECK_RUNS,
+    CheckRollup,
     _check_verdict,
-    _github_get_check_runs,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,6 +125,8 @@ def classify_ci_state(
     *,
     check_runs: Any = None,
     combined_status: Any = None,
+    checks_source: str = CHECKS_SOURCE_CHECK_RUNS,
+    unreadable: Tuple[str, ...] = (),
     repo: str = "",
     number: Optional[int] = None,
 ) -> WaitStatus:
@@ -121,10 +138,21 @@ def classify_ci_state(
     are the head commit's check-runs and combined status JSON. Passing
     *neither* means the rollup was never read — an evidence gap that stays
     PENDING — which is distinct from reading it and finding it empty.
+
+    ``checks_source``/``unreadable`` carry how completely that rollup was read
+    (see :class:`CheckRollup`). They default to a complete read, so a caller
+    holding a full rollup passes nothing extra; when they say otherwise, no
+    verdict here is allowed to claim more than was visible.
     """
     state = str(pr_raw.get("state", "") or "").strip().lower()
     merged = bool(pr_raw.get("merged", False))
     verdict = _check_verdict(check_runs, combined_status)
+    rollup = CheckRollup(
+        check_runs=check_runs,
+        combined_status=combined_status,
+        source=checks_source,
+        unreadable=tuple(unreadable),
+    )
     data: Dict[str, Any] = {
         "repo": repo,
         "number": number,
@@ -132,6 +160,13 @@ def classify_ci_state(
         "merged": merged,
         "checks": verdict,
     }
+    if not rollup.complete:
+        # Recorded on EVERY outcome, terminal or not, including the merged and
+        # closed ones below: a reader auditing why a wait settled the way it
+        # did should not have to infer that the rollup behind it was partial.
+        data["checks_source"] = rollup.source
+        data["unreadable"] = list(rollup.unreadable)
+        data["blind_spot"] = rollup.caveat()
     label = f"{repo}#{number}" if repo else "PR"
 
     if merged:
@@ -141,9 +176,41 @@ def classify_ci_state(
             Outcome.FAILED, f"{label} closed without merge", data=data
         )
     if verdict == "failure":
+        # Terminal whatever else was invisible. An unread gate can only hide
+        # MORE failures, never turn an observed one into a pass, so a partial
+        # rollup does not soften a failure the way it softens a pass.
         return WaitStatus(Outcome.FAILED, f"{label} CI checks failed", data=data)
     if verdict == "success":
+        if not rollup.complete:
+            # Everything VISIBLE passed. Reported PARTIAL rather than DONE so
+            # the caveat rides out to the waiter via ``ToolResult.partial``
+            # instead of being discarded into an unqualified green.
+            data["caveat"] = (
+                f"{label}: every check this poll could read passed, but "
+                f"{rollup.caveat()}"
+            )
+            return WaitStatus(
+                Outcome.PARTIAL,
+                f"{label} visible CI checks passed, rollup incomplete",
+                data=data,
+            )
         return WaitStatus(Outcome.DONE, f"{label} CI checks passed", data=data)
+    if verdict == "none" and not rollup.complete:
+        # Empty, but only the part that was readable. Terminal for the same
+        # #2939 reason as a complete empty rollup — a mode="signal" watch on
+        # an unobservable gate would never fire — but the caveat must not
+        # make the claim the complete case makes. "Nothing ran" and "nothing
+        # I could see ran" differ by exactly the blind spot.
+        data["caveat"] = (
+            f"nothing ran in the part of {label}'s rollup this poll could "
+            f"read, and {rollup.caveat()} — this is NOT evidence that no "
+            f"checks ran"
+        )
+        return WaitStatus(
+            Outcome.PARTIAL,
+            f"{label} open, no checks visible (rollup incomplete)",
+            data=data,
+        )
     if verdict == "none":
         # Read the rollup and it is empty: no CI is configured for this head
         # SHA, or no workflow matched its paths. Terminal — there is nothing
@@ -188,7 +255,7 @@ def classify_ci_state(
 
 
 class _UnderscopedToken(Exception):
-    """The credential can read the PR but not its checks.
+    """The credential can read the PR but no check evidence whatsoever.
 
     Distinct from a transient auth blip on purpose. This module's contract is
     that every observed state must be either terminal or provably
@@ -197,6 +264,15 @@ class _UnderscopedToken(Exception):
     permissions. Reported as ordinary PENDING it is indistinguishable from a
     gate that is merely slow — which is how a wait sat blind for 920 seconds
     on 2026-09-07 while ``gh`` read the same check runs without trouble.
+
+    Narrower than it once was, twice over. A refused Checks API alone no
+    longer reaches here: :func:`fetch_check_rollup` falls back to the Actions
+    API and the wait proceeds on a caveated rollup. And it is a **403** only —
+    a permission this credential lacks. A 401 means the credential itself is
+    finished, which is a different remedy and stays on the plain
+    ``blocked="auth"`` path. What is left is a valid token refused by an
+    endpoint it cannot route around: no verdict to caveat, only a permission
+    to grant.
     """
 
 
@@ -228,11 +304,12 @@ class CIWaitable:
 
     async def _fetch(
         self, repo: str, number: int, token: str
-    ) -> Tuple[Dict[str, Any], Any, Any]:
-        """Fetch the PR payload + head-commit checks. Split out for tests."""
+    ) -> Tuple[Dict[str, Any], CheckRollup]:
+        """Fetch the PR payload + head-commit check rollup. Split out for tests."""
         from kestrel_sovereign.signals.sources.github_pr_watch import (
             PRWatchAuthError,
             _github_get,
+            fetch_check_rollup,
         )
 
         base = f"https://api.github.com/repos/{repo}"
@@ -249,31 +326,42 @@ class CIWaitable:
             )
         head = pr_raw.get("head")
         head_sha = head.get("sha") if isinstance(head, dict) else None
-        check_runs: Any = None
-        combined_status: Any = None
+        # No head SHA (nothing to roll up) reads as an unread rollup, which
+        # ``classify_ci_state`` keeps PENDING rather than settling.
+        rollup = CheckRollup()
         if head_sha:
-            # Reaching here means the PR read SUCCEEDED with this token. If the
-            # checks read now returns 401/403, the credential is valid and
-            # merely under-scoped — a condition no amount of waiting fixes.
-            # ``_UnderscopedToken`` carries that distinction up to ``poll``,
-            # which cannot otherwise tell it from a transient blip.
+            # Reaching here means the PR read SUCCEEDED with this token, so a
+            # surviving auth error from the rollup is a credential that cannot
+            # see CI rather than one GitHub rejects outright.
+            # ``fetch_check_rollup`` degrades the Checks read on its own; what
+            # reaches this handler is a gate class it could not route around.
+            # ``_UnderscopedToken`` carries that up to ``poll``, which cannot
+            # otherwise tell it from a blip.
             try:
-                check_runs = await _github_get_check_runs(
-                    base, head_sha, token=token, timeout=10,
-                    ref=f"{ref} check-runs",
+                rollup = await fetch_check_rollup(
+                    base, head_sha, token=token, timeout=10, ref=ref
                 )
             except PRWatchAuthError as exc:
+                if exc.status_code != 403:
+                    # A 401 is the credential itself — expired or revoked
+                    # between the PR read and this one — not an endpoint
+                    # refusing a valid token. It belongs on the plain
+                    # ``blocked="auth"`` path: wrapping it here would tell an
+                    # operator to grant repository permissions when what they
+                    # need is a new credential, and a remedy that cannot work
+                    # is its own way of being stuck.
+                    raise
                 raise _UnderscopedToken(
-                    f"{ref}: the PR read succeeded but check-runs returned an "
-                    f"authorization error ({exc}). The token is valid and is "
-                    f"missing the Checks / Commit-statuses read permission; "
-                    f"this will not resolve on its own."
+                    f"{ref}: the PR read succeeded but a check endpoint "
+                    f"returned an authorization error ({exc}). The token "
+                    f"cannot see CI; this will not resolve on its own. Grant "
+                    f"it 'Actions' and 'Commit statuses' read. Note that "
+                    f"'Checks' is a GitHub App permission with no fine-grained "
+                    f"PAT equivalent, so /commits/{{sha}}/check-runs is "
+                    f"readable only by a classic token with 'repo' or by a "
+                    f"GitHub App."
                 ) from exc
-            combined_status = await _github_get(
-                f"{base}/commits/{head_sha}/status",
-                token=token, timeout=10, ref=f"{ref} status",
-            )
-        return pr_raw, check_runs, combined_status
+        return pr_raw, rollup
 
     async def poll(self, handle: str) -> WaitStatus:
         from kestrel_sovereign.signals.sources.github_pr_watch import (
@@ -306,9 +394,7 @@ class CIWaitable:
             )
 
         try:
-            pr_raw, check_runs, combined_status = await self._fetch(
-                repo, number, token
-            )
+            pr_raw, rollup = await self._fetch(repo, number, token)
         except _UnderscopedToken as exc:
             # Still not terminal — a human can widen the token and the watch
             # should then complete — but it must never read as progress.
@@ -342,8 +428,10 @@ class CIWaitable:
 
         return classify_ci_state(
             pr_raw,
-            check_runs=check_runs,
-            combined_status=combined_status,
+            check_runs=rollup.check_runs,
+            combined_status=rollup.combined_status,
+            checks_source=rollup.source,
+            unreadable=rollup.unreadable,
             repo=repo,
             number=number,
         )

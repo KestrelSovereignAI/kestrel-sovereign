@@ -22,6 +22,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from kestrel_sovereign.signals.sources.github_pr_watch import CheckRollup
+
 from kestrel_sdk.signals import Status
 from kestrel_sdk.tools import Outcome, WaitStatus
 
@@ -266,9 +268,13 @@ async def test_ci_watch_rearms_across_restart_and_completes_once(db, monkeypatch
     provider = CIWaitable(feature=None)
     # Start open with checks in progress → non-terminal.
     fetch_result = {
-        "value": ({"state": "open", "merged": False},
-                  {"check_runs": [{"name": "ci", "status": "in_progress"}]},
-                  {"state": "pending"}),
+        "value": (
+            {"state": "open", "merged": False},
+            CheckRollup(
+                check_runs={"check_runs": [{"name": "ci", "status": "in_progress"}]},
+                combined_status={"state": "pending"},
+            ),
+        ),
     }
 
     async def fake_fetch(repo, number, token):
@@ -290,7 +296,7 @@ async def test_ci_watch_rearms_across_restart_and_completes_once(db, monkeypatch
     }
 
     # PR merges after restart → terminal DONE.
-    fetch_result["value"] = ({"state": "closed", "merged": True}, None, None)
+    fetch_result["value"] = ({"state": "closed", "merged": True}, CheckRollup())
     await _drain_pair(agent)
     assert len(dispatcher.signals) == 1
     sig = dispatcher.signals[0]
