@@ -3745,6 +3745,15 @@ class AsyncConversationStore:
         DELETE — the absence of a timestamp means we can't safely scope,
         and the original wipe-on-shutdown bug is precisely what this
         method exists to prevent.
+
+        The watermark arrives at the exact instant (microseconds, #3227).
+        On PostgreSQL the column is ``NOW()``-stamped, so the comparison is
+        exact and a NORMAL row from earlier in the transition second
+        survives. On SQLite the column is whole-second by CHECK (#3009): a
+        leak written in the transition second is indistinguishable from a
+        row written just before it, and a privacy sweep must not leave
+        leaks behind, so the watermark is FLOORED to the second there —
+        the whole transition second is purged, as it always was.
         """
         if not since_iso:
             logger.warning(
@@ -3754,6 +3763,8 @@ class AsyncConversationStore:
                 reason,
             )
             return 0
+        if self.db.backend_type == "sqlite":
+            since_iso = str(since_iso).replace("T", " ")[:19]
         created_at_predicate = self._timestamp_predicate("created_at", ">=")
         purged = await self._purge_conversation_rows(
             [

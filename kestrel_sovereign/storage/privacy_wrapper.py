@@ -2116,13 +2116,18 @@ class PrivacyEnforcingStorage:
     def _now_instant() -> datetime:
         """The instant a transition INTO EPHEMERAL happened, at full precision.
 
-        One fact, two projections: :attr:`_entered_ephemeral_at` (whole
-        seconds, for ``conversation_history``, whose column is second-
-        granular by design) and :meth:`_exact_purge_watermark` (microseconds,
-        for the stores whose rows carry ``isoformat()`` timestamps: graph
-        nodes and channel messages). The whole-second projection alone
-        destroyed NORMAL-mode rows written earlier in the same second as the
-        transition (#3227).
+        One fact: every purge sweep is handed the exact instant
+        (:meth:`_exact_purge_watermark`, microseconds) and each store's own
+        comparator decides what its column can honour — a microsecond column
+        compares exactly; SQLite's whole-second conversation column floors
+        the watermark and purges the whole transition second, since a leak
+        there cannot be told from a row just before it and a privacy sweep
+        must not leave leaks behind. :attr:`_entered_ephemeral_at`
+        is the whole-second projection kept for logs and for callers that
+        pin the watermark. A whole-second watermark handed to a microsecond
+        store destroyed NORMAL-mode rows written earlier in the same second
+        as the transition — graph nodes, channel messages, conversation rows
+        on Postgres, observability rows (#3227).
         """
         return datetime.now(timezone.utc)
 
@@ -2178,10 +2183,13 @@ class PrivacyEnforcingStorage:
     def _exact_purge_watermark(self) -> Optional[str]:
         """Microsecond watermark: ``YYYY-MM-DD HH:MM:SS.ffffff``.
 
-        Graph nodes and channel messages stamp ``created_at`` with
-        ``isoformat()`` (sub-second), so their purges compare at that
-        precision; a whole-second watermark treated a NORMAL row from earlier
-        in the transition second as an in-window leak (#3227).
+        The one watermark every sweep receives. Stores with sub-second rows
+        (graph nodes, channel messages, Postgres conversation rows,
+        observability rows) compare at that precision; SQLite's whole-second
+        conversation column floors it and purges the whole transition
+        second. A whole-second watermark handed to a sub-second store
+        treated a NORMAL row from earlier in the transition second as an
+        in-window leak (#3227).
         """
         instant = self._entered_ephemeral_instant
         if instant is None:
@@ -2441,14 +2449,17 @@ class PrivacyEnforcingStorage:
 
         # Attempt ALL independent sweeps, retaining each outcome. A failure in
         # one never turns into a clean count and never skips the others (#2673).
+        # One watermark for every sweep: the exact instant (#3227). Each store
+        # compares it at its own column's precision — a microsecond column
+        # exactly; SQLite's whole-second conversation column floors it and
+        # purges the whole transition second. Handing a sub-second store the
+        # whole-second projection instead destroyed NORMAL rows written
+        # earlier in the same second.
+        exact_since = self._exact_purge_watermark()
         report.record(await self._sweep_store(
             "conversation_history",
-            lambda: self._storage.purge_conversations_since(since, reason=reason),
+            lambda: self._storage.purge_conversations_since(exact_since, reason=reason),
         ))
-        # Graph nodes and channel messages are stamped with isoformat(): their
-        # purges compare at that precision (#3227) — the same instant, not the
-        # whole-second projection conversation_history needs.
-        exact_since = self._exact_purge_watermark()
         report.record(await self._sweep_store(
             "graph_nodes",
             lambda: self._storage.purge_agent_graph_nodes(since_iso=exact_since),
@@ -2496,7 +2507,7 @@ class PrivacyEnforcingStorage:
         if self._observability_purge is not None:
             obs_counts: Dict[str, int] = {}
             try:
-                obs_counts = await self._observability_purge(since) or {}
+                obs_counts = await self._observability_purge(exact_since) or {}
             except Exception as e:  # noqa: BLE001 - retained as non-required outcomes, never clean
                 # The observability sink is NOT a required content store, so a
                 # failure here does not block mode exit — but it must be RETAINED

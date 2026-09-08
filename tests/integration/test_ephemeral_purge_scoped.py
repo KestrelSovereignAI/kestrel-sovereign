@@ -470,3 +470,31 @@ async def test_same_second_pre_transition_channel_message_survives(tmp_path, mon
         assert result["channel_messages"] == 1, result
         rows = await storage.db.fetchall("SELECT id FROM channel_messages ORDER BY id")
         assert [r[0] for r in rows] == ["normal-pre-transition"]
+
+
+@pytest.mark.asyncio
+async def test_every_sweep_is_handed_the_exact_instant(tmp_path, monkeypatch):
+    """Review r3: one watermark for every sweep. The conversation, graph,
+    channel and observability sweeps all receive the microsecond form; each
+    store's comparator decides what its column can honour."""
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    storage = AsyncStorage(str(tmp_path / "w.db"), agent_id=AGENT_ID)
+    async with storage:
+        _pin_clock(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        seen = {}
+        monkeypatch.setattr(storage, "purge_conversations_since", AsyncMock(side_effect=lambda since, **kw: seen.setdefault("conversation", since) and 0))
+        monkeypatch.setattr(storage, "purge_agent_graph_nodes", AsyncMock(side_effect=lambda since_iso=None: seen.setdefault("graph", since_iso) and 0))
+        monkeypatch.setattr(storage, "purge_channel_messages_since", AsyncMock(side_effect=lambda since, **kw: seen.setdefault("channel", since) and 0))
+        wrapper.set_observability_purge(AsyncMock(side_effect=lambda since: seen.setdefault("observability", since) and {}))
+        await wrapper.purge_ephemeral_session(reason="wiring")
+    assert seen == {
+        "conversation": "2026-09-07 12:00:05.500000",
+        "graph": "2026-09-07 12:00:05.500000",
+        "channel": "2026-09-07 12:00:05.500000",
+        "observability": "2026-09-07 12:00:05.500000",
+    }, seen

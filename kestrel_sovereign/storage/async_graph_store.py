@@ -1942,20 +1942,27 @@ class AsyncGraphStore:
             # nodes get purged; without the microseconds, a NORMAL node from
             # earlier in the transition second compared equal to the
             # watermark and was purged too (#3227).
-            # A fraction longer than six digits is TRUNCATED before the
-            # cast: ``timestamptz`` would round it, and SQLite truncates, so
-            # ``.4999999`` must land on the same side on both.
-            truncated = (
-                "regexp_replace(properties::jsonb->>'created_at', "
-                "'(\\.[0-9]{6})[0-9]+', '\\1')"
-            )
+            # Trimmed and upper-cased first, like SQLite, so the two backends
+            # see the same text. A fraction longer than six digits is
+            # TRUNCATED before the cast: a timestamp cast would round it, and
+            # SQLite truncates, so ``.4999999`` must land on the same side on
+            # both. Cast to a zone-less ``timestamp``, never ``timestamptz``:
+            # every accepted marker is UTC and an offset-free value must read
+            # as UTC too, not as the session's TimeZone. A value that is not
+            # shaped like a timestamp is untimed rather than a cast error that
+            # would abort the whole sweep.
+            # The shape check is textual: a well-shaped but impossible date
+            # (``2026-02-30``) still fails the cast and aborts the sweep on
+            # Postgres, as it always did; no writer produces one.
+            raw = "upper(btrim(properties::jsonb->>'created_at'))"
+            truncated = f"regexp_replace({raw}, '(\\.[0-9]{{6}})[0-9]+', '\\1')"
             created_normalized = (
-                "(CASE WHEN (properties::jsonb->>'created_at') IS NULL "
-                "        OR length(properties::jsonb->>'created_at') < 19 "
-                "        OR (properties::jsonb->>'created_at') ~ '[+-](?!00:?00$)[0-9]{2}:?[0-9]{2}$' "
+                f"(CASE WHEN {raw} IS NULL "
+                f"        OR length({raw}) < 19 "
+                f"        OR {raw} !~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ][0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}' "
+                f"        OR {raw} ~ '[+-](?!00:?00(:00)?$)[0-9]{{2}}:?[0-9]{{2}}(:[0-9]{{2}})?$' "
                 "     THEN NULL "
-                f" ELSE to_char(({truncated}::timestamptz) "
-                "              AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') END)"
+                f" ELSE to_char(({truncated}::timestamp), 'YYYY-MM-DD HH24:MI:SS.US') END)"
             )
         else:
             # SQLite normalisation: ``T`` → space, then
@@ -1966,7 +1973,9 @@ class AsyncGraphStore:
             # stamped at whole seconds.  Handles ISO with any fraction length
             # and offset, offset-free ISO, and SQLite-format inputs
             # uniformly, at the precision the rows are written with (#3227).
-            value = "replace(json_extract(properties, '$.created_at'), 'T', ' ')"
+            # Trimmed and upper-cased (a lowercase ``z`` marker, leading or
+            # trailing whitespace) so the terminator branches see one spelling.
+            value = "replace(upper(trim(json_extract(properties, '$.created_at'))), 'T', ' ')"
             # Everything after the seconds: a fraction, an offset, both, or nothing.
             rest = f"substr({value}, 20)"
             frac = f"substr({value}, 21)"
@@ -1983,10 +1992,17 @@ class AsyncGraphStore:
                 f"      WHEN instr({rest}, '-') > 0 THEN substr({rest}, instr({rest}, '-')) "
                 f"      ELSE '' END)"
             )
+            # The same shape check as Postgres: not a timestamp → untimed.
+            shaped = (
+                f"({value} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] "
+                f"[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*')"
+            )
             created_normalized = (
                 f"(CASE WHEN json_extract(properties, '$.created_at') IS NULL "
                 f"        OR length({value}) < 19 "
-                f"        OR {offset} NOT IN ('', '+00:00', '-00:00', '+0000', '-0000') THEN NULL "
+                f"        OR NOT {shaped} "
+                f"        OR {offset} NOT IN ('', '+00:00', '-00:00', '+0000', '-0000', "
+                f"                             '+00:00:00', '-00:00:00') THEN NULL "
                 f" WHEN substr({value}, 20, 1) = '.' "
                 f"  THEN substr({value}, 1, 19) || '.' || substr({digits} || '000000', 1, 6) "
                 f" ELSE substr({value}, 1, 19) || '.000000' END)"

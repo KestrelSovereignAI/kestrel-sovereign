@@ -187,6 +187,13 @@ async def test_date_only_rows_are_counted_as_untimed_on_backend(bound_graph, cap
         ("2026-09-07T12:00:05.5-00:00", "2026-09-07 12:00:05.500001", "kept"),
         ("2026-09-07 12:00:05.5 ", "2026-09-07 12:00:05.500001", "kept"),
         ("2026-09-07T12:00:05.5Z", "2026-09-07 12:00:05.499999", "purged"),
+        # At equality the terminator branch is load-bearing: an un-cut
+        # '5-00:0' or '5 0000' would sort above the watermark by accident of
+        # the mutant, below it by the fix (review r3).
+        ("2026-09-07T12:00:05.5-00:00", "2026-09-07 12:00:05.500000", "purged"),
+        ("2026-09-07 12:00:05.5 ", "2026-09-07 12:00:05.500000", "purged"),
+        ("2026-09-07T12:00:05.5z", "2026-09-07 12:00:05.500001", "kept"),
+        ("2026-09-07T12:00:05.5z", "2026-09-07 12:00:05.500000", "purged"),
     ],
 )
 async def test_a_terminator_never_extends_the_fraction_on_backend(bound_graph, created_at, watermark, expected):
@@ -208,3 +215,51 @@ async def test_a_non_utc_offset_is_counted_as_untimed_on_backend(bound_graph, ca
     assert purged == 0
     assert await store.get_node(f"{agent}:ist") is not None
     assert any("have no properties.created_at" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize(
+    "created_at, expected",
+    [
+        # Not shaped like a timestamp: untimed on both backends — never a
+        # cast error that aborts the whole sweep on Postgres (review r3).
+        ("not a timestamp at all", "kept"),
+        # Whitespace is trimmed on both, so the row is placed, not mangled.
+        (" 2026-09-07T12:00:05.600000+00:00", "purged"),
+        ("2026-09-07T12:00:05.400000+00:00 ", "kept"),
+        # A UTC marker spelled with seconds is still UTC, on both backends.
+        ("2026-09-07T12:00:05.6+00:00:00", "purged"),
+        ("2026-09-07T12:00:05.4+00:00:00", "kept"),
+        ("2026-09-07T12:00:05.6+05:30:00", "kept"),
+    ],
+)
+async def test_unshaped_or_odd_values_are_untimed_on_both_backends(bound_graph, created_at, expected):
+    store, agent = bound_graph
+    await _seed(store, agent, {"row": created_at, "leak": "2026-09-07T12:00:06+00:00"})
+    purged = await store.purge_agent_nodes(agent, since_iso="2026-09-07 12:00:05.500000")
+    assert purged == (2 if expected == "purged" else 1), (created_at, purged)
+    assert (await store.get_node(f"{agent}:row") is None) == (expected == "purged")
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_an_offset_free_value_is_utc_regardless_of_the_session_zone_on_backend(bound_graph):
+    """Review r3 P2: a ``timestamptz`` cast supplied the Postgres session's
+    TimeZone to an offset-free value; SQLite read it as UTC. Cast to a
+    zone-less timestamp, both backends agree whatever the session says."""
+    store, agent = bound_graph
+    if store.db.backend_type == "postgres":
+        await store.db.execute("SET TIME ZONE 'America/New_York'")
+    try:
+        await _seed(store, agent, {
+            "offset-free-before": "2026-09-07T12:00:05.400000",
+            "offset-free-after": "2026-09-07T12:00:05.600000",
+        })
+        purged = await store.purge_agent_nodes(agent, since_iso="2026-09-07 12:00:05.500000")
+        assert purged == 1
+        assert await store.get_node(f"{agent}:offset-free-before") is not None
+        assert await store.get_node(f"{agent}:offset-free-after") is None
+    finally:
+        if store.db.backend_type == "postgres":
+            await store.db.execute("SET TIME ZONE 'UTC'")
