@@ -947,8 +947,8 @@ def _check_sqlite_hold_readiness(
         DERIVED_HOST_DB_PATH_ENV,
         HOST_DB_PATH_ENV,
         sqlite_family,
-        validate_host_database_parent_readiness,
         validate_host_database_migration_readiness,
+        validate_host_database_parent_readiness,
         validate_sqlite_family_private,
     )
     from kestrel_sovereign.private_storage import path_exists
@@ -963,6 +963,7 @@ def _check_sqlite_hold_readiness(
         path_is_implicit = not configured_host_path or (
             launcher_derived_path == configured_host_path
         )
+        readiness_database = database
         if path_is_implicit:
             sources: list[tuple[str, Path]] = []
             if env.get("KESTREL_DB_PATH"):
@@ -973,12 +974,21 @@ def _check_sqlite_hold_readiness(
                     )
                 )
             sources.append(("legacy host database", project_dir / "kestrel_host.db"))
-            validate_host_database_migration_readiness(database, tuple(sources))
+            selected_source = validate_host_database_migration_readiness(
+                database,
+                tuple(sources),
+            )
+            if selected_source is not None:
+                _source_label, readiness_database = selected_source
         if _selected_hold_backend(env) == "sqlite":
             validate_sqlite_hold_readiness(
-                database,
-                runtime_hardens_parent=not bool(
-                    env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
+                readiness_database,
+                runtime_hardens_parent=(
+                    readiness_database == database
+                    and not bool(
+                        env.get("KESTREL_HOST_DB_PATH")
+                        or env.get("KESTREL_DB_PATH")
+                    )
                 ),
             )
         else:
@@ -996,7 +1006,7 @@ def _check_sqlite_hold_readiness(
             # private-family and schema contracts without demanding SQLite-only
             # Hold evidence beside a live WAL family.
             validate_sqlite_family_private(database)
-        validate_sqlite_core_schema_readiness(database)
+        validate_sqlite_core_schema_readiness(readiness_database)
     except Exception as exc:  # noqa: BLE001 - typed failure becomes readiness
         report.fail.append(f"SQLite host readiness NOT verified: {exc}")
         return

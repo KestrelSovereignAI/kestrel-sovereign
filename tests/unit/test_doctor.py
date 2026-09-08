@@ -3625,6 +3625,76 @@ def test_sqlite_doctor_rejects_core_schema_startup_incompatibility(tmp_path):
     ), report.fail
 
 
+def test_sqlite_doctor_rejects_incompatible_selected_migration_source(tmp_path):
+    """Doctor validates the database startup will move, not an absent target."""
+
+    import os
+    import sqlite3
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    home = tmp_path / "runtime-home"
+    previous = home / "host-data" / "host-features.db"
+    previous.parent.mkdir(parents=True, mode=0o700)
+    with sqlite3.connect(previous) as connection:
+        connection.execute("CREATE TABLE graph_nodes(wrong TEXT)")
+    data_root = tmp_path / "mounted-data"
+    (data_root / "host-data").mkdir(parents=True, mode=0o700)
+    if os.name != "nt":
+        previous.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_HOME": str(home),
+            "KESTREL_DB_PATH": str(data_root),
+            "HOME": str(tmp_path),
+        },
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any(
+        "core host schema cannot initialize" in item for item in report.fail
+    ), report.fail
+
+
+def test_sqlite_doctor_rejects_corrupt_hold_selected_migration_source(tmp_path):
+    """A selected legacy source cannot carry an unverified partial Hold schema."""
+
+    import os
+    import sqlite3
+
+    from kestrel_sovereign import doctor
+    from kestrel_sovereign.doctor import DoctorReport
+
+    home = tmp_path / "runtime-home"
+    previous = home / "host-data" / "host-features.db"
+    previous.parent.mkdir(parents=True, mode=0o700)
+    with sqlite3.connect(previous) as connection:
+        connection.execute("CREATE TABLE hold_latches(wrong TEXT)")
+    data_root = tmp_path / "mounted-data"
+    (data_root / "host-data").mkdir(parents=True, mode=0o700)
+    if os.name != "nt":
+        previous.chmod(0o600)
+    report = DoctorReport()
+
+    doctor._check_sqlite_hold_readiness(
+        {
+            "KESTREL_HOME": str(home),
+            "KESTREL_DB_PATH": str(data_root),
+            "HOME": str(tmp_path),
+        },
+        tmp_path,
+        report,
+    )
+
+    assert not report.ready
+    assert any("Hold" in item for item in report.fail), report.fail
+
+
 @pytest.mark.asyncio
 async def test_sqlite_doctor_rejects_existing_store_in_nonprivate_parent(
     tmp_path,

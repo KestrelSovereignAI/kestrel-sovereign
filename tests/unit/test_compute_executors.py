@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import venv
 import zipfile
 from pathlib import Path
@@ -1957,23 +1958,27 @@ def test_docker_rechecks_regular_source_at_copy_boundary(
     raced = source / "input.txt"
     raced.write_text("regular during preflight", encoding="utf-8")
     destination = tmp_path / "isolated" / "workspace"
+    original_open = docker_executor_module.os.open
+    replaced = False
 
-    def replace_before_copy(
-        _source: Path,
-        target: Path,
+    def replace_before_open(
+        path,
+        flags,
+        mode=0o777,
         *,
-        copy_function,
-        **_kwargs: object,
-    ) -> None:
-        target.mkdir(parents=True)
-        raced.unlink()
-        os.mkfifo(raced)
-        copy_function(str(raced), str(target / raced.name))
+        dir_fd=None,
+    ):
+        nonlocal replaced
+        if path == raced.name and dir_fd is not None and not replaced:
+            replaced = True
+            raced.unlink()
+            os.mkfifo(raced)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(
-        docker_executor_module.shutil,
-        "copytree",
-        replace_before_copy,
+        docker_executor_module.os,
+        "open",
+        replace_before_open,
     )
 
     with pytest.raises(
@@ -1983,6 +1988,138 @@ def test_docker_rechecks_regular_source_at_copy_boundary(
         DockerExecutor._snapshot_working_directory(str(source), destination)
 
     assert not destination.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dirfd traversal is POSIX-only")
+def test_docker_snapshot_anchors_directory_replaced_by_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A raced child path cannot redirect descent outside the accepted root."""
+
+    source = tmp_path / "caller cwd"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "public.txt").write_text("public", encoding="utf-8")
+    secret = tmp_path / "ambient secret"
+    secret.mkdir()
+    (secret / "secret.txt").write_text("SECRET", encoding="utf-8")
+    destination = tmp_path / "isolated" / "workspace"
+    original_open = docker_executor_module.os.open
+    replaced = False
+
+    def replace_child_after_open(
+        path,
+        flags,
+        mode=0o777,
+        *,
+        dir_fd=None,
+    ):
+        nonlocal replaced
+        if (
+            path == child.name
+            and dir_fd is not None
+            and flags & os.O_DIRECTORY
+            and not replaced
+        ):
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+            replaced = True
+            child.rename(source / "child-before-race")
+            child.symlink_to(secret, target_is_directory=True)
+            return descriptor
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        docker_executor_module.os,
+        "open",
+        replace_child_after_open,
+    )
+
+    DockerExecutor._snapshot_working_directory(str(source), destination)
+
+    assert replaced is True
+    assert (destination / "child" / "public.txt").read_text(
+        encoding="utf-8"
+    ) == "public"
+    assert not (destination / "child" / "secret.txt").exists()
+
+
+def test_docker_snapshot_enforces_byte_budget(tmp_path: Path) -> None:
+    """Regular files cannot make pre-container host storage grow without bound."""
+
+    source = tmp_path / "caller cwd"
+    source.mkdir()
+    (source / "input.txt").write_bytes(b"12345")
+    destination = tmp_path / "isolated" / "workspace"
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="4-byte limit",
+    ):
+        DockerExecutor._snapshot_working_directory(
+            str(source),
+            destination,
+            max_bytes=4,
+        )
+
+    assert not destination.exists()
+
+
+def test_docker_snapshot_enforces_entry_budget(tmp_path: Path) -> None:
+    """Tiny files cannot evade the workspace resource boundary."""
+
+    source = tmp_path / "caller cwd"
+    source.mkdir()
+    (source / "one").touch()
+    (source / "two").touch()
+    destination = tmp_path / "isolated" / "workspace"
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="1-entry limit",
+    ):
+        DockerExecutor._snapshot_working_directory(
+            str(source),
+            destination,
+            max_entries=1,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_docker_snapshot_is_off_loop_and_deadline_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Snapshot blocking I/O cannot monopolize the server event loop."""
+
+    executor = DockerExecutor()
+    release = threading.Event()
+
+    def blocked_snapshot(*_args, **_kwargs) -> str:
+        release.wait(timeout=0.5)
+        raise TimeoutError("simulated blocking snapshot")
+
+    monkeypatch.setattr(
+        executor,
+        "_snapshot_working_directory",
+        blocked_snapshot,
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        with pytest.raises(ExecutionTimeoutError):
+            await executor._bounded_working_directory_snapshot(
+                str(tmp_path),
+                tmp_path / "workspace",
+                deadline=loop.time() + 0.03,
+                subject_id="snapshot-timeout",
+                timeout_seconds=0.03,
+            )
+        assert loop.time() - started < 0.2
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
