@@ -331,7 +331,7 @@ async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_res
     )
     budget = mock_http.post.await_args.kwargs["timeout"]
     assert isinstance(budget, httpx.Timeout)
-    expected = size / client.UPLOAD_FLOOR_BYTES_PER_SECOND
+    expected = size / client.TRANSFER_FLOOR_BYTES_PER_SECOND
     assert budget.read == pytest.approx(expected) and budget.write == pytest.approx(expected)
     assert expected > 2000
     assert budget.connect == client.timeout and budget.pool == client.timeout
@@ -363,7 +363,7 @@ async def test_upload_budget_is_sized_from_the_content_too(client, mock_response
     assert any(call.args == (content,) for call in fake_len.call_args_list)
     budget = mock_http.post.await_args.kwargs["timeout"]
     assert isinstance(budget, httpx.Timeout)
-    assert budget.write == pytest.approx(size / client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+    assert budget.write == pytest.approx(size / client.TRANSFER_FLOOR_BYTES_PER_SECOND)
 
 
 @pytest.mark.asyncio
@@ -387,7 +387,7 @@ async def test_download_is_given_the_transfer_budget_when_the_size_is_known(clie
         explicit = mock_http.get.await_args.kwargs["timeout"]
 
     assert isinstance(sized, httpx.Timeout)
-    assert sized.read == pytest.approx(1_209_462_784 / client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+    assert sized.read == pytest.approx(1_209_462_784 / client.TRANSFER_FLOOR_BYTES_PER_SECOND)
     assert flat == 120.0
     assert explicit == 7.0
 
@@ -398,6 +398,6 @@ def test_a_small_upload_keeps_the_default_budget(client):
 
 
 def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client):
-    at_floor = int(client.timeout * client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+    at_floor = int(client.timeout * client.TRANSFER_FLOOR_BYTES_PER_SECOND)
     assert client.transfer_timeout(at_floor).write == pytest.approx(client.timeout)
     assert client.transfer_timeout(at_floor * 3).write == pytest.approx(client.timeout * 3)

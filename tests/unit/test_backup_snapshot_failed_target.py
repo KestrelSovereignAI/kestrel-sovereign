@@ -510,10 +510,11 @@ async def test_the_service_marks_only_denied_targets_and_the_unchanged_pass_as_n
     assert set(again) == {"__unchanged__"}
     assert again["__unchanged__"].attempted is False and again["__unchanged__"].success is True
 
-    # A policy-denied remote target is recorded without a call.
-    service._record_policy_skip("gs://denied", "tier not allowed")
+    # A policy-denied remote target is recorded without a call, with its kind.
+    service._record_policy_skip("gs://denied", "tier not allowed", kind="gcs")
     denied = service._policy_skips["gs://denied"]
     assert denied.attempted is False and denied.success is True
+    assert denied.kind == "gcs"
     assert denied.metadata == {"skipped": True, "policy_denied": True, "reason": "tier not allowed"}
     assert RemoteTierPolicyContext is not None and RemoteTierPolicyDecision is not None
     await service.stop()
@@ -550,6 +551,76 @@ async def test_the_lighthouse_restore_gives_the_download_the_manifests_size(
 
     assert seen["cid"] == "QmSnap"
     assert seen["expected_bytes"] == 1_209_462_784
+
+
+@pytest.mark.asyncio
+async def test_the_lighthouse_restore_records_the_exception_type_too(tmp_path, monkeypatch, caplog):
+    from kestrel_sovereign.storage.providers import lighthouse_rest
+
+    class _TimingOut:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def download(self, cid, timeout=None, *, expected_bytes=None):
+            raise httpx.ReadTimeout("")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(lighthouse_rest, "LighthouseRestClient", _TimingOut)
+    target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
+    monkeypatch.setattr(target, "_resolve_latest_snapshot", AsyncMock(return_value=("QmSnap", None)))
+
+    with caplog.at_level("ERROR"):
+        result = await target.restore_snapshot(tmp_path / "restored.db")
+
+    assert result is not None and result.success is False
+    assert result.error == "ReadTimeout: "
+    assert "Failed to restore from Lighthouse: ReadTimeout: " in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_cold_start_restore_gets_the_size_from_the_uploads_api(tmp_path, monkeypatch):
+    """No local manifest: the uploads API names the latest snapshot and its
+    size, so the cold-start download gets the payload-sized budget too."""
+    from kestrel_sovereign.storage.providers import lighthouse_rest
+
+    seen: dict = {}
+
+    class _Api:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get_uploads(self):
+            return {"fileList": [{
+                "cid": "QmCold", "fileName": "kestrel_state__agent__20260831_120132.car",
+                "fileSizeInBytes": "1209462784", "createdAt": "2026-08-31T12:01:32Z",
+            }]}
+
+        async def download(self, cid, timeout=None, *, expected_bytes=None):
+            seen["cid"], seen["expected_bytes"] = cid, expected_bytes
+            return b"not a real snapshot"
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(lighthouse_rest, "LighthouseRestClient", _Api)
+    monkeypatch.delenv("LIGHTHOUSE_STATE_CID", raising=False)
+    target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
+    monkeypatch.setattr(target, "_is_structured_snapshot_upload", lambda u: u.get("cid") == "QmCold")
+
+    await target.restore_snapshot(tmp_path / "restored.db")
+
+    assert seen["cid"] == "QmCold"
+    assert seen["expected_bytes"] == 1_209_462_784
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_state_cid_carries_no_size(tmp_path, monkeypatch):
+    target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
+    monkeypatch.setenv("LIGHTHOUSE_STATE_CID", "QmEnv")
+    assert await target._resolve_latest_snapshot() == ("QmEnv", None)
+    assert await target._resolve_latest_cid() == "QmEnv"
 
 
 # ---------------------------------------------------------------------------

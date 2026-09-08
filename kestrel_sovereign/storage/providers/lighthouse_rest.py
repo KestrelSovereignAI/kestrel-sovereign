@@ -62,11 +62,12 @@ class LighthouseRestClient:
     """Async HTTP client for Lighthouse storage REST API."""
 
     UPLOAD_URL = "https://upload.lighthouse.storage"
-    #: Payload per second of patience an upload is granted, per socket
-    #: operation. The budget for a payload is ``max(timeout, size / this)``,
-    #: so a 60 s default still applies to small requests and a 1.2 GB
-    #: snapshot gets ~2300 s for the server's post-upload processing.
-    UPLOAD_FLOOR_BYTES_PER_SECOND = 512 * 1024
+    #: Payload per second of patience a transfer is granted, per socket
+    #: operation, in either direction. The budget for a payload is
+    #: ``max(timeout, size / this)``, so a 60 s default still applies to
+    #: small requests and a 1.2 GB snapshot gets ~2300 s for the server's
+    #: processing before it answers.
+    TRANSFER_FLOOR_BYTES_PER_SECOND = 512 * 1024
     API_URL = "https://api.lighthouse.storage"
 
     def __init__(
@@ -157,13 +158,13 @@ class LighthouseRestClient:
         read after the body was sent: Lighthouse hashes and stores a 1.2 GB
         CAR before it answers, and that wait grows with the payload, so the
         budget is sized by the payload (``payload_bytes /
-        UPLOAD_FLOOR_BYTES_PER_SECOND``, never below the default) and given
+        TRANSFER_FLOOR_BYTES_PER_SECOND``, never below the default) and given
         to both operations. The floor is a rate of payload per second of
         patience, not a link speed. Connect and pool stay at the default:
         they are not proportional to the payload (#3189).
         """
         budget = max(
-            float(self.timeout), payload_bytes / self.UPLOAD_FLOOR_BYTES_PER_SECOND
+            float(self.timeout), payload_bytes / self.TRANSFER_FLOOR_BYTES_PER_SECOND
         )
         return httpx.Timeout(
             connect=self.timeout, read=budget, write=budget, pool=self.timeout
@@ -223,7 +224,10 @@ class LighthouseRestClient:
 
         Args:
             cid: IPFS Content ID
-            timeout: Override timeout for large downloads
+            timeout: Explicit request timeout; wins over ``expected_bytes``
+            expected_bytes: The object's size when known (a manifest's
+                ``snapshot_size``); buys the payload-sized budget of
+                :meth:`transfer_timeout` instead of the flat default
 
         Returns:
             Content bytes

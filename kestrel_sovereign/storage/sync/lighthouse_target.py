@@ -31,6 +31,17 @@ from kestrel_sovereign.storage.sync.targets import (
 logger = logging.getLogger(__name__)
 
 
+def _snapshot_size(manifest: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The positive ``snapshot_size`` a manifest records, else ``None``."""
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        size = int(manifest.get("snapshot_size") or 0)
+    except (TypeError, ValueError):
+        return None
+    return size or None
+
+
 class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     """
     Lighthouse (Filecoin) storage target.
@@ -132,6 +143,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             logger.info(f"Uploaded snapshot to Lighthouse: {cid} ({size} bytes)")
             self._latest_cid = cid
+            self._latest_size = size
 
             # Upload manifest pointing to this snapshot
             new_manifest = {
@@ -222,7 +234,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            snapshot_cid = await self._resolve_latest_cid()
+            snapshot_cid, expected_bytes = await self._resolve_latest_snapshot()
             if not snapshot_cid:
                 logger.info("No Lighthouse snapshot found to restore")
                 return None
@@ -234,15 +246,10 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
             client = LighthouseRestClient(api_key=self.api_key)
-            # The local manifest records the size of the snapshot it names;
-            # a known size buys the gateway the patience a 1.2 GB CAR needs
-            # before its first byte (#3189).
-            manifest = self._load_local_manifest() or {}
-            expected_bytes = (
-                int(manifest.get("snapshot_size") or 0) or None
-                if manifest.get("snapshot_cid") == snapshot_cid
-                else None
-            )
+            # Whichever path named the snapshot also named its size when it
+            # could (the local manifest, the uploads API record, a remote
+            # manifest); a known size buys the gateway the patience a 1.2 GB
+            # CAR needs before its first byte (#3189).
             content = await client.download(snapshot_cid, expected_bytes=expected_bytes)
             await client.close()
 
@@ -271,14 +278,17 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
         except Exception as e:
-            logger.error(f"Failed to restore from Lighthouse: {e}")
+            # The same empty-message timeout as the upload door (#3189).
+            logger.error(
+                "Failed to restore from Lighthouse: %s: %s", type(e).__name__, e
+            )
             return SyncResult(
                 success=False,
                 target_name=self.name,
                 bytes_synced=0,
                 frames_synced=0,
                 timestamp=timestamp,
-                error=str(e),
+                error=f"{type(e).__name__}: {e}",
             )
 
     def _build_snapshot_car(self, content: bytes) -> tuple[bytes, str]:
@@ -360,6 +370,24 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
             return content
 
+    async def _resolve_latest_snapshot(self) -> tuple[Optional[str], Optional[int]]:
+        """The latest snapshot's CID and, when whichever path named it also
+        recorded a size (the local manifest, this process's own upload, an
+        uploads API record, a remote manifest), that size."""
+        cid = await self._resolve_latest_cid()
+        return cid, (self._known_snapshot_size(cid) if cid else None)
+
+    def _known_snapshot_size(self, cid: str) -> Optional[int]:
+        manifest = self._load_local_manifest()
+        if manifest and manifest.get("snapshot_cid") == cid:
+            return _snapshot_size(manifest)
+        if getattr(self, "_latest_cid", None) == cid:
+            return getattr(self, "_latest_size", None)
+        remote = getattr(self, "_last_remote_manifest", None)
+        if isinstance(remote, dict) and remote.get("snapshot_cid") == cid:
+            return _snapshot_size(remote)
+        return getattr(self, "_upload_sizes_by_cid", {}).get(cid)
+
     async def _resolve_latest_cid(self) -> Optional[str]:
         """
         Find the latest snapshot CID using multiple resolution strategies.
@@ -387,7 +415,11 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         return await self._query_uploads_api()
 
     async def _query_uploads_api(self) -> Optional[str]:
-        """Query Lighthouse uploads API to find the latest snapshot."""
+        """Query Lighthouse uploads API to find the latest snapshot.
+
+        Records each snapshot upload's size by CID so a restore can size its
+        download budget (#3189).
+        """
         try:
             from kestrel_sovereign.storage.providers.lighthouse_rest import (
                 LighthouseRestClient,
@@ -406,6 +438,11 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             agent_snapshots = [
                 u for u in uploads if self._is_structured_snapshot_upload(u)
             ]
+            self._upload_sizes_by_cid = {
+                cid: size
+                for u in agent_snapshots
+                if (cid := self._upload_cid(u)) and (size := self._upload_size(u))
+            }
             if agent_snapshots:
                 latest = max(agent_snapshots, key=self._upload_timestamp)
                 cid = self._upload_cid(latest)
@@ -428,8 +465,19 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             return None
 
         except Exception as e:
-            logger.warning(f"Failed to query Lighthouse uploads API: {e}")
+            logger.warning("Failed to query Lighthouse uploads API: %s: %s", type(e).__name__, e)
             return None
+
+    @staticmethod
+    def _upload_size(upload: Dict[str, Any]) -> Optional[int]:
+        for key in ("fileSizeInBytes", "Size", "size"):
+            value = upload.get(key)
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def _read_manifest_cid(self, manifest_cid: str) -> Optional[str]:
         """Download a manifest file and extract the snapshot CID."""
@@ -442,6 +490,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             content = await client.download(manifest_cid)
             await client.close()
             manifest = json.loads(content)
+            self._last_remote_manifest = manifest if isinstance(manifest, dict) else None
             manifest_agent = manifest.get("agent_id")
             if manifest_agent and manifest_agent != self.agent_id:
                 logger.warning(

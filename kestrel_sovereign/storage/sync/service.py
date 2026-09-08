@@ -226,7 +226,7 @@ class SyncService:
                 self._append_target(target)
                 return
             if not decision.allowed:
-                self._record_policy_skip(target.name, decision.reason)
+                self._record_policy_skip(target.name, decision.reason, kind=target.kind)
                 logger.warning(
                     "Remote sync target skipped by policy before upload: %s (%s)",
                     target.name,
@@ -262,7 +262,12 @@ class SyncService:
         self._append_target(factory())
         return True
 
-    def _record_policy_skip(self, target_name: str, reason: Optional[str]) -> None:
+    def _record_policy_skip(
+        self, target_name: str, reason: Optional[str], *, kind: str = ""
+    ) -> None:
+        """Record a destination the policy denied; ``kind`` is the target's
+        when it was constructed, and unknown when the policy refused before
+        construction (``add_remote_target``)."""
         self._policy_skips[target_name] = SyncResult(
             success=True,
             target_name=target_name,
@@ -270,6 +275,7 @@ class SyncService:
             frames_synced=0,
             timestamp=datetime.now(timezone.utc),
             metadata={"skipped": True, "policy_denied": True, "reason": reason},
+            kind=kind,
             attempted=False,
         )
 
@@ -426,7 +432,7 @@ class SyncService:
             if target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
                 decision = self._remote_target_policy_decision()
                 if decision is not None and not decision.allowed:
-                    self._record_policy_skip(target.name, decision.reason)
+                    self._record_policy_skip(target.name, decision.reason, kind=target.kind)
                     results[target.name] = self._policy_skips[target.name]
                     logger.warning(
                         "Remote sync target skipped by policy before upload: %s (%s)",
