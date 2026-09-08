@@ -129,7 +129,7 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const { state, getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 const chatModule = await import('../../kestrel_sovereign/static/js/chat.js');
-const { mountChatPane, wipeAgentChatPane, sendMessage, stopAgent } = chatModule;
+const { mountChatPane, wipeAgentChatPane, sendMessage, stopAgent, prepareHostStop } = chatModule;
 const apiModule = await import('../../kestrel_sovereign/static/js/api.js');
 
 chatModule.initChat();
@@ -161,6 +161,47 @@ function setQueueMode(agent) {
     pane.composerMode = 'queue';
     return pane;
 }
+
+test('host Stop fences queued follow-ups before I/O and settles typed local outcomes', () => {
+    const agent = 'host-stop-local';
+    const agentId = 'did:agent:host-stop-local';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = setQueueMode(agent);
+    pane.queuedMessage = 'must not restart after Stop All';
+    const chip = makeNode();
+    chip.className = 'queued-message-chip';
+    pane.element.appendChild(chip);
+    state.waitingAgents.add(agent);
+
+    const priorAbortLookup = apiModule.default.getStreamAbortController;
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    let aborted = false;
+    apiModule.default.getStreamAbortController = (name) => (
+        name === agent ? { abort() { aborted = true; } } : null
+    );
+    apiModule.default.getCurrentStreamRequestId = () => 'host-stop-request';
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+
+    assert.equal(pane.queuedMessage, null, 'queue is cleared synchronously');
+    assert.equal(pane.element.querySelector('.queued-message-chip'), null, 'queue chip is removed');
+    assert.equal(aborted, true, 'browser stream is aborted synchronously');
+    assert.equal(state.unconfirmedStopAgents.has(agent), true, 'new turns remain fenced pending evidence');
+
+    settle({
+        stop_outcomes: [{
+            agent_id: agentId,
+            resolved_target: agentId,
+            disposition: 'stopped',
+        }],
+    });
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+    assert.equal(state.waitingAgents.has(agent), false);
+    apiModule.default.getStreamAbortController = priorAbortLookup;
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
 
 
 test('queue mode: Enter-while-busy stores the message and renders a chip, no interrupt', async () => {

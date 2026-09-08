@@ -830,6 +830,26 @@ test('stopHost is wired to the host-root cooperative Stop door', async () => {
     assert.equal(result.stop_outcomes[0].disposition, 'stopped');
 });
 
+test('getHostStopStatus reads caller-scoped host authority and live inventory', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        can_stop: true,
+        in_flight_count: 2,
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+
+    const result = await client.getHostStopStatus();
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop/status');
+    assert.equal(fetchFn.calls[0].options.method, undefined);
+    assert.equal(result.can_stop, true);
+    assert.equal(result.in_flight_count, 2);
+});
+
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
     const { client } = createClient({ fetchFn: createFetchQueue() });
 

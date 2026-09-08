@@ -2642,33 +2642,9 @@ export async function stopAgent(agentName) {
     // letting the turn run; that path is in renderQueuedChip.) Use
     // the map directly so we don't conjure a pane for an agent that
     // never had one.
-    const pane = deps().state.chatPanes.get(agentName);
-    if (pane) {
-        pane.queuedMessage = null;
-        clearQueuedChip(pane);
-    }
-
-    // The server-side turn may outlive the locally aborted response stream.
-    // Set this before abort() so the prior stream's microtask/finally cannot
-    // erase the only guard against opening an overlapping backend turn.
-    unconfirmedStopAgents().add(agentName);
-    refreshAgentThinkingDot(agentName);
-    if (agentName === deps().api.getHostAgent()) {
-        updateThinkingIndicator();
-    }
-
-    const abortController = deps().api.getStreamAbortController(agentName);
-    if (abortController) {
-        try { abortController.abort(); } catch (_) { /* noop */ }
-    }
-
+    const requestId = fenceLocalAgentStop(agentName);
     const retainedRequestIds = unconfirmedStopRequestIds();
     const retainedCorrelationIds = unconfirmedStopCorrelationIds();
-    let requestId = retainedRequestIds.get(agentName) || null;
-    if (!requestId) {
-        requestId = deps().api.getCurrentStreamRequestId(agentName);
-        if (requestId) retainedRequestIds.set(agentName, requestId);
-    }
     let correlationId = retainedCorrelationIds.get(agentName) || null;
     if (!correlationId) {
         correlationId = newChatRequestId();
@@ -2721,6 +2697,103 @@ export async function stopAgent(agentName) {
         updateThinkingIndicator();
     }
     return true;
+}
+
+/**
+ * Fence browser-owned work for one agent before cooperative Stop can yield.
+ * This performs no HTTP request and never touches process lifecycle.
+ */
+function fenceLocalAgentStop(agentName) {
+    const pane = deps().state.chatPanes.get(agentName);
+    if (pane) {
+        pane.queuedMessage = null;
+        clearQueuedChip(pane);
+    }
+
+    // The server-side turn may outlive the locally aborted response stream.
+    // Set this before abort() so the prior stream's microtask/finally cannot
+    // erase the only guard against opening an overlapping backend turn.
+    unconfirmedStopAgents().add(agentName);
+    refreshAgentThinkingDot(agentName);
+    if (agentName === deps().api.getHostAgent()) {
+        updateThinkingIndicator();
+    }
+
+    const abortController = deps().api.getStreamAbortController(agentName);
+    if (abortController) {
+        try { abortController.abort(); } catch (_) { /* noop */ }
+    }
+
+    const retainedRequestIds = unconfirmedStopRequestIds();
+    let requestId = retainedRequestIds.get(agentName) || null;
+    if (!requestId) {
+        requestId = deps().api.getCurrentStreamRequestId(agentName);
+        if (requestId) retainedRequestIds.set(agentName, requestId);
+    }
+    return requestId;
+}
+
+/**
+ * Fence every browser-owned stream and queued follow-up before Host Stop.
+ * Returns a settlement hook for the component to call with typed outcomes.
+ */
+export function prepareHostStop(items = []) {
+    const currentState = deps().state;
+    const localNames = new Set([
+        ...currentState.waitingAgents,
+        ...unconfirmedStopAgents(),
+    ]);
+
+    // A queue belongs to the work being stopped even if its stream has already
+    // left waitingAgents during the same event-loop turn. Clear all pane queues
+    // before the host request is allowed to yield.
+    for (const pane of currentState.chatPanes.values()) {
+        pane.queuedMessage = null;
+        clearQueuedChip(pane);
+    }
+    for (const name of localNames) fenceLocalAgentStop(name);
+
+    const addressToName = new Map();
+    for (const item of Array.isArray(items) ? items : []) {
+        if (!item || typeof item.name !== 'string' || !item.name) continue;
+        for (const address of [
+            item.name,
+            item.id,
+            item.raw && item.raw.id,
+            item.raw && item.raw.did,
+            item.raw && item.raw.routing_name,
+        ]) {
+            if (typeof address === 'string' && address) {
+                addressToName.set(address, item.name);
+            }
+        }
+    }
+
+    return (response) => {
+        const outcomes = Array.isArray(response && response.stop_outcomes)
+            ? response.stop_outcomes
+            : [];
+        const confirmedNames = new Set();
+        for (const outcome of outcomes) {
+            if (!outcome || !['stopped', 'already_complete'].includes(outcome.disposition)) {
+                continue;
+            }
+            for (const address of [outcome.agent_id, outcome.resolved_target]) {
+                const name = addressToName.get(address);
+                if (name) confirmedNames.add(name);
+            }
+        }
+        const retainedRequestIds = unconfirmedStopRequestIds();
+        for (const name of localNames) {
+            if (confirmedNames.has(name)) {
+                unconfirmedStopAgents().delete(name);
+                retainedRequestIds.delete(name);
+                currentState.waitingAgents.delete(name);
+            }
+            refreshAgentThinkingDot(name);
+        }
+        updateThinkingIndicator();
+    };
 }
 
 function newChatRequestId() {

@@ -1414,6 +1414,10 @@ export function createApiClient({
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload || {}),
         }),
+        // Read-only, caller-scoped inventory for the component-owned Stop All
+        // affordance. The server supplies both authority and the live host
+        // count; browser-local stream state is not a fleet inventory.
+        getHostStopStatus: () => client.requestHost('/api/host/stop/status'),
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);
