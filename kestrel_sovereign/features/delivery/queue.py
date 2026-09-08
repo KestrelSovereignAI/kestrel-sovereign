@@ -79,9 +79,20 @@ def _canonical_content_json(
     if not allow_string_fallback:
         _validate_json_value(content, path="content")
     try:
+        # Preserve the legacy unkeyed API's ``json.dumps(default=str)``
+        # acceptance before sorting. Sorting the caller's mapping directly
+        # rejects otherwise-supported mixtures such as string and integer
+        # keys because Python cannot order those key types. A JSON round trip
+        # first applies the encoder's historical key coercion and value
+        # fallback; the second pass can then produce a stable representation.
+        canonical_value = content
+        if allow_string_fallback:
+            canonical_value = json.loads(
+                json.dumps(content, default=str, allow_nan=True)
+            )
         return json.dumps(
-            content,
-            default=str if allow_string_fallback else None,
+            canonical_value,
+            default=None,
             allow_nan=allow_string_fallback,
             sort_keys=True,
             separators=(",", ":"),

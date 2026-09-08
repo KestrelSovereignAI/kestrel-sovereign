@@ -688,6 +688,25 @@ class TestQueueIdempotency:
         await database.close()
 
     @pytest.mark.asyncio
+    async def test_unkeyed_enqueue_preserves_mixed_json_key_compatibility(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+
+        entry_id = await queue.enqueue(
+            "email",
+            "mixed-keys@example.com",
+            {"nested": {1: "one", "2": "two"}},
+        )
+
+        assert entry_id
+        assert await queue.enqueue(
+            "email",
+            "mixed-keys@example.com",
+            {"nested": {"2": "two", 1: "one"}},
+        ) == entry_id
+
+    @pytest.mark.asyncio
     async def test_concurrent_replay_creates_one_row_and_one_delivery(
         self, real_queue
     ):
