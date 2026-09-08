@@ -171,27 +171,36 @@ class UvExecutor(BaseExecutor):
             return False
     
     def _get_uv_path(self) -> Optional[str]:
-        """Find the uv binary path."""
+        """Find the concrete uv executable rather than a host-only alias.
+
+        The Linux sandbox starts from an empty root.  Shell-visible uv paths
+        are commonly symlinks into a package-manager store (Homebrew,
+        Linuxbrew, Nix), so preserving the alias would leave the invoked path
+        absent even though its resolved target is mounted read-only.
+        """
         if self._cached_uv_path:
             return self._cached_uv_path
-        
-        if self._uv_path and os.path.exists(self._uv_path):
-            self._cached_uv_path = self._uv_path
-            return self._uv_path
-        
+
         # Try common locations
         candidates = [
+            self._uv_path,
             shutil.which("uv"),
             os.path.expanduser("~/.cargo/bin/uv"),
             "/usr/local/bin/uv",
             "/opt/homebrew/bin/uv",
         ]
-        
+
         for candidate in candidates:
-            if candidate and os.path.exists(candidate):
-                self._cached_uv_path = candidate
-                return candidate
-        
+            if not candidate:
+                continue
+            try:
+                resolved = Path(candidate).resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                self._cached_uv_path = str(resolved)
+                return self._cached_uv_path
+
         return None
 
     @staticmethod

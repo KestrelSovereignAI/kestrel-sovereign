@@ -12,7 +12,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import venv
 import zipfile
 from pathlib import Path
@@ -415,6 +414,24 @@ def test_uv_base_python_fails_closed_outside_supported_virtual_environment(
         UvExecutor._get_base_python_path()
 
     assert "Conda environment alone is not sufficient" in str(exc_info.value)
+
+
+def test_uv_path_resolves_package_manager_symlink_before_sandbox_mount(
+    tmp_path: Path,
+) -> None:
+    """The command invoked in bwrap must be the mounted executable target."""
+
+    installed_uv = tmp_path / "store" / "uv-1.2.3" / "bin" / "uv"
+    installed_uv.parent.mkdir(parents=True)
+    installed_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    installed_uv.chmod(0o755)
+    alias = tmp_path / "bin" / "uv"
+    alias.parent.mkdir()
+    alias.symlink_to(installed_uv)
+
+    executor = UvExecutor(uv_path=str(alias))
+
+    assert executor._get_uv_path() == str(installed_uv.resolve())
 
 
 def test_uv_macos_sandbox_rejects_preexisting_hard_link_aliases(
@@ -1724,6 +1741,18 @@ async def _capture_container_argv(
     calls: list[list[str]] = []
     contents: list[list[Path]] = []
 
+    async def snapshot_for_argv_test(source: str, destination: Path, **_kwargs) -> str:
+        return DockerExecutor._snapshot_working_directory(source, destination)
+
+    # This helper inspects Docker's container argv. The subprocess worker has
+    # its own lifecycle regression below, so perform the tiny fixture snapshot
+    # directly and leave the one captured subprocess slot for the container.
+    monkeypatch.setattr(
+        executor,
+        "_bounded_working_directory_snapshot",
+        snapshot_for_argv_test,
+    )
+
     async def create_subprocess(*args: object, **kwargs: object):
         calls.append([str(arg) for arg in args])
         contents.append(
@@ -2088,38 +2117,76 @@ def test_docker_snapshot_enforces_entry_budget(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_docker_snapshot_worker_copies_into_private_execution_root(
+    tmp_path: Path,
+) -> None:
+    """The real isolated worker publishes success and leaves no protocol file."""
+
+    source = tmp_path / "caller cwd"
+    source.mkdir()
+    (source / "input.txt").write_text("stable input", encoding="utf-8")
+    execution_root = tmp_path / "execution"
+    execution_root.mkdir()
+    destination = execution_root / "workspace"
+    executor = DockerExecutor()
+    loop = asyncio.get_running_loop()
+
+    result = await executor._bounded_working_directory_snapshot(
+        str(source),
+        destination,
+        deadline=loop.time() + 5,
+        subject_id="snapshot-success",
+        timeout_seconds=5,
+    )
+
+    assert result == str(destination)
+    assert (destination / "input.txt").read_text(encoding="utf-8") == "stable input"
+    assert not (execution_root / ".docker-snapshot-result.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_docker_snapshot_is_off_loop_and_deadline_bounded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Snapshot blocking I/O cannot monopolize the server event loop."""
+    """A stuck filesystem worker is killed without using the shared executor."""
 
     executor = DockerExecutor()
-    release = threading.Event()
+    process = _BlockingProcess()
+    commands: list[tuple[object, ...]] = []
+    options: list[dict[str, object]] = []
 
-    def blocked_snapshot(*_args, **_kwargs) -> str:
-        release.wait(timeout=0.5)
-        raise TimeoutError("simulated blocking snapshot")
+    async def create_subprocess(*args: object, **kwargs: object):
+        commands.append(args)
+        options.append(kwargs)
+        return process
 
-    monkeypatch.setattr(
-        executor,
-        "_snapshot_working_directory",
-        blocked_snapshot,
-    )
+    async def reject_shared_thread(*_args: object, **_kwargs: object):
+        raise AssertionError("snapshot entered asyncio's shared thread executor")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(asyncio, "to_thread", reject_shared_thread)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    try:
-        with pytest.raises(ExecutionTimeoutError):
-            await executor._bounded_working_directory_snapshot(
-                str(tmp_path),
-                tmp_path / "workspace",
-                deadline=loop.time() + 0.03,
-                subject_id="snapshot-timeout",
-                timeout_seconds=0.03,
-            )
-        assert loop.time() - started < 0.2
-    finally:
-        release.set()
+    with pytest.raises(ExecutionTimeoutError):
+        await executor._bounded_working_directory_snapshot(
+            str(tmp_path),
+            tmp_path / "workspace",
+            deadline=loop.time() + 0.03,
+            subject_id="snapshot-timeout",
+            timeout_seconds=0.03,
+        )
+
+    assert loop.time() - started < 0.2
+    assert commands[0][:4] == (
+        sys.executable,
+        "-I",
+        "-m",
+        docker_executor_module._SNAPSHOT_WORKER_MODULE,
+    )
+    assert options[0]["start_new_session"] is (os.name == "posix")
+    assert process.kill_calls >= 1
+    assert process.wait_calls >= 1
 
 
 @pytest.mark.asyncio
@@ -2173,6 +2240,21 @@ async def test_docker_working_directory_socket_never_reaches_container(
 ) -> None:
     executor = _make_executor(monkeypatch, "docker")
     launched = False
+
+    async def snapshot_for_socket_test(
+        source: str,
+        destination: Path,
+        **_kwargs,
+    ) -> str:
+        return DockerExecutor._snapshot_working_directory(source, destination)
+
+    # Keep this assertion focused on the descriptor traversal refusing the
+    # socket before Docker launch; worker teardown is covered independently.
+    monkeypatch.setattr(
+        executor,
+        "_bounded_working_directory_snapshot",
+        snapshot_for_socket_test,
+    )
 
     async def reject_launch(*_args: object, **_kwargs: object):
         nonlocal launched

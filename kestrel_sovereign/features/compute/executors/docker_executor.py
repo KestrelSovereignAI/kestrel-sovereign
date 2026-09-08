@@ -12,7 +12,7 @@ import shlex
 import shutil
 import stat
 import subprocess
-import threading
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -52,6 +52,9 @@ _DOCKER_CONTROL_REAP_TIMEOUT_SECONDS = 1.0
 _DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 _DEFAULT_MAX_SNAPSHOT_ENTRIES = 100_000
 _SNAPSHOT_COPY_CHUNK_BYTES = 1024 * 1024
+_SNAPSHOT_WORKER_MODULE = (
+    "kestrel_sovereign.features.compute.executors.docker_snapshot_worker"
+)
 _SNAPSHOT_DIRFD_SUPPORTED = (
     bool(getattr(os, "O_DIRECTORY", 0))
     and bool(getattr(os, "O_NOFOLLOW", 0))
@@ -280,7 +283,6 @@ class DockerExecutor(BaseExecutor):
         max_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
         max_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
         deadline: float | None = None,
-        cancelled: threading.Event | None = None,
     ) -> str:
         """Copy a host cwd into executor custody without importing live sockets.
 
@@ -334,8 +336,6 @@ class DockerExecutor(BaseExecutor):
 
         def check_limits(*, add_entry: bool = False, add_bytes: int = 0) -> None:
             nonlocal entries_copied, bytes_copied
-            if cancelled is not None and cancelled.is_set():
-                raise TimeoutError("Docker working directory snapshot was cancelled")
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Docker working directory snapshot timed out")
             if add_entry:
@@ -529,32 +529,87 @@ class DockerExecutor(BaseExecutor):
         subject_id: str,
         timeout_seconds: float,
     ) -> str:
-        """Copy a cwd off-loop under the execution's one overall deadline."""
+        """Copy a cwd in a killable child under the execution's deadline.
+
+        A thread cannot be stopped while a FUSE/NFS filesystem call is stuck in
+        the kernel, and a lingering ``asyncio.to_thread`` worker consumes the
+        shared executor and can delay loop shutdown.  The one-purpose child is
+        instead terminated and reaped through the same bounded process
+        lifecycle as script execution.
+        """
 
         loop = asyncio.get_running_loop()
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise ExecutionTimeoutError(subject_id, timeout_seconds)
-        cancelled = threading.Event()
+        worker_deadline = time.monotonic() + remaining
+        result_path = destination.parent / ".docker-snapshot-result.json"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            _SNAPSHOT_WORKER_MODULE,
+            source,
+            str(destination),
+            str(self._max_snapshot_bytes),
+            str(self._max_snapshot_entries),
+            repr(worker_deadline),
+            str(result_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._snapshot_working_directory,
-                    source,
-                    destination,
-                    max_bytes=self._max_snapshot_bytes,
-                    max_entries=self._max_snapshot_entries,
-                    deadline=time.monotonic() + remaining,
-                    cancelled=cancelled,
-                ),
-                timeout=remaining,
-            )
-        except TimeoutError:
-            cancelled.set()
-            raise ExecutionTimeoutError(subject_id, timeout_seconds) from None
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
+            try:
+                _stdout, stderr = await self._capture_process_output(
+                    process,
+                    timeout_seconds=remaining,
+                    terminate=lambda: self._kill_process_group(process),
+                )
+            except TimeoutError:
+                raise ExecutionTimeoutError(subject_id, timeout_seconds) from None
+
+            try:
+                payload = result_path.read_bytes()
+                if len(payload) > 64 * 1024:
+                    raise ValueError
+                response = json.loads(payload)
+            except (OSError, ValueError, json.JSONDecodeError):
+                diagnostic = stderr.content.decode("utf-8", errors="replace").strip()
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker failed without a "
+                    f"valid response{detail}"
+                ) from None
+            kind = response["kind"]
+            message = response["message"]
+            if not isinstance(kind, str) or not isinstance(message, str):
+                raise TypeError
+            if process.returncode == 0 and kind == "success" and destination.is_dir():
+                return str(destination)
+            if kind == "timeout":
+                raise ExecutionTimeoutError(subject_id, timeout_seconds)
+            if kind == "environment":
+                raise ExecutionEnvironmentError(message)
+            if kind == "success":
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker returned an "
+                    "invalid success response"
+                )
+            raise ExecutionEnvironmentError(message)
+        except (KeyError, TypeError):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot worker returned an invalid response"
+            ) from None
+        finally:
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove Docker snapshot worker result %s: %s",
+                    result_path,
+                    exc,
+                )
 
     async def _execute_script(
         self,
