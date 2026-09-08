@@ -18,7 +18,6 @@ from kestrel_sovereign.storage.schema_router import (
     ActionItemExtractor,
     DecisionExtractor,
     DECISION_NODE_TYPE,
-    PersonMatch,
     PersonResolver,
     SchemaRouter,
     extract_interaction_sentiment,
@@ -119,12 +118,20 @@ class TestInteractionSentiment:
 # =============================================================================
 
 
+def _concept_nodes(person_rows):
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    return [
+        GraphNode(node_id=node_id, node_type="concept", label=label, properties={})
+        for node_id, label in (person_rows or [])
+    ]
+
+
 def _make_mock_graph(person_rows=None):
-    """Build a mock graph with db.fetchall stubbed for person listing."""
-    graph = MagicMock()
-    graph.db = MagicMock()
-    graph.db.fetchall = AsyncMock(return_value=person_rows or [])
-    graph.db.execute = AsyncMock()
+    """Build a mock graph facade with the typed query stubbed for person
+    listing. No ``db``: the production facade refuses it (#3228)."""
+    graph = MagicMock(spec=["get_node", "get_nodes_by_type", "add_node", "add_edge", "get_edges"])
+    graph.get_nodes_by_type = AsyncMock(return_value=_concept_nodes(person_rows))
     graph.get_node = AsyncMock(return_value=None)
     graph.add_node = AsyncMock()
     graph.add_edge = AsyncMock()
@@ -408,7 +415,6 @@ class TestSchemaRouterOrchestration:
         """Regression guard: if get_node is called with the new action's id
         and the store has no such node, preservation must not accidentally
         inherit from some other action item."""
-        from kestrel_sovereign.storage.async_graph_store import GraphNode as GN
 
         async def _get_node(node_id):
             # Unrelated existing node with a different id
@@ -457,10 +463,10 @@ class TestSchemaRouterOrchestration:
     @pytest.mark.asyncio
     async def test_pending_person_match_surfaced_in_summary(self, router):
         # Two Alice concepts exist — mentioning "Alice" should flag pending.
-        router.graph.db.fetchall = AsyncMock(return_value=[
+        router.graph.get_nodes_by_type = AsyncMock(return_value=_concept_nodes([
             ("concept:agent-1:alice one", "Alice One"),
             ("concept:agent-1:alice two", "Alice Two"),
-        ])
+        ]))
         summary = await router.route(
             message_id="msg-6",
             content="Thanks so much Alice for everything.",
