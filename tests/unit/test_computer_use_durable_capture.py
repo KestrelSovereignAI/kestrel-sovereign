@@ -1574,27 +1574,42 @@ async def test_the_run_path_carries_truncation_into_the_record():
 
 
 @pytest.mark.asyncio
-async def test_a_command_that_reads_stdin_does_not_hang(workspace: Path, queue):
+async def test_the_child_does_not_inherit_this_process_stdin(tmp_path: Path):
     """Review round 5, and the trap this ticket's own text names. Stdin was
     inherited from the server, so a command that reads it waits for input no
     one will send — ``claude -p`` blocks forever on an inherited stdin, which
     the merge-gate doctrine spells ``</dev/null`` and which this surface
     cannot express, the redirect being shell grammar. The reviewer the
-    feature exists to run is the exact program that hangs."""
-    import asyncio as _a
+    feature exists to run is the exact program that hangs.
 
-    f = await _feature(workspace, queue)
+    The first version of this test just read stdin and expected ``''``, and
+    a mutant restoring the inheritance survived it: under pytest fd 0 is
+    already empty, so the assertion held either way. This one puts real bytes
+    on fd 0 for the duration, which makes inheritance observable — the child
+    would read them.
+    """
+    import os as _os
 
-    env = await _a.wait_for(
-        f.shell(
-            command="python3 -c \"import sys; print(repr(sys.stdin.read()))\"",
+    payload = b"SHOULD-NOT-REACH-THE-CHILD\n"
+    r_fd, w_fd = _os.pipe()
+    _os.write(w_fd, payload)
+    _os.close(w_fd)
+    saved = _os.dup(0)
+    try:
+        _os.dup2(r_fd, 0)
+        _os.close(r_fd)
+        result = await LocalSandboxBackend(GRANTS).exec(
+            ["python3", "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+            cwd=None,
+            env=None,
             timeout=30,
-        ),
-        timeout=20,
-    )
+        )
+    finally:
+        _os.dup2(saved, 0)
+        _os.close(saved)
 
-    assert env.status is ToolResultStatus.OK
-    assert env.data["stdout"].strip() == "''"
+    assert "SHOULD-NOT-REACH-THE-CHILD" not in result.stdout
+    assert result.stdout == ""
 
 
 @pytest.mark.asyncio
@@ -1765,3 +1780,37 @@ async def test_an_older_database_gains_the_columns(tmp_path: Path):
         columns = {row[1] for row in await cursor.fetchall()}
 
     assert {"stdout_truncated", "stderr_truncated"} <= columns
+
+
+@pytest.mark.asyncio
+async def test_fitting_keeps_a_usable_preview_rather_than_collapsing(
+    workspace: Path, queue
+):
+    """Surviving mutants: with the fail-closed minimal envelope in place,
+    deleting the shrink loop entirely still produced something under the cap
+    — so nothing failed, and the loop looked redundant. It is not: without
+    it every oversized capture drops straight to facts-only and the caller
+    loses the verdict they came for. Correctness was covered; QUALITY was
+    not, and that is what the loop buys."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    script = workspace / "quotes.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.write(chr(34) * 60000)\n"
+        "sys.stderr.write(chr(34) * 60000)\n"
+    )
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command=f"python3 {script}", capture_output=True, timeout=60
+    )
+
+    assert serialized_result_len(env) <= orchestrator_result_cap()
+    # Shrunk to fit, not abandoned: the loop should land on a preview worth
+    # reading rather than handing back the facts-only fallback.
+    assert len(env.data["stdout"]) > 500, len(env.data["stdout"])
+    assert env.data["stdout_path"], "fell through to the minimal envelope"
