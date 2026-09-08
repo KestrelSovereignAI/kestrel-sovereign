@@ -25,8 +25,12 @@ The assertions that pin the MATCH gate specifically are the websocket close
 code (1000 from the match gate, 1008 from dispatch) and the wrong-method
 requests to a refused path (404 from the match gate; a neutered match gate
 lets Starlette answer 405). Mutants that must fail this module:
-``_gated_matches`` returning Starlette's match unconditionally; the owner
-check dropped; the live-route check dropped.
+``_gated_matches`` returning Starlette's match unconditionally; its
+live-route check dropped; ``_resolve_live_route_agent`` rebinding with
+more than one survivor (``if survivors:``) or keeping a scoped agent the
+manager no longer lists (``return scoped_agent``). Its ``agent is None``
+guards are redundant with ``_live_feature_route(None, ...) -> None`` and
+are equivalent mutants: dropping one changes nothing observable.
 """
 
 import os
