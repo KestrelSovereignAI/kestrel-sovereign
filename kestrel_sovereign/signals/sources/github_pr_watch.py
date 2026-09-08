@@ -119,6 +119,25 @@ class PRWatchNetworkError(PRWatchError):
     """Network/transport failure (timeout, DNS, 5xx) — distinct from no-change."""
 
 
+class PRWatchRateLimitError(PRWatchNetworkError):
+    """An exhausted GitHub rate limit, which is *also* reported as 403.
+
+    A subclass of the network error rather than the auth one, and that is the
+    whole point: a rate limit clears on its own, so every ``except
+    PRWatchNetworkError`` already treats it correctly, while the permission
+    handling that degrades a rollup (:func:`fetch_check_rollup`) does not see
+    it at all. Collapsing the two is how a five-minute rate limit would settle
+    a wait terminally on half a rollup.
+
+    Measured 2026-09-08 — the response headers separate the two cleanly::
+
+        permission gap  403  x-accepted-github-permissions: checks=read
+                             x-ratelimit-remaining: 4999
+        primary limit   403  x-ratelimit-remaining: 0
+        secondary limit 403  retry-after: <seconds>
+    """
+
+
 # ---------------------------------------------------------------------------
 # Pure change-detection core
 # ---------------------------------------------------------------------------
@@ -562,15 +581,45 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
     }
 
 
+def _is_rate_limited(headers: Any) -> bool:
+    """Whether a 401/403 response is an exhausted rate limit, not a refusal.
+
+    GitHub reports both with the same status code, so the body's status alone
+    cannot tell them apart; the headers can. ``x-ratelimit-remaining: 0`` is
+    the primary limit and ``retry-after`` the secondary one, while a genuine
+    permission refusal arrives with the budget untouched (measured: 4999 of
+    5000 remaining) and an ``x-accepted-github-permissions`` header naming
+    what it wanted.
+
+    Absent headers read as *not* rate limited, which keeps the pre-existing
+    classification: an unrecognised 403 stays an auth error, as it was before
+    this discrimination existed.
+    """
+    if headers is None:
+        return False
+    try:
+        if str(headers.get("retry-after", "") or "").strip():
+            return True
+        return str(headers.get("x-ratelimit-remaining", "") or "").strip() == "0"
+    except Exception:  # pragma: no cover - defensive; headers are mapping-like
+        return False
+
+
 async def _github_get(
     url: str, *, token: str, timeout: int, ref: str
 ) -> Any:
     """GET + JSON-decode one GitHub API URL.
 
-    Raises :class:`PRWatchAuthError` on 401/403 and
-    :class:`PRWatchNetworkError` on any other transport/HTTP/parse failure so
+    Raises :class:`PRWatchAuthError` on a 401/403 the credential caused,
+    :class:`PRWatchRateLimitError` on a 401/403/429 the rate limit caused, and
+    :class:`PRWatchNetworkError` on any other transport/HTTP/parse failure, so
     the caller can report ``blocked: auth`` / ``blocked: network`` distinctly
     from a no-change poll. ``ref`` is only used to label errors.
+
+    The rate-limit split is load-bearing downstream: an auth error is what
+    :func:`fetch_check_rollup` degrades a rollup on, and degrading on a
+    transient would turn a five-minute limit into a terminal verdict read off
+    half the evidence.
     """
     req = urllib.request.Request(
         url,
@@ -587,6 +636,11 @@ async def _github_get(
     try:
         resp = await asyncio.to_thread(_do)
     except urllib.error.HTTPError as e:
+        headers = getattr(e, "headers", None)
+        if e.code == 429 or (e.code in (401, 403) and _is_rate_limited(headers)):
+            raise PRWatchRateLimitError(
+                f"GitHub rate limit hit ({e.code}) for {ref}"
+            ) from e
         if e.code in (401, 403):
             raise PRWatchAuthError(f"GitHub returned {e.code} for {ref}") from e
         raise PRWatchNetworkError(f"GitHub HTTP {e.code} for {ref}") from e
@@ -661,10 +715,15 @@ async def fetch_check_rollup(
     """Read ``head_sha``'s check evidence, degrading rather than going blind.
 
     Order matters. The Checks API is tried first because it is the complete
-    rollup. Only an *authorization* refusal (401/403) falls back — a network
-    error still propagates, because this module's auth/network distinction is
-    the difference between "a human must act" and "wait and it will clear",
-    and a fallback that swallowed transport failures would erase it.
+    rollup. Only an *authorization* refusal falls back — a network error still
+    propagates, because this module's auth/network distinction is the
+    difference between "a human must act" and "wait and it will clear", and a
+    fallback that swallowed transport failures would erase it. An exhausted
+    rate limit is reported by GitHub with the same 403 as a refusal, and
+    :func:`_github_get` separates the two by header before either reaches
+    here: a rate limit arrives as :class:`PRWatchRateLimitError`, is not
+    caught below, and leaves the wait pending instead of settling it on a
+    rollup that was merely throttled.
 
     The fallback exists because for a fine-grained personal access token the
     Checks refusal is permanent, not a misconfiguration: ``checks`` is a

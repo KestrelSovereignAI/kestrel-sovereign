@@ -424,3 +424,149 @@ async def test_fetch_pr_state_degrades_rather_than_blocking_the_whole_poll(
 
     assert "source=workflow_runs" in raw["checks_status"]
     assert "combined=success" in raw["checks_status"]
+
+
+# ---------------------------------------------------------------------------
+# GitHub reports an exhausted rate limit with the same 403 as a refusal
+# ---------------------------------------------------------------------------
+# Found by review, 2026-09-08. The fallback degrades a rollup on
+# PRWatchAuthError, and _github_get mapped EVERY 401/403 to that — so a rate
+# limit on the status request would mark statuses "unreadable", and a visible
+# success would then settle terminally PARTIAL off a rollup that was merely
+# throttled. Terminal-from-transient is the one conversion this module exists
+# to refuse. The response headers separate the two, measured the same day
+# against the live token:
+#
+#     permission gap   403  x-accepted-github-permissions: checks=read
+#                           x-ratelimit-remaining: 4999
+#     primary limit    403  x-ratelimit-remaining: 0
+#     secondary limit  403  retry-after: <seconds>
+
+import email.message
+import urllib.error
+import urllib.request
+
+from kestrel_sovereign.signals.sources.github_pr_watch import PRWatchRateLimitError
+
+
+def _http_error(code, **headers):
+    hdrs = email.message.Message()
+    for k, v in headers.items():
+        hdrs[k.replace("_", "-")] = v
+    return urllib.error.HTTPError("https://api.github.com/x", code, "err", hdrs, None)
+
+
+def _raise_from_urlopen(monkeypatch, exc):
+    """Patch the real transport, so the classification under test is the
+    production one rather than a fake that has already decided the answer."""
+    def fake_urlopen(req, timeout=None):
+        raise exc
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+@pytest.mark.asyncio
+async def test_a_primary_rate_limit_403_is_transient_not_a_permission_gap(monkeypatch):
+    _raise_from_urlopen(monkeypatch, _http_error(403, x_ratelimit_remaining="0"))
+
+    with pytest.raises(PRWatchRateLimitError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+    # Transient BY INHERITANCE: every existing `except PRWatchNetworkError`
+    # keeps waiting through it, and the degrade path never sees it.
+    assert isinstance(caught.value, PRWatchNetworkError)
+    assert not isinstance(caught.value, PRWatchAuthError)
+
+
+@pytest.mark.asyncio
+async def test_a_secondary_rate_limit_retry_after_is_transient(monkeypatch):
+    _raise_from_urlopen(monkeypatch, _http_error(403, retry_after="60"))
+
+    with pytest.raises(PRWatchRateLimitError):
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+
+@pytest.mark.asyncio
+async def test_a_429_is_transient(monkeypatch):
+    _raise_from_urlopen(monkeypatch, _http_error(429))
+
+    with pytest.raises(PRWatchRateLimitError):
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+
+@pytest.mark.asyncio
+async def test_a_real_permission_403_is_still_an_auth_error(monkeypatch):
+    """Control, with the exact headers the live token returns. If this became
+    a rate-limit error the fallback would never fire at all."""
+    _raise_from_urlopen(monkeypatch, _http_error(
+        403,
+        x_accepted_github_permissions="checks=read",
+        x_ratelimit_limit="5000",
+        x_ratelimit_remaining="4999",
+    ))
+
+    with pytest.raises(PRWatchAuthError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+    assert not isinstance(caught.value, PRWatchRateLimitError)
+
+
+@pytest.mark.asyncio
+async def test_a_403_with_no_rate_limit_headers_keeps_its_old_classification(
+    monkeypatch,
+):
+    """An unrecognised 403 must not drift into the transient class just
+    because a discrimination was added around it."""
+    _raise_from_urlopen(monkeypatch, _http_error(403))
+
+    with pytest.raises(PRWatchAuthError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+    assert not isinstance(caught.value, PRWatchRateLimitError)
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limited_status_does_not_degrade_the_rollup(monkeypatch):
+    """The finding itself. A throttled status request must propagate, not
+    come back as an "unreadable" gate class."""
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": {"total_count": 1, "check_runs": [GREEN_RUN]},
+        "/status": PRWatchRateLimitError("GitHub rate limit hit (403)"),
+    }))
+
+    with pytest.raises(PRWatchRateLimitError):
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limited_checks_read_does_not_trigger_the_fallback(monkeypatch):
+    """The same hazard on the other endpoint: falling back here would answer
+    off the Actions API and caveat a rollup that was never refused."""
+    seen: list = []
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchRateLimitError("GitHub rate limit hit (403)"),
+        "/actions/runs": {"total_count": 1, "workflow_runs": [GREEN_RUN]},
+        "/status": EMPTY_STATUS,
+    }, seen=seen))
+
+    with pytest.raises(PRWatchRateLimitError):
+        await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert not [u for u in seen if "/actions/runs" in u]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_poll_stays_pending_instead_of_settling_partial(
+    monkeypatch, _token
+):
+    """End to end, the scenario the review described: green checks plus a
+    throttled status request used to settle terminally PARTIAL. A wait must
+    keep waiting through a rate limit."""
+    st = await _poll(monkeypatch, {
+        "/pulls/": {"state": "open", "merged": False, "head": {"sha": SHA}},
+        "/check-runs": {"total_count": 1, "check_runs": [GREEN_RUN]},
+        "/status": PRWatchRateLimitError("GitHub rate limit hit (403)"),
+    })
+
+    assert st.outcome is Outcome.PENDING
+    assert st.data["blocked"] == "network"
+    assert "caveat" not in st.data
