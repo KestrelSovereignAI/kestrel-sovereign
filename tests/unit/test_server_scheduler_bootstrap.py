@@ -325,21 +325,44 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     from kestrel_sovereign.security import demo_isolation
 
     config_path = tmp_path / "multi_agent.toml"
-    config_path.write_text("[host]\nport = 8888\n")
-    fake_config = SimpleNamespace(
-        host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
+    root_config = ma_config.LocalAgentConfig(
+        data_dir=tmp_path / "root",
+        port=8898,
     )
-    effective_config = SimpleNamespace(
-        host=fake_config.host,
-        agents={"RecoveredChild": object()},
+    cold_root_config = ma_config.LocalAgentConfig(
+        data_dir=tmp_path / "cold-root",
+        port=8897,
+        autostart=False,
+    )
+    fake_config = ma_config.MultiAgentConfig(
+        agents={"Root": root_config, "ColdRoot": cold_root_config},
+    )
+    fake_config.host.port = 8888
+    fake_config.save(config_path)
+    effective_config = fake_config.model_copy(deep=True)
+    effective_config.agents["RecoveredChild"] = ma_config.LocalAgentConfig(
+        data_dir=tmp_path / "recovered-child",
+        port=8896,
     )
     events: list[str] = []
+    removal_resolution_started = asyncio.Event()
+    allow_removal_resolution = asyncio.Event()
 
     class _Manager:
         init_failures = []
 
+        def __init__(self) -> None:
+            self.created_agent_persistence_hook = None
+            self.created_agent_registration_removal_hook = None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
+
+        def set_created_agent_persistence_hook(self, hook) -> None:
+            self.created_agent_persistence_hook = hook
+
+        def set_created_agent_registration_removal_hook(self, hook) -> None:
+            self.created_agent_registration_removal_hook = hook
 
         def reconcile_spawn_authority_restart_roster(self, config):
             assert config is fake_config
@@ -360,8 +383,33 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             events.append("load")
             return 0
 
+        async def resolve_registered_agent_id(
+            self,
+            name,
+            agent_config,
+            *,
+            require_config_identity=False,
+        ) -> str:
+            if name == "Root":
+                assert require_config_identity is True
+                assert agent_config == root_config
+                return "did:test:root"
+            if name == "ColdRoot":
+                assert require_config_identity is True
+                assert agent_config == cold_root_config
+                return "did:test:cold-root"
+            assert require_config_identity is True
+            assert name == "PersistentChild"
+            assert agent_config.port == 8899
+            removal_resolution_started.set()
+            await allow_removal_resolution.wait()
+            return "did:test:persistent-child"
+
         def list_agents(self):
             return {}
+
+        async def shutdown_all(self) -> None:
+            return None
 
     manager = _Manager()
 
@@ -408,6 +456,87 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
 
     async with server._lifespan_startup(FastAPI()):
-        pass
+        child_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "persistent-child",
+            port=8899,
+        )
+        with pytest.raises(RuntimeError, match="restart-registered authority"):
+            await manager.created_agent_persistence_hook(
+                "Orphan",
+                child_config,
+                (("MissingParent", "did:test:missing-parent"),),
+            )
+        assert "Orphan" not in ma_config.MultiAgentConfig.from_file(
+            config_path
+        ).agents
+        with pytest.raises(RuntimeError, match="autostart"):
+            await manager.created_agent_persistence_hook(
+                "ColdOrphan",
+                child_config,
+                (("ColdRoot", "did:test:cold-root"),),
+            )
+        assert "ColdOrphan" not in ma_config.MultiAgentConfig.from_file(
+            config_path
+        ).agents
+        await manager.created_agent_persistence_hook(
+            "PersistentChild",
+            child_config,
+            (("Root", "did:test:root"),),
+        )
+        # The manager writes the exact child row before publication so a crash
+        # cannot leave a discoverable identity without desired startup state.
+        # The later feature-level durability commit must treat that row as the
+        # same transaction, not reject its own prepublication write.
+        await manager.created_agent_persistence_hook(
+            "PersistentChild",
+            child_config,
+            (("Root", "did:test:root"),),
+        )
+        removal_task = asyncio.create_task(
+            manager.created_agent_registration_removal_hook(
+                "PersistentChild",
+                "did:test:persistent-child",
+            )
+        )
+        await asyncio.wait_for(removal_resolution_started.wait(), timeout=1)
+        external_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "external-child",
+            port=8901,
+        )
+        externally_edited = ma_config.MultiAgentConfig.from_file(config_path)
+        externally_edited.agents["ExternalChild"] = external_config
+        externally_edited.save(config_path)
+        concurrent_config = ma_config.LocalAgentConfig(
+            data_dir=tmp_path / "concurrent-child",
+            port=8900,
+        )
+        concurrent_persist = asyncio.create_task(
+            manager.created_agent_persistence_hook(
+                "ConcurrentChild",
+                concurrent_config,
+                (("Root", "did:test:root"),),
+            )
+        )
+        await asyncio.sleep(0)
+        assert concurrent_persist.done() is False
+        allow_removal_resolution.set()
+        rollback = await removal_task
+        await concurrent_persist
+        assert "PersistentChild" not in ma_config.MultiAgentConfig.from_file(
+            config_path
+        ).agents
+        assert ma_config.MultiAgentConfig.from_file(config_path).agents[
+            "ConcurrentChild"
+        ] == concurrent_config
+        assert ma_config.MultiAgentConfig.from_file(config_path).agents[
+            "ExternalChild"
+        ] == external_config
+        await rollback()
+        restored = ma_config.MultiAgentConfig.from_file(config_path).agents
+        assert restored["PersistentChild"] == child_config
+        assert restored["ConcurrentChild"] == concurrent_config
+        assert restored["ExternalChild"] == external_config
 
     assert events == ["reconcile", "preflight", "load", "host-start"]
+    assert callable(manager.created_agent_persistence_hook)
+    assert callable(manager.created_agent_registration_removal_hook)
