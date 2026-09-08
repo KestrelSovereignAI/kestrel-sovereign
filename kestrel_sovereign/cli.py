@@ -7,6 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
+    kestrel stop <name>            # cooperatively stop one agent's work
+    kestrel stop --all             # cooperatively stop all in-flight work
     kestrel terminate              # terminate everything (agents first, then host)
     kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -2412,6 +2414,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
+        "stop": cmd_stop,
         "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,

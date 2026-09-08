@@ -2,7 +2,7 @@
 
 Stop is an andon cord for in-flight cognition.  It calls the authenticated
 agent/host Stop APIs and never enters the process lifecycle manager; process
-teardown is the separate ``kestrel shutdown`` command.
+teardown is the separate ``kestrel terminate`` command.
 """
 
 from __future__ import annotations

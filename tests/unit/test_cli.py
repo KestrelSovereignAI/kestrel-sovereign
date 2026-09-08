@@ -354,19 +354,17 @@ class TestCommandDispatch:
             main()
             mock.assert_called_once()
 
-    def test_process_termination_uses_reserved_terminate_command(self):
-        """Process signals may not remain reachable through `kestrel stop`."""
+    def test_cooperative_stop_does_not_dispatch_process_termination(self):
+        """The Stop command reaches only its cooperative HTTP handler."""
 
-        parser = build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["stop"])
-        with patch("sys.argv", ["kestrel", "terminate"]), patch(
+        with patch("sys.argv", ["kestrel", "stop", "Emma"]), patch(
+            "kestrel_sovereign.cli.cmd_stop", return_value=0
+        ) as stop, patch(
             "kestrel_sovereign.cli.cmd_terminate",
-            return_value=0,
-            create=True,
-        ) as terminate:
+            side_effect=AssertionError("process termination"),
+        ):
             main()
-        terminate.assert_called_once()
+        stop.assert_called_once()
 
     def test_dispatch_status(self):
         """'status' should dispatch to cmd_status."""
@@ -836,7 +834,7 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
     def test_an_unresolvable_bind_address_is_not_called_occupied(self):
         """A typo is a configuration fault, not another process holding a port.
 
-        Claiming occupancy would wedge `shutdown` into permanent failure; the bind
+        Claiming occupancy would wedge `terminate` into permanent failure; the bind
         error surfaces at `start`, where it names the address.
         """
         assert ProcessManager.is_port_in_use(

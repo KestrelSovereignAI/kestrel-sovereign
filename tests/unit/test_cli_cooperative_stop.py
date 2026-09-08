@@ -1,4 +1,4 @@
-"""CLI contract for cooperative Stop and separate process shutdown (#3160)."""
+"""CLI contract for cooperative Stop and separate process termination (#3160)."""
 
 import inspect
 from types import SimpleNamespace
@@ -33,7 +33,7 @@ def _outcome(disposition="stopped", *, receipt="receipt-1", agent="did:emma"):
     }
 
 
-def test_parser_separates_cooperative_stop_from_process_shutdown():
+def test_parser_separates_cooperative_stop_from_process_termination():
     stop = build_parser().parse_args(["stop", "Emma", "--reason", "andon"])
     assert stop.command == "stop"
     assert stop.name == "Emma"
@@ -43,10 +43,10 @@ def test_parser_separates_cooperative_stop_from_process_shutdown():
 
     fleet = build_parser().parse_args(["stop", "--all"])
     assert fleet.all is True
-    shutdown = build_parser().parse_args(["shutdown", "Emma", "--force"])
-    assert shutdown.command == "shutdown"
-    assert shutdown.name == "Emma"
-    assert shutdown.force is True
+    termination = build_parser().parse_args(["terminate", "Emma", "--force"])
+    assert termination.command == "terminate"
+    assert termination.name == "Emma"
+    assert termination.force is True
 
 
 def test_stop_requires_exactly_one_agent_or_all(capsys):
@@ -103,7 +103,7 @@ def test_cooperative_stop_module_has_no_process_mutation_door():
     assert "stop_agent(" not in source
     assert "kill_process(" not in source
     assert "terminate_agent(" not in source
-    assert "cmd_shutdown(" not in source
+    assert "cmd_terminate(" not in source
 
 
 def test_named_stop_posts_only_intent_and_prints_receipted_outcome(capsys):
@@ -220,15 +220,15 @@ def test_success_without_a_durable_receipt_is_nonzero(capsys):
     assert "stopped" in capsys.readouterr().out
 
 
-def test_restart_uses_process_shutdown_not_cooperative_stop():
+def test_restart_uses_process_termination_not_cooperative_stop():
     from kestrel_sovereign import cli
 
     args = SimpleNamespace(name=None, force=False, startup_timeout=30)
     with (
-        patch.object(cli, "cmd_shutdown", return_value=0) as shutdown,
+        patch.object(cli, "cmd_terminate", return_value=0) as terminate,
         patch.object(cli, "cmd_start", return_value=0) as start,
         patch.object(cli, "cmd_stop", side_effect=AssertionError("cooperative")),
     ):
         assert cli.cmd_restart(args) == 0
-    shutdown.assert_called_once_with(args)
+    terminate.assert_called_once_with(args)
     start.assert_called_once_with(args)

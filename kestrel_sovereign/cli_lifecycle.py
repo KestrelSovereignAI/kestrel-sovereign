@@ -1,6 +1,6 @@
 """Kestrel CLI — host/agent lifecycle commands.
 
-``start``, ``shutdown``, ``restart``, ``update``, ``status``, ``logs``. Extracted
+``start``, ``terminate``, ``restart``, ``update``, ``status``, ``logs``. Extracted
 from ``cli.py`` (#1678) following the ``cli_<group>.py`` convention. Shared,
 test-patched helpers (``_get_project_dir``, ``MultiAgentConfig``, and the
 ``update`` git/uv helpers patched via ``cli.<name>``) are reached through the
