@@ -773,3 +773,25 @@ async def test_a_body_only_throttle_does_not_degrade_the_rollup(monkeypatch):
         await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
 
     assert not isinstance(caught.value, PRWatchAuthError)
+
+
+@pytest.mark.asyncio
+async def test_legacy_statuses_alone_are_still_a_rollup(monkeypatch):
+    """Surviving mutant, round 5: nothing distinguished "no check evidence"
+    from "no CHECK-RUNS evidence". A repository whose gates report through
+    legacy commit statuses has a real rollup even with both check endpoints
+    refused, and hard-failing on it would blind the wait to CI it can see."""
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": {"state": "success", "total_count": 1,
+                    "statuses": [{"context": "buildkite", "state": "success"}]},
+    }))
+
+    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert rollup.unreadable == ("check-runs", "actions-runs")
+    assert rollup.complete is False
+    assert prw._check_verdict(rollup.check_runs, rollup.combined_status) == "success"
+    # Still caveated: a pass read this way is not an unqualified pass.
+    assert "all check runs" in rollup.caveat()
