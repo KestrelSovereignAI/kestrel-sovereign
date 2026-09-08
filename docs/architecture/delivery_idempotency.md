@@ -36,6 +36,8 @@ trigger.
 rows. Its age threshold is therefore also the completed-delivery replay-safety
 window: reuse after that retention period creates a new delivery. Dead-letter
 claims remain with their dead-letter record and move to the new canonical queue
-ID on explicit retry. Ordinary ledger deletion never deletes a live queue row;
-only a marker written by failed joined-transaction compensation invokes the
-SQLite cleanup trigger.
+ID on explicit retry. Retry atomically claims that record, preserves its stored
+payload representation and retry policy, and cannot create two live rows when
+operators race. Ordinary ledger deletion never deletes a live queue row; only a
+marker written by failed joined-transaction compensation invokes the SQLite
+cleanup trigger.

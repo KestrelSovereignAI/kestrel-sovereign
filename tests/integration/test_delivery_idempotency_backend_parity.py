@@ -111,6 +111,7 @@ async def test_delivery_idempotency_lifecycle_backend_parity(db_backend):
             "email",
             "dead@example.com",
             {"body": "dead"},
+            max_retries=11,
             idempotency_key="dead-letter-replay",
         )
         await queue.move_to_dead_letter(dead_id, "terminal")
@@ -119,13 +120,22 @@ async def test_delivery_idempotency_lifecycle_backend_parity(db_backend):
                 "email",
                 "dead@example.com",
                 {"body": "dead"},
+                max_retries=11,
                 idempotency_key="dead-letter-replay",
             )
-        retried = await queue.retry(dead_id)
+        retry_results = await asyncio.gather(*(queue.retry(dead_id) for _ in range(8)))
+        successful_retries = [result for result in retry_results if result["success"]]
+        assert len(successful_retries) == 1
+        retried = successful_retries[0]
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (retried["entry_id"], owner),
+        ) == (11,)
         assert await queue.enqueue(
             "email",
             "dead@example.com",
             {"body": "dead"},
+            max_retries=11,
             idempotency_key="dead-letter-replay",
         ) == retried["entry_id"]
 

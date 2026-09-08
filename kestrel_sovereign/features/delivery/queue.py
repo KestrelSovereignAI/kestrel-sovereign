@@ -299,6 +299,7 @@ class DeliveryQueue:
             content, allow_string_fallback=True
         )
         content_hash = QueueEntry.compute_content_hash(recipient, canonical_content)
+        legacy_content_hash = QueueEntry.compute_content_hash(recipient, content_json)
 
         # Deduplication check
         dedup_cutoff = (
@@ -308,10 +309,16 @@ class DeliveryQueue:
         existing = await self._db.fetchone(
             """
             SELECT id FROM delivery_queue
-            WHERE agent_id = ? AND content_hash = ? AND recipient = ?
+            WHERE agent_id = ? AND content_hash IN (?, ?) AND recipient = ?
                   AND created_at >= ?
             """,
-            (self._agent_id, content_hash, recipient, dedup_cutoff),
+            (
+                self._agent_id,
+                content_hash,
+                legacy_content_hash,
+                recipient,
+                dedup_cutoff,
+            ),
         )
         if existing:
             logger.debug("Deduplicated delivery entry: %s", existing[0])
@@ -388,6 +395,9 @@ class DeliveryQueue:
         candidate_id = entry_id
         now_iso = datetime.now(timezone.utc).isoformat()
         content_hash = QueueEntry.compute_content_hash(recipient, content_json)
+        legacy_content_hash = QueueEntry.compute_content_hash(
+            recipient, json.dumps(content, default=str)
+        )
         dedup_cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=DEDUP_WINDOW_SECONDS)
         ).isoformat()
@@ -403,10 +413,17 @@ class DeliveryQueue:
                     deduplicated = await self._db.fetchone(
                         """
                         SELECT id FROM delivery_queue
-                        WHERE agent_id = ? AND content_hash = ? AND recipient = ?
+                        WHERE agent_id = ? AND content_hash IN (?, ?)
+                              AND recipient = ?
                               AND created_at >= ?
                         """,
-                        (self._agent_id, content_hash, recipient, dedup_cutoff),
+                        (
+                            self._agent_id,
+                            content_hash,
+                            legacy_content_hash,
+                            recipient,
+                            dedup_cutoff,
+                        ),
                     )
                     # Always claim with a fresh unguessable candidate. That lets
                     # ambiguous INSERT completion compensate by exact entry ID
@@ -669,30 +686,36 @@ class DeliveryQueue:
             )
             return {"success": True, "entry_id": entry_id, "status": "queued_for_retry"}
 
-        # Check dead letter queue
-        dl_row = await self._db.fetchone(
-            """
-            SELECT id, original_id, agent_id, channel_type, recipient,
-                   content_json, error, attempts, created_at
-            FROM delivery_dead_letter
-            WHERE (id = ? OR original_id = ?) AND agent_id = ?
-            """,
-            (entry_id, entry_id, self._agent_id),
-        )
-
-        if dl_row:
-            # Re-enqueue from dead letter
-            now_iso = datetime.now(timezone.utc).isoformat()
-            new_id = str(uuid.uuid4())
-            content = json.loads(dl_row[5]) if dl_row[5] else {}
-            canonical_content = _canonical_content_json(
-                content, allow_string_fallback=False
-            )
-            content_hash = QueueEntry.compute_content_hash(
-                dl_row[4], canonical_content
+        # Claim and consume a dead-letter row in the same transaction. Keeping
+        # the SELECT inside the writer transaction ensures concurrent operators
+        # cannot each recreate the same logical delivery.
+        async with self._db.transaction(immediate=True):
+            dl_row = await self._db.fetchone(
+                """
+                SELECT id, original_id, agent_id, channel_type, recipient,
+                       content_json, error, attempts, created_at, max_retries
+                FROM delivery_dead_letter
+                WHERE (id = ? OR original_id = ?) AND agent_id = ?
+                """,
+                (entry_id, entry_id, self._agent_id),
             )
 
-            async with self._db.transaction(immediate=True):
+            if dl_row:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                new_id = str(uuid.uuid4())
+                # Hash the already-persisted representation. This preserves the
+                # legacy unkeyed contract, including non-finite floats and
+                # values serialized through ``default=str``.
+                content_hash = QueueEntry.compute_content_hash(dl_row[4], dl_row[5])
+                claimed = await self._db.execute(
+                    "DELETE FROM delivery_dead_letter WHERE id = ? AND agent_id = ?",
+                    (dl_row[0], self._agent_id),
+                )
+                if claimed == 0:
+                    return {
+                        "success": False,
+                        "error": "Message was already retried",
+                    }
                 await self._db.execute(
                     """
                     INSERT INTO delivery_queue
@@ -709,7 +732,7 @@ class DeliveryQueue:
                         dl_row[5],  # content_json
                         content_hash,
                         DeliveryStatus.PENDING.value,
-                        self._max_retries,
+                        dl_row[9],  # preserve the original entry retry policy
                         now_iso,  # next_retry_at
                         now_iso,  # created_at
                     ),
@@ -723,17 +746,12 @@ class DeliveryQueue:
                     """,
                     (new_id, now_iso, self._agent_id, dl_row[1]),
                 )
-                await self._db.execute(
-                    "DELETE FROM delivery_dead_letter WHERE id = ? AND agent_id = ?",
-                    (dl_row[0], self._agent_id),
-                )
-
-            return {
-                "success": True,
-                "entry_id": new_id,
-                "original_id": dl_row[1],
-                "status": "re-enqueued_from_dead_letter",
-            }
+                return {
+                    "success": True,
+                    "entry_id": new_id,
+                    "original_id": dl_row[1],
+                    "status": "re-enqueued_from_dead_letter",
+                }
 
         return {"success": False, "error": f"Entry {entry_id} not found"}
 
@@ -747,7 +765,7 @@ class DeliveryQueue:
         row = await self._db.fetchone(
             """
             SELECT id, agent_id, channel_type, recipient, content_json,
-                   attempts, created_at
+                   attempts, created_at, max_retries
             FROM delivery_queue
             WHERE id = ? AND agent_id = ?
             """,
@@ -764,8 +782,8 @@ class DeliveryQueue:
             """
             INSERT INTO delivery_dead_letter
                 (id, original_id, agent_id, channel_type, recipient,
-                 content_json, error, attempts, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 content_json, error, attempts, created_at, max_retries)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dl_id,
@@ -777,6 +795,7 @@ class DeliveryQueue:
                 reason,
                 row[5],       # attempts
                 now_iso,
+                row[7],       # max_retries
             ),
         )
 
@@ -1184,9 +1203,10 @@ class DeliveryQueue:
             )
             """
         )
-        if not await self._db.column_exists(
+        needs_v3_upgrade = not await self._db.column_exists(
             "delivery_idempotency", "compensating"
-        ):
+        )
+        if needs_v3_upgrade:
             await self._db.execute(
                 """
                 ALTER TABLE delivery_idempotency
@@ -1200,9 +1220,14 @@ class DeliveryQueue:
             await self._db.execute(
                 "DROP TRIGGER IF EXISTS trg_delivery_idempotency_delete"
             )
-        await self._db.execute(
-            "DROP INDEX IF EXISTS idx_delivery_idempotency_entry"
-        )
+        if needs_v3_upgrade:
+            # v2 declared this mapping UNIQUE. v3 deliberately permits several
+            # replay keys to adopt one short-window dedup row. The marker column
+            # is the durable one-time migration boundary, so ordinary startups
+            # never rebuild this potentially large index.
+            await self._db.execute(
+                "DROP INDEX IF EXISTS idx_delivery_idempotency_entry"
+            )
         await self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_entry
@@ -1243,10 +1268,20 @@ class DeliveryQueue:
                 content_json TEXT NOT NULL DEFAULT '{}',
                 error TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                max_retries INTEGER NOT NULL DEFAULT 5
             )
             """
         )
+        if not await self._db.column_exists(
+            "delivery_dead_letter", "max_retries"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter
+                ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 5
+                """
+            )
         await self._db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_dead_letter_agent

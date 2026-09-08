@@ -119,11 +119,23 @@ def _make_dead_letter_row(
     error="Connection refused",
     attempts=5,
     created_at=None,
+    max_retries=5,
 ):
     """Create a mock dead letter row tuple."""
     if created_at is None:
         created_at = datetime.now(timezone.utc).isoformat()
-    return (dl_id, original_id, agent_id, channel_type, recipient, content_json, error, attempts, created_at)
+    return (
+        dl_id,
+        original_id,
+        agent_id,
+        channel_type,
+        recipient,
+        content_json,
+        error,
+        attempts,
+        created_at,
+        max_retries,
+    )
 
 
 # =========================================================================
@@ -559,9 +571,10 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 5 indexes + 2 v2 cleanup statements + the scoped
-        # SQLite atomic-compensation trigger.
-        assert queue._db.execute.call_count == 11
+        # 3 tables + 5 indexes + the one-time v2 trigger cleanup + the scoped
+        # SQLite atomic-compensation trigger. The v2 index is not rebuilt on an
+        # already-v3 schema.
+        assert queue._db.execute.call_count == 10
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -947,6 +960,63 @@ class TestQueueIdempotency:
         assert "idx_delivery_idempotency_retention" in names
 
     @pytest.mark.asyncio
+    async def test_v3_schema_does_not_rebuild_replay_index(self, real_queue):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+
+        with patch.object(queue._db, "execute", wraps=original_execute) as execute:
+            await queue._ensure_tables()
+
+        sql = "\n".join(call.args[0] for call in execute.call_args_list)
+        assert "DROP INDEX IF EXISTS idx_delivery_idempotency_entry" not in sql
+
+    @pytest.mark.asyncio
+    async def test_v2_unique_replay_index_is_replaced_once(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "delivery-v2.db"))
+        try:
+            await database.execute(
+                """
+                CREATE TABLE delivery_idempotency (
+                    agent_id TEXT NOT NULL,
+                    idempotency_key_digest TEXT NOT NULL,
+                    entry_id TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, idempotency_key_digest)
+                )
+                """
+            )
+            await database.execute(
+                """
+                CREATE UNIQUE INDEX idx_delivery_idempotency_entry
+                ON delivery_idempotency(agent_id, entry_id)
+                """
+            )
+
+            queue = DeliveryQueue(database, "did:test:v2-upgrade")
+            await queue._ensure_tables()
+            indexes = await database.fetchall(
+                "PRAGMA index_list('delivery_idempotency')"
+            )
+            replay_index = next(
+                row for row in indexes if row[1] == "idx_delivery_idempotency_entry"
+            )
+
+            assert replay_index[2] == 0
+            assert await database.column_exists(
+                "delivery_idempotency", "compensating"
+            )
+
+            with patch.object(database, "execute", wraps=database.execute) as execute:
+                await queue._ensure_tables()
+            sql = "\n".join(call.args[0] for call in execute.call_args_list)
+            assert "DROP INDEX IF EXISTS idx_delivery_idempotency_entry" not in sql
+        finally:
+            await database.close()
+
+    @pytest.mark.asyncio
     async def test_queue_insert_failure_rolls_back_idempotency_claim(self, real_queue):
         queue, _ = real_queue
         await queue._db.execute(
@@ -1196,6 +1266,54 @@ class TestQueueIdempotency:
         assert ledger == (retried["entry_id"],)
 
     @pytest.mark.asyncio
+    async def test_dead_letter_retry_preserves_policy_and_legacy_json(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "legacy@example.com",
+            {"score": float("nan")},
+            max_retries=11,
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == (11,)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_dead_letter_retry_creates_one_live_row(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "retry-race@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-race",
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        results = await asyncio.gather(*(queue.retry(original_id) for _ in range(8)))
+
+        successes = [result for result in results if result["success"]]
+        assert len(successes) == 1
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_queue
+            WHERE agent_id = ? AND recipient = ?
+            """,
+            (queue._agent_id, "retry-race@example.com"),
+        ) == (1,)
+        assert await queue.enqueue(
+            "email",
+            "retry-race@example.com",
+            {"body": "hello"},
+            idempotency_key="retry-race",
+        ) == successes[0]["entry_id"]
+
+    @pytest.mark.asyncio
     async def test_delivered_purge_expires_replay_claim(self, real_queue):
         queue, _ = real_queue
         request = {
@@ -1307,6 +1425,41 @@ class TestQueueIdempotency:
             {"body": "world", "subject": "hello"},
         )
         assert plain_after == keyed_id
+
+    @pytest.mark.asyncio
+    async def test_pre_upgrade_legacy_hash_still_deduplicates(self, real_queue):
+        queue, _ = real_queue
+        entry_id = "pre-upgrade-entry"
+        content = {"subject": "hello", "body": "world"}
+        content_json = json.dumps(content, default=str)
+        legacy_hash = QueueEntry.compute_content_hash(
+            "legacy-hash@example.com", content_json
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, status, attempts, max_retries,
+                 next_retry_at, last_error, created_at, delivered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 5, ?, NULL, ?, NULL)
+            """,
+            (
+                entry_id,
+                queue._agent_id,
+                "email",
+                "legacy-hash@example.com",
+                content_json,
+                legacy_hash,
+                DeliveryStatus.PENDING.value,
+                now,
+                now,
+            ),
+        )
+
+        assert await queue.enqueue(
+            "email", "legacy-hash@example.com", content
+        ) == entry_id
 
     def test_unrelated_exception_context_is_not_reported_as_conflict(self):
         try:
@@ -1431,6 +1584,7 @@ class TestQueueProcessPending:
             "entry-1", "did:test:delivery-agent", "webhook",
             "https://example.com/hook", '{"text": "hello"}', 5,
             datetime.now(timezone.utc).isoformat(),
+            5,
         ))
 
         deliver_fn = AsyncMock(return_value=DeliveryResult(success=False, error="permanent failure"))
@@ -1517,6 +1671,18 @@ class TestQueueRetry:
         assert any("DELETE FROM delivery_dead_letter" in str(c) for c in execute_calls)
 
     @pytest.mark.asyncio
+    async def test_lost_dead_letter_claim_does_not_insert(self, queue):
+        dl_row = _make_dead_letter_row(dl_id="dl-1", original_id="e1")
+        queue._db.fetchone = AsyncMock(side_effect=[None, dl_row])
+        queue._db.execute = AsyncMock(return_value=0)
+
+        result = await queue.retry("e1")
+
+        assert result == {"success": False, "error": "Message was already retried"}
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "INSERT INTO delivery_queue" not in sql
+
+    @pytest.mark.asyncio
     async def test_retry_not_found(self, queue):
         queue._db.fetchone = AsyncMock(return_value=None)
 
@@ -1538,6 +1704,7 @@ class TestMoveToDeadLetter:
             "e1", "did:test:delivery-agent", "webhook",
             "http://example.com", '{"msg": "hi"}', 5,
             datetime.now(timezone.utc).isoformat(),
+            5,
         ))
 
         await queue.move_to_dead_letter("e1", "Max retries exceeded")
