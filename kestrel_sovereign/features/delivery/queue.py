@@ -929,7 +929,7 @@ class DeliveryQueue:
                     """
                     SELECT id, original_id, agent_id, channel_type, recipient,
                            content_json, error, attempts, created_at, max_retries,
-                           retry_entry_id
+                           retry_entry_id, legacy_content_hash
                     FROM delivery_dead_letter
                     WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
                           AND agent_id = ?
@@ -962,9 +962,10 @@ class DeliveryQueue:
             if dl_row is not None:
                 now_iso = datetime.now(timezone.utc).isoformat()
                 new_id = dl_row[10] or str(uuid.uuid4())
-                legacy_hash, canonical_hash = _persisted_content_hashes(
+                computed_legacy_hash, canonical_hash = _persisted_content_hashes(
                     dl_row[4], dl_row[5]
                 )
+                legacy_hash = dl_row[11] or computed_legacy_hash
                 await self._db.execute(
                     """
                     UPDATE delivery_dead_letter SET retry_entry_id = ?
@@ -1096,7 +1097,7 @@ class DeliveryQueue:
             row = await self._db.fetchone(
                 """
                 SELECT id, agent_id, channel_type, recipient, content_json,
-                       attempts, created_at, max_retries
+                       attempts, created_at, max_retries, content_hash
                 FROM delivery_queue
                 WHERE id = ? AND agent_id = ?
                 """,
@@ -1118,8 +1119,9 @@ class DeliveryQueue:
                     """
                     INSERT INTO delivery_dead_letter
                         (id, original_id, agent_id, channel_type, recipient,
-                         content_json, error, attempts, created_at, max_retries)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         content_json, error, attempts, created_at, max_retries,
+                         legacy_content_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
@@ -1132,6 +1134,7 @@ class DeliveryQueue:
                         row[5],
                         datetime.now(timezone.utc).isoformat(),
                         row[7],
+                        row[8],
                     ),
                 )
 
@@ -1706,7 +1709,8 @@ class DeliveryQueue:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 max_retries INTEGER,
-                retry_entry_id TEXT
+                retry_entry_id TEXT,
+                legacy_content_hash TEXT
             )
             """
         )
@@ -1726,6 +1730,15 @@ class DeliveryQueue:
                 """
                 ALTER TABLE delivery_dead_letter
                 ADD COLUMN retry_entry_id TEXT
+                """
+            )
+        if not await self._db.column_exists(
+            "delivery_dead_letter", "legacy_content_hash"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter
+                ADD COLUMN legacy_content_hash TEXT
                 """
             )
         await self._db.execute(

@@ -50,7 +50,8 @@ rows in bounded 500-row batches. Its age threshold is therefore also the complet
 window: reuse after that retention period creates a new delivery. Dead-letter
 claims remain with their dead-letter record and move to the new canonical queue
 ID on explicit retry. Retry locks that record, records a resumable candidate ID,
-preserves its stored payload representation and retry policy, and deletes the
+preserves its stored payload representation, rolling-writer compatibility hash,
+and retry policy, and deletes the
 dead letter only after the live row and replay mapping exist. This prevents both
 payload loss in joined SQLite transactions and duplicate live rows when
 operators race. Purge removes delivered rows before their replay claims, so a

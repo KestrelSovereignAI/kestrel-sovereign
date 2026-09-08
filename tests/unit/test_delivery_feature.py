@@ -121,6 +121,7 @@ def _make_dead_letter_row(
     created_at=None,
     max_retries=5,
     retry_entry_id=None,
+    legacy_content_hash=None,
 ):
     """Create a mock dead letter row tuple."""
     if created_at is None:
@@ -137,6 +138,7 @@ def _make_dead_letter_row(
         created_at,
         max_retries,
         retry_entry_id,
+        legacy_content_hash,
     )
 
 
@@ -1619,6 +1621,36 @@ class TestQueueIdempotency:
         ) == (11,)
 
     @pytest.mark.asyncio
+    async def test_dead_letter_retry_preserves_rolling_writer_legacy_hash(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        payload = {"z": 1, "a": 2}
+        original_id = await queue.enqueue(
+            "email",
+            "rolling-hash@example.com",
+            payload,
+            idempotency_key="rolling-hash",
+        )
+        original_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (original_id,)
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == original_hash
+        # An older rolling writer hashes its insertion-order JSON and must
+        # still adopt the retry row rather than creating a second delivery.
+        assert await queue.enqueue(
+            "email", "rolling-hash@example.com", payload
+        ) == retried["entry_id"]
+
+    @pytest.mark.asyncio
     async def test_concurrent_dead_letter_retry_creates_one_live_row(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
@@ -2354,6 +2386,7 @@ class TestQueueProcessPending:
             "https://example.com/hook", '{"text": "hello"}', 5,
             datetime.now(timezone.utc).isoformat(),
             5,
+            "abc123",
         )
         queue._db.fetchone = AsyncMock(side_effect=[dead_letter_source, None])
 
@@ -2478,6 +2511,7 @@ class TestMoveToDeadLetter:
             "http://example.com", '{"msg": "hi"}', 5,
             datetime.now(timezone.utc).isoformat(),
             5,
+            "abc123",
         )
         queue._db.fetchone = AsyncMock(side_effect=[row, None])
 

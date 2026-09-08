@@ -199,6 +199,50 @@ async def test_stale_claim_repair_preserves_effective_retry_policy(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_dead_letter_retry_preserves_legacy_content_hash(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-retry-hash:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+    payload = {"z": 1, "a": 2}
+
+    try:
+        original_id = await queue.enqueue(
+            "email",
+            "rolling-hash@example.com",
+            payload,
+            idempotency_key="rolling-hash",
+        )
+        original_hash = await database.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert await database.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (retried["entry_id"], owner),
+        ) == original_hash
+        assert await queue.enqueue(
+            "email", "rolling-hash@example.com", payload
+        ) == retried["entry_id"]
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_keyed_adoption_requires_matching_delivery_semantics(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-semantics:{uuid4().hex}"
