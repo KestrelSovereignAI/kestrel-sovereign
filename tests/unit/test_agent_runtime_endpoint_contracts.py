@@ -934,10 +934,9 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
     agent.sleep_hooks = [object()]
     agent.features = {"SchedulerFeature": scheduler}
     agent._raw_storage = SimpleNamespace(db=db)
-    # The reflection route reads ``agent_id`` first (its own inline
-    # resolution, outside #3246): a MagicMock without it would bind a
-    # fabricated attribute as a SQL parameter.
-    agent.agent_id = "did:test:agent"
+    # The reflection route scopes by the agent's DID through the shared
+    # guard (#3251); a MagicMock's fabricated ``did`` is refused.
+    agent.did = "did:test:agent"
 
     app, original = _prepare_app(agent)
     try:
@@ -1182,5 +1181,49 @@ def test_heartbeat_endpoints_cover_disabled_status_success_and_error_paths():
                 error_response = client.post("/api/agent/heartbeat/trigger", headers=_api_headers())
         assert error_response.status_code == 500
         assert error_response.json()["detail"] == "Error triggering heartbeat."
+    finally:
+        _restore_app(app, original)
+
+
+def test_reflection_status_scopes_execution_history_by_the_did_not_agent_id():
+    """#3251: the history read binds the agent's DID through the shared
+    guard; a differing ``agent_id`` must not reach the query."""
+    db = MagicMock()
+    db.fetchall = AsyncMock(return_value=[])
+    agent = MagicMock()
+    agent.sleep_hooks = []
+    agent.features = {}
+    agent._raw_storage = SimpleNamespace(db=db)
+    agent.did = "did:test:agent"
+    agent.agent_id = "display-id-not-a-did"
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/agent/reflection/status", headers=_api_headers())
+        assert response.status_code == 200
+        db.fetchall.assert_awaited_once()
+        assert db.fetchall.await_args.args[1] == ("did:test:agent",)
+    finally:
+        _restore_app(app, original)
+
+
+def test_reflection_status_refuses_without_a_did_before_reading_history():
+    db = MagicMock()
+    db.fetchall = AsyncMock(return_value=[])
+    agent = MagicMock()
+    agent.sleep_hooks = []
+    agent.features = {}
+    agent._raw_storage = SimpleNamespace(db=db)
+    agent.did = None
+    agent.agent_id = "display-id-not-a-did"
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/agent/reflection/status", headers=_api_headers())
+        assert response.status_code == 503
+        assert "durable identity" in response.json()["detail"]
+        db.fetchall.assert_not_awaited()
     finally:
         _restore_app(app, original)

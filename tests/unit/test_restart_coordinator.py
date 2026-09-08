@@ -6786,3 +6786,212 @@ async def test_a_lost_delivered_write_storms_but_never_claims_delivery(
         f"exactly one dispatch reached the ack path; the other two coalesced "
         f"without reaching it (see docstring). Got {len(lost)} warnings"
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-scoped reads route through the shared DID guard (#3251)
+# ---------------------------------------------------------------------------
+
+_SCOPE_DID = "did:test:scope-owner"
+_NOT_A_DID = "display-id-not-a-did"
+
+
+async def _scoped_feature(tmp_path, *, did=_SCOPE_DID):
+    """A feature whose agent's ``did`` and ``agent_id`` DIFFER (or whose
+    ``did`` is absent), so a site that reads the wrong field binds a value
+    the assertion can see."""
+    feat, backend = await _make_feature(tmp_path, did=_SCOPE_DID)
+    feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": did, "agent_id": _NOT_A_DID})
+    return feat, backend
+
+
+def _status_req():
+    return SimpleNamespace(
+        id="req-scope", requested_by_agent="", operation="restart_only",
+        urgency="normal", policy="idle_agents_only",
+    )
+
+
+@pytest.mark.asyncio
+async def test_grant_delegation_checks_the_subject_against_the_did(tmp_path):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc  # noqa: F401
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    granted = await feat.grant_restart_delegation(subject_agent_did=_SCOPE_DID, operation="restart_only")
+    assert granted.status is ToolResultStatus.OK, granted.error
+    # A well-formed DID that is not this agent's: the subject check compares
+    # against the guard's DID, so a site reading agent_id would accept it.
+    mismatched = await feat.grant_restart_delegation(subject_agent_did="did:test:someone-else", operation="restart_only")
+    assert mismatched.error and "must identify this agent" in mismatched.error
+
+
+@pytest.mark.asyncio
+async def test_grant_delegation_refuses_without_a_did(tmp_path):
+    from kestrel_sovereign.features.restart_coordinator.store import (
+        list_restart_delegations as stored_delegations,
+    )
+
+    feat, backend = await _scoped_feature(tmp_path, did=None)
+    result = await feat.grant_restart_delegation(subject_agent_did=_SCOPE_DID, operation="restart_only")
+    assert result.error and "durable identity" in result.error
+    assert result.data == {"created": False}
+    assert await stored_delegations(backend, subject_agent_did=_SCOPE_DID) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_request_restart_refuses_without_a_did_before_any_authority_work(tmp_path, did):
+    feat, backend = await _scoped_feature(tmp_path, did=did)
+    result = await feat.request_restart(reason="identity-less request")
+    assert result.error and "durable identity" in result.error
+    assert result.data == {"created": False}
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_request_restart_binds_the_did_not_agent_id(tmp_path):
+    feat, backend = await _scoped_feature(tmp_path)
+    result = await feat.request_restart(reason="scoped request")
+    assert result.status is ToolResultStatus.OK, result.error
+    rows = await list_requests(backend)
+    assert [row.requested_by_agent for row in rows] == [_SCOPE_DID]
+
+
+@pytest.mark.asyncio
+async def test_list_delegations_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    seen = []
+
+    async def fake_list(db, *, subject_agent_did):
+        seen.append(subject_agent_did)
+        return []
+
+    monkeypatch.setattr(rc, "list_restart_delegations", fake_list)
+    result = await feat.list_restart_delegations()
+    assert result.error is None, result.error
+    assert seen == [_SCOPE_DID]
+
+
+@pytest.mark.asyncio
+async def test_list_delegations_refuses_without_a_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=None)
+    called = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_restart_delegations", called)
+    result = await feat.list_restart_delegations()
+    assert result.error and "durable identity" in result.error
+    called.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_event_is_attributed_to_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    built = []
+    monkeypatch.setattr(rc, "build_restart_status_event", lambda req, **kw: built.append(kw) or {"state": kw["state"]})
+    recorded = AsyncMock()
+    monkeypatch.setattr(rc, "record_status_event", recorded)
+    feat._resolve_requesting_agent_name = lambda requester: ""
+    await feat._emit_status_event(_status_req(), state="pending")
+    assert [kw["agent_did"] for kw in built] == [_SCOPE_DID]
+    recorded.assert_awaited_once()
+    assert recorded.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+async def test_status_event_is_not_emitted_without_a_did(tmp_path, monkeypatch, caplog):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=None)
+    built = AsyncMock()
+    monkeypatch.setattr(rc, "build_restart_status_event", built)
+    recorded = AsyncMock()
+    monkeypatch.setattr(rc, "record_status_event", recorded)
+    with caplog.at_level("WARNING", logger="kestrel_sovereign.features.restart_coordinator.feature"):
+        await feat._emit_status_event(_status_req(), state="pending")
+    built.assert_not_called()
+    recorded.assert_not_awaited()
+    dropped = [r.getMessage() for r in caplog.records if "identity unavailable" in r.getMessage()]
+    assert dropped and "req-scope" in dropped[0], dropped
+
+
+@pytest.mark.asyncio
+async def test_interrupted_update_reset_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests", reader)
+    await feat._reset_interrupted_updates()
+    reader.assert_awaited_once()
+    assert reader.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_interrupted_update_reset_never_reads_with_an_empty_scope(tmp_path, monkeypatch, did):
+    """``list_requests`` omits the agent predicate for a falsy scope and would
+    read every agent's rows; the refusal must stand in front of it."""
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=did)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests", reader)
+    await feat._reset_interrupted_updates()
+    reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_restart_reap_scopes_by_the_did(tmp_path, monkeypatch):
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests_needing_wake", reader)
+    assert await feat._reap_post_restart_rows() == []
+    reader.assert_awaited_once()
+    assert reader.await_args.kwargs["agent_id"] == _SCOPE_DID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("did", [None, "", 7])
+async def test_post_restart_reap_never_reads_with_an_empty_scope(tmp_path, monkeypatch, did):
+    """``list_requests_needing_wake`` has the same truthiness gate; an empty
+    scope would sweep and wake every agent's rows."""
+    import kestrel_sovereign.features.restart_coordinator.feature as rc
+
+    feat, _backend = await _scoped_feature(tmp_path, did=did)
+    reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(rc, "list_requests_needing_wake", reader)
+    assert await feat._reap_post_restart_rows() == []
+    reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_requester_id_is_the_did_or_nothing(tmp_path):
+    feat, _backend = await _scoped_feature(tmp_path)
+    assert feat._agent_requester_id() == _SCOPE_DID
+    for did in (None, "", 7):
+        feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": did})
+        assert feat._agent_requester_id() is None
+
+
+@pytest.mark.asyncio
+async def test_request_readers_see_what_the_writer_wrote_for_a_padded_did(tmp_path):
+    """The requester read routes through the same guard as the writer, so
+    the two agree on the raw value. A whitespace-padded DID is the one
+    input on which the old stripping reader disagreed with the writer and
+    silently listed nothing."""
+    padded = f"  {_SCOPE_DID}  "
+    feat, backend = await _scoped_feature(tmp_path, did=padded)
+    written = await feat.request_restart(reason="padded requester")
+    assert written.status is ToolResultStatus.OK, written.error
+    assert [row.requested_by_agent for row in await list_requests(backend)] == [padded]
+    listed = await feat.list_restart_requests()
+    assert listed.status is ToolResultStatus.OK, listed.error
+    assert listed.data["count"] == 1
+    assert feat._agent_requester_id() == padded
