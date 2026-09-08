@@ -786,17 +786,18 @@ class DeliveryQueue:
         # caller committed the recoverable live+tombstone intermediate state.
         # Check and lock it before considering the main queue row.
         async with self._db.transaction(immediate=True):
-            locked = await self._db.execute(
-                """
-                UPDATE delivery_dead_letter SET id = id
-                WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
-                      AND agent_id = ?
-                """,
-                (entry_id, entry_id, entry_id, self._agent_id),
-            )
-            dl_row = None
-            if locked != 0:
-                dl_row = await self._db.fetchone(
+            async def lock_dead_letter():
+                locked = await self._db.execute(
+                    """
+                    UPDATE delivery_dead_letter SET id = id
+                    WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
+                          AND agent_id = ?
+                    """,
+                    (entry_id, entry_id, entry_id, self._agent_id),
+                )
+                if locked == 0:
+                    return None
+                return await self._db.fetchone(
                     """
                     SELECT id, original_id, agent_id, channel_type, recipient,
                            content_json, error, attempts, created_at, max_retries,
@@ -807,6 +808,28 @@ class DeliveryQueue:
                     """,
                     (entry_id, entry_id, entry_id, self._agent_id),
                 )
+
+            dl_row = await lock_dead_letter()
+            queue_locked = None
+            if dl_row is None:
+                # Lock the live row before deciding its status. A concurrent
+                # dead-letter move can win between the first tombstone miss and
+                # this lock attempt, so a missing live row requires one final
+                # tombstone check inside the same transaction.
+                queue_locked = await self._db.execute(
+                    """
+                    UPDATE delivery_queue SET id = id
+                    WHERE id = ? AND agent_id = ?
+                    """,
+                    (entry_id, self._agent_id),
+                )
+                if queue_locked == 0:
+                    dl_row = await lock_dead_letter()
+                    if dl_row is None:
+                        return {
+                            "success": False,
+                            "error": f"Entry {entry_id} not found or already retried",
+                        }
 
             if dl_row is not None:
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -851,7 +874,11 @@ class DeliveryQueue:
                         legacy_hash,
                         canonical_hash,
                         DeliveryStatus.PENDING.value,
-                        dl_row[9],  # preserve the original entry retry policy
+                        (
+                            dl_row[9]
+                            if dl_row[9] is not None
+                            else self._max_retries
+                        ),  # legacy rows fall back to this queue's policy
                         now_iso,  # next_retry_at
                         now_iso,  # created_at
                     ),
@@ -884,20 +911,6 @@ class DeliveryQueue:
                     "status": "re-enqueued_from_dead_letter",
                 }
 
-            # No dead-letter row exists. Lock the live row before deciding its
-            # status so concurrent retries cannot race this update.
-            queue_locked = await self._db.execute(
-                """
-                UPDATE delivery_queue SET id = id
-                WHERE id = ? AND agent_id = ?
-                """,
-                (entry_id, self._agent_id),
-            )
-            if queue_locked == 0:
-                return {
-                    "success": False,
-                    "error": f"Entry {entry_id} not found or already retried",
-                }
             row = await self._db.fetchone(
                 """
                 SELECT id, agent_id, channel_type, recipient, content_json,
@@ -1518,7 +1531,7 @@ class DeliveryQueue:
             await self._db.execute(
                 """
                 ALTER TABLE delivery_dead_letter
-                ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 5
+                ADD COLUMN max_retries INTEGER
                 """
             )
         if not await self._db.column_exists(
@@ -1534,5 +1547,17 @@ class DeliveryQueue:
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_dead_letter_agent
             ON delivery_dead_letter(agent_id, created_at DESC)
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_delivery_dead_letter_original
+            ON delivery_dead_letter(agent_id, original_id)
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_delivery_dead_letter_retry_entry
+            ON delivery_dead_letter(agent_id, retry_entry_id)
             """
         )

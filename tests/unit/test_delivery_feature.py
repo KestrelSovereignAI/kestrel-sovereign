@@ -576,7 +576,7 @@ class TestQueueTableCreation:
         # 3 tables + 5 indexes + the one-time v2 trigger cleanup + the scoped
         # SQLite atomic-compensation trigger. The v2 index is not rebuilt on an
         # already-v3 schema.
-        assert queue._db.execute.call_count == 12
+        assert queue._db.execute.call_count == 14
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -924,12 +924,71 @@ class TestQueueIdempotency:
         queue, _ = real_queue
 
         await queue._ensure_tables()
+
+        indexes = await queue._db.fetchall("PRAGMA index_list(delivery_dead_letter)")
+        names = {row[1] for row in indexes}
+        assert "idx_delivery_dead_letter_original" in names
+        assert "idx_delivery_dead_letter_retry_entry" in names
+
         await queue._ensure_tables()
 
         row = await queue._db.fetchone(
             "SELECT COUNT(*) FROM delivery_idempotency",
         )
         assert row == (0,)
+
+    @pytest.mark.asyncio
+    async def test_legacy_dead_letter_uses_configured_retry_policy(self, tmp_path):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(str(tmp_path / "legacy-dead-letter.db"))
+        await database.execute(
+            """
+            CREATE TABLE delivery_dead_letter (
+                id TEXT PRIMARY KEY,
+                original_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-dl",
+                "legacy-original",
+                "did:test:legacy-dead-letter",
+                "email",
+                "legacy@example.com",
+                '{"body":"hello"}',
+                "legacy failure",
+                4,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        queue = DeliveryQueue(
+            database, "did:test:legacy-dead-letter", max_retries=10
+        )
+        try:
+            await queue._ensure_tables()
+            retried = await queue.retry("legacy-original")
+            assert retried["success"] is True
+            assert await database.fetchone(
+                "SELECT max_retries FROM delivery_queue WHERE id = ?",
+                (retried["entry_id"],),
+            ) == (10,)
+        finally:
+            await database.close()
 
     @pytest.mark.asyncio
     async def test_v3_upgrade_removes_unscoped_v2_delete_trigger(self, real_queue):
@@ -1445,6 +1504,55 @@ class TestQueueIdempotency:
             {"body": "hello"},
             idempotency_key="retry-race",
         ) == successes[0]["entry_id"]
+
+    @pytest.mark.asyncio
+    async def test_retry_rechecks_dead_letter_after_live_row_race(self, real_queue):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+        inserted_tombstone = False
+
+        async def inject_winning_dead_letter_move(sql, params=()):
+            nonlocal inserted_tombstone
+            result = await original_execute(sql, params)
+            if (
+                "UPDATE delivery_queue SET id = id" in sql
+                and result == 0
+                and not inserted_tombstone
+            ):
+                inserted_tombstone = True
+                await original_execute(
+                    """
+                    INSERT INTO delivery_dead_letter
+                        (id, original_id, agent_id, channel_type, recipient,
+                         content_json, error, attempts, created_at, max_retries)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "late-dead-letter",
+                        "late-original",
+                        queue._agent_id,
+                        "email",
+                        "late@example.com",
+                        '{"body":"hello"}',
+                        "concurrent move",
+                        5,
+                        datetime.now(timezone.utc).isoformat(),
+                        7,
+                    ),
+                )
+            return result
+
+        with patch.object(
+            queue._db, "execute", side_effect=inject_winning_dead_letter_move
+        ):
+            retried = await queue.retry("late-original")
+
+        assert inserted_tombstone is True
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == (7,)
 
     @pytest.mark.asyncio
     async def test_failed_nested_dead_letter_retry_remains_resumable(
