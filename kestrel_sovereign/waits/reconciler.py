@@ -145,16 +145,18 @@ class WaitReconciler:
         # from that map is already a ``lost_at_restart`` soft-fail that never
         # reaches the visibility accounting.
         self._pending_signal_bindings: Dict[Tuple[str, str], bool] = {}
-        agent_id = (
-            getattr(agent, "did", None)
-            or getattr(agent, "agent_id", None)
-            or ""
-        )
+        # The wait-signal scope is the agent's DID through the shared guard.
+        # A missing identity refuses construction: an empty scope would bind
+        # this agent's transitions to the solo-agent legacy bucket and read
+        # them back as another agent's on a shared backend (#3251).
+        from kestrel_sovereign.features.storage_access import resolve_scoped_agent_did
+
+        agent_id = resolve_scoped_agent_did(agent)
         # The agent's AsyncDatabase lives behind _raw_storage.db (same path
         # PendingA2AQuestionStore is wired through in kestrel_agent.py).
         raw_storage = getattr(agent, "_raw_storage", None)
         db = getattr(raw_storage, "db", None)
-        self._store = WaitSignalStore(db, str(agent_id))
+        self._store = WaitSignalStore(db, agent_id)
         # Serialize reconcile ticks so the TWO drivers that can call this — the
         # scheduler's ``wait_reconcile`` cron AND the mandatory WaitFeature
         # fallback loop (#2729) — can never race on the shared

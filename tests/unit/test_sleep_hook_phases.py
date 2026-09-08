@@ -148,6 +148,7 @@ class _ReflectionDb:
 def _reflection_agent(hooks, rows=(), *, consolidation_result=None):
     agent = _Agent(hooks, consolidation_result=consolidation_result)
     agent.agent_id = "did:test:reflection-phase"
+    agent.did = "did:test:reflection-phase"
     agent.memory_system = _ReflectionMemory(_ReflectionDb(rows))
     return agent
 
@@ -816,6 +817,7 @@ async def test_overlapping_sleep_cycles_keep_reflection_attestations_cycle_scope
         def __init__(self, hook):
             super().__init__([hook])
             self.agent_id = "did:test:reflection-overlap"
+            self.did = "did:test:reflection-overlap"
             self.memory_system = _ReflectionMemory(_ReflectionDb(()))
             self.first_consolidation_started = asyncio.Event()
             self.release_first_consolidation = asyncio.Event()
