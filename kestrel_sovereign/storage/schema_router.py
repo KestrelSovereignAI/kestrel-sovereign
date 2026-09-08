@@ -151,6 +151,15 @@ def _is_person_node(node: Any) -> bool:
 
 
 class PersonResolver:
+    """Three-pass person resolution for a mention the linker already noded.
+
+    Pass 0 is a user-confirmed answer recorded on the mention's own node.
+    Pass 1 is an exact normalised-label match to a DIFFERENT node. Passes 2
+    and 3 (single first-name match, or several and therefore pending) run
+    only for a bare first-name mention: they compare first tokens, so a
+    full name that matched nothing exactly is a new person, never merged
+    into someone who shares the first name (#3259). Never silently merge.
+    """
     """Three-pass person concept resolution.
 
     Pass 1 — exact match on normalized name.
@@ -809,7 +818,11 @@ class SchemaRouter:
         message_node = f"message:{self.agent_id}:{message_id}"
         _person_categories = {"person", "proper_noun"}
         people = [c for c in concepts if c.category in _person_categories]
-        mentioned_nodes = {c.node_id for c in people}
+        # Every target this message will have an edge to: the people it
+        # names, plus each resolved person as its edge lands. add_edge
+        # upserts, so a second write to the same target is not a new edge
+        # and must not be counted as one.
+        written_targets = {c.node_id for c in people}
 
         # Resolve every person BEFORE writing any edge. A resolution that
         # raises then leaves nothing behind, and the caller's zero summary is
@@ -852,14 +865,12 @@ class SchemaRouter:
             # this edge a confirmed person stopped accumulating mentions after
             # the one confirmation (#3259).
             canonical = resolved.get(concept.node_id)
-            # A message that mentions both the label and the person it
-            # resolves to already wrote that edge above; add_edge upserts,
-            # so counting it again would overstate what is in the graph.
-            if canonical and canonical not in mentioned_nodes:
+            if canonical and canonical not in written_targets:
                 await self.graph.add_edge(
                     message_node, canonical, "mentions",
                     properties={**properties, "resolved_from": concept.label},
                 )
+                written_targets.add(canonical)
                 enriched_count += 1
                 if summary is not None:
                     summary["interactions"] = enriched_count

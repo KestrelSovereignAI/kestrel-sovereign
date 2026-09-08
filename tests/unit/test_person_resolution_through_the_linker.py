@@ -297,3 +297,23 @@ async def test_an_earlier_proper_noun_does_not_end_a_run(pipeline, text, people)
     """Review round 3 P2: only a keyword-classified word ends a run."""
     linker, router, _graph = pipeline
     assert (await _say(linker, router, "m1", text))[0] == people
+
+
+@pytest.mark.asyncio
+async def test_interactions_count_matches_the_edges_when_two_mentions_resolve_to_one_person(pipeline):
+    """Review round 4 P2: two mentions resolving to the same person are one
+    upserted edge, counted once."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    await _say(linker, router, "m2", "I saw Mike yesterday.")
+    feature = SimpleNamespace(agent=SimpleNamespace(storage=SimpleNamespace(graph=graph)), agent_id=AGENT)
+    confirm = getattr(MemoryFeature.confirm_person_match, "__wrapped__", MemoryFeature.confirm_person_match)
+    await confirm(feature, message_id="m2", mentioned_label="mike", concept_id=f"concept:{AGENT}:jon doe")
+    _people, summary = await _say(linker, router, "m3", "I saw Mike and Jon today.")
+    out = {e.target_id for e in await graph.get_edges(f"message:{AGENT}:m3", direction="out") if e.label == "mentions"}
+    assert out == {f"concept:{AGENT}:mike", f"concept:{AGENT}:jon", f"concept:{AGENT}:jon doe"}
+    assert summary["interactions"] == len(out)
