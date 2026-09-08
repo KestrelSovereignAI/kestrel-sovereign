@@ -22,6 +22,7 @@ from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    bind_async_invocation,
     invocation_scope,
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
@@ -66,6 +67,13 @@ class _RequestTurnAgent(RequestLifecycleMixin, TurnLifecycleMixin):
         self._active_request_counts = {}
         self._active_request_started_at = {}
         self._cancelled_requests = set()
+
+
+class _IsolatedRequestTurnAgent(_RequestTurnAgent):
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def process_input(self, invocation_id=None):
+        async with self._turn_lifecycle():
+            return "ok"
 
 
 class _HostContextStubAgent(_StubAgent):
@@ -408,11 +416,10 @@ async def test_turn_index_carries_the_exact_request_generation():
 
 
 @pytest.mark.asyncio
-async def test_turn_lifecycle_publishes_and_releases_durable_public_binding():
+async def test_turn_lifecycle_retains_durable_binding_until_request_settlement():
     agent = _RequestTurnAgent()
     registry = SimpleNamespace(
         bind_public_turn=AsyncMock(return_value=True),
-        unbind_public_turn=AsyncMock(return_value=None),
         complete_soon=MagicMock(),
     )
     agent._distributed_invocation_registry = registry
@@ -426,14 +433,8 @@ async def test_turn_lifecycle_publishes_and_releases_durable_public_binding():
                 "durable-turn-request",
                 generation,
             )
-            registry.unbind_public_turn.assert_not_awaited()
 
-    registry.unbind_public_turn.assert_awaited_once_with(
-        agent,
-        turn_id,
-        "durable-turn-request",
-        generation,
-    )
+    registry.bind_public_turn.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -441,7 +442,6 @@ async def test_turn_lifecycle_refuses_cognition_when_public_binding_is_fenced():
     agent = _RequestTurnAgent()
     registry = SimpleNamespace(
         bind_public_turn=AsyncMock(return_value=False),
-        unbind_public_turn=AsyncMock(return_value=None),
         complete_soon=MagicMock(),
     )
     agent._distributed_invocation_registry = registry
@@ -457,7 +457,15 @@ async def test_turn_lifecycle_refuses_cognition_when_public_binding_is_fenced():
     assert ("fenced-turn-request", generation) in (
         agent._cancelled_request_generations
     )
-    registry.unbind_public_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_isolated_invocation_preserves_committed_transition_authority():
+    agent = _IsolatedRequestTurnAgent()
+
+    async with agent.feature_config_transition():
+        with agent.committed_feature_transition_cognition():
+            assert await agent.process_input() == "ok"
 
 
 @pytest.mark.asyncio

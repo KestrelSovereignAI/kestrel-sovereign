@@ -10,11 +10,14 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
     bind_async_invocation,
+    invocation_scope,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
     RequestLifecycleMixin,
 )
+from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
@@ -30,6 +33,12 @@ class _ReplicaAgent(RequestLifecycleMixin):
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
         self._current_request_id = None
+
+
+class _PublicTurnReplicaAgent(_ReplicaAgent, TurnLifecycleMixin):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id)
+        self._lock_manager = OrderedLockManager()
 
 
 class _SelfFencingReplicaAgent(_ReplicaAgent):
@@ -541,7 +550,7 @@ async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
     first_db, second_db, store, replica_a, replica_b = await _shared_registries(
         tmp_path
     )
-    agent = _ReplicaAgent("did:test:abandoned-generation")
+    agent = _PublicTurnReplicaAgent("did:test:abandoned-generation")
     replica_a.attach(agent)
     try:
         generation = agent.register_active_request("abandoned-turn")
@@ -550,6 +559,9 @@ async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
         generation_id = replica_a._by_local_generation[
             (id(agent), "abandoned-turn", generation)
         ]
+        with invocation_scope("abandoned-turn"):
+            async with agent._turn_lifecycle() as public_turn_id:
+                pass
 
         agent._cleanup_cancelled_request(
             "abandoned-turn",
@@ -566,6 +578,15 @@ async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
             await asyncio.sleep(0.01)
 
         assert unresolved == (generation_id,)
+        public_ticket = await replica_b.request_public_turn(
+            agent.agent_id,
+            public_turn_id,
+        )
+        assert public_ticket.generation_ids == (generation_id,)
+        assert (
+            await replica_b.wait_for_stop(public_ticket, timeout_seconds=0.02)
+            is StopDisposition.UNREACHABLE
+        )
         assert (
             await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
             is StopDisposition.UNREACHABLE
@@ -604,6 +625,33 @@ async def test_registry_close_preserves_unsettled_generation(tmp_path):
         assert (
             await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
             is StopDisposition.UNREACHABLE
+        )
+    finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_close_drains_queued_completed_settlement(tmp_path):
+    """Shutdown cannot turn a known completion into unresolved work."""
+
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:completed-before-close")
+    try:
+        assert await replica_a.register(agent, "completed-turn", 1)
+        ticket = await replica_b.request_turn(agent.agent_id, "completed-turn")
+
+        replica_a.complete_soon(agent, "completed-turn", 1)
+        await replica_a.close()
+
+        assert await store.remaining(ticket.generation_ids) == ()
+        assert (
+            await replica_b.wait_for_stop(ticket, timeout_seconds=0.02)
+            is StopDisposition.STOPPED
         )
     finally:
         await replica_a.close()

@@ -119,24 +119,6 @@ class RequestLifecycleMixin:
             return False
         return True
 
-    async def complete_durable_turn_binding(
-        self,
-        turn_id: str,
-        request_id: str,
-        generation: int | None,
-    ) -> None:
-        """Release the exact durable public-turn binding at turn exit."""
-
-        registry = getattr(self, "_distributed_invocation_registry", None)
-        if registry is None:
-            return
-        if generation is None:
-            raise RuntimeError("durable turn cleanup requires a generation")
-        unbind = getattr(registry, "unbind_public_turn", None)
-        if not callable(unbind):
-            raise TypeError("distributed invocation registry cannot unbind turns")
-        await unbind(self, turn_id, request_id, generation)
-
     def _complete_durable_request_generation(
         self,
         request_id: str,

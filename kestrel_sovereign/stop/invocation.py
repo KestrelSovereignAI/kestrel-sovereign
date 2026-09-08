@@ -338,40 +338,6 @@ class DistributedInvocationStore:
                 )
         return True
 
-    async def unbind_public_turn(
-        self,
-        *,
-        generation_id: str,
-        owner_id: str,
-        agent_id: str,
-        turn_id: str,
-    ) -> None:
-        """Release only the exact public-turn binding this owner created."""
-
-        generation_id = _required_identity(generation_id, "generation identity")
-        owner_id = _required_identity(owner_id, "owner identity")
-        agent_id = _required_identity(agent_id, "agent identity")
-        turn_id = _required_opaque_identity(turn_id, "public turn identity")
-        digest = _public_turn_digest(turn_id)
-        async with self._db.transaction(immediate=True):
-            await self._lock_agent(agent_id)
-            changed_active = await self._db.execute(
-                "UPDATE stop_active_invocations SET public_turn_digest = NULL "
-                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ? "
-                "AND public_turn_digest = ?",
-                (generation_id, owner_id, agent_id, digest),
-            )
-            changed_unresolved = await self._db.execute(
-                "UPDATE stop_unresolved_invocations SET public_turn_digest = NULL "
-                "WHERE generation_id = ? AND owner_id = ? AND agent_id = ? "
-                "AND public_turn_digest = ?",
-                (generation_id, owner_id, agent_id, digest),
-            )
-            if changed_active + changed_unresolved > 1:
-                raise RuntimeError(
-                    "distributed Stop public-turn binding exists in multiple states"
-                )
-
     async def settle(
         self,
         generation_id: str,
@@ -922,26 +888,6 @@ class DistributedInvocationRegistry:
             turn_id=turn_id,
         )
 
-    async def unbind_public_turn(
-        self,
-        agent: object,
-        turn_id: str,
-        request_id: str,
-        generation: int,
-    ) -> None:
-        """Release the public address without widening generation cleanup."""
-
-        key = (id(agent), request_id, generation)
-        generation_id = self._by_local_generation.get(key)
-        if generation_id is None:
-            return
-        await self._store.unbind_public_turn(
-            generation_id=generation_id,
-            owner_id=self._owner_id,
-            agent_id=self._agent_id(agent),
-            turn_id=turn_id,
-        )
-
     def complete_soon(
         self,
         agent: object,
@@ -969,7 +915,7 @@ class DistributedInvocationRegistry:
 
         async def complete() -> None:
             try:
-                while not self._closing:
+                while True:
                     try:
                         await self._store.settle(
                             generation_id,
@@ -984,6 +930,13 @@ class DistributedInvocationRegistry:
                             type(error).__name__,
                             exc_info=(type(error), error, error.__traceback__),
                         )
+                        if self._closing:
+                            # Shutdown will conservatively move the still-active
+                            # row to unresolved. A queued settlement always gets
+                            # this first attempt, so a healthy store cannot turn
+                            # known completion into indeterminacy merely because
+                            # close won the event-loop race.
+                            return
                         await asyncio.sleep(self._poll_seconds)
                         continue
                     self._by_local_generation.pop(key, None)

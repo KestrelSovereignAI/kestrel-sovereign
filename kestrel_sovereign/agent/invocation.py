@@ -337,6 +337,14 @@ def bind_async_invocation(
                         operation_context = parent_context.copy()
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
+                        if lock_manager is None:
+                            get_lock_manager = getattr(
+                                type(lifecycle_owner),
+                                "_get_lock_manager",
+                                None,
+                            )
+                            if callable(get_lock_manager):
+                                lock_manager = get_lock_manager(lifecycle_owner)
                         delegate_lock_ownership = getattr(
                             lock_manager,
                             "delegate_current_task_ownership",
@@ -344,8 +352,39 @@ def bind_async_invocation(
                         )
                         if callable(delegate_lock_ownership):
                             delegate_lock_ownership(operation_context)
+
+                        capture_transition_delegation = getattr(
+                            type(lifecycle_owner),
+                            "_capture_committed_feature_transition_delegation",
+                            None,
+                        )
+                        transition_delegation = (
+                            capture_transition_delegation(lifecycle_owner)
+                            if callable(capture_transition_delegation)
+                            else None
+                        )
+
+                        async def run_isolated_operation() -> _T:
+                            if transition_delegation is None:
+                                return await function(*bound.args, **bound.kwargs)
+                            bind_transition_delegation = getattr(
+                                type(lifecycle_owner),
+                                "_bind_committed_feature_transition_delegation",
+                                None,
+                            )
+                            if not callable(bind_transition_delegation):
+                                raise TypeError(
+                                    "committed feature-transition authority "
+                                    "cannot be delegated"
+                                )
+                            with bind_transition_delegation(
+                                lifecycle_owner,
+                                transition_delegation,
+                            ):
+                                return await function(*bound.args, **bound.kwargs)
+
                         isolated_operation = asyncio.create_task(
-                            function(*bound.args, **bound.kwargs),
+                            run_isolated_operation(),
                             name=(
                                 "invocation-turn:"
                                 f"{invocation_log_correlation(invocation_id)}"
