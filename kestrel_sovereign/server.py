@@ -936,11 +936,25 @@ def _gate_feature_route(
     app, and a WebSocket route would receive an invalid HTTP ``JSONResponse``.
     Returning :class:`starlette.routing.Match.NONE` removes a disabled route
     from both HTTP and WebSocket matching before either protocol is handled.
+
+    Starlette's own match runs first. The live-owner and live-route checks
+    — which call ``feature.get_router()`` and, for a withdrawn mount owner,
+    scan every managed agent — run only for a request whose path this
+    route matches at all (#3253). Every request that reached the end of the
+    route table used to pay one router construction per gated feature
+    route, matching or not — every 404 (twice, via the trailing-slash
+    retry) and every request Starlette could only match PARTIAL; a request
+    a core route matched FULL never got this far. A path match with the
+    wrong method (``Match.PARTIAL``) still consults the gate, so a
+    disabled feature answers NONE there too, never 405.
     """
     original_matches = route.matches
     host_dependencies = _feature_route_host_dependencies(route, initial_current)
 
     def _gated_matches(scope):
+        matched = original_matches(scope)
+        if matched[0] is Match.NONE:
+            return matched
         agent = _resolve_live_route_agent(
             app, scope, mount_agent, feature_name, selector
         )
@@ -954,7 +968,7 @@ def _gate_feature_route(
             return Match.NONE, {}
         if _live_feature_route(agent, feature_name, selector) is None:
             return Match.NONE, {}
-        return original_matches(scope)
+        return matched
 
     route.matches = _gated_matches
     # Do not call the copied ``route.app`` directly: it retains the first
