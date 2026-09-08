@@ -6915,7 +6915,8 @@ async def test_status_event_is_not_emitted_without_a_did(tmp_path, monkeypatch, 
         await feat._emit_status_event(_status_req(), state="pending")
     built.assert_not_called()
     recorded.assert_not_awaited()
-    assert any("identity unavailable" in r.getMessage() for r in caplog.records)
+    dropped = [r.getMessage() for r in caplog.records if "identity unavailable" in r.getMessage()]
+    assert dropped and "req-scope" in dropped[0], dropped
 
 
 @pytest.mark.asyncio
@@ -6977,3 +6978,20 @@ async def test_requester_id_is_the_did_or_nothing(tmp_path):
     for did in (None, "", 7):
         feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": did})
         assert feat._agent_requester_id() is None
+
+
+@pytest.mark.asyncio
+async def test_request_readers_see_what_the_writer_wrote_for_a_padded_did(tmp_path):
+    """The requester read routes through the same guard as the writer, so
+    the two agree on the raw value. A whitespace-padded DID is the one
+    input on which the old stripping reader disagreed with the writer and
+    silently listed nothing."""
+    padded = f"  {_SCOPE_DID}  "
+    feat, backend = await _scoped_feature(tmp_path, did=padded)
+    written = await feat.request_restart(reason="padded requester")
+    assert written.status is ToolResultStatus.OK, written.error
+    assert [row.requested_by_agent for row in await list_requests(backend)] == [padded]
+    listed = await feat.list_restart_requests()
+    assert listed.status is ToolResultStatus.OK, listed.error
+    assert listed.data["count"] == 1
+    assert feat._agent_requester_id() == padded

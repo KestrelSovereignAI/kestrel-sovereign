@@ -8,9 +8,11 @@ nothing, purges nothing, or lands in the wait store's legacy bucket while
 the caller reports success). Two do not: the restart coordinator's
 ``list_requests`` and ``list_requests_needing_wake`` gate on truthiness and
 omit the agent predicate for ``""``, so an empty scope there reads EVERY
-agent's restart rows before a sweep that writes. Their two callers had an
-early return that kept ``""`` away from the query; the guard's refusal now
-stands in that place. Two sites read ``agent_id`` before ``did``.
+agent's restart rows before a sweep that writes. Their callers (the
+interrupted-update reset, the post-restart reap, and the request readers
+through the requester read) had an early return or a ``None`` check that
+kept ``""`` away from the query; the guard's refusal now stands in that
+place. Two sites read ``agent_id`` before ``did``.
 
 Each test here fails when its site reads a different field, accepts an empty
 or non-string DID, or resolves the guard inside a catch-all whose handler is
@@ -105,9 +107,10 @@ async def test_notice_retention_sweep_refuses_without_a_did(monkeypatch, caplog)
 
 
 # --- features/restart_coordinator/feature.py ---------------------------------
-# Its six sites are tested in tests/unit/test_restart_coordinator.py, whose
-# fixtures supply the sovereign caller context the tools check first and
-# close what the feature factory opens.
+# Its seven guarded reads (six tool/scan sites and the requester read the
+# request readers share) are tested in tests/unit/test_restart_coordinator.py,
+# whose fixtures supply the sovereign caller context the tools check first
+# and close what the feature factory opens.
 
 
 # --- features/memory/reflection_hook.py --------------------------------------

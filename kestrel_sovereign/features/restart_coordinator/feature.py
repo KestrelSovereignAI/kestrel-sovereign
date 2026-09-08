@@ -1811,7 +1811,7 @@ class RestartCoordinatorFeature(Feature):
         except AgentIdentityUnavailable:
             logger.warning(
                 "restart status event for %s not emitted: agent identity unavailable",
-                getattr(req, "request_id", "?"),
+                getattr(req, "id", "?"),
             )
             return
         requested_by_agent = str(
