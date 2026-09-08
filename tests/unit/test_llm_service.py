@@ -627,20 +627,28 @@ class TestCoreGeneration:
         class _Throttle(Exception):
             status_code = 429
 
-        declined = AdvisedWaitExceedsRetryBudget(
-            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+        soon = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=900, budget_seconds=840,
             retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
         )
-        mock_adapter.get_streaming_response = None  # take the non-streaming fallback
-        mock_adapter.get_response = AsyncMock(
-            side_effect=LLMProviderQuotaError("openai", "Quota exceeded", declined)
+        late = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
         )
+        mock_adapter.get_streaming_response = None  # take the non-streaming fallback
+        # The first route's reset comes first; the LAST route's error is what
+        # ``underlying`` carries, so only the explicit chain names the soonest.
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", soon),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", late),
+        ])
         with pytest.raises(LLMStreamingError) as info:
             async for _chunk in llm_service.stream_with_messages(
                 messages=[{"role": "user", "content": "Hello"}]
             ):
                 pass
-        assert advised_wait_exceeding_budget(info.value) is declined
+        assert info.value.underlying is not None
+        assert advised_wait_exceeding_budget(info.value) is soon
 
     @pytest.mark.asyncio
     async def test_explicit_route_not_gated_by_catalog(self, llm_service, mock_adapter):
