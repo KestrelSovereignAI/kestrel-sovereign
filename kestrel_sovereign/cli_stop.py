@@ -11,9 +11,6 @@ import uuid
 from typing import Any
 
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
-from kestrel_sovereign.paths import spawned_agent_env
-
-
 _CONFIRMED_DISPOSITIONS = frozenset({"stopped", "already_complete"})
 
 
@@ -21,10 +18,24 @@ def _operation_id() -> str:
     return f"cli:{uuid.uuid4()}"
 
 
-def _local_api_key(project_dir) -> str:
-    return str(
-        spawned_agent_env(project_dir).get("KESTREL_API_KEY") or ""
-    ).strip()
+def _host_operator_key(port: int, candidates: tuple[str, ...]) -> str | None:
+    """Identify the credential accepted by the live host without mutating it."""
+
+    import httpx
+
+    probe_url = f"http://localhost:{port}/api/host/ui/contributions"
+    for candidate in candidates:
+        try:
+            response = httpx.get(
+                probe_url,
+                headers={"X-API-Key": candidate},
+                timeout=2.0,
+            )
+        except httpx.RequestError:
+            continue
+        if response.status_code == 200:
+            return candidate
+    return None
 
 
 def _stop_endpoint(args) -> tuple[str, str] | None:
@@ -37,9 +48,15 @@ def _stop_endpoint(args) -> tuple[str, str] | None:
         project_dir / MULTI_AGENT_CONFIG_FILENAME
     )
     if args.all:
+        operator_key = _host_operator_key(
+            config.host.port,
+            cli._operator_api_keys(project_dir),
+        )
+        if operator_key is None:
+            return None
         return (
             f"http://localhost:{config.host.port}/api/host/stop",
-            _local_api_key(project_dir),
+            operator_key,
         )
 
     local = config.get_local_agents().get(args.name)
@@ -53,9 +70,7 @@ def _stop_endpoint(args) -> tuple[str, str] | None:
         if resolved is None:
             return None
         base_url, discovered_key = resolved
-        return f"{base_url}/api/agent/stop", (
-            discovered_key or _local_api_key(project_dir)
-        )
+        return f"{base_url}/api/agent/stop", discovered_key
 
     # Remote registrations carry routing only, not a remote sovereign
     # credential. Never send this host's KESTREL_API_KEY to an arbitrary

@@ -55,7 +55,7 @@ def test_stop_requires_exactly_one_agent_or_all(capsys):
     assert "exactly one" in capsys.readouterr().out
 
 
-def test_host_stop_resolution_uses_host_door_and_local_sovereign_key(tmp_path):
+def test_host_stop_resolution_probes_live_host_for_accepted_sovereign_key(tmp_path):
     from kestrel_sovereign import cli
 
     config = SimpleNamespace(host=SimpleNamespace(port=8888))
@@ -64,14 +64,40 @@ def test_host_stop_resolution_uses_host_door_and_local_sovereign_key(tmp_path):
     with (
         patch.object(cli, "_get_project_dir", return_value=tmp_path),
         patch.object(cli.MultiAgentConfig, "load", return_value=config),
-        patch(
-            "kestrel_sovereign.cli_stop.spawned_agent_env",
-            return_value={"KESTREL_API_KEY": "sovereign-secret"},
+        patch.object(
+            cli,
+            "_operator_api_keys",
+            return_value=("exported-secret", "file-secret"),
         ),
+        patch(
+            "kestrel_sovereign.cli_stop._host_operator_key",
+            return_value="exported-secret",
+        ) as detect,
     ):
         assert cli_stop._stop_endpoint(
             _args(name=None, all_agents=True)
-        ) == ("http://localhost:8888/api/host/stop", "sovereign-secret")
+        ) == ("http://localhost:8888/api/host/stop", "exported-secret")
+    detect.assert_called_once_with(8888, ("exported-secret", "file-secret"))
+
+
+def test_host_operator_key_uses_authenticated_read_only_probe():
+    with patch("httpx.get") as get:
+        get.side_effect = [
+            _response(status=401, payload={}),
+            _response(status=200, payload={"contributions": []}),
+        ]
+
+        assert cli_stop._host_operator_key(
+            8888,
+            ("stale", "accepted"),
+        ) == "accepted"
+
+    assert [call.args[0] for call in get.call_args_list] == [
+        "http://localhost:8888/api/host/ui/contributions",
+        "http://localhost:8888/api/host/ui/contributions",
+    ]
+    assert get.call_args_list[0].kwargs["headers"] == {"X-API-Key": "stale"}
+    assert get.call_args_list[1].kwargs["headers"] == {"X-API-Key": "accepted"}
 
 
 def test_named_stop_resolution_delegates_agent_routing_to_live_http_probe(tmp_path):
@@ -115,7 +141,7 @@ def test_remote_stop_never_sends_the_local_sovereign_key(tmp_path):
         patch.object(cli, "_get_project_dir", return_value=tmp_path),
         patch.object(cli.MultiAgentConfig, "load", return_value=config),
         patch(
-            "kestrel_sovereign.cli_stop._local_api_key",
+            "kestrel_sovereign.cli_stop._host_operator_key",
             side_effect=AssertionError("local sovereign key disclosure"),
         ),
     ):
