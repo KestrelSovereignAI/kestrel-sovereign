@@ -192,6 +192,7 @@ class DockerExecutor(BaseExecutor):
             )
 
         self._validate_additional_mounts(mounts)
+        self._validated_trash_root()
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
@@ -239,6 +240,17 @@ class DockerExecutor(BaseExecutor):
                 "mounts still expose host service sockets and cannot prove "
                 "separation from host Hold custody"
             )
+
+    def _validated_trash_root(self) -> Path:
+        """Resolve the internal writable bind and keep it outside custody."""
+
+        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        if self._policy.touches_host_hold_custody(host_trash_dir):
+            raise ExecutionEnvironmentError(
+                "Docker trash staging overlaps host Hold custody; configure "
+                "KESTREL_TRASH_DIR outside the host control-data directory"
+            )
+        return host_trash_dir
 
     @staticmethod
     def _snapshot_working_directory(source: str, destination: Path) -> str:
@@ -310,7 +322,9 @@ class DockerExecutor(BaseExecutor):
             if working_dir
             else None
         )
-        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        # Repeat at the final pre-bind boundary so a path alias changed after
+        # admission cannot make the earlier validation stale.
+        host_trash_dir = self._validated_trash_root()
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Mount a PER-EXECUTION staging directory, never the shared trash
         # root: a read/write bind of the root would let any container script

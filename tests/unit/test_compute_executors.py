@@ -565,9 +565,9 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
 ) -> None:
     executor = _make_executor(monkeypatch, "uv", max_bytes=128)
     created = _track_temp_dirs(monkeypatch, tmp_path)
-    process = _SuccessfulProcess(b"ok", b"")
-    command: tuple[object, ...] = ()
-    subprocess_options: dict[str, object] = {}
+    processes = [_SuccessfulProcess(b"", b""), _SuccessfulProcess(b"ok", b"")]
+    commands: list[tuple[object, ...]] = []
+    subprocess_options: list[dict[str, object]] = []
     sandbox_workspaces: list[Optional[str]] = []
 
     def sandbox_prefix(
@@ -578,10 +578,9 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
         return ["/fake/filesystem-sandbox", "--"]
 
     async def create_subprocess(*args: object, **kwargs: object):
-        nonlocal command
-        command = args
-        subprocess_options.update(kwargs)
-        return process
+        commands.append(args)
+        subprocess_options.append(kwargs)
+        return processes[len(commands) - 1]
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
     monkeypatch.setattr(executor, "_get_filesystem_sandbox_prefix", sandbox_prefix)
@@ -593,28 +592,60 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
             "UV_OFFLINE": "1",
         }
     )
-    script.requirements = ["declared-one==1.0", "/path with spaces/two.whl"]
+    script.requirements = ["declared-one==1.0", "declared-two>=2"]
 
     record = await executor.execute(script)
 
     script_path = str(created[0] / "script.py")
     assert sandbox_workspaces == [str(created[0])]
-    assert command == (
+    assert commands[0] == (
+        "/fake/uv",
+        "run",
+        "--isolated",
+        "--no-project",
+        "--no-config",
+        "--no-build",
+        "--no-python-downloads",
+        "--python",
+        "/fake/base/python",
+        "--with",
+        "declared-one==1.0",
+        "--with",
+        "declared-two>=2",
+        "--",
+        "/fake/base/python",
+        "-I",
+        "-S",
+        "-c",
+        "pass",
+    )
+    assert commands[1] == (
         "/fake/filesystem-sandbox",
         "--",
         "/fake/uv",
         "run",
         "--isolated",
         "--no-project",
+        "--no-config",
+        "--no-build",
+        "--no-python-downloads",
         "--python",
         "/fake/base/python",
         "--with",
         "declared-one==1.0",
         "--with",
-        "/path with spaces/two.whl",
+        "declared-two>=2",
+        "--offline",
         script_path,
     )
-    child_env = subprocess_options["env"]
+    resolver_env = subprocess_options[0]["env"]
+    assert isinstance(resolver_env, dict)
+    assert "PYTHONPATH" not in resolver_env
+    assert "VIRTUAL_ENV" not in resolver_env
+    assert "UV_OFFLINE" not in resolver_env
+    assert resolver_env["HOME"] == str(created[0])
+    assert resolver_env["UV_CACHE_DIR"] == str(created[0] / ".uv-cache")
+    child_env = subprocess_options[1]["env"]
     assert isinstance(child_env, dict)
     assert "PYTHONPATH" not in child_env
     assert "UV_PROJECT_ENVIRONMENT" not in child_env
@@ -623,8 +654,38 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     assert child_env["HOME"] == str(created[0])
     assert child_env["TMPDIR"] == str(created[0] / "tmp")
     assert child_env["UV_CACHE_DIR"] == str(created[0] / ".uv-cache")
+    assert child_env["UV_NO_CONFIG"] == "1"
+    assert child_env["UV_NO_BUILD"] == "1"
+    assert child_env["UV_PYTHON_DOWNLOADS"] == "never"
     assert record.stdout == "ok"
     assert record.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_uv_rejects_ambient_requirement_sources_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _make_executor(monkeypatch, "uv", max_bytes=128)
+    _track_temp_dirs(monkeypatch, tmp_path)
+    launched = False
+
+    async def reject_launch(*_args: object, **_kwargs: object):
+        nonlocal launched
+        launched = True
+        raise AssertionError("untrusted requirement reached uv")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_launch)
+    script = _script()
+    script.requirements = ["example @ file:///host/custody/package.whl"]
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="direct URL, VCS, and file requirements are not permitted",
+    ):
+        await executor.execute(script)
+
+    assert launched is False
 
 
 @pytest.mark.asyncio
@@ -824,6 +885,38 @@ def test_docker_rejects_read_only_directory_that_can_gain_service_socket(
         DockerExecutor()._validate_additional_mounts(
             [{"src": str(mount_source), "dst": "/run/host", "ro": True}]
         )
+
+
+@pytest.mark.asyncio
+async def test_docker_rejects_internal_trash_staging_inside_hold_custody(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
+    monkeypatch.setenv("KESTREL_TRASH_DIR", str(custody))
+    executor = _make_executor(monkeypatch, "docker")
+    # DEFAULT_TRASH_DIR is intentionally captured at module import. Model a
+    # process that started with this setting without reloading shared modules.
+    executor._policy.trash_dir = custody
+    launched = False
+
+    async def reject_launch(*_args: object, **_kwargs: object):
+        nonlocal launched
+        launched = True
+        raise AssertionError("unsafe Docker command reached process launch")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_launch)
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="trash staging overlaps host Hold custody",
+    ):
+        await executor.execute(_script())
+
+    assert not any(path.name.startswith(".staging-") for path in custody.iterdir())
+    assert launched is False
 
 
 @pytest.mark.asyncio

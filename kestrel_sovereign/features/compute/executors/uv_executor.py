@@ -13,19 +13,21 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from packaging.requirements import InvalidRequirement, Requirement
+
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
+from ..destructive_policy import DestructiveOperationPolicy
+from ..models import ComputeScript, ExecutionRecord
 from .base import (
+    _SAFE_ENV_VARS,
     BaseExecutor,
     ExecutionEnvironmentError,
     ExecutionError,
     ExecutionTimeoutError,
     _ExecutionContext,
     _ExecutionResult,
-    _SAFE_ENV_VARS,
 )
-from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,57 @@ def _is_dynamic_loader_environment_variable(name: str) -> bool:
     )
 
 
+def _validated_requirement(
+    requirement: str,
+    workspace: Path | None = None,
+) -> str:
+    """Accept a registry requirement or an executor-owned wheel.
+
+    Resolution deliberately runs before the network namespace is detached, so
+    its inputs may not name ambient host files, arbitrary URLs, VCS checkouts,
+    or source trees.  Registry packages are constrained to wheels by uv's
+    ``--no-build`` flag; an explicit wheel is accepted only when a trusted
+    caller has already placed the regular file in this run's private workspace.
+    """
+
+    if not isinstance(requirement, str) or not requirement.strip():
+        raise ExecutionEnvironmentError("UV requirements must be non-empty strings")
+    candidate = requirement.strip()
+    try:
+        parsed = Requirement(candidate)
+    except InvalidRequirement:
+        wheel = Path(candidate)
+        if workspace is None and wheel.suffix == ".whl":
+            # The lifecycle has not allocated the workspace yet. The strict
+            # identity/containment proof is repeated once it has.
+            return candidate
+        try:
+            lexical_wheel = wheel.expanduser().absolute()
+            resolved_wheel = lexical_wheel.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionEnvironmentError(
+                f"UV requirement is not a valid registry package: {candidate}"
+            ) from exc
+        if (
+            lexical_wheel.is_symlink()
+            or not resolved_wheel.is_file()
+            or resolved_wheel.stat().st_nlink != 1
+            or resolved_wheel.suffix != ".whl"
+            or not resolved_wheel.is_relative_to(workspace)
+        ):
+            raise ExecutionEnvironmentError(
+                "UV local requirements must be regular .whl files already inside "
+                "the executor-owned workspace"
+            )
+        return str(resolved_wheel)
+    if parsed.url is not None:
+        raise ExecutionEnvironmentError(
+            "UV direct URL, VCS, and file requirements are not permitted; use a "
+            "registry package or an executor-owned wheel"
+        )
+    return candidate
+
+
 class UvExecutor(BaseExecutor):
     """
     Execute Python scripts using a project-free ephemeral uv environment.
@@ -58,7 +111,7 @@ class UvExecutor(BaseExecutor):
     
     This executor provides:
     - Project-free ephemeral environment per execution
-    - Automatic dependency installation
+    - Automatic wheel-only dependency installation
     - Safe deletion rewriting
     - Resource limits via OS controls
     
@@ -387,7 +440,8 @@ class UvExecutor(BaseExecutor):
         Execute a Python script using uv run.
         
         Creates a temporary directory, writes the script (with safe deletion
-        wrapper), optionally writes requirements.txt, and runs with uv.
+        wrapper), resolves declared registry wheels into its private cache, and
+        runs offline with uv inside the OS sandbox.
         
         Args:
             script: The ComputeScript to execute
@@ -404,6 +458,8 @@ class UvExecutor(BaseExecutor):
                 "minimal Hold-safe namespace; place required inputs in the script "
                 "or use the Docker executor"
             )
+        for requirement in script.requirements:
+            _validated_requirement(requirement)
         
         uv_path = self._get_uv_path()
         if not uv_path:
@@ -442,9 +498,11 @@ class UvExecutor(BaseExecutor):
         script_path = Path(context.workdir) / "script.py"
         script_path.write_text(safe_content)
 
-        if script.requirements:
-            req_path = Path(context.workdir) / "requirements.txt"
-            req_path.write_text("\n".join(script.requirements))
+        workspace = Path(context.workdir).resolve(strict=True)
+        requirements = tuple(
+            _validated_requirement(requirement, workspace)
+            for requirement in script.requirements
+        )
 
         # Only pass safe host variables; never leak host credentials to scripts.
         env = {key: value for key, value in os.environ.items() if key in _SAFE_ENV_VARS}
@@ -456,6 +514,10 @@ class UvExecutor(BaseExecutor):
         env["HOME"] = context.workdir
         env["TMPDIR"] = str(Path(context.workdir) / "tmp")
         env["UV_CACHE_DIR"] = str(Path(context.workdir) / ".uv-cache")
+        env["UV_NO_CONFIG"] = "1"
+        env["UV_NO_BUILD"] = "1"
+        env["UV_PYTHON_DOWNLOADS"] = "never"
+        env["UV_OFFLINE"] = "1"
         Path(env["TMPDIR"]).mkdir(mode=0o700)
         # PYTHONPATH bypasses uv's interpreter/environment boundary entirely.
         env.pop("PYTHONPATH", None)
@@ -467,16 +529,83 @@ class UvExecutor(BaseExecutor):
             if _is_dynamic_loader_environment_variable(key):
                 del env[key]
 
-        uv_cmd = [
+        uv_base_cmd = [
             uv_path,
             "run",
             "--isolated",
             "--no-project",
+            "--no-config",
+            "--no-build",
+            "--no-python-downloads",
             "--python",
             base_python_path,
         ]
-        for requirement in script.requirements:
-            uv_cmd.extend(["--with", requirement])
+        for requirement in requirements:
+            uv_base_cmd.extend(["--with", requirement])
+
+        deadline = asyncio.get_running_loop().time() + script.timeout_seconds
+        if requirements:
+            # uv is trusted infrastructure, but dependency packages are not.
+            # Resolve wheel-only registry inputs into the private cache while
+            # running only an isolated, site-disabled interpreter no-op.  The
+            # caller's environment is deliberately absent here, and the later
+            # script process receives neither host networking nor host files.
+            resolver_env = {
+                key: value
+                for key, value in os.environ.items()
+                if key in _SAFE_ENV_VARS
+            }
+            resolver_env.update(
+                {
+                    "HOME": context.workdir,
+                    "TMPDIR": env["TMPDIR"],
+                    "UV_CACHE_DIR": env["UV_CACHE_DIR"],
+                    "UV_NO_CONFIG": "1",
+                    "UV_NO_BUILD": "1",
+                    "UV_PYTHON_DOWNLOADS": "never",
+                }
+            )
+            resolver_env.pop("PYTHONPATH", None)
+            resolver_env.pop("VIRTUAL_ENV", None)
+            resolver_env.pop("UV_OFFLINE", None)
+            resolver_cmd = [
+                *uv_base_cmd,
+                "--",
+                base_python_path,
+                "-I",
+                "-S",
+                "-c",
+                "pass",
+            ]
+            resolver = await asyncio.create_subprocess_exec(
+                *resolver_cmd,
+                cwd=context.workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=resolver_env,
+                start_new_session=os.name == "posix",
+            )
+            try:
+                resolver_stdout, resolver_stderr = await self._capture_process_output(
+                    resolver,
+                    timeout_seconds=max(
+                        0.001,
+                        deadline - asyncio.get_running_loop().time(),
+                    ),
+                    terminate=lambda: self._kill_process_group(resolver),
+                )
+            except TimeoutError:
+                raise ExecutionTimeoutError(
+                    script.id, script.timeout_seconds
+                ) from None
+            if resolver.returncode != 0:
+                return _ExecutionResult(
+                    exit_code=resolver.returncode,
+                    stdout=resolver_stdout,
+                    stderr=resolver_stderr,
+                )
+
+        uv_cmd = [*uv_base_cmd, "--offline"]
         uv_cmd.append(str(script_path))
         cmd = [
             *self._get_filesystem_sandbox_prefix(
@@ -501,7 +630,10 @@ class UvExecutor(BaseExecutor):
         try:
             stdout, stderr = await self._capture_process_output(
                 process,
-                timeout_seconds=script.timeout_seconds,
+                timeout_seconds=max(
+                    0.001,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
                 terminate=lambda: self._kill_process_group(process),
             )
         except TimeoutError:
