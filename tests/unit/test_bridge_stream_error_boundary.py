@@ -33,7 +33,12 @@ API_KEY = "test-bridge-key"
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
-def _boot(process_input_streaming, *, cancel_on_check=None):
+def _boot(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    self_fenced=False,
+):
     """Boot the real app with a single agent exposing a BridgeFeature and the
     given ``process_input_streaming`` async generator. Returns ``(app, restore)``.
     """
@@ -69,6 +74,7 @@ def _boot(process_input_streaming, *, cancel_on_check=None):
         return cancel_on_check is not None and cancellation_checks >= cancel_on_check
 
     agent.is_request_cancelled = MagicMock(side_effect=_is_request_cancelled)
+    agent.is_request_self_fenced = MagicMock(return_value=self_fenced)
 
     app.router.lifespan_context = noop_lifespan
     app.state.agent = agent
@@ -84,11 +90,17 @@ def _boot(process_input_streaming, *, cancel_on_check=None):
     return app, restore
 
 
-def _post_stream(process_input_streaming, *, cancel_on_check=None):
+def _post_stream(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    self_fenced=False,
+):
     os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
         cancel_on_check=cancel_on_check,
+        self_fenced=self_fenced,
     )
     try:
         with TestClient(app) as client:
@@ -172,6 +184,25 @@ def test_bridge_stream_reports_stopped_command_instead_of_success():
     assert response.status_code == 200
     events = _events(response.text)
     assert [event["type"] for event in events] == ["stopped"]
+    assert events[0]["request_id"]
+
+
+def test_bridge_stream_reports_owner_self_fence_as_retryable_error():
+    async def _interrupted_command(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response = _post_stream(
+        _interrupted_command,
+        cancel_on_check=1,
+        self_fenced=True,
+    )
+
+    assert response.status_code == 200
+    events = _events(response.text)
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["code"] == "invocation_owner_lease_lost"
+    assert events[0]["retryable"] is True
     assert events[0]["request_id"]
 
 

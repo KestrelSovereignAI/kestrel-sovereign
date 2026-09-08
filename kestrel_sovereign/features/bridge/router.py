@@ -30,15 +30,19 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import (
+    cancelled_invocation_http_error,
     get_agent,
     get_caller,
     prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     stopped_invocation_http_error,
+    invocation_was_self_fenced,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
@@ -175,14 +179,17 @@ def get_router() -> APIRouter:
             source_locator="POST:/api/bridge/invoke",
         )
         await prime_durable_stop_fence(request, agent, request_id)
-        await _register_bridge_request(agent, request_id)
+        try:
+            await _register_bridge_request(agent, request_id)
+        except InvocationSelfFencedError as error:
+            raise self_fenced_invocation_http_error(request_id) from error
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         try:
             if (
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
-                raise stopped_invocation_http_error(request_id)
+                raise cancelled_invocation_http_error(agent, request_id)
 
             # Session creation and bridge logs are turn side effects. The
             # request lifecycle above must exist before either starts so an
@@ -197,7 +204,7 @@ def get_router() -> APIRouter:
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
-                raise stopped_invocation_http_error(request_id)
+                raise cancelled_invocation_http_error(agent, request_id)
             await bridge.log_invocation(
                 session_id=session.id,
                 direction="inbound",
@@ -207,7 +214,7 @@ def get_router() -> APIRouter:
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
-                raise stopped_invocation_http_error(request_id)
+                raise cancelled_invocation_http_error(agent, request_id)
 
             user_input = body.message
             if context_note:
@@ -221,6 +228,8 @@ def get_router() -> APIRouter:
                     invocation_id=request_id,
                     invocation_provenance=invocation_provenance,
                 )
+            except InvocationSelfFencedError as error:
+                raise self_fenced_invocation_http_error(request_id) from error
             except InvocationCancelledError as error:
                 raise stopped_invocation_http_error(request_id) from error
             except Exception:
@@ -235,7 +244,7 @@ def get_router() -> APIRouter:
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
-                raise stopped_invocation_http_error(request_id)
+                raise cancelled_invocation_http_error(agent, request_id)
             elapsed_ms = int((time.monotonic() - start_ms) * 1000)
             await bridge.log_invocation(
                 session_id=session.id,
@@ -247,7 +256,7 @@ def get_router() -> APIRouter:
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
-                raise stopped_invocation_http_error(request_id)
+                raise cancelled_invocation_http_error(agent, request_id)
 
             http_response.headers["X-Request-ID"] = (
                 invocation_id_response_header(request_id)
@@ -301,7 +310,10 @@ def get_router() -> APIRouter:
             source_locator="POST:/api/bridge/stream",
         )
         await prime_durable_stop_fence(request, agent, request_id)
-        await _register_bridge_request(agent, request_id)
+        try:
+            await _register_bridge_request(agent, request_id)
+        except InvocationSelfFencedError as error:
+            raise self_fenced_invocation_http_error(request_id) from error
         request_lifecycle_registered = True
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         setup_cancelled = (
@@ -356,12 +368,31 @@ def get_router() -> APIRouter:
                 )
                 return f"data: {stopped_data}\n\n"
 
+            def self_fenced_event() -> str:
+                self_fenced_data = json.dumps(
+                    {
+                        "type": "error",
+                        "code": "invocation_owner_lease_lost",
+                        "message": (
+                            "Invocation ownership was lost; retry the request."
+                        ),
+                        "retryable": True,
+                        "request_id": request_id,
+                    }
+                )
+                return f"data: {self_fenced_data}\n\n"
+
+            def cancellation_event() -> str:
+                if invocation_was_self_fenced(agent, request_id):
+                    return self_fenced_event()
+                return stopped_event()
+
             try:
                 if setup_cancelled or (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    yield stopped_event()
+                    yield cancellation_event()
                     return
                 # Wave 5E: bridge consumers (Slack/Discord/email/etc.)
                 # don't speak the chat-protocol revise sentinel —
@@ -396,7 +427,7 @@ def get_router() -> APIRouter:
                         callable(request_cancelled)
                         and request_cancelled(request_id) is True
                     ):
-                        yield stopped_event()
+                        yield cancellation_event()
                         return
                     chunk = strip_revise_sentinels(chunk)
                     if not chunk:
@@ -413,7 +444,7 @@ def get_router() -> APIRouter:
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    yield stopped_event()
+                    yield cancellation_event()
                     return
 
                 # Send completion event with metadata
@@ -435,6 +466,8 @@ def get_router() -> APIRouter:
                     content_preview=response_text,
                     duration_ms=elapsed_ms,
                 )
+            except InvocationSelfFencedError:
+                yield self_fenced_event()
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging

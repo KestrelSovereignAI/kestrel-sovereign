@@ -2776,6 +2776,40 @@ class TestStopEndpoint:
             is RequestCompletionDisposition.COMPLETED
         )
 
+    def test_invoke_reports_owner_self_fence_as_retryable(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.agent.invocation import (
+            InvocationSelfFencedError,
+        )
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+        agent = MagicMock()
+        agent.register_active_request = MagicMock()
+        agent.process_input = AsyncMock(
+            side_effect=InvocationSelfFencedError("owner lease lost")
+        )
+        agent.is_request_cancelled = MagicMock(return_value=True)
+        agent.is_request_self_fenced = MagicMock(return_value=True)
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(return_value="session")
+        app.state.agent = agent
+
+        response = TestClient(app).post(
+            "/api/agent/invoke",
+            json={"input": "work", "request_id": "self-fenced-invoke"},
+        )
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+        assert response.headers["X-Request-ID"] == "self-fenced-invoke"
+        assert "Request stopped" not in response.text
+
     @pytest.mark.asyncio
     async def test_invoke_cancelled_during_session_resolution_cleans_lifecycle(self):
         """Every post-registration await is inside the invoke cleanup boundary."""
@@ -2890,6 +2924,40 @@ class TestStopEndpoint:
         # Exactly one notice — the post-loop emit must not double up with any
         # in-loop emit (there were no chunks, so only the fallback fires).
         assert response.text.count("Request stopped") == 1
+
+    def test_stream_endpoint_reports_owner_self_fence_as_interruption(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.endpoints.agent import router
+        from kestrel_sovereign.rate_limit import limiter
+
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.include_router(router)
+
+        async def _empty_stream(*args, **kwargs):
+            if False:
+                yield "unreachable"
+
+        agent = MagicMock()
+        agent.register_active_request = MagicMock()
+        agent.process_input_streaming = _empty_stream
+        agent.is_request_cancelled = MagicMock(return_value=True)
+        agent.is_request_self_fenced = MagicMock(return_value=True)
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(side_effect=lambda value: value)
+        app.state.agent = agent
+
+        response = TestClient(app).post(
+            "/api/agent/stream",
+            json={"input": "work", "request_id": "self-fenced-stream"},
+        )
+
+        assert response.status_code == 200
+        assert "Request interrupted" in response.text
+        assert "retry the request" in response.text
+        assert "Request stopped" not in response.text
 
     @pytest.mark.asyncio
     async def test_stream_endpoint_reuses_client_request_id_for_turn_provenance(self):

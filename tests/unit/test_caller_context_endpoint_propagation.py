@@ -375,6 +375,39 @@ def test_bridge_invoke_reports_cooperative_stop_as_conflict():
         _restore_app(app, original)
 
 
+def test_bridge_invoke_reports_owner_self_fence_as_retryable():
+    from kestrel_sovereign.agent.invocation import InvocationSelfFencedError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationSelfFencedError("owner lease lost")
+    )
+    _wire_bridge_feature(agent)
+
+    app, original = _prepare_app(agent)
+    try:
+        from kestrel_sovereign.features.bridge.router import get_router
+
+        app.include_router(get_router())
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/bridge/invoke",
+                    headers={
+                        "X-API-Key": "test-key",
+                        "X-Request-ID": "bridge-self-fenced-turn",
+                    },
+                    json={"message": "retry this", "channel_type": "api"},
+                )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "invocation_owner_lease_lost"
+        assert response.headers["Retry-After"] == "1"
+        assert response.headers["X-Request-ID"] == "bridge-self-fenced-turn"
+    finally:
+        _restore_app(app, original)
+
+
 def test_bridge_invoke_rechecks_stop_after_outbound_audit():
     """An outbound audit await cannot reopen the response publication race."""
     stopped = False

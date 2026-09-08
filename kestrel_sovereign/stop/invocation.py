@@ -720,6 +720,7 @@ class DistributedInvocationRegistry:
         self._registration_tasks: set[asyncio.Task[bool]] = set()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_keys: set[tuple[int, str, int]] = set()
+        self._completing_generation_ids: set[str] = set()
         self._relay_task: asyncio.Task[None] | None = None
         self._closing = False
         self._lease_lost = False
@@ -768,8 +769,13 @@ class DistributedInvocationRegistry:
                         "distributed Stop owner lease was lost before admission"
                     )
                 last_heartbeat = self._last_heartbeat_monotonic
+                lease_owned_generation_ids = tuple(
+                    generation_id
+                    for generation_id in self._active
+                    if generation_id not in self._completing_generation_ids
+                )
                 if (
-                    self._active
+                    lease_owned_generation_ids
                     and last_heartbeat is not None
                     and asyncio.get_running_loop().time() - last_heartbeat
                     >= self._owner_lease_seconds
@@ -790,6 +796,11 @@ class DistributedInvocationRegistry:
                 )
                 if not admitted:
                     return False
+                had_other_lease_owned_work = any(
+                    active_generation_id
+                    not in self._completing_generation_ids
+                    for active_generation_id in self._active
+                )
                 # The durable insert establishes cleanup ownership. Publish
                 # that ownership locally before any lease-loss branch can
                 # fail, so complete_soon can retry transient deletion errors.
@@ -800,9 +811,13 @@ class DistributedInvocationRegistry:
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease was lost during admission"
                     )
-                self._last_heartbeat_monotonic = (
-                    asyncio.get_running_loop().time()
-                )
+                if not had_other_lease_owned_work:
+                    # A single-row insert timestamps only that row. It starts
+                    # an idle owner's lease, but cannot renew older rows or
+                    # prove the health of the complete owner inventory.
+                    self._last_heartbeat_monotonic = (
+                        asyncio.get_running_loop().time()
+                    )
                 return True
 
         owner = asyncio.create_task(publish(), name="distributed-stop-register")
@@ -867,6 +882,10 @@ class DistributedInvocationRegistry:
         if generation_id is None or key in self._cleanup_keys:
             return
         self._cleanup_keys.add(key)
+        # Durable deletion may become visible to a concurrent relay before
+        # this task resumes to retire the local map. Mark the row synchronously
+        # so that ordinary completion cannot look like owner lease loss.
+        self._completing_generation_ids.add(generation_id)
 
         async def complete() -> None:
             try:
@@ -885,7 +904,12 @@ class DistributedInvocationRegistry:
                         continue
                     self._by_local_generation.pop(key, None)
                     self._active.pop(generation_id, None)
-                    if not self._active:
+                    self._completing_generation_ids.discard(generation_id)
+                    if not any(
+                        active_generation_id
+                        not in self._completing_generation_ids
+                        for active_generation_id in self._active
+                    ):
                         # A lease protects durable owner rows, not an idle
                         # process identity. The next admission starts a fresh
                         # lease generation instead of inheriting elapsed idle
@@ -894,6 +918,8 @@ class DistributedInvocationRegistry:
                     return
             finally:
                 self._cleanup_keys.discard(key)
+                if self._closing:
+                    self._completing_generation_ids.discard(generation_id)
 
         task = asyncio.create_task(
             complete(), name=f"distributed-stop-complete:{generation_id}"
@@ -958,7 +984,12 @@ class DistributedInvocationRegistry:
         if self._lease_lost:
             return
         self._lease_lost = True
-        for agent, turn_id, generation in tuple(self._active.values()):
+        live_work = tuple(
+            target
+            for generation_id, target in self._active.items()
+            if generation_id not in self._completing_generation_ids
+        )
+        for agent, turn_id, generation in live_work:
             self_fence = getattr(
                 type(agent),
                 "self_fence_current_request",
@@ -982,7 +1013,12 @@ class DistributedInvocationRegistry:
 
     async def _relay(self) -> None:
         while not self._closing:
-            if not self._active:
+            lease_owned_generation_ids = tuple(
+                generation_id
+                for generation_id in self._active
+                if generation_id not in self._completing_generation_ids
+            )
+            if not lease_owned_generation_ids:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             try:
@@ -993,7 +1029,15 @@ class DistributedInvocationRegistry:
                 now = asyncio.get_running_loop().time()
                 self._last_heartbeat_monotonic = now
                 live = set(polled.live_generation_ids)
-                if any(generation_id not in live for generation_id in self._active):
+                lease_owned_generation_ids = tuple(
+                    generation_id
+                    for generation_id in self._active
+                    if generation_id not in self._completing_generation_ids
+                )
+                if any(
+                    generation_id not in live
+                    for generation_id in lease_owned_generation_ids
+                ):
                     self._fail_closed_owner()
                 else:
                     for generation_id in polled.stop_generation_ids:
@@ -1041,6 +1085,7 @@ class DistributedInvocationRegistry:
         self._active.clear()
         self._by_local_generation.clear()
         self._cleanup_keys.clear()
+        self._completing_generation_ids.clear()
 
 
 __all__ = [

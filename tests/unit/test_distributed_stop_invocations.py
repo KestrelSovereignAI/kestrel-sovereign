@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     InvocationSelfFencedError,
     bind_async_invocation,
 )
@@ -39,6 +40,12 @@ class _SelfFencingReplicaAgent(_ReplicaAgent):
         self.operation_started.set()
         await self.release_operation.wait()
         return request_id
+
+
+def test_owner_lease_self_fence_is_not_operator_stop():
+    """Infrastructure lease loss must never match acknowledged Stop catches."""
+
+    assert not issubclass(InvocationSelfFencedError, InvocationCancelledError)
 
 
 @pytest.mark.asyncio
@@ -547,6 +554,79 @@ async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path)
     finally:
         await registry.close()
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_single_row_admission_does_not_refresh_owner_wide_lease(tmp_path):
+    """A new row cannot renew older rows that register did not heartbeat."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "owner-wide-lease.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=1.0,
+    )
+    agent = _ReplicaAgent("did:test:owner-wide-lease")
+    try:
+        assert await registry.register(agent, "older-turn", 1)
+        registry._last_heartbeat_monotonic = (
+            asyncio.get_running_loop().time() - 0.95
+        )
+
+        assert await registry.register(agent, "newer-turn", 2)
+        await asyncio.sleep(0.08)
+
+        with pytest.raises(InvocationSelfFencedError):
+            await registry.register(agent, "third-turn", 3)
+        assert registry._lease_lost is True
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
+    """A committed deletion cannot falsely fence unrelated active work."""
+
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:completion-inventory")
+    replica_a.attach(agent)
+    original_complete = store.complete
+    deletion_committed = asyncio.Event()
+    release_completion = asyncio.Event()
+
+    async def pause_after_durable_delete(generation_id, owner_id):
+        await original_complete(generation_id, owner_id)
+        deletion_committed.set()
+        await release_completion.wait()
+
+    store.complete = pause_after_durable_delete
+    try:
+        assert await replica_a.register(agent, "completing-turn", 1)
+        assert await replica_a.register(agent, "unrelated-turn", 2)
+        unrelated_generation_id = replica_a._by_local_generation[
+            (id(agent), "unrelated-turn", 2)
+        ]
+
+        replica_a.complete_soon(agent, "completing-turn", 1)
+        await deletion_committed.wait()
+        await asyncio.sleep(0.05)
+
+        assert replica_a._lease_lost is False
+        assert unrelated_generation_id in replica_a._active
+    finally:
+        release_completion.set()
+        store.complete = original_complete
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
 
 
 @pytest.mark.asyncio

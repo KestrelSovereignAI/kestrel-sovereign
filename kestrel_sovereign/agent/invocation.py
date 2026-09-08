@@ -66,12 +66,13 @@ class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
 
 
-class InvocationSelfFencedError(InvocationCancelledError):
+class InvocationSelfFencedError(Exception):
     """An invocation stopped because its infrastructure lease became unsafe.
 
-    Unlike ``InvocationCancelledError``, this is not evidence that an operator
-    requested or received an acknowledged Stop. Durable ingress must therefore
-    keep the work retryable instead of consuming it as a terminal no-op.
+    This deliberately is not an ``InvocationCancelledError``: infrastructure
+    lease loss is not evidence that an operator requested or received an
+    acknowledged Stop. Durable ingress and HTTP boundaries must therefore keep
+    the work retryable instead of consuming it as a terminal no-op.
     """
 
 

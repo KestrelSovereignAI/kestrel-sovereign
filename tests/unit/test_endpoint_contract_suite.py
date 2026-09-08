@@ -223,6 +223,34 @@ def test_chat_completions_reports_cooperative_stop_as_conflict():
         _restore_app(app, original)
 
 
+def test_chat_completions_reports_owner_self_fence_as_retryable():
+    from kestrel_sovereign.agent.invocation import InvocationSelfFencedError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationSelfFencedError("owner lease lost")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"X-API-Key": "test-key"},
+                    json={
+                        "id": "openai-self-fenced-turn",
+                        "messages": [{"role": "user", "content": "retry this"}],
+                    },
+                )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "invocation_owner_lease_lost"
+        assert response.headers["Retry-After"] == "1"
+        assert response.headers["X-Request-ID"] == "openai-self-fenced-turn"
+    finally:
+        _restore_app(app, original)
+
+
 def test_chat_completions_encodes_unicode_retry_id_for_response_header():
     """A valid UTF-8 body retry ID must not fail after the agent turn runs."""
     llm_service = MagicMock()

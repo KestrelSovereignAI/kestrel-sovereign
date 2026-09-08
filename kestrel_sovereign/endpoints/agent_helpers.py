@@ -211,6 +211,43 @@ def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
     )
 
 
+def invocation_was_self_fenced(agent: object, invocation_id: str) -> bool:
+    """Whether infrastructure, rather than peer/operator Stop, ended a turn."""
+
+    accessor = getattr(agent, "is_request_self_fenced", None)
+    return bool(
+        callable(accessor)
+        and accessor(invocation_id) is True
+    )
+
+
+def self_fenced_invocation_http_error(
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Expose owner lease loss as retryable infrastructure unavailability."""
+
+    return ApiHTTPException(
+        status_code=503,
+        code="invocation_owner_lease_lost",
+        message="Invocation ownership was lost; retry the request.",
+        headers={
+            "Retry-After": "1",
+            "X-Request-ID": invocation_id_response_header(invocation_id),
+        },
+    )
+
+
+def cancelled_invocation_http_error(
+    agent: object,
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Translate a cancellation marker without forging Stop provenance."""
+
+    if invocation_was_self_fenced(agent, invocation_id):
+        return self_fenced_invocation_http_error(invocation_id)
+    return stopped_invocation_http_error(invocation_id)
+
+
 def get_agent(request: Request):
     """Get the active KestrelAgent for this request.
 

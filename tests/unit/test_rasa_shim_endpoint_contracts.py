@@ -108,6 +108,40 @@ def test_rasa_webhook_reports_cooperative_stop_as_conflict():
         _restore_app(app, original)
 
 
+def test_rasa_webhook_reports_owner_self_fence_as_retryable():
+    from kestrel_sovereign.agent.invocation import InvocationSelfFencedError
+
+    agent = MagicMock()
+    agent.process_input = AsyncMock(
+        side_effect=InvocationSelfFencedError("owner lease lost")
+    )
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict(
+            "os.environ",
+            {
+                "KESTREL_API_KEY": "test-key",
+                "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token",
+            },
+        ):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/webhooks/rest/webhook",
+                    headers={
+                        **_api_headers(),
+                        "X-Request-ID": "rasa-self-fenced-turn",
+                    },
+                    json={"sender": "patient-123", "message": "retry this"},
+                )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "invocation_owner_lease_lost"
+        assert response.headers["Retry-After"] == "1"
+        assert response.headers["X-Request-ID"] == "rasa-self-fenced-turn"
+    finally:
+        _restore_app(app, original)
+
+
 def _prepare_multi_agent_app(agents, default=None):
     """Boot the real app in multi-agent mode with ``{name: agent}``.
 

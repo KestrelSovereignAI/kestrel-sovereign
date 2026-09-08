@@ -25,15 +25,18 @@ from slowapi.util import get_remote_address
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    invocation_was_self_fenced,
     prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     validate_request_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
     invocation_log_correlation,
     new_stream_delivery_id,
@@ -502,6 +505,8 @@ async def invoke_agent(request: Request, http_response: Response):
 
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         if callable(request_cancelled) and request_cancelled(request_id) is True:
+            if invocation_was_self_fenced(agent, request_id):
+                raise self_fenced_invocation_http_error(request_id)
             http_response.headers["X-Request-ID"] = invocation_id_response_header(
                 request_id
             )
@@ -555,6 +560,8 @@ async def invoke_agent(request: Request, http_response: Response):
                     and request_cancelled(request_id) is True
                 ):
                     raise
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -571,6 +578,8 @@ async def invoke_agent(request: Request, http_response: Response):
                 callable(request_cancelled)
                 and request_cancelled(request_id) is True
             ):
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -618,6 +627,8 @@ async def invoke_agent(request: Request, http_response: Response):
                 invocation_provenance=invocation_provenance,
             )
             if callable(request_cancelled) and request_cancelled(request_id) is True:
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -629,6 +640,8 @@ async def invoke_agent(request: Request, http_response: Response):
                 }
         except (asyncio.CancelledError, InvocationCancelledError):
             if callable(request_cancelled) and request_cancelled(request_id) is True:
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -648,6 +661,8 @@ async def invoke_agent(request: Request, http_response: Response):
             "model": identity.get("model"),
             "provider": identity.get("provider"),
         }
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
     except HTTPException:
         raise
     except Exception:
@@ -893,6 +908,10 @@ async def stream_agent_response(request: Request):
                 "\n\n---\n⏹️ **Request stopped**\n\n"
                 "Type `!continue` to resume from where I left off, or start a new message."
             )
+            self_fenced_notice = (
+                "\n\n---\n⚠️ **Request interrupted**\n\n"
+                "Invocation ownership was lost; retry the request."
+            )
             stop_notice_emitted = False
             # #2674 P2: track whether the turn ever surfaced a user-visible
             # response chunk. The post-loop fallback below must fire ONLY for a
@@ -905,7 +924,11 @@ async def stream_agent_response(request: Request):
             agent_stream = None
             try:
                 if agent.is_request_cancelled(request_id) is True:
-                    yield stop_notice
+                    yield (
+                        self_fenced_notice
+                        if invocation_was_self_fenced(agent, request_id)
+                        else stop_notice
+                    )
                     stop_notice_emitted = True
                     return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
@@ -933,7 +956,11 @@ async def stream_agent_response(request: Request):
                 async for chunk in agent_stream:
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
-                        yield stop_notice
+                        yield (
+                            self_fenced_notice
+                            if invocation_was_self_fenced(agent, request_id)
+                            else stop_notice
+                        )
                         stop_notice_emitted = True
                         break
                     # Wave 5E: strip the in-band revise sentinel before
@@ -969,8 +996,14 @@ async def stream_agent_response(request: Request):
                     )
                     and agent.is_request_cancelled(request_id)
                 ):
-                    yield stop_notice
+                    yield (
+                        self_fenced_notice
+                        if invocation_was_self_fenced(agent, request_id)
+                        else stop_notice
+                    )
                     stop_notice_emitted = True
+            except InvocationSelfFencedError:
+                yield self_fenced_notice
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
@@ -979,25 +1012,21 @@ async def stream_agent_response(request: Request):
                 from kestrel_sovereign.agent.invocation import (
                     invocation_log_correlation,
                 )
-                logger.error(
-                    "Streaming request failed (correlation=%s)",
-                    invocation_log_correlation(request_id),
-                )
-                # #2674 findings 3 & 4: emit the user-visible error through the
-                # ONE shared safe boundary used by /api/bridge/stream too, so the
-                # two transports cannot drift. It NEVER reflects ``str(e)``,
-                # ``underlying``, or ``provider`` — an adapter that raises after
-                # yielding partial prose can carry withheld response content or an
-                # injected marker, and ``LLMStreamingError.provider`` is an
-                # unvalidated free string (finding 4: it leaked
-                # ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT). A route failure
-                # still gets the no-blind-fallback / recovery guidance via a
-                # CONSTANT "your selected model route" label; the failing route
-                # and full error remain unavailable to this transport.
-                from kestrel_sovereign.llm.streaming_errors import (
-                    agent_stream_error_block,
-                )
-                yield agent_stream_error_block(e)
+                if invocation_was_self_fenced(agent, request_id):
+                    yield self_fenced_notice
+                else:
+                    logger.error(
+                        "Streaming request failed (correlation=%s)",
+                        invocation_log_correlation(request_id),
+                    )
+                    # #2674 findings 3 & 4: emit the user-visible error through
+                    # the ONE shared safe boundary used by /api/bridge/stream
+                    # too, so the two transports cannot drift. It NEVER reflects
+                    # ``str(e)``, ``underlying``, or ``provider``.
+                    from kestrel_sovereign.llm.streaming_errors import (
+                        agent_stream_error_block,
+                    )
+                    yield agent_stream_error_block(e)
             finally:
                 agent_stream_cleanup_failed = False
                 try:
@@ -1049,6 +1078,9 @@ async def stream_agent_response(request: Request):
             media_type="text/plain",
             headers=headers,
         )
+    except InvocationSelfFencedError as error:
+        cleanup_unstarted_stream()
+        raise self_fenced_invocation_http_error(request_id) from error
     except asyncio.CancelledError:
         cleanup_unstarted_stream()
         raise

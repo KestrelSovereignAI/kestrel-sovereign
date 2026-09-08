@@ -27,10 +27,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     require_sovereign_host_lifecycle,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     stopped_invocation_http_error,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
 )
 from kestrel_sovereign.features.storage_access import (
@@ -3376,6 +3378,8 @@ async def chat_completions(request: Request, http_response: Response):
         }
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
     except HTTPException:
