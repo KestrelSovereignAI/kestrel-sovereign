@@ -40,6 +40,19 @@ logger = logging.getLogger(__name__)
 
 _MAX_OUTPUT_BYTES = 1024 * 1024  # 1 MiB cap on stdout/stderr each
 
+# Copy size for a captured stream. Bounds this process's memory regardless of
+# how much the command produces.
+_PUMP_CHUNK_BYTES = 64 * 1024
+
+# How long the pumps get after the direct child exits before anything still
+# holding the output descriptors is reported instead of waited on.
+_DRAIN_GRACE = 0.5
+
+# Poll interval for the child's exit status, and the bound on reaping it
+# after a kill so a kill that does not land cannot hang the tool.
+_EXIT_POLL_SECONDS = 0.02
+_REAP_GRACE = 5.0
+
 
 class LocalSandboxBackend(SandboxBackend):
     """Host-process backend.
@@ -90,31 +103,26 @@ class LocalSandboxBackend(SandboxBackend):
         Without a capture, output is buffered in memory and clipped at
         ``_MAX_OUTPUT_BYTES`` on the way back — with the clip declared.
 
-        With a capture, the child's stdout and stderr are handed the open
-        files as their own descriptors, so the bytes go from the process to
-        the disk without passing through this one. That is what makes the
-        artifact durable rather than merely re-serialized: there is no cap to
-        exceed, no buffer to exhaust, and nothing to truncate. It is also
-        exactly what the shell redirect this surface cannot express would
-        have done (#3243).
+        With a capture, both streams are piped and pumped to disk in chunks.
+        Memory stays O(chunk) however large the output grows, so the 1 MiB
+        cap does not apply and nothing is truncated; what the pipe buys over
+        handing the child the file descriptor directly is that **EOF is a
+        fact about the output descriptors themselves**. The capture is final
+        exactly when nothing holds them open.
 
-        The child leads its own process group, so a timeout kills the
-        **group**: a command that forked does not leave descendants running
-        after the wait was declared over.
+        That was arrived at twice. Handing over the descriptors could not
+        tell whether a descendant still held them; a process-group probe
+        missed anything that called ``setsid``; and a side-channel sentinel
+        missed anything spawned through ``subprocess.Popen``, which closes
+        non-stdio descriptors while inheriting stdout and stderr — the common
+        case, not an exotic one. Only the streams being written to can answer
+        a question about the streams being written to.
 
-        Whether anything can still be writing is answered by a sentinel pipe
-        rather than by asking whether that group still exists. The child
-        inherits the write end and never learns of it; this process holds the
-        read end and reads EOF exactly when the last holder is gone. Group
-        membership was the first answer and it had a hole review found: a
-        descendant that calls ``setsid`` leaves the group while keeping the
-        capture descriptors, so the probe said "no writers" about a process
-        still writing. Inheritance is the property that actually matters, and
-        the sentinel tests inheritance directly.
-
-        On Windows there is no ``pass_fds``, so no sentinel and no answer —
-        reported as ``None`` rather than as "no writers", which would be a
-        claim this platform cannot support.
+        After the direct child exits the pumps get a short grace. If they
+        have not reached EOF by then something else holds the descriptors,
+        which is reported rather than waited on: a command that legitimately
+        daemonizes should not hold the tool open for its whole timeout, and a
+        capture it may still append to must not be called final.
         """
         if not argv:
             raise ValueError("empty argv")
@@ -122,13 +130,6 @@ class LocalSandboxBackend(SandboxBackend):
         binary = shutil.which(argv[0]) or argv[0]
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
-
-        # Created before the spawn so the child can inherit the write end,
-        # and closed here immediately after so this process is not itself a
-        # holder — otherwise the read end would never see EOF.
-        sentinel_r = sentinel_w = None
-        if capture is not None and not is_windows():
-            sentinel_r, sentinel_w = os.pipe()
 
         out_fh = err_fh = None
         if capture is not None:
@@ -150,59 +151,83 @@ class LocalSandboxBackend(SandboxBackend):
                     *full_argv,
                     cwd=str(cwd) if cwd else None,
                     env=sanitized_subprocess_env(env),
-                    stdout=out_fh if out_fh is not None else asyncio.subprocess.PIPE,
-                    stderr=err_fh if err_fh is not None else asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     **new_process_group_kwargs(),
-                    **({"pass_fds": (sentinel_w,)} if sentinel_w is not None else {}),
                 )
-            except FileNotFoundError as exc:
+            except (FileNotFoundError, OSError) as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
+                message = str(exc)
+                if capture is not None and err_fh is not None:
+                    # The diagnostic is the only useful thing this run
+                    # produced. Written INTO the capture, because the caller
+                    # reads the artifact when there is one and would
+                    # otherwise get rc=127 beside an empty file.
+                    err_fh.write((message + "\n").encode("utf-8"))
                 return CompletedRun(
                     argv=list(argv),
                     returncode=127,
                     stdout="",
-                    stderr=str(exc),
+                    stderr=message,
                     duration_ms=duration_ms,
                     stdout_path=str(capture.stdout_path) if capture else None,
                     stderr_path=str(capture.stderr_path) if capture else None,
+                    cwd=str(cwd) if cwd else os.getcwd(),
+                    writers_remaining=False if capture else None,
                 )
 
             timed_out = False
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                timed_out = True
-                # The tree, not just the leader: killing only ``proc`` is
-                # how a timed-out command left its children running while
-                # the tool reported the wait as over.
-                _kill_tree(proc.pid)
+            writers_remaining: bool | None = None
+            if capture is None:
                 try:
-                    stdout_bytes, stderr_bytes = await proc.communicate()
-                except Exception:  # noqa: BLE001
-                    stdout_bytes, stderr_bytes = b"", b""
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    _kill_tree(proc.pid)
+                    try:
+                        stdout_bytes, stderr_bytes = await proc.communicate()
+                    except Exception:  # noqa: BLE001
+                        stdout_bytes, stderr_bytes = b"", b""
+            else:
+                pumps = [
+                    asyncio.create_task(_pump(proc.stdout, out_fh)),
+                    asyncio.create_task(_pump(proc.stderr, err_fh)),
+                ]
+                # NOT ``proc.wait()``. asyncio finishes a subprocess only
+                # once the process has exited AND every pipe transport has
+                # closed, so awaiting it waits for the descendants too — the
+                # grace below would never apply and a command that
+                # legitimately daemonizes would hold the tool for its whole
+                # timeout. Measured: a forked child sleeping 3s kept
+                # ``proc.wait()`` pending for 3s and the capture was then
+                # reported final, because by then it was.
+                #
+                # ``returncode`` is set by the child watcher when the process
+                # itself exits, independent of the pipes, so polling it
+                # separates "the command finished" from "nothing can write
+                # any more" — the two facts this needs to tell apart.
+                timed_out = not await _await_exit(proc, timeout)
+                if timed_out:
+                    _kill_tree(proc.pid)
+                    await _await_exit(proc, _REAP_GRACE)
+                _, pending = await asyncio.wait(pumps, timeout=_DRAIN_GRACE)
+                writers_remaining = bool(pending)
+                for task in pending:
+                    task.cancel()
+                stdout_bytes = stderr_bytes = b""
         finally:
-            # The child holds its own duplicated descriptors; closing ours
-            # here neither truncates the file nor races the write.
             for fh in (out_fh, err_fh):
                 if fh is not None:
                     try:
                         fh.close()
                     except OSError:  # pragma: no cover - defensive
                         pass
-            if sentinel_w is not None:
-                try:
-                    os.close(sentinel_w)
-                except OSError:  # pragma: no cover - defensive
-                    pass
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
-        writers_remaining = _writers_remain(sentinel_r)
         if capture is not None:
-            # ``communicate`` returns None for a stream it did not pipe.
-            # Nothing was buffered, so nothing could have been clipped.
             return CompletedRun(
                 argv=list(argv),
                 returncode=proc.returncode if proc.returncode is not None else -1,
@@ -230,8 +255,38 @@ class LocalSandboxBackend(SandboxBackend):
             truncated_stderr=err_trunc,
             timed_out=timed_out,
             cwd=effective_cwd,
-            writers_remaining=writers_remaining,
         )
+
+
+async def _await_exit(proc, timeout: float) -> bool:
+    """Wait for the process itself to exit. True if it did, False on timeout.
+
+    Polls ``returncode`` rather than awaiting ``proc.wait()``: see the call
+    site for why the difference is load-bearing.
+    """
+    deadline = time.monotonic() + timeout
+    while proc.returncode is None:
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_EXIT_POLL_SECONDS)
+    return True
+
+
+async def _pump(reader, fh) -> None:
+    """Copy ``reader`` to ``fh`` until EOF, a chunk at a time.
+
+    The loop ends only when every holder of the write end has closed it, so
+    the task outliving the direct child IS the signal that something else is
+    still able to write.
+    """
+    if reader is None:  # pragma: no cover - defensive
+        return
+    while True:
+        chunk = await reader.read(_PUMP_CHUNK_BYTES)
+        if not chunk:
+            return
+        fh.write(chunk)
+
 
 
 def _kill_tree(pid: int) -> None:
@@ -258,36 +313,6 @@ def _kill_tree(pid: int) -> None:
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
-            pass
-
-
-def _writers_remain(sentinel_r: int | None) -> bool | None:
-    """Whether any process still holds the inherited capture descriptors.
-
-    ``None`` when there is no sentinel to ask — an uncaptured run, or a
-    platform without ``pass_fds``. Not ``False``: "nobody is writing" and "I
-    cannot tell" are different answers and only one of them is evidence.
-
-    A non-blocking read on the pipe's read end. ``b""`` is EOF, which happens
-    only once every copy of the write end is closed, so it is exactly the
-    question "did anything outlive the child holding its descriptors" —
-    including a descendant that left the process group by calling ``setsid``,
-    which a group-existence probe cannot see. ``BlockingIOError`` means the
-    write end is still open somewhere: writers remain.
-    """
-    if sentinel_r is None:
-        return None
-    try:
-        os.set_blocking(sentinel_r, False)
-        return os.read(sentinel_r, 1) != b""
-    except BlockingIOError:
-        return True
-    except OSError:  # pragma: no cover - defensive
-        return None
-    finally:
-        try:
-            os.close(sentinel_r)
-        except OSError:  # pragma: no cover - defensive
             pass
 
 

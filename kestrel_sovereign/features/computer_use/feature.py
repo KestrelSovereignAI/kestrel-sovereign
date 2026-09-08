@@ -48,6 +48,8 @@ from kestrel_sdk.tools.base import ToolCategory
 
 from . import capture
 from .audit import AuditLog, AuditRecord
+from kestrel_sovereign.features.base import orchestrator_result_cap
+
 from .backends import (
     CapabilityBlocked,
     CaptureTarget,
@@ -68,6 +70,12 @@ from .policy import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Room left in a captured shell result for everything that is not preview
+# text: three absolute artifact paths, the flags, and JSON escaping. The
+# orchestrator measures the serialized envelope, so a preview sized against
+# itself alone still overshoots.
+_ENVELOPE_RESERVE = 2500
 
 
 # What a shell would have done with the characters callers most often
@@ -1372,16 +1380,31 @@ class ComputerUseFeature(Feature):
             # With a capture, the inline text is a bounded window onto a
             # complete file. That is a preview, not a truncation, so it is
             # read back here rather than being reported as lost output.
+            # Sized against the cap the orchestrator applies to the WHOLE
+            # serialized envelope, not against the preview alone. Measured
+            # before this: a captured review serialized to 9,147 chars, the
+            # orchestrator replaced it with its own 2,000-head/500-tail
+            # preview, and the verdict was not in either window — the very
+            # failure this ticket exists to close, one layer up. The budget
+            # is split between the two streams and leaves room for the paths
+            # and flags that ride beside them.
+            budget = max(500, (orchestrator_result_cap() - _ENVELOPE_RESERVE) // 2)
             stdout_text = (
-                await capture.preview(bundle.stdout_path)
+                await capture.preview(bundle.stdout_path, max_chars=budget)
                 if bundle
                 else result.stdout
             )
             stderr_text = (
-                await capture.preview(bundle.stderr_path)
+                await capture.preview(bundle.stderr_path, max_chars=budget)
                 if bundle
                 else result.stderr
             )
+
+            # A failure to spawn writes its diagnostic to the capture, but
+            # if that write could not happen the message is only on the
+            # result; an empty preview must not silently replace it.
+            if bundle is not None and not stderr_text and result.stderr:
+                stderr_text = result.stderr
 
             data = {
                 "returncode": result.returncode,
@@ -1407,8 +1430,16 @@ class ComputerUseFeature(Feature):
             # scalar-only ``data`` (the structural-payload heuristic
             # only fires on list/nested-dict values), so the user-
             # visible payload has to live in ``confirmation``.
-            stdout_block = f"\nstdout:\n{stdout_text}" if stdout_text else ""
-            stderr_block = f"\nstderr:\n{stderr_text}" if stderr_text else ""
+            # Duplicating the preview into the confirmation doubled the
+            # envelope for no gain: the orchestrator serializes both fields
+            # into one blob and measures that. A captured run points at its
+            # artifact here and carries the text once, in ``data``.
+            if bundle is not None:
+                stdout_block = ""
+                stderr_block = ""
+            else:
+                stdout_block = f"\nstdout:\n{stdout_text}" if stdout_text else ""
+                stderr_block = f"\nstderr:\n{stderr_text}" if stderr_text else ""
             artifact_block = (
                 f"\nartifact: {manifest_path}" if manifest_path else ""
             )

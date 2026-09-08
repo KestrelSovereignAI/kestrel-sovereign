@@ -102,6 +102,35 @@ def is_flat_toolresult_envelope(value: Any) -> bool:
     return False
 
 
+def orchestrator_result_cap() -> int:
+    """The orchestrator's per-tool-result cap (``MAX_TOOL_RESULT_CHARS``).
+
+    Read from the orchestrator constant rather than hardcoded so the two can
+    never drift back into conflict (F086): a serialized result larger than
+    this cap is silently replaced downstream with a head+tail preview, and a
+    feature that does not size against it can have its most important bytes
+    fall in the discarded middle.
+    """
+    try:
+        from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
+    except Exception:  # pragma: no cover - defensive import fallback
+        MAX_TOOL_RESULT_CHARS = 8000
+    return max(1000, int(MAX_TOOL_RESULT_CHARS))
+
+
+def serialized_result_len(result: Any) -> int:
+    """Length of a result exactly as the orchestrator measures it.
+
+    The cap is applied to ``len(json.dumps(_serialize_tool_result(result)))``,
+    so callers size against that same shape rather than a raw character
+    count — JSON escaping of quotes, backslashes and non-ASCII can expand a
+    body several-fold past its ``len()``.
+    """
+    import json as _json
+
+    return len(_json.dumps(_serialize_tool_result(result)))
+
+
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 

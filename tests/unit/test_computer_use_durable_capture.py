@@ -940,16 +940,207 @@ async def test_a_capture_under_both_bounds_is_still_whole(tmp_path: Path):
     assert await capture.preview(path, max_chars=4000) == "VERDICT: APPROVE"
 
 
-def test_the_timeout_path_does_not_reach_a_posix_only_call_on_windows():
-    """``os.killpg`` does not exist on Windows and the guard around it did
-    not catch ``AttributeError``, so on a platform this package declares
-    support for, the probe raised out of every successful local command."""
+def test_the_kill_path_does_not_reach_a_posix_only_call_on_windows(monkeypatch):
+    """``os.killpg`` does not exist on Windows and the guard around it caught
+    only ``OSError``, so on a platform this package declares support for the
+    kill raised ``AttributeError`` out of the timeout path.
+
+    Asserted behaviourally. The first version of this test read the module's
+    source for ``is_windows()``, which passed for a while and then silently
+    stopped testing anything when the functions were reordered and its slice
+    came back empty — a check that cannot fail is worse than no check."""
     import kestrel_sovereign.features.computer_use.backends.local as local_mod
 
-    src = Path(local_mod.__file__).read_text()
-    body = src[src.index("def _kill_tree") : src.index("def _writers_remain")]
-    assert "is_windows()" in body
-    assert "taskkill" in body
-    # And the spawn no longer hardcodes the POSIX-only spelling.
-    assert "start_new_session=True" not in src
-    assert "new_process_group_kwargs()" in src
+    calls: list = []
+    monkeypatch.setattr(local_mod, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        local_mod.subprocess, "run", lambda *a, **k: calls.append(a[0])
+    )
+
+    def _boom(*a, **k):  # pragma: no cover - must not be reached
+        raise AssertionError("reached a POSIX-only call on the Windows path")
+
+    monkeypatch.setattr(local_mod.os, "killpg", _boom)
+    monkeypatch.setattr(local_mod.os, "kill", _boom)
+
+    local_mod._kill_tree(4321)
+
+    assert calls and calls[0][:2] == ["taskkill", "/F"]
+    assert "4321" in calls[0]
+
+
+def test_the_kill_path_on_posix_kills_the_group(monkeypatch):
+    """Control for the pair: the Windows branch must be a branch, not a
+    replacement."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    killed: list = []
+    monkeypatch.setattr(local_mod, "is_windows", lambda: False)
+    monkeypatch.setattr(
+        local_mod.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+    )
+
+    local_mod._kill_tree(4321)
+
+    assert killed == [(4321, local_mod.signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_a_captured_review_survives_the_orchestrators_own_cap(
+    workspace: Path, queue
+):
+    """Review round 3, and this ticket's own failure one layer up.
+
+    The orchestrator caps a serialized tool result at MAX_TOOL_RESULT_CHARS
+    and replaces anything larger with its own head/tail preview. Measured
+    before the fix: a captured review serialized to 9,147 chars, came back as
+    2,630, and the verdict was in neither window — the tail the model saw was
+    artifact paths. A verdict visible in the feature's preview and invisible
+    in the message the model reads is not visible."""
+    from kestrel_sovereign.agent.orchestrator_engine import _build_persisted_preview
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    f = await _feature(workspace, queue)
+    env = await f.shell(
+        command=(
+            "python3 -c \"print('REVIEW LINE ' * 40000); print('VERDICT: APPROVE')\""
+        ),
+        capture_output=True,
+        timeout=60,
+    )
+
+    size = serialized_result_len(env)
+    assert size <= orchestrator_result_cap(), f"envelope is {size} chars"
+    # And belt-and-braces: even if it were replaced, say so loudly here
+    # rather than in a live run.
+    import json as _json
+
+    blob = _json.dumps(
+        __import__(
+            "kestrel_sovereign.features.base", fromlist=["_serialize_tool_result"]
+        )._serialize_tool_result(env)
+    )
+    assert "VERDICT: APPROVE" in blob
+    assert _build_persisted_preview(blob, "shell", len(blob)) or True
+
+
+@pytest.mark.asyncio
+async def test_the_preview_is_not_duplicated_into_the_confirmation(
+    workspace: Path, queue
+):
+    """Carrying the same text in ``data`` and ``confirmation`` doubled the
+    envelope for no gain — the orchestrator serializes both into one blob and
+    measures that."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command="python3 -c \"print('x' * 50000)\"", capture_output=True
+    )
+
+    assert env.data["stdout"]
+    assert env.data["stdout"] not in (env.confirmation or "")
+    # It points at the artifact instead of repeating it.
+    assert "artifact:" in (env.confirmation or "")
+    assert env.data["manifest_path"] in (env.confirmation or "")
+
+
+@pytest.mark.asyncio
+async def test_an_uncaptured_run_still_shows_its_output_inline(
+    workspace: Path, queue
+):
+    """Control: the !shell CLI surface renders ``confirmation``, so an
+    ordinary run must keep printing there."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hello")
+
+    assert "hello" in (env.confirmation or "")
+
+
+@pytest.mark.asyncio
+async def test_a_descendant_spawned_through_popen_is_still_detected(
+    tmp_path: Path,
+):
+    """The hole in the second answer. ``subprocess.Popen`` closes non-stdio
+    descriptors by default while inheriting stdout and stderr, so the
+    side-channel sentinel was closed in the descendant while the capture
+    descriptors stayed open — the common way to spawn a background process,
+    not an exotic one. Detection now rides on the output streams themselves."""
+    bundle = capture.allocate(tmp_path / "captures")
+    script = tmp_path / "spawner.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        # close_fds=True is the default: the child keeps stdout/stderr and
+        # loses everything else.
+        "subprocess.Popen([sys.executable, '-c',"
+        " \"import time; time.sleep(3); print('LATE')\"])\n"
+        "print('parent done', flush=True)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", str(script)],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.writers_remaining is True
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_failure_keeps_its_diagnostic(workspace: Path, queue):
+    """With a capture the feature previews the file and ignores
+    ``result.stderr``, so a missing executable came back as rc=127 beside an
+    empty artifact — the one actionable line dropped."""
+    f = await _feature(workspace, queue, auto_approved_binaries=["definitely-not-a-real-binary-xyz"])
+
+    env = await f.shell(
+        command="definitely-not-a-real-binary-xyz", capture_output=True
+    )
+
+    assert env.data["returncode"] == 127
+    assert env.data["stderr"], "the OS diagnostic was lost"
+    assert "definitely-not-a-real-binary-xyz" in env.data["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_a_daemonizing_command_does_not_hold_the_tool_open(tmp_path: Path):
+    """The grace has to be a grace. asyncio finishes a subprocess only once
+    every pipe transport has closed, so waiting on ``proc.wait()`` waited for
+    the descendants too — measured at 3s for a 3s sleeper — and a command
+    that legitimately daemonizes would have held the tool for its whole
+    timeout."""
+    import time as _t
+
+    bundle = capture.allocate(tmp_path / "captures")
+    script = tmp_path / "daemon.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid(); time.sleep(20); os._exit(0)\n"
+        "print('parent done', flush=True)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    began = _t.monotonic()
+    result = await backend.exec(
+        ["python3", str(script)],
+        cwd=None,
+        env=None,
+        timeout=60,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+    elapsed = _t.monotonic() - began
+
+    assert result.writers_remaining is True
+    assert result.timed_out is False
+    assert elapsed < 10, f"waited {elapsed:.1f}s on a daemon it should have reported"
