@@ -48,7 +48,10 @@ from kestrel_sdk.tools.base import ToolCategory
 
 from . import capture
 from .audit import AuditLog, AuditRecord
-from kestrel_sovereign.features.base import orchestrator_result_cap
+from kestrel_sovereign.features.base import (
+    orchestrator_result_cap,
+    serialized_result_len,
+)
 
 from .backends import (
     CapabilityBlocked,
@@ -72,10 +75,20 @@ from .policy import (
 logger = logging.getLogger(__name__)
 
 # Room left in a captured shell result for everything that is not preview
-# text: three absolute artifact paths, the flags, and JSON escaping. The
-# orchestrator measures the serialized envelope, so a preview sized against
-# itself alone still overshoots.
+# text: three absolute artifact paths, the flags, and JSON escaping. Only a
+# starting guess — the envelope is measured afterwards and the previews
+# shrunk until it really fits, because how much a body expands under
+# ``json.dumps`` is a property of the body, not something a reserve can know.
 _ENVELOPE_RESERVE = 2500
+
+# Halvings allowed while fitting. Five takes a 2,750-char preview to 85,
+# which is past useful; if the envelope still does not fit by then the
+# overflow is not the preview and shrinking further only hides that.
+_FIT_ATTEMPTS = 5
+
+# Below this a preview shows nothing worth reading, so the loop stops rather
+# than trading a verdict for a fit.
+_MIN_PREVIEW_CHARS = 200
 
 
 # What a shell would have done with the characters callers most often
@@ -1361,7 +1374,170 @@ class ComputerUseFeature(Feature):
                 await capture.write_manifest(bundle, body)
                 manifest_path = str(bundle.manifest_path)
 
-            succeeded = result.returncode == 0 and not incomplete
+            # With a capture, the inline text is a bounded window onto a
+            # complete file. That is a preview, not a truncation, so it is
+            # read back here rather than being reported as lost output.
+            # Sized against the cap the orchestrator applies to the WHOLE
+            # serialized envelope: a captured review serialized to 9,147
+            # chars, the orchestrator replaced it with its own
+            # 2,000-head/500-tail preview, and the verdict was in neither
+            # window — the very failure this ticket exists to close, one
+            # layer up.
+            #
+            # Built as a function of the preview budget, because the budget
+            # cannot be chosen up front. The orchestrator measures
+            # ``json.dumps`` of the serialized envelope, and escaping expands
+            # a quote-heavy body several-fold: measured, two 2,750-character
+            # previews of quotes serialized to 12,088 chars under an 8,000
+            # cap. An arithmetic reserve is a guess about that expansion; the
+            # loop below measures the thing itself.
+            async def _build(chars: int) -> tuple[ToolResult, bool]:
+                if bundle:
+                    stdout_text = await capture.preview(
+                        bundle.stdout_path, max_chars=chars
+                    )
+                    stderr_text = await capture.preview(
+                        bundle.stderr_path, max_chars=chars
+                    )
+                else:
+                    stdout_text = (result.stdout or "")[:chars]
+                    stderr_text = (result.stderr or "")[:chars]
+                clipped_here = not bundle and (
+                    len(result.stdout or "") > chars
+                    or len(result.stderr or "") > chars
+                )
+
+                # A failure to spawn writes its diagnostic to the capture,
+                # but if that write could not happen the message is only on
+                # the result; an empty preview must not silently replace it.
+                if bundle is not None and not stderr_text and result.stderr:
+                    stderr_text = result.stderr
+
+                # An uncaptured run that does not fit has genuinely lost
+                # output — there is no artifact to point at, so trimming it
+                # here IS truncation and must count as one. A captured run
+                # has only shown a smaller window onto a whole file.
+                run_incomplete = incomplete or clipped_here
+                data = {
+                    "returncode": result.returncode,
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                    "duration_ms": result.duration_ms,
+                    "timed_out": result.timed_out,
+                    # Surfaced at last. The backends have computed these
+                    # since the feature was written and ``shell`` dropped
+                    # both, so a caller could not have honoured them even
+                    # intending to.
+                    "truncated_stdout": result.truncated_stdout or clipped_here,
+                    "truncated_stderr": result.truncated_stderr or clipped_here,
+                    "complete": not run_incomplete,
+                    "stdout_path": result.stdout_path,
+                    "stderr_path": result.stderr_path,
+                    "manifest_path": manifest_path,
+                    "writers_remaining": result.writers_remaining,
+                    "cwd": result.cwd
+                    or (str(resolved_cwd) if resolved_cwd else None),
+                }
+                # Render stdout/stderr inside the confirmation so the !shell
+                # CLI surface keeps showing the command output — the
+                # command-handler envelope formatter suppresses scalar-only
+                # ``data``. A captured run points at its artifact instead:
+                # duplicating the preview doubled the envelope for no gain,
+                # since the orchestrator serializes both fields into one blob
+                # and measures that.
+                if bundle is not None:
+                    stdout_block = ""
+                    stderr_block = ""
+                else:
+                    stdout_block = (
+                        f"\nstdout:\n{stdout_text}" if stdout_text else ""
+                    )
+                    stderr_block = (
+                        f"\nstderr:\n{stderr_text}" if stderr_text else ""
+                    )
+                artifact_block = (
+                    f"\nartifact: {manifest_path}" if manifest_path else ""
+                )
+                whole = result.returncode == 0 and not run_incomplete
+                if whole:
+                    return (
+                        ToolResult.ok(
+                            f"Command ran successfully "
+                            f"(rc=0, {result.duration_ms}ms)."
+                            + artifact_block
+                            + stdout_block
+                            + stderr_block,
+                            data=data,
+                        ),
+                        run_incomplete,
+                    )
+
+                # Not a whole success: non-zero exit, a timeout, clipped
+                # output, or a capture nothing can vouch for. PARTIAL for all
+                # of them — the shell ran, so audit and follow-up steps that
+                # read stdout/stderr are meaningful, but the LLM must not
+                # claim success. A timed-out or clipped run reaches here even
+                # on rc=0, because "the process exited 0" and "the work
+                # finished" are different claims and only the second is a
+                # verdict.
+                reasons = []
+                if result.returncode != 0:
+                    reasons.append(f"exited rc={result.returncode}")
+                if result.timed_out:
+                    reasons.append(f"timed out after {timeout}s and was killed")
+                if result.truncated_stdout:
+                    reasons.append("stdout was clipped at the output cap")
+                if result.truncated_stderr:
+                    reasons.append("stderr was clipped at the output cap")
+                if clipped_here:
+                    reasons.append(
+                        "produced more output than one tool result can carry "
+                        "and has no artifact — re-run with capture_output=true"
+                    )
+                if result.writers_remaining is True:
+                    reasons.append(
+                        "left processes still running that inherited its "
+                        "output streams, so the captured file is not final"
+                    )
+                elif unverified_writers:
+                    reasons.append(
+                        "ran on a platform where remaining writers cannot be "
+                        "detected, so the captured file cannot be called final"
+                    )
+                caveat = "command " + "; ".join(reasons)
+                if run_incomplete:
+                    caveat += (
+                        " — this output is INCOMPLETE and must not be read "
+                        "as a finished result"
+                    )
+                tail = (stderr_text or "")[-200:].strip()
+                if tail:
+                    caveat += f"; stderr tail: {tail}"
+                return (
+                    ToolResult.partial(
+                        f"Command ran but did not complete cleanly "
+                        f"(rc={result.returncode}, {result.duration_ms}ms)."
+                        + artifact_block
+                        + stdout_block
+                        + stderr_block,
+                        caveat,
+                        data=data,
+                    ),
+                    run_incomplete,
+                )
+
+            cap = orchestrator_result_cap()
+            chars = max(500, (cap - _ENVELOPE_RESERVE) // 2)
+            envelope, run_incomplete = await _build(chars)
+            # Shrink until it actually fits. Measuring beats reserving: what
+            # overflows is the serialized form, and only the serialized form
+            # knows how much a body expanded.
+            for _ in range(_FIT_ATTEMPTS):
+                if serialized_result_len(envelope) <= cap:
+                    break
+                chars = max(_MIN_PREVIEW_CHARS, chars // 2)
+                envelope, run_incomplete = await _build(chars)
+
             await self._audit_run(
                 tool_name="shell",
                 payload={
@@ -1369,132 +1545,24 @@ class ComputerUseFeature(Feature):
                     "returncode": result.returncode,
                     "timed_out": result.timed_out,
                     "truncated": clipped,
+                    "writers_remaining": result.writers_remaining,
+                    "complete": not run_incomplete,
                     "manifest_path": manifest_path,
                 },
                 allowed_by=outcome.allowed_by,
-                outcome="ok" if succeeded else "error",
+                outcome="ok" if not run_incomplete and result.returncode == 0 else "error",
                 duration_ms=duration_ms,
-                error=None if succeeded else f"exit {result.returncode}",
+                # ``exit 0`` was recorded as the error for a run that exited
+                # 0 and was incomplete for some other reason, so the audit
+                # row contradicted itself and named nothing actionable.
+                error=(
+                    None
+                    if not run_incomplete and result.returncode == 0
+                    else (envelope.error or f"exit {result.returncode}")
+                ),
             )
+            return envelope
 
-            # With a capture, the inline text is a bounded window onto a
-            # complete file. That is a preview, not a truncation, so it is
-            # read back here rather than being reported as lost output.
-            # Sized against the cap the orchestrator applies to the WHOLE
-            # serialized envelope, not against the preview alone. Measured
-            # before this: a captured review serialized to 9,147 chars, the
-            # orchestrator replaced it with its own 2,000-head/500-tail
-            # preview, and the verdict was not in either window — the very
-            # failure this ticket exists to close, one layer up. The budget
-            # is split between the two streams and leaves room for the paths
-            # and flags that ride beside them.
-            budget = max(500, (orchestrator_result_cap() - _ENVELOPE_RESERVE) // 2)
-            stdout_text = (
-                await capture.preview(bundle.stdout_path, max_chars=budget)
-                if bundle
-                else result.stdout
-            )
-            stderr_text = (
-                await capture.preview(bundle.stderr_path, max_chars=budget)
-                if bundle
-                else result.stderr
-            )
-
-            # A failure to spawn writes its diagnostic to the capture, but
-            # if that write could not happen the message is only on the
-            # result; an empty preview must not silently replace it.
-            if bundle is not None and not stderr_text and result.stderr:
-                stderr_text = result.stderr
-
-            data = {
-                "returncode": result.returncode,
-                "stdout": stdout_text,
-                "stderr": stderr_text,
-                "duration_ms": result.duration_ms,
-                "timed_out": result.timed_out,
-                # Surfaced at last. The backends have computed these since
-                # the feature was written and ``shell`` dropped both, so a
-                # caller could not have honoured them even intending to.
-                "truncated_stdout": result.truncated_stdout,
-                "truncated_stderr": result.truncated_stderr,
-                "complete": not incomplete,
-                "stdout_path": result.stdout_path,
-                "stderr_path": result.stderr_path,
-                "manifest_path": manifest_path,
-                "writers_remaining": result.writers_remaining,
-                "cwd": result.cwd or (str(resolved_cwd) if resolved_cwd else None),
-            }
-            # Render stdout/stderr inside the confirmation so the
-            # !shell CLI surface keeps showing the command output —
-            # the command-handler envelope formatter suppresses
-            # scalar-only ``data`` (the structural-payload heuristic
-            # only fires on list/nested-dict values), so the user-
-            # visible payload has to live in ``confirmation``.
-            # Duplicating the preview into the confirmation doubled the
-            # envelope for no gain: the orchestrator serializes both fields
-            # into one blob and measures that. A captured run points at its
-            # artifact here and carries the text once, in ``data``.
-            if bundle is not None:
-                stdout_block = ""
-                stderr_block = ""
-            else:
-                stdout_block = f"\nstdout:\n{stdout_text}" if stdout_text else ""
-                stderr_block = f"\nstderr:\n{stderr_text}" if stderr_text else ""
-            artifact_block = (
-                f"\nartifact: {manifest_path}" if manifest_path else ""
-            )
-            if succeeded:
-                return ToolResult.ok(
-                    f"Command ran successfully (rc=0, {result.duration_ms}ms)."
-                    + artifact_block
-                    + stdout_block
-                    + stderr_block,
-                    data=data,
-                )
-            # Not a whole success: non-zero exit, a timeout, or clipped
-            # output. PARTIAL for all three — the shell ran (so audit and
-            # follow-up steps that read stdout/stderr are meaningful) but
-            # the LLM must not claim success. A timed-out or clipped run
-            # reaches here even on rc=0, because "the process exited 0"
-            # and "the work finished" are different claims and only the
-            # second one is a verdict.
-            stderr_tail = (stderr_text or "")[-200:].strip()
-            reasons = []
-            if result.returncode != 0:
-                reasons.append(f"exited rc={result.returncode}")
-            if result.timed_out:
-                reasons.append(f"timed out after {timeout}s and was killed")
-            if result.truncated_stdout:
-                reasons.append("stdout was clipped at the output cap")
-            if result.truncated_stderr:
-                reasons.append("stderr was clipped at the output cap")
-            if result.writers_remaining is True:
-                reasons.append(
-                    "left processes still running that inherited its output "
-                    "streams, so the captured file is not final"
-                )
-            elif unverified_writers:
-                reasons.append(
-                    "ran on a platform where remaining writers cannot be "
-                    "detected, so the captured file cannot be called final"
-                )
-            caveat = "command " + "; ".join(reasons)
-            if incomplete:
-                caveat += (
-                    " — this output is INCOMPLETE and must not be read as a "
-                    "finished result"
-                )
-            if stderr_tail:
-                caveat += f"; stderr tail: {stderr_tail}"
-            return ToolResult.partial(
-                f"Command ran but did not complete cleanly "
-                f"(rc={result.returncode}, {result.duration_ms}ms)."
-                + artifact_block
-                + stdout_block
-                + stderr_block,
-                caveat,
-                data=data,
-            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(

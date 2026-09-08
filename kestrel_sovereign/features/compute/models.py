@@ -255,6 +255,12 @@ class ExecutionRecord:
     exit_code: Optional[int] = None
     stdout: str = ""
     stderr: str = ""
+    # Whether the executor's output cap discarded anything. Previously the
+    # only signal was a marker appended to ``stdout``/``stderr`` themselves,
+    # which a consumer had to parse back out of caller-controlled text — so
+    # a command whose own output happened to end that way was read as
+    # truncated. A boolean cannot be spoofed by what the command prints.
+    output_truncated: bool = False
     
     # Sandbox info
     executor: Literal["uv", "docker", "local"] = "uv"

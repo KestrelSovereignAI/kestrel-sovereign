@@ -421,10 +421,11 @@ async def test_the_docker_backend_reports_a_timeout_instead_of_raising():
 
 
 @pytest.mark.asyncio
-async def test_the_docker_backend_recovers_truncation_from_the_marker():
+async def test_the_docker_backend_reads_truncation_off_the_record():
     """That backend never set ``truncated_stdout`` at all: the executor
-    signals a clip by appending a marker to the text and keeps no boolean,
-    so however much was discarded the flag stayed False."""
+    signalled a clip by appending a marker to the text and kept no boolean,
+    so however much was discarded the flag stayed False. The fact now rides
+    on ``ExecutionRecord.output_truncated``; the marker is only cosmetic."""
     from kestrel_sovereign.features.compute.executors.base import (
         _OUTPUT_TRUNCATED_SUFFIX,
     )
@@ -440,6 +441,7 @@ async def test_the_docker_backend_recovers_truncation_from_the_marker():
                 exit_code = 0
                 stdout = "a review" + _OUTPUT_TRUNCATED_SUFFIX
                 stderr = "clean"
+                output_truncated = True
 
             return _Rec()
 
@@ -448,10 +450,51 @@ async def test_the_docker_backend_recovers_truncation_from_the_marker():
     result = await backend.exec(["echo", "hi"], cwd=None, env=None, timeout=5)
 
     assert result.truncated_stdout is True
-    assert result.truncated_stderr is False
-    # The marker is prose, not payload; it must not stay in the text a
-    # reader would treat as the review.
+    # The marker is presentation; it must not stay in the text a reader
+    # would treat as the review.
     assert result.stdout == "a review"
+
+
+@pytest.mark.asyncio
+async def test_output_that_merely_looks_truncated_is_not(monkeypatch):
+    """Review round 4. Parsing the marker back out of the text made the
+    completeness flag a function of what the command chose to print — a run
+    echoing a prior executor log ends with that exact string and was reported
+    truncated, turning a clean pass into a caveated PARTIAL. Output is
+    caller-controlled; metadata cannot live in it."""
+    from kestrel_sovereign.features.compute.executors.base import (
+        _OUTPUT_TRUNCATED_SUFFIX,
+    )
+    from kestrel_sovereign.features.computer_use.backends.docker import (
+        DockerSandboxBackend,
+    )
+
+    backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None):
+            class _Rec:
+                exit_code = 0
+                stdout = "here is a log I am quoting" + _OUTPUT_TRUNCATED_SUFFIX
+                stderr = ""
+                output_truncated = False
+
+            return _Rec()
+
+    backend._executor = _Executor()
+
+    result = await backend.exec(["echo", "hi"], cwd=None, env=None, timeout=5)
+
+    assert result.truncated_stdout is False
+    assert result.stdout.endswith(_OUTPUT_TRUNCATED_SUFFIX)
+
+
+def test_the_executor_records_truncation_as_a_field():
+    """The other end: the record must carry the fact, or the backend has
+    nothing to read and falls back to guessing from prose."""
+    from kestrel_sovereign.features.compute.models import ExecutionRecord
+
+    assert "output_truncated" in ExecutionRecord.__dataclass_fields__
 
 
 # ---------------------------------------------------------------------------
@@ -1290,3 +1333,132 @@ async def test_the_spawn_asks_the_cross_platform_helper_for_its_group_kwargs(
     )
 
     assert asked, "the spawn did not consult the cross-platform helper"
+
+
+@pytest.mark.asyncio
+async def test_a_quote_heavy_capture_still_fits_the_envelope(
+    workspace: Path, queue
+):
+    """Review round 4. The budget was arithmetic — cap minus a fixed reserve,
+    halved — and ``json.dumps`` escaping expands a quote-heavy body several
+    fold. Measured: two 2,750-character previews of quotes serialized to
+    12,088 chars under an 8,000 cap, so the orchestrator replaced the
+    envelope and hid the verdict again. A reserve is a guess about expansion;
+    the fix measures the serialized form and shrinks until it fits."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    script = workspace / "quotes.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.write(chr(34) * 60000)\n"
+        "sys.stderr.write(chr(34) * 60000)\n"
+    )
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command=f"python3 {script}", capture_output=True, timeout=60
+    )
+
+    size = serialized_result_len(env)
+    assert size <= orchestrator_result_cap(), f"envelope is {size} chars"
+    assert env.data["stdout"], "shrank past showing anything"
+
+
+@pytest.mark.asyncio
+async def test_an_uncaptured_run_over_the_downstream_cap_is_not_complete(
+    workspace: Path, queue
+):
+    """Review round 4. Between the orchestrator's ~8 KB cap and the backend's
+    1 MiB one, both truncation flags stayed false and the run reported
+    ``complete: true`` — while the orchestrator discarded most of an envelope
+    that has no artifact to fall back on. Measured at 80,391 serialized
+    chars."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="python3 -c \"print('z' * 40000)\"", timeout=60)
+
+    assert serialized_result_len(env) <= orchestrator_result_cap()
+    assert env.data["complete"] is False
+    assert env.status is ToolResultStatus.PARTIAL
+    assert "capture_output=true" in (env.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_small_uncaptured_run_is_untouched(workspace: Path, queue):
+    """Control: the downstream-cap rule must fire on size, not on every
+    uncaptured run."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hello")
+
+    assert env.status is ToolResultStatus.OK
+    assert env.data["complete"] is True
+    assert env.data["stdout"].strip() == "hello"
+
+
+@pytest.mark.asyncio
+async def test_a_capture_that_could_not_be_written_is_not_complete(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 4, and the worst of the set. A pump that raises — a full
+    disk, a vanished directory — finishes like any other task and lands in
+    ``done``; not asking for its exception meant a capture missing everything
+    after the failure was reported complete. Silent loss wearing a clean
+    result, which is the exact thing this ticket exists to prevent."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+
+    async def exploding_pump(reader, fh):
+        await reader.read(10)
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(local_mod, "_pump", exploding_pump)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('data' * 1000)"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True
+    assert "No space left on device" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_the_audit_row_names_why_an_incomplete_run_failed(
+    workspace: Path, queue
+):
+    """Review round 4. A run that exited 0 and was incomplete for some other
+    reason was audited as an error whose message was the contradictory
+    ``exit 0``, and the writer state was not in the payload at all — the
+    canonical row could not say what went wrong."""
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(returncode=0, timed_out=True))
+
+    await f.shell(command="echo hi")
+
+    rows = [
+        json.loads(line)
+        for line in (workspace / "audit.jsonl").read_text().splitlines()
+    ]
+    shell_rows = [r for r in rows if r["tool"] == "shell"]
+    assert shell_rows, rows
+    row = shell_rows[-1]
+    assert row["outcome"] == "error"
+    assert row["error"] != "exit 0"
+    assert "timed out" in row["error"]
+    assert row["args"]["complete"] is False
+    assert "writers_remaining" in row["args"]

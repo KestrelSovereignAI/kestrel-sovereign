@@ -112,10 +112,15 @@ class DockerSandboxBackend(SandboxBackend):
         Two completeness facts used to be dropped on this path, and both are
         the shape #3243 is about — a result that reads whole when it is not.
 
-        The executor caps output at ``max_output_bytes`` and marks the clip
-        by appending a marker to the *text*, so ``truncated_stdout`` stayed
-        ``False`` here no matter how much was thrown away. It is now read
-        back off that marker, which is the only signal the executor gives.
+        The executor caps output at ``max_output_bytes`` and used to mark the
+        clip only by appending a marker to the *text*, so ``truncated_stdout``
+        stayed ``False`` here no matter how much was thrown away. Reading it
+        back off the marker fixed the flag and introduced a different lie:
+        the output is caller-controlled, so a command that printed that exact
+        string — echoing a prior executor log, say — was reported truncated
+        when it was whole. ``ExecutionRecord.output_truncated`` now carries
+        the fact, and the marker is only stripped when the record says there
+        was one.
 
         A timeout raised out of this method entirely, so ``timed_out``
         was likewise never ``True`` on this backend. It is now caught and
@@ -180,11 +185,12 @@ class DockerSandboxBackend(SandboxBackend):
             )
         duration_ms = int((time.monotonic() - started) * 1000)
 
+        truncated = bool(getattr(record, "output_truncated", False))
         stdout, out_trunc = _split_truncation_marker(
-            record.stdout, _OUTPUT_TRUNCATED_SUFFIX
+            record.stdout, _OUTPUT_TRUNCATED_SUFFIX, truncated
         )
         stderr, err_trunc = _split_truncation_marker(
-            record.stderr, _OUTPUT_TRUNCATED_SUFFIX
+            record.stderr, _OUTPUT_TRUNCATED_SUFFIX, truncated
         )
 
         stdout_path = stderr_path = None
@@ -210,15 +216,19 @@ class DockerSandboxBackend(SandboxBackend):
         )
 
 
-def _split_truncation_marker(text: str, marker: str) -> tuple[str, bool]:
-    """Recover the executor's truncation flag from the text it appended.
+def _split_truncation_marker(
+    text: str, marker: str, truncated: bool
+) -> tuple[str, bool]:
+    """Drop the executor's cosmetic marker when the record says it clipped.
 
-    The executor signals a clip by appending ``marker`` to the decoded
-    output and keeps no boolean on the record, so this is the only place
-    the fact survives. Reading it back is coupling — hence the shared
-    constant rather than a copied literal — but a marker in prose is not
-    a flag a caller can branch on, and #3243 turns on being able to.
+    ``truncated`` is the authority; the marker is only presentation. The
+    text alone cannot be, because it is whatever the command chose to
+    print — a run that legitimately ends with that string is not a
+    truncated run, and reporting it as one turns a clean pass into a
+    caveated PARTIAL.
     """
+    if not truncated:
+        return text, False
     if text.endswith(marker):
         return text[: -len(marker)], True
-    return text, False
+    return text, True

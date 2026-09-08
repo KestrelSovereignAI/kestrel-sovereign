@@ -212,10 +212,19 @@ class LocalSandboxBackend(SandboxBackend):
                 if timed_out:
                     _kill_tree(proc.pid)
                     await _await_exit(proc, _REAP_GRACE)
-                _, pending = await asyncio.wait(pumps, timeout=_DRAIN_GRACE)
+                done, pending = await asyncio.wait(pumps, timeout=_DRAIN_GRACE)
                 writers_remaining = bool(pending)
                 for task in pending:
                     task.cancel()
+                # A pump that raised — a full disk, a vanished directory —
+                # finishes and lands in ``done`` like any other. Not asking
+                # for its exception meant a capture missing everything after
+                # the failure was reported complete: silent loss wearing a
+                # clean result. asyncio only logs it, at teardown, to a place
+                # no caller reads.
+                pump_error = next(
+                    (t.exception() for t in done if t.exception() is not None), None
+                )
                 stdout_bytes = stderr_bytes = b""
         finally:
             for fh in (out_fh, err_fh):
@@ -228,14 +237,18 @@ class LocalSandboxBackend(SandboxBackend):
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
         if capture is not None:
+            # A failed pump is lost output, which is what ``truncated_*``
+            # already means and already folds into completeness — a second
+            # field for the same fact would be a second thing to forget.
+            lost = pump_error is not None
             return CompletedRun(
                 argv=list(argv),
                 returncode=proc.returncode if proc.returncode is not None else -1,
                 stdout="",
-                stderr="",
+                stderr=f"capture write failed: {pump_error}" if lost else "",
                 duration_ms=duration_ms,
-                truncated_stdout=False,
-                truncated_stderr=False,
+                truncated_stdout=lost,
+                truncated_stderr=lost,
                 timed_out=timed_out,
                 stdout_path=str(capture.stdout_path),
                 stderr_path=str(capture.stderr_path),
