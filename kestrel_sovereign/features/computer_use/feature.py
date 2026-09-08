@@ -1282,7 +1282,9 @@ class ComputerUseFeature(Feature):
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved_cwd = Path(payload["cwd"]) if payload.get("cwd") else None
         bundle = capture.allocate(self._capture_dir) if capture_output else None
-        head_before = await capture.git_head(resolved_cwd) if bundle else None
+        head_before = (
+            await capture.git_head(resolved_cwd or Path.cwd()) if bundle else None
+        )
         started_at = capture.utcnow()
         started = time.monotonic()
         try:
@@ -1306,15 +1308,22 @@ class ComputerUseFeature(Feature):
             # They are collected in one place because a caller who checks
             # only the one they remembered is the #3243 failure repeating.
             clipped = bool(result.truncated_stdout or result.truncated_stderr)
-            incomplete = bool(result.timed_out or clipped)
+            incomplete = bool(
+                result.timed_out or clipped or result.writers_remaining
+            )
 
             manifest_path = None
             if bundle is not None:
-                head_after = await capture.git_head(resolved_cwd)
+                # The directory the backend actually used, which is where
+                # HEAD has to be read: a run with no ``cwd`` still ran
+                # somewhere, and a manifest that says ``null`` cannot answer
+                # the question it exists to answer.
+                effective_cwd = Path(result.cwd) if result.cwd else resolved_cwd
+                head_after = await capture.git_head(effective_cwd)
                 body = capture.build_manifest(
                     bundle=bundle,
                     argv=argv,
-                    cwd=resolved_cwd,
+                    cwd=effective_cwd,
                     backend=self._backend.name,
                     started_at=started_at,
                     finished_at=capture.utcnow(),
@@ -1323,6 +1332,7 @@ class ComputerUseFeature(Feature):
                     timed_out=result.timed_out,
                     truncated_stdout=result.truncated_stdout,
                     truncated_stderr=result.truncated_stderr,
+                    writers_remaining=result.writers_remaining,
                     head_before=head_before,
                     head_after=head_after,
                 )
@@ -1349,10 +1359,14 @@ class ComputerUseFeature(Feature):
             # complete file. That is a preview, not a truncation, so it is
             # read back here rather than being reported as lost output.
             stdout_text = (
-                capture.preview(bundle.stdout_path) if bundle else result.stdout
+                await capture.preview(bundle.stdout_path)
+                if bundle
+                else result.stdout
             )
             stderr_text = (
-                capture.preview(bundle.stderr_path) if bundle else result.stderr
+                await capture.preview(bundle.stderr_path)
+                if bundle
+                else result.stderr
             )
 
             data = {
@@ -1370,7 +1384,8 @@ class ComputerUseFeature(Feature):
                 "stdout_path": result.stdout_path,
                 "stderr_path": result.stderr_path,
                 "manifest_path": manifest_path,
-                "cwd": str(resolved_cwd) if resolved_cwd else None,
+                "writers_remaining": result.writers_remaining,
+                "cwd": result.cwd or (str(resolved_cwd) if resolved_cwd else None),
             }
             # Render stdout/stderr inside the confirmation so the
             # !shell CLI surface keeps showing the command output —
@@ -1408,6 +1423,11 @@ class ComputerUseFeature(Feature):
                 reasons.append("stdout was clipped at the output cap")
             if result.truncated_stderr:
                 reasons.append("stderr was clipped at the output cap")
+            if result.writers_remaining:
+                reasons.append(
+                    "left processes still running that inherited its output "
+                    "streams, so the captured file is not final"
+                )
             caveat = "command " + "; ".join(reasons)
             if incomplete:
                 caveat += (

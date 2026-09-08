@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 # result: nothing was lost, so it must never set ``truncated_stdout``.
 PREVIEW_CHARS = 4000
 
+# Captures hold whatever the command printed — review text, source, and
+# whatever a misbehaving tool echoed of its environment. They get the same
+# owner-only mode the manifest and the audit log already use; a durable
+# artifact readable by every local account is a worse leak than the transient
+# result it replaced, because it persists.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
+
 # Reading HEAD is the runtime describing its own work, not the agent running
 # a command, so the argv is fixed and the window is short. A repository that
 # does not answer in this long simply has no SHA recorded.
@@ -74,6 +82,13 @@ def allocate(capture_dir: Path | str, *, run_id: Optional[str] = None) -> Captur
     rid = run_id or uuid.uuid4().hex
     base = Path(capture_dir).expanduser()
     base.mkdir(parents=True, exist_ok=True)
+    # ``mkdir(mode=...)`` is masked by the umask, and the directory may
+    # already exist from an earlier run under a looser one, so the mode is
+    # set explicitly rather than requested at creation.
+    try:
+        base.chmod(_DIR_MODE)
+    except OSError:  # pragma: no cover - defensive; e.g. a foreign-owned dir
+        logger.warning("could not restrict capture dir %s to 0700", base)
     return CaptureBundle(
         run_id=rid,
         stdout_path=base / f"{rid}.stdout",
@@ -137,6 +152,7 @@ def build_manifest(
     timed_out: bool,
     truncated_stdout: bool,
     truncated_stderr: bool,
+    writers_remaining: bool,
     head_before: Optional[str],
     head_after: Optional[str],
 ) -> dict[str, Any]:
@@ -147,7 +163,9 @@ def build_manifest(
     whole run, so a caller cannot satisfy the gate by checking the one
     condition they remembered.
     """
-    complete = not (timed_out or truncated_stdout or truncated_stderr)
+    complete = not (
+        timed_out or truncated_stdout or truncated_stderr or writers_remaining
+    )
     return {
         "run_id": bundle.run_id,
         "argv": list(argv),
@@ -160,6 +178,7 @@ def build_manifest(
         "timed_out": timed_out,
         "truncated_stdout": truncated_stdout,
         "truncated_stderr": truncated_stderr,
+        "writers_remaining": writers_remaining,
         "complete": complete,
         "stdout_path": str(bundle.stdout_path),
         "stderr_path": str(bundle.stderr_path),
@@ -179,12 +198,38 @@ def build_manifest(
     }
 
 
+def open_stream(path: Path):
+    """Open a capture stream for writing, owner-only.
+
+    ``open(path, "wb")`` would take its mode from the umask — 0644 under the
+    usual 022 — while the manifest beside it is 0600. The whole bundle is one
+    artifact and gets one answer.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+    return os.fdopen(fd, "wb")
+
+
+async def write_stream(path: Path, data: bytes) -> None:
+    """Write a capture stream in one shot, owner-only.
+
+    For a backend that has already buffered the output and cannot hand the
+    child a descriptor.
+    """
+
+    def _write() -> None:
+        with open_stream(path) as fh:
+            fh.write(data)
+
+    await asyncio.to_thread(_write)
+
+
 async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:
     """Write the manifest with ``fsync``, matching the audit log's durability."""
 
     def _write() -> None:
         line = json.dumps(body, indent=2, sort_keys=True) + "\n"
-        fd = os.open(bundle.manifest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(bundle.manifest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
         try:
             os.write(fd, line.encode("utf-8"))
             os.fsync(fd)
@@ -194,24 +239,49 @@ async def write_manifest(bundle: CaptureBundle, body: dict[str, Any]) -> None:
     await asyncio.to_thread(_write)
 
 
-def preview(path: Path, *, max_chars: int = PREVIEW_CHARS) -> str:
+def _read_window(path: Path, max_chars: int) -> str:
+    """Read at most a head and a tail out of ``path``, never the whole file.
+
+    The point of writing straight to disk is that the output can exceed
+    memory. Reading it all back to show 4,000 characters would put the
+    ceiling back where the capture just removed it — and after the
+    subprocess had already succeeded, which is the worst moment to run out
+    of memory. Two bounded ``seek``/``read`` calls instead.
+
+    Byte windows, so a multibyte sequence can be split at either seam;
+    ``errors="replace"`` absorbs that. The alternative is decoding the file
+    to find character boundaries, which is the read this avoids.
+    """
+    size = path.stat().st_size
+    half = max(1, max_chars // 2)
+    # Generous byte budget for a character budget: worst case 4 bytes/char.
+    window = half * 4
+    with open(path, "rb") as fh:
+        if size <= window * 2:
+            return fh.read().decode("utf-8", errors="replace")
+        head = fh.read(window).decode("utf-8", errors="replace")[:half]
+        fh.seek(-window, os.SEEK_END)
+        tail = fh.read(window).decode("utf-8", errors="replace")[-half:]
+    elided = size - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    return (
+        f"{head}\n... [{elided} bytes elided; full output in {path}] ...\n{tail}"
+    )
+
+
+async def preview(path: Path, *, max_chars: int = PREVIEW_CHARS) -> str:
     """Echo a bounded window of a captured file.
 
     Head and tail, not head alone: a review states its verdict at the end,
-    and a head-only window is the exact shape that made a clipped review
-    look like a finished one. The elision is labelled with the byte count so
-    the window is never mistaken for the file.
+    and a head-only window is the exact shape that made a clipped review look
+    like a finished one. The elision is labelled with the byte count so the
+    window is never mistaken for the file.
+
+    Off the event loop, and bounded: see :func:`_read_window`.
     """
     try:
-        raw = path.read_bytes()
+        return await asyncio.to_thread(_read_window, path, max_chars)
     except OSError as exc:
         return f"[capture unreadable: {exc}]"
-    text = raw.decode("utf-8", errors="replace")
-    if len(text) <= max_chars:
-        return text
-    half = max_chars // 2
-    elided = len(text) - (half * 2)
-    return f"{text[:half]}\n... [{elided} chars elided; full output in {path}] ...\n{text[-half:]}"
 
 
 def utcnow() -> datetime:

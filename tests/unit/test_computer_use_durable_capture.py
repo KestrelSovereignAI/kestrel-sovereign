@@ -518,25 +518,27 @@ async def test_relative_argv_tokens_are_vetted_against_the_run_directory(
 # ---------------------------------------------------------------------------
 
 
-def test_a_preview_shows_the_tail_where_a_verdict_lives(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_a_preview_shows_the_tail_where_a_verdict_lives(tmp_path: Path):
     """Head-only is the exact window that made a clipped review look
     finished: a review states its verdict last."""
     body = ("filler\n" * 5000) + "VERDICT: REJECT"
     path = tmp_path / "review.txt"
     path.write_text(body)
 
-    shown = capture.preview(path, max_chars=400)
+    shown = await capture.preview(path, max_chars=400)
 
     assert "VERDICT: REJECT" in shown
     assert "elided" in shown
     assert len(shown) < len(body)
 
 
-def test_a_short_capture_is_shown_whole(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_a_short_capture_is_shown_whole(tmp_path: Path):
     path = tmp_path / "review.txt"
     path.write_text("VERDICT: APPROVE")
 
-    assert capture.preview(path, max_chars=400) == "VERDICT: APPROVE"
+    assert await capture.preview(path, max_chars=400) == "VERDICT: APPROVE"
 
 
 @pytest.mark.asyncio
@@ -555,3 +557,236 @@ async def test_a_preview_does_not_mark_the_run_incomplete(workspace: Path, queue
     assert env.data["complete"] is True
     assert len(env.data["stdout"]) < 200000
     assert Path(env.data["stdout_path"]).stat().st_size > 200000
+
+
+# ---------------------------------------------------------------------------
+# Review round 1. Every finding below was reproduced before it was fixed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_capture_is_owner_only_like_the_manifest_beside_it(tmp_path: Path):
+    """Measured under a 022 umask: the streams came out 0644 and their
+    directory 0755, next to a 0600 manifest and a 0600 audit log. A durable
+    artifact readable by every local account is a worse leak than the
+    transient result it replaced, because it persists."""
+    import stat
+
+    bundle = capture.allocate(tmp_path / "captures")
+    backend = LocalSandboxBackend(GRANTS)
+    await backend.exec(
+        ["python3", "-c", "print('secret')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+    await capture.write_manifest(bundle, {"x": 1})
+
+    mode = lambda p: stat.S_IMODE(p.stat().st_mode)
+    assert mode(bundle.stdout_path) == 0o600
+    assert mode(bundle.stderr_path) == 0o600
+    assert mode(bundle.manifest_path) == 0o600
+    assert mode(bundle.stdout_path.parent) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_a_preview_does_not_read_the_whole_artifact(tmp_path: Path):
+    """The point of writing straight to disk is that output can exceed
+    memory; reading it all back to show 4,000 characters puts the ceiling
+    back where the capture just removed it, and does it AFTER the subprocess
+    succeeded. Measured before the fix: previewing a 50 MB file grew peak RSS
+    by 50 MB.
+
+    Asserted by counting bytes read rather than by watching RSS, which is
+    noisy: the file is instrumented so any full read is visible."""
+    path = tmp_path / "big.txt"
+    body = (b"HEAD-MARKER" + b"f" * 8_000_000 + b"TAIL-MARKER")
+    path.write_bytes(body)
+
+    read_sizes: list[int] = []
+    real_open = open
+
+    def counting_open(p, *a, **k):
+        fh = real_open(p, *a, **k)
+        if str(p) == str(path):
+            real_read = fh.read
+
+            def read(n=-1):
+                data = real_read(n)
+                read_sizes.append(len(data))
+                return data
+
+            fh.read = read
+        return fh
+
+    import builtins
+
+    builtins.open = counting_open
+    try:
+        shown = await capture.preview(path, max_chars=400)
+    finally:
+        builtins.open = real_open
+
+    assert "HEAD-MARKER" in shown and "TAIL-MARKER" in shown
+    assert sum(read_sizes) < 100_000, f"read {sum(read_sizes)} bytes to show 400 chars"
+
+
+@pytest.mark.asyncio
+async def test_a_descendant_still_writing_means_the_capture_is_not_final(
+    tmp_path: Path,
+):
+    """Measured: a forked grandchild appended to the capture 1.5s AFTER
+    ``exec`` returned. ``communicate`` has no pipes to drain when the streams
+    are files, so it waits only for the direct child, and descendants that
+    inherited the descriptors keep writing while the manifest is being
+    written calling the run complete."""
+    bundle = capture.allocate(tmp_path / "captures")
+    script = tmp_path / "fork.py"
+    script.write_text(
+        "import os, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(3); print('LATE', flush=True); os._exit(0)\n"
+        "print('parent done', flush=True)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", str(script)],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.writers_remaining is True
+
+
+@pytest.mark.asyncio
+async def test_a_plain_command_leaves_no_writers(tmp_path: Path):
+    """Control: the flag must mean something. If every run reported survivors
+    it would demote every capture to PARTIAL and stop being readable."""
+    bundle = capture.allocate(tmp_path / "captures")
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", "-c", "print('done')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.writers_remaining is False
+
+
+@pytest.mark.asyncio
+async def test_surviving_writers_make_the_run_incomplete(workspace: Path, queue):
+    """The flag has to reach the verdict, not just the backend — the same
+    gap that left ``truncated_stdout`` computed and unforwarded."""
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(writers_remaining=True))
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert env.status is ToolResultStatus.PARTIAL
+    assert env.data["writers_remaining"] is True
+    assert env.data["complete"] is False
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+    assert body["complete"] is False
+    assert body["writers_remaining"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_kills_the_group_not_just_the_leader(tmp_path: Path):
+    """A timed-out command used to leave its children running while the tool
+    reported the wait as over — the detachment half of the ticket."""
+    bundle = capture.allocate(tmp_path / "captures")
+    marker = tmp_path / "still_alive.txt"
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(4)\n"
+        f"    open({str(marker)!r}, 'w').write('descendant survived')\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", str(script)],
+        cwd=None,
+        env=None,
+        timeout=1,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+    assert result.timed_out is True
+
+    import asyncio as _a
+
+    await _a.sleep(5)
+    assert not marker.exists(), "a descendant outlived the timeout that killed its leader"
+
+
+@pytest.mark.asyncio
+async def test_a_capture_without_a_cwd_still_records_where_it_ran(
+    workspace: Path, queue
+):
+    """A run that named no directory still ran somewhere. The manifest said
+    ``cwd: null`` and recorded no revision, so exactly the captures that
+    most need provenance — the ones taken casually — could not say which
+    checkout they were about."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+    assert body["cwd"] is not None
+    assert body["cwd"] == str(Path.cwd())
+    assert env.data["cwd"] == str(Path.cwd())
+
+
+@pytest.mark.asyncio
+async def test_a_docker_timeout_still_produces_the_files_it_promised():
+    """The manifest named bundle paths that were never created, so the
+    previews read ``[capture unreadable]`` — a missing artifact reported as
+    a broken one."""
+    from kestrel_sovereign.features.compute.executors.base import ExecutionTimeoutError
+    from kestrel_sovereign.features.computer_use.backends.docker import (
+        DockerSandboxBackend,
+    )
+    import tempfile
+
+    backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None):
+            raise ExecutionTimeoutError("cmd", 5)
+
+    backend._executor = _Executor()
+    bundle = capture.allocate(Path(tempfile.mkdtemp()) / "captures")
+
+    result = await backend.exec(
+        ["echo", "hi"],
+        cwd=None,
+        env=None,
+        timeout=5,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.timed_out is True
+    assert bundle.stdout_path.exists()
+    assert bundle.stderr_path.exists()
+    assert result.stdout_path == str(bundle.stdout_path)
+    assert "timeout" in bundle.stderr_path.read_text()

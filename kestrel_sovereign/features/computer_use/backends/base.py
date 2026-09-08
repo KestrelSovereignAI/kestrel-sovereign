@@ -87,6 +87,14 @@ class CompletedRun:
     timed_out: bool = False
     stdout_path: str | None = None
     stderr_path: str | None = None
+    # Where the command actually ran. A caller that named no cwd still ran
+    # somewhere, and a capture that cannot say where is missing the fact its
+    # manifest exists to record.
+    cwd: str | None = None
+    # Processes still alive in the child's group when it was reaped. They
+    # inherited the capture descriptors and may still be writing, so the
+    # file on disk is not yet final and no verdict should be read off it.
+    writers_remaining: bool = False
 
 
 class SandboxBackend(ABC):

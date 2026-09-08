@@ -32,6 +32,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from ..capture import write_stream
 from .base import (
     CaptureTarget,
     CompletedRun,
@@ -152,6 +153,20 @@ class DockerSandboxBackend(SandboxBackend):
             )
         except ExecutionTimeoutError:
             duration_ms = int((time.monotonic() - started) * 1000)
+            # A capture was asked for, so the files must exist even though
+            # the executor kept nothing from before the kill. Skipping them
+            # left the feature writing a manifest that named paths which
+            # were not there, and previews reading "[capture unreadable]" —
+            # a missing artifact reported as a broken one.
+            if capture is not None:
+                await write_stream(capture.stdout_path, b"")
+                await write_stream(
+                    capture.stderr_path,
+                    f"command exceeded its {timeout}s timeout; the "
+                    f"container was killed and no output was preserved\n".encode(
+                        "utf-8"
+                    ),
+                )
             return CompletedRun(
                 argv=list(argv),
                 returncode=-1,
@@ -159,6 +174,9 @@ class DockerSandboxBackend(SandboxBackend):
                 stderr=f"command exceeded its {timeout}s timeout",
                 duration_ms=duration_ms,
                 timed_out=True,
+                stdout_path=str(capture.stdout_path) if capture else None,
+                stderr_path=str(capture.stderr_path) if capture else None,
+                cwd=str(cwd) if cwd else None,
             )
         duration_ms = int((time.monotonic() - started) * 1000)
 
@@ -171,8 +189,10 @@ class DockerSandboxBackend(SandboxBackend):
 
         stdout_path = stderr_path = None
         if capture is not None:
-            await host_write(capture.stdout_path, stdout.encode("utf-8"))
-            await host_write(capture.stderr_path, stderr.encode("utf-8"))
+            # ``write_stream``, not ``host_write``: a capture is owner-only,
+            # like the manifest and the audit log beside it.
+            await write_stream(capture.stdout_path, stdout.encode("utf-8"))
+            await write_stream(capture.stderr_path, stderr.encode("utf-8"))
             stdout_path = str(capture.stdout_path)
             stderr_path = str(capture.stderr_path)
 
@@ -186,6 +206,7 @@ class DockerSandboxBackend(SandboxBackend):
             truncated_stderr=err_trunc,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            cwd=str(cwd) if cwd else None,
         )
 
 
