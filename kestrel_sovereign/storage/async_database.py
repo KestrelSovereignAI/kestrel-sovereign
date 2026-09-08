@@ -840,7 +840,7 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
 """
 
 #: The two created-at partial indexes on ``graph_nodes``, as (index family,
-#: node_type). They are NOT in the DDL blocks below: their definition is
+#: node_type). They are NOT in the DDL blocks beside this: their definition is
 #: computed per backend and goes through ``ensure_index``, which fingerprints
 #: the name, serializes initializers, creates before it retires, and retires
 #: the bare legacy index as a member of the same family (#3255).

@@ -84,7 +84,7 @@ class TestJsonPathIndexes:
 
     @pytest.mark.asyncio
     async def test_indexes_exist_after_init(self, db):
-        """The three JSON-path indexes must be created during _init_schema."""
+        """The JSON-path indexes must be created during _init_schema."""
         rows = await db.fetchall(
             "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_graph_nodes_%'",
         )
@@ -113,7 +113,8 @@ class TestJsonPathIndexes:
 
 class TestPostgresIndexParity:
     """Verify that _POSTGRES_JSON_INDEXES defines the same logical indexes
-    as the SQLite block, including the created_at expression index."""
+    as the SQLite block. The created-at expression indexes are declared
+    apart from both blocks and go through ``ensure_index`` (#3255)."""
 
     def test_created_at_indexes_are_declared_once_for_both_node_types(self):
         from kestrel_sovereign.storage.async_database import (

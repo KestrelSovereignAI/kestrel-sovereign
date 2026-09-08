@@ -86,8 +86,11 @@ async def test_created_ordered_reads_stay_an_index_walk(db_backend, node_type, f
         f"WHERE node_type = '{node_type}' "
         f"ORDER BY {je('properties', 'created_at')} DESC NULLS LAST LIMIT 25"
     )
+    # Statistics on both engines: without them SQLite's planner serves the
+    # node_type predicate from an unrelated index and sorts, which is the
+    # plan this test exists to reject.
+    await db.execute("ANALYZE graph_nodes" if db.backend_type == "postgres" else "ANALYZE")
     if db.backend_type == "postgres":
-        await db.execute("ANALYZE graph_nodes")
         async with db.transaction():
             # A tiny table makes the planner prefer a scan-and-sort even
             # with a perfect index; forbid the scans and the sort so the
@@ -103,12 +106,9 @@ async def test_created_ordered_reads_stay_an_index_walk(db_backend, node_type, f
         # prefix is the stable part.
         assert f"Index Scan using {family}_" in plan and "Sort" not in plan, plan
     else:
-        # SQLite's DESC is already NULLS LAST, so the words must not change
-        # the plan: the same index (whichever the planner picks at this
-        # size) and no table scan, with and without them.
+        # SQLite spells a full ordered index walk "SCAN <table> USING INDEX
+        # <name>"; the plan to reject is the one that serves node_type from
+        # another index and sorts with a temp b-tree.
         rows = await db.fetchall("EXPLAIN QUERY PLAN " + body)
-        plan = " ".join(str(r) for r in rows).upper()
-        rows_plain = await db.fetchall("EXPLAIN QUERY PLAN " + body.replace(" NULLS LAST", ""))
-        plan_plain = " ".join(str(r) for r in rows_plain).upper()
-        assert "USING INDEX" in plan and "SCAN GRAPH_NODES" not in plan, plan
-        assert plan == plan_plain, (plan, plan_plain)
+        plan = " ".join(str(r) for r in rows)
+        assert f"{family}_" in plan and "TEMP B-TREE" not in plan, plan
