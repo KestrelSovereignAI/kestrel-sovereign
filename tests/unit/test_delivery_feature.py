@@ -850,6 +850,66 @@ class TestQueueIdempotency:
         assert replay == first
 
     @pytest.mark.asyncio
+    async def test_stale_claim_repair_preserves_original_effective_retries(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original = await queue.enqueue(
+            "email",
+            "stale-policy@example.com",
+            {"body": "hello"},
+            idempotency_key="stale-policy",
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original, queue._agent_id),
+        )
+
+        restarted = DeliveryQueue(queue._db, queue._agent_id, max_retries=99)
+        repaired = await restarted.enqueue(
+            "email",
+            "stale-policy@example.com",
+            {"body": "hello"},
+            idempotency_key="stale-policy",
+        )
+
+        assert repaired != original
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?", (repaired,)
+        ) == (queue._max_retries,)
+
+    @pytest.mark.asyncio
+    async def test_pre_upgrade_stale_claim_without_policy_fails_closed(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original = await queue.enqueue(
+            "email",
+            "unknown-policy@example.com",
+            {"body": "hello"},
+            idempotency_key="unknown-policy",
+        )
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET effective_max_retries = NULL
+            WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original, queue._agent_id),
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="retry policy"):
+            await queue.enqueue(
+                "email",
+                "unknown-policy@example.com",
+                {"body": "hello"},
+                idempotency_key="unknown-policy",
+            )
+
+    @pytest.mark.asyncio
     async def test_explicit_default_is_distinct_from_omitted_default(
         self, real_queue
     ):
@@ -989,6 +1049,40 @@ class TestQueueIdempotency:
             ) == (10,)
         finally:
             await database.close()
+
+    @pytest.mark.asyncio
+    async def test_rolling_legacy_dead_letter_insert_keeps_policy_nullable(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        rolling = DeliveryQueue(queue._db, queue._agent_id, max_retries=10)
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "rolling-dl",
+                "rolling-original",
+                queue._agent_id,
+                "email",
+                "rolling@example.com",
+                '{"body":"hello"}',
+                "legacy writer failure",
+                4,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        retried = await rolling.retry("rolling-original")
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == (10,)
 
     @pytest.mark.asyncio
     async def test_v3_upgrade_removes_unscoped_v2_delete_trigger(self, real_queue):
@@ -2465,6 +2559,18 @@ class TestQueuePurge:
 
         # Ledger retention still runs, but no queue row is deleted.
         assert "DELETE FROM delivery_queue" in queue._db.fetchall.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_purge_collects_returned_ids_in_bounded_batches(self, queue):
+        first = [(f"delivered-{index}",) for index in range(500)]
+        queue._db.fetchall = AsyncMock(side_effect=[first, [("delivered-500",)]])
+
+        purged = await queue.purge_delivered(older_than_hours=24)
+
+        assert purged == 501
+        assert queue._db.fetchall.call_count == 2
+        for call in queue._db.fetchall.call_args_list:
+            assert "LIMIT 500" in call.args[0]
 
 
 # =========================================================================

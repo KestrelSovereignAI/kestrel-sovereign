@@ -26,7 +26,9 @@ explicitly retried. Whether `max_retries` was omitted is part of request
 identity. Keyed payloads must be JSON-serializable without string fallbacks.
 
 The raw key is not stored. `delivery_idempotency` retains its SHA-256 digest and
-payload digest under the delivery owner's DID. This minimizes accidental raw-key
+payload digest under the delivery owner's DID. It also retains the effective
+retry count so stale-claim repair does not adopt a changed process default; a
+pre-upgrade orphan with no recoverable policy fails closed. This minimizes accidental raw-key
 disclosure but does not make a guessable key confidential. The
 `delivery_queue_schema_v3` migration lock serializes creation and upgrades of
 the ledger, its retention index, and SQLite's explicitly marked compensation
@@ -44,7 +46,7 @@ null set so rows written later by an older rolling-deployment process are
 reconciled before deduplication without an unbounded startup migration.
 
 `delivery_purge` expires successful replay claims with their delivered queue
-rows. Its age threshold is therefore also the completed-delivery replay-safety
+rows in bounded 500-row batches. Its age threshold is therefore also the completed-delivery replay-safety
 window: reuse after that retention period creates a new delivery. Dead-letter
 claims remain with their dead-letter record and move to the new canonical queue
 ID on explicit retry. Retry locks that record, records a resumable candidate ID,

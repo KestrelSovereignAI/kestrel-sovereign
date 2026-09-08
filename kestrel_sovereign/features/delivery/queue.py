@@ -606,8 +606,8 @@ class DeliveryQueue:
                         """
                         INSERT INTO delivery_idempotency
                             (agent_id, idempotency_key_digest, entry_id,
-                             payload_digest, created_at)
-                        VALUES (?, ?, ?, ?, ?)
+                             payload_digest, created_at, effective_max_retries)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
                         """,
                         (
@@ -616,6 +616,7 @@ class DeliveryQueue:
                             candidate_id,
                             payload_digest,
                             now_iso,
+                            retries,
                         ),
                     )
                     # Lock the canonical ledger row portably. SQLite already
@@ -630,7 +631,7 @@ class DeliveryQueue:
                     )
                     existing = await self._db.fetchone(
                         """
-                        SELECT entry_id, payload_digest
+                        SELECT entry_id, payload_digest, effective_max_retries
                         FROM delivery_idempotency
                         WHERE agent_id = ? AND idempotency_key_digest = ?
                         """,
@@ -645,6 +646,8 @@ class DeliveryQueue:
                             "idempotency_key was already used for a different "
                             "delivery request"
                         )
+
+                    stored_retries = existing[2]
 
                     canonical_id = existing[0]
                     dead_letter = await self._db.fetchone(
@@ -663,16 +666,54 @@ class DeliveryQueue:
 
                     queue_row = await self._db.fetchone(
                         """
-                        SELECT status FROM delivery_queue
+                        SELECT status, max_retries FROM delivery_queue
                         WHERE id = ? AND agent_id = ?
                         """,
                         (canonical_id, self._agent_id),
                     )
                     if queue_row is not None:
+                        if stored_retries is None:
+                            # Upgrade old ledger rows lazily from their live
+                            # queue entry. Keeping the column nullable lets old
+                            # rolling-deployment writers continue inserting.
+                            stored_retries = queue_row[1]
+                            await self._db.execute(
+                                """
+                                UPDATE delivery_idempotency
+                                SET effective_max_retries = ?
+                                WHERE agent_id = ?
+                                  AND idempotency_key_digest = ?
+                                  AND effective_max_retries IS NULL
+                                """,
+                                (stored_retries, self._agent_id, key_digest),
+                            )
                         logger.debug(
                             "Adopted idempotent delivery entry: %s", canonical_id
                         )
                         return canonical_id
+
+                    if stored_retries is None:
+                        # A pre-upgrade orphan contains no recoverable record
+                        # of the effective default. Recreating it under today's
+                        # policy would silently change the logical request.
+                        raise DeliveryIdempotencyStateError(
+                            "stale delivery idempotency record has no durable "
+                            "retry policy"
+                        )
+
+                    if stored_retries != retries:
+                        # Omitted defaults are intentionally excluded from the
+                        # request digest, but stale repair must retain the
+                        # original effective policy. Re-evaluate any content
+                        # adoption under that policy before recreating the row.
+                        deduplicated = await self._find_recent_duplicate(
+                            recipient=recipient,
+                            canonical_content_hash=canonical_content_hash,
+                            legacy_content_hash=legacy_content_hash,
+                            dedup_cutoff=dedup_cutoff,
+                            channel_type=channel_type,
+                            max_retries=stored_retries,
+                        )
 
                     if deduplicated is not None:
                         await self._db.execute(
@@ -738,7 +779,7 @@ class DeliveryQueue:
                             legacy_content_hash,
                             canonical_content_hash,
                             DeliveryStatus.PENDING.value,
-                            retries,
+                            stored_retries,
                             now_iso,
                             now_iso,
                         ),
@@ -1239,31 +1280,41 @@ class DeliveryQueue:
             datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
         ).isoformat()
 
+        count = 0
         async with self._db.transaction(immediate=True):
             # Delete queue rows first and capture their IDs atomically. If a
             # joined SQLite transaction is interrupted afterward and its caller
             # commits, stale replay claims safely recreate a missing queue row;
             # deleting claims first could instead leave the old delivered row
             # alongside a newly accepted same-key delivery.
-            purged_rows = await self._db.fetchall(
-                """
-                DELETE FROM delivery_queue
-                WHERE agent_id = ? AND status = ? AND delivered_at < ?
-                RETURNING id
-                """,
-                (self._agent_id, DeliveryStatus.DELIVERED.value, cutoff),
-            )
-            purged_ids = [row[0] for row in purged_rows]
-            for offset in range(0, len(purged_ids), 500):
-                batch = purged_ids[offset : offset + 500]
-                placeholders = ", ".join("?" for _ in batch)
+            while True:
+                purged_rows = await self._db.fetchall(
+                    """
+                    DELETE FROM delivery_queue
+                    WHERE id IN (
+                        SELECT id FROM delivery_queue
+                        WHERE agent_id = ? AND status = ? AND delivered_at < ?
+                        ORDER BY delivered_at, id
+                        LIMIT 500
+                    )
+                    RETURNING id
+                    """,
+                    (self._agent_id, DeliveryStatus.DELIVERED.value, cutoff),
+                )
+                purged_ids = [row[0] for row in purged_rows]
+                if not purged_ids:
+                    break
+                count += len(purged_ids)
+                placeholders = ", ".join("?" for _ in purged_ids)
                 await self._db.execute(
                     f"""
                     DELETE FROM delivery_idempotency
                     WHERE agent_id = ? AND entry_id IN ({placeholders})
                     """,
-                    (self._agent_id, *batch),
+                    (self._agent_id, *purged_ids),
                 )
+                if len(purged_ids) < 500:
+                    break
             # Clean pre-v0.53.12 or independently orphaned claims only after the
             # same retention period, while preserving dead-letter tombstones.
             await self._db.execute(
@@ -1286,8 +1337,6 @@ class DeliveryQueue:
                 """,
                 (self._agent_id, cutoff),
             )
-
-        count = len(purged_ids)
 
         if count > 0:
             logger.info("Purged %d delivered entries older than %dh", count, older_than_hours)
@@ -1552,6 +1601,7 @@ class DeliveryQueue:
                 created_at TEXT NOT NULL,
                 compensating INTEGER NOT NULL DEFAULT 0,
                 previous_entry_id TEXT,
+                effective_max_retries INTEGER,
                 PRIMARY KEY (agent_id, idempotency_key_digest)
             )
             """
@@ -1574,6 +1624,15 @@ class DeliveryQueue:
                 """
                 ALTER TABLE delivery_idempotency
                 ADD COLUMN previous_entry_id TEXT
+                """
+            )
+        if not await self._db.column_exists(
+            "delivery_idempotency", "effective_max_retries"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_idempotency
+                ADD COLUMN effective_max_retries INTEGER
                 """
             )
         # v2 accidentally made ledger deletion cascade into the live queue on
@@ -1646,7 +1705,7 @@ class DeliveryQueue:
                 error TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                max_retries INTEGER NOT NULL DEFAULT 5,
+                max_retries INTEGER,
                 retry_entry_id TEXT
             )
             """

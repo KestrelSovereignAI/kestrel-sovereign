@@ -157,6 +157,48 @@ async def test_keyed_and_plain_enqueues_share_content_gate(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_stale_claim_repair_preserves_effective_retry_policy(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-stale-policy:{uuid4().hex}"
+    original_queue = DeliveryQueue(database, owner, max_retries=5)
+    restarted_queue = DeliveryQueue(database, owner, max_retries=99)
+    await original_queue._ensure_tables()
+
+    try:
+        original_id = await original_queue.enqueue(
+            "email",
+            "stale-policy@example.com",
+            {"body": "same"},
+            idempotency_key="stale-policy",
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+
+        repaired_id = await restarted_queue.enqueue(
+            "email",
+            "stale-policy@example.com",
+            {"body": "same"},
+            idempotency_key="stale-policy",
+        )
+
+        assert repaired_id != original_id
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (repaired_id, owner),
+        ) == (5,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_keyed_adoption_requires_matching_delivery_semantics(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-semantics:{uuid4().hex}"
