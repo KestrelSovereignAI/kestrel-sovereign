@@ -940,10 +940,13 @@ def _gate_feature_route(
     Starlette's own match runs first. The live-owner and live-route checks
     — which call ``feature.get_router()`` and, for a withdrawn mount owner,
     scan every managed agent — run only for a request whose path this
-    route matches at all (#3253). Every request to the host used to pay one
-    router construction per gated feature route, matching or not. A path
-    match with the wrong method (``Match.PARTIAL``) still consults the
-    gate, so a disabled feature answers NONE there too, never 405.
+    route matches at all (#3253). Every request that reached the end of the
+    route table used to pay one router construction per gated feature
+    route, matching or not — every 404 (twice, via the trailing-slash
+    retry) and every request Starlette could only match PARTIAL; a request
+    a core route matched FULL never got this far. A path match with the
+    wrong method (``Match.PARTIAL``) still consults the gate, so a
+    disabled feature answers NONE there too, never 405.
     """
     original_matches = route.matches
     host_dependencies = _feature_route_host_dependencies(route, initial_current)
