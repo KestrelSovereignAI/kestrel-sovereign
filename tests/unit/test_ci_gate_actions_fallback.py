@@ -31,7 +31,9 @@ import pytest
 
 import kestrel_sovereign.signals.sources.github_pr_watch as prw
 from kestrel_sovereign.signals.sources.github_pr_watch import (
+    ACTIONS_RESULT_CEILING,
     CHECKS_SOURCE_CHECK_RUNS,
+    CHECKS_SOURCE_STATUS_ONLY,
     CHECKS_SOURCE_WORKFLOW_RUNS,
     PRWatchAuthError,
     PRWatchNetworkError,
@@ -794,7 +796,7 @@ async def test_legacy_statuses_alone_are_still_a_rollup(monkeypatch):
     assert rollup.complete is False
     assert prw._check_verdict(rollup.check_runs, rollup.combined_status) == "success"
     # Still caveated: a pass read this way is not an unqualified pass.
-    assert "all check runs" in rollup.caveat()
+    assert "every check run" in rollup.caveat()
 
 
 @pytest.mark.asyncio
@@ -831,3 +833,98 @@ async def test_a_403_still_reaches_the_permission_block(monkeypatch, _token):
 
     assert st.data["blocked"] == "permission"
     assert st.data["actionable"] is True
+
+
+# ---------------------------------------------------------------------------
+# GitHub's own limits on the fallback endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_actions_1000_result_ceiling_settles_instead_of_hanging(
+    monkeypatch,
+):
+    """Review round 6. GitHub documents that a ``head_sha`` query returns at
+    most 1,000 results, while still reporting the true ``total_count``. The
+    unread-gate rule then lowers success to pending — correct for a page the
+    crawl missed, wrong here, because no number of requests can reach the
+    rest. Left alone it is a wait that can never settle (#2939)."""
+    runs = [dict(GREEN_RUN, name=f"w{i}") for i in range(ACTIONS_RESULT_CEILING)]
+
+    async def fake_get(url, *, token, timeout, ref):
+        if "/check-runs" in url:
+            raise PRWatchAuthError("403", status_code=403)
+        if "/actions/runs" in url:
+            if "page=2" in url:
+                return {"total_count": 4321, "workflow_runs": []}
+            return {"total_count": 4321, "workflow_runs": runs}
+        return EMPTY_STATUS
+
+    monkeypatch.setattr(prw, "_github_get", fake_get)
+
+    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert prw._check_verdict(rollup.check_runs, rollup.combined_status) == "success"
+    assert "actions-ceiling" in rollup.unreadable
+    assert "1,000-result ceiling" in rollup.caveat() or "1000-result" in rollup.caveat()
+
+
+@pytest.mark.asyncio
+async def test_a_short_read_below_the_ceiling_is_still_an_open_gate(monkeypatch):
+    """Control. The clamp must key on GitHub's documented ceiling, not on any
+    short read — a genuinely missed page is an unread gate and must keep
+    holding the verdict at pending."""
+    async def fake_get(url, *, token, timeout, ref):
+        if "/check-runs" in url:
+            raise PRWatchAuthError("403", status_code=403)
+        if "/actions/runs" in url:
+            if "page=2" in url:
+                return {"total_count": 9, "workflow_runs": []}
+            return {"total_count": 9, "workflow_runs": [GREEN_RUN]}
+        return EMPTY_STATUS
+
+    monkeypatch.setattr(prw, "_github_get", fake_get)
+
+    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert prw._check_verdict(rollup.check_runs, rollup.combined_status) == "pending"
+    assert "actions-ceiling" not in rollup.unreadable
+
+
+@pytest.mark.asyncio
+async def test_a_status_only_rollup_says_so_in_its_source(monkeypatch):
+    """Review round 6. This path was added one commit earlier and left
+    ``source`` at its initial ``check_runs``, so the payload claimed the
+    rollup came from check runs while also reporting check-runs unreadable —
+    provenance contradicting itself in the same dict. The earlier test
+    asserted ``unreadable`` and stopped there."""
+    monkeypatch.setattr(prw, "_github_get", _router({
+        "/check-runs": PRWatchAuthError("403", status_code=403),
+        "/actions/runs": PRWatchAuthError("403", status_code=403),
+        "/status": {"state": "success", "total_count": 1,
+                    "statuses": [{"context": "buildkite", "state": "success"}]},
+    }))
+
+    rollup = await fetch_check_rollup(BASE, SHA, token="t", timeout=1, ref="o/r#20")
+
+    assert rollup.source == CHECKS_SOURCE_STATUS_ONLY
+    assert rollup.source != CHECKS_SOURCE_CHECK_RUNS
+    assert "every check run" in rollup.caveat()
+
+
+def test_a_status_only_summary_is_distinct_from_a_complete_one():
+    """The provenance reaches the fingerprint too, so a token losing its
+    check access is a change the watch can see rather than a silent
+    downgrade."""
+    statuses = {"state": "success", "total_count": 1,
+                "statuses": [{"context": "buildkite", "state": "success"}]}
+
+    complete = summarize_checks(None, statuses)
+    status_only = summarize_checks(
+        None, statuses,
+        source=CHECKS_SOURCE_STATUS_ONLY,
+        unreadable=("check-runs", "actions-runs"),
+    )
+
+    assert complete != status_only
+    assert "source=status_only" in status_only

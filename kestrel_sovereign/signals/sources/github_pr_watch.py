@@ -105,6 +105,15 @@ DEFAULT_TRIGGERS: Tuple[str, ...] = ("state", "merge", "comments", "checks")
 # for a fine-grained PAT rather than a transient one.
 CHECKS_SOURCE_CHECK_RUNS = "check_runs"
 CHECKS_SOURCE_WORKFLOW_RUNS = "workflow_runs"
+# Both check endpoints refused and only legacy commit statuses were readable.
+# A real rollup, but not one that saw a single check run.
+CHECKS_SOURCE_STATUS_ONLY = "status_only"
+
+# "This endpoint will return up to 1,000 results for each search when using
+# the following parameters: actor, branch, check_suite_id, created, event,
+# head_sha, status." — GitHub, List workflow runs for a repository. The
+# fallback queries by ``head_sha``, so it is subject to this cap.
+ACTIONS_RESULT_CEILING = 1000
 
 
 class PRWatchError(Exception):
@@ -559,6 +568,28 @@ async def _github_get_workflow_runs(
     )
 
 
+def _actions_ceiling_hit(payload: Any) -> bool:
+    """Whether GitHub capped this ``head_sha`` query at its 1,000-result limit.
+
+    The shape is a ``total_count`` above what the crawl could ever collect,
+    with a full ceiling's worth in hand. It matters because
+    :func:`_check_verdict` lowers ``success`` to ``pending`` whenever the
+    rollup was read short — the right call for a page the fetch missed, and
+    the **wrong** one here, where the missing runs are unreachable by any
+    number of requests. Left alone it is a wait that can never settle, which
+    is the one state class this rollup must never reach (#2939).
+    """
+    if not isinstance(payload, dict):
+        return False
+    runs = [r for r in (payload.get("workflow_runs") or []) if isinstance(r, dict)]
+    total = payload.get("total_count")
+    return (
+        isinstance(total, int)
+        and total > len(runs)
+        and len(runs) >= ACTIONS_RESULT_CEILING
+    )
+
+
 def _workflow_runs_as_check_runs(payload: Any) -> Any:
     """Project an ``/actions/runs`` payload onto the check-runs shape.
 
@@ -571,7 +602,10 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
     ``total_count`` is carried across verbatim when GitHub sent one, so the
     unread-gate protection in :func:`_check_verdict` — which lowers
     ``success`` to ``pending`` when the rollup was read short — keeps
-    applying to the fallback.
+    applying to the fallback. The one exception is GitHub's own 1,000-result
+    ceiling (:func:`_actions_ceiling_hit`): those runs are unreachable rather
+    than merely unread, so the count is clamped to what was collected and the
+    shortfall is reported as a blind spot instead of as an open gate.
     """
     if not isinstance(payload, dict):
         return payload
@@ -587,6 +621,8 @@ def _workflow_runs_as_check_runs(payload: Any) -> Any:
             }
         )
     total = payload.get("total_count")
+    if _actions_ceiling_hit(payload):
+        total = len(runs)
     return {
         "total_count": total if isinstance(total, int) else len(runs),
         "check_runs": runs,
@@ -760,8 +796,18 @@ class CheckRollup:
                 "check runs from apps other than GitHub Actions (the Checks "
                 "API was refused; read via the Actions API instead)"
             )
+        elif self.source == CHECKS_SOURCE_STATUS_ONLY:
+            holes.append(
+                "every check run (the Checks and Actions APIs were both "
+                "refused; read from legacy commit statuses instead)"
+            )
         elif "check-runs" in self.unreadable:
             holes.append("all check runs (the Checks API was refused)")
+        if "actions-ceiling" in self.unreadable:
+            holes.append(
+                f"workflow runs beyond GitHub's {ACTIONS_RESULT_CEILING}-result "
+                f"ceiling for one head SHA"
+            )
         if not holes:
             holes.append("part of the rollup (" + ",".join(self.unreadable) + ")")
         return "this verdict cannot see " + "; ".join(holes)
@@ -833,17 +879,23 @@ async def fetch_check_rollup(
         unreadable.append("check-runs")
         check_runs = None
         try:
-            check_runs = _workflow_runs_as_check_runs(
-                await _github_get_workflow_runs(
-                    base, head_sha, token=token, timeout=timeout,
-                    ref=f"{ref} actions-runs",
-                )
+            workflow_runs = await _github_get_workflow_runs(
+                base, head_sha, token=token, timeout=timeout,
+                ref=f"{ref} actions-runs",
             )
+            if _actions_ceiling_hit(workflow_runs):
+                unreadable.append("actions-ceiling")
+            check_runs = _workflow_runs_as_check_runs(workflow_runs)
             source = CHECKS_SOURCE_WORKFLOW_RUNS
         except PRWatchAuthError as actions_exc:
             if actions_exc.status_code != 403:
                 raise
             unreadable.append("actions-runs")
+            # Neither check endpoint was readable. Whatever the status
+            # endpoint returns below is the whole rollup, and saying it came
+            # from ``check_runs`` would contradict ``unreadable`` in the same
+            # payload.
+            source = CHECKS_SOURCE_STATUS_ONLY
 
     # Not wrapped: a refused status read is not a degradable gate class.
     combined_status: Any = await _github_get(
