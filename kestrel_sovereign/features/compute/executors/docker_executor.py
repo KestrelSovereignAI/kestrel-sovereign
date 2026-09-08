@@ -112,8 +112,9 @@ class DockerExecutor(BaseExecutor):
         # is swept once older than the longest a script may run under the
         # policy this executor serves; the feature passes its configured
         # maximum, the default is the policy's shipped default.
-        self._legacy_staging_age_seconds = int(
-            legacy_staging_age_seconds or self.LEGACY_STAGING_AGE_SECONDS
+        self._legacy_staging_age_seconds = (
+            int(legacy_staging_age_seconds or self.LEGACY_STAGING_AGE_SECONDS)
+            + self.LEGACY_STAGING_GRACE_SECONDS
         )
 
     @property
@@ -592,6 +593,17 @@ class DockerExecutor(BaseExecutor):
     #: with every staged entry and is not.
     OWNER_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
+    #: Added to the legacy floor: a script may run for the whole maximum, and
+    #: its promotion happens only after the timeout fires, the container is
+    #: killed and its output drained, so the floor must exceed the maximum.
+    LEGACY_STAGING_GRACE_SECONDS = 15 * 60
+
+    #: The most wall-clock one sweep may spend asking Docker about dead
+    #: owners' containers. Each ``docker inspect`` is bounded, but the sweep
+    #: runs at the head of every script and a wedged daemon answers nothing;
+    #: directories not reached this run are left for the next.
+    SWEEP_INSPECT_BUDGET_SECONDS = 20.0
+
     #: Default for ``legacy_staging_age_seconds``: the compute policy's
     #: shipped maximum script timeout. A staging directory with NO owner
     #: record was made by code that wrote none (the leak this ticket closes,
@@ -714,6 +726,7 @@ class DockerExecutor(BaseExecutor):
             return
         legacy_cutoff = time.time() - self._legacy_staging_age_seconds
         suffix = self.STAGING_OWNER_SUFFIX
+        inspect_deadline = time.monotonic() + self.SWEEP_INSPECT_BUDGET_SECONDS
         for candidate in candidates:
             name = candidate.name
             if not name.startswith(".staging-"):
@@ -746,31 +759,60 @@ class DockerExecutor(BaseExecutor):
                 continue
             owner = self._read_owner_record(candidate.with_name(name + suffix))
             if owner is not None:
-                if self._owner_record_expired(owner):
+                expired = self._owner_record_expired(owner)
+                if not expired and self._pid_is_alive(owner["pid"]):
+                    continue
+                if owner["container"]:
+                    # A pid that is dead, or too old to be trusted, settles
+                    # nothing while Docker still knows the container.
+                    if time.monotonic() > inspect_deadline:
+                        logger.debug(
+                            "Sweep inspect budget spent; %s left for the next run", candidate
+                        )
+                        continue
+                    if await self._container_exists(docker_path, owner["container"]):
+                        continue
+                if expired:
                     logger.warning(
-                        "Staging directory %s is older than any script may run; "
-                        "its recorded pid %s is treated as reused and the "
-                        "directory is reaped.",
+                        "Staging directory %s is older than any script may run and "
+                        "Docker no longer knows its container; its recorded pid %s "
+                        "is treated as reused and the directory is reaped.",
                         candidate, owner["pid"],
                     )
-                elif self._pid_is_alive(owner["pid"]):
-                    continue
-                elif owner["container"] and await self._container_exists(
-                    docker_path, owner["container"]
-                ):
-                    continue
             elif st.st_mtime > legacy_cutoff:
                 continue
             self._promote_staged_trash(candidate, host_trash_dir)
 
-    @classmethod
-    def _owner_record_expired(cls, owner: Dict[str, object]) -> bool:
+    def _owner_record_expired(self, owner: Dict[str, object]) -> bool:
         """Whether the record is older than any script may run, so its pid
-        is no longer evidence of a live owner."""
+        is no longer evidence of a live owner (a reused pid answers
+        ``kill -0`` too). The bound follows the configured maximum when that
+        is longer than a week."""
         started = owner.get("started")
         if not isinstance(started, float):
             return False
-        return time.time() - started > cls.OWNER_MAX_AGE_SECONDS
+        bound = max(self.OWNER_MAX_AGE_SECONDS, 2 * self._legacy_staging_age_seconds)
+        return time.time() - started > bound
+
+    #: Where container-made hidden entries go. Not a ``.staging-`` name, so
+    #: the sweep never treats it or its contents as staging directories or
+    #: owner records; hidden, so the trash listing never shows it.
+    QUARANTINE_DIR_NAME = ".quarantine"
+
+    @classmethod
+    def _quarantine(cls, entry: Path, staging_dir: Path, host_trash_dir: Path) -> Path:
+        """Move ``entry`` into the quarantine; the name records which staging
+        directory it came from (the directory itself when moved whole)."""
+        quarantine = host_trash_dir / cls.QUARANTINE_DIR_NAME
+        quarantine.mkdir(mode=0o700, exist_ok=True)
+        label = staging_dir.name if entry == staging_dir else f"{staging_dir.name}-{entry.name}"
+        destination = quarantine / label
+        suffix = 0
+        while destination.exists() or destination.is_symlink():
+            suffix += 1
+            destination = quarantine / f"{label}.{suffix}"
+        entry.rename(destination)
+        return destination
 
     @classmethod
     def _remove_staging_owner(cls, staging_dir: Path) -> None:
@@ -823,16 +865,38 @@ class DockerExecutor(BaseExecutor):
                     # is whatever the container chose; a hidden name is one
                     # no rewriter-made trash entry ever has, and in the root
                     # it would pass for a staging directory or an owner
-                    # record the sweep trusts (review of #3117).
-                    logger.warning(
-                        "Refusing to promote %s staged by a container "
-                        "(symlink or hidden entry); removed.",
-                        entry,
-                    )
-                    if entry.is_dir() and not entry.is_symlink():
-                        shutil.rmtree(entry, ignore_errors=True)
-                    else:
+                    # record the sweep trusts (review of #3117). A link is
+                    # unlinked; anything else is moved aside into the
+                    # quarantine rather than deleted, because a container
+                    # can make a directory the host user cannot remove
+                    # (root-owned, or mode 0500) and a directory that will
+                    # not empty would keep this one, and its record, in the
+                    # root forever. A rename needs only this directory.
+                    if entry.is_symlink():
+                        logger.warning(
+                            "Refusing to promote symlink %s staged by a container; removed.",
+                            entry,
+                        )
                         entry.unlink()
+                        continue
+                    try:
+                        quarantined = cls._quarantine(entry, staging_dir, host_trash_dir)
+                    except OSError:
+                        # Moving a directory rewrites its own '..' entry, so
+                        # one the host user cannot write (mode 0500, or
+                        # root-owned) will not move; the whole staging
+                        # directory, which is ours, is moved aside below.
+                        logger.warning(
+                            "Refusing to promote hidden entry %s staged by a container; "
+                            "it cannot be moved on its own.",
+                            entry,
+                        )
+                        continue
+                    logger.warning(
+                        "Refusing to promote hidden entry %s staged by a container; "
+                        "moved to %s.",
+                        entry, quarantined,
+                    )
                     continue
                 destination = host_trash_dir / entry.name
                 suffix = 0
@@ -850,6 +914,16 @@ class DockerExecutor(BaseExecutor):
                 staging_dir.rmdir()
             except FileNotFoundError:
                 pass
+            except OSError:
+                # Something a container left could not be moved on its own.
+                # The staging directory itself is ours: move the whole of it
+                # aside so neither it nor its record stays in the root.
+                aside = cls._quarantine(staging_dir, staging_dir, host_trash_dir)
+                logger.warning(
+                    "Staging directory %s could not be emptied of container-made "
+                    "entries; moved whole to %s.",
+                    staging_dir, aside,
+                )
             cls._remove_staging_owner(staging_dir)
         except OSError:
             logger.warning(

@@ -337,21 +337,27 @@ container keeps running with the bind until the script ends; an inconclusive
 leaves it alone), and otherwise promoted and removed at once, record included;
 a record older than a week is treated as a reused pid and reaped regardless; one with no record at all is
 legacy (older code wrote none) and is swept once older than the compute
-policy's configured maximum script timeout. An orphan record whose directory is
-gone is reaped the same way. This is a host-side effect across agents: on a host
+policy's configured maximum script timeout plus a grace for the kill-and-capture
+tail. An orphan record whose directory is gone is reaped the same way. A record
+older than a week (or twice the configured maximum, whichever is longer) is
+treated as a reused pid, but still only reaped once Docker no longer knows its
+container; one sweep spends at most a bounded time asking Docker, and leaves the
+rest for the next run. This is a host-side effect across agents: on a host
 where several agents share the trash root, any agent's run reaps the directories
 that a crashed or killed process of another agent left behind, and the entries
 inside them become restorable from the shared root. The sweep never raises: a
 planted or damaged file must not turn every later run into a failure.
 
 The staging bind is the one writable mount a container gets, so nothing in the
-sweep or the promotion follows a symlink or trusts a hidden name: a link or a
-hidden entry planted in the bind is removed rather than promoted (no
-rewriter-made trash entry is ever hidden, and a promoted `.staging-*` directory
-or `.owner` file would pass for one the sweep trusts), and a link wearing a
-staging name in the root is never a sweep candidate. Hidden `.staging-*`
-entries are never listed or restorable by `trash_list`/`trash_restore` before
-promotion, by design.
+sweep or the promotion follows a symlink or trusts a hidden name: a link planted
+in the bind is unlinked rather than promoted, and a hidden entry is moved aside
+into `~/.kestrel/trash/.quarantine/` rather than deleted (no rewriter-made trash
+entry is ever hidden; a promoted `.staging-*` directory or `.owner` file would
+pass for one the sweep trusts; and a container can leave a directory the host
+user cannot remove, which must not keep the staging directory in the root). A
+link wearing a staging name in the root is never a sweep candidate. Hidden
+`.staging-*` entries are never listed or restorable by `list_trash` /
+`restore_from_trash` before promotion, by design.
 
 ### 3.4 Security Review Patterns
 

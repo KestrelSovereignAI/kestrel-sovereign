@@ -223,8 +223,8 @@ async def test_a_symlink_planted_in_the_bind_is_never_promoted_or_followed(
     # sweep itself must skip it, not hand it to promotion for refusal there.
     # The LINK is aged (utime without following), so only lstat keeps it out.
     os.symlink(str(victim), trash_root / ".staging-planted")
-    _age(trash_root / ".staging-planted", DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 3600)
-    _age(victim, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 3600)
+    _age(trash_root / ".staging-planted", DockerExecutor()._legacy_staging_age_seconds + 3600)
+    _age(victim, DockerExecutor()._legacy_staging_age_seconds + 3600)
     with caplog.at_level("DEBUG"):
         await asyncio.wait_for(executor.execute(_script()), timeout=2)  # sweeps
 
@@ -294,10 +294,10 @@ def test_a_legacy_directory_with_no_record_is_swept_only_past_the_default_timeou
     trash_root.mkdir()
     young = trash_root / ".staging-cccccccccccc"
     young.mkdir()
-    _age(young, DockerExecutor.LEGACY_STAGING_AGE_SECONDS - 60)
+    _age(young, DockerExecutor()._legacy_staging_age_seconds - 60)
     old = trash_root / ".staging-dddddddddddd"
     old.mkdir()
-    _age(old, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _age(old, DockerExecutor()._legacy_staging_age_seconds + 60)
 
     _sweep(trash_root)
 
@@ -312,7 +312,9 @@ def test_the_legacy_floor_defaults_to_the_shipped_maximum_and_follows_the_config
     passes its configured maximum, follows that: with a 24 h maximum a 2 h old
     record-less directory may be a live run and is left alone."""
     assert DockerExecutor.LEGACY_STAGING_AGE_SECONDS == ComputePolicy().max_timeout_seconds
-    assert DockerExecutor()._legacy_staging_age_seconds == ComputePolicy().max_timeout_seconds
+    grace = DockerExecutor.LEGACY_STAGING_GRACE_SECONDS
+    assert grace > 0
+    assert DockerExecutor()._legacy_staging_age_seconds == ComputePolicy().max_timeout_seconds + grace
     trash_root = tmp_path / "trash"
     trash_root.mkdir()
     two_hours_old = trash_root / ".staging-2h2h2h2h2h2h"
@@ -345,7 +347,9 @@ async def test_the_feature_passes_its_configured_maximum_to_the_executor(
     agent.storage_path = str(tmp_path / "agent.db")
     feature = ComputeFeature(agent)
     await feature.initialize()
-    assert feature.executors["docker"]._legacy_staging_age_seconds == 86400
+    assert feature.executors["docker"]._legacy_staging_age_seconds == (
+        86400 + DockerExecutor.LEGACY_STAGING_GRACE_SECONDS
+    )
     assert (tmp_path / "trash").is_dir(), "the feature used the patched trash root"
 
 
@@ -355,10 +359,10 @@ def test_an_unreadable_record_counts_as_no_record(tmp_path: Path):
     d = trash_root / ".staging-eeeeeeeeeeee"
     d.mkdir()
     (trash_root / f"{d.name}{OWNER}").write_text("not json")
-    _age(d, DockerExecutor.LEGACY_STAGING_AGE_SECONDS - 60)
+    _age(d, DockerExecutor()._legacy_staging_age_seconds - 60)
     _sweep(trash_root)
     assert d.is_dir(), "young and unreadable: left alone like a legacy directory"
-    _age(d, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _age(d, DockerExecutor()._legacy_staging_age_seconds + 60)
     _sweep(trash_root)
     assert not d.exists()
 
@@ -393,7 +397,7 @@ def test_an_orphan_record_is_reaped_once_its_owner_is_gone(tmp_path: Path):
     assert not dead.exists()
     assert live.is_file(), "its owner may be between writing the record and mkdir"
     assert garbage.is_file(), "unreadable and young: left alone"
-    _age(garbage, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _age(garbage, DockerExecutor()._legacy_staging_age_seconds + 60)
     _sweep(trash_root)
     assert not garbage.exists()
 
@@ -431,7 +435,7 @@ async def test_each_run_sweeps_before_staging_its_own(
     trash_root.mkdir()
     leaked = trash_root / ".staging-0123456789ab"
     leaked.mkdir()
-    _age(leaked, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _age(leaked, DockerExecutor()._legacy_staging_age_seconds + 60)
     _spawn_failure(monkeypatch)
 
     await asyncio.wait_for(executor.execute(_script()), timeout=2)
@@ -524,7 +528,7 @@ def test_a_record_that_is_not_ours_is_no_record(tmp_path: Path):
     trash_root.mkdir()
     d = trash_root / ".staging-forged000000"
     d.mkdir()
-    _age(d, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _age(d, DockerExecutor()._legacy_staging_age_seconds + 60)
     for forged in ('{"pid": 99999999999999999999}', '{"pid": 1.5}', '{"pid": true}', '[1]', '{"pid": -4}', "x" * 5000):
         (trash_root / f"{d.name}{OWNER}").write_text(forged)
         assert DockerExecutor._read_owner_record(trash_root / f"{d.name}{OWNER}") is None
@@ -674,6 +678,53 @@ def test_a_record_older_than_any_script_may_run_is_reaped_even_if_its_pid_answer
     assert fresh.is_dir(), "a young record naming a live pid is still an owner"
 
 
+@pytest.mark.asyncio
+async def test_an_expired_record_whose_container_docker_still_knows_is_kept(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    """Age alone is not proof of a reused pid; Docker's answer is."""
+    executor, trash_root = executor_with_trash
+    trash_root.mkdir()
+    old_live = trash_root / ".staging-oldbutlive00"
+    old_live.mkdir()
+    (trash_root / f"{old_live.name}{OWNER}").write_text(json.dumps({
+        "pid": 1, "container": "kestrel_compute_oldlive",
+        "started": time.time() - DockerExecutor.OWNER_MAX_AGE_SECONDS * 3,
+    }))
+
+    class _Exit:
+        def __init__(self, code):
+            self.returncode = code
+
+        async def wait(self):
+            return self.returncode
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "inspect"):
+            return _Exit(0)
+        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    await asyncio.wait_for(executor.execute(_script()), timeout=2)
+    assert old_live.is_dir()
+
+
+def test_the_expiry_bound_follows_a_long_configured_maximum(tmp_path: Path):
+    """With a ten-day maximum, a record eight days old names a run that may
+    still be in flight."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    d = trash_root / ".staging-longrun00000"
+    d.mkdir()
+    (trash_root / f"{d.name}{OWNER}").write_text(json.dumps({
+        "pid": os.getpid(), "container": None, "started": time.time() - 8 * 24 * 3600,
+    }))
+    _sweep(trash_root, legacy_staging_age_seconds=10 * 24 * 3600)
+    assert d.is_dir()
+    _sweep(trash_root)
+    assert not d.exists()
+
+
 def test_an_orphan_record_older_than_any_script_may_run_is_reaped_too(tmp_path: Path):
     trash_root = tmp_path / "trash"
     trash_root.mkdir()
@@ -683,3 +734,104 @@ def test_an_orphan_record_older_than_any_script_may_run_is_reaped_too(tmp_path: 
     }))
     _sweep(trash_root)
     assert not record.exists()
+
+
+# ---------------------------------------------------------------------------
+# Round 5: what a container leaves that the host cannot delete, and a bounded sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_directory_the_host_cannot_remove_is_quarantined_not_left_behind(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    """The review's P2: a hidden directory made unwritable defeated rmtree,
+    rmdir raised ENOTEMPTY, and the staging directory and its record stayed
+    in the root forever. Moving the entry aside needs only the staging
+    directory's own permission."""
+    executor, trash_root = executor_with_trash
+    made: dict = {}
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "rm"):
+            return _CompletedProcess()
+        staging = _staging_from(command)
+        hostile = staging / ".evil"
+        (hostile / "inner").mkdir(parents=True)
+        (hostile / "inner" / "f").write_text("x")
+        os.chmod(hostile / "inner", 0o500)
+        os.chmod(hostile, 0o500)
+        (staging / "rm_legit0001").mkdir()
+        (staging / "rm_legit0001" / "victim.txt").write_text("v")
+        made["staging"] = staging
+        return _SuccessfulProcess(b"ok", b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    try:
+        record = await asyncio.wait_for(executor.execute(_script()), timeout=2)
+        assert record.exit_code == 0
+        assert not made["staging"].exists()
+        assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
+        assert (trash_root / "rm_legit0001" / "victim.txt").read_text() == "v"
+        quarantine = trash_root / DockerExecutor.QUARANTINE_DIR_NAME
+        moved = list(quarantine.iterdir())
+        assert len(moved) == 1
+        # Either the entry moved on its own, or (an unwritable directory will
+        # not move) the whole staging directory was moved aside.
+        assert moved[0].name == made["staging"].name or moved[0].name.endswith("-.evil")
+        assert list(moved[0].rglob("f")), "the container's content is kept, not deleted"
+    finally:
+        for root, dirs, _files in os.walk(trash_root):
+            for d in dirs:
+                os.chmod(os.path.join(root, d), 0o700)
+
+
+def test_the_quarantine_is_never_a_sweep_candidate(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    quarantine = trash_root / DockerExecutor.QUARANTINE_DIR_NAME
+    (quarantine / ".staging-aaaaaaaaaaaa-.staging-forged").mkdir(parents=True)
+    _age(quarantine, 30 * 24 * 3600)
+    _sweep(trash_root)
+    assert (quarantine / ".staging-aaaaaaaaaaaa-.staging-forged").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_one_sweep_spends_a_bounded_time_asking_docker(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    """Five dead-owner directories, a daemon that answers slowly, a budget of
+    a fraction of a second: not every directory is inspected this run, and
+    none of the uninspected ones is reaped."""
+    executor, trash_root = executor_with_trash
+    trash_root.mkdir()
+    dirs = []
+    for i in range(5):
+        d = trash_root / f".staging-slowdaemon{i:02d}"
+        d.mkdir()
+        _write_owner(trash_root, d.name, _dead_pid(), container=f"kestrel_compute_slow{i}")
+        dirs.append(d)
+    monkeypatch.setattr(DockerExecutor, "SWEEP_INSPECT_BUDGET_SECONDS", 0.12)
+    inspected: list[str] = []
+
+    class _Exit:
+        returncode = 1
+
+        async def wait(self):
+            return 1
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "inspect"):
+            inspected.append(str(command[2]))
+            await asyncio.sleep(0.05)
+            return _Exit()
+        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    await asyncio.wait_for(executor.execute(_script()), timeout=5)
+
+    assert 0 < len(inspected) < 5
+    remaining = [d for d in dirs if d.exists()]
+    assert len(remaining) == 5 - len(inspected)
+    for d in remaining:
+        assert (trash_root / f"{d.name}{OWNER}").is_file()
