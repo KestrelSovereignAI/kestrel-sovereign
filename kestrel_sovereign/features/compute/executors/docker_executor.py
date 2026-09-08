@@ -9,22 +9,23 @@ import logging
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from kestrel_sovereign.kestrel_config.constants import SUBPROCESS_TIMEOUT_SHORT
 
+from ..destructive_policy import DestructiveOperationPolicy
+from ..models import ComputeCommand, ComputeScript, ExecutionRecord
 from .base import (
     BaseExecutor,
-    ExecutionError,
     ExecutionEnvironmentError,
+    ExecutionError,
     ExecutionTimeoutError,
     _ExecutionContext,
     _ExecutionResult,
 )
-from ..destructive_policy import DestructiveOperationPolicy
-from ..models import ComputeCommand, ComputeScript, ExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -219,9 +220,44 @@ class DockerExecutor(BaseExecutor):
         # read or corrupt entries trashed by previous runs and other agents.
         # Staged entries are promoted into the real trash root host-side
         # after the container exits (same filesystem, atomic renames).
+        self._promote_stale_staging_dirs(host_trash_dir)
         staging_dir = host_trash_dir / f".staging-{uuid.uuid4().hex[:12]}"
         staging_dir.mkdir(mode=0o700)
+        # Guarded from the moment it exists: every exit below (a policy
+        # rewrite that refuses the script, the script write, a docker binary
+        # that is not there when the process is spawned, a timeout) promotes
+        # and removes it. Before this guard began at the process wait, each
+        # failed launch left an empty hidden directory in the trash root
+        # that no listing could see: 589 of them on one host (#3117).
+        try:
+            return await self._run_staged_script(
+                script,
+                working_dir,
+                context,
+                docker_path=docker_path,
+                image=image,
+                container_name=container_name,
+                network=network,
+                mounts=mounts,
+                staging_dir=staging_dir,
+            )
+        finally:
+            self._promote_staged_trash(staging_dir, host_trash_dir)
 
+    async def _run_staged_script(
+        self,
+        script: ComputeScript,
+        working_dir: Optional[str],
+        context: _ExecutionContext,
+        *,
+        docker_path: str,
+        image: str,
+        container_name: str,
+        network: bool,
+        mounts: Optional[List[Dict[str, str]]],
+        staging_dir: Path,
+    ) -> _ExecutionResult:
+        """Rewrite, stage and run the script against an existing staging dir."""
         # Container mounts (/scripts, /workspace) are read-only, so no
         # workdir is authorized for direct deletion; every delete moves to
         # the trash bind mount.  The container cwd only resolves relative
@@ -287,12 +323,10 @@ class DockerExecutor(BaseExecutor):
                 ),
             )
         except TimeoutError:
-            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
-        finally:
-            # Promote staged trash entries even on timeout/failure: deletions
+            # The caller's guard still promotes staged entries: deletions
             # performed before the interruption already happened, and their
             # trash entries must stay restorable from the real trash root.
-            self._promote_staged_trash(staging_dir, host_trash_dir)
+            raise ExecutionTimeoutError(script.id, script.timeout_seconds) from None
 
         return _ExecutionResult(
             exit_code=process.returncode,
@@ -528,6 +562,39 @@ class DockerExecutor(BaseExecutor):
             stderr=stderr,
             container_id=container_name,
         )
+
+    #: A staging directory older than this belongs to no live execution: a
+    #: script may run for at most the compute policy's maximum timeout (one
+    #: hour by default, KESTREL_COMPUTE_MAX_TIMEOUT), so a day is beyond any
+    #: configured run. Younger ones may be another process's bind mount and
+    #: are left alone.
+    STALE_STAGING_AGE_SECONDS = 24 * 60 * 60
+
+    @classmethod
+    def _promote_stale_staging_dirs(cls, host_trash_dir: Path) -> None:
+        """Promote and remove staging directories no execution still owns.
+
+        A failed launch used to leave its ``.staging-*`` directory behind
+        (#3117), and the trash listing hides dot-directories by design, so
+        nothing in band ever showed the accumulation. Each script run sweeps
+        the root before staging its own: a stale directory's entries (if any)
+        are promoted into the real trash root, then it is removed. Best-effort
+        and logged, like promotion itself.
+        """
+        try:
+            candidates = list(host_trash_dir.iterdir())
+        except OSError:
+            return
+        cutoff = time.time() - cls.STALE_STAGING_AGE_SECONDS
+        for candidate in candidates:
+            if not candidate.name.startswith(".staging-"):
+                continue
+            try:
+                if not candidate.is_dir() or candidate.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            cls._promote_staged_trash(candidate, host_trash_dir)
 
     @staticmethod
     def _promote_staged_trash(staging_dir: Path, host_trash_dir: Path) -> None:
