@@ -44,6 +44,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
     invocation_id_response_header,
+    register_request_delivery,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
@@ -69,7 +70,7 @@ async def _register_bridge_request(agent, request_id: str) -> None:
     """Publish an early bridge lifecycle before any bridge-side writes."""
 
     if hasattr(agent, "register_active_request"):
-        agent.register_active_request(request_id)
+        register_request_delivery(agent, request_id, nested=False)
         await_admission = getattr(
             type(agent), "await_durable_request_admission", None
         )

@@ -90,6 +90,25 @@ def validate_invocation_id(value: object) -> str:
     return value
 
 
+def register_request_delivery(
+    agent: object,
+    request_id: str,
+    *,
+    nested: bool,
+) -> object:
+    """Register an explicit delivery boundary with legacy-agent compatibility."""
+
+    registrar = getattr(agent, "register_active_request")
+    try:
+        parameters = inspect.signature(registrar).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_boundary = any(parameter.name == "nested" for parameter in parameters)
+    if supports_boundary:
+        return registrar(request_id, nested=nested)
+    return registrar(request_id)
+
+
 def invocation_id_response_header(value: object) -> str:
     """Return an ASCII-safe representation of an accepted invocation ID.
 
@@ -312,7 +331,11 @@ def bind_async_invocation(
                         None,
                     )
                     if callable(register):
-                        register(lifecycle_owner, invocation_id)
+                        register_request_delivery(
+                            lifecycle_owner,
+                            invocation_id,
+                            nested=True,
+                        )
                         registered = True
                 try:
                     if registered:
