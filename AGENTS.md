@@ -143,17 +143,46 @@ one tool's argv stops being true the moment that tool changes or goes away.
 **The verdict must arrive whole, and that is a separate gate.** `shell`
 tokenizes with `shlex` and hands an argv vector to a backend — no shell
 interprets the string (#3129). So `> review.txt` is not a redirect, it is a
-literal argument, and `... | tail` is not a pipe, it is three extra arguments
-to a command that then prints everything and exits 0. Neither a file hatch nor
-a pager is available to a governed caller; the review has to come back through
-the ToolResult, and each of stdout and stderr is capped at 1 MiB with
-`truncated_stdout: true` set on the result.
+literal argument; `... | tail` is not a pipe, it is three extra arguments to a
+command that then prints everything and exits 0; and `cd <worktree> && ...` is
+refused as shell grammar before anything runs.
 
-**A truncated review is a gate FAILURE, not a verdict** — it is the same shape
-as the dead-reviewer case above: plausible text, no completed judgement. Check
-`truncated_stdout` before reading findings, and if it is set, say the gate was
-not met rather than reporting what arrived. Tracked as #3243, filed by the
-agent this rule kept blocking.
+**#3243 gives `shell` the two constructs that line needed**, performed by the
+runtime rather than by a shell it does not have. Two parameters:
+
+* **`cwd=<worktree>`** — replaces `cd <worktree> &&`. Policy-checked, and
+  relative paths in the command resolve against it.
+* **`capture_output=true`** — replaces `> review.txt`. stdout and stderr are
+  written to runtime-owned files; the result carries `stdout_path`,
+  `stderr_path` and a `manifest_path`, and the inline text becomes a bounded
+  preview showing the head *and the tail*, so a verdict at the end of a long
+  review is visible without opening the file. There is no cap on the file: the
+  child writes to it directly.
+
+The manifest records what ran, where, how it ended, and the git `HEAD` before
+and after. **A verdict is about one tree.** During the 2026-08-31 run the head
+moved three times in eight hours; `git.head_moved` is how you can tell a
+verdict was about a tree that no longer exists, and re-running is the answer
+when it is `true`.
+
+**A truncated or timed-out review is a gate FAILURE, not a verdict** — the same
+shape as the dead-reviewer case above: plausible text, no completed judgement.
+Read **`complete`** on the result. It is the conjunction of every way the run
+could be less than whole (timed out, stdout clipped, stderr clipped), so
+checking it cannot be satisfied by remembering only one of them, and the same
+field is on the manifest. Such a run now also comes back PARTIAL rather than
+OK even when the process exited 0 — "the process exited 0" and "the work
+finished" are different claims, and only the second is a verdict.
+
+Until #3243 shipped this paragraph asked you to check `truncated_stdout`, which
+`shell` computed in the backend and **never put in its result**. The rule was
+unfollowable, not merely hard. If a rule here names a field, and the field is
+not in what you get back, that is a defect to file, not an instruction to
+approximate.
+
+**This form has not yet been run by an agent.** Run it once and report what
+came back — the parameter names, the preview shape, whether the verdict was
+visible without opening the file — before it is treated as settled procedure.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
