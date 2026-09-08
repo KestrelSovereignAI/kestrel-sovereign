@@ -1232,12 +1232,17 @@ class RestartCoordinatorFeature(Feature):
         )
 
     def _agent_requester_id(self) -> Optional[str]:
-        """Return the trusted durable principal bound to this feature instance."""
+        """Return the trusted durable principal bound to this feature instance,
+        or ``None`` when the agent has no durable identity.
 
-        value = getattr(self.agent, "did", None)
-        if not isinstance(value, str) or not value.strip():
+        The same guard as every other self-scoped read in this feature
+        (#3251); the readers that call this already treat ``None`` as
+        "no requester", so the refusal keeps that shape.
+        """
+        try:
+            return self._scoped_agent_did()
+        except AgentIdentityUnavailable:
             return None
-        return value.strip()
 
     @tool(
         name="restart_coordinator",

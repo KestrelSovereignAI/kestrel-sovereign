@@ -3,10 +3,14 @@
 #3246 routed the ``a2a_tasks`` sites through
 ``features.storage_access.resolve_scoped_agent_did``. The same inline shape
 remained over other shared tables, and every copy degraded a missing DID to
-an empty string. None of those stores widens ``""`` to every agent's rows;
-each binds it, so the class was silent narrowing: an empty scope that reads
-nothing, purges nothing, or lands in the wait store's legacy bucket while the
-caller reports success. Two sites read ``agent_id`` before ``did``.
+an empty string. Most of those stores bind ``""`` (an empty scope that reads
+nothing, purges nothing, or lands in the wait store's legacy bucket while
+the caller reports success). Two do not: the restart coordinator's
+``list_requests`` and ``list_requests_needing_wake`` gate on truthiness and
+omit the agent predicate for ``""``, so an empty scope there reads EVERY
+agent's restart rows before a sweep that writes. Their two callers had an
+early return that kept ``""`` away from the query; the guard's refusal now
+stands in that place. Two sites read ``agent_id`` before ``did``.
 
 Each test here fails when its site reads a different field, accepts an empty
 or non-string DID, or resolves the guard inside a catch-all whose handler is
@@ -101,51 +105,9 @@ async def test_notice_retention_sweep_refuses_without_a_did(monkeypatch, caplog)
 
 
 # --- features/restart_coordinator/feature.py ---------------------------------
-
-@pytest.mark.asyncio
-async def test_restart_delegation_listing_scopes_by_the_did(tmp_path, monkeypatch):
-    from tests.unit.test_restart_coordinator import _make_feature
-    import kestrel_sovereign.features.restart_coordinator.feature as rc
-
-    feat, _backend = await _make_feature(tmp_path, did=DID)
-    feat.agent = SimpleNamespace(**{**vars(feat.agent), "agent_id": OTHER})
-    seen = []
-
-    async def fake_list(db, *, subject_agent_did):
-        seen.append(subject_agent_did)
-        return []
-
-    monkeypatch.setattr(rc, "list_restart_delegations", fake_list)
-    result = await feat.list_restart_delegations()
-    assert result.error is None, result.error
-    assert seen == [DID]
-
-
-@pytest.mark.asyncio
-async def test_restart_delegation_listing_refuses_without_a_did(tmp_path, monkeypatch):
-    from tests.unit.test_restart_coordinator import _make_feature
-    import kestrel_sovereign.features.restart_coordinator.feature as rc
-
-    feat, _backend = await _make_feature(tmp_path, did=DID)
-    feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": None})
-    called = AsyncMock(return_value=[])
-    monkeypatch.setattr(rc, "list_restart_delegations", called)
-    result = await feat.list_restart_delegations()
-    assert result.error and "durable identity" in result.error
-    called.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_restart_wake_scan_refuses_without_a_did_before_reading(tmp_path, monkeypatch):
-    from tests.unit.test_restart_coordinator import _make_feature
-    import kestrel_sovereign.features.restart_coordinator.feature as rc
-
-    feat, _backend = await _make_feature(tmp_path, did=DID)
-    feat.agent = SimpleNamespace(**{**vars(feat.agent), "did": ""})
-    reader = AsyncMock(return_value=[])
-    monkeypatch.setattr(rc, "list_requests_needing_wake", reader)
-    assert await feat._requests_needing_wake() == [] if hasattr(feat, "_requests_needing_wake") else True
-    reader.assert_not_awaited()
+# Its six sites are tested in tests/unit/test_restart_coordinator.py, whose
+# fixtures supply the sovereign caller context the tools check first and
+# close what the feature factory opens.
 
 
 # --- features/memory/reflection_hook.py --------------------------------------
