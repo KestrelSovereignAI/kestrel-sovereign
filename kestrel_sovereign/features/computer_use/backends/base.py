@@ -45,8 +45,37 @@ class DirEntry:
 
 
 @dataclass(frozen=True)
+class CaptureTarget:
+    """Where a run's output should be written instead of returned inline.
+
+    The governed ``shell`` surface has no shell, so ``> review.txt`` is a
+    literal argv token rather than a redirect (#3129/#3130) and there is no
+    way for a caller to ask for one. A long review therefore had to come back
+    through the tool result, which is capped — and a review truncated
+    mid-argument still ends in something that reads like a verdict (#3243).
+
+    A capture is the redirect the caller cannot write, performed by the
+    backend on the caller's behalf. The paths are chosen by the runtime, not
+    by the agent: this is deliberately NOT a general write primitive, so it
+    grants no filesystem reach the shell tool did not already have.
+    """
+
+    stdout_path: Path
+    stderr_path: Path
+
+
+@dataclass(frozen=True)
 class CompletedRun:
-    """Result of a shell exec."""
+    """Result of a shell exec.
+
+    ``truncated_*`` and ``timed_out`` are claims about *this result's
+    completeness*, and every backend must set them honestly: a caller cannot
+    tell a whole answer from a clipped one by looking at the text, which is
+    the entire failure mode #3243 exists to close.
+
+    ``stdout_path``/``stderr_path`` are set when a :class:`CaptureTarget` was
+    given, and name files holding the run's complete output.
+    """
 
     argv: list[str]
     returncode: int
@@ -56,6 +85,8 @@ class CompletedRun:
     truncated_stdout: bool = False
     truncated_stderr: bool = False
     timed_out: bool = False
+    stdout_path: str | None = None
+    stderr_path: str | None = None
 
 
 class SandboxBackend(ABC):
@@ -86,8 +117,16 @@ class SandboxBackend(ABC):
         cwd: Path | None,
         env: dict[str, str] | None,
         timeout: int,
+        capture: "CaptureTarget | None" = None,
     ) -> CompletedRun:
-        """Run ``argv`` and return its result."""
+        """Run ``argv`` and return its result.
+
+        When ``capture`` is given the backend writes the run's output to
+        those paths and sets ``stdout_path``/``stderr_path`` on the result.
+        A backend that cannot capture without losing output must still say
+        so through ``truncated_stdout``/``truncated_stderr`` rather than
+        returning a clipped file as though it were whole.
+        """
 
     async def shutdown(self) -> None:
         """Optional cleanup. Default: no-op."""

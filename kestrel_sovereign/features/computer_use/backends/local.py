@@ -20,6 +20,7 @@ from kestrel_sovereign.security.subprocess_env import sanitized_subprocess_env
 
 from .base import (
     CapabilityBlocked,
+    CaptureTarget,
     CompletedRun,
     DirEntry,
     SandboxBackend,
@@ -75,7 +76,21 @@ class LocalSandboxBackend(SandboxBackend):
         cwd: Path | None,
         env: dict[str, str] | None,
         timeout: int,
+        capture: CaptureTarget | None = None,
     ) -> CompletedRun:
+        """Run ``argv`` on the host.
+
+        Without a capture, output is buffered in memory and clipped at
+        ``_MAX_OUTPUT_BYTES`` on the way back — with the clip declared.
+
+        With a capture, the child's stdout and stderr are handed the open
+        files as their own descriptors, so the bytes go from the process to
+        the disk without passing through this one. That is what makes the
+        artifact durable rather than merely re-serialized: there is no cap to
+        exceed, no buffer to exhaust, and nothing to truncate. It is also
+        exactly what the shell redirect this surface cannot express would
+        have done (#3243).
+        """
         if not argv:
             raise ValueError("empty argv")
 
@@ -83,38 +98,80 @@ class LocalSandboxBackend(SandboxBackend):
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *full_argv,
-                cwd=str(cwd) if cwd else None,
-                env=sanitized_subprocess_env(env),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            return CompletedRun(
-                argv=list(argv),
-                returncode=127,
-                stdout="",
-                stderr=str(exc),
-                duration_ms=duration_ms,
-            )
-
-        timed_out = False
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            timed_out = True
-            proc.kill()
+        out_fh = err_fh = None
+        if capture is not None:
             try:
-                stdout_bytes, stderr_bytes = await proc.communicate()
-            except Exception:  # noqa: BLE001
-                stdout_bytes, stderr_bytes = b"", b""
+                out_fh, err_fh = await asyncio.to_thread(_open_capture, capture)
+            except OSError as exc:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                return CompletedRun(
+                    argv=list(argv),
+                    returncode=-1,
+                    stdout="",
+                    stderr=f"could not open capture file: {exc}",
+                    duration_ms=duration_ms,
+                )
+
+        try:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *full_argv,
+                    cwd=str(cwd) if cwd else None,
+                    env=sanitized_subprocess_env(env),
+                    stdout=out_fh if out_fh is not None else asyncio.subprocess.PIPE,
+                    stderr=err_fh if err_fh is not None else asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError as exc:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                return CompletedRun(
+                    argv=list(argv),
+                    returncode=127,
+                    stdout="",
+                    stderr=str(exc),
+                    duration_ms=duration_ms,
+                    stdout_path=str(capture.stdout_path) if capture else None,
+                    stderr_path=str(capture.stderr_path) if capture else None,
+                )
+
+            timed_out = False
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+                proc.kill()
+                try:
+                    stdout_bytes, stderr_bytes = await proc.communicate()
+                except Exception:  # noqa: BLE001
+                    stdout_bytes, stderr_bytes = b"", b""
+        finally:
+            # The child holds its own duplicated descriptors; closing ours
+            # here neither truncates the file nor races the write.
+            for fh in (out_fh, err_fh):
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except OSError:  # pragma: no cover - defensive
+                        pass
 
         duration_ms = int((time.monotonic() - started) * 1000)
+        if capture is not None:
+            # ``communicate`` returns None for a stream it did not pipe.
+            # Nothing was buffered, so nothing could have been clipped.
+            return CompletedRun(
+                argv=list(argv),
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout="",
+                stderr="",
+                duration_ms=duration_ms,
+                truncated_stdout=False,
+                truncated_stderr=False,
+                timed_out=timed_out,
+                stdout_path=str(capture.stdout_path),
+                stderr_path=str(capture.stderr_path),
+            )
+
         out, out_trunc = _truncate(stdout_bytes)
         err, err_trunc = _truncate(stderr_bytes)
         return CompletedRun(
@@ -127,6 +184,24 @@ class LocalSandboxBackend(SandboxBackend):
             truncated_stderr=err_trunc,
             timed_out=timed_out,
         )
+
+
+def _open_capture(capture: CaptureTarget):
+    """Open both capture files for writing, creating parents.
+
+    Opened ``wb`` rather than appended: a capture path names one run's
+    output, and a stale body under a fresh run's manifest would read as that
+    run's output.
+    """
+    capture.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    capture.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    out_fh = open(capture.stdout_path, "wb")
+    try:
+        err_fh = open(capture.stderr_path, "wb")
+    except OSError:
+        out_fh.close()
+        raise
+    return out_fh, err_fh
 
 
 def _truncate(data: bytes) -> tuple[str, bool]:

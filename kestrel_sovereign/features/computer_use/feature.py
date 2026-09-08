@@ -46,9 +46,11 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sdk.tools.base import ToolCategory
 
+from . import capture
 from .audit import AuditLog, AuditRecord
 from .backends import (
     CapabilityBlocked,
+    CaptureTarget,
     DockerSandboxBackend,
     LocalSandboxBackend,
     SandboxBackend,
@@ -259,6 +261,7 @@ class ComputerUseFeature(Feature):
         self._binary_policy: Optional[BinaryPolicy] = None
         self._audit: Optional[AuditLog] = None
         self._max_read_bytes: int = 5_000_000
+        self._capture_dir: Path = Path(".kestrel/computer_use_captures")
 
     @property
     def tool_description(self) -> str:
@@ -330,6 +333,11 @@ class ComputerUseFeature(Feature):
 
         audit_path = self._cfg.get("audit_log_path", ".kestrel/computer_use_audit.jsonl")
         self._audit = AuditLog(audit_path, agent=self.agent)
+        # Runtime-owned, deliberately not agent-nameable. See capture.py for
+        # why the path is allocated rather than accepted as a parameter.
+        self._capture_dir = Path(
+            self._cfg.get("capture_dir", ".kestrel/computer_use_captures")
+        ).expanduser()
 
         granted = self._granted_capabilities()
         backend_name = self._cfg.get("backend", "docker")
@@ -498,6 +506,7 @@ class ComputerUseFeature(Feature):
         path_arg: Optional[str] = None,
         write: bool = False,
         argv: Optional[list[str]] = None,
+        cwd_arg: Optional[str] = None,
         pre_approval: Optional[_PreApprovalHook] = None,
     ) -> _GateOutcome:
         """Run the full gate sequence and audit on every refusal.
@@ -610,7 +619,41 @@ class ComputerUseFeature(Feature):
             # search pattern) are ignored to avoid spurious prompts; a
             # deny hit is honored regardless of existence since deny
             # patterns match by prefix.
-            argv_path = evaluate_argv_paths(argv, self._path_policy)
+            # 4.3 The working directory, when one was named. It is not an
+            # argument to the binary, so ``evaluate_argv_paths`` never sees
+            # it, and it is the most consequential path in the call: every
+            # relative token in the command resolves against it. Read
+            # semantics — running in a directory is not writing to it — but
+            # a deny hit is a deny, exactly as it is for a file argument.
+            if cwd_arg is not None:
+                try:
+                    resolved_cwd = resolve_realpath(cwd_arg)
+                except PathSafetyError as exc:
+                    payload["raw_cwd"] = cwd_arg
+                    await self._audit_denied(
+                        tool_name,
+                        payload,
+                        allowed_by + ["denied:path_safety"],
+                        error=str(exc),
+                    )
+                    return _GateOutcome(False, allowed_by, f"path_safety:{exc}")
+                payload["cwd"] = str(resolved_cwd)
+                cwd_decision = self._path_policy.evaluate(resolved_cwd, write=False)
+                if cwd_decision.decision is Decision.DENY:
+                    payload["rule"] = cwd_decision.rule
+                    await self._audit_denied(
+                        tool_name, payload, allowed_by + ["denied:policy:cwd"]
+                    )
+                    return _GateOutcome(False, allowed_by, f"policy:cwd:{cwd_decision.rule}")
+                if cwd_decision.decision is Decision.REQUIRE_APPROVAL:
+                    require_approval = True
+
+            # Relative argv tokens resolve against the working directory the
+            # command will actually run in; vetting them against the process
+            # cwd would check paths that are not the ones being opened.
+            argv_path = evaluate_argv_paths(
+                argv, self._path_policy, cwd=payload.get("cwd")
+            )
             if argv_path.decision is Decision.DENY:
                 payload["rule"] = argv_path.rule
                 payload["denied_path"] = argv_path.path
@@ -1089,7 +1132,13 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
-    async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
+    async def shell(
+        self,
+        command: str,
+        timeout: int | str = 60,
+        cwd: str | None = None,
+        capture_output: bool | str = False,
+    ) -> ToolResult:
         """Run a command after policy + (conditional) approval.
 
         Approval semantics (#1694):
@@ -1124,20 +1173,48 @@ class ComputerUseFeature(Feature):
         (#3130). Quoting is offered instead, because a quoted word is
         inert to bash and to ``shlex`` alike.
 
+        ``cwd`` and ``capture_output`` are the two halves of the
+        documented merge-gate form that this surface could not execute
+        (#3243)::
+
+            cd <worktree> && claude -p --model <opus> "Review..." > review.txt
+
+        Both ``&&`` and ``>`` are shell grammar, refused above; quoting them
+        makes them literal arguments to the reviewer rather than a change of
+        directory and a redirect. Rather than reintroduce a shell to parse
+        two constructs, the runtime performs them: ``cwd`` is passed to the
+        backend, and ``capture_output`` has the backend write the run's
+        output to runtime-owned files. See :mod:`.capture`.
+
+        Truncation and timeout are never success. A capped review still ends
+        in a paragraph that reads like a verdict, and a killed one exits with
+        whatever status it had reached, so a caller reading only ``returncode``
+        cannot tell a finished review from an interrupted one. Any run that is
+        incomplete in either sense returns PARTIAL with the reason in the
+        caveat, whatever it exited with.
+
         Args:
             command: The command to run; tokenized with shlex and
                 executed directly, without a shell.
             timeout: Wall-clock seconds before the process is killed. Coerced
                 to int at the boundary; a non-numeric value is rejected.
+            cwd: Directory to run in. Policy-checked with read semantics,
+                and relative argv tokens are resolved against it.
+            capture_output: When true, stdout and stderr are written to
+                runtime-owned files and the result carries their paths plus a
+                manifest recording what ran, how it ended, and the git HEAD
+                before and after. The inline output becomes a bounded preview
+                of a complete artifact — which is not truncation, and does
+                not set ``truncated_stdout``.
 
         Returns:
-            ToolResult.ok when the command exits 0; ERROR when the
-            command uses shell syntax this tool cannot honour; PARTIAL when the
-            command ran but exited non-zero or timed out (the LLM
-            should NOT claim success — but the shell did run, which
-            matters for audit and for follow-up steps that read
-            stdout/stderr); ERROR for empty-command, gate denial,
-            or any backend exception.
+            ToolResult.ok when the command exits 0 AND ran to completion
+            with nothing clipped; ERROR when the command uses shell syntax
+            this tool cannot honour; PARTIAL when the command ran but exited
+            non-zero, timed out, or had its output clipped (the LLM should
+            NOT claim success — but the shell did run, which matters for
+            audit and for follow-up steps that read stdout/stderr); ERROR for
+            empty-command, gate denial, or any backend exception.
         """
         argv = split_command(command)
         if not argv:
@@ -1158,6 +1235,22 @@ class ComputerUseFeature(Feature):
                 error=f"timeout must be a positive number of seconds, got {timeout}"
             )
 
+        # Same boundary discipline as ``timeout``: the LLM may send the
+        # string "true". An unrecognised value is rejected rather than read
+        # as false, because silently not capturing is how a caller ends up
+        # reasoning from a clipped result believing it has a file.
+        if isinstance(capture_output, str):
+            lowered = capture_output.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                capture_output = True
+            elif lowered in ("false", "0", "no", "off", ""):
+                capture_output = False
+            else:
+                return ToolResult.failed(
+                    error=f"capture_output must be a boolean, got {capture_output!r}"
+                )
+        capture_output = bool(capture_output)
+
         # Capability depends on which backend is wired up; gate semantics
         # treat the two as distinct constitutional grants.
         capability = (
@@ -1174,7 +1267,9 @@ class ComputerUseFeature(Feature):
                 "binary": Path(argv[0]).name,
                 "backend": self._backend.name if self._backend else "uninitialized",
                 "timeout": timeout,
+                "capture_output": capture_output,
             },
+            cwd_arg=cwd,
             # Pass the RAW command (not the pre-tokenized argv) so
             # ``BinaryPolicy.evaluate`` can apply its compound-command
             # guard (#1694 codex review P1). Argv-list inputs are
@@ -1185,24 +1280,97 @@ class ComputerUseFeature(Feature):
             return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
+        resolved_cwd = Path(payload["cwd"]) if payload.get("cwd") else None
+        bundle = capture.allocate(self._capture_dir) if capture_output else None
+        head_before = await capture.git_head(resolved_cwd) if bundle else None
+        started_at = capture.utcnow()
         started = time.monotonic()
         try:
-            result = await self._backend.exec(argv, cwd=None, env=None, timeout=timeout)
+            result = await self._backend.exec(
+                argv,
+                cwd=resolved_cwd,
+                env=None,
+                timeout=timeout,
+                capture=(
+                    CaptureTarget(
+                        stdout_path=bundle.stdout_path,
+                        stderr_path=bundle.stderr_path,
+                    )
+                    if bundle
+                    else None
+                ),
+            )
             duration_ms = int((time.monotonic() - started) * 1000)
+
+            # Three distinct ways this run can be less than a whole answer.
+            # They are collected in one place because a caller who checks
+            # only the one they remembered is the #3243 failure repeating.
+            clipped = bool(result.truncated_stdout or result.truncated_stderr)
+            incomplete = bool(result.timed_out or clipped)
+
+            manifest_path = None
+            if bundle is not None:
+                head_after = await capture.git_head(resolved_cwd)
+                body = capture.build_manifest(
+                    bundle=bundle,
+                    argv=argv,
+                    cwd=resolved_cwd,
+                    backend=self._backend.name,
+                    started_at=started_at,
+                    finished_at=capture.utcnow(),
+                    duration_ms=result.duration_ms,
+                    returncode=result.returncode,
+                    timed_out=result.timed_out,
+                    truncated_stdout=result.truncated_stdout,
+                    truncated_stderr=result.truncated_stderr,
+                    head_before=head_before,
+                    head_after=head_after,
+                )
+                await capture.write_manifest(bundle, body)
+                manifest_path = str(bundle.manifest_path)
+
+            succeeded = result.returncode == 0 and not incomplete
             await self._audit_run(
                 tool_name="shell",
-                payload={**payload, "returncode": result.returncode},
+                payload={
+                    **payload,
+                    "returncode": result.returncode,
+                    "timed_out": result.timed_out,
+                    "truncated": clipped,
+                    "manifest_path": manifest_path,
+                },
                 allowed_by=outcome.allowed_by,
-                outcome="ok" if result.returncode == 0 else "error",
+                outcome="ok" if succeeded else "error",
                 duration_ms=duration_ms,
-                error=None if result.returncode == 0 else f"exit {result.returncode}",
+                error=None if succeeded else f"exit {result.returncode}",
             )
+
+            # With a capture, the inline text is a bounded window onto a
+            # complete file. That is a preview, not a truncation, so it is
+            # read back here rather than being reported as lost output.
+            stdout_text = (
+                capture.preview(bundle.stdout_path) if bundle else result.stdout
+            )
+            stderr_text = (
+                capture.preview(bundle.stderr_path) if bundle else result.stderr
+            )
+
             data = {
                 "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
                 "duration_ms": result.duration_ms,
                 "timed_out": result.timed_out,
+                # Surfaced at last. The backends have computed these since
+                # the feature was written and ``shell`` dropped both, so a
+                # caller could not have honoured them even intending to.
+                "truncated_stdout": result.truncated_stdout,
+                "truncated_stderr": result.truncated_stderr,
+                "complete": not incomplete,
+                "stdout_path": result.stdout_path,
+                "stderr_path": result.stderr_path,
+                "manifest_path": manifest_path,
+                "cwd": str(resolved_cwd) if resolved_cwd else None,
             }
             # Render stdout/stderr inside the confirmation so the
             # !shell CLI surface keeps showing the command output —
@@ -1210,30 +1378,48 @@ class ComputerUseFeature(Feature):
             # scalar-only ``data`` (the structural-payload heuristic
             # only fires on list/nested-dict values), so the user-
             # visible payload has to live in ``confirmation``.
-            stdout_block = (
-                f"\nstdout:\n{result.stdout}" if result.stdout else ""
+            stdout_block = f"\nstdout:\n{stdout_text}" if stdout_text else ""
+            stderr_block = f"\nstderr:\n{stderr_text}" if stderr_text else ""
+            artifact_block = (
+                f"\nartifact: {manifest_path}" if manifest_path else ""
             )
-            stderr_block = (
-                f"\nstderr:\n{result.stderr}" if result.stderr else ""
-            )
-            if result.returncode == 0:
+            if succeeded:
                 return ToolResult.ok(
                     f"Command ran successfully (rc=0, {result.duration_ms}ms)."
+                    + artifact_block
                     + stdout_block
                     + stderr_block,
                     data=data,
                 )
-            # Non-zero exit: PARTIAL — the shell ran (so audit / follow-up
-            # tooling that reads stdout/stderr is meaningful) but the
-            # LLM must not claim success.
-            stderr_tail = (result.stderr or "")[-200:].strip()
-            caveat = (
-                f"command exited rc={result.returncode}"
-                + (" (timed out)" if result.timed_out else "")
-                + (f"; stderr tail: {stderr_tail}" if stderr_tail else "")
-            )
+            # Not a whole success: non-zero exit, a timeout, or clipped
+            # output. PARTIAL for all three — the shell ran (so audit and
+            # follow-up steps that read stdout/stderr are meaningful) but
+            # the LLM must not claim success. A timed-out or clipped run
+            # reaches here even on rc=0, because "the process exited 0"
+            # and "the work finished" are different claims and only the
+            # second one is a verdict.
+            stderr_tail = (stderr_text or "")[-200:].strip()
+            reasons = []
+            if result.returncode != 0:
+                reasons.append(f"exited rc={result.returncode}")
+            if result.timed_out:
+                reasons.append(f"timed out after {timeout}s and was killed")
+            if result.truncated_stdout:
+                reasons.append("stdout was clipped at the output cap")
+            if result.truncated_stderr:
+                reasons.append("stderr was clipped at the output cap")
+            caveat = "command " + "; ".join(reasons)
+            if incomplete:
+                caveat += (
+                    " — this output is INCOMPLETE and must not be read as a "
+                    "finished result"
+                )
+            if stderr_tail:
+                caveat += f"; stderr tail: {stderr_tail}"
             return ToolResult.partial(
-                f"Command ran but failed (rc={result.returncode}, {result.duration_ms}ms)."
+                f"Command ran but did not complete cleanly "
+                f"(rc={result.returncode}, {result.duration_ms}ms)."
+                + artifact_block
                 + stdout_block
                 + stderr_block,
                 caveat,

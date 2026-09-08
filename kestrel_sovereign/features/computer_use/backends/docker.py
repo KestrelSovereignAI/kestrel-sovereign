@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from .base import (
+    CaptureTarget,
     CompletedRun,
     DirEntry,
     SandboxBackend,
@@ -103,11 +104,36 @@ class DockerSandboxBackend(SandboxBackend):
         cwd: Optional[Path],
         env: Optional[dict[str, str]],
         timeout: int,
+        capture: Optional[CaptureTarget] = None,
     ) -> CompletedRun:
+        """Run ``argv`` in a one-shot container.
+
+        Two completeness facts used to be dropped on this path, and both are
+        the shape #3243 is about — a result that reads whole when it is not.
+
+        The executor caps output at ``max_output_bytes`` and marks the clip
+        by appending a marker to the *text*, so ``truncated_stdout`` stayed
+        ``False`` here no matter how much was thrown away. It is now read
+        back off that marker, which is the only signal the executor gives.
+
+        A timeout raised out of this method entirely, so ``timed_out``
+        was likewise never ``True`` on this backend. It is now caught and
+        reported as the outcome it is.
+
+        A capture on this backend is weaker than on the local one and says
+        so: the container's output has already been through the executor's
+        cap by the time it gets here, so the file is written from what
+        survived, and ``truncated_stdout`` rides along to say whether that
+        was everything.
+        """
         if not argv:
             raise ValueError("empty argv")
 
         from kestrel_sovereign.features.compute.models import ComputeCommand
+        from kestrel_sovereign.features.compute.executors.base import (
+            _OUTPUT_TRUNCATED_SUFFIX,
+            ExecutionTimeoutError,
+        )
 
         command = ComputeCommand(
             id=str(uuid.uuid4()),
@@ -119,15 +145,59 @@ class DockerSandboxBackend(SandboxBackend):
         )
 
         started = time.monotonic()
-        record = await self._executor.execute_command(
-            command,
-            working_dir=str(cwd) if cwd else None,
-        )
+        try:
+            record = await self._executor.execute_command(
+                command,
+                working_dir=str(cwd) if cwd else None,
+            )
+        except ExecutionTimeoutError:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            return CompletedRun(
+                argv=list(argv),
+                returncode=-1,
+                stdout="",
+                stderr=f"command exceeded its {timeout}s timeout",
+                duration_ms=duration_ms,
+                timed_out=True,
+            )
         duration_ms = int((time.monotonic() - started) * 1000)
+
+        stdout, out_trunc = _split_truncation_marker(
+            record.stdout, _OUTPUT_TRUNCATED_SUFFIX
+        )
+        stderr, err_trunc = _split_truncation_marker(
+            record.stderr, _OUTPUT_TRUNCATED_SUFFIX
+        )
+
+        stdout_path = stderr_path = None
+        if capture is not None:
+            await host_write(capture.stdout_path, stdout.encode("utf-8"))
+            await host_write(capture.stderr_path, stderr.encode("utf-8"))
+            stdout_path = str(capture.stdout_path)
+            stderr_path = str(capture.stderr_path)
+
         return CompletedRun(
             argv=list(argv),
             returncode=record.exit_code if record.exit_code is not None else -1,
-            stdout=record.stdout,
-            stderr=record.stderr,
+            stdout=stdout,
+            stderr=stderr,
             duration_ms=duration_ms,
+            truncated_stdout=out_trunc,
+            truncated_stderr=err_trunc,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
         )
+
+
+def _split_truncation_marker(text: str, marker: str) -> tuple[str, bool]:
+    """Recover the executor's truncation flag from the text it appended.
+
+    The executor signals a clip by appending ``marker`` to the decoded
+    output and keeps no boolean on the record, so this is the only place
+    the fact survives. Reading it back is coupling — hence the shared
+    constant rather than a copied literal — but a marker in prose is not
+    a flag a caller can branch on, and #3243 turns on being able to.
+    """
+    if text.endswith(marker):
+        return text[: -len(marker)], True
+    return text, False
