@@ -10,6 +10,7 @@ import pytest
 
 from kestrel_sovereign.features.delivery.queue import (
     DeliveryIdempotencyConflict,
+    DeliveryIdempotencyStateError,
     DeliveryIdempotencyTerminal,
     DeliveryQueue,
 )
@@ -233,6 +234,135 @@ async def test_dead_letter_retry_preserves_legacy_content_hash(db_backend):
         await database.execute(
             "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
         )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_rolling_retry_metadata_recovers_from_replay_ledger(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-ledger-retry:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+    payload = {"z": 1, "a": 2}
+
+    try:
+        original_id = await queue.enqueue(
+            "email",
+            "ledger-retry@example.com",
+            payload,
+            max_retries=11,
+            idempotency_key="ledger-retry",
+        )
+        original_hash = await database.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await database.execute(
+            """
+            UPDATE delivery_dead_letter
+            SET max_retries = NULL, legacy_content_hash = NULL
+            WHERE original_id = ? AND agent_id = ?
+            """,
+            (original_id, owner),
+        )
+
+        retried = await DeliveryQueue(database, owner, max_retries=99).retry(
+            original_id
+        )
+
+        assert retried["success"] is True
+        assert await database.fetchone(
+            """
+            SELECT max_retries, content_hash FROM delivery_queue
+            WHERE id = ? AND agent_id = ?
+            """,
+            (retried["entry_id"], owner),
+        ) == (11, original_hash[0])
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_unlinked_rolling_retry_fails_closed_backend_parity(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-unlinked-retry:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+    request = (
+        "email",
+        "unlinked-retry@example.com",
+        {"z": 1, "a": 2},
+    )
+
+    try:
+        original_id = await queue.enqueue(
+            *request, idempotency_key="unlinked-retry"
+        )
+        original = await database.fetchone(
+            """
+            SELECT content_json, canonical_content_hash, max_retries
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            (original_id, owner),
+        )
+        claim_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        candidate_time = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        await database.execute(
+            """
+            UPDATE delivery_idempotency SET created_at = ?
+            WHERE agent_id = ?
+            """,
+            (claim_time, owner),
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+        await database.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', 0, ?, ?, ?)
+            """,
+            (
+                f"rolling-{uuid4().hex}",
+                owner,
+                request[0],
+                request[1],
+                original[0],
+                original[1],
+                original[2],
+                candidate_time,
+                candidate_time,
+            ),
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="unlinked"):
+            await queue.enqueue(*request, idempotency_key="unlinked-retry")
+        assert await database.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?", (owner,)
+        ) == (1,)
+    finally:
         await database.execute(
             "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
         )

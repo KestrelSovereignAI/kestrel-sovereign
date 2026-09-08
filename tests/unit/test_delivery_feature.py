@@ -1339,6 +1339,111 @@ class TestQueueIdempotency:
             await queue.enqueue(**{**request, "content": {"body": "changed"}})
 
     @pytest.mark.asyncio
+    async def test_ambiguous_stale_repair_cancel_restores_original_claim(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "ambiguous-stale@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "ambiguous-stale",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        original_execute = queue._db.execute
+        cancelled = False
+
+        async def cancel_after_insert(sql, params=()):
+            nonlocal cancelled
+            result = await original_execute(sql, params)
+            if "INSERT INTO delivery_queue" in sql and not cancelled:
+                cancelled = True
+                raise asyncio.CancelledError("ambiguous stale insert")
+            return result
+
+        async with queue._db.transaction(immediate=True):
+            with patch.object(queue._db, "execute", side_effect=cancel_after_insert):
+                with pytest.raises(asyncio.CancelledError, match="ambiguous stale"):
+                    await queue.enqueue(**request)
+
+        assert await queue._db.fetchone(
+            """
+            SELECT entry_id, compensating, previous_entry_id
+            FROM delivery_idempotency WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        ) == (original_id, 0, None)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (0,)
+
+    @pytest.mark.asyncio
+    async def test_stale_claim_with_unlinked_rolling_retry_fails_closed(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "rolling-retry@example.com",
+            "content": {"z": 1, "a": 2},
+            "idempotency_key": "rolling-retry",
+        }
+        original_id = await queue.enqueue(**request)
+        original = await queue._db.fetchone(
+            """
+            SELECT content_json, content_hash, canonical_content_hash, max_retries
+            FROM delivery_queue WHERE id = ?
+            """,
+            (original_id,),
+        )
+        claim_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        candidate_time = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_idempotency SET created_at = ? WHERE agent_id = ?",
+            (claim_time, queue._agent_id),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                "rolling-retry-candidate",
+                queue._agent_id,
+                "email",
+                request["recipient"],
+                original[0],
+                original[2],
+                None,
+                DeliveryStatus.PENDING.value,
+                original[3],
+                candidate_time,
+                candidate_time,
+            ),
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="unlinked"):
+            await queue.enqueue(**request)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+
+    @pytest.mark.asyncio
     async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
         queue._db.backend_type = "postgres"
         queue._db.nested_transaction_strategy = "savepoint"
@@ -1621,6 +1726,34 @@ class TestQueueIdempotency:
         ) == (11,)
 
     @pytest.mark.asyncio
+    async def test_dead_letter_retry_recovers_policy_from_replay_ledger(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "ledger-policy@example.com",
+            {"body": "hello"},
+            max_retries=11,
+            idempotency_key="ledger-policy",
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            "UPDATE delivery_dead_letter SET max_retries = NULL WHERE original_id = ?",
+            (original_id,),
+        )
+
+        retried = await DeliveryQueue(
+            queue._db, queue._agent_id, max_retries=99
+        ).retry(original_id)
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == (11,)
+
+    @pytest.mark.asyncio
     async def test_dead_letter_retry_preserves_rolling_writer_legacy_hash(
         self, real_queue
     ):
@@ -1636,6 +1769,13 @@ class TestQueueIdempotency:
             "SELECT content_hash FROM delivery_queue WHERE id = ?", (original_id,)
         )
         await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            UPDATE delivery_dead_letter SET legacy_content_hash = NULL
+            WHERE original_id = ?
+            """,
+            (original_id,),
+        )
 
         retried = await queue.retry(original_id)
 

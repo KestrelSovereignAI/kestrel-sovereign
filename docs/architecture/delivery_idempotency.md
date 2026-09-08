@@ -27,7 +27,8 @@ identity. Keyed payloads must be JSON-serializable without string fallbacks.
 
 The raw key is not stored. `delivery_idempotency` retains its SHA-256 digest and
 payload digest under the delivery owner's DID. It also retains the effective
-retry count so stale-claim repair does not adopt a changed process default; a
+retry count and rolling-writer compatibility hash so stale-claim repair and
+dead-letter retry do not adopt a changed process default or reconstructed hash; a
 pre-upgrade orphan with no recoverable policy fails closed. This minimizes accidental raw-key
 disclosure but does not make a guessable key confidential. The
 `delivery_queue_schema_v3` migration lock serializes creation and upgrades of
@@ -59,8 +60,13 @@ partially committed joined operation leaves a safe stale claim rather than two
 deliveries. Ordinary ledger deletion never deletes a live queue row; only a
 marker written by failed enqueue compensation invokes the SQLite cleanup
 trigger. A stale replay claim records its prior queue ID while a replacement is
-being created, so failed joined-transaction compensation restores that claim
-instead of deleting its fail-closed conflict history. The move into dead letter
+being created and retains that recovery anchor after insertion, so an
+ambiguously completed insert can still be compensated and restore the claim
+instead of deleting its fail-closed conflict history. If a stale claim finds an
+unlinked compatible rolling-writer retry outside the short deduplication window,
+replay fails closed for manual reconciliation: automatically adopting it could
+collapse an independent delivery, while inserting again could duplicate a retry.
+The move into dead letter
 uses the same recoverable ordering: it writes
 the tombstone before deleting the live row, while queue processing and keyed
 replay treat any temporary dual-row state as terminal until the transition is
@@ -68,6 +74,7 @@ resumed. Explicit retry checks the tombstone first, removes any residual live
 original, and only then consumes the tombstone and exposes the single retry row.
 While retry is resumable, both `original_id` and `retry_entry_id` remain
 tombstoned for processing, deduplication, replay, listing, and retention.
-Legacy dead-letter rows added before retry policy persistence keep a nullable
-policy marker and fall back to the active queue configuration; new rows always
-persist their original policy.
+Legacy dead-letter rows added before retry metadata persistence recover policy
+and compatibility hash from any attached replay ledger before falling back to
+the active queue configuration or canonical reconstruction; new rows always
+persist both values directly.

@@ -530,6 +530,63 @@ class DeliveryQueue:
                 return missing_id
         return None
 
+    async def _has_unlinked_compatible_queue_row(
+        self,
+        *,
+        recipient: str,
+        canonical_content_hash: str,
+        legacy_content_hash: str,
+        channel_type: str,
+        max_retries: int,
+        claim_created_at: str,
+    ) -> bool:
+        """Detect an unreconciled rolling-writer retry outside dedup time.
+
+        Adopting such a row could collapse a legitimate independent delivery,
+        while inserting another row could duplicate an older process's retry.
+        The only safe automatic outcome is therefore to fail closed.
+        """
+        row = await self._db.fetchone(
+            """
+            SELECT delivery_queue.id
+            FROM delivery_queue
+            WHERE delivery_queue.agent_id = ?
+              AND delivery_queue.recipient = ?
+              AND delivery_queue.channel_type = ?
+              AND delivery_queue.max_retries = ?
+              AND delivery_queue.created_at >= ?
+              AND (
+                    delivery_queue.canonical_content_hash = ?
+                    OR delivery_queue.content_hash IN (?, ?)
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_dead_letter
+                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                      AND (
+                            delivery_dead_letter.original_id = delivery_queue.id
+                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                      )
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_idempotency
+                    WHERE delivery_idempotency.agent_id = delivery_queue.agent_id
+                      AND delivery_idempotency.entry_id = delivery_queue.id
+              )
+            LIMIT 1
+            """,
+            (
+                self._agent_id,
+                recipient,
+                channel_type,
+                max_retries,
+                claim_created_at,
+                canonical_content_hash,
+                canonical_content_hash,
+                legacy_content_hash,
+            ),
+        )
+        return row is not None
+
     async def _enqueue_idempotent(
         self,
         *,
@@ -606,8 +663,9 @@ class DeliveryQueue:
                         """
                         INSERT INTO delivery_idempotency
                             (agent_id, idempotency_key_digest, entry_id,
-                             payload_digest, created_at, effective_max_retries)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                             payload_digest, created_at, effective_max_retries,
+                             legacy_content_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
                         """,
                         (
@@ -617,6 +675,7 @@ class DeliveryQueue:
                             payload_digest,
                             now_iso,
                             retries,
+                            legacy_content_hash,
                         ),
                     )
                     # Lock the canonical ledger row portably. SQLite already
@@ -631,7 +690,8 @@ class DeliveryQueue:
                     )
                     existing = await self._db.fetchone(
                         """
-                        SELECT entry_id, payload_digest, effective_max_retries
+                        SELECT entry_id, payload_digest, effective_max_retries,
+                               created_at, legacy_content_hash
                         FROM delivery_idempotency
                         WHERE agent_id = ? AND idempotency_key_digest = ?
                         """,
@@ -648,6 +708,8 @@ class DeliveryQueue:
                         )
 
                     stored_retries = existing[2]
+                    claim_created_at = existing[3]
+                    stored_legacy_hash = existing[4]
 
                     canonical_id = existing[0]
                     dead_letter = await self._db.fetchone(
@@ -666,7 +728,8 @@ class DeliveryQueue:
 
                     queue_row = await self._db.fetchone(
                         """
-                        SELECT status, max_retries FROM delivery_queue
+                        SELECT status, max_retries, content_hash
+                        FROM delivery_queue
                         WHERE id = ? AND agent_id = ?
                         """,
                         (canonical_id, self._agent_id),
@@ -686,6 +749,18 @@ class DeliveryQueue:
                                   AND effective_max_retries IS NULL
                                 """,
                                 (stored_retries, self._agent_id, key_digest),
+                            )
+                        if stored_legacy_hash is None:
+                            stored_legacy_hash = queue_row[2]
+                            await self._db.execute(
+                                """
+                                UPDATE delivery_idempotency
+                                SET legacy_content_hash = ?
+                                WHERE agent_id = ?
+                                  AND idempotency_key_digest = ?
+                                  AND legacy_content_hash IS NULL
+                                """,
+                                (stored_legacy_hash, self._agent_id, key_digest),
                             )
                         logger.debug(
                             "Adopted idempotent delivery entry: %s", canonical_id
@@ -739,6 +814,20 @@ class DeliveryQueue:
                         )
                         return deduplicated
 
+                    if await self._has_unlinked_compatible_queue_row(
+                        recipient=recipient,
+                        canonical_content_hash=canonical_content_hash,
+                        legacy_content_hash=stored_legacy_hash
+                        or legacy_content_hash,
+                        channel_type=channel_type,
+                        max_retries=stored_retries,
+                        claim_created_at=claim_created_at,
+                    ):
+                        raise DeliveryIdempotencyStateError(
+                            "stale delivery idempotency record has an unlinked "
+                            "compatible queue row; manual reconciliation is required"
+                        )
+
                     if canonical_id != candidate_id:
                         # The queue row was removed independently of its ledger
                         # (or by a pre-v0.53.12 purge). Repair the claim under the
@@ -784,19 +873,11 @@ class DeliveryQueue:
                             now_iso,
                         ),
                     )
-                    # Commit the stale-claim repair only after the replacement
-                    # queue row exists. Until this marker is cleared, SQLite's
-                    # joined-transaction compensation trigger can restore the
-                    # prior fail-closed claim atomically.
-                    await self._db.execute(
-                        """
-                        UPDATE delivery_idempotency
-                        SET previous_entry_id = NULL
-                        WHERE agent_id = ? AND idempotency_key_digest = ?
-                              AND entry_id = ?
-                        """,
-                        (self._agent_id, key_digest, candidate_id),
-                    )
+                    # Keep previous_entry_id as a durable compensation anchor.
+                    # If the INSERT above completed but cancellation was
+                    # reported ambiguously, a joined SQLite caller may catch
+                    # the cancellation and commit. The trigger must still be
+                    # able to restore the prior fail-closed claim.
                 except BaseException:
                     if nesting_strategy == "joined":
                         # A joined nested transaction cannot roll back only this
@@ -965,7 +1046,36 @@ class DeliveryQueue:
                 computed_legacy_hash, canonical_hash = _persisted_content_hashes(
                     dl_row[4], dl_row[5]
                 )
-                legacy_hash = dl_row[11] or computed_legacy_hash
+                ledger_rows = await self._db.fetchall(
+                    """
+                    SELECT effective_max_retries, legacy_content_hash
+                    FROM delivery_idempotency
+                    WHERE agent_id = ? AND entry_id = ?
+                    """,
+                    (self._agent_id, dl_row[1]),
+                )
+                ledger_policies = {
+                    row[0] for row in ledger_rows if row[0] is not None
+                }
+                ledger_hashes = {
+                    row[1] for row in ledger_rows if row[1] is not None
+                }
+                if len(ledger_policies) > 1 or len(ledger_hashes) > 1:
+                    raise DeliveryIdempotencyStateError(
+                        "dead-letter retry found inconsistent replay metadata"
+                    )
+                ledger_policy = next(iter(ledger_policies), None)
+                ledger_legacy_hash = next(iter(ledger_hashes), None)
+                legacy_hash = (
+                    dl_row[11] or ledger_legacy_hash or computed_legacy_hash
+                )
+                retry_policy = (
+                    dl_row[9]
+                    if dl_row[9] is not None
+                    else ledger_policy
+                    if ledger_policy is not None
+                    else self._max_retries
+                )
                 await self._db.execute(
                     """
                     UPDATE delivery_dead_letter SET retry_entry_id = ?
@@ -1003,11 +1113,7 @@ class DeliveryQueue:
                         legacy_hash,
                         canonical_hash,
                         DeliveryStatus.PENDING.value,
-                        (
-                            dl_row[9]
-                            if dl_row[9] is not None
-                            else self._max_retries
-                        ),  # legacy rows fall back to this queue's policy
+                        retry_policy,
                         now_iso,  # next_retry_at
                         now_iso,  # created_at
                     ),
@@ -1605,6 +1711,7 @@ class DeliveryQueue:
                 compensating INTEGER NOT NULL DEFAULT 0,
                 previous_entry_id TEXT,
                 effective_max_retries INTEGER,
+                legacy_content_hash TEXT,
                 PRIMARY KEY (agent_id, idempotency_key_digest)
             )
             """
@@ -1636,6 +1743,15 @@ class DeliveryQueue:
                 """
                 ALTER TABLE delivery_idempotency
                 ADD COLUMN effective_max_retries INTEGER
+                """
+            )
+        if not await self._db.column_exists(
+            "delivery_idempotency", "legacy_content_hash"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_idempotency
+                ADD COLUMN legacy_content_hash TEXT
                 """
             )
         # v2 accidentally made ledger deletion cascade into the live queue on
@@ -1721,6 +1837,17 @@ class DeliveryQueue:
                 """
                 ALTER TABLE delivery_dead_letter
                 ADD COLUMN max_retries INTEGER
+                """
+            )
+        elif self._db.backend_type == "postgres":
+            # Early v0.53.12 prerelease schemas declared this NOT NULL. A
+            # rolling old writer cannot persist the new value, so the durable
+            # ledger recovery path requires the compatibility column to remain
+            # nullable on upgraded PostgreSQL databases too.
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter
+                ALTER COLUMN max_retries DROP NOT NULL
                 """
             )
         if not await self._db.column_exists(
