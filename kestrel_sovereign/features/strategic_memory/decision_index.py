@@ -29,6 +29,8 @@ import hashlib
 import logging
 from typing import Any, Dict, List, Optional, Set
 
+from .timestamps import stamp_created_at
+
 logger = logging.getLogger(__name__)
 
 DECISION_NODE_TYPE = "decision"
@@ -72,15 +74,17 @@ def strategy_decision_node_id(agent_id: str, entry: Dict[str, Any]) -> str:
 def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     """The node properties a decision entry projects to.
 
-    ``agent_id`` and ``created_at`` are load-bearing, not decoration:
-    ``recall_decisions`` filters on the former and orders on the latter, so a
-    node missing either is written but unreachable.
+    ``agent_id`` is load-bearing: ``recall_decisions`` filters on it, so a
+    node missing it is written but unreachable. ``created_at`` orders the
+    recall; it is stamped under the graph contract from the entry's date and
+    left ABSENT when the entry has none (#3255), and an unstamped node sorts
+    last on both backends, so it can be pushed off a limited page by stamped
+    ones but is never unreachable.
     """
     text = str(entry.get("decision") or "").strip()
-    return {
+    properties = {
         "agent_id": agent_id,
         "text": text,
-        "created_at": str(entry.get("date") or ""),
         "rationale": str(entry.get("rationale") or ""),
         "impact": str(entry.get("impact") or ""),
         "session": str(entry.get("session") or ""),
@@ -89,6 +93,9 @@ def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "claim_source": "strategy_yaml",
         "source": _PROJECTION_SOURCE,
     }
+    # The entry's day at midnight UTC, in the graph contract; absent when the
+    # entry has no date (#3255).
+    return stamp_created_at(properties, entry.get("date"))
 
 
 def _label_for(entry: Dict[str, Any], limit: int = 120) -> str:

@@ -208,3 +208,18 @@ def kestrel_toml_catalog(request, monkeypatch):
         monkeypatch.setattr(token_counter, "_catalog_service", None)
 
     return publish
+
+
+@pytest.fixture
+def new_york_clock(monkeypatch):
+    """A non-UTC process zone, so a rule about naive or local time can be
+    seen to fail on CI's UTC runners. Undone in the right order:
+    ``monkeypatch`` restores ``TZ`` at teardown but ``tzset()`` is what the C
+    library reads, and on glibc the cached zone outlives the variable."""
+    import time
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
