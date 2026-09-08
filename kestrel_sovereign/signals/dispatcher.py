@@ -466,11 +466,11 @@ class _DurableAdmissionReservation:
 
 @dataclass
 class _DurableCognitionSettlementGuard:
-    """Hold Stop completion until one cancelled delivery is terminally settled."""
+    """Bind Stop to settlement and classify its one safe acknowledgement."""
 
     request_id: str
     generation: int
-    stop_observed: bool = False
+    operation: asyncio.Task[None]
     stop_terminalized: bool = False
 
 
@@ -1131,8 +1131,13 @@ class SignalDispatcher:
         if not _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
             return None
         register = getattr(type(self._agent), "register_active_request", None)
+        bind_operation = getattr(type(self._agent), "bind_request_operation", None)
         cleanup = getattr(type(self._agent), "_cleanup_cancelled_request", None)
-        if not callable(register) or not callable(cleanup):
+        if (
+            not callable(register)
+            or not callable(bind_operation)
+            or not callable(cleanup)
+        ):
             return None
         owner = asyncio.current_task()
         if owner is None:
@@ -1144,15 +1149,59 @@ class SignalDispatcher:
             or generation <= 0
         ):
             raise RuntimeError("durable cognition settlement has no valid generation")
+        # This otherwise-idle task is the cancellable part of settlement. It
+        # deliberately does not cancel the dispatcher owner: once cognition
+        # has returned, ACK/NACK must finish so we can distinguish a proven
+        # stopped delivery from completed effects or indeterminate storage.
+        settlement_release = asyncio.Event()
+
+        async def await_settlement_release() -> None:
+            await settlement_release.wait()
+
+        operation = asyncio.create_task(
+            await_settlement_release(),
+            name=f"durable_cognition_settlement:{request_id}",
+        )
+        try:
+            bind_operation(self._agent, request_id, operation)
+        except BaseException:
+            operation.cancel()
+            cleanup(
+                self._agent,
+                request_id,
+                disposition=RequestCompletionDisposition.ABANDONED,
+                generation=generation,
+            )
+            raise
         guard = _DurableCognitionSettlementGuard(
             request_id=request_id,
             generation=generation,
+            operation=operation,
         )
 
-        def release_settlement_owner(_owner: asyncio.Task) -> None:
+        def release_settlement_owner(completed_owner: asyncio.Task) -> None:
+            stop_reached_settlement = (
+                guard.operation.cancelling() > 0 or guard.operation.cancelled()
+            )
+            owner_abandoned_settlement = completed_owner.cancelled()
+            # Race matrix for the single release invariant:
+            #
+            #   cognition/settlement                  Stop completion
+            #   stopped + terminal NACK committed  -> COMPLETED (STOPPED)
+            #   stopped + NACK unavailable         -> ABANDONED (UNREACHABLE)
+            #   completed + late Stop during ACK   -> ABANDONED (UNREACHABLE)
+            #   any owner cancellation pre-settle  -> ABANDONED (UNREACHABLE)
+            #   no Stop, any ordinary terminal path-> COMPLETED
+            #
+            # The barrier is the shared linearization guard: cancellation must
+            # reach it, and only durable Stop terminalization can turn that
+            # cancellation into successful completion evidence.
             disposition = (
                 RequestCompletionDisposition.ABANDONED
-                if guard.stop_observed and not guard.stop_terminalized
+                if (
+                    (stop_reached_settlement or owner_abandoned_settlement)
+                    and not guard.stop_terminalized
+                )
                 else RequestCompletionDisposition.COMPLETED
             )
             try:
@@ -1169,6 +1218,8 @@ class SignalDispatcher:
                     "Could not release durable cognition settlement owner: signal=%s",
                     guard.request_id,
                 )
+            finally:
+                settlement_release.set()
 
         owner.add_done_callback(release_settlement_owner)
         return guard
@@ -3406,11 +3457,6 @@ class SignalDispatcher:
                     signal=routing_signal,
                     start=start,
                 )
-                if (
-                    settlement_guard is not None
-                    and isinstance(result, _StoppedCognitionResult)
-                ):
-                    settlement_guard.stop_observed = True
         except asyncio.CancelledError:
             if routing_task is not None:
                 # A caller cancellation is not a durable receipt.  Never join

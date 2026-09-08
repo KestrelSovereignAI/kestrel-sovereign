@@ -92,6 +92,8 @@ class _LifecycleAgent(RequestLifecycleMixin, _Agent):
     def __init__(self, did: str):
         super().__init__(did)
         self.process_started = asyncio.Event()
+        self.allow_process_completion = asyncio.Event()
+        self.process_error: BaseException | None = None
         self._current_request_id = None
         self._active_request_ids: set[str] = set()
         self._active_request_counts: dict[str, int] = {}
@@ -116,7 +118,9 @@ class _LifecycleAgent(RequestLifecycleMixin, _Agent):
         **_kwargs,
     ) -> str:
         self.process_started.set()
-        await asyncio.Future()
+        await self.allow_process_completion.wait()
+        if self.process_error is not None:
+            raise self.process_error
         return prompt
 
 
@@ -2133,6 +2137,203 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
         allow_terminalization.set()
         if completion is not None and not completion.done():
             completion.cancel()
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "settlement_case",
+        "expected_result_status",
+        "expected_delivery_status",
+    ),
+    (
+        pytest.param(
+            "ack_committed",
+            Status.OK,
+            ACKNOWLEDGED,
+            id="normal-ack-committed",
+        ),
+        pytest.param(
+            "ack_rejected",
+            Status.FAILED,
+            RETRY,
+            id="normal-ack-rejected",
+        ),
+        pytest.param(
+            "ordinary_nack",
+            Status.FAILED,
+            RETRY,
+            id="ordinary-nack",
+        ),
+    ),
+)
+async def test_late_stop_cannot_claim_completed_cognition_during_settlement(
+    tmp_path,
+    monkeypatch,
+    settlement_case,
+    expected_result_status,
+    expected_delivery_status,
+):
+    """A settlement-only owner cannot turn completed effects into STOPPED.
+
+    Together with the active-cancellation test above, the parameter table is
+    the durable settlement race matrix: successful terminal NACK is the sole
+    cancelled path allowed to complete; failed terminal NACK and every late
+    Stop over normal ACK/ordinary NACK remain indeterminate.
+    """
+
+    backend = SQLiteBackend(
+        str(tmp_path / f"late-stop-during-{settlement_case}.db")
+    )
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _LifecycleAgent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    await dispatcher.initialize_durable_delivery()
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    settlement_started = asyncio.Event()
+    allow_settlement = asyncio.Event()
+    original_ack = dispatcher.ack_durable_delivery
+    original_nack = dispatcher.nack_durable_delivery
+
+    async def delayed_ack(*args, **kwargs):
+        settlement_started.set()
+        await allow_settlement.wait()
+        if settlement_case == "ack_rejected":
+            return False
+        return await original_ack(*args, **kwargs)
+
+    async def delayed_nack(*args, **kwargs):
+        if kwargs.get("terminal") is not True:
+            settlement_started.set()
+            await allow_settlement.wait()
+        return await original_nack(*args, **kwargs)
+
+    if settlement_case == "ordinary_nack":
+        agent.process_error = RuntimeError("ordinary cognition failure")
+        monkeypatch.setattr(dispatcher, "nack_durable_delivery", delayed_nack)
+    else:
+        monkeypatch.setattr(dispatcher, "ack_durable_delivery", delayed_ack)
+    completion = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, f"late-stop-during-{settlement_case}"),
+            source_event_id=f"telegram:update:late-stop-during-{settlement_case}",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        agent.allow_process_completion.set()
+        await asyncio.wait_for(settlement_started.wait(), timeout=1)
+
+        request_id = handle.signal_id
+        assert agent.cancel_current_request(request_id) is True
+        completion = asyncio.create_task(
+            agent.wait_for_request_completion(request_id)
+        )
+        assert completion.done() is False
+
+        allow_settlement.set()
+        assert (
+            await asyncio.wait_for(completion, timeout=1)
+            is RequestCompletionDisposition.ABANDONED
+        )
+        assert (await handle.wait()).status is expected_result_status
+        [delivery] = await dispatcher.list_durable_deliveries()
+        assert delivery.status == expected_delivery_status
+    finally:
+        allow_settlement.set()
+        if completion is not None and not completion.done():
+            completion.cancel()
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_durable_settlement_abandons_lifecycle_generation(
+    tmp_path,
+    monkeypatch,
+):
+    """Owner cancellation without a durable verdict is never completion."""
+
+    backend = SQLiteBackend(str(tmp_path / "cancelled-settlement-owner.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _LifecycleAgent("did:agent:one")
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    await dispatcher.initialize_durable_delivery()
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    ack_started = asyncio.Event()
+    allow_ack = asyncio.Event()
+
+    async def delayed_ack(*_args, **_kwargs):
+        ack_started.set()
+        await allow_ack.wait()
+        return True
+
+    monkeypatch.setattr(dispatcher, "ack_durable_delivery", delayed_ack)
+    handle = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "cancelled-settlement-owner"),
+            source_event_id="telegram:update:cancelled-settlement-owner",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(agent.process_started.wait(), timeout=1)
+        agent.allow_process_completion.set()
+        await asyncio.wait_for(ack_started.wait(), timeout=1)
+
+        request_id = handle.signal_id
+        handle.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handle.wait()
+        assert (
+            await agent.wait_for_request_completion(request_id)
+            is RequestCompletionDisposition.ABANDONED
+        )
+        [delivery] = await dispatcher.list_durable_deliveries()
+        assert delivery.status == LEASED
+    finally:
+        allow_ack.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
 
