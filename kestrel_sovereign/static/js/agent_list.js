@@ -636,9 +636,9 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     function renderStopAllOutcomes(response) {
-        const outcomes = Array.isArray(response)
-            ? response
-            : (response && Array.isArray(response.outcomes) ? response.outcomes : null);
+        const outcomes = response && Array.isArray(response.stop_outcomes)
+            ? response.stop_outcomes
+            : null;
         stopAllResults.hidden = false;
         stopAllResults.textContent = '';
         if (!outcomes || outcomes.length === 0) {

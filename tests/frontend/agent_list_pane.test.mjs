@@ -372,7 +372,7 @@ test('Stop All is disabled without live work and confirms the exact in-flight co
             stopHost: async (payload) => {
                 stopCalls.push(payload);
                 return {
-                    outcomes: [
+                    stop_outcomes: [
                         {
                             agent_id: 'did:agent:emma',
                             resolved_target: 'did:agent:emma',
@@ -418,7 +418,7 @@ test('Stop All never calls the host seam when no agent is in flight', async () =
     const handle = mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
         isThinking: () => false,
-        api: { stopHost: async () => { calls += 1; return { outcomes: [] }; } },
+        api: { stopHost: async () => { calls += 1; return { stop_outcomes: [] }; } },
         confirmStopAll: () => true,
         storageKey: 'a:test-stop-all-idle',
     });
@@ -438,7 +438,7 @@ test('Stop All reports an empty or malformed fan-out as indeterminate, never suc
     const handle = mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
         isThinking: () => true,
-        api: { stopHost: async () => ({ outcomes: [] }) },
+        api: { stopHost: async () => ({ stop_outcomes: [] }) },
         confirmStopAll: () => true,
         storageKey: 'a:test-stop-all-empty',
     });
@@ -459,7 +459,7 @@ test('re-mounting an adopted pane replaces Stop All ownership without duplicate 
     mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
         isThinking: () => true,
-        api: { stopHost: async () => { firstCalls += 1; return { outcomes: [] }; } },
+        api: { stopHost: async () => { firstCalls += 1; return { stop_outcomes: [] }; } },
         confirmStopAll: () => true,
         storageKey: 'a:test-stop-all-remount-one',
     });
@@ -468,7 +468,7 @@ test('re-mounting an adopted pane replaces Stop All ownership without duplicate 
     const second = mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
         isThinking: () => true,
-        api: { stopHost: async () => { secondCalls += 1; return { outcomes: [] }; } },
+        api: { stopHost: async () => { secondCalls += 1; return { stop_outcomes: [] }; } },
         confirmStopAll: () => true,
         storageKey: 'a:test-stop-all-remount-two',
     });

@@ -810,7 +810,7 @@ test('requestHost sends no CSRF token on safe (GET) host requests (#2293)', asyn
 
 test('stopHost is wired to the host-root cooperative Stop door', async () => {
     const fetchFn = createFetchQueue(jsonResponse(200, {
-        outcomes: [{ agent_id: 'did:agent:emma', disposition: 'stopped' }],
+        stop_outcomes: [{ agent_id: 'did:agent:emma', disposition: 'stopped' }],
     }));
     const { client } = createClient({
         fetchFn,
@@ -827,7 +827,7 @@ test('stopHost is wired to the host-root cooperative Stop door', async () => {
         JSON.parse(fetchFn.calls[0].options.body),
         { reason: 'operator andon cord' },
     );
-    assert.equal(result.outcomes[0].disposition, 'stopped');
+    assert.equal(result.stop_outcomes[0].disposition, 'stopped');
 });
 
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
