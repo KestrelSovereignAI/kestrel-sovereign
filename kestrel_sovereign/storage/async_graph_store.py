@@ -1670,7 +1670,10 @@ class AsyncGraphStore:
 
         Pushes equality and range filters into SQL so the database can
         use the JSON-path partial indexes (``idx_graph_nodes_agent``,
-        ``idx_graph_nodes_action_status``, ``idx_graph_nodes_action_created``).
+        ``idx_graph_nodes_action_status``, ``idx_graph_nodes_action_created``
+        on SQLite and ``idx_graph_nodes_action_created_desc`` on Postgres,
+        where the created-at index is stored DESC NULLS LAST to match the
+        ordering below).
 
         Args:
             node_type: Required ``node_type`` value (e.g. ``"action_item"``).

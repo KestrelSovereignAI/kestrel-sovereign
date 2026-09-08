@@ -85,9 +85,12 @@ def _label(text: str, limit: int = 120) -> str:
 def _pattern_properties(agent_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
     """The node properties a pattern row projects to.
 
-    ``agent_id`` and ``created_at`` are load-bearing, not decoration: scoped
-    queries filter on the former and order on the latter, so a node missing
-    either is written but unreachable.
+    ``agent_id`` is load-bearing: scoped queries filter on it, so a node
+    missing it is written but unreachable. ``created_at`` orders the recall;
+    it is stamped under the graph contract from the row's date and left
+    ABSENT when the row has none (#3255), and an unstamped node sorts last on
+    both backends, so it can be pushed off a limited page by stamped ones but
+    is never unreachable.
     """
     properties = {
         "agent_id": agent_id,

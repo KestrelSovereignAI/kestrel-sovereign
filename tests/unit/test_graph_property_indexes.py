@@ -114,14 +114,19 @@ class TestPostgresIndexParity:
 
     def test_postgres_has_created_at_index(self):
         from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
-        assert "idx_graph_nodes_action_created" in _POSTGRES_JSON_INDEXES
+        assert "idx_graph_nodes_action_created_desc" in _POSTGRES_JSON_INDEXES
 
     def test_postgres_created_at_targets_action_item(self):
         from kestrel_sovereign.storage.async_database import _POSTGRES_JSON_INDEXES
-        # The index should be a partial index filtered to action_item
-        assert "node_type = 'action_item'" in _POSTGRES_JSON_INDEXES.split(
-            "idx_graph_nodes_action_created"
+        # A partial index filtered to action_item, stored DESC NULLS LAST so
+        # it matches the created-ordered query exactly (#3255); the old ASC
+        # index of the same purpose is dropped by name.
+        definition = _POSTGRES_JSON_INDEXES.split(
+            "CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created_desc"
         )[1].split(";")[0]
+        assert "node_type = 'action_item'" in definition
+        assert "DESC NULLS LAST" in definition
+        assert "DROP INDEX IF EXISTS idx_graph_nodes_action_created;" in _POSTGRES_JSON_INDEXES
 
 
 # =====================================================================

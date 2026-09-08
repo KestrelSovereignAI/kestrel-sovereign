@@ -845,14 +845,23 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
   WHERE node_type = 'todo_item';
 """
 
+# The two created-at partial indexes are stored DESC NULLS LAST on Postgres so
+# they match the created-ordered graph query exactly (#3255): on Postgres a
+# plain ``ORDER BY expr DESC`` is DESC NULLS FIRST, which a backward scan of
+# an ASC index serves, but ``DESC NULLS LAST`` matches neither direction of
+# that index and the planner falls back to a sequential scan. SQLite's DESC
+# is already NULLS LAST, so its indexes are unchanged. The old ASC indexes are
+# dropped by name on every schema init (a no-op once gone) because
+# ``CREATE INDEX IF NOT EXISTS`` would otherwise keep the stale definition.
 _POSTGRES_JSON_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_agent
   ON graph_nodes(node_type, (properties::jsonb->>'agent_id'));
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
   ON graph_nodes((properties::jsonb->>'status'))
   WHERE node_type = 'action_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
-  ON graph_nodes((properties::jsonb->>'created_at'))
+DROP INDEX IF EXISTS idx_graph_nodes_action_created;
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created_desc
+  ON graph_nodes(((properties::jsonb->>'created_at')) DESC NULLS LAST)
   WHERE node_type = 'action_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
   ON graph_nodes((properties::jsonb->>'status'))
@@ -860,8 +869,9 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
   ON graph_nodes((properties::jsonb->>'scope'))
   WHERE node_type = 'todo_item';
-CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
-  ON graph_nodes((properties::jsonb->>'created_at'))
+DROP INDEX IF EXISTS idx_graph_nodes_todo_created;
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created_desc
+  ON graph_nodes(((properties::jsonb->>'created_at')) DESC NULLS LAST)
   WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));

@@ -74,9 +74,12 @@ def strategy_decision_node_id(agent_id: str, entry: Dict[str, Any]) -> str:
 def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     """The node properties a decision entry projects to.
 
-    ``agent_id`` and ``created_at`` are load-bearing, not decoration:
-    ``recall_decisions`` filters on the former and orders on the latter, so a
-    node missing either is written but unreachable.
+    ``agent_id`` is load-bearing: ``recall_decisions`` filters on it, so a
+    node missing it is written but unreachable. ``created_at`` orders the
+    recall; it is stamped under the graph contract from the entry's date and
+    left ABSENT when the entry has none (#3255), and an unstamped node sorts
+    last on both backends, so it can be pushed off a limited page by stamped
+    ones but is never unreachable.
     """
     text = str(entry.get("decision") or "").strip()
     properties = {
