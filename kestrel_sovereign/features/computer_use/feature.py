@@ -1281,13 +1281,23 @@ class ComputerUseFeature(Feature):
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved_cwd = Path(payload["cwd"]) if payload.get("cwd") else None
-        bundle = capture.allocate(self._capture_dir) if capture_output else None
-        head_before = (
-            await capture.git_head(resolved_cwd or Path.cwd()) if bundle else None
-        )
         started_at = capture.utcnow()
         started = time.monotonic()
         try:
+            # Inside the try: allocating the capture touches the filesystem
+            # and can fail on a read-only or full disk, and a call that has
+            # passed every gate must leave an audit row whatever happens
+            # after. Outside, that failure escaped unaudited.
+            bundle = capture.allocate(self._capture_dir) if capture_output else None
+            # HEAD is only meaningful for a directory on this host. The
+            # docker backend with no cwd runs at ``/`` inside a container,
+            # where this process's repository is not the tree under review —
+            # recording it would put an unrelated SHA in the provenance the
+            # manifest exists to make trustworthy.
+            head_dir = resolved_cwd
+            if head_dir is None and self._backend.name == "local":
+                head_dir = Path.cwd()
+            head_before = await capture.git_head(head_dir) if bundle else None
             result = await self._backend.exec(
                 argv,
                 cwd=resolved_cwd,
@@ -1308,9 +1318,11 @@ class ComputerUseFeature(Feature):
             # They are collected in one place because a caller who checks
             # only the one they remembered is the #3243 failure repeating.
             clipped = bool(result.truncated_stdout or result.truncated_stderr)
-            incomplete = bool(
-                result.timed_out or clipped or result.writers_remaining
-            )
+            # ``is not False`` — an unverifiable capture is not a clean one.
+            # ``None`` only arises for a captured run whose platform has no
+            # sentinel; an uncaptured run has nothing to keep final.
+            unverified_writers = bundle is not None and result.writers_remaining is not False
+            incomplete = bool(result.timed_out or clipped or unverified_writers)
 
             manifest_path = None
             if bundle is not None:
@@ -1319,7 +1331,9 @@ class ComputerUseFeature(Feature):
                 # somewhere, and a manifest that says ``null`` cannot answer
                 # the question it exists to answer.
                 effective_cwd = Path(result.cwd) if result.cwd else resolved_cwd
-                head_after = await capture.git_head(effective_cwd)
+                head_after = await capture.git_head(
+                    effective_cwd if result.cwd else head_dir
+                )
                 body = capture.build_manifest(
                     bundle=bundle,
                     argv=argv,
@@ -1423,10 +1437,15 @@ class ComputerUseFeature(Feature):
                 reasons.append("stdout was clipped at the output cap")
             if result.truncated_stderr:
                 reasons.append("stderr was clipped at the output cap")
-            if result.writers_remaining:
+            if result.writers_remaining is True:
                 reasons.append(
                     "left processes still running that inherited its output "
                     "streams, so the captured file is not final"
+                )
+            elif unverified_writers:
+                reasons.append(
+                    "ran on a platform where remaining writers cannot be "
+                    "detected, so the captured file cannot be called final"
                 )
             caveat = "command " + "; ".join(reasons)
             if incomplete:

@@ -790,3 +790,166 @@ async def test_a_docker_timeout_still_produces_the_files_it_promised():
     assert bundle.stderr_path.exists()
     assert result.stdout_path == str(bundle.stdout_path)
     assert "timeout" in bundle.stderr_path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_setsid_descendant_is_still_detected(tmp_path: Path):
+    """The hole in the first answer. Group membership was the test, and a
+    descendant that calls ``setsid`` leaves the group while keeping the
+    capture descriptors — so the probe reported "no writers" about a process
+    that was still writing. Inheritance is the property that matters, and the
+    sentinel pipe tests it directly."""
+    bundle = capture.allocate(tmp_path / "captures")
+    script = tmp_path / "daemon.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()            # leave the group the probe watched\n"
+        "    time.sleep(3)\n"
+        "    print('LATE', flush=True)\n"
+        "    os._exit(0)\n"
+        "print('parent done', flush=True)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", str(script)],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.writers_remaining is True
+
+
+@pytest.mark.asyncio
+async def test_could_not_check_is_not_no_writers(workspace: Path, queue):
+    """Three states, because two would force a guess. ``None`` is what a
+    platform without ``pass_fds`` can honestly report, and it must not be
+    read as a cleared check — an unverifiable capture is not a clean one."""
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(writers_remaining=None))
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert env.status is ToolResultStatus.PARTIAL
+    assert env.data["complete"] is False
+    assert "cannot be detected" in (env.error or "")
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+    assert body["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_an_uncaptured_run_is_not_demoted_by_the_writer_check(
+    workspace: Path, queue
+):
+    """Control. There is no sentinel without a capture, so the answer is
+    ``None`` there too — and there is also no file whose finality matters.
+    Folding the two together would demote every ordinary shell call."""
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(writers_remaining=None))
+
+    env = await f.shell(command="echo hi")
+
+    assert env.status is ToolResultStatus.OK
+    assert env.data["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_capture_allocation_failure_is_audited(workspace: Path, queue):
+    """It happened before the audited boundary, so a call that had passed
+    every gate could fail with no computer-use audit row — the trail losing
+    exactly the runs that went wrong."""
+    f = await _feature(workspace, queue)
+    # A capture dir that cannot be created: a regular file sits in its path.
+    blocker = workspace / "blocked"
+    blocker.write_text("not a directory")
+    f._capture_dir = blocker / "captures"
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert env.status is not ToolResultStatus.OK
+    audit = (workspace / "audit.jsonl").read_text().splitlines()
+    rows = [json.loads(line) for line in audit]
+    assert any(r["tool"] == "shell" and r["outcome"] == "error" for r in rows), rows
+
+
+@pytest.mark.asyncio
+async def test_a_cwdless_docker_run_records_no_host_head(workspace: Path, queue):
+    """With the docker backend and no cwd the command runs at ``/`` inside a
+    container, where this process's repository is not the tree under review.
+    Recording the host SHA would put an unrelated revision in the provenance
+    the manifest exists to make trustworthy — worse than recording none,
+    which is this module's stated rule."""
+    f = await _feature(workspace, queue)
+    stub = _StubBackend(_run())
+    stub.name = "docker"
+    f._backend = stub
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+    assert body["git"]["head_before"] is None
+    assert body["git"]["head_after"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_local_cwdless_run_still_records_its_head(workspace: Path, queue):
+    """Control for the pair: the local backend really does run in this
+    process's directory, so suppressing the SHA there would lose provenance
+    that is genuinely available."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", capture_output=True)
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+
+    expected = await capture.git_head(Path.cwd())
+    assert body["git"]["head_before"] == expected
+
+
+@pytest.mark.asyncio
+async def test_the_preview_bound_is_a_character_bound(tmp_path: Path):
+    """The byte window is four times the character budget, so a file small
+    in bytes could still return four times the advertised characters — a
+    15,000-character ASCII capture came back whole under a 4,000 bound, and
+    the bound exists to keep the model's context bounded, not merely to
+    avoid a large read."""
+    path = tmp_path / "review.txt"
+    path.write_text("A" * 15_000)
+
+    shown = await capture.preview(path, max_chars=4000)
+
+    assert len(shown) < 4600  # the budget plus the elision notice
+    assert "elided" in shown
+
+
+@pytest.mark.asyncio
+async def test_a_capture_under_both_bounds_is_still_whole(tmp_path: Path):
+    """Control: the character bound must not start eliding short captures."""
+    path = tmp_path / "review.txt"
+    path.write_text("VERDICT: APPROVE")
+
+    assert await capture.preview(path, max_chars=4000) == "VERDICT: APPROVE"
+
+
+def test_the_timeout_path_does_not_reach_a_posix_only_call_on_windows():
+    """``os.killpg`` does not exist on Windows and the guard around it did
+    not catch ``AttributeError``, so on a platform this package declares
+    support for, the probe raised out of every successful local command."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    src = Path(local_mod.__file__).read_text()
+    body = src[src.index("def _kill_tree") : src.index("def _writers_remain")]
+    assert "is_windows()" in body
+    assert "taskkill" in body
+    # And the spawn no longer hardcodes the POSIX-only spelling.
+    assert "start_new_session=True" not in src
+    assert "new_process_group_kwargs()" in src

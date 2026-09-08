@@ -15,9 +15,14 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import time
 from pathlib import Path
 
+from kestrel_sovereign._subprocess_helpers import (
+    is_windows,
+    new_process_group_kwargs,
+)
 from kestrel_sovereign.security.subprocess_env import sanitized_subprocess_env
 
 from .base import (
@@ -93,14 +98,23 @@ class LocalSandboxBackend(SandboxBackend):
         exactly what the shell redirect this surface cannot express would
         have done (#3243).
 
-        The child leads its own process group, which buys two things a
-        direct-child-only view got wrong. A timeout kills the **group**, so a
-        command that forked does not leave descendants running after the wait
-        was declared over. And when the group outlives the child that led it,
-        those descendants inherited the capture descriptors and can still be
-        writing — measured: a forked grandchild appended to the capture 1.5s
-        after this method returned — so ``writers_remaining`` says the file
-        is not final rather than letting a manifest call it complete.
+        The child leads its own process group, so a timeout kills the
+        **group**: a command that forked does not leave descendants running
+        after the wait was declared over.
+
+        Whether anything can still be writing is answered by a sentinel pipe
+        rather than by asking whether that group still exists. The child
+        inherits the write end and never learns of it; this process holds the
+        read end and reads EOF exactly when the last holder is gone. Group
+        membership was the first answer and it had a hole review found: a
+        descendant that calls ``setsid`` leaves the group while keeping the
+        capture descriptors, so the probe said "no writers" about a process
+        still writing. Inheritance is the property that actually matters, and
+        the sentinel tests inheritance directly.
+
+        On Windows there is no ``pass_fds``, so no sentinel and no answer —
+        reported as ``None`` rather than as "no writers", which would be a
+        claim this platform cannot support.
         """
         if not argv:
             raise ValueError("empty argv")
@@ -108,6 +122,13 @@ class LocalSandboxBackend(SandboxBackend):
         binary = shutil.which(argv[0]) or argv[0]
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
+
+        # Created before the spawn so the child can inherit the write end,
+        # and closed here immediately after so this process is not itself a
+        # holder — otherwise the read end would never see EOF.
+        sentinel_r = sentinel_w = None
+        if capture is not None and not is_windows():
+            sentinel_r, sentinel_w = os.pipe()
 
         out_fh = err_fh = None
         if capture is not None:
@@ -131,7 +152,8 @@ class LocalSandboxBackend(SandboxBackend):
                     env=sanitized_subprocess_env(env),
                     stdout=out_fh if out_fh is not None else asyncio.subprocess.PIPE,
                     stderr=err_fh if err_fh is not None else asyncio.subprocess.PIPE,
-                    start_new_session=True,
+                    **new_process_group_kwargs(),
+                    **({"pass_fds": (sentinel_w,)} if sentinel_w is not None else {}),
                 )
             except FileNotFoundError as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
@@ -152,10 +174,10 @@ class LocalSandboxBackend(SandboxBackend):
                 )
             except asyncio.TimeoutError:
                 timed_out = True
-                # The group, not just the leader: killing only ``proc`` is
+                # The tree, not just the leader: killing only ``proc`` is
                 # how a timed-out command left its children running while
                 # the tool reported the wait as over.
-                _kill_group(proc.pid)
+                _kill_tree(proc.pid)
                 try:
                     stdout_bytes, stderr_bytes = await proc.communicate()
                 except Exception:  # noqa: BLE001
@@ -169,10 +191,15 @@ class LocalSandboxBackend(SandboxBackend):
                         fh.close()
                     except OSError:  # pragma: no cover - defensive
                         pass
+            if sentinel_w is not None:
+                try:
+                    os.close(sentinel_w)
+                except OSError:  # pragma: no cover - defensive
+                    pass
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
-        writers_remaining = _group_survives(proc.pid)
+        writers_remaining = _writers_remain(sentinel_r)
         if capture is not None:
             # ``communicate`` returns None for a stream it did not pipe.
             # Nothing was buffered, so nothing could have been clipped.
@@ -207,8 +234,22 @@ class LocalSandboxBackend(SandboxBackend):
         )
 
 
-def _kill_group(pid: int) -> None:
-    """SIGKILL the whole process group led by ``pid``, best effort."""
+def _kill_tree(pid: int) -> None:
+    """Kill the process and everything under it, best effort.
+
+    ``os.killpg`` does not exist on Windows, and reaching it unguarded raised
+    ``AttributeError`` out of the timeout path on a platform this package
+    declares support for. The split mirrors
+    :func:`kestrel_sovereign._subprocess_helpers.stop_process`.
+    """
+    if is_windows():
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)], check=False
+            )
+        except OSError:  # pragma: no cover - windows-only path
+            pass
+        return
     try:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -220,21 +261,34 @@ def _kill_group(pid: int) -> None:
             pass
 
 
-def _group_survives(pid: int) -> bool:
-    """Whether anything is still alive in the group ``pid`` led.
+def _writers_remain(sentinel_r: int | None) -> bool | None:
+    """Whether any process still holds the inherited capture descriptors.
 
-    Signal 0 tests for the group's existence without touching it. The direct
-    child has been reaped by the time this is asked, so a group that still
-    answers holds someone else — a descendant that inherited the capture
-    descriptors. A conservative read: it is a snapshot, and a descendant may
-    exit immediately after, but claiming a file is final when it is not is
-    the error that matters here.
+    ``None`` when there is no sentinel to ask — an uncaptured run, or a
+    platform without ``pass_fds``. Not ``False``: "nobody is writing" and "I
+    cannot tell" are different answers and only one of them is evidence.
+
+    A non-blocking read on the pipe's read end. ``b""`` is EOF, which happens
+    only once every copy of the write end is closed, so it is exactly the
+    question "did anything outlive the child holding its descriptors" —
+    including a descendant that left the process group by calling ``setsid``,
+    which a group-existence probe cannot see. ``BlockingIOError`` means the
+    write end is still open somewhere: writers remain.
     """
+    if sentinel_r is None:
+        return None
     try:
-        os.killpg(pid, 0)
-    except (ProcessLookupError, OSError):
-        return False
-    return True
+        os.set_blocking(sentinel_r, False)
+        return os.read(sentinel_r, 1) != b""
+    except BlockingIOError:
+        return True
+    except OSError:  # pragma: no cover - defensive
+        return None
+    finally:
+        try:
+            os.close(sentinel_r)
+        except OSError:  # pragma: no cover - defensive
+            pass
 
 
 def _open_capture(capture: CaptureTarget):

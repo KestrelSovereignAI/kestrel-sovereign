@@ -91,10 +91,12 @@ class CompletedRun:
     # somewhere, and a capture that cannot say where is missing the fact its
     # manifest exists to record.
     cwd: str | None = None
-    # Processes still alive in the child's group when it was reaped. They
-    # inherited the capture descriptors and may still be writing, so the
-    # file on disk is not yet final and no verdict should be read off it.
-    writers_remaining: bool = False
+    # Whether anything could still be writing to the capture when the child
+    # was reaped. Three states, because two would force a guess:
+    # ``True`` writers remain, ``False`` verified none, ``None`` the platform
+    # could not tell. ``None`` counts as incomplete — a completeness claim
+    # this module cannot check is not one it may make.
+    writers_remaining: "bool | None" = False
 
 
 class SandboxBackend(ABC):

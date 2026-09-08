@@ -152,7 +152,7 @@ def build_manifest(
     timed_out: bool,
     truncated_stdout: bool,
     truncated_stderr: bool,
-    writers_remaining: bool,
+    writers_remaining: Optional[bool],
     head_before: Optional[str],
     head_after: Optional[str],
 ) -> dict[str, Any]:
@@ -163,8 +163,14 @@ def build_manifest(
     whole run, so a caller cannot satisfy the gate by checking the one
     condition they remembered.
     """
+    # ``writers_remaining is not False`` rather than a truthiness test: the
+    # third state is "could not check", and an unchecked claim is not a
+    # cleared one.
     complete = not (
-        timed_out or truncated_stdout or truncated_stderr or writers_remaining
+        timed_out
+        or truncated_stdout
+        or truncated_stderr
+        or writers_remaining is not False
     )
     return {
         "run_id": bundle.run_id,
@@ -258,7 +264,17 @@ def _read_window(path: Path, max_chars: int) -> str:
     window = half * 4
     with open(path, "rb") as fh:
         if size <= window * 2:
-            return fh.read().decode("utf-8", errors="replace")
+            whole = fh.read().decode("utf-8", errors="replace")
+            if len(whole) <= max_chars:
+                return whole
+            # Small in bytes, still over the character budget. Reading it
+            # whole was cheap; returning it whole would not be — the bound
+            # exists to keep the tool result and the model's context bounded,
+            # not merely to avoid a large read.
+            return (
+                f"{whole[:half]}\n... [{len(whole) - half * 2} chars elided; "
+                f"full output in {path}] ...\n{whole[-half:]}"
+            )
         head = fh.read(window).decode("utf-8", errors="replace")[:half]
         fh.seek(-window, os.SEEK_END)
         tail = fh.read(window).decode("utf-8", errors="replace")[-half:]
