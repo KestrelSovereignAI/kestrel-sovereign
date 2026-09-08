@@ -1578,10 +1578,12 @@ class KestrelAgent(
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
         # A caller may retry the same id while its original delivery is still
-        # running. Keep lifecycle registration ownership per delivery so one
-        # completion cannot unregister the other.
+        # running. The request-level maps are compatibility projections; the
+        # generation index keeps each top-level delivery independently owned
+        # while nested registrations reference-count that exact generation.
         self._active_request_counts: dict[str, int] = {}
         self._active_request_generations: dict[str, int] = {}
+        self._active_request_generation_counts: dict[tuple[str, int], int] = {}
         self._next_request_generation = 0
         self._abandoned_request_generations: dict[str, set[int]] = {}
         self._abandoned_request_dispositions: dict[
@@ -1590,6 +1592,9 @@ class KestrelAgent(
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
+        self._active_request_generation_started_at: dict[
+            tuple[str, int], float
+        ] = {}
         # Observable turn IDs resolve to the task-local invocation/request IDs
         # that the cooperative Stop loop already understands (#3141).
         self._turn_request_ids: dict[str, str] = {}

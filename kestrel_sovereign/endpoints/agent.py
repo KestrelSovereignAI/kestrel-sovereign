@@ -40,6 +40,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
     invocation_log_correlation,
     new_stream_delivery_id,
+    register_request_delivery,
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
@@ -484,7 +485,7 @@ async def invoke_agent(request: Request, http_response: Response):
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
+            register_request_delivery(agent, request_id, nested=False)
             await_admission = getattr(
                 type(agent), "await_durable_request_admission", None
             )
@@ -864,7 +865,7 @@ async def stream_agent_response(request: Request):
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
+            register_request_delivery(agent, request_id, nested=False)
             request_lifecycle_registered = True
             await_admission = getattr(
                 type(agent), "await_durable_request_admission", None

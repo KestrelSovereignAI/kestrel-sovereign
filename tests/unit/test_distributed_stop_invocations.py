@@ -11,6 +11,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationSelfFencedError,
     bind_async_invocation,
     invocation_scope,
+    register_request_delivery,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
@@ -306,6 +307,89 @@ async def test_public_turn_on_replica_b_cancels_uuid_bound_on_replica_a(tmp_path
             generation=1,
         )
     finally:
+        await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_same_id_deliveries_own_distinct_durable_generations(
+    tmp_path,
+):
+    """A transport retry is a new delivery; only its nested calls are idempotent."""
+
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _PublicTurnReplicaAgent("did:test:overlapping-retries")
+    replica_a.attach(agent)
+    both_registered = asyncio.Event()
+    release = asyncio.Event()
+    registrations: list[tuple[int, int, str]] = []
+    request_id = "shared-transport-retry"
+    # Model an orchestrator that spawns independent delivery tasks while its
+    # own wrapper is active. Context inheritance alone is not nesting proof;
+    # the explicit top-level boundary must override this inherited generation.
+    inherited_generation = register_request_delivery(
+        agent, request_id, nested=False
+    )
+
+    async def delivery(index: int) -> None:
+        generation = register_request_delivery(agent, request_id, nested=False)
+        try:
+            assert await agent.await_durable_request_admission(request_id)
+            # The decorated cognition registration for this same delivery joins
+            # its task-local generation rather than allocating another row.
+            nested_generation = register_request_delivery(
+                agent, request_id, nested=True
+            )
+            assert await agent.await_durable_request_admission(request_id)
+            registrations.append((generation, nested_generation, request_id))
+            if len(registrations) == 2:
+                both_registered.set()
+            await both_registered.wait()
+            async with agent._turn_lifecycle() as turn_id:
+                assert await agent.await_durable_turn_admission(
+                    turn_id,
+                    request_id,
+                    generation,
+                )
+                await release.wait()
+        finally:
+            agent._cleanup_cancelled_request(request_id)
+            agent._cleanup_cancelled_request(request_id)
+
+    first = asyncio.create_task(delivery(1))
+    second = asyncio.create_task(delivery(2))
+    try:
+        await asyncio.wait_for(both_registered.wait(), timeout=1)
+        top_level_generations = [registration[0] for registration in registrations]
+        assert len(set(top_level_generations)) == 2
+        assert inherited_generation not in top_level_generations
+        assert all(
+            generation == nested_generation
+            for generation, nested_generation, _ in registrations
+        )
+        await _wait_until_registered(store, expected=2)
+        rows = await first_db.fetchall(
+            "SELECT generation_id, request_generation "
+            "FROM stop_active_invocations ORDER BY request_generation"
+        )
+        assert len({row[0] for row in rows}) == 2
+        assert {row[1] for row in rows} == set(top_level_generations)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    finally:
+        release.set()
+        for operation in (first, second):
+            if not operation.done():
+                operation.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        agent._cleanup_cancelled_request(
+            request_id,
+            generation=inherited_generation,
+        )
         await replica_a.close()
         await replica_b.close()
         await first_db.close()

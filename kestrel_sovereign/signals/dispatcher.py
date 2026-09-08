@@ -112,6 +112,7 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
+from kestrel_sovereign.agent.invocation import register_request_delivery
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.security.encryption import (
@@ -1142,7 +1143,7 @@ class SignalDispatcher:
         owner = asyncio.current_task()
         if owner is None:
             raise RuntimeError("durable cognition settlement requires a task owner")
-        generation = register(self._agent, request_id)
+        generation = register_request_delivery(self._agent, request_id, nested=False)
         if (
             not isinstance(generation, int)
             or isinstance(generation, bool)
@@ -1349,18 +1350,26 @@ class SignalDispatcher:
                 payload={},
                 target_agent=delivery.event.target_agent,
             )
-            await self._route_durable_cognition_delivery(
-                seed,
-                registration,
-                time.monotonic(),
-                persisted_event_id=delivery.event_id,
-                consumer_id=consumer_id,
-                durable_admission=None,
-                durable_created=False,
-                use_live_signal=False,
-                claimed_delivery=delivery,
-                retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
+            # The drainer owns a batch, not any one attempt's Stop lifecycle.
+            # Give each recovered delivery its own task so the settlement guard
+            # callback runs at that delivery's ACK/NACK boundary before the
+            # scanner advances. A later wedged row must not keep prior rows live.
+            delivery_task = asyncio.create_task(
+                self._route_durable_cognition_delivery(
+                    seed,
+                    registration,
+                    time.monotonic(),
+                    persisted_event_id=delivery.event_id,
+                    consumer_id=consumer_id,
+                    durable_admission=None,
+                    durable_created=False,
+                    use_live_signal=False,
+                    claimed_delivery=delivery,
+                    retry_delay=_DURABLE_COGNITION_RETRY_DELAY,
+                ),
+                name=f"durable_cognition_recovery:{delivery.delivery_id}",
             )
+            await delivery_task
 
     async def _schedule_next_durable_cognition_drain(self, consumer_id: str) -> None:
         pending = await self.list_durable_deliveries(

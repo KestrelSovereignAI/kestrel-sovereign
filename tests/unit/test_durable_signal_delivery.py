@@ -3741,6 +3741,100 @@ async def test_cursor_owned_cognition_recovers_after_restart_before_cognition_ac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_outcome", ("ack", "nack"))
+async def test_recovery_drainer_releases_each_delivery_settlement_owner(
+    tmp_path,
+    first_outcome,
+):
+    """A later wedged recovery cannot keep an earlier attempt Stop-active.
+
+    The two cases cover the recovered-delivery settlement matrix: both a
+    successful ACK and an ordinary retry NACK end the first attempt's lifecycle
+    before the drainer advances to its second delivery.
+    """
+
+    path = tmp_path / f"recovery-settlement-owner-{first_outcome}.db"
+    backend_a, agent_a, dispatcher_a = await _channel_dispatcher(
+        path, "did:agent:recovery-settlement"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent_a.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+
+    async def leave_for_recovery(_prompt: str):
+        raise RuntimeError("seed retry for restarted dispatcher")
+
+    agent_a.process_input = leave_for_recovery
+    try:
+        await dispatcher_a.register_durable_consumer(consumer)
+        for ordinal in ("first", "second"):
+            handle = await dispatcher_a.enqueue_durable_cognition(
+                _channel_signal(agent_a.did, f"recovery-owner-{ordinal}"),
+                source_event_id=f"telegram:update:recovery-owner:{ordinal}",
+                consumer_id=consumer.consumer_id,
+            )
+            assert (await handle.wait()).status is Status.FAILED
+    finally:
+        await dispatcher_a.shutdown_durable_delivery()
+        await _close(backend_a, agent_a)
+
+    backend_b = SQLiteBackend(str(path))
+    await backend_b.connect()
+    store_b = SignalLogStore(backend_b)
+    await store_b.initialize()
+    agent_b = _LifecycleAgent("did:agent:recovery-settlement")
+    registry_b = SourceRegistry()
+    registry_b.register(build_channel_message_registration())
+    dispatcher_b = SignalDispatcher(
+        agent=agent_b,
+        registry=registry_b,
+        lock_manager=OrderedLockManager(),
+        store=store_b,
+    )
+    await dispatcher_b.initialize_durable_delivery()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+    recovered_invocations: list[str] = []
+
+    async def recover_in_order(
+        _prompt: str,
+        *,
+        invocation_id: str | None = None,
+        **_kwargs,
+    ):
+        assert invocation_id is not None
+        recovered_invocations.append(invocation_id)
+        if len(recovered_invocations) == 1:
+            if first_outcome == "nack":
+                raise RuntimeError("first recovered delivery remains retryable")
+            return "first recovered delivery acknowledged"
+        second_started.set()
+        await release_second.wait()
+        return "second recovered delivery acknowledged"
+
+    agent_b.process_input = recover_in_order
+    try:
+        await dispatcher_b.register_durable_consumer(consumer)
+        await dispatcher_b.start_durable_cognition_consumer(consumer.consumer_id)
+        await asyncio.wait_for(second_started.wait(), timeout=2)
+
+        first_invocation, second_invocation = recovered_invocations
+        assert agent_b.cancel_current_request(first_invocation) is False
+        assert agent_b._active_request_ids == {second_invocation}
+    finally:
+        release_second.set()
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
 async def test_malformed_telegram_terminal_is_durable_without_cognition(tmp_path):
     backend, agent, dispatcher = await _channel_dispatcher(
         tmp_path / "terminal-ingress.db", "did:agent:one"
