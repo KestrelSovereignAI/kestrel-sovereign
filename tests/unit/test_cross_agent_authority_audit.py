@@ -955,6 +955,14 @@ class _StaticBindingFlow:
             is not None
         }
 
+    def declare(
+        self,
+        statement: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    ) -> None:
+        """Replay a declaration; specialized domains may preserve semantics."""
+
+        self.bindings.pop(statement.name, None)
+
     def replay(
         self,
         statements: list[ast.stmt],
@@ -1000,7 +1008,7 @@ class _StaticBindingFlow:
                 statement,
                 (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
             ):
-                self.bindings.pop(statement.name, None)
+                self.declare(statement)
             else:
                 self.replay_expression_bindings(
                     statement,
@@ -8579,8 +8587,11 @@ def _has_provenance_value(
         or _is_provenance_accessor_call(node)
         or any(
             isinstance(child, ast.Call)
-            and _call_name(child).casefold()
-            in (provenance_return_helpers or set())
+            and (
+                _call_name(child).casefold()
+                in (provenance_return_helpers or set())
+                or _CALLABLE_PROVENANCE in _callable_semantics(child)
+            )
             for child in ast.walk(node)
         )
         or any(
@@ -9308,7 +9319,8 @@ def _is_cross_agent_control_call(
         )
     )
     return (
-        _is_unambiguous_control_sink(node, control_aliases)
+        _CALLABLE_CONTROL in _callable_semantics(node.func)
+        or _is_unambiguous_control_sink(node, control_aliases)
         or kills_agent_process
         or call_name in (control_aliases or set())
         or any(
@@ -9445,8 +9457,11 @@ def _provenance_aliases(
             value = value.value
         calls_known_helper = any(
             isinstance(node, ast.Call)
-            and _call_name(node).casefold()
-            in (provenance_return_helpers or set())
+            and (
+                _call_name(node).casefold()
+                in (provenance_return_helpers or set())
+                or _CALLABLE_PROVENANCE in _callable_semantics(node)
+            )
             for node in ast.walk(value)
         )
         calls_known_accessor = _is_provenance_accessor_call(value) or any(
@@ -9484,7 +9499,10 @@ def _provenance_aliases(
             call_name = _call_name(value).casefold()
             if _is_provenance_accessor_call(value):
                 return True
-            if call_name in (provenance_return_helpers or set()):
+            if (
+                call_name in (provenance_return_helpers or set())
+                or _CALLABLE_PROVENANCE in _callable_semantics(value)
+            ):
                 return True
             if call_name.startswith(("can_", "has_", "is_", "may_")) or (
                 _is_permission_name(call_name)
@@ -10114,8 +10132,12 @@ def _class_provenance_state_aliases(
                         }
                         calls_helper = any(
                             isinstance(child, ast.Call)
-                            and _call_name(child).casefold()
-                            in visible_helpers
+                            and (
+                                _call_name(child).casefold()
+                                in visible_helpers
+                                or _CALLABLE_PROVENANCE
+                                in _callable_semantics(child)
+                            )
                             for child in ast.walk(value)
                         )
                         if not (
@@ -10826,6 +10848,416 @@ def _expanded_callable_sources(
     return sources
 
 
+_CALLABLE_CONTROL = "control"
+_CALLABLE_PROVENANCE = "provenance"
+_CALLABLE_CYCLE_BOUNDED = "cycle_bounded"
+_CALLABLE_VALUE = "callable"
+_CALLABLE_CLASS = "class"
+_CALLABLE_FACTORY = "factory"
+
+_CYCLE_BOUNDED_UNIVERSAL_CALLS = {
+    "ask_agent",
+    "peer_stop",
+    "send_a2a_message",
+    "send_a2a_question",
+    "send_a2a_task",
+    "stop_peer",
+}
+
+
+def _callable_semantics(node: ast.AST) -> frozenset[str]:
+    """Return semantic effects attached by the source-order callable flow."""
+
+    return getattr(node, "_authority_callable_semantics", frozenset())
+
+
+def _mark_callable_semantics(node: ast.AST, semantics: set[str]) -> None:
+    """Attach monotone semantic evidence to one expression node."""
+
+    setattr(
+        node,
+        "_authority_callable_semantics",
+        _callable_semantics(node) | frozenset(semantics),
+    )
+
+
+def _semantic_binding(
+    semantics: set[str] | frozenset[str], kind: str
+) -> _StaticBinding:
+    return "+".join(sorted(semantics)), kind
+
+
+def _semantic_binding_flags(binding: _StaticBinding) -> set[str]:
+    return set(binding[0].split("+")) - {""}
+
+
+def _merge_semantic_bindings(
+    bindings: list[_StaticBinding],
+) -> _StaticBinding:
+    """Conservatively join callable effects across possible flow paths."""
+
+    semantics = {
+        semantic
+        for binding in bindings
+        for semantic in _semantic_binding_flags(binding)
+    }
+    kind = (
+        bindings[0][1]
+        if bindings and all(binding[1] == bindings[0][1] for binding in bindings)
+        else _CALLABLE_VALUE
+    )
+    return _semantic_binding(semantics, kind)
+
+
+class _CallableSemanticFlow(_StaticBindingFlow):
+    """Source-order identity flow for summarized callable behavior.
+
+    Function aliases and instances of callable classes are the same semantic
+    problem: Python changed the expression that names a callable, not what an
+    invocation does.  Keep that identity in one small abstract domain and
+    annotate call sites for the provenance and control scanners to consume.
+    """
+
+    def __init__(
+        self,
+        declarations: dict[str, _StaticBinding],
+        classes: dict[str, _StaticBinding],
+        bindings: dict[str, _StaticBinding] | None = None,
+    ) -> None:
+        super().__init__(lambda _node: None, _merge_semantic_bindings, bindings)
+        self.declarations = declarations
+        self.classes = classes
+
+    def fork(self) -> _CallableSemanticFlow:
+        return _CallableSemanticFlow(
+            self.declarations,
+            self.classes,
+            self.bindings,
+        )
+
+    def resolve(
+        self,
+        value: ast.AST,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ]
+        | None = None,
+    ) -> _StaticBinding | None:
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        if isinstance(value, ast.Name):
+            return self.bindings.get(value.id.casefold())
+        if isinstance(value, ast.Attribute):
+            return self.bindings.get(
+                ast.unparse(value).casefold()
+            ) or self.bindings.get(value.attr.casefold())
+        if isinstance(value, ast.IfExp):
+            return self._merge_values([
+                self.resolve(value.body),
+                self.resolve(value.orelse),
+            ])
+        if not isinstance(value, ast.Call):
+            return None
+
+        callee = self.resolve(value.func)
+        if callee is not None and callee[1] in {
+            _CALLABLE_CLASS,
+            _CALLABLE_FACTORY,
+        }:
+            return _semantic_binding(
+                _semantic_binding_flags(callee), _CALLABLE_VALUE
+            )
+        if _call_name(value).casefold() in {
+            "cache",
+            "cast",
+            "identity",
+            "lru_cache",
+            "partial",
+            "partialmethod",
+            "singledispatch",
+            "singledispatchmethod",
+            "update_wrapper",
+            "wraps",
+        } and value.args:
+            return self.resolve(value.args[0])
+        return None
+
+    def declare(
+        self,
+        statement: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    ) -> None:
+        name = statement.name.casefold()
+        self.bindings.pop(name, None)
+        binding = (
+            self.classes.get(name)
+            if isinstance(statement, ast.ClassDef)
+            else self.declarations.get(name)
+        )
+        if binding is not None:
+            self.bindings[name] = binding
+
+    def _annotate_expression(self, expression: ast.AST) -> None:
+        flow = self
+
+        class SemanticCallVisitor(ast.NodeVisitor):
+            def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+                self.generic_visit(node)
+                callee = flow.resolve(node.func)
+                if callee is None:
+                    return
+                semantics = _semantic_binding_flags(callee)
+                if callee[1] == _CALLABLE_VALUE:
+                    _mark_callable_semantics(node.func, semantics)
+                    if _CALLABLE_PROVENANCE in semantics:
+                        _mark_callable_semantics(
+                            node, {_CALLABLE_PROVENANCE}
+                        )
+                elif callee[1] in {_CALLABLE_CLASS, _CALLABLE_FACTORY}:
+                    _mark_callable_semantics(node, semantics)
+
+            def visit_FunctionDef(  # noqa: N802
+                self, node: ast.FunctionDef
+            ) -> None:
+                return
+
+            def visit_AsyncFunctionDef(  # noqa: N802
+                self, node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+                return
+
+        SemanticCallVisitor().visit(expression)
+
+    def replay(
+        self,
+        statements: list[ast.stmt],
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ]
+        | None = None,
+    ) -> None:
+        for statement in statements:
+            if isinstance(statement, _MODULE_COMPOUND_STATEMENT_TYPES):
+                expressions, _blocks = _compound_flow_parts(statement)
+                for expression in expressions:
+                    self._annotate_expression(expression)
+            elif not isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                self._annotate_expression(statement)
+            super().replay([statement])
+
+
+def _callable_class_semantics(
+    tree: ast.AST,
+    provenance_return_helpers: set[str],
+    control_helpers: set[str],
+    module_control_aliases: set[str],
+    function_control_imports: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    class_control_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    module_provenance_aliases: set[str],
+    class_provenance_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+) -> dict[str, frozenset[str]]:
+    """Summarize each class whose instances are semantically callable."""
+
+    summarized: dict[str, frozenset[str]] = {}
+    if not isinstance(tree, ast.Module):
+        return summarized
+    for class_node in (
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    ):
+        call_method = next(
+            (
+                statement
+                for statement in class_node.body
+                if isinstance(
+                    statement, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                and statement.name == "__call__"
+            ),
+            None,
+        )
+        if call_method is None:
+            continue
+        semantics: set[str] = set()
+        visible_controls = (
+            control_helpers
+            | module_control_aliases
+            | function_control_imports.get(call_method, set())
+            | class_control_aliases.get(call_method, set())
+        )
+        if _contains_cross_agent_control_call(
+            call_method.body, visible_controls
+        ):
+            semantics.add(_CALLABLE_CONTROL)
+
+        visible_provenance_helpers = (
+            provenance_return_helpers
+            | function_imported_provenance_helpers.get(call_method, set())
+        ) - {"__call__"}
+        provenance_aliases, _selected = _provenance_aliases(
+            call_method,
+            visible_provenance_helpers,
+            initial_aliases=(
+                module_provenance_aliases
+                | class_provenance_aliases.get(call_method, set())
+            ),
+            authority_analysis=False,
+        )
+        if any(
+            isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
+            and node.value is not None
+            and _has_provenance_value(
+                node.value,
+                provenance_aliases,
+                visible_provenance_helpers,
+            )
+            for node in _walk_lexical_scope(call_method)
+        ):
+            semantics.add(_CALLABLE_PROVENANCE)
+        if semantics:
+            summarized[class_node.name.casefold()] = frozenset(semantics)
+    return summarized
+
+
+def _annotate_static_callable_semantics(
+    tree: ast.AST,
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    function_parents: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        ast.FunctionDef | ast.AsyncFunctionDef,
+    ],
+    provenance_return_helpers: set[str],
+    control_helpers: set[str],
+    control_return_helpers: set[str],
+    callable_classes: dict[str, frozenset[str]],
+    imported_provenance_helpers: set[str],
+    module_control_aliases: set[str],
+    function_imported_provenance_helpers: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    function_control_imports: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+    function_accessor_aliases: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ],
+) -> None:
+    """Annotate invocations after resolving aliases and callable instances."""
+
+    declaration_semantics: dict[str, set[str]] = {}
+    for name in provenance_return_helpers:
+        declaration_semantics.setdefault(name, set()).add(_CALLABLE_PROVENANCE)
+    for name in control_helpers:
+        declaration_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
+        if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
+            declaration_semantics[name].add(_CALLABLE_CYCLE_BOUNDED)
+    declarations = {
+        name: _semantic_binding(semantics, _CALLABLE_VALUE)
+        for name, semantics in declaration_semantics.items()
+    }
+    for name in control_return_helpers - set(declarations):
+        declarations[name] = _semantic_binding(
+            {_CALLABLE_CONTROL}, _CALLABLE_FACTORY
+        )
+    classes = {
+        name: _semantic_binding(semantics, _CALLABLE_CLASS)
+        for name, semantics in callable_classes.items()
+    }
+
+    module_bindings: dict[str, _StaticBinding] = {}
+    for name in imported_provenance_helpers:
+        module_bindings[name] = _semantic_binding(
+            {_CALLABLE_PROVENANCE}, _CALLABLE_VALUE
+        )
+    for name in module_control_aliases:
+        existing = module_bindings.get(name)
+        semantics = (
+            _semantic_binding_flags(existing) if existing is not None else set()
+        )
+        semantics.add(_CALLABLE_CONTROL)
+        if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
+            semantics.add(_CALLABLE_CYCLE_BOUNDED)
+        module_bindings[name] = _semantic_binding(
+            semantics, _CALLABLE_VALUE
+        )
+    module_flow = _CallableSemanticFlow(
+        declarations, classes, module_bindings
+    )
+    if isinstance(tree, ast.Module):
+        module_flow.replay(tree.body)
+
+    completed: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, dict[str, _StaticBinding]
+    ] = {}
+
+    def analyze(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, _StaticBinding]:
+        cached = completed.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = (
+            analyze(parent) if parent is not None else module_flow.bindings
+        )
+        bindings = dict(inherited)
+        local_semantics: dict[str, set[str]] = {}
+        for name in (
+            function_imported_provenance_helpers.get(function, set())
+            | function_accessor_aliases.get(function, set())
+        ):
+            local_semantics.setdefault(name, set()).add(_CALLABLE_PROVENANCE)
+        for name in function_control_imports.get(function, set()):
+            local_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
+            if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
+                local_semantics[name].add(_CALLABLE_CYCLE_BOUNDED)
+        for name, semantics in local_semantics.items():
+            bindings[name] = _semantic_binding(semantics, _CALLABLE_VALUE)
+        parameters = {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+                *(
+                    [function.args.vararg]
+                    if function.args.vararg is not None
+                    else []
+                ),
+                *(
+                    [function.args.kwarg]
+                    if function.args.kwarg is not None
+                    else []
+                ),
+            ]
+        }
+        for parameter in parameters:
+            bindings.pop(parameter, None)
+        flow = _CallableSemanticFlow(declarations, classes, bindings)
+        flow.replay(function.body)
+        completed[function] = dict(flow.bindings)
+        return completed[function]
+
+    for function in functions:
+        analyze(function)
+
+
 def _local_parameter_return_flows(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     function_imported_flows: dict[
@@ -11127,12 +11559,17 @@ def _local_provenance_return_helpers(
                     call_name = _call_name(value).casefold()
                     calls_known_helper = any(
                         isinstance(child, ast.Call)
-                        and _call_name(child).casefold() in visible_helpers
+                        and (
+                            _call_name(child).casefold() in visible_helpers
+                            or _CALLABLE_PROVENANCE
+                            in _callable_semantics(child)
+                        )
                         for child in ast.walk(value)
                     )
                     returns_provenance = (
                         _is_provenance_accessor_call(value)
                         or call_name in visible_helpers
+                        or _CALLABLE_PROVENANCE in _callable_semantics(value)
                         or call_returns_supplied_provenance(
                             value,
                             aliases,
@@ -11297,9 +11734,128 @@ def _cached_contains_cross_agent_control_call(
 def _is_cross_agent_control_reference(node: ast.AST) -> bool:
     """Whether an expression selects a control callable without invoking it."""
 
-    return any(
+    return _CALLABLE_CONTROL in _callable_semantics(node) or any(
         _is_unambiguous_control_token(source)
         for source in _control_reference_sources(node)
+    )
+
+
+def _causation_membership_polarity(
+    condition: ast.AST,
+    provenance_aliases: set[str],
+    provenance_return_helpers: set[str] | None = None,
+) -> str | None:
+    """Return whether a target-membership test selects seen or unseen peers."""
+
+    inverted = False
+    while isinstance(condition, ast.UnaryOp) and isinstance(
+        condition.op, ast.Not
+    ):
+        inverted = not inverted
+        condition = condition.operand
+    if (
+        not isinstance(condition, ast.Compare)
+        or len(condition.ops) != 1
+        or len(condition.comparators) != 1
+        or not isinstance(condition.ops[0], (ast.In, ast.NotIn))
+    ):
+        return None
+    member = condition.left
+    collection = condition.comparators[0]
+    if _has_provenance_value(
+        member, provenance_aliases, provenance_return_helpers
+    ) or not _has_provenance_value(
+        collection, provenance_aliases, provenance_return_helpers
+    ):
+        return None
+    selects_seen = isinstance(condition.ops[0], ast.In) ^ inverted
+    return "seen" if selects_seen else "unseen"
+
+
+def _is_cycle_bounded_universal_call(call: ast.Call) -> bool:
+    return (
+        _call_name(call).casefold() in _CYCLE_BOUNDED_UNIVERSAL_CALLS
+        or _CALLABLE_CYCLE_BOUNDED in _callable_semantics(call.func)
+    )
+
+
+def _contains_only_cycle_bounded_controls(
+    nodes: ast.AST | list[ast.AST],
+    control_aliases: set[str],
+    state_object_aliases: set[str] | None = None,
+) -> bool:
+    """Whether every guarded authority sink is an explicit universal rail."""
+
+    roots = tuple(nodes) if isinstance(nodes, list) else (nodes,)
+
+    class CycleBoundedControlVisitor(ast.NodeVisitor):
+        found_control = False
+        invalid_control = False
+
+        def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            if _is_cross_agent_state_mutation_call(
+                node, state_object_aliases
+            ):
+                self.invalid_control = True
+                return
+            if _is_cross_agent_control_call(
+                node, control_aliases, state_object_aliases
+            ):
+                self.found_control = True
+                if not _is_cycle_bounded_universal_call(node):
+                    self.invalid_control = True
+                    return
+            self.generic_visit(node)
+
+        def visit_FunctionDef(  # noqa: N802
+            self, node: ast.FunctionDef
+        ) -> None:
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = CycleBoundedControlVisitor()
+    for root in roots:
+        visitor.visit(root)
+    return visitor.found_control and not visitor.invalid_control
+
+
+def _if_only_suppresses_causation_cycle(
+    statement: ast.If,
+    provenance_aliases: set[str],
+    control_aliases: set[str],
+    provenance_return_helpers: set[str] | None = None,
+    state_object_aliases: set[str] | None = None,
+) -> bool:
+    """Whether an if removes a repeated peer from a universal operation."""
+
+    polarity = _causation_membership_polarity(
+        statement.test,
+        provenance_aliases,
+        provenance_return_helpers,
+    )
+    if polarity == "unseen":
+        permitted_branch, suppressed_branch = statement.body, statement.orelse
+    elif polarity == "seen":
+        permitted_branch, suppressed_branch = statement.orelse, statement.body
+    else:
+        return False
+    return (
+        _contains_only_cycle_bounded_controls(
+            permitted_branch, control_aliases, state_object_aliases
+        )
+        and not _contains_cross_agent_control_call(
+            suppressed_branch, control_aliases, state_object_aliases
+        )
     )
 
 
@@ -11401,6 +11957,42 @@ def _guard_clause_provenance_lines(
                             statements[index + 1 :],
                         )
                     )
+                membership_polarity = _causation_membership_polarity(
+                    statement.test,
+                    provenance_aliases,
+                    provenance_return_helpers,
+                )
+                seen_branch_exits = (
+                    body_exits
+                    if membership_polarity == "seen"
+                    else orelse_exits
+                    if membership_polarity == "unseen"
+                    else False
+                )
+                unseen_branch_exits = (
+                    orelse_exits
+                    if membership_polarity == "seen"
+                    else body_exits
+                    if membership_polarity == "unseen"
+                    else False
+                )
+                only_suppresses_cycle = (
+                    suffix_controls[index + 1]
+                    and not enclosing_continuation_controls
+                    and not enclosing_loop_continuation_controls
+                    and seen_branch_exits
+                    and not unseen_branch_exits
+                    and not _contains_cross_agent_control_call(
+                        [*statement.body, *statement.orelse],
+                        control_aliases,
+                        state_object_aliases,
+                    )
+                    and _contains_only_cycle_bounded_controls(
+                        statements[index + 1 :],
+                        control_aliases,
+                        state_object_aliases,
+                    )
+                )
                 if (
                     (
                         local_continuation_controls
@@ -11414,7 +12006,7 @@ def _guard_clause_provenance_lines(
                     statement.test,
                     provenance_aliases,
                     provenance_return_helpers,
-                ):
+                ) and not only_suppresses_cycle:
                     lines.add(statement.lineno)
             elif controls_continuation and isinstance(statement, ast.Match):
                 has_catch_all = any(
@@ -13459,6 +14051,116 @@ def _authority_provenance_lines(
             or provenance_return_helpers != previous_helper_names
             or class_provenance_aliases != previous_class_aliases
         )
+
+    # Callable identity is a shared semantic layer, not a growing inventory of
+    # AST spellings.  Reconcile helper summaries after annotating aliases and
+    # callable instances so wrappers discovered through either domain feed the
+    # same fixed point as directly named functions.
+    callable_semantics_changed = True
+    while callable_semantics_changed:
+        previous_control_helpers = set(control_helpers)
+        previous_control_return_helpers = set(control_return_helpers)
+        previous_class_control_aliases = {
+            function: set(aliases)
+            for function, aliases in class_control_aliases.items()
+        }
+        previous_provenance_helpers = set(provenance_return_helpers)
+        previous_module_provenance_aliases = set(module_provenance_aliases)
+        previous_class_provenance_aliases = {
+            function: set(aliases)
+            for function, aliases in class_provenance_aliases.items()
+        }
+
+        callable_classes = _callable_class_semantics(
+            tree,
+            provenance_return_helpers,
+            control_helpers,
+            module_control_aliases,
+            function_control_imports,
+            class_control_aliases,
+            module_provenance_aliases,
+            class_provenance_aliases,
+            function_imported_provenance_helpers,
+        )
+        _annotate_static_callable_semantics(
+            tree,
+            functions,
+            function_parents,
+            provenance_return_helpers,
+            control_helpers,
+            control_return_helpers,
+            callable_classes,
+            imported_provenance_helpers,
+            module_control_aliases,
+            function_imported_provenance_helpers,
+            function_control_imports,
+            function_accessor_aliases,
+        )
+        _cached_contains_cross_agent_control_call.cache_clear()
+
+        visible_control_aliases = {
+            function: function_control_imports[function]
+            | class_control_aliases.get(function, set())
+            | function_callback_control_aliases[function]
+            for function in functions
+        }
+        control_return_helpers.update(
+            _local_control_return_helpers(
+                functions,
+                control_helpers,
+                visible_control_aliases,
+            )
+        )
+        control_helpers.update(
+            _local_control_helpers(
+                functions,
+                module_control_aliases | control_helpers,
+                visible_control_aliases,
+                function_callback_control_aliases,
+                function_control_parameter_return_flows,
+            )
+        )
+        class_control_aliases = _class_control_state_aliases(
+            tree,
+            control_helpers,
+            module_control_aliases,
+            visible_control_aliases,
+            control_return_helpers,
+        )
+        class_provenance_aliases = _class_provenance_state_aliases(
+            tree,
+            provenance_return_helpers,
+            module_provenance_aliases,
+            function_imported_provenance_helpers,
+        )
+        provenance_return_helpers = _local_provenance_return_helpers(
+            functions,
+            control_helpers,
+            module_provenance_aliases,
+            provenance_return_helpers,
+            class_provenance_aliases,
+            function_imported_provenance_helpers,
+            function_parameter_return_flows,
+        )
+        module_provenance_aliases = _module_provenance_state_aliases(
+            functions,
+            function_parents,
+            provenance_return_helpers,
+            module_provenance_aliases,
+            class_provenance_aliases,
+            function_accessor_aliases,
+            function_imported_provenance_helpers,
+        )
+        callable_semantics_changed = (
+            control_helpers != previous_control_helpers
+            or control_return_helpers != previous_control_return_helpers
+            or class_control_aliases != previous_class_control_aliases
+            or provenance_return_helpers != previous_provenance_helpers
+            or module_provenance_aliases
+            != previous_module_provenance_aliases
+            or class_provenance_aliases
+            != previous_class_provenance_aliases
+        )
     function_state_objects: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
@@ -13883,7 +14585,16 @@ def _authority_provenance_lines(
                 _is_cross_agent_control_reference(branch)
                 for branch in (node.body, node.orelse)
             )
-            if has_provenance and (
+            only_suppresses_cycle = isinstance(
+                node, ast.If
+            ) and _if_only_suppresses_causation_cycle(
+                node,
+                provenance_aliases,
+                control_aliases,
+                decision_provenance_helpers,
+                state_object_aliases,
+            )
+            if has_provenance and not only_suppresses_cycle and (
                 has_permission
                 or function_is_permission_boundary
                 or _contains_cross_agent_control_call(
@@ -16622,6 +17333,84 @@ def test_provenance_scanner_follows_module_control_aliases_and_factories(
 
     assert _authority_provenance_lines(tree) == {6, 10}
     assert _cached_authority_provenance_lines(source_path) == frozenset({6, 10})
+
+
+@pytest.mark.parametrize(
+    "binding",
+    (
+        "check = derive",
+        "renamed = derive\ncheck = renamed",
+    ),
+)
+def test_provenance_helper_semantics_survive_callable_aliases(
+    binding: str,
+) -> None:
+    """Renaming a summarized helper must not erase its return semantics."""
+
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    return request.causation_chain\n\n"
+        f"{binding}\n\n"
+        "def dispatch(request, target):\n"
+        "    if check(request):\n"
+        "        terminate_child(target)\n"
+    )
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+def test_control_semantics_survive_callable_instance_construction() -> None:
+    """A class instance keeps the control semantics of its ``__call__``."""
+
+    tree = ast.parse(
+        "class Controller:\n"
+        "    def __call__(self, target):\n"
+        "        target.shutdown()\n\n"
+        "controller = Controller()\n\n"
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        controller(target)\n"
+    )
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+@pytest.mark.parametrize(
+    ("operator", "guard_exits", "expected_violation"),
+    (
+        ("not in", False, False),
+        ("in", False, True),
+        ("in", True, False),
+        ("not in", True, True),
+    ),
+)
+def test_causation_cycle_suppression_is_not_an_authority_grant(
+    operator: str,
+    guard_exits: bool,
+    expected_violation: bool,
+) -> None:
+    """Only the polarity that suppresses a repeated peer is non-authority."""
+
+    guarded = (
+        "        return\n"
+        if guard_exits
+        else "        send_a2a_message(peer)\n"
+    )
+    continuation = "    send_a2a_message(peer)\n" if guard_exits else ""
+    tree = ast.parse(
+        "def dispatch(request, peer):\n"
+        "    visited = {frame.agent_id for frame in request.causation_chain}\n"
+        f"    if peer.agent_id {operator} visited:\n"
+        f"{guarded}"
+        f"{continuation}"
+    )
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert (guard.lineno in _authority_provenance_lines(tree)) is (
+        expected_violation
+    )
 
 
 def test_provenance_scanner_excludes_benign_task_and_host_calls() -> None:
