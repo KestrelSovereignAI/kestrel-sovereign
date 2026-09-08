@@ -822,6 +822,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `PATCH /api/identity`
   - `POST /api/identity/avatar`
   - `POST /api/identity/avatar/generate`
+  - `GET /api/ipfs/node`
   - `GET /api/ipfs/status`
   - `GET /api/keys`
   - `POST /api/keys`

@@ -257,14 +257,21 @@ _INERT_CHARACTERS = frozenset(
 
 # Words a shell reads as GRAMMAR rather than as the name of a program.
 #
-# The character allow-list above is not enough on its own, because one
-# backend does not exec the argv it is handed: DockerSandboxBackend
-# rebuilds a bash script from it (``" ".join(shlex.quote(a))``) and runs
-# that (#3187). Quoting neutralises every metacharacter there — but a
-# bare word needs no quoting, so ``eval 'dd ...'``, ``FOO=x dd ...`` and
-# ``trap 'dd ...' EXIT`` survive intact and run a binary
-# ``BinaryPolicy`` never saw, having vetted ``eval``, ``FOO=x`` or
-# ``trap``.
+# The character allow-list above is not enough on its own, because a
+# grammar word is spelled entirely in inert characters. ``eval``,
+# ``FOO=x`` and ``trap`` are requests to run some *other* program, and
+# ``BinaryPolicy`` vets only the first token — so what the operator
+# approves is not what the caller asked for.
+#
+# This was originally a containment for a backend that did not exec the
+# vector it was handed: ``DockerSandboxBackend`` rebuilt a bash script
+# from it, where those three words ran a binary the policy never saw
+# (#3187). That backend now execs argv, so such a word fails as a
+# missing executable on both backends instead. The rule stays because
+# the tool's contract is stated here, not in a backend: a refusal that
+# names what is wrong beats a container that starts and exits 127, and
+# a future backend cannot re-open the hole by being written the old
+# way.
 #
 # Listing the builtins that dispatch a command is the enumeration this
 # ticket has been burned by six times: round 7 named `eval`, `exec`,
@@ -286,19 +293,21 @@ _BUILTINS_THAT_ARE_ALSO_PROGRAMS = frozenset(
 # newer bash adds; this snapshot is what makes the check version-proof
 # where the developer's shell is older than the runner's.
 #
-# It is a union of the shells the shipped backends can reach, because
-# "which shell" is not a constant here: DockerExecutor writes a script
-# it calls bash and runs it with `sh` inside `alpine:3.19`, where
-# /bin/sh is BusyBox. Measured in that image rather than read from
-# documentation — BusyBox ash has `chdir`, which bash does not, and
-# `shell("chdir /tmp")` therefore succeeded under the default backend
-# while failing "command not found" under the local one (codex round 9).
+# It is a union of bash and BusyBox ash, because "which shell" was not
+# a constant while a backend still ran one: DockerExecutor wrote a
+# script it called bash and ran it with `sh` inside `alpine:3.19`,
+# where /bin/sh is BusyBox. Measured in that image rather than read
+# from documentation — BusyBox ash has `chdir`, which bash does not,
+# and `shell("chdir /tmp")` therefore succeeded under the default
+# backend while failing "command not found" under the local one (codex
+# round 9).
 #
-# The limit, stated rather than implied: this covers bash and BusyBox
-# ash. `DEFAULT_IMAGES` is configurable, so an operator who points the
-# backend at an image with a different shell gets grammar this does not
-# know. That is not fixable by a longer list — it is #3187, where a
-# backend named `exec(argv)` stops running a shell at all.
+# #3187 removed the shell from that path, and with it the open-ended
+# obligation this list could not meet: no image's `/bin/sh` decides
+# what runs any more, so an operator who repoints `DEFAULT_IMAGES`
+# cannot introduce grammar the list has never heard of. What remains is
+# a closed question about the two shells a caller may plausibly have in
+# mind when they write a command by hand.
 _SHELL_RESERVED_WORDS = frozenset(
     "if then else elif fi case esac for select while until do done in "
     "function time coproc { } ! [[ ]]".split()

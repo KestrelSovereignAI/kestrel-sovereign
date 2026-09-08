@@ -16,18 +16,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from kestrel_sovereign.auth import current_caller_context
-from kestrel_sovereign.security.sovereign_key import (
-    is_ephemeral_sovereign_key,
-    normalize_sovereign_api_key,
-    sovereign_key_fingerprint,
+from kestrel_sovereign.security.host_authority import (
+    HostAuthorityError,
+    require_sovereign_caller,
+    stable_sovereign_secret,
 )
 
 
@@ -82,52 +80,27 @@ class RestartAuthorityError(ValueError):
     """A whole-host request lacks verifiable sovereign authority."""
 
 
+_OPERATION = "whole-host restart"
+
+
 def _sovereign_secret() -> bytes:
-    raw = normalize_sovereign_api_key(os.environ.get("KESTREL_API_KEY") or "")
-    if not raw:
-        raise RestartAuthorityError(
-            "whole-host restart authority is unavailable: no stable sovereign key"
-        )
     try:
-        if is_ephemeral_sovereign_key(raw):
-            raise RestartAuthorityError(
-                "whole-host restart authority is unavailable: the server generated "
-                "a temporary sovereign key; configure a stable KESTREL_API_KEY"
-            )
-        return raw.encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise RestartAuthorityError(
-            "whole-host restart authority is unavailable: the sovereign key is "
-            "not valid UTF-8"
-        ) from error
+        return stable_sovereign_secret(_OPERATION)
+    except HostAuthorityError as error:
+        raise RestartAuthorityError(str(error)) from error
 
 
 def require_restart_request_authority() -> str:
-    """Return the current sovereign actor after validating durable key custody."""
+    """Return the current sovereign actor after validating durable key custody.
 
-    caller = current_caller_context()
-    if caller is None or caller.is_sovereign is not True:
-        raise RestartAuthorityError(
-            "whole-host restart requires an authenticated sovereign-key caller"
-        )
-    actor = caller.identity
-    if not isinstance(actor, str) or not actor.strip():
-        raise RestartAuthorityError("sovereign caller has no durable actor identity")
-    # Validate the signing key before callers perform any update-path
-    # inspection, then bind it to the credential the endpoint actually
-    # authenticated. A request admitted under key A cannot mint authority under
-    # newly rotated key B merely because its agent turn is still running.
-    secret = _sovereign_secret()
-    authenticated_fingerprint = caller.credential_fingerprint
-    if not isinstance(authenticated_fingerprint, str) or not hmac.compare_digest(
-        authenticated_fingerprint,
-        sovereign_key_fingerprint(secret.decode("utf-8")),
-    ):
-        raise RestartAuthorityError(
-            "whole-host restart authority no longer matches the authenticated "
-            "credential at request entry"
-        )
-    return actor.strip()
+    The predicate itself lives in :mod:`kestrel_sovereign.security.host_authority`
+    since #3221/#3223, shared with the model service and fleet deployment; this
+    keeps the restart-specific error type and messages callers already handle.
+    """
+    try:
+        return require_sovereign_caller(_OPERATION)
+    except HostAuthorityError as error:
+        raise RestartAuthorityError(str(error)) from error
 
 
 def _request_claims(

@@ -12,8 +12,13 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.auth import AuthMethod, CallerContext, CallerRole
+
 from kestrel_sovereign import cli
 from kestrel_sovereign.endpoints import features as features_endpoint
+from kestrel_sovereign.endpoints.agent_helpers import (
+    require_sovereign_host_lifecycle,
+)
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
@@ -77,9 +82,28 @@ def _make_feature(
     return feature
 
 
-def _make_app(agent=None):
-    """Create a FastAPI app with the features router mounted."""
+_UNSET = object()
+
+
+def _make_app(agent=None, caller=_UNSET):
+    """Create a FastAPI app with the features router mounted.
+
+    ``caller`` stands in for the auth middleware that populates
+    ``request.state.caller`` in ``server.py``. It defaults to a sovereign
+    caller because install and remove now require sovereign authority
+    (#3214) and the tests below are about install mechanics, not about
+    who may ask. Pass an explicit caller — including ``None`` for "no
+    middleware ran" — to exercise the authority gate itself.
+    """
     app = FastAPI()
+
+    resolved = CallerContext.sovereign() if caller is _UNSET else caller
+
+    @app.middleware("http")
+    async def _attach_caller(request, call_next):
+        request.state.caller = resolved
+        return await call_next(request)
+
     app.include_router(features_router)
     if agent is not None:
         app.state.agent = agent
@@ -1491,6 +1515,136 @@ class TestDisableFeature:
         assert feature_name in response.json()["detail"]
         feature.on_disable.assert_not_awaited()
         assert feature.enabled is True
+
+    def test_host_scope_disable_is_rejected_and_core_baseline_still_toggles(self):
+        """#3234: a ``host_scope = true`` package cannot be disabled per agent,
+        even by the sovereign; an ordinary ``core = true`` package can.
+
+        The REAL registry, not a fake: ``restart_coordinator`` declares
+        ``host_scope`` and ``web_search`` is ``core`` without it. The class is
+        resolved by bare name (the path that never consults the registry) and
+        by package stable id. The positive control is the correction of the
+        first cut of this ticket, which refused all 37 core classes on the
+        premise that the baseline is host policy — a per-agent carve-out of a
+        core feature is a first-class concept (``[agents.<name>].features``).
+        """
+        host_scope = _make_feature(name="RestartCoordinatorFeature")
+        baseline = _make_feature(name="WebSearchFeature")
+        agent = _lifecycle_agent(
+            features={
+                "RestartCoordinatorFeature": host_scope,
+                "WebSearchFeature": baseline,
+            }
+        )
+        app = _make_app(agent)  # sovereign caller
+
+        with TestClient(app) as client:
+            for name in ("RestartCoordinatorFeature", "restart_coordinator"):
+                resp = client.post(f"/api/features/{name}/disable")
+                assert resp.status_code == 409, (name, resp.text)
+                assert "RestartCoordinatorFeature" in resp.json()["detail"]
+                assert "host-wide" in resp.json()["detail"]
+            host_scope.on_disable.assert_not_awaited()
+            host_scope.shutdown.assert_not_awaited()
+            assert host_scope.enabled is True
+
+            resp = client.post("/api/features/WebSearchFeature/disable")
+            assert resp.status_code == 200, resp.text
+            baseline.on_disable.assert_awaited_once()
+            assert baseline.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_boot_replay_of_disabled_deltas_reads_the_same_rule(self):
+        """#3234 round 2: the rule guarded the WRITER of the enablement delta;
+        the two boot-time READERS still filtered on the mandatory set only,
+        so a persisted ``disabled`` row for a host-scope class (one that
+        predates the rule, or is written by any future door) would drop the
+        class from the load loop at every boot with nothing left to refuse
+        it. Both readers now apply the rule; an ordinary core class is still
+        honoured.
+        """
+        agent = _lifecycle_agent()
+        agent._allowed_features = {
+            "RestartCoordinatorFeature", "SchedulerFeature", "WebSearchFeature", "TodoFeature",
+        }
+        store = MagicMock()
+        store.get_deltas = AsyncMock(return_value=[
+            {"name": "RestartCoordinatorFeature", "state": "disabled"},
+            {"name": "SchedulerFeature", "state": "disabled"},
+            {"name": "IdentityFeature", "state": "disabled"},
+            {"name": "WebSearchFeature", "state": "disabled"},
+            {"name": "VoiceFeature", "state": "enabled"},
+        ])
+        agent._feature_enablement_store = store
+
+        assert await agent._disabled_feature_names() == {"WebSearchFeature"}
+        effective = await agent._effective_allowed_features()
+        assert effective == {
+            "RestartCoordinatorFeature", "SchedulerFeature", "TodoFeature", "VoiceFeature",
+        }
+
+    def test_scheduler_is_host_scope_because_it_ticks_the_restart_cron(self):
+        """#3234 round 2: the host-wide half of the restart protocol is the
+        ACTION cron the scheduler ticks; disabling the scheduler on one agent
+        degrades the host exactly as disabling the coordinator would.
+        """
+        scheduler = _make_feature(name="SchedulerFeature")
+        agent = _lifecycle_agent(features={"SchedulerFeature": scheduler})
+        app = _make_app(agent)
+        with TestClient(app) as client:
+            resp = client.post("/api/features/SchedulerFeature/disable")
+        assert resp.status_code == 409, resp.text
+        assert "SchedulerFeature" in resp.json()["detail"]
+        scheduler.on_disable.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_agents_own_disable_doors_read_the_same_rule(self):
+        """#3234 round 1 (P1): the HTTP route was one door of two. The
+        tool-driven ``feature_remove`` reaches ``KestrelAgent._disable_feature``
+        and then persists a per-agent ``disabled`` delta that is replayed at
+        every boot — the durable door. Both now refuse a host-scope class with
+        the same rule the route answers 409 with, and both still admit an
+        ordinary core class.
+        """
+        from kestrel_sovereign.feature_registry import HostScopeFeatureError
+
+        # ``_disable_feature`` keys on ``type(feature).__name__``, so the
+        # stand-in must carry the real class name, not a MagicMock's.
+        RestartCoordinatorFeature = type("RestartCoordinatorFeature", (MagicMock,), {})
+        WebSearchFeature = type("WebSearchFeature", (MagicMock,), {})
+        host_scope = RestartCoordinatorFeature()
+        host_scope.name = "RestartCoordinatorFeature"
+        baseline = WebSearchFeature()
+        baseline.name = "WebSearchFeature"
+        agent = _lifecycle_agent(
+            features={
+                "RestartCoordinatorFeature": host_scope,
+                "WebSearchFeature": baseline,
+            }
+        )
+        agent._unregister_feature_runtime = AsyncMock()
+        store = MagicMock()
+        store.set_state = AsyncMock()
+        agent._feature_enablement_store = store
+
+        with pytest.raises(HostScopeFeatureError):
+            await agent._disable_feature("RestartCoordinatorFeature")
+        with pytest.raises(HostScopeFeatureError):
+            await agent.persist_feature_enablement(
+                "feature", "RestartCoordinatorFeature", "disabled"
+            )
+        agent._unregister_feature_runtime.assert_not_awaited()
+        store.set_state.assert_not_awaited()
+
+        await agent._disable_feature("WebSearchFeature")
+        await agent.persist_feature_enablement("feature", "WebSearchFeature", "disabled")
+        agent._unregister_feature_runtime.assert_awaited_once()
+        store.set_state.assert_awaited_once()
+        # Re-enabling a host-scope feature is never refused: only "disabled"
+        # deltas are governed.
+        await agent.persist_feature_enablement(
+            "feature", "RestartCoordinatorFeature", "enabled"
+        )
 
     def test_disable_calls_on_disable(self):
         feature = _make_feature()
@@ -3953,3 +4107,445 @@ class TestPostRepairRevalidation:
 
         assert resp.status_code == 500, resp.json()   # the check really ran...
         assert held == [True]                          # ...and ran holding the lock
+
+
+# =============================================================================
+# Sovereign authority on the shared-environment routes (#3214)
+# =============================================================================
+
+
+def _seal_installer_seams(monkeypatch):
+    """Make it impossible for these tests to install or uninstall anything.
+
+    **This is load-bearing today, not only under mutation.** The tests
+    below deliberately drive a sovereign caller *past* the gate to show
+    the differential exists, and both handlers then run to completion:
+    `install` reaches `uv pip install --python <venv> -c <constraints>
+    kestrel-feature-test` and `remove` reaches
+    `<venv>/bin/python -m pip uninstall -y kestrel-feature-test`
+    (`_remove_feature_locked` does not 404 when nothing is loaded).
+    Delete this call and the suite really does install and uninstall a
+    package in whichever venv is running it. The returned recorder is
+    asserted on for that reason — so the danger is visible in the test
+    body rather than trusted to this docstring.
+
+    Everything goes through `monkeypatch`, deliberately. Using
+    `@patch("...features.subprocess.run")` alongside `use_fake_uv` does
+    not work: the decorator targets the STDLIB module object — the same
+    one `use_fake_uv` patches, since `cli.subprocess`,
+    `cli_features.subprocess` and `features.subprocess` are all that
+    module — so monkeypatch records the MagicMock as the "old" value and
+    writes it back at fixture teardown, after the decorator has exited.
+    `subprocess.run` then stays a MagicMock configured
+    `returncode=0, stdout=""` for the rest of the worker: the
+    silent-success shape, which makes any later test that shells out and
+    checks only a return code pass without running anything. One
+    mechanism, one LIFO teardown, no leak.
+
+    Note the second `setattr` replaces FakeUv's own modelled installer
+    on that same attribute; FakeUv is still what answers the venv-state
+    reads, which is what the constraints resolution needs.
+    """
+    use_fake_uv(
+        monkeypatch,
+        FakeUv(feature="kestrel-feature-test", core_checkout="/src/core"),
+    )
+    attempted: list[list[str]] = []
+
+    def _record(*args, **kwargs):
+        attempted.append(list(args[0] if args else kwargs.get("args") or []))
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(features_endpoint.subprocess, "run", _record)
+    return attempted
+
+
+# Every mutation on this router, as (method, path suffix, body). Install and
+# remove mutate the interpreter every agent is loaded from (#3214); enable,
+# disable and config PATCH mutate a caller-SELECTED agent's runtime — the
+# routing middleware pins whichever agent the path names and the caller
+# model carries no binding to any agent, so "the routed agent's own runtime"
+# is a blast radius, not an authority (#3234). PATCH is also a disable door:
+# a config that fails reconciliation tears the feature down.
+_MUTATIONS = [
+    ("POST", "install", None),
+    ("POST", "remove", None),
+    ("POST", "enable", None),
+    ("POST", "disable", None),
+    ("PATCH", "config", {"config": {}}),
+]
+_MUTATION_IDS = [suffix for _method, suffix, _body in _MUTATIONS]
+
+
+def _mutate(client, method, name, suffix, body):
+    return client.request(method, f"/api/features/{name}/{suffix}", json=body)
+
+
+class TestSharedEnvironmentRoutesRequireSovereignAuthority:
+    """Install and remove run pip against the interpreter every agent on the
+    host is loaded from, so they are host administration rather than the
+    routed agent's own business (#3214). Enable, disable and config PATCH
+    act on whichever agent the caller named in the path, with no per-agent
+    authorization anywhere between the auth middleware and the handler, so
+    they are not the caller's own business either (#3234).
+
+    The claim was already in the docstring — "Requires a sovereign agent —
+    governed agents cannot install packages" — while the handler resolved
+    the routed agent and installed. The predicate that would have enforced
+    it existed and guarded ``POST /api/agents``; these routes just never
+    used it.
+    """
+
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
+    @pytest.mark.parametrize(
+        "caller,label",
+        [
+            (CallerContext(role=CallerRole.AUTHENTICATED), "an OAuth/JWT user"),
+            (CallerContext.a2a_transport(), "a peer admitted by transport"),
+            (CallerContext.anonymous(), "an anonymous caller"),
+            (None, "middleware ran but attached no caller"),
+        ],
+    )
+    def test_a_caller_without_sovereign_authority_is_refused(
+        self, method, suffix, body, caller, label
+    ):
+        agent = _make_agent()
+        app = _make_app(agent, caller=caller)
+
+        with TestClient(app) as client:
+            response = _mutate(client, method, "test-pkg", suffix, body)
+
+        assert response.status_code == 403, (label, suffix, response.text)
+        assert "Sovereign authority is required." in response.text
+
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
+    def test_an_app_with_no_auth_middleware_at_all_is_refused(
+        self, method, suffix, body
+    ):
+        """The shape round 1's P1 actually had.
+
+        `_make_app` always registers its middleware, so passing
+        ``caller=None`` produces "middleware ran and attached nothing" —
+        a different thing from "no middleware ran", where
+        ``request.state.caller`` is not merely None but absent. The
+        existing regression tests build exactly this kind of app, so the
+        guard has to fail closed on a missing attribute and not only on
+        a None one.
+        """
+        app = FastAPI()
+        app.include_router(features_router)
+        app.state.agent = _make_agent()
+
+        with TestClient(app) as client:
+            response = _mutate(client, method, "test-pkg", suffix, body)
+
+        assert response.status_code == 403, response.text
+
+    @pytest.mark.parametrize("route", ["install", "remove"])
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_refusal_does_not_reveal_whether_the_package_exists(
+        self, mock_registry, route, monkeypatch
+    ):
+        """403 before 404, so the refusal is not an existence oracle.
+
+        The guard is a route dependency for this reason: a check inside
+        the handler would run after the registry lookup, and an
+        unauthorized caller could tell a real package from an invented
+        one by whether they got 404 or 403.
+
+        The registry has to be the real fake one for this to mean
+        anything. Written first against a bare `_make_agent()`, both
+        names resolved identically, so the two requests could not
+        differ however the guard was placed — and a mutant that moved
+        the check after the lookup passed. `test-pkg` is in the catalog
+        below and the invented name is not, so the oracle exists to be
+        closed.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        attempted = _seal_installer_seams(monkeypatch)
+        agent = _make_agent()
+        app = _make_app(agent, caller=CallerContext.anonymous())
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            known = client.post(f"/api/features/test-pkg/{route}")
+            invented = client.post(
+                f"/api/features/no-such-package-anywhere/{route}"
+            )
+
+        assert known.status_code == invented.status_code == 403
+        assert known.text == invented.text
+
+        # The differential has to exist for its absence to mean anything.
+        # Stated in prose, this was unasserted: rename `test-pkg` in
+        # FAKE_REGISTRY and both probes collapse to one answer, the
+        # oracle disappears, and the test above stays green proving
+        # nothing.
+        sovereign = _make_app(agent, caller=CallerContext.sovereign())
+        with TestClient(sovereign, raise_server_exceptions=False) as client:
+            real = client.post(f"/api/features/test-pkg/{route}")
+            fake = client.post(f"/api/features/no-such-package-anywhere/{route}")
+        assert real.status_code != fake.status_code, (
+            "a sovereign caller must be able to tell these apart, or the "
+            "anonymous pair above proves nothing"
+        )
+
+        # The sovereign leg above ran a real handler to completion, and
+        # the seam is what stopped it touching this machine. Asserting
+        # that keeps the seal from looking optional to the next reader.
+        assert any(
+            "kestrel-feature-test" in " ".join(command) for command in attempted
+        ), (
+            "the sovereign request should have reached the installer through "
+            f"the sealed seam; captured {attempted!r}"
+        )
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    @pytest.mark.parametrize(
+        "caller,expected",
+        [
+            (CallerContext.sovereign(), True),
+            (CallerContext(role=CallerRole.AUTHENTICATED), False),
+            (CallerContext.anonymous(), False),
+            (None, False),
+        ],
+    )
+    def test_catalog_reads_publish_whether_the_caller_may_manage(
+        self, mock_registry, caller, expected
+    ):
+        """The console draws Install/Remove/Enable/Disable/Save only for a
+        caller the mutation gate would admit (#3234 round 1 F3), the way
+        ``GET /api/agents`` publishes ``can_create_agents``. The flag is the
+        gate's own predicate, asked without raising; the reads stay open to
+        every caller.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
+        app = _make_app(agent, caller=caller)
+        with TestClient(app) as client:
+            for path in (
+                "/api/features",
+                "/api/features/installed",
+                "/api/features/TestFeature/config",
+            ):
+                resp = client.get(path)
+                assert resp.status_code == 200, (path, resp.text)
+                assert resp.json()["can_manage_features"] is expected, path
+
+    def test_catalog_read_parses_the_registry_once(self, monkeypatch):
+        """#3234 round 3: publishing ``disable_refusal`` per row asked the
+        host-scope set per class, and that set re-parsed and re-validated the
+        whole registry every time — ~50 loads and ~92 ms of event-loop CPU
+        per ``GET /api/features``. The set is memoized; a catalog read loads
+        the registry exactly once (the catalog's own load).
+        """
+        from kestrel_sovereign import feature_registry
+
+        feature_registry.host_scope_feature_classes.cache_clear()
+        real_load = feature_registry.load_registry
+        calls = []
+
+        def counting_load(path=None):
+            calls.append(path)
+            return real_load(path)
+
+        monkeypatch.setattr(feature_registry, "load_registry", counting_load)
+        # The endpoint module imports get_registry, which calls load_registry
+        # through the feature_registry module namespace; host_scope_feature_classes
+        # does too, so both are counted.
+        agent = _lifecycle_agent(features={"WebSearchFeature": _make_feature(name="WebSearchFeature")})
+        app = _make_app(agent)
+        with TestClient(app) as client:
+            assert client.get("/api/features").status_code == 200
+            first = len(calls)
+            assert client.get("/api/features").status_code == 200
+        assert first <= 2, calls  # the catalog's own load + at most one host-scope load
+        assert len(calls) - first <= 1, calls  # nothing per row, nothing per class
+
+    def test_catalog_and_detail_publish_the_servers_own_disable_answer(self):
+        """#3234 round 2: the console gated Disable on ``host_scope`` alone
+        while the server refuses two classes (mandatory too), so the modal
+        offered Disable on ``identity`` and got a 409. Every row and every
+        detail — registry branch and loaded branch — now carries
+        ``disable_refusal``, the exact string the 409 would say, or ``None``.
+        Real registry.
+        """
+        loaded_core = _make_feature(name="WebSearchFeature")
+        loaded_host = _make_feature(name="RestartCoordinatorFeature")
+        loaded_private = _make_feature(name="NotInAnyRegistryFeature")
+        agent = _lifecycle_agent(features={
+            "WebSearchFeature": loaded_core,
+            "RestartCoordinatorFeature": loaded_host,
+            "NotInAnyRegistryFeature": loaded_private,
+        })
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+        with TestClient(app) as client:
+            rows = {r["name"]: r for r in client.get("/api/features").json()["features"]}
+            assert "Mandatory" in rows["identity"]["disable_refusal"]
+            assert "Host-scope" in rows["restart_coordinator"]["disable_refusal"]
+            assert "Host-scope" in rows["scheduler"]["disable_refusal"]
+            assert rows["web_search"]["disable_refusal"] is None
+
+            # Loaded branch (the modal's source for a loaded feature).
+            assert "Host-scope" in client.get(
+                "/api/features/RestartCoordinatorFeature"
+            ).json()["disable_refusal"]
+            assert client.get("/api/features/WebSearchFeature").json()["disable_refusal"] is None
+            assert client.get("/api/features/NotInAnyRegistryFeature").json()["disable_refusal"] is None
+            # Registry branch (not loaded).
+            assert "Mandatory" in client.get("/api/features/identity").json()["disable_refusal"]
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_the_gate_is_not_on_the_reads(self, mock_registry):
+        """Where the guard is NOT, stated executably.
+
+        Everything above pins the gate ON the mutations and nothing pinned
+        it OFF anywhere, so hoisting the dependency onto the `APIRouter`
+        (which 403s the entire feature UI for every OAuth user) or adding
+        it to `GET /api/features/{name}` survived the whole suite until
+        this existed. A scoping decision recorded only in prose is not a
+        decision the suite can keep.
+
+        Until #3234 this test also pinned enable/disable/config OFF, on the
+        reasoning that they touch "the routed agent's own loaded runtime".
+        That premise was wrong — the routed agent is caller-selected — and
+        the pin was removed deliberately: the same loaded feature that
+        those routes answered 200 for now answers 403, asserted here so the
+        reversal is visible in one place rather than inferred from the
+        refusal matrix above.
+
+        `== 200`, not `!= 403`: a deleted or renamed route answers 404,
+        and 404 is also `!= 403`, so the weaker form could not tell
+        "reachable without sovereign authority" from "not there at all".
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+
+        with TestClient(app) as client:
+            assert client.get("/api/features").status_code == 200
+            assert client.get("/api/features/installed").status_code == 200
+            assert client.get("/api/features/TestFeature").status_code == 200
+
+            for method, suffix, body in _MUTATIONS[2:]:
+                response = _mutate(client, method, "TestFeature", suffix, body)
+                assert response.status_code == 403, (suffix, response.text)
+
+    @patch("kestrel_sovereign.endpoints.features.get_registry")
+    def test_per_agent_mutation_refusal_does_not_reveal_whether_the_feature_is_loaded(
+        self, mock_registry
+    ):
+        """403 before the loaded-feature lookup, for enable/disable/config.
+
+        Same shape as the install/remove oracle test above, with the
+        differential these routes actually have: a LOADED feature versus an
+        invented name. A sovereign caller gets 200 for the former and 404
+        for the latter; a non-sovereign caller must get one indistinguishable
+        answer for both, which only a route-level dependency delivers.
+        """
+        mock_registry.return_value = dict(FAKE_REGISTRY)
+        agent = _lifecycle_agent(
+            features={"TestFeature": _make_feature(name="TestFeature")}
+        )
+
+        app = _make_app(agent, caller=CallerContext(role=CallerRole.AUTHENTICATED))
+        with TestClient(app) as client:
+            for method, suffix, body in _MUTATIONS[2:]:
+                known = _mutate(client, method, "TestFeature", suffix, body)
+                invented = _mutate(
+                    client, method, "NoSuchFeatureAnywhere", suffix, body
+                )
+                assert known.status_code == invented.status_code == 403, suffix
+                assert known.text == invented.text, suffix
+
+        # The differential has to exist for its absence to mean anything.
+        sovereign = _make_app(agent, caller=CallerContext.sovereign())
+        with TestClient(sovereign) as client:
+            for method, suffix, body in _MUTATIONS[2:]:
+                real = _mutate(client, method, "TestFeature", suffix, body)
+                fake = _mutate(
+                    client, method, "NoSuchFeatureAnywhere", suffix, body
+                )
+                assert real.status_code == 200, (suffix, real.text)
+                assert fake.status_code == 404, (suffix, fake.text)
+
+    def test_exactly_the_shared_environment_routes_carry_the_gate(self):
+        """The scoping decision, read off the route table rather than a list.
+
+        A hand-picked list of unguarded routes is an open statement: it
+        says nothing about the routes it forgot, and this router has 14.
+        Adding the dependency to `GET /api/ui/contributions`,
+        `/api/features/{name}/config`, `/skills` or `/api/skills/...`
+        survived the whole suite until this existed.
+
+        `GET /api/ui/capabilities` is the sharpest of those: `server.py`
+        exempts `/api/ui/` from auth entirely when serving the UI, so
+        `request.state.caller` is never set there and a gate would refuse
+        everyone, sovereign included.
+        """
+        # Keyed by (path, method) rather than path: this router already
+        # has two routes sharing `/api/features/{name}/config`, so an
+        # ungated sibling method on a gated path would otherwise vanish
+        # into a set of paths.
+        #
+        # Read off a mounted app for readability — it is the table that
+        # serves. It buys nothing over the bare router here, and saying
+        # so matters: FastAPI merges router-level `dependencies=` into
+        # each route at decoration time, so both views catch a hoist
+        # onto `APIRouter(...)`, and neither catches
+        # `include_router(..., dependencies=[...])` in server.py, because
+        # this test mounts its own app and never imports server.
+        app = _make_app(_make_agent())
+        gated = {
+            (route.path, method)
+            for route in app.routes
+            for method in getattr(route, "methods", ()) or ()
+            if any(
+                dependency.dependency is require_sovereign_host_lifecycle
+                for dependency in getattr(route, "dependencies", ())
+            )
+        }
+
+        assert gated == {
+            ("/api/features/{name}/install", "POST"),
+            ("/api/features/{name}/remove", "POST"),
+            ("/api/features/{name}/enable", "POST"),
+            ("/api/features/{name}/disable", "POST"),
+            ("/api/features/{name}/config", "PATCH"),
+        }, (
+            "exactly the mutation routes require sovereign authority "
+            "(#3214 shared interpreter, #3234 caller-selected agent); every "
+            "read on this router serves the console for ordinary callers"
+        )
+
+        # Stated limits, so nobody reads this as more than it is. It sees
+        # route-level dependencies on this router only. Invisible to it:
+        # a check written inside a handler body; one in middleware; how
+        # `server.py` actually mounts this router, including a
+        # `include_router(..., dependencies=[...])` there; and an
+        # install-shaped route added in another endpoint module.
+
+    @pytest.mark.parametrize("method,suffix,body", _MUTATIONS, ids=_MUTATION_IDS)
+    def test_a_sovereign_caller_is_admitted_past_the_gate(
+        self, method, suffix, body, monkeypatch
+    ):
+        """The positive control.
+
+        Without it, a guard that refused everyone would satisfy every
+        assertion above. A sovereign caller must get *past* authority —
+        whatever the route then does about an unknown package is the
+        route's business, but it must not be 403.
+        """
+        _seal_installer_seams(monkeypatch)
+        agent = _make_agent()
+        app = _make_app(agent, caller=CallerContext.sovereign(AuthMethod.API_KEY))
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = _mutate(
+                client, method, "no-such-package-anywhere", suffix, body
+            )
+
+        assert response.status_code != 403, response.text

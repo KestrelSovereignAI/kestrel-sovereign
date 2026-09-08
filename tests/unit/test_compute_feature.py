@@ -24,6 +24,7 @@ import pytest
 
 # Import compute feature components
 from kestrel_sovereign.features.compute.models import (
+    ComputeCommand,
     ComputeScript,
     ExecutionRecord,
     ScriptState,
@@ -163,6 +164,56 @@ class TestModels:
         assert script.id == "test-123"
         assert script.state == ScriptState.SIGNED
     
+    def test_compute_command_holds_a_vector_not_a_script(self):
+        """A command names a program; it has no language and no text."""
+        command = ComputeCommand(
+            id="test-command-001",
+            name="list",
+            argv=["ls", "-la", "/tmp"],
+            purpose="test",
+        )
+        assert command.argv == ("ls", "-la", "/tmp")
+        assert not hasattr(command, "language")
+        assert not hasattr(command, "content")
+
+    def test_compute_command_cannot_be_emptied_after_it_is_checked(self):
+        """The construction check is only worth something if the value
+        cannot change behind it.
+
+        A list would stay the caller's. Emptying it after construction
+        would leave Docker with no command, and `docker run IMAGE` with
+        no command runs the image's default CMD — a shell.
+        """
+        caller_list = ["ls", "-la"]
+        command = ComputeCommand(
+            id="c", name="n", argv=caller_list, purpose="test"
+        )
+
+        caller_list.clear()
+        assert command.argv == ("ls", "-la")
+
+        with pytest.raises((AttributeError, TypeError)):
+            command.argv = []  # type: ignore[misc]
+        with pytest.raises(AttributeError):
+            command.argv.clear()  # type: ignore[attr-defined]
+
+    def test_compute_command_refuses_an_empty_vector(self):
+        """``docker run IMAGE`` with no command runs the image's own
+        default CMD — a shell in the execution images. An empty vector
+        is a request to run nothing, and running a shell is not that.
+        """
+        with pytest.raises(ValueError, match="non-empty argv"):
+            ComputeCommand(id="c", name="n", argv=[], purpose="test")
+
+        with pytest.raises(ValueError, match="must name a program"):
+            ComputeCommand(id="c", name="n", argv=[""], purpose="test")
+
+    def test_compute_command_refuses_a_non_string_element(self):
+        """Caught where the caller is, not as a run that failed for a
+        reason the record cannot express."""
+        with pytest.raises(TypeError, match=r"argv\[1\] must be str"):
+            ComputeCommand(id="c", name="n", argv=["ls", 3], purpose="test")
+
     def test_execution_record_duration(self):
         """Test ExecutionRecord duration calculation."""
         start = datetime.now()

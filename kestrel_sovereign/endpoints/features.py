@@ -9,11 +9,16 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from kestrel_sovereign._async_ownership import await_owned_task
-from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.endpoints.agent_helpers import (
+    get_agent,
+    get_caller,
+    caller_is_sovereign,
+    require_sovereign_host_lifecycle,
+)
 from kestrel_sovereign.features.config_validation import (
     FeatureConfigInvalid,
     validate_feature_config,
@@ -22,6 +27,7 @@ from kestrel_sovereign.features.isolated_runtime import (
     IsolatedRuntimeConfigGenerationChanged,
 )
 from kestrel_sovereign.feature_registry import (
+    feature_disable_refusal,
     FeaturePackageInfo,
     FeatureStatus,
     get_all_skills,
@@ -151,6 +157,21 @@ class ConfigUpdateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _package_disable_refusal(info: FeaturePackageInfo) -> Optional[str]:
+    """Why this package cannot be disabled per agent, or ``None``.
+
+    The server's own answer (``feature_disable_refusal``), published so the
+    console draws no Disable that would only 409 — for mandatory and
+    host-scope classes alike, rather than a client-side proxy that knows one
+    of the two (kestrel-sovereign#3234).
+    """
+    for class_name in info.features:
+        reason = feature_disable_refusal(class_name)
+        if reason is not None:
+            return reason
+    return None
+
+
 def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
     """Serialize a FeaturePackageInfo to a JSON-safe dict."""
     d = asdict(info)
@@ -158,12 +179,23 @@ def _feature_package_to_dict(info: FeaturePackageInfo) -> Dict[str, Any]:
     d["boundary"] = info.boundary.value
     d["installable"] = info.installable
     d["skills"] = [asdict(s) for s in info.skills]
+    d["disable_refusal"] = _package_disable_refusal(info)
     return d
 
 
 def _get_enabled_class_names(agent) -> set:
     """Return the set of Feature class names currently enabled on *agent*."""
     return active_feature_class_names(agent)
+
+
+def _caller_can_manage_features(request: Request) -> bool:
+    """Whether the request's caller passes the mutation routes' authority gate.
+
+    The same predicate ``require_sovereign_host_lifecycle`` enforces, asked
+    without raising, so a catalog read can tell the console which controls
+    to draw (kestrel-sovereign#3234). Absent or non-sovereign caller → False.
+    """
+    return caller_is_sovereign(request)
 
 
 def _registry_info(agent, name: str) -> Optional[FeaturePackageInfo]:
@@ -249,7 +281,15 @@ async def list_features(
             continue
         results.append(_feature_package_to_dict(info))
 
-    return {"features": results, "count": len(results)}
+    return {
+        "features": results,
+        "count": len(results),
+        # Whether THIS caller may install/remove/enable/disable/configure
+        # (sovereign only, #3214/#3234). Lets the console hide controls that
+        # would only 403, the way `GET /api/agents` publishes
+        # `can_create_agents` for the danger zone. Reads stay open.
+        "can_manage_features": _caller_can_manage_features(request),
+    }
 
 
 @router.get("/api/features/installed")
@@ -281,7 +321,11 @@ async def list_installed_features(request: Request) -> Dict[str, Any]:
             entry["boundary"] = pkg.boundary.value
         results.append(entry)
 
-    return {"features": results, "count": len(results)}
+    return {
+        "features": results,
+        "count": len(results),
+        "can_manage_features": _caller_can_manage_features(request),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -352,12 +396,17 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
             "hooks": [{"name": h.name, "events": [e.value for e in h.events]} for h in hooks] if hooks else [],
             "config_schema": feature.config_schema,
         }
+        # The server's own disable answer for this loaded class, published
+        # for every loaded feature (registry-known or not) so the console
+        # never draws a Disable that would only 409 (#3234).
+        detail["disable_refusal"] = feature_disable_refusal(name)
         if pkg:
             detail["package"] = pkg.package
             detail["git"] = pkg.git
             detail["tags"] = pkg.tags
             detail["icon"] = pkg.icon
             detail["core"] = pkg.core
+            detail["host_scope"] = pkg.host_scope
             detail["boundary"] = pkg.boundary.value
             detail["installable"] = pkg.installable
             detail["skills"] = [asdict(s) for s in pkg.skills]
@@ -374,12 +423,27 @@ async def get_feature_detail(request: Request, name: str) -> Dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"Feature '{name}' not found in registry or loaded features")
 
 
-@router.post("/api/features/{name}/install")
+@router.post(
+    "/api/features/{name}/install",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Install a feature package via pip.
 
-    Requires a sovereign agent — governed agents cannot install packages.
+    Requires the sovereign principal. A governed agent has no sovereign
+    credential of its own, so it cannot reach this — but the check is on
+    the caller's authority, not on which agent the request was routed
+    to. The requirement used to be documentation only: the handler
+    resolved the routed agent and installed, so any authenticated caller
+    routed to any agent could run pip against the shared interpreter
+    every agent on the host is loaded from (#3214).
+
+    The guard is a route dependency, not a call in the body, so it runs
+    before the registry lookup below and the refusal is the same whether
+    or not the package exists. That keeps the refusal from being a probe;
+    it does not hide the catalogue, which `GET /api/features` serves to
+    anyone.
     """
     agent = get_agent(request)
 
@@ -549,10 +613,23 @@ async def install_feature(request: Request, name: str) -> Dict[str, Any]:
     }
 
 
-@router.post("/api/features/{name}/enable")
+@router.post(
+    "/api/features/{name}/enable",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def enable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Enable a loaded feature.
+
+    Requires the sovereign principal (kestrel-sovereign#3234). The routed
+    agent is whichever one the caller named in the path — the routing
+    middleware pins it, the auth middleware applies no per-agent
+    authorization, and the caller model carries no binding between a
+    principal and an agent — so "the routed agent's own runtime" describes
+    the blast radius of the call, not the caller's authority over it. An
+    enable also re-runs ``initialize()``, which for an isolated feature can
+    provision a venv with ``uv pip install``. The gate is a route dependency
+    so the refusal precedes the feature lookup (no existence oracle).
 
     Runs the agent's canonical runtime *activation*
     (``KestrelAgent._activate_feature_runtime``) per member — the exact inverse
@@ -699,10 +776,26 @@ async def _enter_feature_quarantine_safe_mode(agent: object, reason: str) -> Non
         setattr(agent, "_safe_mode_cause", lifecycle_cause)
 
 
-@router.post("/api/features/{name}/disable")
+@router.post(
+    "/api/features/{name}/disable",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def disable_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Disable a loaded feature.
+
+    Requires the sovereign principal, for the reason given on ``enable``
+    (kestrel-sovereign#3234). A ``host_scope = true`` package is additionally
+    refused outright, sovereign or not: such a feature participates in a
+    host-wide protocol for every co-hosted agent (``RestartCoordinatorFeature``
+    and the whole-host restart handshake), so switching it off on one agent
+    degrades the host rather than that agent. Its own authority module guards
+    its operations but could not guard its existence. Ordinary ``core = true``
+    packages are the shipped baseline and stay per-agent toggles — a per-agent
+    carve-out is a first-class concept (``[agents.<name>].features``). The
+    refusal is one rule shared with the agent's own runtime disable and the
+    persistent enablement delta, so the tool-driven ``feature_remove`` door
+    declines exactly where this route answers 409.
 
     Runs the agent's canonical runtime *teardown*
     (``KestrelAgent._unregister_feature_runtime`` with ``unload=False``) per
@@ -734,17 +827,22 @@ async def _disable_feature_locked(agent: object, name: str) -> Dict[str, Any]:
     """Disable a feature group while the agent's turn boundary is held."""
 
     loaded = _get_loaded_features_or_404(agent, name)
-    mandatory = sorted(
-        class_name
-        for class_name, _feature in loaded
-        if class_name in MANDATORY_FEATURES
-    )
-    if mandatory:
+    # One rule for every disable door (kestrel-sovereign#3234): mandatory
+    # sovereignty features and host-scope features are refused here, in the
+    # agent's own runtime disable, and in the persistent enablement delta.
+    # ``_get_loaded_features_or_404`` resolves a bare class name without the
+    # registry, so the rule is asked per class, not per package.
+    refusals: Dict[str, List[str]] = {}
+    for class_name, _feature in loaded:
+        reason = feature_disable_refusal(class_name)
+        if reason is not None:
+            refusals.setdefault(reason, []).append(class_name)
+    if refusals:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Mandatory sovereignty features cannot be disabled: "
-                + ", ".join(mandatory)
+            detail="; ".join(
+                f"{reason}: {', '.join(sorted(classes))}"
+                for reason, classes in refusals.items()
             ),
         )
 
@@ -889,10 +987,19 @@ async def _restore_feature_group(
     ) from None
 
 
-@router.post("/api/features/{name}/remove")
+@router.post(
+    "/api/features/{name}/remove",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     """
     Uninstall a feature package.
+
+    Requires the sovereign principal, for the same reason as ``install``: the
+    pip uninstall at the end of this reaches the shared interpreter every
+    agent on the host runs from, so it is host administration and not the
+    routed agent's own business (#3214). Guarded as a route dependency so
+    the refusal precedes any lookup that would reveal package state.
 
     Runs the agent's canonical runtime *teardown*
     (``KestrelAgent._unregister_feature_runtime`` with ``unload=True``) per
@@ -905,7 +1012,7 @@ async def remove_feature(request: Request, name: str) -> Dict[str, Any]:
     executable because tool resolution gates on the feature's ``enabled`` flag,
     not on membership of a still-registered tool map, so a "removed" feature's
     ``@tool`` methods remained callable until restart (kestrel-sovereign#2522
-    P1). Requires a sovereign agent — governed agents cannot remove packages.
+    P1).
     """
     agent = get_agent(request)
 
@@ -1072,10 +1179,16 @@ async def get_feature_config(request: Request, name: str) -> Dict[str, Any]:
         "config": config,
         "config_schema": schema,
         "secrets_set": secrets_set,
+        # PATCH on this path is sovereign-gated (#3234); the form reads this
+        # to decide whether to offer Save at all.
+        "can_manage_features": _caller_can_manage_features(request),
     }
 
 
-@router.patch("/api/features/{name}/config")
+@router.patch(
+    "/api/features/{name}/config",
+    dependencies=[Depends(require_sovereign_host_lifecycle)],
+)
 async def update_feature_config(
     request: Request,
     name: str,
@@ -1083,6 +1196,13 @@ async def update_feature_config(
 ) -> Dict[str, Any]:
     """
     Update feature configuration.
+
+    Requires the sovereign principal (kestrel-sovereign#3234): a per-agent
+    mutation of a caller-selected agent, and a second disable door — a
+    config that fails reconciliation tears the feature down
+    (``_disable_feature_after_config_reconciliation_failure``), so an
+    ungated PATCH would let a non-sovereign caller do what ``disable`` now
+    refuses.
 
     Validates against the feature's config_schema if available.
 

@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from kestrel_sdk.features import FeatureContributionSet
 
+from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.features import router as features_router
 from kestrel_sovereign.feature_registry import FeaturePackageInfo, FeatureStatus
 from kestrel_sovereign.features.contribution_runtime import (
@@ -300,6 +301,15 @@ class TestRenderMultiAgentHostConfigScript:
 
 def _make_app(agent):
     app = FastAPI()
+
+    # Stands in for the auth middleware: enable/disable require the sovereign
+    # principal (#3234) and these tests are about the capability map they
+    # return, not about who may ask.
+    @app.middleware("http")
+    async def _attach_caller(request, call_next):
+        request.state.caller = CallerContext.sovereign()
+        return await call_next(request)
+
     app.include_router(features_router)
     app.state.agent = agent
     return app

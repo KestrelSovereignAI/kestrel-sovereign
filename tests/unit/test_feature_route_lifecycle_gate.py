@@ -20,7 +20,7 @@ actual server/app path, asserting:
 """
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -107,13 +107,34 @@ class _InstanceBoundRouterFeature:
     def __init__(self, owner: str):
         self.enabled = True
         self.owner = owner
+        self.served = 0
 
     def get_router(self):
         router = APIRouter()
 
         @router.get("/test-feature-lifecycle/instance-bound")
         async def instance_bound():
+            self.served += 1
             return {"owner": self.owner}
+
+        return router
+
+
+class _DriftedRouterFeature:
+    """Enabled, same feature name, but its router no longer exposes the
+    mounted shape: it must not count as a survivor of that route."""
+
+    def __init__(self):
+        self.enabled = True
+        self.served = 0
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/test-feature-lifecycle/somewhere-else")
+        async def elsewhere():
+            self.served += 1
+            return {"owner": "drifted"}
 
         return router
 
@@ -687,5 +708,682 @@ def test_unprefixed_webhook_form_retains_aggregate_lookup():
             assert resp.json()["webhook"] == "deposit"
             assert _event_count(b_hook) == 1
             assert _event_count(a_hook) == 0
+    finally:
+        restore()
+
+
+def _post_unprefixed_and_prefixed_ambiguous(agents, a_hook, b_hook):
+    """Boot ``agents`` (an ordered ``{name: agent}`` map whose iteration order
+    IS the fleet order) and exercise the ambiguous unprefixed form plus both
+    explicit agent-prefixed forms. ``a_hook``/``b_hook`` are agent a's and
+    agent b's webhook features, whichever order the fleet lists them in.
+
+    Returns ``(unprefixed_response, unknown_response)`` where the unknown
+    response is for a name nobody owns, taken AFTER every ownership assertion
+    (the unknown-name 404 is audited on the first receiver, which would skew
+    the per-receiver tallies asserted here).
+    """
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            # Refused, not dispatched: neither owner handled it. Each owner
+            # audits exactly one refusal (a 404, unauthenticated) and no
+            # receive succeeded anywhere.
+            assert resp.status_code == 404, resp.text
+            for hook in (a_hook, b_hook):
+                events = list(hook.receiver.event_log)
+                assert [e.status_code for e in events] == [404], events
+                assert not any(e.authenticated for e in events)
+                # Refused, so no rate-limit window was opened on either owner.
+                assert "deposit" not in hook.receiver._rate_windows
+
+            # The explicit agent-prefixed form is unaffected by the
+            # collision: each agent still receives ONLY what is addressed to
+            # it, in the same boot.
+            resp_a = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp_a.status_code == 200, resp_a.text
+            assert resp_a.json()["webhook"] == "deposit"
+            resp_b = client.post("/api/agents/b/webhooks/deposit", content=b"{}")
+            assert resp_b.status_code == 200, resp_b.text
+            assert resp_b.json()["webhook"] == "deposit"
+            assert [e.status_code for e in a_hook.receiver.event_log] == [404, 200]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+
+            unknown = client.post("/webhooks/ghost", content=b"{}")
+            return resp, unknown
+    finally:
+        restore()
+
+
+def test_unprefixed_webhook_ambiguous_ownership_is_refused_in_either_fleet_order():
+    """#3216: two enabled agents own ``deposit``; the unprefixed form must not
+    let fleet iteration order choose the target.
+
+    Before the fix the first receiver in ``list_agents()`` order won: fleet
+    order (a, b) dispatched to A and order (b, a) dispatched to B, each a 200
+    with the other agent none the wiser. Now BOTH orders refuse without any
+    dispatch, with the same public 404 an unregistered name gets — so a
+    keyless caller learns nothing about which names collide — while the
+    explicit ``/api/agents/{name}/webhooks/deposit`` form keeps working.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    for order in (("a", "b"), ("b", "a")):
+        a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+        by_name = {
+            "a": _make_agent({"WebhookFeature": a_hook}),
+            "b": _make_agent({"WebhookFeature": b_hook}),
+        }
+        agents = {name: by_name[name] for name in order}
+        assert list(agents) == list(order)
+        resp, unknown = _post_unprefixed_and_prefixed_ambiguous(
+            agents, a_hook, b_hook
+        )
+        # Same safe public response as an unregistered name: status and body
+        # shape are identical (only the echoed name differs).
+        assert unknown.status_code == 404
+        assert resp.status_code == unknown.status_code, order
+        assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+        assert unknown.json() == {"error": "Unknown webhook: ghost"}, order
+
+
+def test_unprefixed_webhook_ambiguity_tracks_live_enabled_owners():
+    """#3216: only ENABLED owners count, and the count is read live.
+
+    A enabled + B disabled is one owner → the unprefixed form dispatches to
+    A. Enabling B makes the name ambiguous → refused, A's tally unchanged.
+    Disabling A leaves B the sole owner → dispatches to B. A stale or
+    enabled-blind count would fail one of the three legs.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    a_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    b_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=False)
+    agents = {
+        "a": _make_agent({"WebhookFeature": a_hook}),
+        "b": _make_agent({"WebhookFeature": b_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200]
+            assert _event_count(b_hook) == 0
+
+            b_hook.enabled = True
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404]
+
+            a_hook.enabled = False
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in a_hook.receiver.event_log] == [200, 404]
+            assert [e.status_code for e in b_hook.receiver.event_log] == [404, 200]
+    finally:
+        restore()
+
+
+def test_one_receiver_reachable_through_two_agents_is_one_owner():
+    """#3216: dedupe-by-identity is now load-bearing for correctness.
+
+    The aggregate provider dedupes receivers by identity because one
+    receiver can be reached through more than one agent. Before the
+    ambiguity rule that only saved a redundant scan; now a duplicate entry
+    would count as two owners and falsely refuse a single-owner name. The
+    same feature instance mounted on two fleet entries must still dispatch
+    exactly once.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    shared_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    agents = {
+        "a": _make_agent({"WebhookFeature": shared_hook}),
+        "b": _make_agent({"WebhookFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()
+
+    # The per-agent scan dedupes too (round 7 coverage gap): one agent whose
+    # two feature entries share one receiver object is one owner on the
+    # agent-prefixed form, which is the only path where the per-agent scan's
+    # result reaches dispatch without the aggregate's own dedupe.
+    shared_hook.receiver.event_log.clear()
+    agents = {
+        "a": _make_agent({"FirstFeature": shared_hook, "SecondFeature": shared_hook}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/api/agents/a/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 200, resp.text
+            assert [e.status_code for e in shared_hook.receiver.event_log] == [200]
+    finally:
+        restore()
+
+
+@contextmanager
+def _receiver_log():
+    """Collect the webhook receiver module's log records directly.
+
+    The server's boot reconfigures root logging, so a root-level capture
+    (``caplog``) misses records emitted during the first boot in a process;
+    a handler on the module logger itself sees them regardless.
+    """
+    import logging
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    target = logging.getLogger("kestrel_sovereign.features.webhooks.receiver")
+    handler = _Collect(level=logging.WARNING)
+    previous = target.level
+    target.addHandler(handler)
+    if previous == logging.NOTSET or previous > logging.WARNING:
+        target.setLevel(logging.WARNING)
+    try:
+        yield records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
+
+
+class _MinimalReceiverFeatureStub:
+    """A receiver meeting only the host's duck-typed contract: ``webhooks`` +
+    ``handle_webhook``. No ``record_refusal``, no ring buffer — the shape an
+    out-of-tree feature package can contribute."""
+
+    name = "ThirdPartyWebhookFeature"
+
+    class _Receiver:
+        def __init__(self, webhook_name):
+            self.webhooks = {webhook_name: object()}
+            self.handled = []
+
+        async def handle_webhook(self, name, *, headers, body, source_ip):
+            self.handled.append(name)
+            return {"status_code": 200, "body": {"status": "received", "webhook": name}}
+
+    def __init__(self, webhook_name="deposit"):
+        self.enabled = True
+        self.receiver = self._Receiver(webhook_name)
+
+    def get_router(self):  # pragma: no cover - never mounted per-feature
+        return None
+
+
+def test_ambiguity_with_a_contract_minimal_receiver_is_still_the_same_404():
+    """#3216 round 3: a receiver that meets only the required contract
+    (no ``record_refusal``) must not turn the refusal into a 500 — that would
+    be the ownership oracle the shared response denies. Same 404, no
+    dispatch to either owner, the core owner still audits, and the host log
+    says the other owner could not audit its own refusal.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    minimal = _MinimalReceiverFeatureStub(webhook_name="deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": minimal}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        minimal.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, order
+            assert minimal.receiver.handled == [], order
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], order
+            assert any(
+                "cannot audit its own refusal" in r.getMessage() for r in records
+            ), order
+        finally:
+            restore()
+
+
+def test_two_distinct_receivers_that_compare_equal_are_two_owners():
+    """#3216 round 4: the dedupe must be by identity, never ``==``.
+
+    An out-of-tree receiver class with value equality (a dataclass, a
+    pydantic model) is admitted on the same two-attribute contract. Two
+    distinct instances that compare equal collapsed to one owner under an
+    ``in``-based dedupe, so the unprefixed form dispatched again — to
+    whichever agent the fleet listed first. Both orders must refuse.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+
+    class _ValueEqualReceiver(_MinimalReceiverFeatureStub._Receiver):
+        def __eq__(self, other):
+            return isinstance(other, _ValueEqualReceiver)
+
+        __hash__ = object.__hash__
+
+    class _ValueEqualFeature(_MinimalReceiverFeatureStub):
+        def __init__(self):
+            self.enabled = True
+            self.receiver = _ValueEqualReceiver("deposit")
+
+    first, second = _ValueEqualFeature(), _ValueEqualFeature()
+    assert first.receiver == second.receiver and first.receiver is not second.receiver
+    fleets = [
+        # Two agents, one value-equal receiver each — both fleet orders.
+        {"a": _make_agent({"ThirdPartyWebhookFeature": first}),
+         "b": _make_agent({"ThirdPartyWebhookFeature": second})},
+        {"b": _make_agent({"ThirdPartyWebhookFeature": second}),
+         "a": _make_agent({"ThirdPartyWebhookFeature": first})},
+        # One agent, two features with value-equal receivers: the per-agent
+        # scan dedupes too, and must also do so by identity.
+        {"a": _make_agent({"FirstFeature": first, "SecondFeature": second})},
+    ]
+    for agents in fleets:
+        first.receiver.handled.clear()
+        second.receiver.handled.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+                    assert resp.status_code == 404, (list(agents), resp.text)
+                    if len(agents) == 1:
+                        # A collision INSIDE one agent: the prefixed form
+                        # refuses too, and the log must not send the
+                        # operator to an address that also 404s.
+                        scoped = client.post(
+                            "/api/agents/a/webhooks/deposit", content=b"{}"
+                        )
+                        assert scoped.status_code == 404, scoped.text
+                        assert scoped.json() == {"error": "Unknown webhook: deposit"}
+            collisions = [
+                r.getMessage() for r in records if "is owned by" in r.getMessage()
+            ]
+            assert collisions, [r.getMessage() for r in records]
+            # An unscoped refusal cannot know whether the owners span agents,
+            # so its remedy is conditional: try the prefixed form for the
+            # intended agent, and if that refuses too the collision is inside
+            # that agent. It must never present the prefixed form as a bare
+            # "instead", which 404s in the one-agent fleet.
+            unscoped = collisions[0]
+            assert "/api/agents/{agent}/webhooks/deposit for the intended agent" in unscoped, unscoped
+            assert "if that form refuses too" in unscoped, unscoped
+            assert "instead." not in unscoped, unscoped
+            if len(agents) == 1:
+                # The scoped refusal KNOWS it is the within-agent case.
+                assert len(collisions) == 2, collisions
+                assert "within the addressed agent" in collisions[1], collisions
+                assert "Address it as" not in collisions[1], collisions
+            else:
+                assert len(collisions) == 1, collisions
+            assert first.receiver.handled == [] and second.receiver.handled == [], list(agents)
+        finally:
+            restore()
+
+
+@pytest.mark.parametrize(
+    "record_refusal,label",
+    [
+        (lambda self, name, **_: (_ for _ in ()).throw(RuntimeError("audit sink down")), "raises"),
+        (lambda self, name, **_: None, "synchronous"),
+    ],
+)
+def test_a_foreign_refusal_audit_that_misbehaves_never_changes_the_404(
+    record_refusal, label
+):
+    """#3216 round 4: the refusal path awaits foreign ``record_refusal``
+    implementations. One that raises, or returns nothing awaitable, must not
+    turn the indistinguishable 404 into a 500 (the ownership oracle). The
+    core owner still audits; the failure is host-logged.
+    """
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    core_hook = _WebhookFeatureStub(webhook_name="deposit", enabled=True)
+    Foreign = type(
+        "_ForeignReceiver",
+        (_MinimalReceiverFeatureStub._Receiver,),
+        {"record_refusal": record_refusal},
+    )
+    foreign = _MinimalReceiverFeatureStub("deposit")
+    foreign.receiver = Foreign("deposit")
+    for order in (("core", "third"), ("third", "core")):
+        by_name = {
+            "core": _make_agent({"WebhookFeature": core_hook}),
+            "third": _make_agent({"ThirdPartyWebhookFeature": foreign}),
+        }
+        agents = {name: by_name[name] for name in order}
+        core_hook.receiver.event_log.clear()
+        app, restore = _boot_multi_agent(agents)
+        try:
+            with _receiver_log() as records:
+                with TestClient(app) as client:
+                    resp = client.post("/webhooks/deposit", content=b"{}")
+            assert resp.status_code == 404, (label, order, resp.text)
+            assert resp.json() == {"error": "Unknown webhook: deposit"}, (label, order)
+            assert [e.status_code for e in core_hook.receiver.event_log] == [404], (label, order)
+            assert foreign.receiver.handled == [], (label, order)
+            failures = [r for r in records if "failed to audit" in r.getMessage()]
+            if label == "raises":
+                assert failures, order
+            else:
+                # A synchronous audit is a valid implementation, not a failure.
+                assert not failures, (order, [r.getMessage() for r in failures])
+        finally:
+            restore()
+
+
+# ---------------------------------------------------------------------------
+# #3240: an unprefixed feature route whose mount owner was withdrawn
+# ---------------------------------------------------------------------------
+
+
+def _reorder(agents: dict, *names: str) -> None:
+    """Re-key the live fleet mapping in place so ``list_agents()`` iterates in
+    the given order; the manager stub reads the same dict on every call."""
+    snapshot = {name: agents[name] for name in names}
+    agents.clear()
+    agents.update(snapshot)
+
+
+def test_unprefixed_feature_route_with_two_survivors_is_refused_in_either_fleet_order():
+    """Once the mount owner is withdrawn, two remaining agents that both serve
+    the shape must not be chosen between by ``list_agents()`` order: the
+    unprefixed form is refused in both orders and neither endpoint runs, while
+    each agent-prefixed form still serves its own agent."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            # The mount owner serves the unprefixed form while it is managed.
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+
+            agents.pop("alice")
+            for order in (("bob", "carol"), ("carol", "bob")):
+                _reorder(agents, *order)
+                response = client.get(path, headers=headers)
+                assert response.status_code == 404, order
+                assert bob.served == 0 and carol.served == 0, order
+
+            assert client.get(f"/api/agents/bob{path}", headers=headers).json() == {
+                "owner": "bob-v1"
+            }
+            assert client.get(f"/api/agents/carol{path}", headers=headers).json() == {
+                "owner": "carol-v1"
+            }
+            assert bob.served == 1 and carol.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_rebinds_to_the_only_survivor():
+    """One remaining agent that serves the shape is not an ambiguous choice."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert alice.served == 1 and bob.served == 1
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_survivor_count_tracks_live_enabled_serving():
+    """A candidate that no longer serves the shape (feature disabled, or the
+    feature removed) does not count: with it gone the other one is the only
+    survivor and serves; with both live the unprefixed form is refused."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            bob.enabled = False
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0
+
+            bob.enabled = True
+            assert client.get(path, headers=headers).status_code == 404
+
+            agents["bob"].features.pop("ProxyFeature")
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert bob.served == 0 and carol.served == 2
+
+            # Enabled and same-named, but the shape is gone from its router:
+            # not a survivor of THIS route, so carol is still the only one.
+            drifted = _DriftedRouterFeature()
+            agents["bob"].features["ProxyFeature"] = drifted
+            assert client.get(path, headers=headers).json() == {"owner": "carol-v1"}
+            assert drifted.served == 0 and carol.served == 3
+    finally:
+        restore()
+
+
+def test_unprefixed_feature_route_follows_the_mount_owner_across_its_reload():
+    """Review r1 P2: the mount owner reloaded under a NEW object with the same
+    routing name and DID is still the mount owner. Retention by object
+    identity made that a permanent 404 while another agent served the shape;
+    the DID is the stable identity, so the reloaded owner serves — even with
+    two other survivors that would otherwise be an ambiguous pair."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    carol = _InstanceBoundRouterFeature("carol-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+        "carol": _make_agent({"ProxyFeature": carol}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    agents["carol"].did = "did:test:carol"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: two survivors, refused.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).status_code == 404
+
+            # Re-created under a new object, same name and DID: the owner is
+            # back, and it wins over the pair that was ambiguous a moment ago.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert alice_v1.served == 1 and alice_v2.served == 1
+            assert bob.served == 0 and carol.served == 0
+            assert client.get(f"/api/agents/alice{path}", headers=headers).json() == {
+                "owner": "alice-v2"
+            }
+
+            # A different agent under the owner's old name is not the owner.
+            impostor = _InstanceBoundRouterFeature("impostor")
+            agents["alice"] = _make_agent({"ProxyFeature": impostor})
+            agents["alice"].did = "did:test:someone-else"
+            assert client.get(path, headers=headers).status_code == 404
+            assert impostor.served == 0
+    finally:
+        restore()
+
+
+class _FeaturesOnceThenGone(dict):
+    """A ``features`` mapping whose lookup answers once and then reports the
+    feature gone: the change between ``route.matches()`` and dispatch."""
+
+    def __init__(self, name, feature, *, answers: int):
+        super().__init__({name: feature})
+        self._answers = answers
+
+    def get(self, key, default=None):
+        if self._answers <= 0:
+            return default
+        self._answers -= 1
+        return super().get(key, default)
+
+
+def test_dispatch_refuses_a_feature_that_vanished_after_the_match():
+    """Review r1 M12: the match gate admits the request, then the feature is
+    gone by dispatch. Dispatch must refuse, never fall back to the mounted
+    copy's first-tenant endpoint (which is #3240 itself)."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    agents = {"alice": agent}
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            # One answer for the match gate; dispatch sees no feature.
+            agent.features = _FeaturesOnceThenGone("ProxyFeature", alice, answers=1)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
+    finally:
+        restore()
+
+
+class _FeaturesDisabledAfterFirstLookup(dict):
+    """A ``features`` mapping that soft-disables the feature after the first
+    lookup: the match gate sees it enabled, dispatch sees it disabled."""
+
+    def __init__(self, name, feature):
+        super().__init__({name: feature})
+        self._looked_up = 0
+
+    def get(self, key, default=None):
+        feature = super().get(key, default)
+        self._looked_up += 1
+        if self._looked_up > 1 and feature is not None:
+            feature.enabled = False
+        return feature
+
+
+def test_dispatch_refuses_a_feature_disabled_after_the_match():
+    """Review r2: the match gate admits the request, then the feature is
+    soft-disabled before dispatch. Dispatch re-checks ``enabled`` itself and
+    refuses; it must not serve on the match gate's stale answer."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice = _InstanceBoundRouterFeature("alice-v1")
+    agent = _make_agent({"ProxyFeature": alice})
+    app, restore = _boot_multi_agent({"alice": agent})
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+            assert alice.served == 1
+            agent.features = _FeaturesDisabledAfterFirstLookup("ProxyFeature", alice)
+            response = client.get(path, headers=headers)
+            assert response.status_code == 404
+            assert alice.served == 1
+            assert alice.enabled is False
+            # Exactly two lookups per request: the match gate, then dispatch.
+            # The double disables after the FIRST, so this pins that the 404
+            # came from dispatch's own check; a future extra lookup earlier
+            # in the request would move the disable into the gate and make
+            # this test vacuous — fail loudly instead.
+            assert agent.features._looked_up == 2
+    finally:
+        restore()
+
+
+def test_a_reloaded_owner_that_does_not_serve_outranks_the_surviving_peer():
+    """Review r2: the owner clause precedes the survivor rule. A mount owner
+    re-created under its DID with the feature disabled (readiness rollback,
+    then retry) is still the owner: the unprefixed form refuses rather than
+    quietly rebinding to the one peer that serves, which is exactly the
+    order-chosen executor this ticket removes."""
+
+    os.environ["KESTREL_API_KEY"] = API_KEY
+    alice_v1 = _InstanceBoundRouterFeature("alice-v1")
+    bob = _InstanceBoundRouterFeature("bob-v1")
+    agents = {
+        "alice": _make_agent({"ProxyFeature": alice_v1}),
+        "bob": _make_agent({"ProxyFeature": bob}),
+    }
+    agents["alice"].did = "did:test:alice"
+    agents["bob"].did = "did:test:bob"
+    app, restore = _boot_multi_agent(agents)
+    path = "/test-feature-lifecycle/instance-bound"
+    headers = {"X-API-Key": API_KEY}
+    try:
+        with TestClient(app) as client:
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v1"}
+
+            # Withdrawn: bob is the sole survivor and serves.
+            agents.pop("alice")
+            assert client.get(path, headers=headers).json() == {"owner": "bob-v1"}
+            assert bob.served == 1
+
+            # Back under the same DID, but not serving: the owner is retained
+            # and refuses; the surviving peer is not chosen instead.
+            alice_v2 = _InstanceBoundRouterFeature("alice-v2")
+            alice_v2.enabled = False
+            reloaded = _make_agent({"ProxyFeature": alice_v2})
+            reloaded.did = "did:test:alice"
+            agents["alice"] = reloaded
+            assert client.get(path, headers=headers).status_code == 404
+            assert bob.served == 1 and alice_v2.served == 0
+
+            # Once it serves again, it serves.
+            alice_v2.enabled = True
+            assert client.get(path, headers=headers).json() == {"owner": "alice-v2"}
+            assert bob.served == 1
     finally:
         restore()

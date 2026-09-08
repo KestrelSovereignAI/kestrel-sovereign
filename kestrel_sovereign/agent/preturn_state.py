@@ -27,6 +27,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.features.storage_access import (
+    AgentIdentityUnavailable,
+    resolve_scoped_agent_did,
+)
+
 logger = logging.getLogger(__name__)
 
 _BLOCK_HEADER = "--- AGENT STATE (pre-turn snapshot; not user input) ---"
@@ -149,10 +154,11 @@ async def _a2a_inbox_section(agent: Any) -> Optional[str]:
     if task_manager is None:
         return None
     try:
+        recipient_agent_id = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return None
+    try:
         from kestrel_sovereign.a2a.types import TaskState
-        recipient_agent_id = getattr(agent, "did", None)
-        if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
-            return None
         tasks = await task_manager.task_store.list_tasks(
             recipient_agent_id=recipient_agent_id,
             limit=50,
@@ -216,17 +222,18 @@ async def _restart_status_section(agent: Any) -> Optional[str]:
     # state block. Scope the query to the current agent's DID via
     # the dedicated agent-scoped store helper (codex P2 r1).
     db = getattr(feat, "_db", None)
-    agent_did = getattr(agent, "did", None) or getattr(
-        agent, "_did", None,
-    )
-    if db is None or not agent_did:
+    if db is None:
+        return None
+    try:
+        agent_did = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
         return None
     try:
         from kestrel_sovereign.features.restart_coordinator.event_store import (
             list_recent_events_for_agent_context,
         )
         rows = await list_recent_events_for_agent_context(
-            db, agent_id=str(agent_did), limit=20,
+            db, agent_id=agent_did, limit=20,
         )
         events = [r.to_public_dict() for r in rows]
     except Exception as exc:  # noqa: BLE001
@@ -336,17 +343,18 @@ async def _codex_decline_section(agent: Any) -> Optional[str]:
         resolve_feature_database,
     )
     db = resolve_feature_database(agent)
-    agent_id = getattr(agent, "did", None) or getattr(
-        agent, "_did", None,
-    )
-    if db is None or not agent_id:
+    if db is None:
+        return None
+    try:
+        agent_id = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
         return None
     try:
         from kestrel_sovereign.llm.codex_decline_events import (
             list_recent_declines_for_agent,
         )
         rows = await list_recent_declines_for_agent(
-            db, agent_id=str(agent_id), limit=10,
+            db, agent_id=agent_id, limit=10,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(

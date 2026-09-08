@@ -2361,17 +2361,28 @@ async def reflection_status(request: Request):
     return result
 
 
-def _task_recipient_principal(agent) -> str:
-    """Return the route-bound durable recipient, never request metadata."""
+def _task_recipient_principal(agent, *, verb: str = "reads require") -> str:
+    """Return the route-bound durable recipient, never request metadata.
 
-    for attribute in ("agent_id", "did"):
-        value = getattr(agent, attribute, None)
-        if isinstance(value, str) and value:
-            return value
-    raise HTTPException(
-        status_code=503,
-        detail="A2A task reads require a durable recipient identity",
+    The agent's ``did`` through the shared guard, and only that. This used
+    to try ``agent_id`` first, so the one ``a2a_tasks`` table was scoped by
+    a different resolution order here than under ``!tasks``; the two agreed
+    only because ``KestrelAgent.agent_id`` returns ``self.did``, which
+    neither surface asserted (#3246).
+    """
+
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
     )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail=f"A2A task {verb} a durable recipient identity",
+        ) from None
 
 
 @router.get("/tasks")
@@ -2652,6 +2663,17 @@ async def _create_a2a_task_under_lifecycle_lease(
         verify_inbound_envelope,
     )
 
+    recipient_agent_id = None
+    if commit is None:
+        # The recipient a new task is filed under is the same principal
+        # every read of the table resolves (#3246 review r2). Decided before
+        # any verification work: a recipient with no identity cannot file a
+        # task whatever the sender proves. Actions carrying a ``commit``
+        # resolve their own recipient at their route.
+        recipient_agent_id = _task_recipient_principal(
+            agent, verb="creation requires"
+        )
+
     if hosted_policy is not None:
         inbound_authorizer = hosted_policy.authorizer
         # Hosted recipients normally require a verified sender.  Keep the
@@ -2928,15 +2950,10 @@ async def _create_a2a_task_under_lifecycle_lease(
                 status_code=500, detail="Failed to commit A2A action"
             ) from exc
 
-    local_name = (
-        getattr(agent, "did", None)
-        or getattr(agent, "_agent_name", None)
-        or "unknown"
-    )
     try:
         return await agent.task_manager.create_task(
             params=params,
-            agent_name=local_name,
+            agent_name=recipient_agent_id,
             artifacts=sender_artifacts or None,
             creator_agent_id=authorized_sender_id,
         )
@@ -3408,23 +3425,13 @@ async def cancel_task_from_peer(request: Request, task_id: str):
         message=Message(role="user", parts=[TextPart(text=reason)]),
         metadata=metadata,
     )
-    recipient_agent_id = next(
-        (
-            candidate
-            for candidate in (
-                getattr(agent.task_manager, "host_agent_id", None),
-                getattr(agent, "did", None),
-                getattr(agent, "agent_id", None),
-            )
-            if isinstance(candidate, str) and candidate
-        ),
-        None,
+    # The same recipient as every other task route. This used to try the
+    # task manager's ``host_agent_id`` first — a copy of the agent's own DID
+    # taken at construction — then ``did``, then ``agent_id``: a third
+    # resolution order over the one ``a2a_tasks`` table (#3246 review).
+    recipient_agent_id = _task_recipient_principal(
+        agent, verb="cancellation requires"
     )
-    if not isinstance(recipient_agent_id, str) or not recipient_agent_id:
-        raise HTTPException(
-            status_code=503,
-            detail="A2A task cancellation requires a durable recipient identity",
-        )
 
     async def _cancel(authorized_sender_id: str):
         if not isinstance(authorized_sender_id, str) or not authorized_sender_id:

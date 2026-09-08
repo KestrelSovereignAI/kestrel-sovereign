@@ -616,7 +616,14 @@ async def verify_api_key(
 
 
 def _is_webhook_receiver(receiver) -> bool:
-    """Duck-typed webhook-receiver check (keeps core decoupled from the class)."""
+    """Duck-typed webhook-receiver check (keeps core decoupled from the class).
+
+    ``handle_webhook`` + ``webhooks`` is the whole required contract.
+    ``record_refusal`` (auditing a refused ambiguous-ownership request,
+    #3216) is optional: the dispatch router calls it only when present, so a
+    receiver without it is still dispatched and still refused with the same
+    404, just without an audit row of its own.
+    """
     return (
         receiver is not None
         and hasattr(receiver, "handle_webhook")
@@ -695,6 +702,40 @@ def _current_feature_router_route(feature, selector: tuple):
     return current
 
 
+def _stable_agent_did(agent) -> Optional[str]:
+    """The agent's DID through the shared guard, or None when it has none.
+
+    Used to recognise a mount owner that was reloaded under a new object.
+    A test double with no string DID has no stable identity here and is
+    only ever matched by object.
+    """
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable:
+        return None
+
+
+def _live_feature_route(agent, feature_name: str, selector: tuple):
+    """The current child route ``agent`` serves for one mounted shape, or None.
+
+    One check for "this agent still serves this route": the feature is
+    present, enabled, and exposes the mounted shape now. The owner
+    resolution and both request paths ask the same question; three copies
+    of it drifted once already.
+    """
+
+    features = getattr(agent, "features", None) or {}
+    feature = features.get(feature_name) if hasattr(features, "get") else None
+    if feature is None or not bool(getattr(feature, "enabled", True)):
+        return None
+    return _current_feature_router_route(feature, selector)
+
+
 def _resolve_live_route_agent(
     app: FastAPI,
     scope,
@@ -705,10 +746,16 @@ def _resolve_live_route_agent(
     """Resolve a live owner for one physically shared feature route.
 
     Request-scoped routing is authoritative.  For unprefixed routes, retain
-    the original mount owner while it is managed; if readiness rollback or
-    DELETE withdrew that owner while another agent shares the physical route,
-    rebind to the first currently managed compatible feature instead of
-    leaving the preserved route closed over a dead owner.
+    the original mount owner while it is managed — the same object, or the
+    same agent reloaded under a new object (readiness rollback then retry,
+    DELETE then re-create, a scheduler cold wake): the manager keeps one
+    routing name per DID, so the DID is the owner's stable identity and the
+    object is not.  If that owner is gone, the route may rebind only when
+    exactly one managed agent still serves it: an unprefixed address names
+    no agent, so with two or more candidates the executor would be chosen
+    by ``list_agents()`` order, invisible to the caller (#3240, the shape of
+    #3216). Refuse instead; the agent-prefixed form stays the unambiguous
+    address.
     """
 
     state = scope.get("state") or {}
@@ -732,15 +779,22 @@ def _resolve_live_route_agent(
         )
     if any(current is mount_agent for current in managed_agents):
         return mount_agent
-    for candidate in managed_agents:
-        features = getattr(candidate, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if (
-            feature is not None
-            and bool(getattr(feature, "enabled", True))
-            and _current_feature_router_route(feature, selector) is not None
-        ):
-            return candidate
+    mount_did = _stable_agent_did(mount_agent)
+    if mount_did is not None:
+        reloaded = [
+            current
+            for current in managed_agents
+            if _stable_agent_did(current) == mount_did
+        ]
+        if len(reloaded) == 1:
+            return reloaded[0]
+    survivors = [
+        candidate
+        for candidate in managed_agents
+        if _live_feature_route(candidate, feature_name, selector) is not None
+    ]
+    if len(survivors) == 1:
+        return survivors[0]
     return None
 
 
@@ -898,13 +952,7 @@ def _gate_feature_route(
         # that exposes the same feature.
         if agent is None:
             return Match.NONE, {}
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if (
-            feature is None
-            or not bool(getattr(feature, "enabled", True))
-            or _current_feature_router_route(feature, selector) is None
-        ):
+        if _live_feature_route(agent, feature_name, selector) is None:
             return Match.NONE, {}
         return original_matches(scope)
 
@@ -920,12 +968,7 @@ def _gate_feature_route(
         if agent is None:
             await _feature_route_gone_response(scope, receive, send)
             return
-        features = getattr(agent, "features", None) or {}
-        feature = features.get(feature_name) if hasattr(features, "get") else None
-        if feature is None or not bool(getattr(feature, "enabled", True)):
-            await _feature_route_gone_response(scope, receive, send)
-            return
-        current = _current_feature_router_route(feature, selector)
+        current = _live_feature_route(agent, feature_name, selector)
         if current is None:
             await _feature_route_gone_response(scope, receive, send)
             return
@@ -1068,8 +1111,10 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
     # /api/agents/{name}/webhooks/{name} request sees ONLY that agent's enabled
     # receivers (so it can't dispatch to another agent's identically-named
     # webhook), while the unprefixed /webhooks/{name} form aggregates across
-    # every agent (#2522). Mounted when at least one enabled webhook receiver
-    # exists at startup; the provider itself stays live thereafter.
+    # every agent (#2522) and the router refuses a name that more than one of
+    # them owns, so iteration order never picks the target (#3216). Mounted
+    # when at least one enabled webhook receiver exists at startup; the
+    # provider itself stays live thereafter.
     candidate_webhook_receivers = []
     if agents is not None:
         for candidate in agents:
@@ -1138,12 +1183,14 @@ def _agent_webhook_receivers(agent) -> list:
     Deduplicated by identity; a disabled/removed feature's receiver is dropped.
     """
     receivers: list = []
+    seen: set[int] = set()
     features = getattr(agent, "features", {}) or {}
     for feature in features.values():
         if not bool(getattr(feature, "enabled", True)):
             continue
         receiver = getattr(feature, "receiver", None)
-        if _is_webhook_receiver(receiver) and receiver not in receivers:
+        if _is_webhook_receiver(receiver) and id(receiver) not in seen:
+            seen.add(id(receiver))
             receivers.append(receiver)
     return receivers
 
@@ -1164,14 +1211,22 @@ def _live_webhook_receivers(app: FastAPI, agent=None) -> list:
     unprefixed ``/webhooks/{name}`` form, or single-agent mode) the aggregate
     of every current agent's enabled receivers is returned. Deduplicated by
     identity because one receiver can be reached through multiple agents.
+    The dispatch router refuses a name owned by more than one receiver in
+    the returned set (#3216); this provider only decides the scope. The
+    dedupe is by ``id()``, never ``==``: a receiver is admitted on a
+    two-attribute duck-typed contract, and an out-of-tree class with value
+    equality (a dataclass, a pydantic model) would otherwise collapse two
+    distinct owners into one and hand the target back to iteration order.
     """
     if agent is not None:
         return _agent_webhook_receivers(agent)
 
     receivers: list = []
+    seen: set[int] = set()
     for current in _iter_current_agents(app):
         for receiver in _agent_webhook_receivers(current):
-            if receiver not in receivers:
+            if id(receiver) not in seen:
+                seen.add(id(receiver))
                 receivers.append(receiver)
     return receivers
 

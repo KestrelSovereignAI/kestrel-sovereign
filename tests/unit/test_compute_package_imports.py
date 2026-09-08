@@ -11,6 +11,7 @@ from pathlib import Path
 
 _EXPECTED_EXPORTS = [
     "ComputeFeature",
+    "ComputeCommand",
     "ComputePolicy",
     "ComputeScript",
     "DenialResponse",
@@ -34,6 +35,7 @@ _EXPECTED_EXPORTS = [
     "BaseExecutor",
     "ExecutionError",
     "ExecutionTimeoutError",
+    "CommandExecutionUnsupported",
     "UvExecutor",
     "DockerExecutor",
     "LocalExecutor",
@@ -237,6 +239,7 @@ def test_historical_compute_reexports_remain_compatible() -> None:
         expected_groups = {
             "kestrel_sovereign.features.compute.feature": ("ComputeFeature",),
             "kestrel_sovereign.features.compute.models": (
+                "ComputeCommand",
                 "ComputePolicy",
                 "ComputeScript",
                 "DenialResponse",
@@ -270,6 +273,7 @@ def test_historical_compute_reexports_remain_compatible() -> None:
                 "BaseExecutor",
                 "ExecutionError",
                 "ExecutionTimeoutError",
+                "CommandExecutionUnsupported",
                 "UvExecutor",
                 "DockerExecutor",
                 "LocalExecutor",

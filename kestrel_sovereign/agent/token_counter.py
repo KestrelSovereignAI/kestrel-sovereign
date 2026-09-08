@@ -135,18 +135,41 @@ class TokenCounter:
         if not self._use_tiktoken:
             logger.debug(f"Using character estimation for model: {model}")
 
-    def count(self, text: str) -> int:
+    def count(self, text: Any) -> int:
         """
-        Count tokens in text.
+        Count tokens in text, or in structured message content.
+
+        Structured content — an Anthropic block array (``text`` /
+        ``tool_use`` / ``tool_result``), or any nested payload — reaches the
+        provider as JSON, so it is measured the way it is actually sent.
+        This mirrors ``_count_tool_schema_tokens``, which already serialises
+        tool schemas before counting them.
+
+        Without this, a non-string fell through to the character estimate
+        below and was measured as ``len(obj) // 4`` — the number of BLOCKS,
+        not their size. A single ``tool_result`` block holding 400 KB counted
+        as 7 tokens, so any budget fed block-form content was blind to
+        essentially all of it.
 
         Args:
-            text: The text to count tokens for
+            text: Text, or structured content, to count tokens for
 
         Returns:
             Number of tokens
         """
         if not text:
             return 0
+
+        if not isinstance(text, str):
+            try:
+                text = json.dumps(
+                    text, sort_keys=True, separators=(",", ":"), default=str
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    f"content serialisation failed during measurement: {e}"
+                )
+                text = str(text)
 
         if self._use_tiktoken and self.encoder:
             try:
@@ -186,9 +209,9 @@ class TokenCounter:
 
         return total
 
-    def get_context_limit(self) -> int:
+    def resolved_context_limit(self) -> Optional[int]:
         """
-        Get the context window limit for the current model.
+        The context window limit KNOWN for the current model, or None.
 
         Sources (in order of priority):
         1. Discovered limits (from API discovery this session)
@@ -205,7 +228,8 @@ class TokenCounter:
         what discovery records and what catalog lookups expect.
 
         Returns:
-            Maximum tokens allowed in context
+            Maximum tokens allowed in context, or ``None`` when no discovery
+            source, cache or catalog knows this model.
         """
         # Build candidate keys for discovered/cache/catalog lookup.
         # Route-qualified ``"<vendor>:<route>/<model_name>"`` splits on
@@ -267,8 +291,26 @@ class TokenCounter:
                 if limit is not None:
                     return limit
 
-        logger.warning(f"Unknown model {self.model}, using default context limit {DEFAULT_CONTEXT_LIMIT}")
-        return DEFAULT_CONTEXT_LIMIT
+        return None
+
+    def get_context_limit(self) -> int:
+        """The context limit to USE — the resolved one, or the default.
+
+        Split from :meth:`resolved_context_limit` so callers who must not act
+        on a guess can tell "we know this model's window" from "nothing knows
+        it, here is 32768". Budget enforcement is such a caller: refusing a
+        subagent at the 32768 default when it is actually running on a
+        1,000,000-token model would kill working work. Delegating rather than
+        re-implementing the lookup keeps the two answers from drifting.
+        """
+        limit = self.resolved_context_limit()
+        if limit is None:
+            logger.warning(
+                f"Unknown model {self.model}, using default context limit "
+                f"{DEFAULT_CONTEXT_LIMIT}"
+            )
+            return DEFAULT_CONTEXT_LIMIT
+        return limit
 
     def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
         """

@@ -46,6 +46,20 @@ logger = logging.getLogger(__name__)
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
+
+class SubagentContextBudgetExceeded(RuntimeError):
+    """A subagent's accumulated messages no longer fit its model's window.
+
+    Raised rather than returned as a string so the failure reaches the
+    envelope honestly. ``execute_as_subagent``'s boundary turns an exception
+    into ``{"success": False, "error": ...}``; a returned ``"Error: ..."``
+    string would have been wrapped as ``{"success": True}``, which
+    ``infer_tool_result_status`` reads as a successful dispatch and
+    ``_result_indicates_failure`` reads as no failure -- so an outage-class
+    event would be invisible on both the dispatch log and the narration
+    audit, the two surfaces an operator would check.
+    """
+
 CONTINUATION_INTENT_RE = re.compile(
     r"\b("
     r"let me|i(?:'ll| will| am going to)|"
@@ -1342,11 +1356,16 @@ class Feature(_SdkFeature):
         # happenstance.
         subagent_parts: List[dict] = []
         try:
-            # Get feature's own tools, excluding any denied by security policy
-            available_tools = self.get_tools()
+            # The canonical runtime toolset for this invocation: the feature's
+            # own tools minus anything security denied, plus the framework's
+            # lent context-retrieval tools. The advertised schemas, the prompt
+            # and the loop's executable map all derive from THIS list.
+            available_tools = self._compose_subagent_runtime_tools(denied_tools)
             if denied_tools:
-                available_tools = [t for t in available_tools if t.name not in denied_tools]
-                logger.info(f"Feature {self.name}: stripped {len(denied_tools)} denied tools, {len(available_tools)} remaining")
+                logger.info(
+                    f"Feature {self.name}: stripped {len(denied_tools)} denied tools, "
+                    f"{len(available_tools)} remaining"
+                )
 
             # If ALL tools are denied, return immediately with denial
             if not available_tools and denied_tools:
@@ -1363,8 +1382,9 @@ class Feature(_SdkFeature):
             ]
             logger.debug(f"Feature {self.name} has {len(feature_tools)} tools available")
 
-            # Feature-specific system prompt
-            system_prompt = self._get_subagent_prompt()
+            # Feature-specific system prompt, named from the SAME list the
+            # model is given so the two cannot disagree.
+            system_prompt = self._get_subagent_prompt(available_tools)
 
             # Build user prompt with task and context
             user_prompt = f"Task: {task}"
@@ -1383,7 +1403,9 @@ class Feature(_SdkFeature):
             # translation and break Gemini/Vertex routes — codex
             # round 3 P2 on #1461 follow-up.
             tool_executor = (
-                self._make_feature_inline_tool_executor(parts_sink=subagent_parts)
+                self._make_feature_inline_tool_executor(
+                    parts_sink=subagent_parts, runtime_tools=available_tools
+                )
                 if feature_tools else None
             )
             # The subagent reasons on behalf of the turn that dispatched it, so
@@ -1430,6 +1452,7 @@ class Feature(_SdkFeature):
                 model_override=model_override,
                 parts_sink=subagent_parts,
                 session_id=turn_session_id,
+                runtime_tools=available_tools,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -1451,11 +1474,21 @@ class Feature(_SdkFeature):
                 err_envelope["parts"] = subagent_parts
             return err_envelope
 
-    def _make_feature_inline_tool_executor(self, parts_sink: Optional[List[dict]] = None):
+    def _make_feature_inline_tool_executor(
+        self,
+        parts_sink: Optional[List[dict]] = None,
+        runtime_tools: Optional[List[Any]] = None,
+    ):
         """Build an inline ``(name, args) -> result_dict`` async callable
-        bound to this feature's OWN tool palette, gated by the same
+        bound to this invocation's runtime tool palette, gated by the same
         ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
         path enforces.
+
+        ``runtime_tools`` is the same list the non-inline loop executes
+        against. Both paths must resolve a name identically: this one was
+        rebuilding the map from an unfiltered ``self.get_tools()``, so the
+        two doors to the same tool palette disagreed about which tools
+        security had denied.
 
         ``parts_sink`` (#2641) is the subagent-local typed-parts buffer:
         threaded into ``_execute_subagent_tool`` so parts emitted by inline
@@ -1530,7 +1563,9 @@ class Feature(_SdkFeature):
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
-                    tools_by_name={t.name: t for t in self.get_tools()},
+                    tools_by_name={
+                        t.name: t for t in (runtime_tools or self.get_tools())
+                    },
                     return_with_effective_args=True,
                     parts_sink=parts_sink,
                 )
@@ -1705,13 +1740,45 @@ class Feature(_SdkFeature):
                     parts_sink.extend(envelope_parts)
             return _shape(effective_args, serialized)
 
-    def _get_subagent_prompt(self) -> str:
+    def _compose_subagent_runtime_tools(
+        self, denied_tools: Optional[Any] = None
+    ) -> List[Any]:
+        """The canonical tool set for ONE subagent invocation.
+
+        Three things have to agree — the schemas advertised to the model, the
+        "your tools are" line in the subagent prompt, and ``tools_by_name``,
+        the map the loop executes against. Before this they were derived
+        separately and disagreed in two ways:
+
+        * ``execute_as_subagent`` filtered ``denied_tools`` out of the
+          advertised schemas, but both the prompt and ``tools_by_name`` were
+          rebuilt from an unfiltered ``self.get_tools()``. A denied tool was
+          therefore still *executable* if its name reached the loop — the
+          model was not offered it, which is why this had not bitten, but the
+          policy was enforced only by omission.
+        * The prompt listed tools the model was not given, and (once tools are
+          lent) would omit tools it was.
+
+        Deriving all three from this one list is what keeps them from drifting
+        again.
+        """
+        denied = set(denied_tools or ())
+        return [t for t in self.get_tools() if t.name not in denied]
+
+    def _get_subagent_prompt(self, runtime_tools: Optional[List[Any]] = None) -> str:
         """
         Get the system prompt for this feature's subagent context.
 
+        ``runtime_tools`` is the toolset the model will actually be given for
+        this invocation (see ``_compose_subagent_runtime_tools``). It is passed
+        rather than re-derived so the prompt cannot name a different set from
+        the one the loop advertises and executes. Omitted, it falls back to
+        ``get_tools()`` for callers and subclasses that predate this.
+
         Override this in subclasses for more specialized prompts.
         """
-        tool_names = [t.name for t in self.get_tools()]
+        source = runtime_tools if runtime_tools is not None else self.get_tools()
+        tool_names = [t.name for t in source]
         tools_list = ", ".join(tool_names) if tool_names else "None"
 
         return f"""EXECUTION MODE: You are now executing as the {self.name} subagent.
@@ -1741,6 +1808,104 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 - If a tool call fails or is not available, say so explicitly - do not fill in fake values
 - A fabricated cryptographic value is a lie and a constitutional violation"""
 
+    # Fraction of the model's context window a subagent may fill before the
+    # loop refuses to continue. The remainder covers the response and the
+    # provider's own accounting slack.
+    _SUBAGENT_CONTEXT_FRACTION = 0.85
+
+    def _subagent_context_budget(self, model: Optional[str]) -> Optional[int]:
+        """Token ceiling for one subagent's message array, or None to skip.
+
+        Uses ``resolved_context_limit`` -- the limit actually KNOWN for this
+        model -- not ``get_context_limit``, which substitutes a 32768 default
+        for anything it cannot resolve. Enforcing against that default would
+        refuse a subagent at ~28k while it is really running on a
+        1,000,000-token window. None means "do not enforce"; the provider's
+        own limit still backstops.
+        """
+        if not model:
+            return None
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            limit = get_token_counter(model).resolved_context_limit()
+        except Exception as e:
+            logger.debug(f"{self.name}: no context limit for {model!r}: {e}")
+            return None
+        if not limit or limit <= 0:
+            return None
+        return int(limit * self._SUBAGENT_CONTEXT_FRACTION)
+
+    @staticmethod
+    def _subagent_wire_chars(messages: List[Dict[str, Any]]) -> str:
+        """The array serialised the way it goes on the wire.
+
+        ``count_messages`` reads only ``content``, so it cannot see a tool
+        call's ``arguments`` or an assistant turn's ``reasoning_content`` --
+        both of which are resent every iteration and, on a thinking model,
+        can be the larger share. Serialising the whole message measures what
+        is actually sent.
+        """
+        import json as _json
+
+        try:
+            return _json.dumps(messages, default=str)
+        except (TypeError, ValueError):
+            return "".join(str(m) for m in messages)
+
+    def _subagent_context_overflow(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """Return an operator-facing reason when ``messages`` will not fit.
+
+        Why this refuses instead of trimming. Trimming is model-visible
+        pruning, and salvage.py's invariant forbids that without "a
+        synchronous durable artifact or lossless pointer". For conversation
+        history that machinery exists. For TOOL RESULTS it does not: they are
+        never written to ``conversation_history``, so they have no row id to
+        salvage; ``_log_tool_dispatch`` records only ``result_status`` and
+        ``result_size_bytes``; and the orchestrator's own cap calls
+        ``_build_persisted_preview``, which despite its name persists nothing
+        -- it keeps a head and a tail and discards the middle irrecoverably.
+
+        So there is nowhere to put what trimming would drop. Refusing loudly
+        is the only behaviour that neither loses data nor sends a request the
+        provider will certainly reject. Once tool results have a durable home,
+        this is the seam that becomes a microcompact-and-salvage step.
+        """
+        budget = self._subagent_context_budget(model)
+        if budget is None:
+            return None
+        try:
+            from kestrel_sovereign.agent.token_counter import get_token_counter
+
+            counter = get_token_counter(model)
+            # Count the SERIALISED payload, not `count_messages`: that helper
+            # reads only `content`, missing tool-call `arguments` and
+            # `reasoning_content`, and never sees the tool schemas that are
+            # resent with every request. See _subagent_wire_chars.
+            payload = self._subagent_wire_chars(messages)
+            if tools:
+                payload += self._subagent_wire_chars(tools)
+            used = counter.count(payload)
+        except Exception as e:
+            logger.debug(f"{self.name}: could not measure subagent context: {e}")
+            return None
+        if used <= budget:
+            return None
+        return (
+            f"Subagent {self.name!r} exceeded its context budget: {used:,} tokens "
+            f"against a {budget:,} ceiling for model {model!r}. The tool-call "
+            f"loop accumulates every tool result and resends them, and tool "
+            f"results have no durable store to be salvaged into, so the loop "
+            f"stops here rather than dropping them silently or sending a "
+            f"request the provider will reject. Narrow the task, or have the "
+            f"tool return less."
+        )
+
     async def _handle_feature_tool_calls(
         self,
         response: Union[str, Any],
@@ -1752,6 +1917,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         model_override: Optional[str] = None,
         parts_sink: Optional[List[dict]] = None,
         session_id: Optional[str] = None,
+        runtime_tools: Optional[List[Any]] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -1793,6 +1959,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         if isinstance(response, str):
             return response
 
+        # The model this subagent is ACTUALLY running on. Neither
+        # execute_as_subagent call site passes ``model_override``
+        # (orchestrator_engine.py:1299 and :1891), so relying on it would
+        # leave the budget resolving "auto" -> the 32768 default and refusing
+        # a subagent on a 1,000,000-token window at ~28k. ``LLMResponse``
+        # carries the model the provider actually served, so the loop learns
+        # it from the response it already has.
+        effective_model = model_override or getattr(response, "model", None)
+
         # Build message history for multi-turn tool calling
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1818,7 +1993,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
-        tools_by_name = {agent_tool.name: agent_tool for agent_tool in self.get_tools()}
+        # The executable map is the RUNTIME toolset, not an unfiltered
+        # re-derivation: rebuilding from ``self.get_tools()`` here put every
+        # security-denied tool back into the map (the model was not offered
+        # them, so policy held by omission alone) and left lent tools out.
+        tools_by_name = {t.name: t for t in (runtime_tools or self.get_tools())}
 
         for iteration in range(max_iterations):
             # Warn when approaching iteration limit
@@ -1862,6 +2041,18 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     "content": json.dumps(result)
                 })
 
+            # Refuse before sending rather than after being rejected. The
+            # array grows by a full tool result every iteration and is resent
+            # whole, so this is where an unbounded run is caught -- see
+            # ``_subagent_context_overflow`` for why it refuses instead of
+            # trimming.
+            overflow = self._subagent_context_overflow(
+                messages, effective_model, tools
+            )
+            if overflow is not None:
+                logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                raise SubagentContextBudgetExceeded(overflow)
+
             # Continue conversation with tool results — thread the
             # ``tool_executor`` through so codex-routed continuation
             # turns don't hit the same "requires a tool_executor"
@@ -1878,11 +2069,21 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 invocation_context=_subagent_turn_identity(session_id),
             )
 
+            effective_model = (
+                model_override or getattr(response, "model", None) or effective_model
+            )
+
             # If response is string or has no more tool calls, we're done
             if isinstance(response, str):
                 return response
 
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
+                overflow = self._subagent_context_overflow(
+                    messages, effective_model, tools
+                )
+                if overflow is not None:
+                    logger.error(f"[SUBAGENT {self.name}] {overflow}")
+                    raise SubagentContextBudgetExceeded(overflow)
                 response = await self._repair_subagent_premature_yield(
                     response,
                     messages,

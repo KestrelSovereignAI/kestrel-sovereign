@@ -70,6 +70,58 @@ def _safe_privacy_config(value: Any) -> Any:
     return getattr(value, "privacy_config", None)
 
 
+class AgentIdentityUnavailable(RuntimeError):
+    """The agent has no usable DID, so nothing can be scoped to it."""
+
+
+def resolve_scoped_agent_did(agent: Any) -> str:
+    """The DID every self-scoped read and write of this agent is bound to.
+
+    The guard for the sites that scope a shared table to the calling agent
+    and route through it: the consent log and audit anchors (#3229/#3230),
+    observability (#3215), the ``!tasks`` command, and since #3246 the
+    A2A task routes' recipient (reads, subscribe, cancel, and the creation
+    of an inbound task), the host-attested local submission's recipient,
+    the inbound-scope gate's recipient (``a2a/inbound_authorization``),
+    the task feature's own durable identity, the task wait provider's
+    ownership check, the pre-turn state sections, the restart
+    status-events route, and (#3240) the feature-route mount owner's
+    stable identity across a reload. They had drifted — one gated on truthiness alone,
+    so a non-string truthy value was bound as a query parameter; the task
+    routes and the inbound-scope gate read ``agent_id`` before ``did``; the
+    cancel route tried the task manager's ``host_agent_id`` first; creation
+    fell back to the display name and then ``"unknown"``. That list is
+    hand-written too, so ``test_every_routed_site_is_named_here`` in the
+    same test module holds the set of modules that call this guard.
+
+    The sites that still resolve an agent's identity inline are not listed
+    here: four review rounds found a hand-written list wrong four times.
+    Those that read BOTH identity attributes off one object — an ``or``
+    chain, a nested default, a candidate tuple, a two-name loop — are
+    enumerated, with a reason each, by
+    ``tests/unit/test_scoped_agent_did_guard.py::
+    test_every_inline_did_resolution_is_a_known_exception``, which scans the
+    package for those shapes and fails when one appears or disappears. A
+    single-attribute copy (``getattr(agent, "did", …)`` plus its own type
+    check, or a scope taken from a manager's ``host_agent_id``) is NOT in
+    that scan; several exist over other tables (#3251). Before adding a
+    copy of either kind, route through here; if a site genuinely cannot,
+    register it in that test with its reason.
+
+    A missing, empty, or non-string DID is "cannot be scoped", never
+    "unscoped": the caller refuses (a store that gates on ``if agent_id:``
+    turns an empty string into every agent's rows). A plain read, not the
+    module's mock-safe one: the agent protocol declares ``did`` and an
+    implementation may back it with a property, which ``_safe_attr`` would
+    refuse; a MagicMock's fabricated attribute is not a string and is
+    refused by the type check regardless.
+    """
+    did = getattr(agent, "did", None)
+    if not isinstance(did, str) or not did:
+        raise AgentIdentityUnavailable("agent identity unavailable")
+    return did
+
+
 def resolve_feature_database(agent: Any) -> Optional[Any]:
     """Resolve the database handle a feature should use for its own tables.
 

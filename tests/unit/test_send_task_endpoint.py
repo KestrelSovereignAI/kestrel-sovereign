@@ -149,6 +149,30 @@ def test_send_task_without_artifacts_passes_none(app_with_send):
     assert agent.task_manager.create_task.await_args.kwargs["artifacts"] is None
 
 
+def test_send_task_files_the_task_under_the_recipient_did_not_its_display_name(app_with_send):
+    """#3246: the row's recipient scope is the DID the reads resolve, never
+    the display name it used to fall back to; without a DID nothing is filed."""
+    agent = _stub_agent()
+    assert agent._agent_name != agent.did
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+    assert resp.status_code == 200
+    assert agent.task_manager.create_task.await_args.kwargs["agent_name"] == agent.did
+
+
+def test_send_task_files_nothing_for_a_recipient_without_a_did(app_with_send):
+    unnamed = _stub_agent()
+    unnamed.did = ""
+    _attach(app_with_send, unnamed)
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=_body())
+    assert resp.status_code == 503
+    assert "creation requires a durable recipient identity" in resp.json()["detail"]
+    unnamed.task_manager.create_task.assert_not_awaited()
+
+
 def test_send_task_reports_caller_supplied_duplicate_id_as_conflict(app_with_send):
     agent = _stub_agent()
     agent.task_manager.create_task = AsyncMock(

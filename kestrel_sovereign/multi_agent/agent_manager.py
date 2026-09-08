@@ -712,7 +712,16 @@ def _has_shutdown_reaper_handoff_contract(agent: object) -> bool:
 
 
 def _loaded_agent_did(agent: object) -> Optional[str]:
-    """Return a concrete agent DID without trusting a dynamic test proxy."""
+    """Return a concrete agent DID without trusting a dynamic test proxy.
+
+    Still ``did`` then ``agent_id`` rather than the shared
+    ``resolve_scoped_agent_did`` guard (#3246): this is the manager's
+    routing and lineage identity, the read end of the host-attested local
+    task route, and its suite builds agents carrying ``agent_id`` alone.
+    On a real agent the two attributes are one value. Routing it is a
+    suite-wide double change tracked in #3251; the census test in
+    ``tests/unit/test_scoped_agent_did_guard.py`` registers this copy.
+    """
 
     for attribute in ("did", "agent_id"):
         value = getattr(agent, attribute, None)

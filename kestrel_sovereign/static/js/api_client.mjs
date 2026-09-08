@@ -1203,6 +1203,10 @@ export function createApiClient({
         importSovereignty: (cid) => client.request('/api/sovereignty/import', { method: 'POST', body: JSON.stringify({ cid }) }),
         getSovereigntyFiles: () => client.request('/api/sovereignty/files'),
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
+        // The download is a plain <a href>, not a request(): it must be routed
+        // to the selected host agent the same way the listing and preview are,
+        // or a multi-agent host answers 503 for an unrouted file (#3225).
+        sovereigntyFileUrl: (filename) => applyHostAgentPrefix(`/api/sovereignty/files/${encodeURIComponent(filename)}`, state.selectedHostAgent),
         // `cursor` continues a previous page; the response's `next_cursor` is
         // the token for the one after it, and null at the end of the list
         // (#2960). Opaque — it encodes the server's ordering keys, which is not
@@ -1314,6 +1318,8 @@ export function createApiClient({
             return client.requestForAgent(url, {}, agent);
         },
         getIpfsStatus: () => client.request('/api/ipfs/status'),
+        // Host view of the daemon (identity, version, every pin): sovereign only (#3226).
+        getIpfsNode: () => client.request('/api/ipfs/node'),
         getWallet: () => client.request('/api/wallet'),
         invoke: async (input, model = null, sessionId = null, provider = null) => {
             // Capture dispatchAgent BEFORE the await so the session_id

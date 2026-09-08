@@ -346,6 +346,21 @@ def test_sovereignty_import_reports_cooperative_stop_as_conflict():
         _restore_app(app, original)
 
 
+def _agent_owning(*content_hashes):
+    """An agent whose own storage holds a backup receipt for each hash.
+
+    The browser lists and serves only what the routed agent's receipts
+    name (#3225); a bare MagicMock storage owns nothing and sees nothing.
+    """
+    receipts = [SimpleNamespace(node_id=h, properties={}) for h in content_hashes]
+
+    async def get_nodes_by_type(node_type):
+        return receipts if node_type == "backup_artifact" else []
+
+    storage = SimpleNamespace(privacy_config=None, get_nodes_by_type=get_nodes_by_type)
+    return SimpleNamespace(storage=storage, did="did:test:owner", agent_name="owner")
+
+
 def test_sovereignty_files_listing_and_preview_contract(tmp_path):
     from kestrel_sovereign.endpoints import sovereignty as sovereignty_endpoints
 
@@ -354,7 +369,7 @@ def test_sovereignty_files_listing_and_preview_contract(tmp_path):
     (cache_dir / "sample.cache").write_text("hello world")
     (cache_dir / "sample.meta").write_text('{"source":"test"}')
 
-    agent = MagicMock(storage=MagicMock())
+    agent = _agent_owning("sample")
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -388,7 +403,7 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
     (cache_dir / "sample.cache").write_text("hello world")
     (cache_dir / "sample.meta").write_text('{"source":"test"}')
 
-    agent = MagicMock(storage=MagicMock())
+    agent = _agent_owning("sample")
     app, original = _prepare_app(agent)
     original_cache_dir = sovereignty_endpoints.STORAGE_CACHE_DIR
     sovereignty_endpoints.STORAGE_CACHE_DIR = cache_dir
@@ -411,7 +426,7 @@ def test_sovereignty_file_browser_offloads_blocking_io(tmp_path):
                     )
         assert list_response.status_code == 200
         assert preview_response.status_code == 200
-        assert "_list_storage_cache_files" in calls
+        assert "_list_owned_cache_files" in calls
         assert "_read_preview_bytes" in calls
     finally:
         sovereignty_endpoints.STORAGE_CACHE_DIR = original_cache_dir

@@ -114,12 +114,15 @@ def shell_syntax_refusal(
     and exits 0: the bound the caller asked for is discarded and
     nothing says so (#3129, measured at 128 live calls).
 
-    "No shell interprets the string" is the tool's contract, not a
-    property of every backend. The local backend execs the vector; the
-    Docker backend rebuilds a bash script from it and runs that, so
-    quoting is what neutralises metacharacters there and command-position
-    grammar is what escapes quoting. Both halves of the refusal exist
-    for that reason. The backend's own claim to exec argv is #3187.
+    "No shell interprets the string" is the tool's contract. Both
+    shipped backends now honour it — the local one execs the vector and
+    the Docker one hands it to ``docker run`` after the image (#3187) —
+    but the refusal is stated here, at the boundary where the contract
+    is made, rather than inferred from every backend continuing to keep
+    it. That ordering is why the command-position half of this check
+    survives the backend fix: without it, a caller who writes
+    ``eval 'dd ...'`` learns only that some program called ``eval``
+    could not be found, which is a true message about the wrong thing.
 
     Refusing is the only option that does not execute a different
     command than the one written. Routing the string through ``bash
@@ -134,10 +137,11 @@ def shell_syntax_refusal(
     the gates that ran before this one already vetted.
     """
     # Command position first: a word there may be grammar rather than a
-    # program, and every character in it can be inert. One backend does
-    # not exec the argv it is handed — DockerSandboxBackend rebuilds a
-    # bash script from it — so `eval 'dd ...'` and `FOO=x dd ...` reach
-    # a shell with only `eval` or `FOO=x` vetted (#3187).
+    # program, and every character in it can be inert — so the character
+    # rule below cannot see it. `eval 'dd ...'` and `FOO=x dd ...` are
+    # requests to run a program the policy was never shown, and they
+    # are refused as such rather than dispatched to a backend to fail
+    # as a missing executable (#3129, #3187).
     if argv:
         grammar = command_word_is_shell_grammar(argv[0])
         if grammar is not None:

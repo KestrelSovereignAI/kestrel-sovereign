@@ -14,6 +14,56 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.api_errors import ApiHTTPException
 
 
+def require_sovereign_host_lifecycle(request: Request):
+    """Admit only the sovereign-key principal to host lifecycle mutations.
+
+    A FastAPI dependency rather than a call inside a handler, and that
+    placement is load-bearing: it runs before the handler body, so the
+    refusal itself carries no state about what it refused. A check placed
+    after a registry lookup would answer 404 for an unknown package and
+    403 for a known one, making the refusal a probe.
+
+    That is a property of the refusal, not a confidentiality guarantee
+    about the surface. `GET /api/features` deliberately returns the whole
+    catalogue with per-package status to any *authenticated* caller (it
+    sits behind the auth middleware, unlike `/health` or `/metrics`), so
+    a non-sovereign caller can already read what is installed and never
+    needs a probe pair. Do not cite this as though it hid anything.
+
+    Lives here, next to :func:`get_caller`, because it is the host's
+    authority predicate and not one endpoint module's private helper.
+    #3214 was what that privacy cost: `POST /api/features/{name}/install`
+    documented "requires a sovereign agent — governed agents cannot
+    install packages" and enforced nothing, while the predicate that
+    would have said so sat in a sibling module guarding
+    `POST /api/agents`.
+    """
+
+    if not caller_is_sovereign(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Sovereign authority is required.",
+        )
+    return get_caller(request)
+
+
+def caller_is_sovereign(request: Request) -> bool:
+    """Whether the caller would pass :func:`require_sovereign_host_lifecycle`.
+
+    The same predicate, asked without raising, so a read can tell the
+    console which controls to draw or which host view to fetch
+    (``can_manage_features`` on the feature catalogue, #3234;
+    ``can_view_node`` on the agent-local IPFS status, #3226). Absent or
+    non-sovereign caller → False.
+
+    This is a hint for the client, never the gate: a mutation or a
+    host-scoped read still declares the dependency, which refuses before
+    the handler body runs.
+    """
+    caller = get_caller(request)
+    return getattr(caller, "is_sovereign", False) is True
+
+
 def get_caller(request: Request):
     """Return the CallerContext attached by the auth middleware, or None.
 

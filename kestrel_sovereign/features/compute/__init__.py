@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     )
     from .executors import (
         BaseExecutor as BaseExecutor,
+        CommandExecutionUnsupported as CommandExecutionUnsupported,
         DockerExecutor as DockerExecutor,
         ExecutionError as ExecutionError,
         ExecutionTimeoutError as ExecutionTimeoutError,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     )
     from .feature import ComputeFeature as ComputeFeature
     from .models import (
+        ComputeCommand as ComputeCommand,
         ComputePolicy as ComputePolicy,
         ComputeScript as ComputeScript,
         DenialResponse as DenialResponse,
@@ -91,6 +93,7 @@ if TYPE_CHECKING:
 _EXPORTS_BY_MODULE = {
     ".feature": ("ComputeFeature",),
     ".models": (
+        "ComputeCommand",
         "ComputePolicy",
         "ComputeScript",
         "DenialResponse",
@@ -113,6 +116,7 @@ _EXPORTS_BY_MODULE = {
         "BaseExecutor",
         "ExecutionError",
         "ExecutionTimeoutError",
+        "CommandExecutionUnsupported",
         "UvExecutor",
         "DockerExecutor",
         "LocalExecutor",
@@ -126,6 +130,7 @@ _EXPORT_MODULES = {
 
 __all__ = [
     "ComputeFeature",
+    "ComputeCommand",
     "ComputePolicy",
     "ComputeScript",
     "DenialResponse",
@@ -149,6 +154,7 @@ __all__ = [
     "BaseExecutor",
     "ExecutionError",
     "ExecutionTimeoutError",
+    "CommandExecutionUnsupported",
     "UvExecutor",
     "DockerExecutor",
     "LocalExecutor",

@@ -3,18 +3,30 @@
 Filesystem ops run on the host (the agent is editing user files; that is
 the whole point of the feature). Shell exec is wrapped through the
 existing ``ComputeFeature`` ``DockerExecutor``: each call constructs a
-one-shot ``ComputeScript`` and runs it in a fresh container with the
+one-shot ``ComputeCommand`` and runs it in a fresh container with the
 working directory mounted read-only by default. The reuse is deliberate
 — the compute feature already has a vetted set of container security
 flags (``--read-only``, ``--network=none``, ``--security-opt=no-new-privileges``,
 memory and pid limits) and we don't want a second container runtime path
 that could drift from those guarantees.
+
+The command is an argv vector all the way down. This backend used to
+quote the vector into a bash script and run that instead, which meant
+the words were read a second time, by a shell, after the policy had
+vetted them — so ``eval 'printf HACKED'`` ran ``printf`` having shown
+the policy only ``eval``, which is not a program at all (#3187). A
+method named ``exec(argv)`` now execs argv.
+
+Position after the image is not what makes that true; the executor
+names ``argv[0]`` to Docker with ``--entrypoint``. Words placed after
+an image are appended to whatever ``ENTRYPOINT`` it declares, so on an
+image that has one they are arguments to the image's program rather
+than a program of their own — the same defect one layer down.
 """
 
 from __future__ import annotations
 
 import logging
-import shlex
 import time
 import uuid
 from pathlib import Path
@@ -95,21 +107,20 @@ class DockerSandboxBackend(SandboxBackend):
         if not argv:
             raise ValueError("empty argv")
 
-        from kestrel_sovereign.features.compute.models import ComputeScript
+        from kestrel_sovereign.features.compute.models import ComputeCommand
 
-        script = ComputeScript(
+        command = ComputeCommand(
             id=str(uuid.uuid4()),
             name=f"computer-use:{argv[0]}",
-            language="bash",
-            content=" ".join(shlex.quote(a) for a in argv) + "\n",
+            argv=list(argv),
             purpose="computer-use shell exec",
             timeout_seconds=timeout,
             environment=env or {},
         )
 
         started = time.monotonic()
-        record = await self._executor.execute(
-            script,
+        record = await self._executor.execute_command(
+            command,
             working_dir=str(cwd) if cwd else None,
         )
         duration_ms = int((time.monotonic() - started) * 1000)

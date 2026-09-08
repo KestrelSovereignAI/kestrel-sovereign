@@ -92,6 +92,9 @@ def test_observability_summary_endpoint_returns_serialized_summary():
         metadata={"foo": "bar"},
     )
     agent = MagicMock(
+        # The summary scopes by the agent's DID and refuses a MagicMock
+        # fabrication as identity (the shared guard, #3229).
+        did="did:test:claw",
         observability_store=MagicMock(query_events=AsyncMock(return_value=[event]))
     )
 
