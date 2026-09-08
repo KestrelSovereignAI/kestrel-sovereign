@@ -696,6 +696,94 @@ class TestCoreGeneration:
         assert advised_wait_exceeding_budget(info.value) is None
 
     @pytest.mark.asyncio
+    async def test_an_exhausted_configured_routes_raise_states_the_common_verdict(
+        self, llm_service, mock_adapter,
+    ):
+        """The round-4 P1: when the preferred routes are exhausted mid-loop,
+        the raise chained the LAST route's error; if that route declined after
+        an earlier unrelated failure, its decline became the call's verdict."""
+        from datetime import UTC, datetime
+        from unittest.mock import Mock
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        # Exhausted only after the second route failed.
+        llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(Exception) as info:
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert info.value.__cause__ is not None
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.stream_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            ):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert info.value.underlying is not None
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
+    async def test_generate_stream_aggregate_carries_the_common_decline(
+        self, llm_service, mock_adapter,
+    ):
+        """The fifth aggregate site, behind generate_stream."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        soon = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=900, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        late = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+        )
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", soon),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", late),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.generate_stream(
+                system_prompt="Test", user_prompt="Hello"
+            ):
+                pass
+        assert advised_wait_exceeding_budget(info.value) is soon
+
+    @pytest.mark.asyncio
     async def test_stream_with_tool_detection_aggregate_carries_the_common_decline(
         self, llm_service, mock_adapter,
     ):

@@ -1326,13 +1326,17 @@ class StreamingMixin:
                         "vendor. Error: %s",
                         providers_to_use[0].get("vendor"), provider_name, e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider_name} failed and the only "
                         f"remaining routes are unconfigured vendors; refusing to "
                         f"silently swap vendors: {e}",
                         provider=provider_name,
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 # Default multi-provider chain: log the fallback server-side;
                 # don't corrupt the stream with a note about it.
                 logger.warning(
@@ -1594,13 +1598,17 @@ class StreamingMixin:
                         "route is an unconfigured vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
                 )
@@ -1977,13 +1985,17 @@ class StreamingMixin:
                         "vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
                 )

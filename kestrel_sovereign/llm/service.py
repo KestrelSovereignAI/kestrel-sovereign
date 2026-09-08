@@ -4714,12 +4714,16 @@ No other text or formatting.
                         "an unconfigured vendor. Error: %s",
                         available_providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
 
         # The aggregate states its own verdict: a reset time only when every
         # ATTEMPTED route declined (skipped routes and models a route cannot
@@ -5349,12 +5353,16 @@ No other text or formatting.
                         "route is an unconfigured vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
                     provider["name"], e,

@@ -496,3 +496,57 @@ async def test_advice_of_zero_with_nothing_left_to_wait_ends_the_loop():
     ):
         await with_retry(op)
     assert slept == [THROTTLE_BUDGET] and calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Round 5: advice on the final attempt is still a reset time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_advice_that_arrives_on_the_final_attempt_is_declined_not_discarded():
+    """The review's script: no header on attempts 0-6, `retry-after: 46774` on
+    the last; before, the attempt count ended the loop with the raw error."""
+    seq = [_FakeRateLimit() for _ in range(THROTTLE_MAX_RETRIES - 1)] + [_throttle(46774)]
+    calls = {"n": 0}
+
+    async def op():
+        i = calls["n"]
+        calls["n"] += 1
+        raise seq[i]
+
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep"),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(AdvisedWaitExceedsRetryBudget) as info,
+    ):
+        await with_retry(op)
+    assert calls["n"] == THROTTLE_MAX_RETRIES
+    assert info.value.advised_seconds == 46774.0
+    assert info.value.budget_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_single_attempt_loop_still_declines_with_the_reset_time():
+    with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
+        await _drive([_throttle(300)], throttle_max_retries=1)
+    assert info.value.advised_seconds == 300.0
+
+
+@pytest.mark.asyncio
+async def test_the_final_attempt_without_advice_raises_the_provider_error():
+    seq = [_FakeRateLimit() for _ in range(THROTTLE_MAX_RETRIES)]
+    calls = {"n": 0}
+
+    async def op():
+        i = calls["n"]
+        calls["n"] += 1
+        raise seq[i]
+
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep"),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(_FakeRateLimit),
+    ):
+        await with_retry(op)
+    assert calls["n"] == THROTTLE_MAX_RETRIES

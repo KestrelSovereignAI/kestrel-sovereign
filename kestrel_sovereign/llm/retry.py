@@ -522,13 +522,17 @@ async def with_retry(
                 eff_max_retries = max_retries
                 eff_max_delay = max_delay
 
-            if attempt >= eff_max_retries - 1:
-                raise
-
             # What this call may still sleep in total: the loop's classic
             # worst case (every remaining attempt at the cap) less what it
-            # has slept already.
-            remaining_budget = max(0.0, eff_max_delay * (eff_max_retries - 1) - waited)
+            # has slept already; nothing once no attempt remains. Advice is
+            # read BEFORE the attempt count ends the loop, so a Retry-After
+            # that arrives on the final attempt still reaches the caller as
+            # a reset time rather than as the raw provider error.
+            attempts_left = eff_max_retries - attempt - 1
+            remaining_budget = (
+                0.0 if attempts_left <= 0
+                else max(0.0, eff_max_delay * (eff_max_retries - 1) - waited)
+            )
 
             # Prefer the server-advised cool-down; otherwise exponential
             # backoff + jitter. Both are capped at the effective max delay.
@@ -560,8 +564,12 @@ async def with_retry(
                         budget_seconds=remaining_budget,
                         retry_at=retry_at,
                     ) from e
+                if attempts_left <= 0:
+                    raise
                 delay = advised + random.uniform(0, 1)
             else:
+                if attempts_left <= 0:
+                    raise
                 # A spent budget ends the loop: an attempt without a wait is
                 # a request fired back-to-back at a provider that just
                 # refused, with no backoff and no jitter. (Advice beyond the
