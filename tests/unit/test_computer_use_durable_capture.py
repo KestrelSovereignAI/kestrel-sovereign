@@ -1144,3 +1144,149 @@ async def test_a_daemonizing_command_does_not_hold_the_tool_open(tmp_path: Path)
     assert result.writers_remaining is True
     assert result.timed_out is False
     assert elapsed < 10, f"waited {elapsed:.1f}s on a daemon it should have reported"
+
+
+# ---------------------------------------------------------------------------
+# Surviving mutants from round 4. Each named a gap, not a false alarm.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_envelope_fits_when_BOTH_streams_are_large(
+    workspace: Path, queue
+):
+    """Surviving mutant: replacing the cap-derived budget with the fixed
+    4,000-char default changed nothing, because the only envelope test had an
+    empty stderr and 4,000 + 0 + metadata still fit. Two full previews is the
+    case the budget is halved for."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    f = await _feature(workspace, queue)
+    env = await f.shell(
+        command=(
+            "python3 -c \"import sys; "
+            "sys.stdout.write('O' * 60000); sys.stderr.write('E' * 60000)\""
+        ),
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert env.data["stdout"] and env.data["stderr"]
+    size = serialized_result_len(env)
+    assert size <= orchestrator_result_cap(), f"envelope is {size} chars"
+
+
+@pytest.mark.asyncio
+async def test_the_spawn_diagnostic_reaches_the_artifact_itself(
+    workspace: Path, queue
+):
+    """Surviving mutant: dropping the write into the captured stderr changed
+    no test, because the feature's fallback put the message in ``data``
+    anyway. Two guarantees for one property is fine; a test that cannot tell
+    them apart is not. The artifact is supposed to be readable on its own."""
+    f = await _feature(
+        workspace, queue, auto_approved_binaries=["definitely-not-a-real-binary-xyz"]
+    )
+
+    env = await f.shell(
+        command="definitely-not-a-real-binary-xyz", capture_output=True
+    )
+
+    captured = Path(env.data["stderr_path"]).read_text()
+    assert "definitely-not-a-real-binary-xyz" in captured
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_covers_a_capture_that_holds_nothing(
+    workspace: Path, queue
+):
+    """The other half of that pair. If the diagnostic could not be written
+    into the capture, the empty file must not silently replace it."""
+    bundle_dir = workspace / "captures"
+    f = await _feature(workspace, queue)
+
+    class _EmptyCaptureBackend:
+        name = "local"
+
+        async def exec(self, argv, *, cwd, env, timeout, capture=None):
+            # Files exist and are empty: the shape of a write that failed.
+            capture.stdout_path.write_bytes(b"")
+            capture.stderr_path.write_bytes(b"")
+            return CompletedRun(
+                argv=argv,
+                returncode=127,
+                stdout="",
+                stderr="No such file or directory: 'ghost'",
+                duration_ms=1,
+                stdout_path=str(capture.stdout_path),
+                stderr_path=str(capture.stderr_path),
+                writers_remaining=False,
+            )
+
+        async def shutdown(self):
+            pass
+
+    f._backend = _EmptyCaptureBackend()
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert "No such file or directory" in env.data["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_an_uncaptured_timeout_also_kills_the_tree(tmp_path: Path):
+    """Surviving mutant: the uncaptured branch's tree-kill was untested — the
+    only timeout test used a capture. A command that forks and times out must
+    not leave descendants running on either path."""
+    marker = tmp_path / "survived.txt"
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(4)\n"
+        f"    open({str(marker)!r}, 'w').write('x')\n"
+        "    os._exit(0)\n"
+        "time.sleep(30)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    result = await backend.exec(
+        ["python3", str(script)], cwd=None, env=None, timeout=1
+    )
+    assert result.timed_out is True
+
+    import asyncio as _a
+
+    await _a.sleep(5)
+    assert not marker.exists(), "a descendant outlived an uncaptured timeout"
+
+
+@pytest.mark.asyncio
+async def test_the_spawn_asks_the_cross_platform_helper_for_its_group_kwargs(
+    tmp_path: Path, monkeypatch
+):
+    """Surviving mutant, and one this platform cannot kill behaviourally:
+    ``start_new_session=True`` and ``new_process_group_kwargs()`` are
+    identical on POSIX and differ only on Windows, which the suite cannot
+    run. So the wiring itself is the assertion — the helper must be what
+    decides, because it is the only thing that knows about the other
+    platform."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    asked = []
+    real = local_mod.new_process_group_kwargs
+
+    def spy():
+        asked.append(True)
+        return real()
+
+    monkeypatch.setattr(local_mod, "new_process_group_kwargs", spy)
+
+    await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('hi')"], cwd=None, env=None, timeout=30
+    )
+
+    assert asked, "the spawn did not consult the cross-platform helper"
