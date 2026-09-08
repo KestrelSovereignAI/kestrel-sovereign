@@ -5067,3 +5067,64 @@ async def test_durable_registration_persistence_handoff_is_atomic_across_instanc
         )
     finally:
         await peer_backend.close()
+
+
+def test_postgres_counter_fence_reads_seen_and_copies_under_one_snapshot():
+    """#3218: the BEFORE fence must decide "seen but no positive copy" from
+    ONE statement. Under READ COMMITTED each PL/pgSQL statement takes its own
+    snapshot, so reading the copies in one statement and ``seen`` in another
+    let a concurrent writer commit in between and the fence raised the loss
+    error for a scope that had lost nothing."""
+    from kestrel_sovereign.signals.durable import (
+        _postgres_source_sequence_counter_fence_definitions,
+    )
+
+    (before, _after) = _postgres_source_sequence_counter_fence_definitions()
+    assert before.role == "before"
+    body = before.function_body
+    assert body.count("INTO ") == 1, body
+    assert "INTO seen_scope, recovered" in body
+    # One SELECT feeds the decision; the raise reads only its variables.
+    decision = body.split("INTO seen_scope, recovered")[0]
+    assert decision.count("SELECT") == 4  # the outer SELECT and its three subqueries
+    assert "IF seen_scope AND recovered < 1 THEN" in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_postgres_counter_fence_does_not_raise_for_a_live_writer_racing_a_legacy_advance(db_backend):
+    """#3218, measured before the fix: 22 spurious loss raises in 300
+    concurrent pairs on an otherwise idle database. A legacy primary-only
+    advance and a live persist on one fresh scope, many scopes at once, must
+    never trip the fence: nothing is lost, both writers commit."""
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL counter-fence snapshot regression")
+    async with _independent_postgres_schema_backend(db_backend) as backend:
+        store = DurableSignalStore(backend)
+        await store.initialize()
+
+        async def pair(agent_id: str, source: str):
+            legacy = await _independent_backend(backend)
+            live = await _independent_backend(backend)
+            try:
+                return await asyncio.gather(
+                    _legacy_primary_only_advance(legacy, agent_id=agent_id, source=source),
+                    DurableSignalStore(live).persist_signal(
+                        _signal(agent_id), agent_id=agent_id,
+                        source_event_id=f"fence-race:{uuid4()}", retention_days=7,
+                    ),
+                    return_exceptions=True,
+                )
+            finally:
+                await live.close()
+                await legacy.close()
+
+        losses = []
+        for _round in range(30):
+            scopes = [(f"did:test:fence-race:{uuid4()}", "provider.message") for _ in range(10)]
+            for outcome in await asyncio.gather(*(pair(a, s) for a, s in scopes)):
+                for item in outcome:
+                    if isinstance(item, BaseException):
+                        assert "both exact counter copies" in str(item), item
+                        losses.append(str(item))
+        assert losses == [], f"{len(losses)} spurious loss raises in 300 pairs"
