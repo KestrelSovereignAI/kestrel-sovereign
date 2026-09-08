@@ -60,7 +60,69 @@ async def get_spawn_children(request: Request):
         return {"children": [], "count": 0, "delegation_chain": {}, "history": []}
 
     parent_did = agent.agent_id
-    child_names = manager.get_children(parent_did)
+    relations = await manager.get_authoritative_spawn_relations()
+    child_names = [
+        child_name
+        for _child_did, (relation_parent, child_name) in relations.items()
+        if relation_parent == parent_did
+    ]
+    child_dids = {
+        child_name.casefold(): child_did
+        for child_did, (relation_parent, child_name) in relations.items()
+        if relation_parent == parent_did
+    }
+    persistent_cleanup_children = getattr(
+        type(manager),
+        "persistent_spawn_cleanup_children",
+        None,
+    )
+    if callable(persistent_cleanup_children):
+        known = {name.casefold() for name in child_names}
+        for retained_name, retained_did in persistent_cleanup_children(
+            manager,
+            parent_did=parent_did,
+        ):
+            canonical_name = retained_name.casefold()
+            if canonical_name not in known:
+                child_names.append(retained_name)
+                known.add(canonical_name)
+                child_dids[canonical_name] = retained_did
+    registry_cleanup_children = getattr(
+        type(manager),
+        "registry_spawn_cleanup_children",
+        None,
+    )
+    if callable(registry_cleanup_children):
+        known = {name.casefold() for name in child_names}
+        for retained_name, retained_did in registry_cleanup_children(
+            manager,
+            parent_did=parent_did,
+        ):
+            canonical_name = retained_name.casefold()
+            if canonical_name not in known:
+                child_names.append(retained_name)
+                known.add(canonical_name)
+                child_dids[canonical_name] = retained_did
+    lifecycle = _get_lifecycle(agent, request=request)
+    retained_children = getattr(lifecycle, "get_cleanup_retained_children", None)
+    retained_child_did = getattr(lifecycle, "cleanup_retained_child_did", None)
+    if callable(retained_children):
+        known = {name.casefold() for name in child_names}
+        for retained_name in retained_children(parent_did=parent_did):
+            canonical_name = retained_name.casefold()
+            cleanup_did = (
+                retained_child_did(
+                    parent_did=parent_did,
+                    child_name=retained_name,
+                )
+                if callable(retained_child_did)
+                else None
+            )
+            if canonical_name not in known and isinstance(cleanup_did, str):
+                child_names.append(retained_name)
+                known.add(canonical_name)
+                child_dids[canonical_name] = cleanup_did
+    child_names.sort(key=lambda name: (name.casefold(), name))
 
     children = []
     now = datetime.now(timezone.utc)
@@ -72,7 +134,11 @@ async def get_spawn_children(request: Request):
         child_info = {
             "name": child_name,
             "status": "running" if child_agent is not None else "stopped",
-            "did": child_agent.agent_id if child_agent else "",
+            "did": (
+                child_agent.agent_id
+                if child_agent
+                else child_dids.get(child_name.casefold(), "")
+            ),
             "purpose": mandate.purpose if mandate else "",
             "ttl_seconds": mandate.ttl_seconds if mandate else 0,
             "budget_allocated": float(mandate.budget_allocation) if mandate else 0.0,
@@ -92,7 +158,6 @@ async def get_spawn_children(request: Request):
                 pass
 
         # Try to get budget info from lifecycle tracker
-        lifecycle = _get_lifecycle(agent, request=request)
         if lifecycle is not None:
             tracked = lifecycle._tracked.get(child_name)
             if tracked and tracked.result:
@@ -113,7 +178,9 @@ async def get_spawn_children(request: Request):
         children.append(child_info)
 
     # Build delegation chain tree
-    delegation_chain = _build_delegation_chain(manager, parent_did, agent.agent_id)
+    delegation_chain = await _build_delegation_chain(
+        manager, parent_did, agent.agent_id, relations=relations
+    )
 
     # Build spawn history from lifecycle results
     history = _build_spawn_history(agent, manager, request=request)
@@ -126,39 +193,43 @@ async def get_spawn_children(request: Request):
     }
 
 
-def _build_delegation_chain(manager, parent_did: str, parent_name: str) -> dict:
+async def _build_delegation_chain(
+    manager,
+    parent_did: str,
+    parent_name: str,
+    *,
+    relations: dict[str, tuple[str, str]] | None = None,
+) -> dict:
     """Build a tree structure showing Parent -> Child -> Grandchild relationships."""
-    child_names = manager.get_children(parent_did)
-    children_nodes = []
+    if relations is None:
+        relations = await manager.get_authoritative_spawn_relations()
+    by_parent: dict[str, list[tuple[str, str]]] = {}
+    for child_did, (relation_parent, child_name) in relations.items():
+        by_parent.setdefault(relation_parent, []).append((child_did, child_name))
+    for children in by_parent.values():
+        children.sort(key=lambda item: (item[1].casefold(), item[1], item[0]))
 
-    for child_name in child_names:
-        child_agent = manager.get_agent(child_name)
-        child_did = child_agent.agent_id if child_agent else ""
-        mandate = manager.get_mandate(child_name)
-
-        child_node = {
-            "name": child_name,
-            "did": child_did,
-            "purpose": mandate.purpose if mandate else "",
-            "status": "running" if child_agent is not None else "stopped",
-            "children": [],
-        }
-
-        # Recurse for grandchildren
-        if child_did:
-            grandchildren = manager.get_children(child_did)
-            if grandchildren:
-                child_node["children"] = _build_delegation_chain(
-                    manager, child_did, child_name
-                ).get("children", [])
-
-        children_nodes.append(child_node)
+    def render_children(current_parent: str) -> list[dict]:
+        children_nodes = []
+        for child_did, child_name in by_parent.get(current_parent, ()):
+            child_agent = manager.get_agent(child_name)
+            mandate = manager.get_mandate(child_name)
+            children_nodes.append(
+                {
+                    "name": child_name,
+                    "did": child_did,
+                    "purpose": mandate.purpose if mandate else "",
+                    "status": "running" if child_agent is not None else "stopped",
+                    "children": render_children(child_did),
+                }
+            )
+        return children_nodes
 
     return {
         "name": parent_name,
         "did": parent_did,
         "status": "running",
-        "children": children_nodes,
+        "children": render_children(parent_did),
     }
 
 

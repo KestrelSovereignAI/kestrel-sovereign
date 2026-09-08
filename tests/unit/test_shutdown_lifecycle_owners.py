@@ -783,6 +783,12 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
         def reconcile_spawn_authority_restart_roster(self, config):
             return config
 
+        def set_created_agent_persistence_hook(self, _hook) -> None:
+            return None
+
+        def set_created_agent_registration_removal_hook(self, _hook) -> None:
+            return None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
@@ -3394,7 +3400,10 @@ async def test_shutdown_all_joins_spawn_before_removing_child_or_budget_commit(
         identity=None,
         features={},
         wallet=None,
+        shutdown=AsyncMock(),
     )
+    manager._agents["spawn-fenced-parent"] = parent
+    manager._agent_names[parent.agent_id] = "spawn-fenced-parent"
     budget_entered = asyncio.Event()
     allow_budget = asyncio.Event()
 
@@ -3580,6 +3589,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
+    )
     refund_started = asyncio.Event()
     allow_refund = asyncio.Event()
 
@@ -3587,9 +3601,11 @@ async def test_terminate_child_keeps_tracking_until_quarantined_refund_drains() 
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry
@@ -3632,6 +3648,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
     manager._child_budgets[child_name] = entry
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
+    # This lifecycle-ownership fixture intentionally uses object sentinels,
+    # not signed authority receipts. Keep it focused on quarantine tracking.
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={child.agent_id: (parent_did, child_name)}
+    )
     refund_started = asyncio.Event()
     allow_failure = asyncio.Event()
 
@@ -3639,9 +3660,11 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
         name: str,
         *,
         offboard_runtime: bool = False,
+        _lifecycle_cleanup_expected_agent_id: str | None = None,
     ) -> bool:
         assert offboard_runtime is False
         assert name == child_name
+        assert _lifecycle_cleanup_expected_agent_id == child.agent_id
         assert manager._agents.pop(name) is child
         assert manager._agent_names.pop(child.agent_id) == name
         assert manager._child_budgets.pop(name) is entry

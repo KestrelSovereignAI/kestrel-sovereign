@@ -219,7 +219,16 @@ def _mandate_scope_wire_json(mandate: SpawnMandate) -> str:
     """Return signed fields whose values must survive proposal promotion."""
 
     payload = mandate.to_dict()
-    for field_name in ("child_did", "parent_signature", "created_at"):
+    # These fields are finalized after inception. ``authority_committed``
+    # deliberately transitions True (proposal/default) -> False (signed but
+    # provisional receipt) -> True (governance commit); it is separately bound
+    # by each receipt signature and is not caller-mutable scope.
+    for field_name in (
+        "child_did",
+        "parent_signature",
+        "created_at",
+        "authority_committed",
+    ):
         payload.pop(field_name, None)
     return json.dumps(
         payload,
@@ -319,6 +328,11 @@ class SpawnAuthorityRegistry:
         # yet from a genuinely orphaned denial.  The registry mutation lock
         # alone cannot carry this liveness signal once its write completes.
         self._owned_pending_locks: dict[str, tuple[int, Any, Path]] = {}
+        # Promotion removes the pending record before the later governance CAS.
+        # Keep an equally durable producer lease across that provisional-active
+        # window so a sibling ProcessManager cannot mistake live work for a
+        # crash remnant and retire it during restart reconciliation.
+        self._owned_provisional_locks: dict[str, tuple[int, Any, Path]] = {}
 
     @staticmethod
     def _lock_descriptor(descriptor: int) -> Any:
@@ -422,6 +436,12 @@ class SpawnAuthorityRegistry:
         digest = hashlib.sha256(reservation_id.encode("utf-8")).hexdigest()
         return self.path.parent / f".{self.path.name}.pending-{digest}.lock"
 
+    def _provisional_owner_lock_path(self, child_did: str) -> Path:
+        """Return the producer lease path for one provisional child identity."""
+
+        digest = hashlib.sha256(child_did.encode("utf-8")).hexdigest()
+        return self.path.parent / f".{self.path.name}.provisional-{digest}.lock"
+
     def _acquire_pending_owner_lock(self, reservation_id: str) -> None:
         if reservation_id in self._owned_pending_locks:
             raise RuntimeError("pending spawn authority owner lock is duplicated")
@@ -453,11 +473,44 @@ class SpawnAuthorityRegistry:
         if unlink:
             path.unlink(missing_ok=True)
 
+    def _acquire_provisional_owner_lock(self, child_did: str) -> None:
+        if child_did in self._owned_provisional_locks:
+            raise RuntimeError("provisional spawn authority owner lock is duplicated")
+        path = self._provisional_owner_lock_path(child_did)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            token = self._lock_descriptor(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._owned_provisional_locks[child_did] = (descriptor, token, path)
+
+    def _release_provisional_owner_lock(
+        self,
+        child_did: str,
+        *,
+        unlink: bool,
+    ) -> None:
+        owned = self._owned_provisional_locks.pop(child_did, None)
+        if owned is None:
+            return
+        descriptor, token, path = owned
+        try:
+            self._unlock_descriptor(descriptor, token)
+        finally:
+            os.close(descriptor)
+        if unlink:
+            path.unlink(missing_ok=True)
+
     def close(self) -> None:
-        """Release this process object's pending-reservation liveness locks."""
+        """Release this registry object's producer-liveness locks."""
 
         for reservation_id in tuple(self._owned_pending_locks):
             self._release_pending_owner_lock(reservation_id, unlink=False)
+        for child_did in tuple(self._owned_provisional_locks):
+            self._release_provisional_owner_lock(child_did, unlink=False)
 
     def __del__(self) -> None:  # pragma: no cover - interpreter cleanup timing
         try:
@@ -984,9 +1037,88 @@ class SpawnAuthorityRegistry:
             assert _mandate_wire_json(witness.mandate) == expected_wire
             return witness, True
 
-        promoted = self._mutate_state(apply)  # type: ignore[assignment]
+        # Acquire the next-phase lease before publishing the active record. The
+        # pending lease remains held too, so there is no ownerless instant that
+        # a sibling registry can race during the atomic state replacement.
+        self._acquire_provisional_owner_lock(child_did)
+        try:
+            promoted = self._mutate_state(apply)  # type: ignore[assignment]
+        except BaseException:
+            self._release_provisional_owner_lock(child_did, unlink=True)
+            raise
         self._release_pending_owner_lock(reservation_id, unlink=True)
         return promoted  # type: ignore[return-value]
+
+    def admit_orphaned_provisional_retirements(
+        self,
+        *,
+        child_dids: tuple[str, ...],
+    ) -> tuple[SpawnAuthorityWitness, ...]:
+        """Mark only provisionals whose producer lease is positively ownerless.
+
+        The liveness probe and record transition share the registry mutation
+        lock. A producer therefore cannot commit between the proof that its
+        lease is gone and the transition to terminal restart intent.
+        """
+
+        if not isinstance(child_dids, tuple) or any(
+            not isinstance(child_did, str) or not child_did
+            for child_did in child_dids
+        ):
+            raise TypeError("provisional child DIDs must be a string tuple")
+        selected = frozenset(child_dids)
+        claimed: list[tuple[int, Any, Path]] = []
+
+        def apply(
+            records: dict[str, SpawnAuthorityWitness],
+        ) -> tuple[object, bool]:
+            transitioned: list[SpawnAuthorityWitness] = []
+            for child_did in selected:
+                witness = records.get(child_did)
+                if (
+                    witness is None
+                    or not witness.active
+                    or witness.mandate.authority_committed
+                ):
+                    continue
+                path = self._provisional_owner_lock_path(child_did)
+                try:
+                    descriptor = os.open(
+                        path,
+                        os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                    )
+                except FileNotFoundError:
+                    # New producers create and lock the sidecar before the
+                    # provisional record becomes visible. Its absence therefore
+                    # proves this is a legacy/crashed ownerless record.
+                    ownerless = True
+                except OSError:
+                    # Authority reconciliation fails closed on an ambiguous
+                    # liveness rail: preserve the provisional denial.
+                    continue
+                else:
+                    ownerless, token = self._try_lock_descriptor(descriptor)
+                    if not ownerless:
+                        os.close(descriptor)
+                        continue
+                    claimed.append((descriptor, token, path))
+                if ownerless:
+                    retiring = self._with_state(witness, "retiring")
+                    records[child_did] = retiring
+                    transitioned.append(retiring)
+            return tuple(transitioned), bool(transitioned)
+
+        try:
+            result = self._mutate(apply)
+        finally:
+            for descriptor, token, path in claimed:
+                try:
+                    self._unlock_descriptor(descriptor, token)
+                finally:
+                    os.close(descriptor)
+                path.unlink(missing_ok=True)
+        assert isinstance(result, tuple)
+        return result
 
     def authoritative_for_slot(
         self,
@@ -1117,6 +1249,73 @@ class SpawnAuthorityRegistry:
 
         return self._mutate_state(apply)  # type: ignore[return-value]
 
+    def commit_active_receipt(
+        self,
+        *,
+        child_name: str,
+        child_did: str,
+        expected_mandate: SpawnMandate,
+        committed_mandate: SpawnMandate,
+    ) -> SpawnAuthorityWitness:
+        """Atomically replace one provisional active receipt with its commit.
+
+        The final governance bit and signature are part of the signed mandate,
+        so mutating only the child-owned graph edge would leave the independent
+        host witness describing a different receipt after restart.  Require an
+        exact compare-and-swap against the provisional wire image before
+        publishing the committed copy.
+        """
+
+        if not isinstance(expected_mandate, SpawnMandate) or not isinstance(
+            committed_mandate, SpawnMandate
+        ):
+            raise TypeError("spawn authority commit requires two SpawnMandates")
+        if expected_mandate.authority_committed:
+            raise ValueError("expected spawn authority receipt is already committed")
+        if not committed_mandate.authority_committed:
+            raise ValueError("final spawn authority receipt is not committed")
+        if (
+            expected_mandate.child_did != child_did
+            or committed_mandate.child_did != child_did
+        ):
+            raise ValueError("spawn authority child DID does not match mandate")
+        if (
+            expected_mandate.created_at != committed_mandate.created_at
+            or _mandate_scope_wire_json(expected_mandate)
+            != _mandate_scope_wire_json(committed_mandate)
+        ):
+            raise ValueError("spawn authority scope changed during governance commit")
+        expected_wire = _mandate_wire_json(expected_mandate)
+        committed_wire = _mandate_wire_json(committed_mandate)
+
+        def apply(records: dict[str, SpawnAuthorityWitness]) -> tuple[object, bool]:
+            existing = records.get(child_did)
+            if existing is None or not existing.active:
+                raise RuntimeError("provisional spawn authority witness is unavailable")
+            if (
+                existing.child_name.casefold() != child_name.casefold()
+                or _mandate_wire_json(existing.mandate) != expected_wire
+            ):
+                raise RuntimeError(
+                    "provisional spawn authority witness changed before commit"
+                )
+            committed = SpawnAuthorityWitness(
+                child_name=existing.child_name,
+                child_did=existing.child_did,
+                parent_did=existing.parent_did,
+                mandate=committed_mandate,
+                config=existing.config,
+                proposal_created_at=existing.proposal_created_at,
+                state=existing.state,
+            )
+            assert _mandate_wire_json(committed.mandate) == committed_wire
+            records[child_did] = committed
+            return committed, True
+
+        committed = self._mutate(apply)  # type: ignore[assignment]
+        self._release_provisional_owner_lock(child_did, unlink=True)
+        return committed  # type: ignore[return-value]
+
     def withdraw_active(
         self,
         *,
@@ -1141,6 +1340,7 @@ class SpawnAuthorityRegistry:
             return None, True
 
         self._mutate(apply)
+        self._release_provisional_owner_lock(child_did, unlink=True)
 
     @staticmethod
     def _with_state(
@@ -1271,4 +1471,13 @@ class SpawnAuthorityRegistry:
             records[child_did] = self._with_state(existing, "retired")
             return True, True
 
-        return bool(self._mutate(apply))
+        retired = bool(self._mutate(apply))
+        if retired:
+            # A provisional producer lease prevents another process from
+            # mistaking an in-flight governance commit for an abandoned
+            # receipt.  Once the exact witness is durably terminal there is
+            # no producer work left to protect, and retaining the descriptor
+            # (and its sidecar) would leak one lock per failed spawn until the
+            # whole registry object or process shuts down.
+            self._release_provisional_owner_lock(child_did, unlink=True)
+        return retired
