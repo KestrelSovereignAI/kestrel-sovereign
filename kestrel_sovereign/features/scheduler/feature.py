@@ -85,6 +85,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     validate_schedule_idempotency_base,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.storage.sync.targets import SYNC_TARGET_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,29 @@ _SUPERSEDED_AUTOSEEDS = {
 }
 
 
+def backup_target_failure_code(kind: str) -> str:
+    """The ``backup_snapshot`` reason code naming a failed target of ``kind``.
+
+    ``kind`` is a ``SyncTarget.kind`` token; an empty (undeclared) kind yields
+    the kind-less code, so a third-party target still reports as a failed
+    target rather than as nothing.
+    """
+    token = kind.strip().upper()
+    return f"BACKUP_TARGET_FAILED_{token}" if token else "BACKUP_TARGET_FAILED"
+
+
+#: The closed vocabulary ``_handle_backup_snapshot`` may return. Every failed
+#: pass is one of: every target failed (there is no current snapshot), more
+#: than one but not every target failed (a snapshot exists somewhere), or
+#: exactly one target failed, named by its kind. A code per shipped kind is
+#: declared up front from ``SYNC_TARGET_KINDS``; the signal boundary admits a
+#: code only by membership here, so a kind not listed there falls to the
+#: undeclared-code path and is dropped with a warning naming the task.
+BACKUP_SNAPSHOT_REASON_CODES: frozenset[str] = frozenset(
+    {"BACKUP_ALL_TARGETS_FAILED", "BACKUP_TARGETS_FAILED", "BACKUP_TARGET_FAILED"}
+) | frozenset(backup_target_failure_code(kind) for kind in SYNC_TARGET_KINDS)
+
+
 class SchedulerFeature(Feature):
     """
     Cron/scheduler system for running agent tasks on a schedule.
@@ -148,6 +172,7 @@ class SchedulerFeature(Feature):
     #: not in the core signals module.
     tool_reason_codes = {
         "sleep": frozenset({"SLEEP_FAILED"}) | SLEEP_FAILURE_REASONS,
+        "backup_snapshot": BACKUP_SNAPSHOT_REASON_CODES,
     }
 
     @property
@@ -1358,6 +1383,8 @@ class SchedulerFeature(Feature):
                 target: {
                     "success": result.success,
                     "bytes": result.bytes_synced,
+                    "kind": getattr(result, "kind", "") or "",
+                    "error": getattr(result, "error", None),
                 }
                 for target, result in results.items()
             }
@@ -1368,15 +1395,39 @@ class SchedulerFeature(Feature):
                         "reason": "no sync targets configured",
                     }
                 )
-            success = all(
-                target["success"] is True for target in targets.values()
-            )
+            failed = {
+                name: entry
+                for name, entry in targets.items()
+                if entry["success"] is not True
+            }
+            success = not failed
             payload: dict[str, Any] = {
                 "success": success,
+                # A pass with a failed target still has a snapshot on every
+                # target that succeeded; that is a different condition from
+                # no snapshot at all, and readers of the local artifact should
+                # not have to recompute it from the map (#3189).
+                "outcome": (
+                    "ok" if success
+                    else "failed" if len(failed) == len(targets)
+                    else "partial"
+                ),
                 "targets": targets,
             }
             if not success:
-                payload["error"] = "backup_snapshot_failed"
+                # The error names the failed targets by kind (the bounded part
+                # of their identity); the reason_code carries the same fact
+                # across the signal boundary, where a bare "failed" said
+                # nothing for eighty consecutive runs (#3189).
+                kinds = sorted(entry["kind"] or "undeclared" for entry in failed.values())
+                payload["error"] = "backup_snapshot_failed: " + ", ".join(kinds)
+                if len(failed) == len(targets):
+                    payload["reason_code"] = "BACKUP_ALL_TARGETS_FAILED"
+                elif len(failed) > 1:
+                    payload["reason_code"] = "BACKUP_TARGETS_FAILED"
+                else:
+                    (entry,) = failed.values()
+                    payload["reason_code"] = backup_target_failure_code(entry["kind"])
             return json.dumps(payload, default=str)
         return json.dumps({
             "skipped": True,

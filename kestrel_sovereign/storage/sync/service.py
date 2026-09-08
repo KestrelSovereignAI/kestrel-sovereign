@@ -434,6 +434,10 @@ class SyncService:
                     continue
             try:
                 result = await target.sync_snapshot(self.db_path)
+                # The result is what leaves this loop; the target does not.
+                # Carry the target's bounded kind on it so the scheduled
+                # backup can name which kind of destination failed (#3189).
+                result.kind = target.kind
                 if result.success:
                     successful_snapshots += 1
                     await self._prune_after_success(target, result)
@@ -451,7 +455,8 @@ class SyncService:
                     bytes_synced=0,
                     frames_synced=0,
                     timestamp=datetime.now(timezone.utc),
-                    error=str(e),
+                    error=f"{type(e).__name__}: {e}",
+                    kind=target.kind,
                 )
 
         if self._state:

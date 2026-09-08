@@ -62,6 +62,10 @@ class LighthouseRestClient:
     """Async HTTP client for Lighthouse storage REST API."""
 
     UPLOAD_URL = "https://upload.lighthouse.storage"
+    #: The slowest link an upload budget is sized for. The budget for a
+    #: payload is ``max(timeout, size / this)``, so a 60 s default still
+    #: applies to small requests and a 1.2 GB snapshot gets ~2400 s.
+    UPLOAD_FLOOR_BYTES_PER_SECOND = 512 * 1024
     API_URL = "https://api.lighthouse.storage"
 
     def __init__(
@@ -142,6 +146,26 @@ class LighthouseRestClient:
             return data["data"]
         return data
 
+    def upload_timeout(self, payload_bytes: int) -> "httpx.Timeout":
+        """The request budget for uploading ``payload_bytes``.
+
+        The client's default ``timeout`` is a flat per-operation budget. A
+        multipart POST of an agent snapshot is bounded by the link, not by
+        the server: at ``UPLOAD_FLOOR_BYTES_PER_SECOND`` a 1.2 GB snapshot
+        needs about forty minutes to send, and Lighthouse then hashes the
+        CAR before answering, so the read budget matches the write budget.
+        Under the flat 60 s default every snapshot larger than the link could
+        carry in a minute timed out, and did so for eighteen days (#3189).
+        The connect and pool budgets stay at the default: they are not
+        proportional to the payload.
+        """
+        budget = max(
+            float(self.timeout), payload_bytes / self.UPLOAD_FLOOR_BYTES_PER_SECOND
+        )
+        return httpx.Timeout(
+            connect=self.timeout, read=budget, write=budget, pool=self.timeout
+        )
+
     async def upload_car(
         self,
         car_bytes: bytes,
@@ -175,6 +199,7 @@ class LighthouseRestClient:
             headers=self._auth_headers,
             files=files,
             params={"tag": tag},
+            timeout=self.upload_timeout(len(car_bytes)),
         )
         response.raise_for_status()
 

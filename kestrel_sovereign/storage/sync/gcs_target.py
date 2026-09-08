@@ -54,6 +54,8 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
         self._last_content_hash: Optional[str] = None
         self._bucket = None
 
+    kind = "gcs"
+
     @property
     def name(self) -> str:
         return f"gs://{self.bucket_name}/{self.prefix}{self.agent_id}"

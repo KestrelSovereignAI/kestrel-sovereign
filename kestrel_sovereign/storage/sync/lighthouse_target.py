@@ -72,6 +72,8 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         self._manifest_filename = f".lighthouse_manifest_{self.agent_id}.json"
         self._latest_cid: Optional[str] = None
 
+    kind = "lighthouse"
+
     @property
     def name(self) -> str:
         return f"lighthouse://{self.agent_id}"
@@ -155,14 +157,19 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
         except Exception as e:
-            logger.error(f"Failed to sync to Lighthouse: {e}")
+            # ``str(e)`` is empty for an httpx timeout, and 880 empty
+            # "Failed to sync" lines hid an 18-day outage (#3189): the type
+            # is the diagnosis, so it travels with the message.
+            logger.error(
+                "Failed to sync to Lighthouse: %s: %s", type(e).__name__, e
+            )
             return SyncResult(
                 success=False,
                 target_name=self.name,
                 bytes_synced=0,
                 frames_synced=0,
                 timestamp=timestamp,
-                error=str(e),
+                error=f"{type(e).__name__}: {e}",
             )
 
     async def _upload_manifest(self, client: Any, manifest: Dict[str, Any]) -> None:

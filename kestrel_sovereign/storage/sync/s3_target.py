@@ -56,6 +56,8 @@ class S3Target(SyncTarget):
         self._secret_access_key = secret_access_key
         self._client = None
 
+    kind = "s3"
+
     @property
     def name(self) -> str:
         return f"s3://{self.bucket}/{self.prefix}"

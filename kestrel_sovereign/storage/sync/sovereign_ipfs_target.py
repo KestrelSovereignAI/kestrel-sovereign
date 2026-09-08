@@ -47,6 +47,8 @@ class SovereignIPFSTarget(ManifestManagerMixin, SyncTarget):
         self._manifest_filename = f".sovereign_ipfs_manifest_{self.agent_id}.json"
         self._client = None
 
+    kind = "sovereign_ipfs"
+
     @property
     def name(self) -> str:
         return f"ipfs://{self.agent_id}"

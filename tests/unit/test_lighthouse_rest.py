@@ -294,3 +294,46 @@ class TestLighthouseRestClient:
             result = await client.upload(b"test", "test.bin")
 
         assert result["Hash"] == "QmDirect"
+
+
+# ---------------------------------------------------------------------------
+# #3189: the upload budget grows with the payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_car_budget_is_proportional_to_the_payload(client, mock_response):
+    """A 1.2 GB snapshot cannot cross a link in the flat 60 s default; for
+    eighteen days every Lighthouse upload timed out with an empty message.
+    The read and write budgets are sized by the payload at the floor rate;
+    connect and pool stay at the default."""
+    import httpx
+
+    resp = mock_response(json_data={"data": {"Hash": "QmBig", "Size": "1"}})
+    size = 1_209_462_784
+    payload = bytearray(1)  # never sent: post is a mock
+    with patch.object(client, "_get_client") as mock_get:
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=resp)
+        mock_get.return_value = mock_http
+        with patch("kestrel_sovereign.storage.providers.lighthouse_rest.len", create=True) as fake_len:
+            fake_len.return_value = size
+            await client.upload_car(bytes(payload), tag="t", filename="big.car")
+
+    budget = mock_http.post.await_args.kwargs["timeout"]
+    assert isinstance(budget, httpx.Timeout)
+    expected = size / client.UPLOAD_FLOOR_BYTES_PER_SECOND
+    assert budget.read == pytest.approx(expected) and budget.write == pytest.approx(expected)
+    assert expected > 2000
+    assert budget.connect == client.timeout and budget.pool == client.timeout
+
+
+def test_a_small_upload_keeps_the_default_budget(client):
+    budget = client.upload_timeout(1024)
+    assert budget.read == client.timeout and budget.write == client.timeout
+
+
+def test_the_budget_is_the_larger_of_the_default_and_the_payload_rate(client):
+    at_floor = int(client.timeout * client.UPLOAD_FLOOR_BYTES_PER_SECOND)
+    assert client.upload_timeout(at_floor).write == pytest.approx(client.timeout)
+    assert client.upload_timeout(at_floor * 3).write == pytest.approx(client.timeout * 3)

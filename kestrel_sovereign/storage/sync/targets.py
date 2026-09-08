@@ -87,6 +87,17 @@ def _create_consistent_snapshot(db_path: Path) -> bytes:
                 pass
 
 
+#: The kinds of sync target this package ships. A target's ``kind`` is the
+#: bounded token that may name it across a signal boundary (a target's
+#: ``name`` is a URL that carries bucket and prefix, so it may not). The
+#: scheduler declares one ``backup_snapshot`` reason code per kind listed
+#: here; ``tests/unit/test_backup_snapshot_failed_target.py`` asserts the list
+#: equals the kinds the shipped target classes declare.
+SYNC_TARGET_KINDS: frozenset[str] = frozenset(
+    {"gcs", "s3", "lighthouse", "sovereign_ipfs"}
+)
+
+
 @dataclass
 class SyncResult:
     """Result of a sync operation."""
@@ -97,6 +108,11 @@ class SyncResult:
     timestamp: datetime
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    #: The producing target's ``SyncTarget.kind``. Stamped by the sync service
+    #: when it collects a snapshot pass, so a consumer that only sees results
+    #: (the scheduled backup handler) can still say which kind of target
+    #: failed without the URL-shaped ``target_name``.
+    kind: str = ""
 
 
 class SyncTarget(ABC):
@@ -107,6 +123,14 @@ class SyncTarget(ABC):
     def name(self) -> str:
         """Target name for logging and identification."""
         ...
+
+    #: A short token naming what kind of destination this is (``"gcs"``,
+    #: ``"lighthouse"``); one of ``SYNC_TARGET_KINDS`` for the shipped targets.
+    #: Unlike ``name`` it carries no bucket, prefix or agent id, so it is the
+    #: only part of a target's identity that may cross a bounded boundary such
+    #: as a scheduled task's ``reason_code``. Empty means undeclared: such a
+    #: target is reported as failed without its kind.
+    kind: str = ""
 
     @property
     def trust_tier(self) -> TrustTier:
