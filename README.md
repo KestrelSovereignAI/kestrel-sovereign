@@ -184,9 +184,11 @@ project-free script environment, so scripts cannot inherit Kestrel's installed
 packages. It also requires an OS filesystem sandbox: macOS `sandbox-exec`, or
 Linux `bwrap` (bubblewrap). The sandbox denies every write below host Hold
 custody, including writes issued by native extensions rather than Python file
-APIs. It also denies hard-link aliases on macOS and gives Linux compute a
-private PID/proc namespace so host process paths cannot bypass the read-only
-custody mount. `uv tool install` and the source checkout's `uv sync` satisfy the
+APIs. It also denies hard-link creation on macOS. Linux compute receives a
+read-only view of the host filesystem, with only its freshly allocated
+executor workspace reopened for writes, plus a private PID/proc namespace;
+an external hard-link alias therefore cannot bypass custody by using another
+pathname. `uv tool install` and the source checkout's `uv sync` satisfy the
 virtual environment requirement automatically. For a plain pip installation,
 create and activate a Python virtual environment first. A system or `--user`
 install, a Linux host without bubblewrap, or an unsupported OS can run Kestrel,

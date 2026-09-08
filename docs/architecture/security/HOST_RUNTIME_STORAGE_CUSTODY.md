@@ -116,12 +116,17 @@ The UV executor additionally makes the complete host-control directory
 non-writable at the OS boundary (macOS Seatbelt or Linux bubblewrap). Python API
 patches alone are not a custody boundary because native modules such as
 `sqlite3` can open and mutate files without calling them. Seatbelt denies its
-separate hard-link operation globally; bubblewrap replaces imported host procfs
-with a private proc mount inside a PID namespace. These controls prevent native
-code from creating a writable alias or reaching the parent process's writable
-mount namespace. UV execution therefore fails unavailable when that
-kernel-enforced boundary cannot be established; the Docker executor is the
-fallback.
+separate hard-link operation globally. Bubblewrap imports the host filesystem
+read-only, reopens only the fresh per-execution workspace for writes, and
+replaces imported host procfs with a private proc mount inside a PID namespace.
+The read-only root is load-bearing: remounting only the canonical control
+directory would leave an existing hard-link alias elsewhere writable. These
+controls prevent native code from creating or using a writable alias or reaching
+the parent process's writable mount namespace. UV execution therefore fails
+unavailable when that kernel-enforced boundary cannot be established; the
+Docker executor is the fallback. Docker likewise permits only read-only
+caller-selected bind mounts; its sole writable host bind is an executor-owned
+per-run trash staging directory.
 
 ## Two host databases, two responsibilities
 

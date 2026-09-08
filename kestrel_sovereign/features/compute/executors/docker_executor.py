@@ -220,7 +220,15 @@ class DockerExecutor(BaseExecutor):
         self,
         mounts: Optional[List[Dict[str, str]]],
     ) -> None:
-        """Reject writable bind paths that can mutate host-owned Hold state."""
+        """Keep caller-selected host paths read-only inside compute containers.
+
+        Path containment cannot prove that a writable source is independent of
+        Hold custody: a file anywhere below it may be a hard-link alias of a
+        protected inode, and another same-user process can add such an alias
+        after a recursive preflight scan.  The executor-owned per-run trash
+        staging directory is the sole writable host bind and is assembled
+        internally, so arbitrary additional mounts have no safe writable mode.
+        """
 
         for mount in mounts or []:
             src = mount.get("src")
@@ -233,12 +241,11 @@ class DockerExecutor(BaseExecutor):
                 raise ExecutionError(
                     f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
                 )
-            if not mount.get("ro", True) and self._policy.touches_host_hold_custody(
-                src
-            ):
+            if not mount.get("ro", True):
                 raise ExecutionEnvironmentError(
-                    "Refusing writable Docker mount that overlaps host Hold "
-                    f"custody: {src}"
+                    "Refusing writable Docker mount because an arbitrary host "
+                    "path cannot prove separation from host Hold custody; "
+                    f"additional mounts must be read-only: {src}"
                 )
 
     async def _execute_script(

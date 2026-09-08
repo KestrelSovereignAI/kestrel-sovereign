@@ -239,7 +239,7 @@ def _make_executor(monkeypatch: pytest.MonkeyPatch, name: str, max_bytes: int = 
         monkeypatch.setattr(
             executor,
             "_get_filesystem_sandbox_prefix",
-            lambda: ["/fake/filesystem-sandbox", "--"],
+            lambda _writable_workspace=None: ["/fake/filesystem-sandbox", "--"],
         )
         return executor
     if name == "docker":
@@ -436,6 +436,12 @@ def test_uv_linux_sandbox_remounts_host_custody_read_only(
 ) -> None:
     custody = tmp_path / "host-data"
     custody.mkdir()
+    database = custody / "host-features.db"
+    database.write_bytes(b"intact")
+    external_alias = tmp_path / "outside-custody-alias"
+    os.link(database, external_alias)
+    workspace = tmp_path / "kestrel_compute_fresh"
+    workspace.mkdir()
     monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
     monkeypatch.setattr(uv_executor_module.sys, "platform", "linux")
     monkeypatch.setattr(
@@ -444,7 +450,8 @@ def test_uv_linux_sandbox_remounts_host_custody_read_only(
         lambda command: "/usr/bin/bwrap" if command == "bwrap" else None,
     )
 
-    assert UvExecutor()._get_filesystem_sandbox_prefix() == [
+    assert database.stat().st_ino == external_alias.stat().st_ino
+    assert UvExecutor()._get_filesystem_sandbox_prefix(str(workspace)) == [
         "/usr/bin/bwrap",
         "--die-with-parent",
         "--new-session",
@@ -452,11 +459,14 @@ def test_uv_linux_sandbox_remounts_host_custody_read_only(
         "--unshare-pid",
         "--cap-drop",
         "ALL",
-        "--bind",
+        "--ro-bind",
         "/",
         "/",
         "--proc",
         "/proc",
+        "--bind",
+        str(workspace.resolve()),
+        str(workspace.resolve()),
         "--ro-bind",
         str(custody.resolve()),
         str(custody.resolve()),
@@ -534,6 +544,11 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     process = _SuccessfulProcess(b"ok", b"")
     command: tuple[object, ...] = ()
     subprocess_options: dict[str, object] = {}
+    sandbox_workspaces: list[Optional[str]] = []
+
+    def sandbox_prefix(writable_workspace: Optional[str] = None) -> list[str]:
+        sandbox_workspaces.append(writable_workspace)
+        return ["/fake/filesystem-sandbox", "--"]
 
     async def create_subprocess(*args: object, **kwargs: object):
         nonlocal command
@@ -542,6 +557,7 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(executor, "_get_filesystem_sandbox_prefix", sandbox_prefix)
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/host/project/.venv")
     monkeypatch.setenv("UV_INDEX_URL", "https://host-index.invalid/simple")
     script = _script(
@@ -555,6 +571,7 @@ async def test_uv_command_is_isolated_project_free_and_only_adds_declared_requir
     record = await executor.execute(script, working_dir=str(tmp_path / "nested cwd"))
 
     script_path = str(created[0] / "script.py")
+    assert sandbox_workspaces == [str(created[0])]
     assert command == (
         "/fake/filesystem-sandbox",
         "--",
@@ -697,6 +714,46 @@ async def test_docker_rejects_writable_alias_of_host_hold_custody_before_launch(
             ],
         )
 
+    assert launched is False
+
+
+@pytest.mark.asyncio
+async def test_docker_rejects_writable_mount_with_hard_link_to_hold_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custody = tmp_path / "host-data"
+    custody.mkdir()
+    database = custody / "host-features.db"
+    database.write_bytes(b"intact")
+    mount_source = tmp_path / "additional-mount"
+    mount_source.mkdir()
+    alias = mount_source / "unrelated-name"
+    os.link(database, alias)
+    monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(database))
+    executor = DockerExecutor()
+    monkeypatch.setattr(executor, "_get_docker_path", lambda: "/fake/docker")
+    launched = False
+
+    async def reject_launch(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        raise AssertionError("unsafe Docker command reached process launch")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_launch)
+
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="writable Docker mount.*host Hold custody.*read-only",
+    ):
+        await executor.execute(
+            _script(),
+            mounts=[
+                {"src": str(mount_source), "dst": "/data", "ro": False}
+            ],
+        )
+
+    assert database.stat().st_ino == alias.stat().st_ino
     assert launched is False
 
 

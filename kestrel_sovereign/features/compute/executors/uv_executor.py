@@ -189,13 +189,19 @@ class UvExecutor(BaseExecutor):
             "UvExecutor could not resolve an executable base Python interpreter"
         )
 
-    def _get_filesystem_sandbox_prefix(self) -> list[str]:
+    def _get_filesystem_sandbox_prefix(
+        self,
+        writable_workspace: Optional[str] = None,
+    ) -> list[str]:
         """Build a fail-closed OS boundary around host Hold custody.
 
         Python-level ``open`` patches cannot mediate C extensions such as
         ``sqlite3`` or a dependency that issues raw syscalls. The UV executor
         therefore runs only when the platform can make the entire host-control
-        directory non-writable for the child process.
+        directory non-writable for the child process. Linux starts from a
+        read-only view of the complete host and reopens only the freshly
+        allocated executor workspace for writes, so an external hard-link
+        alias cannot bypass the protected directory's canonical path.
         """
 
         protected = self._policy.host_control_data_path.resolve(strict=False)
@@ -234,10 +240,25 @@ class UvExecutor(BaseExecutor):
                     "UvExecutor requires bubblewrap on Linux to protect host "
                     "Hold custody; install bwrap or use the Docker executor"
                 )
+            workspace: Optional[Path] = None
+            if writable_workspace is not None:
+                workspace = Path(writable_workspace).resolve(strict=True)
+                if not workspace.is_dir():
+                    raise ExecutionEnvironmentError(
+                        "UvExecutor writable workspace must be an existing directory"
+                    )
+                if self._policy.touches_host_hold_custody(workspace):
+                    raise ExecutionEnvironmentError(
+                        "UvExecutor writable workspace overlaps host Hold custody"
+                    )
+
             # Explicitly discard capabilities even when Kestrel itself runs as
             # UID 0 in a service container; otherwise CAP_SYS_ADMIN could
-            # remount a read-only bind inside the new namespace.
-            return [
+            # remount a read-only bind inside the new namespace. The root must
+            # be read-only, not merely the canonical custody directory: an
+            # existing hard-link alias has a different pathname but the same
+            # inode. Only this run's newly-created workspace is reopened.
+            prefix = [
                 bubblewrap,
                 "--die-with-parent",
                 "--new-session",
@@ -249,16 +270,29 @@ class UvExecutor(BaseExecutor):
                 "--unshare-pid",
                 "--cap-drop",
                 "ALL",
-                "--bind",
+                "--ro-bind",
                 "/",
                 "/",
                 "--proc",
                 "/proc",
-                "--ro-bind",
-                str(protected),
-                str(protected),
-                "--",
             ]
+            if workspace is not None:
+                prefix.extend(
+                    [
+                        "--bind",
+                        str(workspace),
+                        str(workspace),
+                    ]
+                )
+            prefix.extend(
+                [
+                    "--ro-bind",
+                    str(protected),
+                    str(protected),
+                    "--",
+                ]
+            )
+            return prefix
 
         raise ExecutionEnvironmentError(
             "UvExecutor has no verified host Hold filesystem sandbox on this "
@@ -383,7 +417,10 @@ class UvExecutor(BaseExecutor):
         for requirement in script.requirements:
             uv_cmd.extend(["--with", requirement])
         uv_cmd.append(str(script_path))
-        cmd = [*self._get_filesystem_sandbox_prefix(), *uv_cmd]
+        cmd = [
+            *self._get_filesystem_sandbox_prefix(context.workdir),
+            *uv_cmd,
+        ]
 
         logger.info("Executing script %s... with uv", script.id[:8])
         logger.debug("Command: %s", " ".join(cmd))
