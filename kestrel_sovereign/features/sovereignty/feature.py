@@ -8,6 +8,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
 from decimal import Decimal
 from datetime import datetime
+from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import GraphNode
 
 logger = logging.getLogger(__name__)
@@ -214,7 +215,8 @@ class SovereigntyFeature(Feature):
             "encrypted": result.encrypted,
             "encryption_key_hash": result.encryption_key_hash,
             "size_bytes": getattr(result, "size_bytes", 0) or len(backup_blob),
-            "created_at": datetime.now().isoformat(),
+            # Graph created_at is a UTC ISO-8601 contract (#3256).
+            "created_at": utc_now_iso(),
             "node_id": node_id,
         }
         if audit_anchors is not None:
