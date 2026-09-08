@@ -23,8 +23,8 @@ _AUTHORITY_AUDIT_PATHS = tuple(
     sorted((REPO_ROOT / "kestrel_sovereign").rglob("*.py"))
 )
 _AUTHORITY_AUDIT_CHUNKS = tuple(
-    _AUTHORITY_AUDIT_PATHS[index : index + 144]
-    for index in range(0, len(_AUTHORITY_AUDIT_PATHS), 144)
+    _AUTHORITY_AUDIT_PATHS[index : index + 48]
+    for index in range(0, len(_AUTHORITY_AUDIT_PATHS), 48)
 )
 CONTROL_NAME_TERMS = (
     "agent",
@@ -808,6 +808,11 @@ class _StaticBindingFlow:
             direct = self.direct_resolver(value)
         if direct is not None:
             return direct
+        if isinstance(value, ast.NamedExpr):
+            return self.resolve(
+                value.target,
+                supplemental_resolver,
+            ) or self.resolve(value.value, supplemental_resolver)
         if isinstance(value, ast.Name):
             return self.bindings.get(value.id)
         if isinstance(value, ast.IfExp):
@@ -3059,6 +3064,12 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+            # The callable expression is evaluated before the arguments and
+            # may itself bind the registry or one of its publish methods.
+            self.flows[-1].replay_expression_bindings(
+                node.func,
+                self._bound_publish_method,
+            )
             setattr_value: ast.AST | None = None
             if (
                 _call_name(node) == "setattr"
@@ -10864,6 +10875,29 @@ _CYCLE_BOUNDED_UNIVERSAL_CALLS = {
     "stop_peer",
 }
 
+_CYCLE_BOUNDED_UNIVERSAL_MODULE = (
+    REPO_ROOT / "kestrel_sovereign/features/peers/feature.py"
+).resolve()
+
+
+def _resolved_cycle_bounded_helpers(
+    tree: ast.AST,
+    source_path: Path | None,
+) -> set[str]:
+    """Name universal rails only when their defining module is verified."""
+
+    if (
+        source_path is None
+        or source_path.resolve() != _CYCLE_BOUNDED_UNIVERSAL_MODULE
+    ):
+        return set()
+    return {
+        node.name.casefold()
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.casefold() in _CYCLE_BOUNDED_UNIVERSAL_CALLS
+    }
+
 
 def _callable_semantics(node: ast.AST) -> frozenset[str]:
     """Return semantic effects attached by the source-order callable flow."""
@@ -10924,7 +10958,14 @@ class _CallableSemanticFlow(_StaticBindingFlow):
         classes: dict[str, _StaticBinding],
         bindings: dict[str, _StaticBinding] | None = None,
     ) -> None:
-        super().__init__(lambda _node: None, _merge_semantic_bindings, bindings)
+        super().__init__(
+            lambda _node: None,
+            _merge_semantic_bindings,
+            {
+                name.casefold(): binding
+                for name, binding in (bindings or {}).items()
+            },
+        )
         self.declarations = declarations
         self.classes = classes
 
@@ -10995,6 +11036,45 @@ class _CallableSemanticFlow(_StaticBindingFlow):
         )
         if binding is not None:
             self.bindings[name] = binding
+
+    def assign(
+        self,
+        targets: list[ast.AST],
+        value: ast.AST | None,
+        supplemental_resolver: Callable[
+            [ast.AST], _StaticBinding | None
+        ]
+        | None = None,
+    ) -> None:
+        """Replay bindings in the same normalized namespace as ``resolve``."""
+
+        assigned = (
+            self.assignment_bindings(
+                targets,
+                value,
+                supplemental_resolver,
+            )
+            if value is not None
+            else {}
+        )
+        rebound = {
+            name.casefold()
+            for target in targets
+            for name in _assignment_target_names(target)
+        }
+        for name in rebound:
+            self.bindings.pop(name, None)
+        self.bindings.update(
+            {name.casefold(): binding for name, binding in assigned.items()}
+        )
+
+    def disturbed_fork(self, statement: ast.stmt) -> _CallableSemanticFlow:
+        """Invalidate branch-local names in the normalized namespace."""
+
+        branch = self.fork()
+        for name in _compound_binding_names(statement, set()):
+            branch.bindings.pop(name.casefold(), None)
+        return branch
 
     def _annotate_expression(self, expression: ast.AST) -> None:
         flow = self
@@ -11135,6 +11215,215 @@ def _callable_class_semantics(
     return summarized
 
 
+@lru_cache(maxsize=None)
+def _direct_repository_callable_class_semantics(
+    source_path: Path,
+) -> tuple[tuple[str, frozenset[str]], ...]:
+    """Summarize classes defined in one module before following re-exports."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    call_methods = {
+        statement
+        for class_node in ast.walk(tree)
+        if isinstance(class_node, ast.ClassDef)
+        for statement in class_node.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and statement.name == "__call__"
+    }
+    if not call_methods:
+        return ()
+    calls = [
+        call
+        for method in call_methods
+        for call in _lexical_scope_calls(method)
+    ]
+    module_controls = _module_imported_control_aliases(
+        tree,
+        source_path,
+        calls=calls,
+    )
+    function_controls = _function_control_import_aliases(
+        tree,
+        functions,
+        module_controls,
+        source_path,
+        eligible_functions=call_methods,
+    )
+    control_helpers = _local_control_helpers(
+        functions,
+        module_controls,
+        function_controls,
+    )
+    imported_provenance = _module_imported_provenance_return_helper_aliases(
+        tree,
+        source_path,
+        calls=calls,
+    )
+    function_provenance = _function_provenance_helper_import_aliases(
+        tree,
+        functions,
+        imported_provenance,
+        source_path,
+        eligible_functions=call_methods,
+    )
+    module_provenance = (
+        _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_accessor_aliases(tree)
+    )
+    summarized = _callable_class_semantics(
+        tree,
+        set(imported_provenance),
+        control_helpers,
+        module_controls,
+        function_controls,
+        {},
+        module_provenance,
+        {},
+        function_provenance,
+    )
+    return tuple(sorted(summarized.items()))
+
+
+def _repository_callable_class_semantics(
+    source_path: Path,
+    requested_names: set[str],
+    seen: frozenset[tuple[Path, str]] = frozenset(),
+) -> dict[str, frozenset[str]]:
+    """Resolve callable-class effects through repository re-export edges."""
+
+    source_path = source_path.resolve()
+    requested = {
+        name.casefold()
+        for name in requested_names
+        if (source_path, name.casefold()) not in seen
+    }
+    if not requested:
+        return {}
+    direct = dict(_direct_repository_callable_class_semantics(source_path))
+    resolved = {
+        name: direct[name] for name in requested.intersection(direct)
+    }
+    active = seen | {
+        (source_path, name) for name in requested - resolved.keys()
+    }
+    for local_name, imported_path, remote_name in _repository_reexport_bindings(
+        source_path,
+        requested - resolved.keys(),
+    ):
+        remote = _repository_callable_class_semantics(
+            imported_path,
+            {remote_name},
+            active,
+        )
+        if remote_name in remote:
+            resolved[local_name] = remote[remote_name]
+    return resolved
+
+
+def _scope_imported_callable_class_semantics(
+    scope: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef,
+    source_path: Path | None,
+) -> dict[str, frozenset[str]]:
+    """Bind invoked imported classes to their summarized ``__call__`` effects."""
+
+    if source_path is None:
+        return {}
+    source_path = source_path.resolve()
+    visible_calls = _lexical_scope_calls(scope)
+    called_names = {_call_name(call).casefold() for call in visible_calls}
+    imported_classes: dict[str, frozenset[str]] = {}
+    for node in _lexical_scope_imports(scope):
+        if isinstance(node, ast.ImportFrom):
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                node.module,
+                node.level,
+            )
+            if imported_path is None:
+                continue
+            bindings = {
+                (imported.asname or imported.name).casefold(): (
+                    imported.name.casefold()
+                )
+                for imported in node.names
+                if imported.name != "*"
+                and (imported.asname or imported.name).casefold()
+                in called_names
+            }
+            star_names = called_names if any(
+                imported.name == "*" for imported in node.names
+            ) else set()
+            remote = _repository_callable_class_semantics(
+                imported_path,
+                set(bindings.values()) | star_names,
+            )
+            imported_classes.update(
+                {
+                    local_name: remote[remote_name]
+                    for local_name, remote_name in bindings.items()
+                    if remote_name in remote
+                }
+            )
+            imported_classes.update(
+                {
+                    name: remote[name]
+                    for name in star_names.intersection(remote)
+                }
+            )
+            continue
+        for imported in node.names:
+            imported_path = _resolved_repository_import_path(
+                source_path,
+                imported.name,
+            )
+            if imported_path is None:
+                continue
+            qualifier = (imported.asname or imported.name).casefold()
+            member_calls = _module_attribute_call_names(
+                visible_calls,
+                qualifier,
+                scope if isinstance(scope, ast.Module) else None,
+            )
+            remote = _repository_callable_class_semantics(
+                imported_path,
+                member_calls,
+            )
+            imported_classes.update(
+                {
+                    f"{qualifier}.{name}": semantics
+                    for name, semantics in remote.items()
+                }
+            )
+    return imported_classes
+
+
+def _function_imported_callable_class_semantics(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    source_path: Path | None,
+) -> dict[
+    ast.FunctionDef | ast.AsyncFunctionDef,
+    dict[str, frozenset[str]],
+]:
+    """Resolve callable-class imports visible at every function scope."""
+
+    # Enclosing/module bindings arrive through the ordinary callable flow.
+    # Seeding them again as classes would overwrite an already-constructed
+    # instance with its constructor semantics.
+    return {
+        function: _scope_imported_callable_class_semantics(
+            function,
+            source_path,
+        )
+        for function in functions
+    }
+
+
 def _annotate_static_callable_semantics(
     tree: ast.AST,
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
@@ -11146,6 +11435,11 @@ def _annotate_static_callable_semantics(
     control_helpers: set[str],
     control_return_helpers: set[str],
     callable_classes: dict[str, frozenset[str]],
+    imported_callable_classes: dict[str, frozenset[str]],
+    function_imported_callable_classes: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef,
+        dict[str, frozenset[str]],
+    ],
     imported_provenance_helpers: set[str],
     module_control_aliases: set[str],
     function_imported_provenance_helpers: dict[
@@ -11157,6 +11451,7 @@ def _annotate_static_callable_semantics(
     function_accessor_aliases: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ],
+    cycle_bounded_helpers: set[str],
 ) -> None:
     """Annotate invocations after resolving aliases and callable instances."""
 
@@ -11165,7 +11460,7 @@ def _annotate_static_callable_semantics(
         declaration_semantics.setdefault(name, set()).add(_CALLABLE_PROVENANCE)
     for name in control_helpers:
         declaration_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
-        if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
+        if name in cycle_bounded_helpers:
             declaration_semantics[name].add(_CALLABLE_CYCLE_BOUNDED)
     declarations = {
         name: _semantic_binding(semantics, _CALLABLE_VALUE)
@@ -11181,6 +11476,10 @@ def _annotate_static_callable_semantics(
     }
 
     module_bindings: dict[str, _StaticBinding] = {}
+    module_bindings.update({
+        name: _semantic_binding(semantics, _CALLABLE_CLASS)
+        for name, semantics in imported_callable_classes.items()
+    })
     for name in imported_provenance_helpers:
         module_bindings[name] = _semantic_binding(
             {_CALLABLE_PROVENANCE}, _CALLABLE_VALUE
@@ -11191,8 +11490,6 @@ def _annotate_static_callable_semantics(
             _semantic_binding_flags(existing) if existing is not None else set()
         )
         semantics.add(_CALLABLE_CONTROL)
-        if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
-            semantics.add(_CALLABLE_CYCLE_BOUNDED)
         module_bindings[name] = _semantic_binding(
             semantics, _CALLABLE_VALUE
         )
@@ -11217,6 +11514,15 @@ def _annotate_static_callable_semantics(
             analyze(parent) if parent is not None else module_flow.bindings
         )
         bindings = dict(inherited)
+        for name in cycle_bounded_helpers:
+            if name in declarations:
+                bindings[name] = declarations[name]
+        bindings.update({
+            name: _semantic_binding(semantics, _CALLABLE_CLASS)
+            for name, semantics in function_imported_callable_classes[
+                function
+            ].items()
+        })
         local_semantics: dict[str, set[str]] = {}
         for name in (
             function_imported_provenance_helpers.get(function, set())
@@ -11225,8 +11531,6 @@ def _annotate_static_callable_semantics(
             local_semantics.setdefault(name, set()).add(_CALLABLE_PROVENANCE)
         for name in function_control_imports.get(function, set()):
             local_semantics.setdefault(name, set()).add(_CALLABLE_CONTROL)
-            if name in _CYCLE_BOUNDED_UNIVERSAL_CALLS:
-                local_semantics[name].add(_CALLABLE_CYCLE_BOUNDED)
         for name, semantics in local_semantics.items():
             bindings[name] = _semantic_binding(semantics, _CALLABLE_VALUE)
         parameters = {
@@ -11773,10 +12077,7 @@ def _causation_membership_polarity(
 
 
 def _is_cycle_bounded_universal_call(call: ast.Call) -> bool:
-    return (
-        _call_name(call).casefold() in _CYCLE_BOUNDED_UNIVERSAL_CALLS
-        or _CALLABLE_CYCLE_BOUNDED in _callable_semantics(call.func)
-    )
+    return _CALLABLE_CYCLE_BOUNDED in _callable_semantics(call.func)
 
 
 def _contains_only_cycle_bounded_controls(
@@ -13812,6 +14113,39 @@ def _executable_body_functions(
     return scopes
 
 
+def _permission_mutation_uses_provenance(
+    targets: list[ast.AST],
+    values: list[ast.AST],
+    provenance_aliases: set[str],
+    provenance_return_helpers: set[str],
+) -> bool:
+    """Whether provenance selects a permission write's subject or value."""
+
+    if not any(
+        _is_permission_name(token)
+        for target in targets
+        for token in _identifier_tokens(target)
+    ):
+        return False
+    target_selectors: list[ast.AST] = []
+    for target in targets:
+        if isinstance(target, ast.Subscript):
+            target_selectors.append(target.slice)
+            if not isinstance(target.value, ast.Name):
+                target_selectors.append(target.value)
+        elif isinstance(target, ast.Attribute):
+            target_selectors.append(target.value)
+    candidates = [*values, *target_selectors]
+    return any(
+        _has_provenance_value(
+            candidate,
+            provenance_aliases,
+            provenance_return_helpers,
+        )
+        for candidate in candidates
+    )
+
+
 def _authority_provenance_lines(
     tree: ast.AST,
     source_path: Path | None = None,
@@ -14071,7 +14405,18 @@ def _authority_provenance_lines(
             for function, aliases in class_provenance_aliases.items()
         }
 
-        callable_classes = _callable_class_semantics(
+        imported_callable_classes = _scope_imported_callable_class_semantics(
+            tree,
+            source_path,
+        )
+        function_imported_callable_classes = (
+            _function_imported_callable_class_semantics(
+                functions,
+                source_path,
+            )
+        )
+        callable_classes = dict(imported_callable_classes)
+        callable_classes.update(_callable_class_semantics(
             tree,
             provenance_return_helpers,
             control_helpers,
@@ -14081,7 +14426,7 @@ def _authority_provenance_lines(
             module_provenance_aliases,
             class_provenance_aliases,
             function_imported_provenance_helpers,
-        )
+        ))
         _annotate_static_callable_semantics(
             tree,
             functions,
@@ -14090,11 +14435,14 @@ def _authority_provenance_lines(
             control_helpers,
             control_return_helpers,
             callable_classes,
+            imported_callable_classes,
+            function_imported_callable_classes,
             imported_provenance_helpers,
             module_control_aliases,
             function_imported_provenance_helpers,
             function_control_imports,
             function_accessor_aliases,
+            _resolved_cycle_bounded_helpers(tree, source_path),
         )
         _cached_contains_cross_agent_control_call.cache_clear()
 
@@ -14314,11 +14662,11 @@ def _authority_provenance_lines(
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if is_permission_call and any(
                     _has_provenance_value(
-                        argument,
+                        candidate,
                         provenance_aliases,
                         decision_provenance_helpers,
                     )
-                    for argument in arguments
+                    for candidate in [node.func, *arguments]
                 ):
                     lines.add(node.lineno)
                 is_control_call = _is_cross_agent_control_call(
@@ -14378,18 +14726,11 @@ def _authority_provenance_lines(
                 assignment_targets = [node.target]
                 assignment_value = node.value
             if assignment_value is not None:
-                target_tokens = {
-                    token
-                    for target in assignment_targets
-                    for token in _identifier_tokens(target)
-                }
-                if (
-                    any(_is_permission_name(token) for token in target_tokens)
-                    and _has_provenance_value(
-                        assignment_value,
-                        provenance_aliases,
-                        decision_provenance_helpers,
-                    )
+                if _permission_mutation_uses_provenance(
+                    assignment_targets,
+                    [assignment_value],
+                    provenance_aliases,
+                    decision_provenance_helpers,
                 ):
                     lines.add(node.lineno)
                 if any(
@@ -14408,28 +14749,48 @@ def _authority_provenance_lines(
                 ):
                     lines.add(node.lineno)
             if isinstance(node, ast.AugAssign):
-                if _is_cross_agent_state_mutation_target(
-                    node.target,
-                    state_object_aliases,
-                ) and any(
-                    _has_provenance_value(
-                        candidate,
+                if (
+                    isinstance(node.target, (ast.Attribute, ast.Subscript))
+                    and _permission_mutation_uses_provenance(
+                        [node.target],
+                        [],
                         provenance_aliases,
                         decision_provenance_helpers,
                     )
-                    for candidate in (node.target, node.value)
+                ) or (
+                    _is_cross_agent_state_mutation_target(
+                        node.target,
+                        state_object_aliases,
+                    )
+                    and any(
+                        _has_provenance_value(
+                            candidate,
+                            provenance_aliases,
+                            decision_provenance_helpers,
+                        )
+                        for candidate in (node.target, node.value)
+                    )
                 ):
                     lines.add(node.lineno)
             if isinstance(node, ast.Delete):
-                if any(
+                structured_targets = [
+                    target
+                    for target in node.targets
+                    if isinstance(target, (ast.Attribute, ast.Subscript))
+                ]
+                if _permission_mutation_uses_provenance(
+                    structured_targets,
+                    [],
+                    provenance_aliases,
+                    decision_provenance_helpers,
+                ) or any(
                     _is_cross_agent_state_mutation_target(
                         target,
                         state_object_aliases,
                     )
+                    and isinstance(target, (ast.Attribute, ast.Subscript))
                     and _has_provenance_value(
-                        target,
-                        provenance_aliases,
-                        decision_provenance_helpers,
+                        target, provenance_aliases, decision_provenance_helpers
                     )
                     for target in node.targets
                 ):
@@ -14607,6 +14968,40 @@ def _authority_provenance_lines(
 
 
 @lru_cache(maxsize=None)
+def _imported_callable_classes_expose_provenance(
+    source_path: Path,
+) -> bool:
+    """Whether an invoked imported ``__call__`` can return provenance."""
+
+    source_path = source_path.resolve()
+    tree = _parsed_module(source_path)
+    module_classes = _scope_imported_callable_class_semantics(
+        tree,
+        source_path,
+    )
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    function_classes = _function_imported_callable_class_semantics(
+        functions,
+        source_path,
+    )
+    return any(
+        _CALLABLE_PROVENANCE in semantics
+        for semantics in [
+            *module_classes.values(),
+            *(
+                semantics
+                for classes in function_classes.values()
+                for semantics in classes.values()
+            ),
+        ]
+    )
+
+
+@lru_cache(maxsize=None)
 def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
     """Reuse one module's parsed tree and complete authority summary."""
 
@@ -14618,7 +15013,9 @@ def _cached_authority_provenance_lines(source_path: Path) -> frozenset[int]:
         source_path
     ) and not _source_references_repository_reexport(
         source_path
-    ) and not _function_local_imports_expose_provenance(source_path):
+    ) and not _function_local_imports_expose_provenance(
+        source_path
+    ) and not _imported_callable_classes_expose_provenance(source_path):
         return frozenset()
     tree = _parsed_module(source_path)
     return frozenset(
@@ -17377,6 +17774,165 @@ def test_control_semantics_survive_callable_instance_construction() -> None:
     assert _authority_provenance_lines(tree) == {guard.lineno}
 
 
+def test_callable_semantics_preserve_constant_style_aliases() -> None:
+    """Python's case-sensitive aliases must retain summarized effects."""
+
+    tree = ast.parse(
+        "def derive(request):\n"
+        "    return request.causation_chain\n\n"
+        "def apply(target):\n"
+        "    target.shutdown()\n\n"
+        "HANDLER = derive\n"
+        "CONTROL = apply\n\n"
+        "def dispatch(request, first, second):\n"
+        "    if HANDLER(request):\n"
+        "        terminate_child(first)\n"
+        "    if request.causation_chain:\n"
+        "        CONTROL(second)\n"
+    )
+    guards = {
+        node.lineno for node in ast.walk(tree) if isinstance(node, ast.If)
+    }
+
+    assert _authority_provenance_lines(tree) == guards
+
+
+@pytest.mark.parametrize("callable_kind", ("control", "provenance"))
+@pytest.mark.parametrize("import_scope", ("module", "function"))
+def test_provenance_scanner_follows_imported_callable_classes(
+    tmp_path: Path,
+    callable_kind: str,
+    import_scope: str,
+) -> None:
+    """An imported class instance keeps the semantics of ``__call__``."""
+
+    helper_path = tmp_path / "authority.py"
+    if callable_kind == "control":
+        helper_path.write_text(
+            "class Provider:\n"
+            "    def __call__(self, target):\n"
+            "        target.shutdown()\n",
+            encoding="utf-8",
+        )
+        guarded_expression = "request.causation_chain"
+        guarded_action = "provider(target)"
+    else:
+        helper_path.write_text(
+            "class Provider:\n"
+            "    def __call__(self, request):\n"
+            "        return request.causation_chain\n",
+            encoding="utf-8",
+        )
+        guarded_expression = "provider(request)"
+        guarded_action = "target.shutdown()"
+    source_path = tmp_path / "dispatch.py"
+    source = (
+        (
+            "from .authority import Provider\n"
+            "provider = Provider()\n\n"
+            "def dispatch(request, target):\n"
+        )
+        if import_scope == "module"
+        else (
+            "def dispatch(request, target):\n"
+            "    from .authority import Provider\n"
+            "    provider = Provider()\n"
+        )
+    ) + (
+        f"    if {guarded_expression}:\n"
+        f"        {guarded_action}\n"
+    )
+    source_path.write_text(source, encoding="utf-8")
+    guard = next(
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.If)
+    )
+
+    assert _cached_authority_provenance_lines(source_path) == frozenset({guard.lineno})
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "permissions[request.causation_chain[-1].agent_id] = True",
+        "permissions[request.causation_chain[-1].agent_id] |= {'stop'}",
+        "del permissions[request.causation_chain[-1].agent_id]",
+    ),
+)
+def test_permission_mutation_targets_are_provenance_inputs(
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "def configure(request, permissions):\n"
+        f"    {mutation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+def test_permission_callable_selector_is_a_provenance_input() -> None:
+    tree = ast.parse(
+        "def dispatch(request, grantors, target):\n"
+        "    grantors[request.causation_chain[-1].agent_id](target)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+def test_cycle_exemption_requires_resolved_universal_rail_semantics() -> None:
+    """A lookalike helper name is not evidence of a bounded signal rail."""
+
+    tree = ast.parse(
+        "def stop_peer(subject):\n"
+        "    subject.shutdown()\n\n"
+        "def dispatch(request, target):\n"
+        "    if target not in request.causation_chain:\n"
+        "        stop_peer(target)\n"
+    )
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+    verified_rail = ast.parse(
+        "class PeersFeature:\n"
+        "    def send_a2a_message(self, subject):\n"
+        "        subject.shutdown()\n\n"
+        "    def dispatch(self, request, target):\n"
+        "        if target not in request.causation_chain:\n"
+        "            self.send_a2a_message(target)\n"
+    )
+    assert _authority_provenance_lines(
+        verified_rail,
+        _CYCLE_BOUNDED_UNIVERSAL_MODULE,
+    ) == set()
+
+
+@pytest.mark.parametrize(
+    "publication",
+    (
+        "(publish := self._direct_tools.update)(tools)",
+        "(registry := self._direct_tools).update(tools)",
+    ),
+)
+def test_dynamic_tool_registry_replays_inline_walrus_publications(
+    publication: str,
+) -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def publish(self, tools):\n"
+        f"        {publication}\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.publish"
+    }
+
+
+def test_authority_audit_chunks_fit_the_per_test_timeout_budget() -> None:
+    """Cold-worker scan units stay bounded beneath CI's 60-second guard."""
+
+    assert max(map(len, _AUTHORITY_AUDIT_CHUNKS)) <= 48
+
+
 @pytest.mark.parametrize(
     ("operator", "guard_exits", "expected_violation"),
     (
@@ -17407,6 +17963,14 @@ def test_causation_cycle_suppression_is_not_an_authority_grant(
         f"{continuation}"
     )
     guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    for call in (
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+    ):
+        if _call_name(call) == "send_a2a_message":
+            _mark_callable_semantics(
+                call.func,
+                {_CALLABLE_CONTROL, _CALLABLE_CYCLE_BOUNDED},
+            )
 
     assert (guard.lineno in _authority_provenance_lines(tree)) is (
         expected_violation
