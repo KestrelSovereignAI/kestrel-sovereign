@@ -215,7 +215,9 @@ def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitE
     """The :class:`AdvisedWaitExceedsRetryBudget` ``error`` explicitly wraps, if any.
 
     Only explicit links are followed: ``__cause__`` (``raise X from e``), an
-    ``LLMProviderError.original_error`` and an ``LLMStreamingError.underlying``.
+    ``LLMProviderError.original_error`` and an ``LLMStreamingError.underlying``;
+    an error carrying a ``declined_wait`` attribute is an aggregate whose
+    verdict is final, whatever its links hold.
     Implicit ``__context__`` is not: a chain severed with ``from None`` stays
     severed, and an unrelated exception raised while a decline was being
     handled (a cleanup failure, a fallback that itself broke) is not rendered
@@ -231,6 +233,14 @@ def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitE
         seen.add(id(current))
         if isinstance(current, AdvisedWaitExceedsRetryBudget):
             return current
+        if hasattr(current, "declined_wait"):
+            # An aggregate of several routes' errors states its own verdict
+            # (``common_declined_wait``); its links are the routes' errors and
+            # must not be read past that verdict, or the last route's decline
+            # would surface through ``underlying``/``__cause__`` when another
+            # route failed for a reason a retry could clear at once.
+            verdict = current.declined_wait
+            return verdict if isinstance(verdict, AdvisedWaitExceedsRetryBudget) else None
         for link in (
             current.__cause__,
             getattr(current, "original_error", None),
@@ -526,6 +536,14 @@ async def with_retry(
             if advised is not None:
                 # Advice is not clamped: a wait that fits what the loop could
                 # still spend is taken whole; one that does not ends the loop.
+                if advised <= 0 and remaining_budget <= 0:
+                    # "Retry now" with nothing left to wait is the hot loop
+                    # the advice-less branch below refuses; end here too.
+                    logger.warning(
+                        "LLM retry budget spent after %.0fs of waits (status=%s): %s: %s",
+                        waited, getattr(e, "status_code", None), type(e).__name__, e,
+                    )
+                    raise
                 if advised > remaining_budget:
                     retry_at = datetime.now(UTC) + timedelta(
                         seconds=min(advised, float(ADVISED_WAIT_HORIZON_SECONDS))

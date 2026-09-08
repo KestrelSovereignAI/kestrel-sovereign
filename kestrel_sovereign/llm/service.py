@@ -4618,6 +4618,7 @@ No other text or formatting.
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         errors = {}
+        route_errors: list[BaseException] = []  # attempted routes only
         for provider_index, provider in enumerate(available_providers):
             if not explicit_selection and self._skip_paid_fallback(
                 provider, available_providers, provider_index
@@ -4685,6 +4686,7 @@ No other text or formatting.
             except LLMProviderError as e:
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
+                route_errors.append(e)
                 # Record the failed attempt as an event on the one
                 # logical-request span (opened by the public entry method).
                 # #2674 finding 4: thread the per-invocation redaction flag so an
@@ -4719,9 +4721,13 @@ No other text or formatting.
                         f"Underlying error: {e}"
                     ) from e
 
-        # A route that declined an advised wait is the soonest any retry can
-        # succeed; carry the earliest as the cause so the surface can say when.
-        raise LLMAllProvidersFailedError(errors) from common_declined_wait(errors.values())
+        # The aggregate states its own verdict: a reset time only when every
+        # ATTEMPTED route declined (skipped routes and models a route cannot
+        # serve were not attempted). Surfaces read the verdict, never the
+        # routes' errors behind it.
+        aggregate = LLMAllProvidersFailedError(errors)
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from aggregate.declined_wait
 
     async def get_response_with_model(
         self,
@@ -5355,10 +5361,12 @@ No other text or formatting.
                 )
                 continue
 
-        raise LLMServiceError(
+        aggregate = LLMServiceError(
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
-        ) from (common_declined_wait(route_errors) or last_error)
+        )
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from last_error
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin

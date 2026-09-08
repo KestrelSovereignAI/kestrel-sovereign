@@ -446,3 +446,53 @@ def test_the_decline_mirrors_its_causes_status_and_names_a_throttle_only_when_it
         retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
     )
     assert by_message.status_code == 429 and by_message.throttled is True
+
+
+# ---------------------------------------------------------------------------
+# Round 4: an aggregate's verdict is final; advice of zero is no wait
+# ---------------------------------------------------------------------------
+
+
+def test_an_aggregates_verdict_overrides_the_links_behind_it():
+    declined = _declined()
+    quota = LLMProviderQuotaError("anthropic", "Quota exceeded", declined)
+    aggregate = LLMStreamingError("All providers failed", provider="p", underlying=quota)
+    # No verdict attribute: links are followed.
+    assert advised_wait_exceeding_budget(aggregate) is declined
+    # A verdict of "no common decline" wins over the last route's decline.
+    aggregate.declined_wait = None
+    assert advised_wait_exceeding_budget(aggregate) is None
+    # A positive verdict is what the surface gets.
+    other = _declined()
+    aggregate.declined_wait = other
+    assert advised_wait_exceeding_budget(aggregate) is other
+    # Wrapped once more, the verdict still governs.
+    try:
+        raise RuntimeError("wrapped") from aggregate
+    except RuntimeError as wrapped:
+        assert advised_wait_exceeding_budget(wrapped) is other
+
+
+@pytest.mark.asyncio
+async def test_advice_of_zero_with_nothing_left_to_wait_ends_the_loop():
+    """The review's script: 840 s advised, then Retry-After: 0 ten times slept
+    [840, 0, 0, 0, 0, 0, 0]; now the loop ends after the first wait."""
+    slept: list[float] = []
+    calls = {"n": 0}
+    seq = [_throttle(THROTTLE_BUDGET)] + [_throttle(0)] * 10
+
+    async def op():
+        i = calls["n"]
+        calls["n"] += 1
+        raise seq[i]
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    with (
+        patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep),
+        patch("kestrel_sovereign.llm.retry.random.uniform", return_value=0.0),
+        pytest.raises(_FakeRateLimit),
+    ):
+        await with_retry(op)
+    assert slept == [THROTTLE_BUDGET] and calls["n"] == 2

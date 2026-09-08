@@ -1343,11 +1343,14 @@ class StreamingMixin:
 
         provider_type = "local" if force_local_only else "all"
         logger.error(f"All {provider_type} providers failed for streaming. Last error: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All {provider_type} providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from common_declined_wait(route_errors)
+        )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate
 
     async def generate_stream(
         self,
@@ -1604,11 +1607,14 @@ class StreamingMixin:
                 continue
 
         logger.error(f"All providers failed for stream_with_messages: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from common_declined_wait(route_errors)
+        )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate
 
     @staticmethod
     def _adapter_supports_vision(adapter: Any) -> bool:
@@ -1984,8 +1990,11 @@ class StreamingMixin:
                 continue
 
         logger.error(f"All providers failed for stream_with_tool_detection: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        ) from common_declined_wait(route_errors)
+        )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate

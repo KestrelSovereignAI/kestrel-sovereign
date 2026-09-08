@@ -576,7 +576,8 @@ async def invoke_agent(request: Request, http_response: Response):
         declined = advised_wait_exceeding_budget(exc)
         if declined is not None:
             logger.error(
-                "Agent invocation declined: model route rate limited until %s",
+                "Agent invocation declined: model route %s until %s",
+                "rate limited" if declined.throttled else "unavailable",
                 declined.retry_at.isoformat(timespec="seconds"),
             )
             raise rate_limited_until(declined)
