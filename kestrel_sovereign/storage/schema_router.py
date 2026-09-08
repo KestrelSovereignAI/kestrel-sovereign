@@ -186,15 +186,19 @@ class PersonResolver:
         return PersonMatch(concept_id=None, status="new", candidates=[])
 
     async def _list_person_concepts(self, agent_id: str) -> List[Tuple[str, str]]:
-        """Return list of (concept_id, label) for person concepts of this agent."""
-        rows = await self.graph.db.fetchall(
-            """
-            SELECT node_id, label FROM graph_nodes
-            WHERE node_type = 'concept' AND node_id LIKE ?
-            """,
-            (f"concept:{agent_id}:%",),
-        )
-        return [(row[0], row[1]) for row in rows]
+        """Return list of (concept_id, label) for person concepts of this agent.
+
+        Read through the graph facade's own typed query, never a raw ``db``
+        handle: the privacy-governing graph proxy forwards
+        ``get_nodes_by_type`` and refuses ``db`` (#2672), and a tenant-bound
+        store scopes that query to the agent's own nodes. Reaching for
+        ``graph.db`` made every resolution fail on a real agent, silently,
+        as a logged warning (#3228). The ``concept:{agent_id}:`` prefix is
+        the same selection the SQL ``LIKE`` made.
+        """
+        prefix = f"concept:{agent_id}:"
+        nodes = await self.graph.get_nodes_by_type("concept")
+        return [(node.node_id, node.label) for node in nodes if node.node_id.startswith(prefix)]
 
 
 def _normalize_person_name(name: str) -> str:
@@ -565,11 +569,13 @@ class SchemaRouter:
         epistemic = _extract_epistemic_fields(metadata)
 
         # 1. Action items (graph nodes)
+        # Each lane counts a write into ``summary`` as it lands, so a
+        # failure part-way through a lane leaves a truthful count of what is
+        # in the graph rather than a zero over committed rows (#3228).
         try:
             items = self.action_extractor.extract_with_evidence(content)
             if items:
-                await self._persist_action_items(items, message_id, epistemic)
-                summary["action_items"] = len(items)
+                await self._persist_action_items(items, message_id, epistemic, summary)
         except Exception as e:
             logger.warning("Action item routing failed: %s", e)
 
@@ -577,19 +583,14 @@ class SchemaRouter:
         try:
             decisions = self.decision_extractor.extract(content)
             if decisions:
-                await self._persist_decisions(decisions, message_id, epistemic)
-                summary["decisions"] = len(decisions)
+                await self._persist_decisions(decisions, message_id, epistemic, summary)
         except Exception as e:
             logger.warning("Decision routing failed: %s", e)
 
         # 3. Interaction enrichment (edge properties) + person resolution.
         # Operates on person-type concepts the linker already created.
         try:
-            enriched, pending = await self._enrich_person_interactions(
-                concepts, content, message_id
-            )
-            summary["interactions"] = enriched
-            summary["pending_person_matches"] = pending
+            await self._enrich_person_interactions(concepts, content, message_id, summary)
         except Exception as e:
             logger.warning("Interaction enrichment failed: %s", e)
 
@@ -604,8 +605,12 @@ class SchemaRouter:
         items: List[str],
         message_id: Optional[str],
         epistemic: Optional[Dict[str, Any]] = None,
+        summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent action item persistence as graph nodes.
+
+        ``summary["action_items"]`` is advanced after each node lands, so a
+        failure part-way through reports the nodes that exist.
 
         Deterministic node_id from (agent, message, text) means reprocessing
         the same message upserts the same node — the graph's
@@ -648,6 +653,8 @@ class SchemaRouter:
                 label=text[:120],
                 properties=properties,
             ))
+            if summary is not None:
+                summary["action_items"] = summary.get("action_items", 0) + 1
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
                 await self.graph.add_edge(source, node_id, "records_action")
@@ -661,8 +668,12 @@ class SchemaRouter:
         decisions: List[str],
         message_id: Optional[str],
         epistemic: Optional[Dict[str, Any]] = None,
+        summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Idempotent decision node creation.
+
+        ``summary["decisions"]`` is advanced after each node lands, so a
+        failure part-way through reports the nodes that exist.
 
         Uses a deterministic node id from (agent, message, text) so that
         reprocessing the same message upserts the same node instead of
@@ -690,6 +701,8 @@ class SchemaRouter:
                 label=text[:120],
                 properties=properties,
             ))
+            if summary is not None:
+                summary["decisions"] = summary.get("decisions", 0) + 1
             if message_id:
                 source = f"message:{self.agent_id}:{message_id}"
                 await self.graph.add_edge(source, node_id, "records_decision")
@@ -703,6 +716,7 @@ class SchemaRouter:
         concepts: List[LinkedConcept],
         content: str,
         message_id: Optional[str],
+        summary: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, List[Dict[str, Any]]]:
         """Enrich message→person mentions edges with sentiment + topics.
 
@@ -721,16 +735,30 @@ class SchemaRouter:
             return 0, []
 
         sentiment, topics = extract_interaction_sentiment(content)
-        enriched_count = 0
         pending: List[Dict[str, Any]] = []
-
         message_node = f"message:{self.agent_id}:{message_id}"
-
         _person_categories = {"person", "proper_noun"}
-        for concept in concepts:
-            if concept.category not in _person_categories:
-                continue
+        people = [c for c in concepts if c.category in _person_categories]
 
+        # Resolve every person BEFORE writing any edge. A resolution that
+        # raises then leaves nothing behind, and the caller's zero summary is
+        # the truth; resolving between edge writes left a multi-person
+        # message half-enriched under a summary that said zero (#3228).
+        for concept in people:
+            match = await self.person_resolver.resolve(concept.label, self.agent_id)
+            if match.status == "pending":
+                pending.append({
+                    "mentioned_label": concept.label,
+                    "candidates": match.candidates,
+                    "message_id": message_id,
+                })
+        if summary is not None:
+            summary["pending_person_matches"] = pending
+
+        # Count each edge as it lands: a write that fails part-way leaves the
+        # edges before it committed, and the summary must say so.
+        enriched_count = 0
+        for concept in people:
             # Attach interaction properties to the existing mentions edge.
             properties = {
                 "sentiment": sentiment,
@@ -741,15 +769,8 @@ class SchemaRouter:
                 message_node, concept.node_id, "mentions", properties=properties
             )
             enriched_count += 1
-
-            # 3-pass resolution against other person concepts of this agent.
-            match = await self.person_resolver.resolve(concept.label, self.agent_id)
-            if match.status == "pending":
-                pending.append({
-                    "mentioned_label": concept.label,
-                    "candidates": match.candidates,
-                    "message_id": message_id,
-                })
+            if summary is not None:
+                summary["interactions"] = enriched_count
 
         return enriched_count, pending
 
