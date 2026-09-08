@@ -88,6 +88,8 @@ PROVENANCE_TRANSFORM_CALLS = {
     "map",
     "max",
     "min",
+    "partial",
+    "partialmethod",
     "reversed",
     "set",
     "sorted",
@@ -7889,19 +7891,83 @@ def _is_cross_agent_state_mutation_call(
             call.func.value, state_object_aliases
         )
     )
+    call_name = _call_name(call).casefold()
+    named_mutation_receiver = (
+        call.args[0]
+        if call.args
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"obj", "object"}
+            ),
+            None,
+        )
+    )
+    named_mutation_attribute = (
+        call.args[1]
+        if len(call.args) > 1
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"attr", "name"}
+            ),
+            None,
+        )
+    )
+    resolved_mutation_attribute = (
+        _resolved_string(named_mutation_attribute)
+        if named_mutation_attribute is not None
+        else None
+    )
+    mutates_named_registry = (
+        resolved_mutation_attribute is not None
+        and _is_cross_agent_state_collection_name(
+            resolved_mutation_attribute
+        )
+    )
     named_mutation = (
-        _call_name(call).casefold()
-        in {"__delattr__", "__setattr__", "delattr", "setattr"}
-        and bool(call.args)
-        and _is_cross_agent_state_object_reference(
-            call.args[0], state_object_aliases
+        call_name in {"__delattr__", "__setattr__", "delattr", "setattr"}
+        and named_mutation_receiver is not None
+        and (
+            _is_cross_agent_state_object_reference(
+                named_mutation_receiver, state_object_aliases
+            )
+            or mutates_named_registry
+        )
+    )
+    bound_mutation_attribute = (
+        call.args[0]
+        if call.args
+        else next(
+            (
+                keyword.value
+                for keyword in call.keywords
+                if keyword.arg in {"attr", "name"}
+            ),
+            None,
+        )
+    )
+    resolved_bound_mutation_attribute = (
+        _resolved_string(bound_mutation_attribute)
+        if bound_mutation_attribute is not None
+        else None
+    )
+    mutates_bound_named_registry = (
+        resolved_bound_mutation_attribute is not None
+        and _is_cross_agent_state_collection_name(
+            resolved_bound_mutation_attribute
         )
     )
     bound_dunder_mutation = (
         isinstance(call.func, ast.Attribute)
         and call.func.attr.casefold() in {"__delattr__", "__setattr__"}
-        and _is_cross_agent_state_object_reference(
-            call.func.value, state_object_aliases
+        and (
+            _is_cross_agent_state_object_reference(
+                call.func.value, state_object_aliases
+            )
+            or mutates_bound_named_registry
         )
     )
     lifecycle_target_arguments = [
@@ -8871,7 +8937,9 @@ def _control_reference_sources(
             if isinstance(receiver, ast.Name)
             else {receiver.attr.casefold()}
             if isinstance(receiver, ast.Attribute)
-            else set()
+            else _control_reference_sources(
+                receiver, control_return_helpers
+            )
         )
     if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
         elements = (
@@ -14618,6 +14686,62 @@ def test_provenance_scanner_follows_controls_stored_in_containers() -> None:
     assert _authority_provenance_lines(rebound_alias_callback) == {6}
 
 
+def test_provenance_scanner_follows_controls_selected_from_literals() -> None:
+    mapping = ast.parse(
+        "def dispatch(request, target):\n"
+        "    {True: terminate_child, False: record_metric}[\n"
+        "        bool(request.causation_chain)\n"
+        "    ](target)\n"
+    )
+    sequence = ast.parse(
+        "def dispatch(request, target):\n"
+        "    (record_metric, terminate_child)[\n"
+        "        bool(request.causation_chain)\n"
+        "    ](target)\n"
+    )
+    benign = ast.parse(
+        "def dispatch(request, target):\n"
+        "    {True: record_metric, False: record_event}[\n"
+        "        bool(request.causation_chain)\n"
+        "    ](target)\n"
+    )
+
+    assert _authority_provenance_lines(mapping) == {2}
+    assert _authority_provenance_lines(sequence) == {2}
+    assert _authority_provenance_lines(benign) == set()
+
+
+def test_provenance_scanner_retains_partial_bound_provenance() -> None:
+    controlled = ast.parse(
+        "from functools import partial\n"
+        "def dispatch(request):\n"
+        "    operation = partial(\n"
+        "        terminate_child, request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    operation()\n"
+    )
+    qualified = ast.parse(
+        "import functools\n"
+        "def dispatch(request):\n"
+        "    operation = functools.partial(\n"
+        "        terminate_child, target=request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    operation()\n"
+    )
+    benign = ast.parse(
+        "from functools import partial\n"
+        "def dispatch(request):\n"
+        "    operation = partial(\n"
+        "        record_metric, request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    operation()\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {6}
+    assert _authority_provenance_lines(qualified) == {6}
+    assert _authority_provenance_lines(benign) == set()
+
+
 def test_provenance_scanner_follows_controls_selected_with_mapping_get() -> None:
     assigned_callback = ast.parse(
         "def dispatch(request, target):\n"
@@ -15837,6 +15961,33 @@ def test_provenance_scanner_tracks_direct_agent_object_mutations_and_aliases() -
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 11}
+
+
+def test_provenance_scanner_tracks_reflective_registry_mutations() -> None:
+    guarded = ast.parse(
+        "def dispatch(request, manager):\n"
+        "    if request.causation_chain:\n"
+        "        setattr(manager, '_agents', {})\n"
+    )
+    direct = ast.parse(
+        "def dispatch(request, manager):\n"
+        "    setattr(manager, '_children', request.causation_chain)\n"
+    )
+    bound = ast.parse(
+        "def dispatch(request, manager):\n"
+        "    if request.orchestrator:\n"
+        "        manager.__setattr__('_peers', {})\n"
+    )
+    benign = ast.parse(
+        "def dispatch(request, manager):\n"
+        "    if request.causation_chain:\n"
+        "        setattr(manager, '_metrics', {})\n"
+    )
+
+    assert _authority_provenance_lines(guarded) == {2}
+    assert _authority_provenance_lines(direct) == {2}
+    assert _authority_provenance_lines(bound) == {2}
+    assert _authority_provenance_lines(benign) == set()
 
 
 def test_provenance_scanner_tracks_dunder_agent_object_mutations() -> None:
