@@ -97,6 +97,16 @@ CATEGORY_FIELDS: Dict[str, Tuple[str, ...]] = {
 DEFAULT_TRIGGERS: Tuple[str, ...] = ("state", "merge", "comments", "checks")
 
 
+# Which endpoint a head commit's check evidence was actually read from.
+# ``check_runs`` is the full rollup (``/commits/{sha}/check-runs``, every
+# app's check runs). ``workflow_runs`` is the narrower Actions-only fallback
+# (``/actions/runs?head_sha=``) used when the credential cannot read Checks
+# at all — see :func:`fetch_check_rollup` for why that is a permanent state
+# for a fine-grained PAT rather than a transient one.
+CHECKS_SOURCE_CHECK_RUNS = "check_runs"
+CHECKS_SOURCE_WORKFLOW_RUNS = "workflow_runs"
+
+
 class PRWatchError(Exception):
     """Base class for github_pr_watch fetch failures."""
 
@@ -260,7 +270,11 @@ def _check_verdict(
 
 
 def summarize_checks(
-    check_runs: Any = None, combined_status: Any = None
+    check_runs: Any = None,
+    combined_status: Any = None,
+    *,
+    source: str = CHECKS_SOURCE_CHECK_RUNS,
+    unreadable: Tuple[str, ...] = (),
 ) -> str:
     """Reduce real GitHub check-runs + commit statuses to a stable string.
 
@@ -286,8 +300,24 @@ def summarize_checks(
     so the same set of checks always summarizes identically. Returns ``""``
     when there are no checks or statuses at all, which is indistinguishable
     from "no checks key in payload".
+
+    ``source``/``unreadable`` describe how completely the rollup was read
+    (see :class:`CheckRollup`). Both are fingerprinted, for two reasons. A
+    degraded read must not summarize identically to a complete one, or the
+    watch would report "no change" across the moment its own visibility
+    changed; and an empty *degraded* rollup must not collapse to ``""``,
+    which this module's callers read as "no checks exist" — a claim a blind
+    poll cannot make. So whenever either is non-default the summary is
+    non-empty even with nothing else in it.
     """
     parts = []
+    # Recorded separately from the check/status parts so they cannot be
+    # mistaken for evidence, while still keeping the summary non-empty.
+    provenance = []
+    if source != CHECKS_SOURCE_CHECK_RUNS:
+        provenance.append(f"source={source}")
+    if unreadable:
+        provenance.append("unreadable=" + ",".join(sorted(unreadable)))
 
     if isinstance(combined_status, dict):
         for s in combined_status.get("statuses", []) or []:
@@ -314,11 +344,11 @@ def summarize_checks(
     # is no verdict to fingerprint; the caller treats "" as "no checks".
     verdict = _check_verdict(check_runs, combined_status)
     combined_state = verdict if verdict in ("pending", "failure", "success") else ""
-    if not parts and not combined_state:
+    if not parts and not combined_state and not provenance:
         return ""
 
     parts.sort()
-    return ";".join([f"combined={combined_state}", *parts])
+    return ";".join([f"combined={combined_state}", *parts, *provenance])
 
 
 def changed_categories(
@@ -419,46 +449,117 @@ def evaluate_pr_watch(
 # ---------------------------------------------------------------------------
 
 
+async def _github_get_paged(
+    url: str, key: str, *, token: str, timeout: int, ref: str
+) -> Any:
+    """GET a ``total_count``-plus-list GitHub collection, following pages.
+
+    ``url`` must already carry ``per_page`` and any other query parameters;
+    ``key`` is the list field to accumulate (``check_runs``,
+    ``workflow_runs``). Returns the first page's object with that list
+    extended, so callers see the shape the API documents.
+
+    GitHub pages these at 30 by default; callers ask for 100 and this follows
+    ``page=`` until ``total_count`` is met, so a gate on page two is read
+    rather than merely detected. The crawl is bounded by GitHub's own
+    ``total_count``: every non-empty page grows the list and an empty page
+    ends the loop, so it issues at most ``ceil(total_count / 100)`` requests.
+    There is deliberately no fixed page cap on top of that — a rollup larger
+    than a cap would be read short every poll, and :func:`_check_verdict`
+    would then hold it at ``"pending"`` forever, the one state class this
+    rollup must never settle in (#2939).
+
+    One paginator, not one per endpoint: the bound above is the load-bearing
+    half, and a second copy of it is a second place for it to drift.
+    """
+    first = await _github_get(url, token=token, timeout=timeout, ref=ref)
+    if not isinstance(first, dict):
+        return first
+    items = [r for r in (first.get(key) or []) if isinstance(r, dict)]
+    total = first.get("total_count")
+    page = 1
+    sep = "&" if "?" in url else "?"
+    while isinstance(total, int) and len(items) < total:
+        page += 1
+        more = await _github_get(
+            f"{url}{sep}page={page}",
+            token=token, timeout=timeout, ref=f"{ref} page {page}",
+        )
+        batch = (
+            [r for r in (more.get(key) or []) if isinstance(r, dict)]
+            if isinstance(more, dict) else []
+        )
+        if not batch:
+            break
+        items.extend(batch)
+    return {**first, key: items}
+
+
 async def _github_get_check_runs(
     base: str, head_sha: str, *, token: str, timeout: int, ref: str
 ) -> Any:
     """Every check run for ``head_sha`` (GitHub's ``filter=latest`` default).
 
-    GitHub pages the rollup at 30 by default; this asks for 100 and follows
-    ``page=`` until ``total_count`` is met, so a gate on page two is read
-    rather than merely detected. Returns the first page's object with its
-    ``check_runs`` extended, so callers see the shape the API documents.
-
-    The crawl is bounded by GitHub's own ``total_count``: every non-empty
-    page grows ``runs`` and an empty page ends the loop, so it issues at most
-    ``ceil(total_count / 100)`` requests. There is deliberately no fixed page
-    cap on top of that — a rollup larger than a cap would be read short every
-    poll, and :func:`_check_verdict` would then hold it at ``"pending"``
-    forever, the one state class this rollup must never settle in (#2939).
+    The complete rollup: every app's check runs, GitHub Actions and third
+    parties alike. Needs the ``checks`` read permission — see
+    :func:`fetch_check_rollup` for what happens to a credential that has no
+    way to hold it.
     """
-    first = await _github_get(
+    return await _github_get_paged(
         f"{base}/commits/{head_sha}/check-runs?per_page=100",
-        token=token, timeout=timeout, ref=ref,
+        "check_runs", token=token, timeout=timeout, ref=ref,
     )
-    if not isinstance(first, dict):
-        return first
-    runs = [r for r in (first.get("check_runs") or []) if isinstance(r, dict)]
-    total = first.get("total_count")
-    page = 1
-    while isinstance(total, int) and len(runs) < total:
-        page += 1
-        more = await _github_get(
-            f"{base}/commits/{head_sha}/check-runs?per_page=100&page={page}",
-            token=token, timeout=timeout, ref=f"{ref} page {page}",
+
+
+async def _github_get_workflow_runs(
+    base: str, head_sha: str, *, token: str, timeout: int, ref: str
+) -> Any:
+    """Every Actions workflow run for ``head_sha``.
+
+    The narrower half of the rollup, readable with the ``actions`` permission
+    instead of ``checks``. A workflow *run* is coarser than a check *run* —
+    one run covers all of its jobs, so six job-level check runs collapse to
+    the single run that produced them — which is enough for a verdict (a
+    failed job fails its run) but loses per-job names and per-job timing.
+    """
+    return await _github_get_paged(
+        f"{base}/actions/runs?head_sha={head_sha}&per_page=100",
+        "workflow_runs", token=token, timeout=timeout, ref=ref,
+    )
+
+
+def _workflow_runs_as_check_runs(payload: Any) -> Any:
+    """Project an ``/actions/runs`` payload onto the check-runs shape.
+
+    ``status`` (``queued``/``in_progress``/``completed``) and ``conclusion``
+    (``success``/``failure``/``skipped``/…) are the same vocabulary on both
+    endpoints, so the projection lets :func:`_check_verdict` and
+    :func:`summarize_checks` read Actions runs unchanged rather than growing
+    a second, separately-drifting reducer.
+
+    ``total_count`` is carried across verbatim when GitHub sent one, so the
+    unread-gate protection in :func:`_check_verdict` — which lowers
+    ``success`` to ``pending`` when the rollup was read short — keeps
+    applying to the fallback.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    runs = []
+    for r in payload.get("workflow_runs") or []:
+        if not isinstance(r, dict):
+            continue
+        runs.append(
+            {
+                "name": str(r.get("name", "") or ""),
+                "status": str(r.get("status", "") or ""),
+                "conclusion": r.get("conclusion"),
+            }
         )
-        batch = (
-            [r for r in (more.get("check_runs") or []) if isinstance(r, dict)]
-            if isinstance(more, dict) else []
-        )
-        if not batch:
-            break
-        runs.extend(batch)
-    return {**first, "check_runs": runs}
+    total = payload.get("total_count")
+    return {
+        "total_count": total if isinstance(total, int) else len(runs),
+        "check_runs": runs,
+    }
 
 
 async def _github_get(
@@ -502,6 +603,134 @@ async def _github_get(
         ) from e
 
 
+@dataclass(frozen=True)
+class CheckRollup:
+    """One head commit's check evidence, plus how completely it was read.
+
+    ``check_runs`` is always check-runs-shaped — either the real Checks
+    payload or an Actions payload projected onto it by
+    :func:`_workflow_runs_as_check_runs` — so every downstream reducer takes
+    it unchanged. ``source`` says which, and ``unreadable`` names the
+    endpoints the credential was refused.
+
+    The pair exists because "the rollup is empty" and "the part of the rollup
+    I can see is empty" are different claims, and this module's whole
+    contract turns on not confusing them (#2939): an empty rollup is terminal
+    ("no CI ran"), while an empty *partial* rollup is only terminal about
+    what was visible.
+    """
+
+    check_runs: Any = None
+    combined_status: Any = None
+    source: str = CHECKS_SOURCE_CHECK_RUNS
+    unreadable: Tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        """Whether every gate class this module knows about was readable."""
+        return not self.unreadable and self.source == CHECKS_SOURCE_CHECK_RUNS
+
+    def caveat(self) -> str:
+        """Operator-facing sentence naming what this rollup could not see.
+
+        Empty when the rollup is complete. Names the blind spot in terms of
+        what could be hiding in it, not just which endpoint failed — the
+        point of the sentence is that a reader can decide whether it matters
+        for their repository.
+        """
+        if self.complete:
+            return ""
+        holes = []
+        if self.source == CHECKS_SOURCE_WORKFLOW_RUNS:
+            holes.append(
+                "check runs from apps other than GitHub Actions (the Checks "
+                "API was refused; read via the Actions API instead)"
+            )
+        elif "check-runs" in self.unreadable:
+            holes.append("all check runs (the Checks API was refused)")
+        if "status" in self.unreadable:
+            holes.append("legacy commit statuses (the Statuses API was refused)")
+        if not holes:
+            holes.append("part of the rollup (" + ",".join(self.unreadable) + ")")
+        return "this verdict cannot see " + "; ".join(holes)
+
+
+async def fetch_check_rollup(
+    base: str, head_sha: str, *, token: str, timeout: int, ref: str
+) -> CheckRollup:
+    """Read ``head_sha``'s check evidence, degrading rather than going blind.
+
+    Order matters. The Checks API is tried first because it is the complete
+    rollup. Only an *authorization* refusal (401/403) falls back — a network
+    error still propagates, because this module's auth/network distinction is
+    the difference between "a human must act" and "wait and it will clear",
+    and a fallback that swallowed transport failures would erase it.
+
+    The fallback exists because for a fine-grained personal access token the
+    Checks refusal is permanent, not a misconfiguration: ``checks`` is a
+    GitHub *App* permission and is absent from the fine-grained repository
+    permission list entirely, so ``/commits/{sha}/check-runs`` answers 403
+    with ``x-accepted-github-permissions: checks=read`` — naming a permission
+    that token type can never hold. ``/actions/runs?head_sha=`` answers the
+    same question for GitHub Actions under ``actions=read``, which such a
+    token *can* hold, and ``/commits/{sha}/status`` covers integrations that
+    report through legacy commit statuses. Between them they are complete for
+    a repository whose gates are Actions and statuses, and blind to exactly
+    one class: a third-party app that reports only through check runs.
+
+    That residual hole is why the result carries :meth:`CheckRollup.caveat`
+    rather than being silently promoted to a full read. Callers must not turn
+    an incomplete rollup into an unqualified pass.
+
+    Raises :class:`PRWatchAuthError` only when *no* check evidence at all is
+    readable — the genuinely blind case, which no amount of waiting fixes.
+    """
+    unreadable: List[str] = []
+    source = CHECKS_SOURCE_CHECK_RUNS
+    checks_error: Optional[PRWatchAuthError] = None
+    try:
+        check_runs: Any = await _github_get_check_runs(
+            base, head_sha, token=token, timeout=timeout, ref=f"{ref} check-runs"
+        )
+    except PRWatchAuthError as exc:
+        checks_error = exc
+        unreadable.append("check-runs")
+        check_runs = None
+        try:
+            check_runs = _workflow_runs_as_check_runs(
+                await _github_get_workflow_runs(
+                    base, head_sha, token=token, timeout=timeout,
+                    ref=f"{ref} actions-runs",
+                )
+            )
+            source = CHECKS_SOURCE_WORKFLOW_RUNS
+        except PRWatchAuthError:
+            unreadable.append("actions-runs")
+
+    try:
+        combined_status: Any = await _github_get(
+            f"{base}/commits/{head_sha}/status",
+            token=token, timeout=timeout, ref=f"{ref} status",
+        )
+    except PRWatchAuthError:
+        unreadable.append("status")
+        combined_status = None
+
+    if check_runs is None and combined_status is None:
+        # Nothing at all was readable: no check runs, no workflow runs, no
+        # statuses. There is no verdict to caveat, only a credential to fix.
+        raise PRWatchAuthError(
+            f"{ref}: no check evidence is readable — check-runs, "
+            f"actions-runs and status were all refused ({checks_error})"
+        )
+
+    return CheckRollup(
+        check_runs=check_runs,
+        combined_status=combined_status,
+        source=source,
+        unreadable=tuple(unreadable),
+    )
+
 async def fetch_pr_state(
     repo: str, number: int, *, token: str, kind: str = "pr", timeout: int = 10
 ) -> Dict[str, Any]:
@@ -523,11 +752,18 @@ async def fetch_pr_state(
     change rather than depending on a field GitHub never sends. Issues have
     no head SHA, so their ``checks_status`` stays empty.
 
+    The checks half degrades before it blocks (:func:`fetch_check_rollup`):
+    a credential that cannot read the Checks API falls back to the Actions
+    API, and the resulting summary records that it did, so a partial read is
+    never fingerprinted as a complete one and an empty partial read is never
+    fingerprinted as "no checks exist".
+
     Raises :class:`PRWatchAuthError` on 401/403 and
     :class:`PRWatchNetworkError` on any other transport/HTTP failure so the
     caller can report ``blocked: auth`` / ``blocked: network`` distinctly
-    from a no-change poll. A blocked checks fetch blocks the whole poll
-    rather than reporting a false "checks cleared" change.
+    from a no-change poll. A checks fetch with *no* readable evidence at all
+    blocks the whole poll rather than reporting a false "checks cleared"
+    change.
     """
     base = f"https://api.github.com/repos/{repo}"
     endpoint = "issues" if kind == "issue" else "pulls"
@@ -543,16 +779,15 @@ async def fetch_pr_state(
     head = raw.get("head")
     head_sha = head.get("sha") if isinstance(head, dict) else None
     if kind != "issue" and head_sha:
-        check_runs = await _github_get_check_runs(
-            base, head_sha, token=token, timeout=timeout, ref=f"{ref} check-runs"
+        rollup = await fetch_check_rollup(
+            base, head_sha, token=token, timeout=timeout, ref=ref
         )
-        combined_status = await _github_get(
-            f"{base}/commits/{head_sha}/status",
-            token=token,
-            timeout=timeout,
-            ref=f"{ref} status",
+        raw["checks_status"] = summarize_checks(
+            rollup.check_runs,
+            rollup.combined_status,
+            source=rollup.source,
+            unreadable=rollup.unreadable,
         )
-        raw["checks_status"] = summarize_checks(check_runs, combined_status)
 
     return raw
 
