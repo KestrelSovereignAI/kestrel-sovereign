@@ -44,7 +44,12 @@ def _stop_endpoint(args) -> tuple[str, str] | None:
 
     local = config.get_local_agents().get(args.name)
     if local is not None:
-        resolved = cli._detect_running_agent_server(args.name, local, config)
+        resolved = cli._detect_running_agent_server(
+            args.name,
+            local,
+            config,
+            operator_api_keys=cli._operator_api_keys(project_dir),
+        )
         if resolved is None:
             return None
         base_url, discovered_key = resolved
@@ -52,12 +57,12 @@ def _stop_endpoint(args) -> tuple[str, str] | None:
             discovered_key or _local_api_key(project_dir)
         )
 
-    remote = config.get_remote_agents().get(args.name)
-    if remote is not None:
-        return (
-            f"{remote.url.rstrip('/')}/api/agent/stop",
-            _local_api_key(project_dir),
-        )
+    # Remote registrations carry routing only, not a remote sovereign
+    # credential. Never send this host's KESTREL_API_KEY to an arbitrary
+    # configured URL. A future remote operator-auth contract can add a
+    # separately scoped credential; until then this CLI door fails closed.
+    if args.name in config.get_remote_agents():
+        return None
     return None
 
 

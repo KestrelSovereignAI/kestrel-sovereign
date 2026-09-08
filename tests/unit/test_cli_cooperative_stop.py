@@ -89,13 +89,37 @@ def test_named_stop_resolution_delegates_agent_routing_to_live_http_probe(tmp_pa
             "_detect_running_agent_server",
             return_value=("http://localhost:8888/api/agents/Emma", "key"),
         ) as detect,
+        patch.object(cli, "_operator_api_keys", return_value=("operator-key",)),
     ):
         resolved = cli_stop._stop_endpoint(_args())
     assert resolved == (
         "http://localhost:8888/api/agents/Emma/api/agent/stop",
         "key",
     )
-    detect.assert_called_once_with("Emma", agent_config, config)
+    detect.assert_called_once_with(
+        "Emma",
+        agent_config,
+        config,
+        operator_api_keys=("operator-key",),
+    )
+
+
+def test_remote_stop_never_sends_the_local_sovereign_key(tmp_path):
+    from kestrel_sovereign import cli
+
+    remote = SimpleNamespace(url="https://peer.example")
+    config = SimpleNamespace(host=SimpleNamespace(port=8888))
+    config.get_local_agents = lambda: {}
+    config.get_remote_agents = lambda: {"Peer": remote}
+    with (
+        patch.object(cli, "_get_project_dir", return_value=tmp_path),
+        patch.object(cli.MultiAgentConfig, "load", return_value=config),
+        patch(
+            "kestrel_sovereign.cli_stop._local_api_key",
+            side_effect=AssertionError("local sovereign key disclosure"),
+        ),
+    ):
+        assert cli_stop._stop_endpoint(_args(name="Peer")) is None
 
 
 def test_cooperative_stop_module_has_no_process_mutation_door():

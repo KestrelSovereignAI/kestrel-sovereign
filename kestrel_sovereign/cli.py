@@ -1965,7 +1965,7 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
-    # kestrel start|shutdown|restart|update|status|logs
+    # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
 
