@@ -4319,7 +4319,23 @@ def _route_declarations(
         module_runtime_route_aliases,
     )
 
-    def route_collection_receiver(expression: ast.AST) -> str | None:
+    route_collection_binding = "route_collection"
+    unresolved_route_collection = "<unresolved>"
+
+    def route_collection_receiver(
+        expression: ast.AST,
+        aliases: dict[str, _StaticBinding] | None = None,
+    ) -> str | None:
+        if isinstance(expression, ast.Name) and aliases is not None:
+            binding = aliases.get(expression.id)
+            if binding is None or binding[1] != route_collection_binding:
+                return None
+            if binding[0] == unresolved_route_collection:
+                raise AssertionError(
+                    "Unresolved route collection alias: "
+                    f"{ast.unparse(expression)}"
+                )
+            return binding[0]
         if not isinstance(expression, ast.Attribute) or expression.attr != "routes":
             return None
         owner = expression.value
@@ -4333,12 +4349,40 @@ def _route_declarations(
             return owner.value.id
         return None
 
+    def scope_route_collection_aliases(
+        statements: list[ast.stmt],
+        prefixes: dict[str, str],
+        inherited: dict[str, _StaticBinding] | None = None,
+    ) -> dict[str, _StaticBinding]:
+        def direct_binding(value: ast.AST) -> _StaticBinding | None:
+            receiver = route_collection_receiver(value)
+            if receiver == "app" or receiver in prefixes:
+                return receiver, route_collection_binding
+            return None
+
+        flow = _StaticBindingFlow(
+            direct_binding,
+            lambda _bindings: (
+                unresolved_route_collection,
+                route_collection_binding,
+            ),
+            inherited,
+        )
+        flow.replay(statements)
+        return flow.bindings
+
+    module_runtime_route_collections = scope_route_collection_aliases(
+        tree.body,
+        module_runtime_prefixes,
+    )
+
     def route_object_declaration(
         route_object: ast.AST,
         collection: ast.AST,
         active_strings: dict[str, str],
         active_methods: dict[str, tuple[str, ...]],
         prefixes: dict[str, str],
+        route_collections: dict[str, _StaticBinding],
     ) -> tuple[tuple[str, ...], str]:
         methods, path = _route_object_methods_and_path(
             route_object,
@@ -4346,7 +4390,7 @@ def _route_declarations(
             active_methods,
         )
 
-        receiver = route_collection_receiver(collection)
+        receiver = route_collection_receiver(collection, route_collections)
         if receiver == "app":
             prefix = ""
         elif receiver is not None and receiver in prefixes:
@@ -4361,9 +4405,15 @@ def _route_declarations(
             prefix + path,
         )
 
-    def appended_route_objects(call: ast.Call) -> tuple[ast.AST, list[ast.AST]] | None:
+    def appended_route_objects(
+        call: ast.Call,
+        route_collections: dict[str, _StaticBinding],
+    ) -> tuple[ast.AST, list[ast.AST]] | None:
         member = _static_member_reference(call.func)
-        if member is None or route_collection_receiver(member[0]) is None:
+        if (
+            member is None
+            or route_collection_receiver(member[0], route_collections) is None
+        ):
             return None
         collection, operation = member
         if operation == "append" and len(call.args) == 1 and not call.keywords:
@@ -4467,6 +4517,7 @@ def _route_declarations(
         inherited_methods: dict[str, tuple[str, ...]],
         inherited_route_aliases: dict[str, tuple[str, str]],
         inherited_route_factories: dict[str, ast.Call],
+        inherited_route_collections: dict[str, _StaticBinding],
         *,
         module_scope: bool = False,
         class_body_uses_module_globals: bool = False,
@@ -4516,6 +4567,7 @@ def _route_declarations(
                         nested_methods,
                         active_route_aliases,
                         active_route_factories,
+                        active_route_collections,
                         module_scope=module_scope,
                         class_body_uses_module_globals=(
                             class_body_uses_module_globals
@@ -4593,6 +4645,11 @@ def _route_declarations(
                     if module_scope or class_body_uses_module_globals
                     else active_route_factories
                 )
+                child_route_collections = (
+                    module_runtime_route_collections
+                    if module_scope or class_body_uses_module_globals
+                    else active_route_collections
+                )
                 walk_scope(
                     node.body,
                     child_prefixes,
@@ -4600,6 +4657,7 @@ def _route_declarations(
                     child_methods,
                     child_route_aliases,
                     child_route_factories,
+                    child_route_collections,
                 )
                 return
             if isinstance(node, ast.ClassDef):
@@ -4610,6 +4668,7 @@ def _route_declarations(
                     active_methods,
                     active_route_aliases,
                     active_route_factories,
+                    active_route_collections,
                     class_body_uses_module_globals=(
                         module_scope or class_body_uses_module_globals
                     ),
@@ -4623,18 +4682,31 @@ def _route_declarations(
                 )
                 route_targets: list[tuple[ast.AST, bool]] = []
                 for target in targets:
-                    if route_collection_receiver(target) is not None:
+                    if (
+                        not isinstance(target, ast.Name)
+                        and route_collection_receiver(
+                            target, active_route_collections
+                        )
+                        is not None
+                    ):
                         route_targets.append((target, True))
                     elif (
                         isinstance(target, ast.Subscript)
-                        and route_collection_receiver(target.value) is not None
+                        and route_collection_receiver(
+                            target.value, active_route_collections
+                        )
+                        is not None
                     ):
                         route_targets.append(
                             (target.value, isinstance(target.slice, ast.Slice))
                         )
                     elif any(
-                        route_collection_receiver(candidate) is not None
+                        route_collection_receiver(
+                            candidate, active_route_collections
+                        )
+                        is not None
                         for candidate in ast.walk(target)
+                        if not isinstance(candidate, ast.Name)
                     ):
                         raise AssertionError(
                             "Unresolved route collection assignment: "
@@ -4665,20 +4737,25 @@ def _route_declarations(
                             active_strings,
                             active_methods,
                             prefixes,
+                            active_route_collections,
                         )
                         for route_object in route_objects
                     )
                     return
             if isinstance(node, ast.AugAssign):
                 collection = node.target
-                receiver = route_collection_receiver(collection)
+                receiver = route_collection_receiver(
+                    collection, active_route_collections
+                )
                 if (
                     receiver is None
                     and isinstance(node.target, ast.Subscript)
                     and isinstance(node.target.slice, ast.Slice)
                 ):
                     collection = node.target.value
-                    receiver = route_collection_receiver(collection)
+                    receiver = route_collection_receiver(
+                        collection, active_route_collections
+                    )
                 if receiver is not None:
                     if not isinstance(node.op, ast.Add) or not isinstance(
                         node.value, (ast.List, ast.Tuple, ast.Set)
@@ -4694,12 +4771,15 @@ def _route_declarations(
                             active_strings,
                             active_methods,
                             prefixes,
+                            active_route_collections,
                         )
                         for route_object in node.value.elts
                     )
                     return
             if isinstance(node, ast.Call):
-                publication = appended_route_objects(node)
+                publication = appended_route_objects(
+                    node, active_route_collections
+                )
                 if publication is not None:
                     collection, route_objects = publication
                     declarations.extend(
@@ -4709,6 +4789,7 @@ def _route_declarations(
                             active_strings,
                             active_methods,
                             prefixes,
+                            active_route_collections,
                         )
                         for route_object in route_objects
                     )
@@ -4912,6 +4993,11 @@ def _route_declarations(
                 active_route_aliases,
                 inherited_route_factories,
             )
+            active_route_collections = scope_route_collection_aliases(
+                statements[:index],
+                prefixes,
+                inherited_route_collections,
+            )
             visit(
                 statement,
                 active_strings,
@@ -4920,7 +5006,7 @@ def _route_declarations(
                 active_route_factories,
             )
 
-    walk_scope(tree.body, {}, {}, {}, {}, {}, module_scope=True)
+    walk_scope(tree.body, {}, {}, {}, {}, {}, {}, module_scope=True)
     return declarations
 
 
@@ -6522,6 +6608,28 @@ def test_route_objects_appended_to_route_collections_are_inventoried() -> None:
         (("POST",), "/host/restart"),
         (("WEBSOCKET",), "/agents/{name}/events"),
     ]
+
+
+def test_route_collection_alias_publications_are_inventoried() -> None:
+    aliased = ast.parse(
+        "app = Starlette()\n"
+        "routes = app.routes\n"
+        "published = routes\n"
+        "published.append(Route(\n"
+        "    '/api/agents/{name}/terminate', endpoint, methods=['DELETE']\n"
+        "))\n"
+    )
+    rebound = ast.parse(
+        "app = Starlette()\n"
+        "routes = app.routes\n"
+        "routes = []\n"
+        "routes.append(Route('/local', endpoint))\n"
+    )
+
+    assert _route_declarations(aliased, {}, {}) == [
+        (("DELETE",), "/api/agents/{name}/terminate"),
+    ]
+    assert _route_declarations(rebound, {}, {}) == []
 
 
 def test_direct_route_collection_mutations_are_inventoried_or_rejected() -> None:
@@ -11156,6 +11264,12 @@ def _cached_contains_cross_agent_control_call(
                 return
             self.generic_visit(node)
 
+        def visit_Return(self, node: ast.Return) -> None:  # noqa: N802
+            if node.value is not None and is_control_reference(node.value):
+                self.found = True
+                return
+            self.generic_visit(node)
+
         def visit_FunctionDef(  # noqa: N802 - ast API
             self, node: ast.FunctionDef
         ) -> None:
@@ -15406,6 +15520,26 @@ def test_provenance_scanner_follows_control_return_helpers(
     assert _authority_provenance_lines(local_factory) == {6}
     assert _authority_provenance_lines(chained_factory) == {10}
     assert _cached_authority_provenance_lines(controller_path) == frozenset({5})
+
+
+def test_provenance_scanner_detects_guarded_control_callable_returns() -> None:
+    selected = ast.parse(
+        "def choose(request):\n"
+        "    if request.causation_chain:\n"
+        "        return terminate_child\n"
+        "    return record_metric\n\n"
+        "def dispatch(request, target):\n"
+        "    choose(request)(target)\n"
+    )
+    benign = ast.parse(
+        "def choose(configured):\n"
+        "    if configured:\n"
+        "        return terminate_child\n"
+        "    return record_metric\n"
+    )
+
+    assert _authority_provenance_lines(selected) == {2}
+    assert _authority_provenance_lines(benign) == set()
 
 
 def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> None:
