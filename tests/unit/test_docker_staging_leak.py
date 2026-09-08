@@ -8,13 +8,18 @@ write, a docker binary that is not there) leaked the directory: 589 empty ones
 on one host, invisible to the trash listing, which hides dot-directories by
 design so mid-flight entries are never listed or restored early.
 
-Two halves: the guard now begins the moment the directory exists, and each
-run sweeps stale staging directories that older code left behind.
+Three parts: the guard begins the moment the directory exists; each run
+sweeps staging directories whose OWNER is gone (an owner record beside the
+directory, outside the bind mount, names the process; a directory with no
+record is legacy and is swept once older than the default maximum script
+timeout); and nothing in the sweep or the promotion follows a symlink, since
+the staging bind is the one writable mount a container gets.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -22,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from kestrel_sovereign.features.compute.executors.docker_executor import DockerExecutor
-from kestrel_sovereign.features.compute.models import ExecutionRecord
+from kestrel_sovereign.features.compute.models import ComputePolicy, ExecutionRecord
 from tests.unit.test_compute_executors import (
     _CompletedProcess,
     _is_docker_command,
@@ -31,9 +36,38 @@ from tests.unit.test_compute_executors import (
     _SuccessfulProcess,
 )
 
+OWNER = DockerExecutor.STAGING_OWNER_SUFFIX
+
 
 def _staging_dirs(trash_root: Path) -> list[Path]:
-    return sorted(p for p in trash_root.iterdir() if p.name.startswith(".staging-"))
+    return sorted(
+        p for p in trash_root.iterdir()
+        if p.name.startswith(".staging-") and not p.name.endswith(OWNER)
+    )
+
+
+def _owner_records(trash_root: Path) -> list[Path]:
+    return sorted(p for p in trash_root.iterdir() if p.name.endswith(OWNER))
+
+
+def _age(path: Path, seconds: float) -> None:
+    stamp = time.time() - seconds
+    os.utime(path, (stamp, stamp))
+
+
+def _dead_pid() -> int:
+    """A pid no process has: fork a child that exits at once, reap it."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return pid
+
+
+def _write_owner(trash_root: Path, name: str, pid: int) -> Path:
+    record = trash_root / f"{name}{OWNER}"
+    record.write_text(json.dumps({"pid": pid, "started": time.time()}))
+    return record
 
 
 @pytest.fixture
@@ -44,32 +78,41 @@ def executor_with_trash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return executor, trash_root
 
 
+def _spawn_failure(monkeypatch: pytest.MonkeyPatch, seen_binds: list[str] | None = None):
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if seen_binds is not None:
+            seen_binds.extend(str(c) for c in command if ".staging-" in str(c))
+        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+
+def _staging_from(command: tuple[object, ...]) -> Path:
+    bind = next(str(c) for c in command if ".staging-" in str(c))
+    return Path(bind.split(":", 1)[0])
+
+
 # ---------------------------------------------------------------------------
 # The guard covers every exit
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_a_missing_docker_binary_at_spawn_leaves_no_staging_dir(
+async def test_a_missing_docker_binary_at_spawn_leaves_no_staging_dir_or_record(
     executor_with_trash, monkeypatch: pytest.MonkeyPatch,
 ):
     """The ordinary case on a machine running unit tests: ``create_subprocess_exec``
     raises FileNotFoundError. The record says failed; the trash root is clean."""
     executor, trash_root = executor_with_trash
     seen_binds: list[str] = []
-
-    async def create_subprocess(*command: object, **_kwargs: object):
-        seen_binds.extend(str(c) for c in command if ".staging-" in str(c))
-        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    _spawn_failure(monkeypatch, seen_binds)
 
     record = await asyncio.wait_for(executor.execute(_script()), timeout=2)
 
     assert isinstance(record, ExecutionRecord)
     assert record.exit_code == -1
     assert seen_binds, "the staging bind was built before the spawn failed"
-    assert _staging_dirs(trash_root) == []
+    assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
 
 
 @pytest.mark.asyncio
@@ -93,22 +136,27 @@ async def test_a_refused_rewrite_leaves_no_staging_dir(
 
     assert record.exit_code == -1
     assert "refused" in record.stderr
-    assert _staging_dirs(trash_root) == []
+    assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
 
 
 @pytest.mark.asyncio
-async def test_a_successful_run_still_promotes_staged_entries_and_removes_the_dir(
+async def test_a_successful_run_promotes_staged_entries_and_removes_dir_and_record(
     executor_with_trash, monkeypatch: pytest.MonkeyPatch,
 ):
-    """The guard moved; the promotion it performs did not change."""
+    """The guard moved; the promotion it performs did not change. While the
+    container runs, the owner record names this process and sits beside the
+    directory, outside the bind."""
     executor, trash_root = executor_with_trash
+    seen: dict[str, object] = {}
 
     async def create_subprocess(*command: object, **_kwargs: object):
         if _is_docker_command(command, "rm"):
             return _CompletedProcess()
+        staging = _staging_from(command)
+        record = trash_root / f"{staging.name}{OWNER}"
+        seen["record"] = json.loads(record.read_text())
+        seen["record_inside_bind"] = (staging / record.name).exists()
         # The container "deletes" a file: it lands in the staging bind.
-        bind = next(str(c) for c in command if ".staging-" in str(c))
-        staging = Path(bind.split(":", 1)[0])
         (staging / "rm_deadbeef").mkdir()
         (staging / "rm_deadbeef" / "victim.txt").write_text("v")
         return _SuccessfulProcess(b"ok", b"")
@@ -118,51 +166,163 @@ async def test_a_successful_run_still_promotes_staged_entries_and_removes_the_di
     record = await asyncio.wait_for(executor.execute(_script()), timeout=2)
 
     assert record.exit_code == 0
-    assert _staging_dirs(trash_root) == []
+    assert seen["record"]["pid"] == os.getpid()
+    assert seen["record_inside_bind"] is False
+    assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
     assert (trash_root / "rm_deadbeef" / "victim.txt").read_text() == "v"
 
 
 # ---------------------------------------------------------------------------
-# Stale staging directories from older code are swept
+# A container cannot turn the sweep against the host
 # ---------------------------------------------------------------------------
 
 
-def _age(path: Path, seconds: float) -> None:
-    stamp = time.time() - seconds
-    os.utime(path, (stamp, stamp))
-
-
-def test_the_sweep_removes_stale_empties_promotes_stale_entries_and_keeps_live_ones(
-    tmp_path: Path,
+@pytest.mark.asyncio
+async def test_a_symlink_planted_in_the_bind_is_never_promoted_or_followed(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
+    """The review's reproduction: the container's only action is one
+    ``os.symlink("../agent_data", staging / ".staging-pwned")``. Before, the
+    link was promoted into the root and the next sweep emptied its target."""
+    executor, trash_root = executor_with_trash
+    victim = tmp_path / "agent_data"
+    victim.mkdir()
+    (victim / "memory.db").write_text("AGENT MEMORY")
+    (victim / "keys").mkdir()
+    (victim / "keys" / "signing.pem").write_text("KEY")
+    planted = {"done": False}
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "rm"):
+            return _CompletedProcess()
+        staging = _staging_from(command)
+        if not planted["done"]:
+            os.symlink("../../agent_data", staging / ".staging-pwned")
+            planted["done"] = True
+        return _SuccessfulProcess(b"ok", b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+    await asyncio.wait_for(executor.execute(_script()), timeout=2)  # plants
+    assert not (trash_root / ".staging-pwned").exists()
+    assert not (trash_root / ".staging-pwned").is_symlink()
+
+    # Even a link that somehow sits in the root is not a sweep candidate.
+    os.symlink(str(victim), trash_root / ".staging-planted")
+    _age(victim, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 3600)
+    await asyncio.wait_for(executor.execute(_script()), timeout=2)  # sweeps
+
+    assert sorted(p.name for p in victim.iterdir()) == ["keys", "memory.db"]
+    assert (trash_root / ".staging-planted").is_symlink()
+
+
+def test_the_promotion_refuses_a_staging_path_that_is_a_symlink(tmp_path: Path, caplog):
     trash_root = tmp_path / "trash"
     trash_root.mkdir()
-    stale_empty = trash_root / ".staging-aaaaaaaaaaaa"
-    stale_empty.mkdir()
-    stale_full = trash_root / ".staging-bbbbbbbbbbbb"
-    (stale_full / "rm_cafe0001").mkdir(parents=True)
-    (stale_full / "rm_cafe0001" / "kept.txt").write_text("k")
-    live = trash_root / ".staging-cccccccccccc"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("k")
+    link = trash_root / ".staging-link"
+    os.symlink(str(victim), link)
+
+    with caplog.at_level("WARNING"):
+        DockerExecutor._promote_staged_trash(link, trash_root)
+
+    assert (victim / "keep.txt").read_text() == "k"
+    assert link.is_symlink()
+    assert "Refusing to promote" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Stale means "no live owner", not "old"
+# ---------------------------------------------------------------------------
+
+
+def test_a_directory_whose_owner_is_running_is_never_swept_however_old(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    live = trash_root / ".staging-aaaaaaaaaaaa"
     live.mkdir()
-    not_a_dir = trash_root / ".staging-dddddddddddd"
-    not_a_dir.write_text("a file with a staging name")
-    real_entry = trash_root / "rm_11112222"
-    real_entry.mkdir()
-    other_hidden = trash_root / ".not-staging"
-    other_hidden.mkdir()
-    for p in (stale_empty, stale_full, not_a_dir, real_entry, other_hidden):
-        _age(p, DockerExecutor.STALE_STAGING_AGE_SECONDS + 60)
-    _age(live, DockerExecutor.STALE_STAGING_AGE_SECONDS - 60)
+    _write_owner(trash_root, live.name, os.getpid())
+    _age(live, 30 * 24 * 3600)
 
     DockerExecutor._promote_stale_staging_dirs(trash_root)
 
-    assert not stale_empty.exists()
-    assert not stale_full.exists()
+    assert live.is_dir()
+    assert (trash_root / f"{live.name}{OWNER}").is_file()
+
+
+def test_a_directory_whose_owner_is_gone_is_swept_at_once_with_its_record(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    orphan = trash_root / ".staging-bbbbbbbbbbbb"
+    (orphan / "rm_cafe0001").mkdir(parents=True)
+    (orphan / "rm_cafe0001" / "kept.txt").write_text("k")
+    record = _write_owner(trash_root, orphan.name, _dead_pid())
+
+    DockerExecutor._promote_stale_staging_dirs(trash_root)
+
+    assert not orphan.exists() and not record.exists()
     assert (trash_root / "rm_cafe0001" / "kept.txt").read_text() == "k"
-    assert live.is_dir(), "a directory younger than the bound may be a live bind mount"
-    assert not_a_dir.is_file()
-    assert real_entry.is_dir()
-    assert other_hidden.is_dir(), "only the executor's own .staging- prefix is swept"
+
+
+def test_a_legacy_directory_with_no_record_is_swept_only_past_the_default_timeout(
+    tmp_path: Path,
+):
+    """The 589 on the live host have no record. A young one may be an
+    older process's live bind mount across an upgrade; an old one is not."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    young = trash_root / ".staging-cccccccccccc"
+    young.mkdir()
+    _age(young, DockerExecutor.LEGACY_STAGING_AGE_SECONDS - 60)
+    old = trash_root / ".staging-dddddddddddd"
+    old.mkdir()
+    _age(old, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+
+    DockerExecutor._promote_stale_staging_dirs(trash_root)
+
+    assert young.is_dir() and not old.exists()
+
+
+def test_the_legacy_floor_is_the_default_maximum_script_timeout():
+    """A legacy directory is judged by age because it has nothing better; the
+    floor is the policy's shipped maximum, the longest any default run lasts."""
+    assert DockerExecutor.LEGACY_STAGING_AGE_SECONDS == ComputePolicy().max_timeout_seconds
+
+
+def test_an_unreadable_record_counts_as_no_record(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    d = trash_root / ".staging-eeeeeeeeeeee"
+    d.mkdir()
+    (trash_root / f"{d.name}{OWNER}").write_text("not json")
+    _age(d, DockerExecutor.LEGACY_STAGING_AGE_SECONDS - 60)
+    DockerExecutor._promote_stale_staging_dirs(trash_root)
+    assert d.is_dir(), "young and unreadable: left alone like a legacy directory"
+    _age(d, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    DockerExecutor._promote_stale_staging_dirs(trash_root)
+    assert not d.exists()
+
+
+def test_the_sweep_touches_only_staging_directories(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    not_a_dir = trash_root / ".staging-ffffffffffff"
+    not_a_dir.write_text("a file with a staging name")
+    other_hidden = trash_root / ".not-staging"
+    other_hidden.mkdir()
+    real_entry = trash_root / "rm_11112222"
+    real_entry.mkdir()
+    stray_record = trash_root / f".staging-000000000000{OWNER}"
+    stray_record.write_text("{}")
+    for p in (not_a_dir, other_hidden, real_entry, stray_record):
+        _age(p, 30 * 24 * 3600)
+
+    DockerExecutor._promote_stale_staging_dirs(trash_root)
+
+    assert not_a_dir.is_file() and other_hidden.is_dir() and real_entry.is_dir()
+    assert stray_record.is_file(), "a record is never itself a candidate"
 
 
 def test_the_sweep_tolerates_a_missing_trash_root(tmp_path: Path):
@@ -180,22 +340,48 @@ async def test_each_run_sweeps_before_staging_its_own(
     trash_root.mkdir()
     leaked = trash_root / ".staging-0123456789ab"
     leaked.mkdir()
-    _age(leaked, DockerExecutor.STALE_STAGING_AGE_SECONDS + 60)
-
-    async def create_subprocess(*_command: object, **_kwargs: object):
-        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    _age(leaked, DockerExecutor.LEGACY_STAGING_AGE_SECONDS + 60)
+    _spawn_failure(monkeypatch)
 
     await asyncio.wait_for(executor.execute(_script()), timeout=2)
 
     assert not leaked.exists()
-    assert _staging_dirs(trash_root) == []
+    assert _staging_dirs(trash_root) == [] and _owner_records(trash_root) == []
 
 
-def test_the_stale_bound_exceeds_any_configured_script_timeout(monkeypatch):
-    """A live run's directory is at most as old as its timeout; the sweep's
-    bound must sit beyond the compute policy's maximum."""
-    from kestrel_sovereign.features.compute.models import ComputePolicy
+# ---------------------------------------------------------------------------
+# Two sweeps on one stale directory
+# ---------------------------------------------------------------------------
 
-    assert DockerExecutor.STALE_STAGING_AGE_SECONDS > ComputePolicy().max_timeout_seconds
+
+def test_the_loser_of_a_promotion_race_does_not_cry_stranded(tmp_path: Path, caplog):
+    """Four agents share the root; both sweeps pass the check, A promotes
+    first, B's renames find nothing. The entries are safe in the root and
+    B says so at debug, not as a data-loss warning."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    stale = trash_root / ".staging-abcdefabcdef"
+    (stale / "rm_00000001").mkdir(parents=True)
+    (stale / "rm_00000001" / "f").write_text("x")
+    entries = list(stale.iterdir())
+
+    class _Replay:
+        """B's view: the listing it took before A promoted."""
+
+        def __init__(self, path):
+            self._path = path
+
+        def __getattr__(self, name):
+            return getattr(self._path, name)
+
+        def iterdir(self):
+            return iter(entries)
+
+    DockerExecutor._promote_staged_trash(stale, trash_root)  # A wins
+    assert (trash_root / "rm_00000001" / "f").read_text() == "x"
+
+    with caplog.at_level("DEBUG"):
+        DockerExecutor._promote_staged_trash(_Replay(stale), trash_root)  # B loses
+
+    assert "NOT visible" not in caplog.text
+    assert (trash_root / "rm_00000001" / "f").read_text() == "x"

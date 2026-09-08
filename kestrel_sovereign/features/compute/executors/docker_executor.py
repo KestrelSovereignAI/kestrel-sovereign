@@ -5,9 +5,12 @@ Execute scripts in isolated Docker containers for maximum security.
 """
 
 import asyncio
+import json
 import logging
+import os
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 import uuid
@@ -222,6 +225,11 @@ class DockerExecutor(BaseExecutor):
         # after the container exits (same filesystem, atomic renames).
         self._promote_stale_staging_dirs(host_trash_dir)
         staging_dir = host_trash_dir / f".staging-{uuid.uuid4().hex[:12]}"
+        # The owner record lives BESIDE the directory, outside the bind
+        # mount, so the container can neither read nor forge it. It is
+        # written first: a directory with no record is one this code never
+        # owned (see ``_promote_stale_staging_dirs``).
+        self._write_staging_owner(staging_dir)
         staging_dir.mkdir(mode=0o700)
         # Guarded from the moment it exists: every exit below (a policy
         # rewrite that refuses the script, the script write, a docker binary
@@ -563,12 +571,44 @@ class DockerExecutor(BaseExecutor):
             container_id=container_name,
         )
 
-    #: A staging directory older than this belongs to no live execution: a
-    #: script may run for at most the compute policy's maximum timeout (one
-    #: hour by default, KESTREL_COMPUTE_MAX_TIMEOUT), so a day is beyond any
-    #: configured run. Younger ones may be another process's bind mount and
-    #: are left alone.
-    STALE_STAGING_AGE_SECONDS = 24 * 60 * 60
+    #: Suffix of the owner record written beside a staging directory
+    #: (``.staging-<hex>.owner``), outside the container's bind mount.
+    STAGING_OWNER_SUFFIX = ".owner"
+
+    #: A staging directory with NO owner record was made by code that wrote
+    #: none (the leak this ticket closes, or a run of that older code still
+    #: in flight across an upgrade). It is swept once older than the compute
+    #: policy's default maximum script timeout; a record-bearing directory is
+    #: judged by its owner's liveness, never by age.
+    LEGACY_STAGING_AGE_SECONDS = 60 * 60
+
+    @classmethod
+    def _write_staging_owner(cls, staging_dir: Path) -> None:
+        """Record which process owns ``staging_dir``: this one, from now."""
+        record = staging_dir.with_name(staging_dir.name + cls.STAGING_OWNER_SUFFIX)
+        record.write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        record.chmod(0o600)
+
+    @staticmethod
+    def _owner_is_alive(record: Path) -> Optional[bool]:
+        """Whether the process named in ``record`` is running.
+
+        ``None`` means the record is unreadable (treated as no record).
+        A process this user may not signal is still a live process.
+        """
+        try:
+            pid = int(json.loads(record.read_text())["pid"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     @classmethod
     def _promote_stale_staging_dirs(cls, host_trash_dir: Path) -> None:
@@ -577,45 +617,110 @@ class DockerExecutor(BaseExecutor):
         A failed launch used to leave its ``.staging-*`` directory behind
         (#3117), and the trash listing hides dot-directories by design, so
         nothing in band ever showed the accumulation. Each script run sweeps
-        the root before staging its own: a stale directory's entries (if any)
-        are promoted into the real trash root, then it is removed. Best-effort
-        and logged, like promotion itself.
+        the root before staging its own. "Still owned" is a fact about a
+        process, not an age: a directory whose owner record names a running
+        process is left alone however old it is; one whose owner is gone is
+        promoted (its entries, if any, into the real trash root) and removed
+        at once, and its record with it. A directory with no record is
+        legacy and is swept once older than the default maximum script
+        timeout. Nothing here follows a symlink: the staging bind is the one
+        writable mount a container gets, and a link planted there must never
+        become a promotion source (review of #3117).
         """
         try:
             candidates = list(host_trash_dir.iterdir())
         except OSError:
             return
-        cutoff = time.time() - cls.STALE_STAGING_AGE_SECONDS
+        legacy_cutoff = time.time() - cls.LEGACY_STAGING_AGE_SECONDS
         for candidate in candidates:
-            if not candidate.name.startswith(".staging-"):
+            name = candidate.name
+            if not name.startswith(".staging-") or name.endswith(cls.STAGING_OWNER_SUFFIX):
                 continue
             try:
-                if not candidate.is_dir() or candidate.stat().st_mtime > cutoff:
-                    continue
+                st = candidate.lstat()
             except OSError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                # A symlink or file wearing a staging name is not a staging
+                # directory; it is never entered, promoted or followed.
+                continue
+            record = candidate.with_name(name + cls.STAGING_OWNER_SUFFIX)
+            if record.is_file() and not record.is_symlink():
+                alive = cls._owner_is_alive(record)
+                if alive:
+                    continue
+                if alive is None and st.st_mtime > legacy_cutoff:
+                    continue
+            elif st.st_mtime > legacy_cutoff:
                 continue
             cls._promote_staged_trash(candidate, host_trash_dir)
 
-    @staticmethod
-    def _promote_staged_trash(staging_dir: Path, host_trash_dir: Path) -> None:
+    @classmethod
+    def _remove_staging_owner(cls, staging_dir: Path) -> None:
+        record = staging_dir.with_name(staging_dir.name + cls.STAGING_OWNER_SUFFIX)
+        try:
+            record.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Could not remove staging owner record %s", record, exc_info=True)
+
+    @classmethod
+    def _promote_staged_trash(cls, staging_dir: Path, host_trash_dir: Path) -> None:
         """Move per-execution staged trash entries into the real trash root.
 
         Renames each staged entry (same filesystem, atomic) with a collision
-        suffix, then removes the staging directory. Best-effort: a promotion
-        failure must not mask the execution result — but it is logged loudly
-        because it strands restorable trash entries in a hidden directory.
+        suffix, then removes the staging directory and its owner record.
+        Best-effort: a promotion failure must not mask the execution result,
+        but it is logged loudly because it strands restorable trash entries
+        in a hidden directory. Two exceptions are quiet: a staging directory
+        that is not a real directory (a symlink planted by the container is
+        skipped, never followed, and reported), and entries that vanished
+        because another process promoted the same stale directory first
+        (the entries are then already in the root).
         """
         try:
-            if not staging_dir.is_dir():
+            try:
+                st = staging_dir.lstat()
+            except FileNotFoundError:
+                cls._remove_staging_owner(staging_dir)
+                return
+            if not stat.S_ISDIR(st.st_mode):
+                logger.warning(
+                    "Refusing to promote %s: not a directory (a symlink or file "
+                    "wearing a staging name); left in place.",
+                    staging_dir,
+                )
                 return
             for entry in staging_dir.iterdir():
+                if entry.is_symlink():
+                    # Never promote a link: its target is whatever the
+                    # container chose, and a promoted link would make the
+                    # next sweep treat that target as a staging directory.
+                    logger.warning(
+                        "Refusing to promote symlink %s staged by a container; "
+                        "removed.",
+                        entry,
+                    )
+                    entry.unlink()
+                    continue
                 destination = host_trash_dir / entry.name
                 suffix = 0
-                while destination.exists():
+                while destination.exists() or destination.is_symlink():
                     suffix += 1
                     destination = host_trash_dir / f"{entry.name}.{suffix}"
-                entry.rename(destination)
-            staging_dir.rmdir()
+                try:
+                    entry.rename(destination)
+                except FileNotFoundError:
+                    # Another sweep promoted this stale directory first.
+                    logger.debug(
+                        "Staged entry %s already promoted by another process", entry
+                    )
+            try:
+                staging_dir.rmdir()
+            except FileNotFoundError:
+                pass
+            cls._remove_staging_owner(staging_dir)
         except OSError:
             logger.warning(
                 "Failed to promote staged trash entries from %s into %s; "
