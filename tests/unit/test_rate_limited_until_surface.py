@@ -87,6 +87,25 @@ def test_an_overload_that_advised_a_wait_is_a_503_not_a_rate_limit():
     assert safe_streaming_error_message(_wrapped(declined)).startswith("The model route is unavailable.")
 
 
+def test_the_invoke_endpoint_logs_an_overload_as_unavailable_not_rate_limited(caplog):
+    class _Overloaded(Exception):
+        status_code = 503
+
+    declined = AdvisedWaitExceedsRetryBudget(
+        _Overloaded(PROVIDER_PROSE), advised_seconds=300, budget_seconds=240,
+        retry_at=datetime.now(UTC) + timedelta(seconds=300),
+    )
+    app, restore = _boot_app(_wrapped(declined))
+    try:
+        with caplog.at_level("ERROR"):
+            response = _invoke(app)
+    finally:
+        restore()
+    assert response.status_code == 503
+    assert "model route unavailable until" in caplog.text
+    assert "rate limited" not in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Streams
 # ---------------------------------------------------------------------------
