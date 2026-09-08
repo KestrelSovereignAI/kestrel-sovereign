@@ -54,6 +54,7 @@ CONTROL_NAME_TERMS = (
     "kill_process",
 )
 PERMISSION_NAME_TERMS = (
+    "acl",
     "approv",
     "authoriz",
     "authority",
@@ -70,6 +71,7 @@ PERMISSION_NAME_TERMS = (
     "access",
     "gate",
     "require",
+    "rbac",
 )
 PROVENANCE_TRANSFORM_CALLS = {
     "all",
@@ -4268,8 +4270,17 @@ def _fastapi_generated_route_declarations(
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
         value = statement.value
-        if not isinstance(value, ast.Call) or _call_name(value) != "FastAPI":
+        if not isinstance(value, ast.Call):
             continue
+        constructor = _call_name(value)
+        if constructor not in {"APIRouter", "FastAPI"}:
+            continue
+        prefix = (
+            optional_path(value, "prefix", "")
+            if constructor == "APIRouter"
+            else ""
+        )
+        assert prefix is not None
         routes_keyword = next(
             (item for item in value.keywords if item.arg == "routes"),
             None,
@@ -4285,14 +4296,15 @@ def _fastapi_generated_route_declarations(
                     "Unresolved FastAPI constructor routes: "
                     f"{ast.unparse(route_values)}"
                 )
-            declarations.extend(
-                _route_object_methods_and_path(
+            for route_object in route_objects:
+                methods, path = _route_object_methods_and_path(
                     route_object,
                     constants,
                     method_constants,
                 )
-                for route_object in route_objects
-            )
+                declarations.append((methods, prefix + path))
+        if constructor != "FastAPI":
+            continue
         openapi_path = optional_path(value, "openapi_url", "/openapi.json")
         if openapi_path is None:
             continue
@@ -6889,6 +6901,16 @@ def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
         (("GET", "HEAD"), "/docs"),
         (("GET", "HEAD"), "/docs/oauth2-redirect"),
         (("GET", "HEAD"), "/redoc"),
+    ]
+
+    router_routes = ast.parse(
+        'router = APIRouter(prefix="/api", routes=['
+        'APIRoute("/agents/{name}/stop", endpoint, methods=["POST"]), '
+        'WebSocketRoute("/agents/{name}/events", socket_endpoint)])\n'
+    )
+    assert _route_declarations(router_routes, {}, {}) == [
+        (("POST",), "/api/agents/{name}/stop"),
+        (("WEBSOCKET",), "/api/agents/{name}/events"),
     ]
 
 
@@ -9565,7 +9587,11 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
         ),
         None,
     )
-    command = positional_command or keyword_command
+    command = (
+        ast.List(elts=call.args, ctx=ast.Load())
+        if adapter == "asyncio.create_subprocess_exec"
+        else positional_command or keyword_command
+    )
     if command is None:
         return False
 
@@ -10596,6 +10622,9 @@ def _local_control_helpers(
     invoked_parameters: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] = {}
+    reflective_lifecycle_parameters: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[tuple[str, str]]
+    ] = {}
     for function in functions:
         parameter_names = {
             argument.arg.casefold()
@@ -10611,6 +10640,18 @@ def _local_control_helpers(
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id.casefold() in parameter_names
+        }
+        reflective_lifecycle_parameters[function] = {
+            (node.func.args[0].id.casefold(), node.func.args[1].id.casefold())
+            for node in _walk_lexical_scope(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Call)
+            and _call_name(node.func).casefold() == "getattr"
+            and len(node.func.args) > 1
+            and isinstance(node.func.args[0], ast.Name)
+            and isinstance(node.func.args[1], ast.Name)
+            and node.func.args[0].id.casefold() in parameter_names
+            and node.func.args[1].id.casefold() in parameter_names
         }
 
     call_sites = [
@@ -10725,6 +10766,44 @@ def _local_control_helpers(
                 if function_name not in helper_names:
                     helper_names.add(function_name)
                     changed = True
+
+            reflective_parameters = reflective_lifecycle_parameters.get(
+                function, set()
+            )
+            for caller, call in call_sites:
+                if not reflective_parameters or function_name not in (
+                    _expanded_callable_sources(
+                        _call_name(call), callable_alias_edges[caller]
+                    )
+                ):
+                    continue
+                caller_state_objects = _cross_agent_state_object_aliases(caller)
+                for object_parameter, name_parameter in reflective_parameters:
+                    bound_arguments = dict(
+                        callback_parameter_bindings(
+                            call,
+                            function,
+                            {object_parameter, name_parameter},
+                        )
+                    )
+                    object_argument = bound_arguments.get(object_parameter)
+                    name_argument = bound_arguments.get(name_parameter)
+                    resolved_name = (
+                        _resolved_string(name_argument)
+                        if name_argument is not None
+                        else None
+                    )
+                    if (
+                        object_argument is not None
+                        and _is_cross_agent_state_object_reference(
+                            object_argument, caller_state_objects
+                        )
+                        and resolved_name is not None
+                        and _is_unambiguous_control_token(resolved_name)
+                        and function_name not in helper_names
+                    ):
+                        helper_names.add(function_name)
+                        changed = True
 
             callback_parameters = invoked_parameters.get(function, set())
             if not callback_parameters:
@@ -16374,6 +16453,7 @@ def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None
     "invocation",
     (
         'subprocess.run(["kestrel", "terminate", target.name])',
+        'asyncio.create_subprocess_exec("kestrel", "restart", target.name)',
         'os.system(f"kestrel restart {target.name}")',
         'shell(command=f"kestrel stop {target.name}")',
     ),
@@ -16941,6 +17021,18 @@ def test_provenance_scanner_recognizes_peer_targeted_control_calls() -> None:
     )
 
     assert _authority_provenance_lines(tree) == {2, 6, 10, 18, 22}
+
+
+def test_provenance_scanner_propagates_reflective_lifecycle_helper_names() -> None:
+    tree = ast.parse(
+        "def apply(obj, name):\n"
+        "    getattr(obj, name)()\n\n"
+        "def dispatch(request, child):\n"
+        "    if request.causation_chain:\n"
+        "        apply(child, 'terminate')\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {5}
 
 
 def test_provenance_scanner_resolves_imported_annotation_aliases() -> None:
@@ -18231,6 +18323,18 @@ def test_permission_mutation_targets_are_provenance_inputs(
     tree = ast.parse(
         "def configure(request, permissions):\n"
         f"    {mutation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize("store_name", ("acl", "rbac"))
+def test_acl_and_rbac_mutation_targets_are_provenance_inputs(
+    store_name: str,
+) -> None:
+    tree = ast.parse(
+        f"def configure(request, {store_name}):\n"
+        f"    {store_name}[request.causation_chain[-1].agent_id] = True\n"
     )
 
     assert _authority_provenance_lines(tree) == {2}
