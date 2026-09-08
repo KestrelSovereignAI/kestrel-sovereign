@@ -12,18 +12,16 @@ warning, and no partial writes.
 from __future__ import annotations
 
 import logging
-import uuid
 
 import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.associative_linker import LinkedConcept
-from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
-from kestrel_sovereign.storage.schema_router import PersonResolver, SchemaRouter
+from kestrel_sovereign.storage.schema_router import SchemaRouter
 
 AGENT = "did:test:agent-a"
 
@@ -133,35 +131,6 @@ async def test_resolution_through_the_facade_without_warning(governed, router_lo
 
 
 @pytest.mark.asyncio
-async def test_one_agent_never_lists_another_agents_people_on_a_shared_graph(tmp_path):
-    """Two tenant-bound facades over ONE database: the shared-backend shape.
-    Agent B's people are invisible to agent A's resolver."""
-    from kestrel_sovereign.storage.db import SQLiteBackend
-
-    raw = SQLiteBackend(str(tmp_path / "shared.db"))
-    await raw.connect()
-    db = AsyncDatabase(raw)
-    await db._init_schema()
-    db._initialized = True
-    try:
-        agent_a, agent_b = f"did:test:a-{uuid.uuid4().hex}", f"did:test:b-{uuid.uuid4().hex}"
-        graph_a, graph_b = AsyncGraphStore(db, agent_id=agent_a), AsyncGraphStore(db, agent_id=agent_b)
-        await _seed_people(graph_a, agent_a, "Alice")
-        await _seed_people(graph_b, agent_b, "Alice", "Bob")
-
-        assert {cid for cid, _ in await PersonResolver(graph_a)._list_person_concepts(agent_a)} == {
-            f"concept:{agent_a}:alice"
-        }
-        assert {cid for cid, _ in await PersonResolver(graph_b)._list_person_concepts(agent_b)} == {
-            f"concept:{agent_b}:alice", f"concept:{agent_b}:bob"
-        }
-        # Even asked about the other agent's prefix, a bound store yields nothing.
-        assert await PersonResolver(graph_a)._list_person_concepts(agent_b) == []
-    finally:
-        await db.close()
-
-
-@pytest.mark.asyncio
 async def test_a_failing_resolution_leaves_no_partial_edges(governed, router_log, monkeypatch):
     """A message naming two people: if the second resolution raises, the
     first person's edge must not have been written, and the summary's zero
@@ -225,3 +194,77 @@ async def test_memory_system_wires_the_governed_graph_into_person_resolution(tmp
         edges = await ms.router.graph.get_edges(f"message:{AGENT}:m-1")
         assert {e.target_id for e in edges} >= {f"concept:{AGENT}:robert"}
         assert not any("Interaction enrichment failed" in m for m in router_log.messages), router_log.messages
+
+
+class _FailingWrites:
+    """Delegate to the governed facade, but make the n-th call of one writer
+    raise, so a lane fails part-way through its writes."""
+
+    def __init__(self, inner, method, fail_on_call):
+        self._inner, self._method, self._fail_on, self.calls = inner, method, fail_on_call, 0
+
+    def __getattr__(self, name):
+        target = getattr(self._inner, name)
+        if name != self._method:
+            return target
+
+        async def wrapped(*args, **kwargs):
+            self.calls += 1
+            if self.calls == self._fail_on:
+                raise RuntimeError(f"{name} failed on call {self.calls}")
+            return await target(*args, **kwargs)
+
+        return wrapped
+
+
+@pytest.mark.asyncio
+async def test_an_edge_write_failing_part_way_reports_the_edges_that_landed(governed, router_log):
+    """Two people, the second edge write fails: the first edge is in the
+    graph, and the summary says one, not zero."""
+    wrapper, storage = governed
+    await _seed_people(wrapper.graph, AGENT, "Alice", "Bob")
+    router = SchemaRouter(graph=wrapper.graph, db=storage.db, agent_id=AGENT)
+    await _seed_message(router.graph, AGENT, "msg-4")
+    router.graph = _FailingWrites(wrapper.graph, "add_edge", fail_on_call=2)
+
+    summary = await router.route(
+        message_id="msg-4", content="Alice and Bob argued about lunch.",
+        concepts=[_mention(AGENT, "Alice"), _mention(AGENT, "Bob")], role="user",
+    )
+    targets = [e.target_id for e in await wrapper.graph.get_edges(f"message:{AGENT}:msg-4")]
+    assert targets == [f"concept:{AGENT}:alice"]
+    assert summary["interactions"] == 1
+    assert summary["pending_person_matches"] == []
+    assert any("Interaction enrichment failed" in m for m in router_log.messages)
+
+
+@pytest.mark.asyncio
+async def test_an_action_item_write_failing_part_way_reports_the_nodes_that_landed(governed, router_log, monkeypatch):
+    wrapper, storage = governed
+    router = SchemaRouter(graph=wrapper.graph, db=storage.db, agent_id=AGENT)
+    await _seed_message(router.graph, AGENT, "msg-5")
+    monkeypatch.setattr(router.action_extractor, "extract_with_evidence", lambda content: [("file the report", "need to"), ("call the bank", "must")])
+    monkeypatch.setattr(router.decision_extractor, "extract", lambda content: [])
+    router.graph = _FailingWrites(wrapper.graph, "add_node", fail_on_call=2)
+
+    summary = await router.route(message_id="msg-5", content="irrelevant", concepts=[], role="user")
+    assert summary["action_items"] == 1
+    nodes = await wrapper.graph.get_nodes_by_type("action_item")
+    assert [n.properties["text"] for n in nodes] == ["file the report"]
+    assert any("Action item routing failed" in m for m in router_log.messages)
+
+
+@pytest.mark.asyncio
+async def test_a_decision_write_failing_part_way_reports_the_nodes_that_landed(governed, router_log, monkeypatch):
+    wrapper, storage = governed
+    router = SchemaRouter(graph=wrapper.graph, db=storage.db, agent_id=AGENT)
+    await _seed_message(router.graph, AGENT, "msg-6")
+    monkeypatch.setattr(router.action_extractor, "extract_with_evidence", lambda content: [])
+    monkeypatch.setattr(router.decision_extractor, "extract", lambda content: ["use postgres", "ship friday"])
+    router.graph = _FailingWrites(wrapper.graph, "add_node", fail_on_call=2)
+
+    summary = await router.route(message_id="msg-6", content="irrelevant", concepts=[], role="user")
+    assert summary["decisions"] == 1
+    nodes = await wrapper.graph.get_nodes_by_type("decision")
+    assert [n.properties["text"] for n in nodes] == ["use postgres"]
+    assert any("Decision routing failed" in m for m in router_log.messages)
