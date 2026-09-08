@@ -66,6 +66,16 @@ class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
 
 
+class InvocationSelfFencedError(Exception):
+    """An invocation stopped because its infrastructure lease became unsafe.
+
+    This deliberately is not an ``InvocationCancelledError``: infrastructure
+    lease loss is not evidence that an operator requested or received an
+    acknowledged Stop. Durable ingress and HTTP boundaries must therefore keep
+    the work retryable instead of consuming it as a terminal no-op.
+    """
+
+
 def validate_invocation_id(value: object) -> str:
     """Return a bounded opaque invocation id or reject an invalid one."""
     if not isinstance(value, str) or not (1 <= len(value) <= MAX_INVOCATION_ID_LENGTH):
@@ -306,6 +316,18 @@ def bind_async_invocation(
                         registered = True
                 try:
                     if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, invocation_id
+                        ):
+                            raise InvocationCancelledError(
+                                "invocation was stopped before durable admission "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            )
                         bind_operation = getattr(
                             type(lifecycle_owner),
                             "bind_request_operation",
@@ -315,6 +337,14 @@ def bind_async_invocation(
                         operation_context = parent_context.copy()
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
+                        if lock_manager is None:
+                            get_lock_manager = getattr(
+                                type(lifecycle_owner),
+                                "_get_lock_manager",
+                                None,
+                            )
+                            if callable(get_lock_manager):
+                                lock_manager = get_lock_manager(lifecycle_owner)
                         delegate_lock_ownership = getattr(
                             lock_manager,
                             "delegate_current_task_ownership",
@@ -322,8 +352,39 @@ def bind_async_invocation(
                         )
                         if callable(delegate_lock_ownership):
                             delegate_lock_ownership(operation_context)
+
+                        capture_transition_delegation = getattr(
+                            type(lifecycle_owner),
+                            "_capture_committed_feature_transition_delegation",
+                            None,
+                        )
+                        transition_delegation = (
+                            capture_transition_delegation(lifecycle_owner)
+                            if callable(capture_transition_delegation)
+                            else None
+                        )
+
+                        async def run_isolated_operation() -> _T:
+                            if transition_delegation is None:
+                                return await function(*bound.args, **bound.kwargs)
+                            bind_transition_delegation = getattr(
+                                type(lifecycle_owner),
+                                "_bind_committed_feature_transition_delegation",
+                                None,
+                            )
+                            if not callable(bind_transition_delegation):
+                                raise TypeError(
+                                    "committed feature-transition authority "
+                                    "cannot be delegated"
+                                )
+                            with bind_transition_delegation(
+                                lifecycle_owner,
+                                transition_delegation,
+                            ):
+                                return await function(*bound.args, **bound.kwargs)
+
                         isolated_operation = asyncio.create_task(
-                            function(*bound.args, **bound.kwargs),
+                            run_isolated_operation(),
                             name=(
                                 "invocation-turn:"
                                 f"{invocation_log_correlation(invocation_id)}"
@@ -353,7 +414,20 @@ def bind_async_invocation(
                             if callable(is_cancelled) and is_cancelled(
                                 lifecycle_owner, invocation_id
                             ):
-                                raise InvocationCancelledError(
+                                is_self_fenced = getattr(
+                                    type(lifecycle_owner),
+                                    "is_request_self_fenced",
+                                    None,
+                                )
+                                cancellation_error = (
+                                    InvocationSelfFencedError
+                                    if callable(is_self_fenced)
+                                    and is_self_fenced(
+                                        lifecycle_owner, invocation_id
+                                    )
+                                    else InvocationCancelledError
+                                )
+                                raise cancellation_error(
                                     "isolated invocation was stopped after "
                                     "operation completion "
                                     f"({invocation_log_correlation(invocation_id)})"
@@ -366,7 +440,20 @@ def bind_async_invocation(
                                 > caller_cancellation_baseline
                             ):
                                 raise
-                            raise InvocationCancelledError(
+                            is_self_fenced = getattr(
+                                type(lifecycle_owner),
+                                "is_request_self_fenced",
+                                None,
+                            )
+                            cancellation_error = (
+                                InvocationSelfFencedError
+                                if callable(is_self_fenced)
+                                and is_self_fenced(
+                                    lifecycle_owner, invocation_id
+                                )
+                                else InvocationCancelledError
+                            )
+                            raise cancellation_error(
                                 "isolated invocation was cancelled "
                                 f"({invocation_log_correlation(invocation_id)})"
                             ) from error
@@ -390,10 +477,11 @@ def bind_async_invocation(
                                 ):
                                     variable.set(child_value)
                     return await function(*bound.args, **bound.kwargs)
-                except InvocationCancelledError:
-                    # The isolated child cooperatively unwound after Stop. Its
-                    # cancellation is a successful lifecycle completion, not a
-                    # cleanup failure.
+                except (InvocationCancelledError, InvocationSelfFencedError):
+                    # The isolated child cooperatively unwound after Stop or a
+                    # lease self-fence. Its cancellation is a successful
+                    # lifecycle cleanup, not abandonment. Keep the typed errors
+                    # distinct so callers retry only the infrastructure case.
                     raise
                 except BaseException as error:
                     if registered:
@@ -465,6 +553,8 @@ def bind_async_invocation(
 
 def bind_async_generator_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., AsyncIterator[_T]]], Callable[..., AsyncIterator[_T]]]:
     """Bind/generate ``parameter`` for an async-generator top-level turn.
 
@@ -502,11 +592,37 @@ def bind_async_generator_invocation(
                 if supplied_provenance is not None
                 else _current_invocation_provenance.get()
             )
+            lifecycle_owner = args[0] if args else None
+            registered = False
+            if track_request_lifecycle and lifecycle_owner is not None:
+                register = getattr(
+                    type(lifecycle_owner),
+                    "register_active_request",
+                    None,
+                )
+                if callable(register):
+                    register(lifecycle_owner, effective_id)
+                    registered = True
+            iterator = None
             with caller_context_lifetime(
                 bound.arguments.get("caller")
             ) as caller_binding:
-                iterator = function(*bound.args, **bound.kwargs)
                 try:
+                    if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, effective_id
+                        ):
+                            raise InvocationCancelledError(
+                                "streaming invocation was stopped before durable "
+                                "admission "
+                                f"({invocation_log_correlation(effective_id)})"
+                            )
+                    iterator = function(*bound.args, **bound.kwargs)
                     while True:
                         with _exact_invocation_scope(
                             effective_id,
@@ -518,13 +634,17 @@ def bind_async_generator_invocation(
                                 return
                         yield item
                 finally:
-                    close_iterator = getattr(iterator, "aclose", None)
-                    if callable(close_iterator):
-                        with _exact_invocation_scope(
-                            effective_id,
-                            effective_provenance,
-                        ), caller_context_binding_scope(caller_binding):
-                            await close_iterator()
+                    try:
+                        close_iterator = getattr(iterator, "aclose", None)
+                        if callable(close_iterator):
+                            with _exact_invocation_scope(
+                                effective_id,
+                                effective_provenance,
+                            ), caller_context_binding_scope(caller_binding):
+                                await close_iterator()
+                    finally:
+                        if registered:
+                            lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 

@@ -11,6 +11,7 @@ auth and assert the SSE error payload is a stable, content-free constant while t
 marker (and any provider/underlying text) never surfaces.
 """
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -18,16 +19,26 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.features.bridge.feature import BridgeFeature
+from kestrel_sovereign.features.bridge.protocol import BridgeRequest
+from kestrel_sovereign.features.bridge.router import get_router
 
 
 API_KEY = "test-bridge-key"
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
 
-def _boot(process_input_streaming, *, cancellation_after_stream=False):
+def _boot(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    self_fenced=False,
+):
     """Boot the real app with a single agent exposing a BridgeFeature and the
     given ``process_input_streaming`` async generator. Returns ``(app, restore)``.
     """
@@ -60,9 +71,10 @@ def _boot(process_input_streaming, *, cancellation_after_stream=False):
     def _is_request_cancelled(_request_id):
         nonlocal cancellation_checks
         cancellation_checks += 1
-        return cancellation_after_stream and cancellation_checks >= 2
+        return cancel_on_check is not None and cancellation_checks >= cancel_on_check
 
     agent.is_request_cancelled = MagicMock(side_effect=_is_request_cancelled)
+    agent.is_request_self_fenced = MagicMock(return_value=self_fenced)
 
     app.router.lifespan_context = noop_lifespan
     app.state.agent = agent
@@ -78,11 +90,17 @@ def _boot(process_input_streaming, *, cancellation_after_stream=False):
     return app, restore
 
 
-def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
+def _post_stream(
+    process_input_streaming,
+    *,
+    cancel_on_check=None,
+    self_fenced=False,
+):
     os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
-        cancellation_after_stream=cancellation_after_stream,
+        cancel_on_check=cancel_on_check,
+        self_fenced=self_fenced,
     )
     try:
         with TestClient(app) as client:
@@ -98,14 +116,14 @@ def _post_stream(process_input_streaming, *, cancellation_after_stream=False):
 def _post_stream_with_agent(
     process_input_streaming,
     *,
-    cancellation_after_stream=False,
+    cancel_on_check=None,
 ):
     """Drive the real bridge route and retain its test agent for assertions."""
 
     os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
-        cancellation_after_stream=cancellation_after_stream,
+        cancel_on_check=cancel_on_check,
     )
     agent = app.state.agent
     try:
@@ -160,13 +178,131 @@ def test_bridge_stream_reports_stopped_command_instead_of_success():
 
     response = _post_stream(
         _stopped_command,
-        cancellation_after_stream=True,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
     events = _events(response.text)
     assert [event["type"] for event in events] == ["stopped"]
     assert events[0]["request_id"]
+
+
+def test_bridge_stream_reports_owner_self_fence_as_retryable_error():
+    async def _interrupted_command(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response = _post_stream(
+        _interrupted_command,
+        cancel_on_check=1,
+        self_fenced=True,
+    )
+
+    assert response.status_code == 200
+    events = _events(response.text)
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["code"] == "invocation_owner_lease_lost"
+    assert events[0]["retryable"] is True
+    assert events[0]["request_id"]
+
+
+def test_bridge_stream_renders_typed_admission_refusal_as_stopped():
+    """A durable Stop unwind must not be relabeled as a model-route failure."""
+
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+
+    async def _durably_stopped(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+        raise InvocationCancelledError("durable public-turn Stop won")
+
+    response = _post_stream(_durably_stopped)
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_stop_interrupts_producer_blocked_before_first_event():
+    """Bridge binds the same blocked producer owner to its request generation."""
+
+    producer_started = asyncio.Event()
+    release_producer = asyncio.Event()
+    producer_finalized = asyncio.Event()
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        return_value=SimpleNamespace(id="bridge-session")
+    )
+    bridge.log_invocation = AsyncMock()
+
+    class BlockedBridgeAgent(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+            self.features = {"BridgeFeature": bridge}
+
+        async def process_input_streaming(self, *_args, **_kwargs):
+            try:
+                producer_started.set()
+                await release_producer.wait()
+                yield "late"
+            finally:
+                producer_finalized.set()
+
+    agent = BlockedBridgeAgent()
+    app = FastAPI()
+    app.state.agent = agent
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/bridge/stream",
+            "raw_path": b"/api/bridge/stream",
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        }
+    )
+    route = next(
+        route
+        for route in get_router().routes
+        if getattr(route, "path", None) == "/api/bridge/stream"
+    )
+    endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+    response = await endpoint(
+        request,
+        BridgeRequest(message="work", request_id="blocked-bridge"),
+    )
+    consumer = asyncio.create_task(anext(response.body_iterator))
+
+    await asyncio.wait_for(producer_started.wait(), timeout=1)
+    assert agent.cancel_current_request("blocked-bridge") is True
+    try:
+        assert '"type": "stopped"' in await asyncio.wait_for(
+            consumer,
+            timeout=0.2,
+        )
+    finally:
+        release_producer.set()
+        if not consumer.done():
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        await response.body_iterator.aclose()
+
+    assert producer_finalized.is_set()
+    await asyncio.wait_for(
+        agent.wait_for_request_completion("blocked-bridge"),
+        timeout=1,
+    )
 
 
 def test_bridge_stream_withholds_chunk_queued_before_stop():
@@ -177,12 +313,29 @@ def test_bridge_stream_withholds_chunk_queued_before_stop():
 
     response, agent = _post_stream_with_agent(
         _queued,
-        cancellation_after_stream=True,
+        cancel_on_check=5,
     )
 
     assert response.status_code == 200
     assert [event["type"] for event in _events(response.text)] == ["stopped"]
     assert "must not escape" not in response.text
+    assert agent.features["BridgeFeature"].log_invocation.await_count == 1
+
+
+def test_bridge_stream_reports_stop_after_clean_producer_eof():
+    """A stopped clean unwind cannot fall through to done or outbound logging."""
+
+    async def _clean_eof(*_args, **_kwargs):
+        if False:
+            yield "unreachable"
+
+    response, agent = _post_stream_with_agent(
+        _clean_eof,
+        cancel_on_check=5,
+    )
+
+    assert response.status_code == 200
+    assert [event["type"] for event in _events(response.text)] == ["stopped"]
     assert agent.features["BridgeFeature"].log_invocation.await_count == 1
 
 

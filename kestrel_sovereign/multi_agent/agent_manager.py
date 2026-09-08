@@ -1059,6 +1059,12 @@ class AgentManager:
                 Awaitable[Optional[Callable[[], Awaitable[None]]]],
             ]
         ] = None
+        # Process-wide invocation ownership must be installed before feature
+        # initialization can start scheduler/signal work.  This synchronous
+        # seam is deliberately earlier than app onboarding/publication.
+        self._agent_pre_initialize_hook: Optional[
+            Callable[[str, KestrelAgent], None]
+        ] = None
         # Shared-PostgreSQL hosts install this after the long-lived scheduler
         # storage is ready. It durably prepares a runtime-created DID and
         # returns an async rollback for state seeded before onboarding commits.
@@ -1435,6 +1441,14 @@ class AgentManager:
         """Install config CAS removal for destructive persistent offboarding."""
 
         self._created_agent_registration_removal_hook = hook
+
+    def set_agent_pre_initialize_hook(
+        self,
+        hook: Optional[Callable[[str, KestrelAgent], None]],
+    ) -> None:
+        """Install host process authority before agent initialization."""
+
+        self._agent_pre_initialize_hook = hook
 
     def set_scheduler_tenant_registration_hook(
         self,
@@ -2781,6 +2795,9 @@ class AgentManager:
                 await active_boot_semaphore.acquire()
                 active_boot_slot_held = True
             try:
+                pre_initialize = self._agent_pre_initialize_hook
+                if pre_initialize is not None:
+                    pre_initialize(name, agent)
                 await agent.initialize()
             finally:
                 if active_boot_semaphore is not None and active_boot_slot_held:

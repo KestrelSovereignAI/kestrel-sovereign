@@ -12,6 +12,7 @@ permanently blocks ``idle_agents_only`` restarts (#1558).
 """
 
 import asyncio
+import inspect
 import logging
 import time
 from contextvars import ContextVar
@@ -38,8 +39,101 @@ _current_request_generation: ContextVar[tuple[int, str, int] | None] = ContextVa
 )
 
 
+def bind_request_operation_if_supported(
+    agent: object,
+    request_id: str,
+    operation: asyncio.Task,
+) -> bool:
+    """Bind a real lifecycle implementation without trusting dynamic proxies."""
+
+    try:
+        inspect.getattr_static(agent, "bind_request_operation")
+    except AttributeError:
+        return False
+    binder = getattr(agent, "bind_request_operation")
+    if not callable(binder):
+        raise TypeError("request operation binder must be callable")
+    binder(request_id, operation)
+    return True
+
+
 class RequestLifecycleMixin:
     """Mixin providing request tracking and cancellation for KestrelAgent."""
+
+    async def await_durable_request_admission(self, request_id: str) -> bool:
+        """Publish this exact generation before any cognition can begin.
+
+        A host without the distributed registry retains the local lifecycle
+        contract.  A host with one fails closed if an exact Stop fence won the
+        shared-database race.
+        """
+
+        generation = self._request_generation_for_current_task(request_id)
+        if generation is None:
+            raise RuntimeError("durable admission requires an active generation")
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return True
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            raise TypeError("distributed invocation registry cannot register")
+        admitted = await register(self, request_id, generation)
+        if admitted is not True:
+            self.reserve_request_cancellation(request_id)
+            self._consume_pending_request_cancellation(request_id, generation)
+            return False
+        return True
+
+    async def await_durable_turn_admission(
+        self,
+        turn_id: str,
+        request_id: str,
+        generation: int | None,
+    ) -> bool:
+        """Publish a public turn against its exact durable generation UUID."""
+
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return True
+        if generation is None:
+            raise RuntimeError("durable turn admission requires a generation")
+        bind = getattr(registry, "bind_public_turn", None)
+        if not callable(bind):
+            raise TypeError("distributed invocation registry cannot bind turns")
+        admitted = await bind(self, turn_id, request_id, generation)
+        if admitted is not True:
+            cancelled_generations = getattr(
+                self,
+                "_cancelled_request_generations",
+                None,
+            )
+            if not isinstance(cancelled_generations, set):
+                cancelled_generations = set()
+                self._cancelled_request_generations = cancelled_generations
+            cancelled_generations.add((request_id, generation))
+            cancelled_requests = getattr(self, "_cancelled_requests", None)
+            if not isinstance(cancelled_requests, set):
+                cancelled_requests = set()
+                self._cancelled_requests = cancelled_requests
+            cancelled_requests.add(request_id)
+            return False
+        return True
+
+    def _complete_durable_request_generation(
+        self,
+        request_id: str,
+        generation: int | None,
+        disposition: RequestCompletionDisposition,
+    ) -> None:
+        if generation is None:
+            return
+        registry = getattr(self, "_distributed_invocation_registry", None)
+        if registry is None:
+            return
+        complete = getattr(registry, "complete_soon", None)
+        if not callable(complete):
+            raise TypeError("distributed invocation registry cannot complete")
+        complete(self, request_id, generation, disposition=disposition)
 
     def register_active_request(self, request_id: str) -> int:
         """Track an active delivery and bind its generation to this task."""
@@ -52,6 +146,11 @@ class RequestLifecycleMixin:
             set,
         ):
             self._cancelled_request_generations = set()
+        if not isinstance(
+            getattr(self, "_self_fenced_request_generations", None),
+            set,
+        ):
+            self._self_fenced_request_generations = set()
         if not isinstance(getattr(self, "_active_request_counts", None), dict):
             self._active_request_counts = {}
         counts = self._active_request_counts
@@ -385,6 +484,43 @@ class RequestLifecycleMixin:
         )
         return True
 
+    def self_fence_current_request(
+        self,
+        request_id: str,
+        *,
+        generation: int,
+    ) -> bool:
+        """Cancel one generation while preserving infrastructure provenance."""
+
+        fenced = getattr(self, "_self_fenced_request_generations", None)
+        if not isinstance(fenced, set):
+            fenced = set()
+            self._self_fenced_request_generations = fenced
+        key = (request_id, generation)
+        fenced.add(key)
+        try:
+            cancelled = self.cancel_current_request(
+                request_id=request_id,
+                generation=generation,
+            )
+        except BaseException:
+            fenced.discard(key)
+            raise
+        if not cancelled:
+            fenced.discard(key)
+        return cancelled
+
+    def is_request_self_fenced(self, request_id: str) -> bool:
+        """Whether this task's generation was cancelled by lease self-fencing."""
+
+        generation = self._request_generation_for_current_task(request_id)
+        fenced = getattr(self, "_self_fenced_request_generations", None)
+        return bool(
+            generation is not None
+            and isinstance(fenced, set)
+            and (request_id, generation) in fenced
+        )
+
     def is_request_cancelled(self, request_id: Optional[str] = None) -> bool:
         """Check if a request has been cancelled."""
         rid = request_id or self._current_request_id
@@ -532,6 +668,7 @@ class RequestLifecycleMixin:
         disposition: RequestCompletionDisposition = (
             RequestCompletionDisposition.COMPLETED
         ),
+        generation: int | None = None,
     ) -> None:
         """Release one delivery after completed or failed nested cleanup."""
 
@@ -539,7 +676,11 @@ class RequestLifecycleMixin:
             raise TypeError("request completion disposition must be typed")
         active_request_ids = getattr(self, "_active_request_ids", None)
         counts = getattr(self, "_active_request_counts", None)
-        generation = self._request_generation_for_cleanup(request_id)
+        generation = (
+            self._request_generation_for_cleanup(request_id)
+            if generation is None
+            else generation
+        )
         active_generations = getattr(self, "_active_request_generations", None)
         active_generation = (
             active_generations.get(request_id)
@@ -622,6 +763,11 @@ class RequestLifecycleMixin:
                 final_disposition,
                 generation=generation,
             )
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                final_disposition,
+            )
             return
 
         cleans_active_generation = (
@@ -667,6 +813,11 @@ class RequestLifecycleMixin:
                 effective_disposition,
                 generation=generation,
             )
+            self._complete_durable_request_generation(
+                request_id,
+                generation,
+                effective_disposition,
+            )
 
     def _release_cancelled_generation(
         self,
@@ -686,6 +837,13 @@ class RequestLifecycleMixin:
                 self._cancelled_requests.discard(request_id)
         else:
             self._cancelled_requests.discard(request_id)
+        self_fenced = getattr(
+            self,
+            "_self_fenced_request_generations",
+            None,
+        )
+        if isinstance(self_fenced, set) and generation is not None:
+            self_fenced.discard((request_id, generation))
 
     def active_request_ages(self) -> Dict[str, float]:
         """Return ``{request_id: age_seconds}`` for each active request.

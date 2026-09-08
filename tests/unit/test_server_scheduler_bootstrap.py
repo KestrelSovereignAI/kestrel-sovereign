@@ -418,6 +418,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is effective_config
         events.append("preflight")
 
+    async def _stop_receipts(app) -> None:
+        events.append("stop-receipts")
+        app.state.stop_receipt_store = object()
+        app.state.stop_receipt_db = None
+
     async def _start(app, supplied_manager, config) -> None:
         assert supplied_manager is manager
         assert config is effective_config
@@ -446,6 +451,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(
         server, "_start_shared_agent_postgres_backend", _shared_backend
     )
+    monkeypatch.setattr(server, "_initialize_stop_receipts", _stop_receipts)
     monkeypatch.setattr(server, "_start_host_scheduler", _start)
     monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *_a, **_k: None)
     monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
@@ -537,6 +543,12 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert restored["ConcurrentChild"] == concurrent_config
         assert restored["ExternalChild"] == external_config
 
-    assert events == ["reconcile", "preflight", "load", "host-start"]
+    assert events == [
+        "stop-receipts",
+        "reconcile",
+        "preflight",
+        "load",
+        "host-start",
+    ]
     assert callable(manager.created_agent_persistence_hook)
     assert callable(manager.created_agent_registration_removal_hook)
