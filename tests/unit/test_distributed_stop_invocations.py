@@ -641,6 +641,62 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
+    """A captured row that completes before SQL polling is not lease-lost."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-completion-race.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=1.0,
+    )
+    agent = _ReplicaAgent("did:test:relay-completion-race")
+    original_poll = store.poll_owner
+    poll_entered = asyncio.Event()
+    release_poll = asyncio.Event()
+
+    async def pause_before_snapshot(*args, **kwargs):
+        poll_entered.set()
+        await release_poll.wait()
+        return await original_poll(*args, **kwargs)
+
+    try:
+        assert await registry.register(agent, "completing-turn", 1)
+        assert await registry.register(agent, "unrelated-turn", 2)
+        completing_generation_id = registry._by_local_generation[
+            (id(agent), "completing-turn", 1)
+        ]
+        unrelated_generation_id = registry._by_local_generation[
+            (id(agent), "unrelated-turn", 2)
+        ]
+        store.poll_owner = pause_before_snapshot
+        registry.start()
+        await asyncio.wait_for(poll_entered.wait(), timeout=1)
+
+        registry.complete_soon(agent, "completing-turn", 1)
+        for _ in range(100):
+            if completing_generation_id not in registry._active:
+                break
+            await asyncio.sleep(0.01)
+        assert completing_generation_id not in registry._active
+
+        release_poll.set()
+        await asyncio.sleep(0.05)
+
+        assert registry._lease_lost is False
+        assert unrelated_generation_id in registry._active
+    finally:
+        release_poll.set()
+        store.poll_owner = original_poll
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
     """A committed deletion cannot falsely fence unrelated active work."""
 

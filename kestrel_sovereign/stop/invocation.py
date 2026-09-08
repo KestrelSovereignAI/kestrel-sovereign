@@ -1033,7 +1033,17 @@ class DistributedInvocationRegistry:
                 # the inventory captured above. A concurrent admission may be
                 # published locally after that SQL snapshot; comparing it to
                 # this older reply would falsely declare the healthy owner
-                # lease lost. The fresh row is covered by the next poll.
+                # lease lost. Conversely, an originally captured row can enter
+                # ordinary completion before the database snapshot and be
+                # legitimately absent. Compare the captured inventory only
+                # after subtracting rows that have since completed or begun
+                # completion; fresh admissions are covered by the next poll.
+                lease_owned_generation_ids = tuple(
+                    generation_id
+                    for generation_id in lease_owned_generation_ids
+                    if generation_id in self._active
+                    and generation_id not in self._completing_generation_ids
+                )
                 if any(
                     generation_id not in live
                     for generation_id in lease_owned_generation_ids
