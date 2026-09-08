@@ -3084,11 +3084,20 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             )
             direct_member = _static_member_reference(node.func)
             bound_method = self.flows[-1].resolve(node.func)
+            functional_publish = bool(
+                node.args
+                and _call_name(node).casefold()
+                in {"__setitem__", "ior", "setdefault", "setitem", "update"}
+                and self._is_registry(node.args[0])
+            )
             publishes_directly = bool(
                 direct_member is not None
                 and direct_member[1] in self.PUBLISH_METHODS
                 and self._is_registry(direct_member[0])
-            ) or bound_method in self.PUBLISH_BINDINGS.values()
+            ) or (
+                bound_method in self.PUBLISH_BINDINGS.values()
+                or functional_publish
+            )
             helper = _registry_helper_call_bindings(
                 node,
                 helpers,
@@ -4428,6 +4437,47 @@ def _route_declarations(
         call: ast.Call,
         route_collections: dict[str, _StaticBinding],
     ) -> tuple[ast.AST, list[ast.AST]] | None:
+        operation = _call_name(call).casefold()
+        functional_collection = call.args[0] if call.args else None
+        if (
+            functional_collection is not None
+            and route_collection_receiver(
+                functional_collection, route_collections
+            )
+            is not None
+        ):
+            if operation == "append" and len(call.args) == 2 and not call.keywords:
+                return functional_collection, [call.args[1]]
+            if (
+                operation in {"extend", "iadd"}
+                and len(call.args) == 2
+                and not call.keywords
+            ):
+                values = call.args[1]
+                if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+                    return functional_collection, list(values.elts)
+            if operation == "insert" and len(call.args) == 3 and not call.keywords:
+                return functional_collection, [call.args[2]]
+            if operation in {
+                "__delitem__",
+                "__iadd__",
+                "__setitem__",
+                "append",
+                "clear",
+                "delitem",
+                "extend",
+                "iadd",
+                "insert",
+                "pop",
+                "remove",
+                "reverse",
+                "setitem",
+                "sort",
+            }:
+                raise AssertionError(
+                    "Unresolved functional route collection mutation: "
+                    f"{ast.unparse(call)}"
+                )
         member = _static_member_reference(call.func)
         if (
             member is None
@@ -5426,6 +5476,29 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
         "example.py::Publisher.replace",
         "example.py::Publisher.setattr_replace",
         "example.py::Publisher.union",
+    }
+
+
+@pytest.mark.parametrize(
+    "publication",
+    (
+        "operator.setitem(self._direct_tools, 'x', tool)",
+        "dict.__setitem__(self._direct_tools, 'x', tool)",
+        "dict.update(self._direct_tools, {'x': tool})",
+        "operator.ior(self._direct_tools, {'x': tool})",
+    ),
+)
+def test_functional_dynamic_tool_registry_writes_are_inventoried(
+    publication: str,
+) -> None:
+    tree = ast.parse(
+        "class Publisher:\n"
+        "    def publish(self, tool):\n"
+        f"        {publication}\n"
+    )
+
+    assert _direct_tool_writer_surfaces(tree, "example.py") == {
+        "example.py::Publisher.publish"
     }
 
 
@@ -6627,6 +6700,31 @@ def test_route_objects_appended_to_route_collections_are_inventoried() -> None:
         (("POST",), "/host/restart"),
         (("WEBSOCKET",), "/agents/{name}/events"),
     ]
+
+
+def test_functional_route_collection_publications_are_inventoried() -> None:
+    tree = ast.parse(
+        "app = Starlette()\n"
+        "list.append(app.routes, Route(\n"
+        "    '/api/agents/{name}/stop', endpoint, methods=['POST']\n"
+        "))\n"
+        "operator.iadd(app.routes, [\n"
+        "    Route('/host/restart', endpoint, methods=['POST'])\n"
+        "])\n"
+    )
+    unresolved = ast.parse(
+        "app = Starlette()\n"
+        "operator.setitem(app.routes, index, build_route())\n"
+    )
+
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST",), "/api/agents/{name}/stop"),
+        (("POST",), "/host/restart"),
+    ]
+    with pytest.raises(
+        AssertionError, match="functional route collection mutation"
+    ):
+        _route_declarations(unresolved, {}, {})
 
 
 def test_route_collection_alias_publications_are_inventoried() -> None:
@@ -9332,6 +9430,7 @@ def _is_cross_agent_control_call(
     return (
         _CALLABLE_CONTROL in _callable_semantics(node.func)
         or _is_unambiguous_control_sink(node, control_aliases)
+        or _shell_adapter_invokes_kestrel_lifecycle(node)
         or kills_agent_process
         or call_name in (control_aliases or set())
         or any(
@@ -9344,6 +9443,87 @@ def _is_cross_agent_control_call(
             or token in (control_aliases or set())
             for token in callable_tokens
         )
+    )
+
+
+def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
+    """Recognize statically visible host-lifecycle CLI re-entry.
+
+    The shell/subprocess adapter is merely the execution mechanism; the
+    authority-bearing operation lives in its command payload.  Restrict the
+    check to known adapters and a literal ``kestrel <lifecycle-verb>`` command
+    prefix so logging or echoing the same words does not become a control sink.
+    """
+
+    def reference_path(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id.casefold()
+        if isinstance(node, ast.Attribute):
+            prefix = reference_path(node.value)
+            return (
+                f"{prefix}.{node.attr.casefold()}"
+                if prefix
+                else node.attr.casefold()
+            )
+        return ""
+
+    adapter = reference_path(call.func)
+    adapter_name = adapter.rsplit(".", 1)[-1]
+    positional_command = call.args[0] if call.args else None
+    keyword_command = next(
+        (
+            keyword.value
+            for keyword in call.keywords
+            if keyword.arg in {"args", "cmd", "command"}
+        ),
+        None,
+    )
+    command = positional_command or keyword_command
+    if command is None:
+        return False
+
+    shell_adapters = {"os.system", "shell"}
+    subprocess_adapters = {
+        "asyncio.create_subprocess_exec",
+        "asyncio.create_subprocess_shell",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.popen",
+        "subprocess.run",
+    }
+    if (
+        adapter not in shell_adapters
+        and adapter_name != "shell"
+        and adapter not in subprocess_adapters
+    ):
+        return False
+
+    def literal_tokens(node: ast.AST) -> list[str]:
+        return [
+            token
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+            for token in SOURCE_IDENTIFIER_CHAIN.findall(child.value.casefold())
+        ]
+
+    if isinstance(command, (ast.List, ast.Tuple)):
+        if len(command.elts) < 2:
+            return False
+        executable = literal_tokens(command.elts[0])
+        operation = literal_tokens(command.elts[1])
+        return bool(
+            executable
+            and executable[-1] == "kestrel"
+            and operation
+            and _is_cross_agent_lifecycle_action(operation[0])
+        )
+
+    tokens = literal_tokens(command)
+    return bool(
+        len(tokens) >= 2
+        and tokens[0] == "kestrel"
+        and _is_cross_agent_lifecycle_action(tokens[1])
     )
 
 
@@ -16083,6 +16263,36 @@ def test_provenance_scanner_recognizes_generic_lifecycle_control_sinks() -> None
 
     assert _authority_provenance_lines(target_shutdown) == {2}
     assert _authority_provenance_lines(process_kill) == {2}
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        'subprocess.run(["kestrel", "terminate", target.name])',
+        'os.system(f"kestrel restart {target.name}")',
+        'shell(command=f"kestrel stop {target.name}")',
+    ),
+)
+def test_provenance_scanner_recognizes_shell_lifecycle_commands(
+    invocation: str,
+) -> None:
+    tree = ast.parse(
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        f"        {invocation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+def test_shell_payload_words_without_lifecycle_execution_are_benign() -> None:
+    tree = ast.parse(
+        "def dispatch(request):\n"
+        "    if request.causation_chain:\n"
+        '        subprocess.run(["echo", "kestrel terminate"])\n'
+    )
+
+    assert _authority_provenance_lines(tree) == set()
 
 
 def test_provenance_scanner_recognizes_delegation_revocation_control_sink() -> None:
