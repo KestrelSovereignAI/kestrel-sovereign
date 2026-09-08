@@ -130,6 +130,13 @@ class PersonMatch:
 # =============================================================================
 
 
+#: Concept categories the linker gives people; ``None`` is a node written
+#: before categories were stored.
+PERSON_CATEGORIES = frozenset({"person", "proper_noun", None})
+#: Edge from a mention's own concept node to the person the user confirmed.
+ALIAS_EDGE_LABEL = "alias_of"
+
+
 class PersonResolver:
     """Three-pass person concept resolution.
 
@@ -160,6 +167,15 @@ class PersonResolver:
         normalized = _normalize_person_name(name)
         if not normalized:
             return PersonMatch(concept_id=None, status="new", candidates=[])
+
+        # Pass 0: a mention the user already resolved. ``confirm_person_match``
+        # records an ``alias_of`` edge from the mention's own node to the
+        # chosen person, and that answer stands for every later mention;
+        # without it the same ambiguity re-prompted forever (#3259).
+        if self_node_id:
+            canonical = await self._confirmed_alias(self_node_id)
+            if canonical:
+                return PersonMatch(concept_id=canonical, status="exact", candidates=[])
 
         # Pull all existing person concepts for this agent, less the mention's
         # own node.
@@ -200,8 +216,20 @@ class PersonResolver:
 
         return PersonMatch(concept_id=None, status="new", candidates=[])
 
+    async def _confirmed_alias(self, node_id: str) -> Optional[str]:
+        """The person a mention node was confirmed to mean, or ``None``."""
+        for edge in await self.graph.get_edges(node_id, direction="out"):
+            if edge.label == ALIAS_EDGE_LABEL:
+                return edge.target_id
+        return None
+
     async def _list_person_concepts(self, agent_id: str) -> List[Tuple[str, str]]:
         """Return list of (concept_id, label) for person concepts of this agent.
+
+        Only nodes the linker categorised as ``person`` or ``proper_noun``
+        are candidates; a month or a place is never a person. A node written
+        before the linker stored categories carries none and is admitted
+        until its next mention stamps it (#3259).
 
         Read through the graph facade's own typed query, never a raw ``db``
         handle: the privacy-governing graph proxy forwards
@@ -213,7 +241,12 @@ class PersonResolver:
         """
         prefix = f"concept:{agent_id}:"
         nodes = await self.graph.get_nodes_by_type("concept")
-        return [(node.node_id, node.label) for node in nodes if node.node_id.startswith(prefix)]
+        return [
+            (node.node_id, node.label)
+            for node in nodes
+            if node.node_id.startswith(prefix)
+            and (node.properties or {}).get("category", None) in PERSON_CATEGORIES
+        ]
 
 
 def _normalize_person_name(name: str) -> str:

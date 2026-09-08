@@ -341,13 +341,19 @@ class TestConfirmPersonMatch:
             concept_id="concept:did:test:recall-agent:alice-smith",
         )
         assert result.status is ToolResultStatus.OK
-        # A mentions edge must be written with the canonical concept
-        feature.agent.storage.graph.add_edge.assert_awaited()
-        call = feature.agent.storage.graph.add_edge.await_args
-        assert call.args[2] == "mentions"
-        props = call.kwargs.get("properties") or {}
+        # A mentions edge must be written with the canonical concept, then
+        # the answer recorded as an alias from the ambiguous node so the
+        # next mention resolves without asking again (#3259).
+        writes = feature.agent.storage.graph.add_edge.await_args_list
+        assert [c.args[2] for c in writes] == ["mentions", "alias_of"]
+        canonical, alias = writes
+        assert canonical.args[1] == "concept:did:test:recall-agent:alice-smith"
+        props = canonical.kwargs.get("properties") or {}
         assert props.get("confirmed") is True
         assert props.get("resolved_from") == "alice"
+        assert alias.args[0] == "concept:did:test:recall-agent:alice"
+        assert alias.args[1] == "concept:did:test:recall-agent:alice-smith"
+        assert (alias.kwargs.get("properties") or {}).get("confirmed_from_message") == "msg-1"
 
     @pytest.mark.asyncio
     async def test_attempts_to_remove_ambiguous_edge(self, feature):

@@ -49,11 +49,9 @@ async def test_a_first_name_shared_by_two_people_is_pending_through_the_pipeline
     people, summary = await _say(linker, router, "m3", "Thanks Jon for everything.")
     assert people == ["jon"]
     assert summary["interactions"] == 1
-    assert summary["pending_person_matches"] == [{
-        "mentioned_label": "jon",
-        "candidates": [f"concept:{AGENT}:jon doe", f"concept:{AGENT}:jon lee"],
-        "message_id": "m3",
-    }]
+    (pending,) = summary["pending_person_matches"]
+    assert (pending["mentioned_label"], pending["message_id"]) == ("jon", "m3")
+    assert sorted(pending["candidates"]) == [f"concept:{AGENT}:jon doe", f"concept:{AGENT}:jon lee"]
 
 
 @pytest.mark.asyncio
@@ -94,3 +92,67 @@ async def test_a_mention_never_resolves_to_itself(pipeline):
 async def test_linker_names(pipeline, text, people):
     linker, router, _graph = pipeline
     assert (await _say(linker, router, "m1", text))[0] == people
+
+
+@pytest.mark.asyncio
+async def test_a_classified_word_next_to_a_name_is_not_part_of_it(pipeline):
+    """Review round 1 P1: "Robert Monday" is Robert, on Monday."""
+    linker, router, graph = pipeline
+    people, _summary = await _say(linker, router, "m1", "Lunch with Robert Monday was great.")
+    assert people == ["robert"]
+    assert (await graph.get_node(f"concept:{AGENT}:monday")).properties["category"] == "time"
+    assert (await graph.get_node(f"concept:{AGENT}:robert")).properties["category"] == "proper_noun"
+    assert await graph.get_node(f"concept:{AGENT}:robert monday") is None
+
+
+@pytest.mark.asyncio
+async def test_candidates_are_people_never_a_month(pipeline):
+    linker, router, _graph = pipeline
+    await _say(linker, router, "m1", "It all happened in March.")
+    await _say(linker, router, "m2", "I called Marcus about it.")
+    people, summary = await _say(linker, router, "m3", "I met Marc again.")
+    assert people == ["marc"]
+    assert summary["pending_person_matches"] == []
+    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
+    assert (match.status, match.concept_id) == ("fuzzy", f"concept:{AGENT}:marcus")
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_node_without_a_category_is_admitted_until_stamped(pipeline):
+    from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+    linker, router, graph = pipeline
+    await graph.add_node(GraphNode(
+        node_id=f"concept:{AGENT}:march", node_type="concept", label="march",
+        properties={"agent_id": AGENT, "mention_count": 1},
+    ))
+    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
+    assert match.concept_id == f"concept:{AGENT}:march"  # legacy, unstamped: admitted
+    await _say(linker, router, "m1", "It all happened in March.")  # stamped as time
+    match = await router.person_resolver.resolve("marc", AGENT, self_node_id=f"concept:{AGENT}:marc")
+    assert match.status == "new"
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_match_converges(pipeline):
+    """Review round 1 P2: after the user confirms who "Jon" is, the next
+    mention resolves to that person and does not ask again."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.memory.feature import MemoryFeature
+
+    linker, router, graph = pipeline
+    await _say(linker, router, "m1", "I helped Jon Doe move.")
+    await _say(linker, router, "m2", "I called Jon Lee about the sink.")
+    _people, summary = await _say(linker, router, "m3", "Thanks Jon for everything.")
+    assert len(summary["pending_person_matches"]) == 1
+
+    feature = SimpleNamespace(agent=SimpleNamespace(storage=SimpleNamespace(graph=graph)), agent_id=AGENT)
+    confirm = getattr(MemoryFeature.confirm_person_match, "__wrapped__", MemoryFeature.confirm_person_match)
+    result = await confirm(feature, message_id="m3", mentioned_label="jon", concept_id=f"concept:{AGENT}:jon doe")
+    assert result.error is None, result.error
+
+    _people, summary = await _say(linker, router, "m4", "Thanks Jon again.")
+    assert summary["pending_person_matches"] == []
+    match = await router.person_resolver.resolve("jon", AGENT, self_node_id=f"concept:{AGENT}:jon")
+    assert (match.status, match.concept_id) == ("exact", f"concept:{AGENT}:jon doe")

@@ -623,8 +623,14 @@ five categories:
 | Activities | cooking, reading, running, travel, gardening |
 | Emotions | happy, sad, angry, scared, anxious, excited |
 
-Proper nouns (capitalized words mid-sentence) are also extracted as
-potential concepts.
+Proper nouns are also extracted as potential concepts: a run of consecutive
+capitalized words mid-sentence is one concept ("jon doe"), a word that starts
+a sentence is never part of a name, and a run stops at a word the keyword
+passes already classified ("Robert Monday" is Robert, on Monday). Concept
+nodes carry the category they were extracted with, and the person resolver
+offers only people as candidates. A multi-word label matches a memory only
+where the name appears whole, so the retriever's concept-overlap bonus no
+longer fires on a bare first name; the resolver's fuzzy pass covers that.
 
 ### Association Strengthening
 

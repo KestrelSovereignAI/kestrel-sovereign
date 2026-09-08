@@ -10,7 +10,7 @@ Example: "Mom" triggers "Sunday calls", "Brooklyn", "her garden"
 import re
 import logging
 from dataclasses import dataclass
-from typing import List, Literal, Set, Dict, Any
+from typing import List, Literal, Optional, Set, Dict, Any
 from datetime import datetime, timezone
 
 from .async_graph_store import AsyncGraphStore, GraphNode
@@ -22,6 +22,9 @@ ConceptCategory = Literal[
     "person", "place", "time", "activity", "emotion", "proper_noun"
 ]
 
+
+#: A capitalised stop word ends a proper-noun run: "Jon And Doe" is not one name.
+_RUN_STOP_WORDS = frozenset({"the", "and", "but", "for"})
 
 @dataclass
 class LinkedConcept:
@@ -140,9 +143,11 @@ class AssociativeLinker:
 
         labels = [label for label, _ in categorized]
 
-        # Create/update concept nodes
-        for label in labels:
-            await self._ensure_concept_node(label, agent_id)
+        # Create/update concept nodes, stamping the category the extraction
+        # gave each one: the person resolver reads it to keep months and
+        # places out of a person's candidate list (#3259).
+        for label, category in categorized:
+            await self._ensure_concept_node(label, agent_id, category)
 
         # Create message → concept links
         linked: List[LinkedConcept] = []
@@ -225,6 +230,13 @@ class AssociativeLinker:
             run: List[str] = []
             j = i
             while j < len(words) and words[j][0].isupper() and len(words[j]) > 2:
+                token = re.sub(r"[^\w]", "", words[j]).lower()
+                # A word the keyword passes already classified ("Monday",
+                # "Christmas") is its own concept, never part of a name:
+                # "Robert Monday" is Robert, on Monday. A stop word ends a
+                # run the same way.
+                if token in seen or token in _RUN_STOP_WORDS:
+                    break
                 run.append(words[j])
                 if words[j][-1] in ".!?,;:":
                     j += 1
@@ -234,7 +246,7 @@ class AssociativeLinker:
                 clean = " ".join(
                     part for part in (re.sub(r"[^\w]", "", w).lower() for w in run) if part
                 )
-                if clean and clean not in ["the", "and", "but", "for"] and clean not in seen:
+                if clean and clean not in seen:
                     seen.add(clean)
                     results.append((clean, "proper_noun"))
             i = max(j, i + 1)
@@ -244,9 +256,15 @@ class AssociativeLinker:
     async def _ensure_concept_node(
         self,
         concept: str,
-        agent_id: str
+        agent_id: str,
+        category: Optional[str] = None,
     ) -> None:
-        """Create or update concept node in graph."""
+        """Create or update concept node in graph.
+
+        ``category`` is recorded on the node (and refreshed on every
+        mention, so a node written before categories were stored acquires
+        one the next time it is mentioned).
+        """
         concept_node_id = f"concept:{agent_id}:{concept}"
 
         existing = await self.graph.get_node(concept_node_id)
@@ -255,6 +273,8 @@ class AssociativeLinker:
             props = existing.properties or {}
             props["mention_count"] = props.get("mention_count", 0) + 1
             props["last_mentioned"] = datetime.now(timezone.utc).isoformat()
+            if category:
+                props["category"] = category
             await self.graph.add_node(GraphNode(
                 node_id=concept_node_id,
                 node_type="concept",
@@ -272,6 +292,7 @@ class AssociativeLinker:
                     "agent_id": agent_id,
                     "first_mentioned": datetime.now(timezone.utc).isoformat(),
                     "last_mentioned": datetime.now(timezone.utc).isoformat(),
+                    **({"category": category} if category else {}),
                 },
             ))
 

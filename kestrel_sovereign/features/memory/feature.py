@@ -18,6 +18,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 import asyncio
 import inspect
 import logging
+from kestrel_sovereign.storage.schema_router import ALIAS_EDGE_LABEL
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
@@ -1933,6 +1934,27 @@ class MemoryFeature(Feature):
         except Exception as e:
             logger.error("confirm_person_match canonical edge write failed: %s", e)
             return ToolResult.failed(str(e))
+        # Record the answer where the resolver reads it, so the next mention
+        # of this label resolves to the confirmed person instead of asking
+        # again (#3259). Same node ids the router used; both are this
+        # agent's, so the edge is permitted.
+        if ambiguous_target != concept_id:
+            try:
+                await storage.graph.add_edge(
+                    ambiguous_target,
+                    concept_id,
+                    ALIAS_EDGE_LABEL,
+                    properties={
+                        "confirmed_from_message": message_id,
+                        "confirmed_at": _utc_now_iso(),
+                    },
+                )
+            except Exception as e:
+                logger.error("confirm_person_match alias edge write failed: %s", e)
+                return ToolResult.failed(
+                    f"canonical edge written but the alias for future mentions "
+                    f"could not be recorded: {e}"
+                )
 
         # Honesty: AsyncGraphStore.delete_edge() is a SQL DELETE that
         # returns no affected-row count and does not raise when the
