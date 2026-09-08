@@ -2863,7 +2863,7 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
     string_constants = _module_string_constants(tree)
 
     class DirectToolWriterVisitor(ast.NodeVisitor):
-        PUBLISH_METHODS = {"__setitem__", "setdefault", "update"}
+        PUBLISH_METHODS = {"__ior__", "__setitem__", "setdefault", "update"}
         REGISTRY_BINDING = ("_direct_tools", "mutable-registry")
         PUBLISH_BINDINGS = {
             method: ("_direct_tools", f"publish:{method}")
@@ -3088,7 +3088,14 @@ def _direct_tool_writer_surfaces(tree: ast.Module, relative: str) -> set[str]:
             functional_publish = bool(
                 node.args
                 and _call_name(node).casefold()
-                in {"__setitem__", "ior", "setdefault", "setitem", "update"}
+                in {
+                    "__ior__",
+                    "__setitem__",
+                    "ior",
+                    "setdefault",
+                    "setitem",
+                    "update",
+                }
                 and self._is_registry(node.args[0])
             )
             publishes_directly = bool(
@@ -5485,6 +5492,8 @@ def test_dynamic_tool_registry_mutation_forms_are_inventoried() -> None:
     (
         "operator.setitem(self._direct_tools, 'x', tool)",
         "dict.__setitem__(self._direct_tools, 'x', tool)",
+        "dict.__ior__(self._direct_tools, {'x': tool})",
+        "self._direct_tools.__ior__({'x': tool})",
         "dict.update(self._direct_tools, {'x': tool})",
         "operator.ior(self._direct_tools, {'x': tool})",
     ),
@@ -7925,6 +7934,7 @@ _CROSS_AGENT_TARGETED_CONTROL_ACTIONS = frozenset(
     {
         "ask",
         "delegate",
+        "deploy",
         "dispatch",
         "execute",
         "invoke",
@@ -7935,6 +7945,7 @@ _CROSS_AGENT_TARGETED_CONTROL_ACTIONS = frozenset(
         "spawn",
         "submit",
         "subscribe",
+        "teardown",
         "verify",
     }
 )
@@ -9818,7 +9829,7 @@ def _provenance_aliases(
         parameter.arg.casefold()
         for parameter in annotated_parameters
         if parameter.annotation is not None
-        and _has_provenance_token(parameter.annotation)
+        and _has_provenance_token(parameter.annotation, aliases)
     )
     default_bindings = [
         *zip(
@@ -13004,6 +13015,21 @@ def _module_provenance_constant_aliases(
     return aliases
 
 
+def _module_imported_provenance_annotation_aliases(tree: ast.AST) -> set[str]:
+    """Return local aliases for imported causation/provenance annotation types."""
+
+    if not isinstance(tree, ast.Module):
+        return set()
+    return {
+        (imported.asname or imported.name).casefold()
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for imported in node.names
+        if imported.name != "*"
+        and _has_provenance_token(ast.Name(id=imported.name))
+    }
+
+
 def _module_imported_provenance_accessor_aliases(tree: ast.AST) -> set[str]:
     """Return module aliases that preserve canonical chain accessors."""
 
@@ -13613,6 +13639,7 @@ def _direct_provenance_helper_names(source_path: Path) -> frozenset[str]:
     ]
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_annotation_aliases(tree)
         | _module_imported_provenance_accessor_aliases(tree)
     )
     module_control_aliases = _module_imported_control_aliases(tree)
@@ -13706,6 +13733,7 @@ def _repository_provenance_helper_names(
     )
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_annotation_aliases(tree)
         | _module_imported_provenance_accessor_aliases(tree)
     )
     module_control_aliases = _module_imported_control_aliases(
@@ -14470,6 +14498,7 @@ def _authority_provenance_lines(
     }
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
+        | _module_imported_provenance_annotation_aliases(tree)
         | _module_imported_provenance_accessor_aliases(tree)
     )
     imported_provenance_helpers = (
@@ -16902,10 +16931,27 @@ def test_provenance_scanner_recognizes_peer_targeted_control_calls() -> None:
         "        store.read(peer)\n\n"
         "def benign(request, metrics):\n"
         "    if request.causation_chain:\n"
-        "        metrics.read()\n"
+        "        metrics.read()\n\n"
+        "def first(request, peer):\n"
+        "    if request.causation_chain:\n"
+        "        peer.deploy()\n\n"
+        "def second(request, peer):\n"
+        "    if request.orchestrator:\n"
+        "        peer.teardown()\n"
     )
 
-    assert _authority_provenance_lines(tree) == {2, 6, 10}
+    assert _authority_provenance_lines(tree) == {2, 6, 10, 18, 22}
+
+
+def test_provenance_scanner_resolves_imported_annotation_aliases() -> None:
+    tree = ast.parse(
+        "from kestrel_sdk.signals import CausationFrame as Frame\n\n"
+        "def dispatch(context: Frame, child):\n"
+        "    if context:\n"
+        "        child.stop()\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {4}
 
 
 def test_provenance_scanner_follows_control_return_helpers(
