@@ -46,6 +46,7 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -148,6 +149,8 @@ def get_router() -> APIRouter:
             )
         except InvocationCancelledError as error:
             raise stopped_invocation_http_error(request_id) from error
+        except HoldTurnRefusal as exc:
+            raise exc.as_http_exception() from exc
         except Exception:
             # Exception text and tracebacks can contain bridge message/context
             # content.  The client receives only the fixed HTTP detail below;
@@ -316,6 +319,8 @@ def get_router() -> APIRouter:
                     content_preview=response_text,
                     duration_ms=elapsed_ms,
                 )
+            except HoldTurnRefusal as exc:
+                yield f"event: refusal\ndata: {exc.wire_json()}\n\n"
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging

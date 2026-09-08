@@ -2668,12 +2668,13 @@ async def _shutdown_server_resources(app: FastAPI) -> tuple[bool, BaseException 
 
     for name, operation in (
         ("host-scheduler", lambda: _shutdown_host_scheduler(app)),
-        # A shared PostgreSQL runner can still complete a cold wake's
-        # registration/onboarding path while stop() drains owned work. Drain
-        # it before unmounting host and feature surfaces, otherwise that late
-        # onboarding can remount routes or UI after their only teardown pass.
-        ("host-features", lambda: _shutdown_host_features(app)),
         ("agents", lambda: _shutdown_server_agents(app)),
+        # HostContext owns the fleet Hold store. Agent heartbeats, signals and
+        # feature cleanup may still enter the universal turn seam until agent
+        # shutdown is terminal, so that context must remain live through the
+        # agents phase. The host scheduler above is already drained, preventing
+        # late cold onboarding from remounting feature surfaces during teardown.
+        ("host-features", lambda: _shutdown_host_features(app)),
         (
             "shared-agent-postgres",
             lambda: _shutdown_shared_agent_postgres_backend(app),
@@ -2903,7 +2904,8 @@ async def _lifespan_startup(app: FastAPI):
             # caught up yet. Doing this inside load_from_config is too late for
             # both custody creation and scheduler preflight.
             config = manager.reconcile_spawn_authority_restart_roster(config)
-            await _build_host_control_context(app, config)
+            host_context = await _build_host_control_context(app, config)
+            manager.bind_hold_store(host_context.hold_store)
             shared_postgres_backend = await _start_shared_agent_postgres_backend(app)
             if shared_postgres_backend is not None:
                 manager.bind_shared_postgres_backend(shared_postgres_backend)
@@ -3067,7 +3069,7 @@ async def _lifespan_startup(app: FastAPI):
             # bind another deployment's pre-Hold database to this host's
             # evidence service before refusing the DID mismatch.
             verify_identity_isolation(agent_did)
-            await _build_host_control_context(app, None)
+            host_context = await _build_host_control_context(app, None)
 
             llm_service = LLMService()
             if db_backend.lower() == "postgres" and database_url:
@@ -3085,6 +3087,8 @@ async def _lifespan_startup(app: FastAPI):
                     llm_service=llm_service,
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
+
+            app.state.agent._hold_store = host_context.hold_store
 
             host_context_publication_gate = asyncio.Event()
             app.state.host_context_publication_gate = host_context_publication_gate

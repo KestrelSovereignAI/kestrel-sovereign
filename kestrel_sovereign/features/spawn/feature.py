@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -682,6 +683,7 @@ class SpawnFeature(Feature):
             manager = AgentManager(
                 base_data_dir=base_dir,
                 startup_roster_enabled=False,
+                hold_store=vars(self.agent).get("_hold_store"),
             )
             standalone_manager_created = True
             self._standalone_manager_owned = True
@@ -1103,6 +1105,13 @@ class SpawnFeature(Feature):
                     self._child_results[child_name] = {
                         "success": True,
                         "result": result,
+                        "completed_at": time.time(),
+                    }
+            except HoldTurnRefusal as exc:
+                if self._child_tasks.get(child_name) is owner:
+                    self._child_results[child_name] = {
+                        "success": False,
+                        "refusal": exc.wire_payload(),
                         "completed_at": time.time(),
                     }
             except Exception as e:

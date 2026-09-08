@@ -823,6 +823,12 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        # Production launchers bind the fleet control store before initialize.
+        # Direct construction remains supported for embedding/tests; only an
+        # explicit binding activates the durable turn-start admission seam.
+        self._hold_store = None
+        self._standalone_hold_context = None
+        self._standalone_hold_context_close_task = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         effective_db_backend = db_backend or os.environ.get(
@@ -6197,6 +6203,12 @@ Expected Duration: {expected_duration}
                 transport metadata. This is task-local only; tools cannot
                 provide or override it through their arguments.
         """
+        from kestrel_sovereign.hold import require_turn_start_allowed
+
+        # Universal willingness-to-begin gate. It precedes credentials,
+        # genesis, hooks, context, turn lifecycle, tools, and provider work.
+        await require_turn_start_allowed(self)
+
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
         # USER_BYOK credentials are a non-cognitive readiness input. Refresh
@@ -7831,6 +7843,32 @@ Expected Duration: {expected_duration}
             skills=skills
         )
 
+    async def _close_standalone_hold_context(
+        self,
+    ) -> tuple[bool, BaseException | None]:
+        """Join closure of a standalone helper's agent-owned Hold context."""
+
+        state = vars(self)
+        context = state.get("_standalone_hold_context")
+        task = state.get("_standalone_hold_context_close_task")
+        if context is None and task is None:
+            return False, None
+        if task is None:
+            from kestrel_sovereign.hold import close_bound_host_context
+
+            task = asyncio.create_task(
+                close_bound_host_context(context),
+                name="agent_shutdown:standalone_hold_context",
+            )
+            self._standalone_hold_context_close_task = task
+        cancelled, failure = await await_lifecycle_task_completion(task)
+        if failure is None:
+            self._standalone_hold_context = None
+        # A failed close remains retryable on a later shutdown call; a terminal
+        # success is idempotent and no longer needs a task reference.
+        self._standalone_hold_context_close_task = None
+        return cancelled, failure
+
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections.
 
@@ -8191,6 +8229,20 @@ Expected Duration: {expected_duration}
             # shutdown as complete while its owned dispatcher-to-storage tail
             # is still running.
             tail_degraded = True
+
+        context_cancelled, context_failure = await self._close_standalone_hold_context()
+        shutdown_cancelled = shutdown_cancelled or context_cancelled
+        if context_failure is not None:
+            tail_degraded = True
+            logging.warning(
+                "Standalone Hold context shutdown failed: %s",
+                context_failure,
+                exc_info=(
+                    type(context_failure),
+                    context_failure,
+                    context_failure.__traceback__,
+                ),
+            )
 
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer

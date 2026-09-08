@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
@@ -583,7 +584,12 @@ async def _run_shell(agent_dir: Path, args) -> int:
         storage_path=str(db_path),
         llm_service=llm_service,
     )
-    await agent.initialize()
+    from kestrel_sovereign.hold import (
+        close_bound_host_context,
+        initialize_with_bound_hold_context,
+    )
+
+    hold_context = await initialize_with_bound_hold_context(agent)
 
     # Load extension if requested
     if hasattr(args, 'app') and args.app:
@@ -610,6 +616,8 @@ async def _run_shell(agent_dir: Path, args) -> int:
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal as exc:
+                print(f"\n{exc.wire_json()}")
             except DecryptionError:
                 decryption_error_count += 1
                 print(f"\n\U0001f510 DECRYPTION ERROR: Cannot read encrypted data.")
@@ -655,6 +663,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
         except Exception:
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 

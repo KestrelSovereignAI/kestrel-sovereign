@@ -334,6 +334,9 @@ async def test_server_lifespan_wires_and_closes_host_features(
         def set_host_context_publication_gate(self, gate) -> None:
             self.host_context_publication_gate = gate
 
+        def bind_hold_store(self, store) -> None:
+            assert store is ctx.hold_store
+
         def reconcile_spawn_authority_restart_roster(self, config):
             return config
 
@@ -469,10 +472,10 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "host-start",
             "host-context-validate",
             "host-stop",
+            "agents-stop",
             "host-unmount",
             "session-close",
             "db-close",
-            "agents-stop",
         ]
         assert not fake_manager.host_context_publication_gate.is_set()
         assert fake_manager.readiness_sweep_calls == 0
@@ -497,11 +500,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert fake_manager.readiness_sweep_calls == 1
 
     assert events[-5:] == [
+        "agents-stop",
         "host-stop",
         "host-unmount",
         "session-close",
         "db-close",
-        "agents-stop",
     ]
 
 

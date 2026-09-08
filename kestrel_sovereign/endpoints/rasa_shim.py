@@ -34,6 +34,7 @@ from kestrel_sovereign.agent.invocation import (
     invocation_id_response_header,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.rate_limit import limiter
 from slowapi.util import get_remote_address
 
@@ -282,6 +283,8 @@ async def rasa_webhook(
 
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except Exception as exc:
         logger.error(f"[rasa-shim] Error processing message from {sender}: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail="Kestrel agent failed to process the message.")

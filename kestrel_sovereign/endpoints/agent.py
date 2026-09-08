@@ -40,6 +40,7 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
@@ -565,6 +566,8 @@ async def invoke_agent(request: Request, http_response: Response):
             "model": identity.get("model"),
             "provider": identity.get("provider"),
         }
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception:
@@ -858,6 +861,8 @@ async def stream_agent_response(request: Request):
                 ):
                     yield stop_notice
                     stop_notice_emitted = True
+            except HoldTurnRefusal as exc:
+                yield exc.wire_json() + "\n"
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
