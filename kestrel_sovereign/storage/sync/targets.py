@@ -87,6 +87,20 @@ def _create_consistent_snapshot(db_path: Path) -> bytes:
                 pass
 
 
+#: The kinds of sync target this package ships. A target's ``kind`` is the
+#: bounded token that may name it across a signal boundary (a target's
+#: ``name`` is a URL that carries bucket and prefix, so it may not). The
+#: scheduler declares one ``backup_snapshot`` reason code per kind listed
+#: here; ``tests/unit/test_backup_snapshot_failed_target.py`` imports every
+#: module of this package, subpackages included, and asserts the set equals
+#: the kinds every ``SyncTarget`` subclass found there declares, so a new
+#: shipped target cannot ship without its code. A kind outside this census
+#: reports with the kind-less code rather than being dropped.
+SYNC_TARGET_KINDS: frozenset[str] = frozenset(
+    {"gcs", "s3", "lighthouse", "sovereign_ipfs"}
+)
+
+
 @dataclass
 class SyncResult:
     """Result of a sync operation."""
@@ -97,6 +111,17 @@ class SyncResult:
     timestamp: datetime
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    #: The producing target's ``SyncTarget.kind``. Stamped by the sync service
+    #: when it collects a snapshot pass, so a consumer that only sees results
+    #: (the scheduled backup handler) can still say which kind of target
+    #: failed without the URL-shaped ``target_name``.
+    kind: str = ""
+    #: Whether the service called the target at all. ``False`` only for a
+    #: destination a policy denied and for the unchanged-DB placeholder the
+    #: change-aware snapshot returns; a target that found its content already
+    #: current was attempted and succeeded. Readers must not infer this from
+    #: ``metadata["skipped"]``, which the targets also set for that dedup.
+    attempted: bool = True
 
 
 class SyncTarget(ABC):
@@ -107,6 +132,14 @@ class SyncTarget(ABC):
     def name(self) -> str:
         """Target name for logging and identification."""
         ...
+
+    #: A short token naming what kind of destination this is (``"gcs"``,
+    #: ``"lighthouse"``); one of ``SYNC_TARGET_KINDS`` for the shipped targets.
+    #: Unlike ``name`` it carries no bucket, prefix or agent id, so it is the
+    #: only part of a target's identity that may cross a bounded boundary such
+    #: as a scheduled task's ``reason_code``. Empty means undeclared: such a
+    #: target is reported as failed without its kind.
+    kind: str = ""
 
     @property
     def trust_tier(self) -> TrustTier:
