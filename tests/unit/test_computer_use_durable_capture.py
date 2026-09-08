@@ -1850,28 +1850,26 @@ def test_the_size_measured_is_the_size_the_orchestrator_receives():
 
 @pytest.mark.asyncio
 async def test_no_output_length_slips_past_the_wrapped_cap(workspace: Path, queue):
-    """Two tests missed this before it was written correctly, and the reasons
-    are worth keeping.
+    """Fourth attempt, and the three failures each taught something.
 
-    The first guessed four output sizes. The window is narrow, and none of
-    them landed in it.
+    1. Guessed four output sizes. The window is five characters wide — the
+       length of the tool name, since ``serialized_result_len`` counts the
+       wrapper keys even when the name is empty — so guessing was hopeless.
+    2. Computed the boundary from a synthetic ToolResult. The feature
+       duplicates stdout into the confirmation for an uncaptured run, so its
+       envelope crosses the cap at half the predicted output length.
+    3. Bisected on the feature's own returned size. That predicate is NOT
+       monotonic in a working build: the envelope grows with output until
+       the fit loop fires, then collapses and stays small. Bisection over a
+       non-monotonic predicate lands anywhere, and it landed at the top of
+       the range.
 
-    The second computed the boundary from a synthetic ToolResult — but the
-    feature duplicates stdout into the confirmation for an uncaptured run, so
-    its envelope crosses the cap at roughly HALF the output length that
-    calculation predicted, and the sweep ran a thousand characters past the
-    window.
-
-    It also looked for the bug's signature (``bare <= cap < wrapped``) on the
-    returned envelope, which a working build never produces — the fit loop
-    exists to prevent exactly that. The assertion has to be the invariant,
-    not the symptom.
-
-    So: bisect on THE FEATURE's own measurement to find where its envelope
-    crosses, then sweep either side asserting the invariant. The residual gap
-    is only the tool name — ``serialized_result_len`` counts the wrapper keys
-    even with an empty name — so the window is about five characters wide and
-    has to be found rather than approached."""
+    Each of those looked for the boundary using the very machinery whose
+    correctness is in question. So this derives it instead, from two
+    measurements taken well below the cap where the loop provably does not
+    fire, and then sweeps the derived crossing. Verified by hand against the
+    mutated build: it fails at 3806, 3807 and 3808.
+    """
     from kestrel_sovereign.features.base import (
         orchestrator_result_cap,
         serialized_result_len,
@@ -1880,25 +1878,21 @@ async def test_no_output_length_slips_past_the_wrapped_cap(workspace: Path, queu
     f = await _feature(workspace, queue)
     cap = orchestrator_result_cap()
 
-    async def size_at(n: int, *, tool_name: str) -> int:
+    async def envelope_size(n: int) -> int:
         f._backend = _StubBackend(_run(stdout="p" * n, stderr=""))
         env = await f.shell(command="echo hi")
-        return serialized_result_len(env, tool_name=tool_name)
+        return serialized_result_len(env, tool_name="shell")
 
-    # Where does the feature's own envelope first exceed the cap, measured
-    # the way the mutant would measure it (no tool name)?
-    lo, hi = 0, cap
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if await size_at(mid, tool_name="") <= cap:
-            lo = mid + 1
-        else:
-            hi = mid
+    # Two points in the linear region, far below the cap.
+    a, b = 1000, 2000
+    size_a, size_b = await envelope_size(a), await envelope_size(b)
+    assert size_a < cap and size_b < cap, "sample points must be below the cap"
+    slope = (size_b - size_a) / (b - a)
+    assert slope > 0, "envelope must grow with output for this derivation"
+    crossing = int(a + (cap - size_a) / slope)
 
-    for n in range(max(0, lo - 30), lo + 30):
-        f._backend = _StubBackend(_run(stdout="p" * n, stderr=""))
-        env = await f.shell(command="echo hi")
-        wrapped = serialized_result_len(env, tool_name="shell")
+    for n in range(max(0, crossing - 20), crossing + 20):
+        wrapped = await envelope_size(n)
         assert wrapped <= cap, f"{n} chars of stdout -> {wrapped} wrapped"
 
 
