@@ -57,3 +57,5 @@ the tombstone before deleting the live row, while queue processing and keyed
 replay treat any temporary dual-row state as terminal until the transition is
 resumed. Explicit retry checks the tombstone first, removes any residual live
 original, and only then consumes the tombstone and exposes the single retry row.
+While retry is resumable, both `original_id` and `retry_entry_id` remain
+tombstoned for processing, deduplication, replay, listing, and retention.

@@ -1469,6 +1469,55 @@ class TestQueueIdempotency:
         ) == retried["entry_id"]
 
     @pytest.mark.asyncio
+    async def test_partial_retry_candidate_remains_tombstoned(self, real_queue):
+        queue, deliveries = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "retry-tombstone@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "retry-tombstone",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_dead_letter_retry_delete
+            BEFORE DELETE ON delivery_dead_letter
+            BEGIN SELECT RAISE(ABORT, 'retry delete failed'); END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="retry delete failed"):
+                await queue.retry(original_id)
+
+        retry_row = await queue._db.fetchone(
+            """
+            SELECT retry_entry_id FROM delivery_dead_letter
+            WHERE original_id = ? AND agent_id = ?
+            """,
+            (original_id, queue._agent_id),
+        )
+        assert retry_row is not None and retry_row[0] is not None
+        candidate_id = retry_row[0]
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ?",
+            (candidate_id,),
+        ) == (1,)
+        assert await queue.get_pending_entries() == []
+        assert await queue.process_pending() == 0
+        assert deliveries == []
+        with pytest.raises(DeliveryIdempotencyTerminal):
+            await queue.enqueue(**request)
+
+        await queue._db.execute("DROP TRIGGER reject_dead_letter_retry_delete")
+        resumed = await queue.retry(original_id)
+        assert resumed["success"] is True
+        assert resumed["entry_id"] == candidate_id
+        assert await queue.process_pending() == 1
+        assert len(deliveries) == 1
+
+    @pytest.mark.asyncio
     async def test_dead_letter_retry_restores_canonical_dedup_hash(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
