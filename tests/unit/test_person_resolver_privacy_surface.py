@@ -198,3 +198,30 @@ async def test_all_people_resolve_then_all_edges_are_written(governed, router_lo
     targets = {e.target_id for e in await wrapper.graph.get_edges(f"message:{AGENT}:msg-3")}
     assert targets == {f"concept:{AGENT}:alice", f"concept:{AGENT}:bob"}
     assert not any("Interaction enrichment failed" in m for m in router_log.messages)
+
+
+@pytest.mark.asyncio
+async def test_memory_system_wires_the_governed_graph_into_person_resolution(tmp_path, router_log):
+    """The production constructor: MemorySystem hands SchemaRouter the privacy
+    wrapper's graph proxy, the router hands it to its resolver, and a message
+    through the linker + router enriches its person with no warning."""
+    from kestrel_sovereign.storage.memory_system import MemorySystem
+
+    async with AsyncStorage(str(tmp_path / "kestrel.db"), agent_id=AGENT) as raw:
+        wrapper = PrivacyEnforcingStorage(raw, PrivacyMode.NORMAL)
+        ms = MemorySystem(storage=raw, agent_id=AGENT, privacy_storage=wrapper)
+        await ms.initialize()
+
+        assert ms.router.person_resolver.graph is ms.router.graph
+        with pytest.raises(PrivacyViolationError, match="refuses to forward 'db'"):
+            ms.router.graph.db
+
+        # The linker does not tag a sentence-initial capitalised word as a name.
+        concepts = await ms.linker.extract_and_link("m-1", "Today Robert fixed the sink.", AGENT)
+        people = [c for c in concepts if c.category in ("person", "proper_noun")]
+        assert [c.label for c in people] == ["robert"]
+        summary = await ms.router.route(message_id="m-1", content="Today Robert fixed the sink.", concepts=concepts, role="user")
+        assert summary["interactions"] == 1
+        edges = await ms.router.graph.get_edges(f"message:{AGENT}:m-1")
+        assert {e.target_id for e in edges} >= {f"concept:{AGENT}:robert"}
+        assert not any("Interaction enrichment failed" in m for m in router_log.messages), router_log.messages
