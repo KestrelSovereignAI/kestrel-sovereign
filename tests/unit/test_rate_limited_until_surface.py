@@ -87,7 +87,12 @@ def test_an_overload_that_advised_a_wait_is_a_503_not_a_rate_limit():
     assert safe_streaming_error_message(_wrapped(declined)).startswith("The model route is unavailable.")
 
 
-def test_the_invoke_endpoint_logs_an_overload_as_unavailable_not_rate_limited(caplog):
+def test_the_invoke_endpoint_logs_an_overload_as_unavailable_not_rate_limited():
+    """The endpoint's logger does not always propagate to the root handler
+    once the project's logging is configured, so the line is read at the
+    logger itself."""
+    from kestrel_sovereign.endpoints import agent as agent_endpoints
+
     class _Overloaded(Exception):
         status_code = 503
 
@@ -97,13 +102,14 @@ def test_the_invoke_endpoint_logs_an_overload_as_unavailable_not_rate_limited(ca
     )
     app, restore = _boot_app(_wrapped(declined))
     try:
-        with caplog.at_level("ERROR"):
+        with patch.object(agent_endpoints.logger, "error") as log_error:
             response = _invoke(app)
     finally:
         restore()
     assert response.status_code == 503
-    assert "model route unavailable until" in caplog.text
-    assert "rate limited" not in caplog.text
+    rendered = [call.args[0] % tuple(call.args[1:]) for call in log_error.call_args_list]
+    assert any(line.startswith("Agent invocation declined: model route unavailable until") for line in rendered)
+    assert not any("rate limited" in line for line in rendered)
 
 
 # ---------------------------------------------------------------------------
