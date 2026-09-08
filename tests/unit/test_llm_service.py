@@ -24,6 +24,7 @@ from pydantic import BaseModel, SecretStr
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.error_handling import (
     LLMAllProvidersFailedError,
+    LLMProviderQuotaError,
     LLMProviderError,
 )
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
@@ -517,6 +518,37 @@ class TestCoreGeneration:
                 system_prompt="Test",
                 user_prompt="Test prompt",
             )
+
+    @pytest.mark.asyncio
+    async def test_get_response_all_providers_fail_carries_the_earliest_decline(
+        self, llm_service, mock_adapter,
+    ):
+        """When every route failed and one declined a server-advised wait, the
+        aggregate is chained to that decline so the caller can be told when a
+        retry could succeed (#3127)."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(
+            side_effect=LLMProviderQuotaError("openai", "Quota exceeded", declined)
+        )
+        with pytest.raises(LLMAllProvidersFailedError) as info:
+            await llm_service.get_response(
+                system_prompt="Test",
+                user_prompt="Test prompt",
+            )
+        assert advised_wait_exceeding_budget(info.value) is declined
 
     @pytest.mark.asyncio
     async def test_explicit_route_not_gated_by_catalog(self, llm_service, mock_adapter):

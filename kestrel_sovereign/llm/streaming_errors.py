@@ -91,13 +91,12 @@ def _rate_limited_message(declined) -> tuple[str, str]:
     returned, not caller content, provider prose, or the route's free-string
     name. The guidance stays constant and mirrors ``_ROUTE_ERROR``.
     """
-    reset = declined.retry_at.isoformat(timespec="seconds")
     return (
         "Your selected model route is rate limited.",
         (
-            f"The provider asked to wait until {reset}. No fallback response was "
-            "generated — retry after that time, or pick a different model/route "
-            "from the dropdown."
+            f"The provider asked to wait {declined.reset_phrase()}. No fallback "
+            "response was generated — retry after that time, or pick a different "
+            "model/route from the dropdown."
         ),
     )
 

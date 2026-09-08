@@ -147,12 +147,13 @@ async def test_the_attempt_that_raises_did_not_sleep_first():
 
 @pytest.mark.asyncio
 async def test_the_budget_is_what_the_loop_could_still_wait_not_the_whole_budget():
-    """After spending attempts, less budget remains: 500 s of advice fits at
-    attempt 0 (7 x 120 = 840 left) and does not fit at attempt 6 (120 left)."""
-    seq = [_throttle(10)] * 6 + [_throttle(500)]
+    """The budget is what the loop may still SLEEP in total: after five 10 s
+    waits (50 s spent) 500 s still fits (790 s left); after that, 800 s does
+    not (290 s left)."""
+    seq = [_throttle(10)] * 5 + [_throttle(500), _throttle(800)]
     with pytest.raises(AdvisedWaitExceedsRetryBudget) as info:
         await _run(seq)
-    assert info.value.budget_seconds == THROTTLE_MAX_DELAY * 1
+    assert info.value.budget_seconds == THROTTLE_MAX_DELAY * (THROTTLE_MAX_RETRIES - 1) - 50 - 500
 
     result, sleeps, _ = await _run([_throttle(500), "ok"])
     assert result == "ok" and sleeps == [500.0]

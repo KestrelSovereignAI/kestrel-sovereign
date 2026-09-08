@@ -16,6 +16,7 @@ import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+from kestrel_sovereign.llm.retry import earliest_declined_wait
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -4718,7 +4719,9 @@ No other text or formatting.
                         f"Underlying error: {e}"
                     ) from e
 
-        raise LLMAllProvidersFailedError(errors)
+        # A route that declined an advised wait is the soonest any retry can
+        # succeed; carry the earliest as the cause so the surface can say when.
+        raise LLMAllProvidersFailedError(errors) from earliest_declined_wait(errors.values())
 
     async def get_response_with_model(
         self,
@@ -4792,16 +4795,16 @@ No other text or formatting.
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
             logger.error(f"Model {model_id} network error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (KeyError, AttributeError, TypeError) as e:
             logger.error(f"Model {model_id} data error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except Exception as e:
             logger.error(f"Model {model_id} failed: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
 
     # get_streaming_response is provided by StreamingMixin
 
@@ -5258,6 +5261,7 @@ No other text or formatting.
             force_local_only=force_local_only,
         )
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -5320,6 +5324,7 @@ No other text or formatting.
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e
+                route_errors.append(e)
                 if explicit_selection:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
@@ -5353,7 +5358,7 @@ No other text or formatting.
         raise LLMServiceError(
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
-        )
+        ) from (earliest_declined_wait(route_errors) or last_error)
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin

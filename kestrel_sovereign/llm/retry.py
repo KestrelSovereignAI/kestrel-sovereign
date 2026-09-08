@@ -6,9 +6,10 @@ like rate limiting (429) and server errors (5xx).
 """
 import asyncio
 import logging
+import math
 import random
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Iterable, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ MAX_DELAY = 60.0      # seconds
 # failover on local/metered routes.
 THROTTLE_MAX_RETRIES = 8
 THROTTLE_MAX_DELAY = 120.0
+
+# The furthest ahead a server-advised cool-down is believed. A provider that
+# puts an epoch timestamp or a stray exponent in ``Retry-After`` must not
+# produce a reset time in 2082 or an OverflowError in date arithmetic: the
+# advised seconds are kept as reported, but the reset time is computed from
+# ``min(advised, horizon)`` and the surfaces say "at least until". A week is
+# beyond any published plan-limit window (daily and weekly resets).
+ADVISED_WAIT_HORIZON_SECONDS = 7 * 24 * 60 * 60
 
 # PLAN-LIMIT budget — deliberately much tighter than the throttle budget.
 #
@@ -158,32 +167,85 @@ class AdvisedWaitExceedsRetryBudget(Exception):
     ) -> None:
         self.advised_seconds = float(advised_seconds)
         self.budget_seconds = float(budget_seconds)
+        #: When a retry can succeed, computed from the advice clamped to
+        #: ``ADVISED_WAIT_HORIZON_SECONDS``; ``beyond_horizon`` says the
+        #: advice exceeded it, so this is a floor, not the exact time.
         self.retry_at = retry_at
+        self.beyond_horizon = self.advised_seconds > ADVISED_WAIT_HORIZON_SECONDS
         self.retry_after = self.advised_seconds
         self.response = getattr(cause, "response", None)
         super().__init__(
             f"429 rate limit: the provider advised waiting {self.advised_seconds:.0f}s "
-            f"(until {retry_at.isoformat(timespec='seconds')}), more than the "
+            f"({self.reset_phrase()}), more than the "
             f"{self.budget_seconds:.0f}s this call could still wait; not retrying"
         )
         self.__cause__ = cause
 
+    def reset_phrase(self) -> str:
+        """``until <iso>``, or the floor when the advice exceeded the horizon.
+
+        The only value either surface interpolates: a time derived from the
+        provider's number, never its prose.
+        """
+        stamp = self.retry_at.isoformat(timespec="seconds")
+        if self.beyond_horizon:
+            days = ADVISED_WAIT_HORIZON_SECONDS // (24 * 60 * 60)
+            return f"for more than {days} days, until at least {stamp}"
+        return f"until {stamp}"
+
+    @property
+    def retry_after_header_seconds(self) -> int:
+        """Whole seconds for ``Retry-After``: the advice, clamped to the
+        horizon, rounded up, at least one."""
+        bounded = min(self.advised_seconds, float(ADVISED_WAIT_HORIZON_SECONDS))
+        return max(1, math.ceil(bounded))
+
 
 def advised_wait_exceeding_budget(error: BaseException) -> Optional[AdvisedWaitExceedsRetryBudget]:
-    """The :class:`AdvisedWaitExceedsRetryBudget` in ``error``'s cause chain, if any.
+    """The :class:`AdvisedWaitExceedsRetryBudget` ``error`` explicitly wraps, if any.
 
-    Callers between the retry loop and the HTTP surface wrap provider errors
-    (``RuntimeError(f"Model ... failed: {e}") from e``); the reset time survives
-    in the chain, and a surface that can say "come back at" reads it here.
+    Only explicit links are followed: ``__cause__`` (``raise X from e``), an
+    ``LLMProviderError.original_error`` and an ``LLMStreamingError.underlying``.
+    Implicit ``__context__`` is not: a chain severed with ``from None`` stays
+    severed, and an unrelated exception raised while a decline was being
+    handled (a cleanup failure, a fallback that itself broke) is not rendered
+    as a rate limit it has nothing to do with. The service's wrappers link
+    explicitly for that reason.
     """
     seen: set[int] = set()
-    current: Optional[BaseException] = error
-    while current is not None and id(current) not in seen:
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
         seen.add(id(current))
         if isinstance(current, AdvisedWaitExceedsRetryBudget):
             return current
-        current = current.__cause__ or current.__context__
+        for link in (
+            current.__cause__,
+            getattr(current, "original_error", None),
+            getattr(current, "underlying", None),
+        ):
+            if isinstance(link, BaseException):
+                pending.append(link)
     return None
+
+
+def earliest_declined_wait(
+    errors: Iterable[BaseException],
+) -> Optional[AdvisedWaitExceedsRetryBudget]:
+    """Among several routes' errors, the decline whose reset comes first.
+
+    When every route failed and some declined an advised wait, the soonest
+    reset is the earliest any retry could succeed, so it is the one an
+    aggregate error carries as its cause.
+    """
+    earliest: Optional[AdvisedWaitExceedsRetryBudget] = None
+    for error in errors:
+        declined = advised_wait_exceeding_budget(error)
+        if declined is not None and (earliest is None or declined.retry_at < earliest.retry_at):
+            earliest = declined
+    return earliest
 
 
 def retry_after_seconds(error: Exception) -> Optional[float]:
@@ -206,7 +268,7 @@ def retry_after_seconds(error: Exception) -> Optional[float]:
             ms = getter("retry-after-ms")
             if ms:
                 try:
-                    return max(0.0, float(ms) / 1000.0)
+                    return _finite_wait(float(ms) / 1000.0)
                 except (TypeError, ValueError):
                     pass
             secs = getter("retry-after")
@@ -214,14 +276,21 @@ def retry_after_seconds(error: Exception) -> Optional[float]:
                 try:
                     # Numeric seconds. (An HTTP-date form is rare here and not
                     # worth parsing — exponential backoff covers that case.)
-                    return max(0.0, float(secs))
+                    return _finite_wait(float(secs))
                 except (TypeError, ValueError):
                     pass
     # Some SDKs surface a parsed attribute directly.
     attr = getattr(error, "retry_after", None)
-    if isinstance(attr, (int, float)):
-        return max(0.0, float(attr))
+    if isinstance(attr, (int, float)) and not isinstance(attr, bool):
+        return _finite_wait(float(attr))
     return None
+
+
+def _finite_wait(value: float) -> Optional[float]:
+    """A usable advised wait, or ``None`` for ``inf``/``nan`` (no advice)."""
+    if not math.isfinite(value):
+        return None
+    return max(0.0, value)
 
 
 def is_plan_limit_error(error: Exception) -> bool:
@@ -390,6 +459,11 @@ async def with_retry(
         AdvisedWaitExceedsRetryBudget when the advised wait cannot fit.
     """
     attempt = 0
+    # Seconds this call has already slept. The budget below bounds the SUM
+    # of waits, not a price per attempt: pricing each remaining attempt at
+    # the cap and then sleeping advice uncapped let one throttle hold a turn
+    # for 3360 s (#3127 review).
+    waited = 0.0
 
     while True:
         try:
@@ -419,15 +493,21 @@ async def with_retry(
             if attempt >= eff_max_retries - 1:
                 raise
 
+            # What this call may still sleep in total: the loop's classic
+            # worst case (every remaining attempt at the cap) less what it
+            # has slept already.
+            remaining_budget = max(0.0, eff_max_delay * (eff_max_retries - 1) - waited)
+
             # Prefer the server-advised cool-down; otherwise exponential
             # backoff + jitter. Both are capped at the effective max delay.
             advised = retry_after_seconds(e)
             if advised is not None:
                 # Advice is not clamped: a wait that fits what the loop could
                 # still spend is taken whole; one that does not ends the loop.
-                remaining_budget = eff_max_delay * (eff_max_retries - attempt - 1)
                 if advised > remaining_budget:
-                    retry_at = datetime.now(UTC) + timedelta(seconds=advised)
+                    retry_at = datetime.now(UTC) + timedelta(
+                        seconds=min(advised, float(ADVISED_WAIT_HORIZON_SECONDS))
+                    )
                     logger.warning(
                         "LLM retry declined: advised wait %.0fs exceeds the %.0fs "
                         "this call could still wait (status=%s, retry_at=%s): %s: %s",
@@ -442,7 +522,11 @@ async def with_retry(
                     ) from e
                 delay = advised + random.uniform(0, 1)
             else:
-                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), eff_max_delay)
+                delay = min(
+                    base_delay * (2 ** attempt) + random.uniform(0, 1),
+                    eff_max_delay,
+                    remaining_budget,
+                )
 
             # Log the *actual* error — type, status code, and advised wait —
             # so a throttle that's being ridden out (rather than billed via
@@ -454,6 +538,7 @@ async def with_retry(
                 advised, type(e).__name__, e,
             )
             await asyncio.sleep(delay)
+            waited += delay
             attempt += 1
 
 

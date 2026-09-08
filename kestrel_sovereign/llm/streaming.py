@@ -48,6 +48,7 @@ from kestrel_sdk.llm import (
     ToolCallStarted,
 )
 
+from kestrel_sovereign.llm.retry import earliest_declined_wait
 from .adapter import (
     LLMResponse,
     ThinkingDelta,
@@ -1199,6 +1200,7 @@ class StreamingMixin:
         explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers_to_use):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1286,6 +1288,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 if _is_harness_owned_transport_error(e):
                     # Harness-owned transport error (codex app-server idle
                     # stall, app-server connection closed, etc.). Don't
@@ -1344,7 +1347,7 @@ class StreamingMixin:
             f"All {provider_type} providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        )
+        ) from earliest_declined_wait(route_errors)
 
     async def generate_stream(
         self,
@@ -1494,6 +1497,7 @@ class StreamingMixin:
         explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1561,6 +1565,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 if _is_harness_owned_transport_error(e):
                     # See #1429: skip _maybe_disable_route too — harness
                     # owns auth, kestrel doesn't disable the route on its
@@ -1603,7 +1608,7 @@ class StreamingMixin:
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        )
+        ) from earliest_declined_wait(route_errors)
 
     @staticmethod
     def _adapter_supports_vision(adapter: Any) -> bool:
@@ -1821,6 +1826,7 @@ class StreamingMixin:
         tools = self._check_model_tool_support(providers, tools, model_override)
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1937,6 +1943,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 last_provider_name = provider["name"]
                 if _is_harness_owned_transport_error(e):
                     # See #1429: skip _maybe_disable_route too — harness
@@ -1981,4 +1988,4 @@ class StreamingMixin:
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
-        )
+        ) from earliest_declined_wait(route_errors)
