@@ -4275,12 +4275,35 @@ def _route_declarations(
             values = call.args[0]
             if isinstance(values, (ast.List, ast.Tuple, ast.Set)):
                 return collection, list(values.elts)
-        if operation in {"append", "extend"}:
+        if operation == "insert" and len(call.args) == 2 and not call.keywords:
+            return collection, [call.args[1]]
+        if operation in {"append", "extend", "insert"}:
             raise AssertionError(
                 "Unresolved route collection publication: "
                 f"{ast.unparse(call)}"
             )
+        if operation in {"__iadd__", "__setitem__"}:
+            raise AssertionError(
+                "Unresolved route collection mutation: "
+                f"{ast.unparse(call)}"
+            )
         return None
+
+    def filters_existing_route_objects(value: ast.AST, collection: ast.AST) -> bool:
+        """Whether a slice replacement only removes members of this collection."""
+
+        if not isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            return False
+        if len(value.generators) != 1:
+            return False
+        generator = value.generators[0]
+        return (
+            not generator.is_async
+            and isinstance(generator.target, ast.Name)
+            and isinstance(value.elt, ast.Name)
+            and value.elt.id == generator.target.id
+            and ast.dump(generator.iter) == ast.dump(collection)
+        )
 
     def module_router_reference_is_static(
         expression: ast.AST | None,
@@ -4495,8 +4518,70 @@ def _route_declarations(
                     ),
                 )
                 return
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    list(node.targets)
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                route_targets: list[tuple[ast.AST, bool]] = []
+                for target in targets:
+                    if route_collection_receiver(target) is not None:
+                        route_targets.append((target, True))
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and route_collection_receiver(target.value) is not None
+                    ):
+                        route_targets.append(
+                            (target.value, isinstance(target.slice, ast.Slice))
+                        )
+                    elif any(
+                        route_collection_receiver(candidate) is not None
+                        for candidate in ast.walk(target)
+                    ):
+                        raise AssertionError(
+                            "Unresolved route collection assignment: "
+                            f"{ast.unparse(node)}"
+                        )
+                if route_targets:
+                    if len(route_targets) != 1 or node.value is None:
+                        raise AssertionError(
+                            "Unresolved route collection assignment: "
+                            f"{ast.unparse(node)}"
+                        )
+                    collection, requires_iterable = route_targets[0]
+                    if requires_iterable:
+                        if filters_existing_route_objects(node.value, collection):
+                            return
+                        if not isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+                            raise AssertionError(
+                                "Unresolved route collection assignment: "
+                                f"{ast.unparse(node)}"
+                            )
+                        route_objects = list(node.value.elts)
+                    else:
+                        route_objects = [node.value]
+                    declarations.extend(
+                        route_object_declaration(
+                            route_object,
+                            collection,
+                            active_strings,
+                            active_methods,
+                            prefixes,
+                        )
+                        for route_object in route_objects
+                    )
+                    return
             if isinstance(node, ast.AugAssign):
-                receiver = route_collection_receiver(node.target)
+                collection = node.target
+                receiver = route_collection_receiver(collection)
+                if (
+                    receiver is None
+                    and isinstance(node.target, ast.Subscript)
+                    and isinstance(node.target.slice, ast.Slice)
+                ):
+                    collection = node.target.value
+                    receiver = route_collection_receiver(collection)
                 if receiver is not None:
                     if not isinstance(node.op, ast.Add) or not isinstance(
                         node.value, (ast.List, ast.Tuple, ast.Set)
@@ -4508,7 +4593,7 @@ def _route_declarations(
                     declarations.extend(
                         route_object_declaration(
                             route_object,
-                            node.target,
+                            collection,
                             active_strings,
                             active_methods,
                             prefixes,
@@ -6342,6 +6427,44 @@ def test_route_objects_appended_to_route_collections_are_inventoried() -> None:
     ]
 
 
+def test_direct_route_collection_mutations_are_inventoried_or_rejected() -> None:
+    tree = ast.parse(
+        'router = APIRouter(prefix="/api")\n'
+        'app.routes.insert(0, Route(\n'
+        '    "/api/agents/{name}/stop", endpoint, methods=["POST"]\n'
+        '))\n'
+        'router.routes[:] = [\n'
+        '    APIRoute("/agents/{name}/terminate", endpoint, methods=["DELETE"]),\n'
+        '    WebSocketRoute("/agents/{name}/events", socket_endpoint),\n'
+        ']\n'
+    )
+    unresolved = ast.parse(
+        "app.routes.insert(index=position, object=build_route())\n"
+    )
+    unsupported = ast.parse("app.routes.__setitem__(slice(None), build_routes())\n")
+    destructured = ast.parse(
+        "app.routes, marker = [Route('/hidden', endpoint)], 1\n"
+    )
+    deletion = ast.parse("del app.routes[:]\n")
+    filtered = ast.parse(
+        "app.routes[:] = [route for route in app.routes if keep(route)]\n"
+    )
+
+    assert _route_declarations(tree, {}, {}) == [
+        (("POST",), "/api/agents/{name}/stop"),
+        (("DELETE",), "/api/agents/{name}/terminate"),
+        (("WEBSOCKET",), "/api/agents/{name}/events"),
+    ]
+    with pytest.raises(AssertionError, match="route collection publication"):
+        _route_declarations(unresolved, {}, {})
+    with pytest.raises(AssertionError, match="route collection mutation"):
+        _route_declarations(unsupported, {}, {})
+    with pytest.raises(AssertionError, match="route collection assignment"):
+        _route_declarations(destructured, {}, {})
+    assert _route_declarations(deletion, {}, {}) == []
+    assert _route_declarations(filtered, {}, {}) == []
+
+
 def test_decorator_factory_route_registrations_are_inventoried() -> None:
     tree = ast.parse(
         'router = APIRouter(prefix="/api")\n'
@@ -6863,7 +6986,7 @@ def test_spawn_authority_distinguishes_issuance_from_control_boundaries() -> Non
         assert "Defect" in row
 
 
-def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
+def test_main_fixed_surfaces_record_current_authority_enforcement() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     expected = {
         "Read observability summaries/metrics": "[#3215]",
@@ -6876,19 +6999,54 @@ def test_newly_discovered_unenforced_surfaces_link_focused_defects() -> None:
             line for line in audit.splitlines() if line.startswith(f"| {action} |")
         )
         assert issue in row
-        assert "Defect:" in row
+        assert "Defect:" not in row
 
-    tool_defects = {
-        "features/consent/feature.py::consent_log": "D-3229",
-        "features/consent/feature.py::consent_stats": "D-3229",
-        "features/audit_anchor/feature.py::audit_anchor": "D-3230",
-        "features/audit_anchor/feature.py::audit_anchor_status": "D-3230",
-        "features/audit_anchor/feature.py::audit_verify": "D-3230",
+    scoped_tools = {
+        "features/consent/feature.py::consent_log": "#3229",
+        "features/consent/feature.py::consent_stats": "#3229",
+        "features/audit_anchor/feature.py::audit_anchor": "#3230",
+        "features/audit_anchor/feature.py::audit_anchor_status": "#3230",
+        "features/audit_anchor/feature.py::audit_verify": "#3230",
     }
-    for surface, defect in tool_defects.items():
+    for surface, issue in scoped_tools.items():
         row = next(line for line in audit.splitlines() if surface in line)
-        assert defect in row
-        assert "shared PostgreSQL" in row
+        assert issue in row
+        assert re.search(r"\bD-\d+", row) is None
+        assert "scoped" in row
+
+    for suffix in ("install", "remove"):
+        canonical = next(
+            line
+            for line in audit.splitlines()
+            if f"endpoints/features.py::POST /api/features/{{name}}/{suffix}`" in line
+        )
+        alias = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/features.py::POST "
+            f"/api/agents/{{selected_agent_name}}/api/features/{{name}}/{suffix}`"
+            in line
+        )
+        assert "require_sovereign_host_lifecycle" in canonical
+        assert "| H —" in alias
+        assert "#3214" in canonical and "#3214" in alias
+
+    for suffix in ("summary", "metrics/{metric_name}"):
+        canonical = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/observability.py::GET "
+            f"/api/observability/{suffix}`" in line
+        )
+        alias = next(
+            line
+            for line in audit.splitlines()
+            if "endpoints/observability.py::GET "
+            f"/api/agents/{{selected_agent_name}}/api/observability/{suffix}`"
+            in line
+        )
+        assert "#3215" in canonical and "#3215" in alias
+        assert "scoped" in canonical and "| A —" in alias
 
 
 def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None:
@@ -6913,7 +7071,7 @@ def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None
         assert "D-3233" in tool_row
 
 
-def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
+def test_multi_agent_deployment_control_records_3223_enforcement() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
         line
@@ -6927,8 +7085,9 @@ def test_multi_agent_deployment_control_is_recorded_as_3223() -> None:
     )
     assert "Sovereign/delegated" in action_row
     assert "[#3223]" in action_row
-    assert "Defect:" in action_row
-    assert "D-3223" in tool_row
+    assert "Defect:" not in action_row
+    assert "#3223" in tool_row
+    assert "Sovereign-gated" in tool_row
     assert "multi-agent" in tool_row
 
 
@@ -6968,7 +7127,7 @@ def test_task_reads_record_3145_durable_principal_enforcement() -> None:
         assert "signed" in row.casefold()
 
 
-def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
+def test_webhook_collision_refusal_and_open_unlimited_mode_are_recorded() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     row = next(
         line
@@ -6976,7 +7135,8 @@ def test_webhook_ambiguity_and_open_unlimited_mode_are_recorded() -> None:
         if line.startswith("| General webhook ingress |")
     )
     assert "[#3216]" in row
-    assert "Defect:" in row
+    assert "refuses duplicate ownership" in row
+    assert "Defect:" not in row
     assert 'auth_type="none"' in row
     assert "rate_limit=0" in row
     assert "allow_unauthenticated" in row
@@ -7012,7 +7172,7 @@ def test_feature_static_alias_auth_exception_is_recorded() -> None:
     assert "| S —" in row
 
 
-def test_shared_local_model_mutations_are_recorded_as_3221() -> None:
+def test_shared_local_model_mutations_record_3221_enforcement() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     action_row = next(
         line
@@ -7027,11 +7187,12 @@ def test_shared_local_model_mutations_are_recorded_as_3221() -> None:
         "features/model/feature.py::cleanup_models",
     ):
         row = next(line for line in audit.splitlines() if surface in line)
-        assert "D-3221" in row
+        assert "#3221" in row
+        assert "Sovereign-gated" in row
         assert "shared" in row.casefold()
 
 
-def test_routed_rasa_target_mismatch_is_recorded() -> None:
+def test_routed_rasa_target_binding_is_recorded_after_3220() -> None:
     audit = AUDIT_PATH.read_text(encoding="utf-8")
     row = next(
         line
@@ -7039,9 +7200,10 @@ def test_routed_rasa_target_mismatch_is_recorded() -> None:
         if "endpoints/rasa_shim.py::POST "
         "/api/agents/{selected_agent_name}/webhooks/rest/webhook" in line
     )
-    assert "D-3220" in row
-    assert "host-default agent" in row
-    assert "target binding" in row
+    assert "| W —" in row
+    assert "#3220" in row
+    assert "bound to the trusted routed agent" in row
+    assert "per-agent" in row
 
 
 def test_sovereignty_cache_reads_are_owner_scoped_after_3225() -> None:
@@ -7400,6 +7562,26 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
 )
 
 
+def _is_cross_agent_lifecycle_action(name: str) -> bool:
+    """Recognize exact lifecycle verbs and conventional async variants."""
+
+    normalized = name.casefold()
+    if normalized in _CROSS_AGENT_LIFECYCLE_ACTIONS:
+        return True
+    candidates = []
+    if normalized.startswith("async_"):
+        candidates.append(normalized.removeprefix("async_"))
+    if normalized.startswith("a"):
+        candidates.append(normalized[1:])
+    for suffix in ("_async", "_now", "_sync"):
+        if normalized.endswith(suffix):
+            candidates.append(normalized.removesuffix(suffix))
+    parts = normalized.split("_")
+    if len(parts) > 1:
+        candidates.extend((parts[0], parts[-1]))
+    return any(candidate in _CROSS_AGENT_LIFECYCLE_ACTIONS for candidate in candidates)
+
+
 def _cross_agent_state_object_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     initial_aliases: set[str] | None = None,
@@ -7603,8 +7785,7 @@ def _is_cross_agent_state_mutation_call(
     )
     lifecycle_mutation = (
         isinstance(call.func, ast.Attribute)
-        and call.func.attr.casefold()
-        in _CROSS_AGENT_LIFECYCLE_ACTIONS
+        and _is_cross_agent_lifecycle_action(call.func.attr)
         and _is_cross_agent_state_object_reference(
             call.func.value, state_object_aliases
         )
@@ -8678,10 +8859,36 @@ def _is_cross_agent_control_call(
         "call_soon_threadsafe": (0,),
         "filter": (0,),
         "map": (0,),
+        "process": (1,),
+        "reduce": (0,),
         "register": (0,),
         "run_in_executor": (1,),
+        "starmap": (0,),
+        "starmap_async": (0,),
         "submit": (0,),
+        "thread": (1,),
+        "timer": (1,),
         "to_thread": (0,),
+    }
+    higher_order_callable_keywords = {
+        "add_done_callback": {"fn"},
+        "apply_async": {"callback", "error_callback", "func"},
+        "call_at": {"callback"},
+        "call_later": {"callback"},
+        "call_soon": {"callback"},
+        "call_soon_threadsafe": {"callback"},
+        "filter": {"function"},
+        "map": {"function"},
+        "process": {"target"},
+        "reduce": {"function"},
+        "register": {"func"},
+        "run_in_executor": {"func"},
+        "starmap": {"func"},
+        "starmap_async": {"func"},
+        "submit": {"fn"},
+        "thread": {"target"},
+        "timer": {"function"},
+        "to_thread": {"func"},
     }
     higher_order_sources = {
         source
@@ -8689,6 +8896,12 @@ def _is_cross_agent_control_call(
         if index < len(node.args)
         for source in _control_reference_sources(node.args[index])
     }
+    higher_order_sources.update(
+        source
+        for keyword in node.keywords
+        if keyword.arg in higher_order_callable_keywords.get(call_name, set())
+        for source in _control_reference_sources(keyword.value)
+    )
     kills_agent_process = (
         call_name == "kill"
         and bool(node.args)
@@ -15509,6 +15722,49 @@ def test_provenance_scanner_classifies_lifecycle_methods_on_agent_objects(
 
     assert _authority_provenance_lines(controlled) == {2}
     assert _authority_provenance_lines(benign) == set()
+
+
+@pytest.mark.parametrize(
+    "method", ["aclose", "terminate_async", "stop_now", "shutdown_runtime"]
+)
+def test_provenance_scanner_classifies_async_lifecycle_method_variants(
+    method: str,
+) -> None:
+    controlled = ast.parse(
+        "async def dispatch(request, child):\n"
+        "    if request.causation_chain:\n"
+        f"        await child.{method}()\n"
+    )
+    benign = ast.parse(
+        "async def dispatch(request, metrics):\n"
+        "    if request.causation_chain:\n"
+        f"        await metrics.{method}()\n"
+    )
+
+    assert _authority_provenance_lines(controlled) == {2}
+    assert _authority_provenance_lines(benign) == set()
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "threading.Thread(target=terminate_fleet).start()",
+        "multiprocessing.Process(target=terminate_fleet).start()",
+        "executor.submit(fn=terminate_fleet)",
+        "itertools.starmap(terminate_fleet, targets)",
+        "functools.reduce(function=terminate_fleet, iterable=targets)",
+    ],
+)
+def test_provenance_scanner_classifies_deferred_callback_dispatch(
+    dispatch: str,
+) -> None:
+    tree = ast.parse(
+        "def dispatch(request, targets):\n"
+        "    if request.causation_chain:\n"
+        f"        {dispatch}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
 
 
 @pytest.mark.parametrize(
