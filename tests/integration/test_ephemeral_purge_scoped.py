@@ -343,7 +343,7 @@ async def test_same_second_pre_transition_node_survives_and_post_transition_node
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
         assert wrapper._entered_ephemeral_at == "2026-09-07 12:00:05"
-        assert wrapper._graph_purge_watermark() == "2026-09-07 12:00:05.500000"
+        assert wrapper._exact_purge_watermark() == "2026-09-07 12:00:05.500000"
 
         for node_id, stamp in (("at-transition", transition), ("post-transition-same-second", after)):
             await storage.graph.add_node(GraphNode(
@@ -398,15 +398,15 @@ def test_watermark_setter_accepts_legacy_whole_second_strings(tmp_path):
     storage = AsyncStorage(str(tmp_path / "w.db"), agent_id=AGENT_ID)
     wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
     assert wrapper._entered_ephemeral_at is None
-    assert wrapper._graph_purge_watermark() is None
+    assert wrapper._exact_purge_watermark() is None
     wrapper._entered_ephemeral_at = "2026-07-01 12:00:00"
     assert wrapper._entered_ephemeral_at == "2026-07-01 12:00:00"
-    assert wrapper._graph_purge_watermark() == "2026-07-01 12:00:00.000000"
+    assert wrapper._exact_purge_watermark() == "2026-07-01 12:00:00.000000"
     wrapper._entered_ephemeral_at = "2026-07-01T12:00:00.250000"
     assert wrapper._entered_ephemeral_at == "2026-07-01 12:00:00"
-    assert wrapper._graph_purge_watermark() == "2026-07-01 12:00:00.250000"
+    assert wrapper._exact_purge_watermark() == "2026-07-01 12:00:00.250000"
     wrapper._entered_ephemeral_at = None
-    assert wrapper._graph_purge_watermark() is None
+    assert wrapper._exact_purge_watermark() is None
     with pytest.raises(ValueError, match="watermark"):
         wrapper._entered_ephemeral_at = "not a timestamp"
 
@@ -425,7 +425,48 @@ def test_the_transition_clock_carries_sub_second_precision(tmp_path):
     for _ in range(25):
         wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
-        mark = wrapper._graph_purge_watermark()
+        mark = wrapper._exact_purge_watermark()
         assert len(mark) == 26 and mark[19] == ".", mark
         marks.add(mark[20:])
     assert any(fraction != "000000" for fraction in marks), marks
+
+
+@pytest.mark.asyncio
+async def test_same_second_pre_transition_channel_message_survives(tmp_path, monkeypatch):
+    """Review r2 P1: channel_messages rows are stamped with isoformat() and the
+    purge parses both sides, so the sweep must be handed the exact instant.
+    Handed the whole-second projection it destroyed a NORMAL message written
+    300 ms before the transition."""
+    from datetime import datetime, timedelta, timezone
+
+    transition = datetime(2026, 9, 7, 12, 0, 5, 500000, tzinfo=timezone.utc)
+    before = (transition - timedelta(milliseconds=300)).isoformat()
+    after = (transition + timedelta(milliseconds=300)).isoformat()
+
+    db_path = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db_path), agent_id=AGENT_ID) as storage:
+        await storage.db.execute_commit(
+            """CREATE TABLE IF NOT EXISTS channel_messages (
+                   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, channel_type TEXT NOT NULL,
+                   direction TEXT NOT NULL, sender TEXT, recipient TEXT, content TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'success', metadata TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+        async def _insert(mid, ts):
+            await storage.db.execute_commit(
+                "INSERT INTO channel_messages (id, agent_id, channel_type, direction, sender, "
+                "recipient, content, status, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, AGENT_ID, "telegram", "inbound", "alice", "bot", "text", "received", None, ts),
+            )
+
+        await _insert("normal-pre-transition", before)
+        _pin_clock(monkeypatch, transition)
+        wrapper = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+        wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
+        await _insert("leak-post-transition", after)
+        result = await wrapper.purge_ephemeral_session(reason="test-channel-same-second")
+        assert result["channel_messages"] == 1, result
+        rows = await storage.db.fetchall("SELECT id FROM channel_messages ORDER BY id")
+        assert [r[0] for r in rows] == ["normal-pre-transition"]

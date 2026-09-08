@@ -2117,11 +2117,12 @@ class PrivacyEnforcingStorage:
         """The instant a transition INTO EPHEMERAL happened, at full precision.
 
         One fact, two projections: :attr:`_entered_ephemeral_at` (whole
-        seconds, for the stores whose rows carry ``datetime('now')``-shaped
-        timestamps) and :meth:`_graph_purge_watermark` (microseconds, for
-        the graph purge, whose rows carry ``isoformat()`` timestamps). The
-        whole-second projection alone destroyed NORMAL-mode graph nodes
-        written earlier in the same second as the transition (#3227).
+        seconds, for ``conversation_history``, whose column is second-
+        granular by design) and :meth:`_exact_purge_watermark` (microseconds,
+        for the stores whose rows carry ``isoformat()`` timestamps: graph
+        nodes and channel messages). The whole-second projection alone
+        destroyed NORMAL-mode rows written earlier in the same second as the
+        transition (#3227).
         """
         return datetime.now(timezone.utc)
 
@@ -2174,13 +2175,13 @@ class PrivacyEnforcingStorage:
             )
         self._entered_ephemeral_instant = parsed.replace(tzinfo=timezone.utc)
 
-    def _graph_purge_watermark(self) -> Optional[str]:
-        """Microsecond watermark for the graph purge: ``YYYY-MM-DD HH:MM:SS.ffffff``.
+    def _exact_purge_watermark(self) -> Optional[str]:
+        """Microsecond watermark: ``YYYY-MM-DD HH:MM:SS.ffffff``.
 
-        Graph rows stamp ``properties.created_at`` with ``isoformat()`` (sub-
-        second), so the purge compares at that precision; a whole-second
-        watermark treated a NORMAL node from earlier in the transition
-        second as an in-window leak (#3227).
+        Graph nodes and channel messages stamp ``created_at`` with
+        ``isoformat()`` (sub-second), so their purges compare at that
+        precision; a whole-second watermark treated a NORMAL row from earlier
+        in the transition second as an in-window leak (#3227).
         """
         instant = self._entered_ephemeral_instant
         if instant is None:
@@ -2444,21 +2445,23 @@ class PrivacyEnforcingStorage:
             "conversation_history",
             lambda: self._storage.purge_conversations_since(since, reason=reason),
         ))
-        # The graph purge compares at the precision graph rows are stamped
-        # with (#3227); the same instant, not the whole-second projection.
-        graph_since = self._graph_purge_watermark()
+        # Graph nodes and channel messages are stamped with isoformat(): their
+        # purges compare at that precision (#3227) — the same instant, not the
+        # whole-second projection conversation_history needs.
+        exact_since = self._exact_purge_watermark()
         report.record(await self._sweep_store(
             "graph_nodes",
-            lambda: self._storage.purge_agent_graph_nodes(since_iso=graph_since),
+            lambda: self._storage.purge_agent_graph_nodes(since_iso=exact_since),
         ))
         # Defense-in-depth for the channels feature (#2096 / F112): a leaked
         # channel_messages row must be swept on EPHEMERAL exit, scoped to the
-        # same watermark. The primitive itself tolerates the table being absent
-        # (channels feature never loaded) and returns 0 — only a genuine backend
-        # error becomes FAILED here.
+        # same instant. The primitive parses both sides to aware datetimes,
+        # so it keeps the microseconds it is handed. It tolerates the table
+        # being absent (channels feature never loaded) and returns 0 — only a
+        # genuine backend error becomes FAILED here.
         report.record(await self._sweep_store(
             "channel_messages",
-            lambda: self._storage.purge_channel_messages_since(since, reason=reason),
+            lambda: self._storage.purge_channel_messages_since(exact_since, reason=reason),
         ))
 
         # Last, because the sweeps above fire the projection's change trigger

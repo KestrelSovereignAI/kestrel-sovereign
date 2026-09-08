@@ -863,16 +863,25 @@ def _normalize_purge_watermark(since_iso: Optional[str]) -> Optional[str]:
     if not since_iso:
         return since_iso
     text = str(since_iso).strip().replace("T", " ")
-    if len(text) > 19 and text[19] in "+-":
-        text = text[:19]
-    if len(text) == 19:
-        return text + ".000000"
-    if len(text) > 20 and text[19] == ".":
-        fraction = "".join(ch for ch in text[20:] if ch.isdigit())[:6]
-        return text[:19] + "." + fraction.ljust(6, "0")
-    raise ValueError(
-        f"purge watermark must be YYYY-MM-DD HH:MM:SS[.ffffff]; got {since_iso!r}"
-    )
+    if len(text) < 19:
+        raise ValueError(
+            f"purge watermark must be YYYY-MM-DD HH:MM:SS[.ffffff]; got {since_iso!r}"
+        )
+    head, tail = text[:19], text[19:]
+    fraction = ""
+    if tail.startswith("."):
+        digits = tail[1:]
+        end = 0
+        while end < len(digits) and digits[end].isdigit():
+            end += 1
+        fraction, tail = digits[:end], digits[end:]
+    # The watermark is a UTC instant. Only a UTC marker is tolerated behind
+    # it; any other offset would need converting, and no caller emits one.
+    if tail not in ("", "Z", "+00:00", "-00:00"):
+        raise ValueError(
+            f"purge watermark must be a UTC instant (no offset, Z or +00:00); got {since_iso!r}"
+        )
+    return head + "." + fraction[:6].ljust(6, "0")
 
 
 class AsyncGraphStore:
@@ -1913,11 +1922,15 @@ class AsyncGraphStore:
         # A value shorter than ``YYYY-MM-DD HH:MM:SS`` (a bare date, an empty
         # string) carries no instant to compare: it reads as NULL on both
         # backends and falls into the untimed branch below — preserved and
-        # counted, never purged. Some live writers stamp ``created_at`` with a
-        # bare date; appending a fraction to those sorted them ABOVE the
-        # watermark and would have purged every same-day one (#3227 review).
-        # On Postgres the guard also keeps ``''`` away from the timestamptz
-        # cast, which used to fail the whole sweep.
+        # counted, never purged. The strategic-memory writers stamp
+        # ``created_at`` with a bare date or ``''`` (#3255); appending a
+        # fraction to those sorted them ABOVE the watermark and would have
+        # purged every same-day one (#3227 review). On Postgres the guard also
+        # keeps ``''`` away from the timestamptz cast, which used to fail the
+        # whole sweep. A value carrying an offset other than UTC is outside
+        # the module's contract (``+00:00`` only); it reads as NULL too, on
+        # both backends, rather than SQLite taking its wall-clock text as UTC
+        # while Postgres converts it.
         if self.db.backend_type == "postgres":
             # graph_nodes.properties.created_at is documented as
             # ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00`` (ISO with T separator,
@@ -1938,7 +1951,9 @@ class AsyncGraphStore:
             )
             created_normalized = (
                 "(CASE WHEN (properties::jsonb->>'created_at') IS NULL "
-                "        OR length(properties::jsonb->>'created_at') < 19 THEN NULL "
+                "        OR length(properties::jsonb->>'created_at') < 19 "
+                "        OR (properties::jsonb->>'created_at') ~ '[+-](?!00:?00$)[0-9]{2}:?[0-9]{2}$' "
+                "     THEN NULL "
                 f" ELSE to_char(({truncated}::timestamptz) "
                 "              AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') END)"
             )
@@ -1952,6 +1967,8 @@ class AsyncGraphStore:
             # and offset, offset-free ISO, and SQLite-format inputs
             # uniformly, at the precision the rows are written with (#3227).
             value = "replace(json_extract(properties, '$.created_at'), 'T', ' ')"
+            # Everything after the seconds: a fraction, an offset, both, or nothing.
+            rest = f"substr({value}, 20)"
             frac = f"substr({value}, 21)"
             digits = (
                 f"(CASE WHEN instr({frac}, '+') > 0 THEN substr({frac}, 1, instr({frac}, '+') - 1) "
@@ -1960,9 +1977,16 @@ class AsyncGraphStore:
                 f"      WHEN instr({frac}, ' ') > 0 THEN substr({frac}, 1, instr({frac}, ' ') - 1) "
                 f"      ELSE {frac} END)"
             )
+            # The offset text, if any: from its sign to the end.
+            offset = (
+                f"(CASE WHEN instr({rest}, '+') > 0 THEN substr({rest}, instr({rest}, '+')) "
+                f"      WHEN instr({rest}, '-') > 0 THEN substr({rest}, instr({rest}, '-')) "
+                f"      ELSE '' END)"
+            )
             created_normalized = (
                 f"(CASE WHEN json_extract(properties, '$.created_at') IS NULL "
-                f"        OR length({value}) < 19 THEN NULL "
+                f"        OR length({value}) < 19 "
+                f"        OR {offset} NOT IN ('', '+00:00', '-00:00', '+0000', '-0000') THEN NULL "
                 f" WHEN substr({value}, 20, 1) = '.' "
                 f"  THEN substr({value}, 1, 19) || '.' || substr({digits} || '000000', 1, 6) "
                 f" ELSE substr({value}, 1, 19) || '.000000' END)"
