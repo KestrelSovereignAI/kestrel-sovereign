@@ -9,7 +9,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass, replace as _replace_dataclass
-from datetime import datetime
+from kestrel_sovereign.audit_time import utc_now_iso
 from kestrel_sovereign.storage import AsyncStorage, PrivacyEnforcingStorage
 from kestrel_sovereign.storage.privacy_wrapper import (
     ReentrantTransitionLock,
@@ -7705,7 +7705,8 @@ Expected Duration: {expected_duration}
                 label=agent_name,
                 properties={
                     "did": new_agent_did_doc['id'],
-                    "created_at": datetime.now().isoformat(),
+                    # Graph created_at is a UTC ISO-8601 contract (#3256).
+                    "created_at": utc_now_iso(),
                     "trust_level": "trusted"
                 }
             )
