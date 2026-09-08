@@ -570,3 +570,19 @@ async def test_a_throttled_poll_stays_pending_instead_of_settling_partial(
     assert st.outcome is Outcome.PENDING
     assert st.data["blocked"] == "network"
     assert "caveat" not in st.data
+
+
+@pytest.mark.asyncio
+async def test_a_403_carrying_no_headers_at_all_is_still_an_auth_error(monkeypatch):
+    """Surviving mutant, 2026-09-08: flipping the ``headers is None`` default
+    to "rate limited" was killed by nothing. The direction is load-bearing in
+    the direction this whole change exists for — read as transient, a
+    headerless 403 would never reach the fallback and the gate would stay
+    blind forever, reporting ``network`` at it. Unprovable is not transient."""
+    err = urllib.error.HTTPError("https://api.github.com/x", 403, "err", None, None)
+    _raise_from_urlopen(monkeypatch, err)
+
+    with pytest.raises(PRWatchAuthError) as caught:
+        await prw._github_get("https://api.github.com/x", token="t", timeout=1, ref="r")
+
+    assert not isinstance(caught.value, PRWatchRateLimitError)
