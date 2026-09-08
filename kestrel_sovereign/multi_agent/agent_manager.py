@@ -797,6 +797,7 @@ class AgentManager:
         base_data_dir: Optional[Path] = None,
         *,
         startup_config_path: Optional[Path] = None,
+        startup_runtime_env: Optional[Mapping[str, str]] = None,
         startup_roster_enabled: bool = True,
         hosted_telegram_route_attestation_resolver_factory: Optional[
             Callable[[str, str, LocalAgentConfig], object]
@@ -809,13 +810,7 @@ class AgentManager:
         ] = None,
         shared_postgres_backend: object | None = None,
     ):
-        if shared_postgres_backend is not None:
-            from kestrel_sovereign.storage.db.postgres import PostgresBackend
-
-            if not isinstance(shared_postgres_backend, PostgresBackend):
-                raise TypeError("shared_postgres_backend must be a PostgresBackend")
-            if not shared_postgres_backend.is_connected:
-                raise ValueError("shared_postgres_backend must already be connected")
+        self._validate_shared_postgres_backend(shared_postgres_backend)
         self._agents: dict[str, KestrelAgent] = {}
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
@@ -828,6 +823,9 @@ class AgentManager:
         # termination can release the unspent hold back to the parent (#2113).
         self._child_budgets: dict[str, tuple] = {}
         self._base_data_dir = (base_data_dir or Path.cwd()).expanduser().resolve()
+        self._startup_runtime_env = dict(
+            os.environ if startup_runtime_env is None else startup_runtime_env
+        )
         self._spawn_authority_registry = SpawnAuthorityRegistry(self._base_data_dir)
         if type(startup_roster_enabled) is not bool:
             raise TypeError("startup_roster_enabled must be a bool")
@@ -1102,6 +1100,40 @@ class AgentManager:
                 Awaitable[Optional[Callable[[], Awaitable[None]]]],
             ]
         ] = None
+
+    @staticmethod
+    def _validate_shared_postgres_backend(backend: object | None) -> None:
+        if backend is None:
+            return
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        if not isinstance(backend, PostgresBackend):
+            raise TypeError("shared_postgres_backend must be a PostgresBackend")
+        if not backend.is_connected:
+            raise ValueError("shared_postgres_backend must already be connected")
+
+    def bind_shared_postgres_backend(self, backend: object) -> None:
+        """Bind the server-owned pool before any hosted child can initialize."""
+
+        self._validate_shared_postgres_backend(backend)
+        if self._shared_postgres_backend is not None:
+            if self._shared_postgres_backend is backend:
+                return
+            raise RuntimeError("shared PostgreSQL backend is already bound")
+        if self._agents or self._agent_operations or self._initializing_agents:
+            raise RuntimeError(
+                "shared PostgreSQL backend must be bound before agent initialization"
+            )
+        self._shared_postgres_backend = backend
+
+    def _load_startup_config(self, config_path: Path) -> MultiAgentConfig:
+        """Reload a roster using the same runtime context as initial startup."""
+
+        return MultiAgentConfig.from_file(
+            config_path,
+            runtime_env=self._startup_runtime_env,
+            runtime_base=self._base_data_dir,
+        )
 
     def _isolated_runtime_scope(self, agent_did: str) -> tuple[Path, str]:
         """Return this host's canonical mutable runtime scope for one agent.
@@ -6405,7 +6437,7 @@ class AgentManager:
             # The caller's host projection can contain process-local listen
             # overrides and is restored only on the returned runtime model.
             runtime_host = config.host.model_copy(deep=True)
-            reconciled = MultiAgentConfig.from_file(
+            reconciled = self._load_startup_config(
                 self._startup_config_path
             ).model_copy(deep=True)
         else:
@@ -6503,6 +6535,15 @@ class AgentManager:
             )
             changed = True
         type(reconciled).model_validate(reconciled.model_dump())
+        # Registry-first spawn persistence can leave an active child absent
+        # from multi_agent.toml after a crash. Validate the repaired, effective
+        # roster against this host's original path context before persisting it
+        # or allowing the server to create Hold custody. Model validation alone
+        # has no runtime base/environment with which to resolve this relation.
+        reconciled.validate_host_custody_paths(
+            base_dir=self._base_data_dir,
+            runtime_env=self._startup_runtime_env,
+        )
         if changed and self._startup_config_path is not None:
             type(reconciled).model_validate(reconciled.model_dump())
             reconciled.save(self._startup_config_path)
@@ -9757,6 +9798,19 @@ class AgentManager:
                 autostart=True,
                 features=features,
             )
+            try:
+                # Endpoint model validation has no target-runtime path context.
+                # Guard this exact candidate before mkdir/inception can write
+                # agent-owned state over the host's sovereign Hold custody.
+                MultiAgentConfig.validate_local_agent_host_custody(
+                    name,
+                    config,
+                    base_dir=self._base_data_dir,
+                    runtime_env=self._startup_runtime_env,
+                )
+            except Exception:
+                self._reserved_ports.discard(port)
+                raise
             admission.spawn_candidate_config = config.model_copy(deep=True)
             agent_dir = self._base_data_dir / "agent_data" / name
 
@@ -11514,7 +11568,7 @@ class AgentManager:
             raise RuntimeError(
                 "Spawned child has no local configuration for restart selection"
             )
-        current = MultiAgentConfig.from_file(config_path)
+        current = self._load_startup_config(config_path)
         collision = next(
             (
                 existing
@@ -11553,7 +11607,7 @@ class AgentManager:
             return False
         if not isinstance(expected, LocalAgentConfig) or config_path is None:
             raise RuntimeError("Uncommitted spawn startup witness is incomplete")
-        current = MultiAgentConfig.from_file(config_path)
+        current = self._load_startup_config(config_path)
         stored = current.agents.get(admission.name)
         if stored != expected:
             raise RuntimeError(
@@ -11585,7 +11639,7 @@ class AgentManager:
         config_path = self._startup_config_path
         if config_path is None:
             return None
-        current = MultiAgentConfig.from_file(config_path)
+        current = self._load_startup_config(config_path)
         matching = [
             name
             for name in current.agents
@@ -11635,7 +11689,7 @@ class AgentManager:
         """Compensate desired state only when destructive cleanup never began."""
 
         config_path, persisted_name, expected = witness
-        current = MultiAgentConfig.from_file(config_path)
+        current = self._load_startup_config(config_path)
         matching = [
             name
             for name in current.agents

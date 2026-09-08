@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Iterator
 
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
@@ -18,6 +20,66 @@ PRIVATE_FILE_MODE = 0o600
 
 class PrivateStorageError(RuntimeError):
     """Sensitive local storage cannot be opened with exclusive custody."""
+
+
+def _lock_private_file_descriptor(descriptor: int) -> Any:
+    """Take one blocking cross-process exclusive lock."""
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        overlapped = _Overlapped()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.LockFileEx(
+            wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
+            0x00000002,  # LOCKFILE_EXCLUSIVE_LOCK
+            0,
+            1,
+            0,
+            ctypes.byref(overlapped),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return overlapped
+
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return None
+
+
+def _unlock_private_file_descriptor(descriptor: int, token: Any) -> None:
+    """Release a lock obtained by ``_lock_private_file_descriptor``."""
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.UnlockFileEx(
+            wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)),
+            0,
+            1,
+            0,
+            ctypes.byref(token),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def absolute_without_following_leaf(path: Path) -> Path:
@@ -134,13 +196,15 @@ def require_private_directory(path: Path, *, label: str = "storage") -> None:
         )
 
 
-def open_private_file(
+def _open_private_file(
     path: Path,
     flags: int,
     *,
-    label: str = "storage",
+    label: str,
+    harden: bool,
 ) -> int:
-    """Open a non-link, single-link regular file and enforce mode ``0600``."""
+    """Open one private file and either harden or validate its custody mode."""
+
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow and path_exists(path):  # pragma: no cover - Windows fallback
         try:
@@ -167,20 +231,90 @@ def open_private_file(
                 f"{label} custody file has {st.st_nlink} hard links; exclusive "
                 f"custody cannot be established: {path}"
             )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, PRIVATE_FILE_MODE)
-        else:  # pragma: no cover - Windows has no POSIX mode enforcement
-            path.chmod(PRIVATE_FILE_MODE)
+        if harden:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, PRIVATE_FILE_MODE)
+            else:  # pragma: no cover - Windows has no POSIX mode enforcement
+                path.chmod(PRIVATE_FILE_MODE)
+        elif os.name != "nt" and stat.S_IMODE(st.st_mode) != PRIVATE_FILE_MODE:
+            raise PrivateStorageError(
+                f"{label} custody file {path} must have mode 0600; found "
+                f"{stat.S_IMODE(st.st_mode):04o}"
+            )
         return fd
     except (OSError, PrivateStorageError):
         os.close(fd)
         raise
 
 
+def open_private_file(
+    path: Path,
+    flags: int,
+    *,
+    label: str = "storage",
+) -> int:
+    """Open a non-link, single-link regular file and enforce mode ``0600``."""
+
+    return _open_private_file(path, flags, label=label, harden=True)
+
+
+def open_private_file_for_validation(
+    path: Path,
+    flags: int = os.O_RDONLY,
+    *,
+    label: str = "storage",
+) -> int:
+    """Open an existing private file without changing its custody metadata."""
+
+    mutating_flags = os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_WRONLY
+    if flags & mutating_flags:
+        raise ValueError("validation-only private file open cannot mutate the file")
+    return _open_private_file(path, flags, label=label, harden=False)
+
+
 def ensure_private_file(path: Path, *, label: str = "storage") -> None:
     """Securely create or harden a regular file without writing content."""
     fd = open_private_file(path, os.O_RDWR | os.O_CREAT, label=label)
     os.close(fd)
+
+
+@contextmanager
+def exclusive_private_file_lock(
+    path: Path,
+    *,
+    label: str = "storage",
+) -> Iterator[None]:
+    """Serialize one private-file protocol across processes.
+
+    The lock file is durable protocol structure rather than authoritative
+    payload. Keeping it after release lets every process contend on the same
+    inode and makes process death release ownership without a stale sentinel.
+    """
+
+    ensure_private_directory(path.parent, label=label)
+    descriptor = open_private_file(
+        path,
+        os.O_RDWR | os.O_CREAT,
+        label=f"{label} lock",
+    )
+    try:
+        token = _lock_private_file_descriptor(descriptor)
+    except OSError as exc:
+        os.close(descriptor)
+        raise PrivateStorageError(
+            f"cannot lock private {label} file {path}: {exc}"
+        ) from exc
+
+    try:
+        yield
+    finally:
+        try:
+            _unlock_private_file_descriptor(descriptor, token)
+        except OSError:
+            # Closing the descriptor releases the ownership even when an
+            # explicit unlock reports a teardown-only failure.
+            pass
+        os.close(descriptor)
 
 
 __all__ = [
@@ -190,7 +324,9 @@ __all__ = [
     "absolute_without_following_leaf",
     "ensure_private_directory",
     "ensure_private_file",
+    "exclusive_private_file_lock",
     "open_private_file",
+    "open_private_file_for_validation",
     "path_exists",
     "require_private_directory",
 ]

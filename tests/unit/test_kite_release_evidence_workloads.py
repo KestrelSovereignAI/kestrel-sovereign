@@ -11,14 +11,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kestrel_sovereign.knowledge import kite_release_evidence_workloads as workloads
 from kestrel_sovereign.knowledge.kite_release_evidence import (
-    KiteEvidenceError,
     KiteAggregateObservation,
+    KiteEvidenceError,
     KiteGate,
     KiteIsolationConfig,
     KiteStorageConfig,
     SurfaceErasureObservation,
 )
-from kestrel_sovereign.knowledge.release_evidence import erasure_drill_binding, release_gate_specs
+from kestrel_sovereign.knowledge.release_evidence import (
+    erasure_drill_binding,
+    release_gate_specs,
+)
 from kestrel_sovereign.knowledge.release_evidence_execution import (
     CatalogExecutionAuthority,
     CatalogSigningIdentity,
@@ -30,7 +33,9 @@ from kestrel_sovereign.knowledge.release_evidence_models import (
     ExecutionEnvironment,
     ReleaseEvidenceError,
 )
-from kestrel_sovereign.knowledge.release_evidence_postgres import DisposablePostgresDatabase
+from kestrel_sovereign.knowledge.release_evidence_postgres import (
+    DisposablePostgresDatabase,
+)
 
 
 def _gate(gate_id: str):
@@ -375,3 +380,4 @@ def test_kite_postgres_child_receives_only_the_disposable_authority_dsn(
     assert environment["DATABASE_URL"] == database.dsn
     assert environment["KESTREL_DATABASE_URL"] == database.dsn
     assert environment["DATABASE_URL"] != "postgresql://ambient/shared"
+    assert environment["KESTREL_HOLD_BACKEND"] == "sqlite"

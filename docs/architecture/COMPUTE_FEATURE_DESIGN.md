@@ -447,14 +447,33 @@ environment, `--no-project` prevents project/workspace discovery, and a
 concrete base-interpreter path anchors interpreter selection outside Kestrel's
 runtime as defense-in-depth against uv resolver changes. The real-process test
 demonstrates the fresh and project-free behavior; the explicit pin makes that
-choice independent of the caller-selected working directory rather than
-depending on uv's future interpreter-resolution semantics.
+choice independent of uv's future interpreter-resolution semantics.
+On Linux the child command is additionally wrapped in a mandatory bubblewrap
+(`bwrap`) sandbox. Its mount namespace starts empty and imports only the trusted
+base-interpreter runtime, the `uv` executable, and the executor-owned workspace;
+the project, home, host-control, `/run`, and `/var` trees are absent rather than
+merely read-only. New network, IPC, PID, UTS, user, and cgroup namespaces close
+service sockets and remote databases as alternate Hold mutation channels.
+External host working directories are refused for the same reason. The UV
+executor is unavailable on
+macOS because Seatbelt (`sandbox-exec`) path filters do not make an inode
+read-only when it is reached through a pre-existing alias outside the protected
+directory. The executor fails unavailable if the verified Linux sandbox cannot
+be established; Docker remains the portable fallback.
 Kestrel must itself run inside a Python `venv` or `virtualenv` so that base
 interpreter cannot be Kestrel's own runtime. A Conda environment alone does not
 provide the distinct `sys.prefix`/`sys.base_prefix` boundary required here.
 Deployment packaging must preserve that boundary: the shipped sovereign image
 creates `/app/.venv` and launches Kestrel with `/app/.venv/bin/python`; a system
 or `--user` Python installation leaves the uv executor unavailable by design.
+Declared registry requirements are resolved before the network namespace is
+detached, but only by the trusted `uv` binary with source builds, configuration
+discovery, caller environment, and Python site initialization disabled. This
+populates the fresh executor-owned cache without executing dependency code.
+The reviewed script then runs offline inside the minimal namespace. Direct URL,
+VCS, host-file, and source-only requirements are refused; a local wheel is
+accepted only when trusted executor setup has already placed it inside that
+run's private workspace.
 
 ```python
 class UvExecutor:
@@ -469,27 +488,32 @@ class UvExecutor:
         Execute Python script using uv.
         
         1. Create temporary directory
-        2. Write script and requirements.txt
+        2. Write the reviewed script
         3. Resolve the executable behind the Kestrel virtual environment
-        4. Run with `uv run --isolated --no-project --python <base-executable>`
-        5. Capture output
-        6. Clean up
+        4. Resolve wheel-only registry requirements into the private cache
+           using trusted uv and a site-disabled Python no-op
+        5. Enter a minimal OS sandbox that omits host Hold custody
+        6. Run offline with
+           `uv run --isolated --no-project --no-build --offline`
+        7. Capture output and clean up
         """
         with tempfile.TemporaryDirectory(prefix="kestrel_compute_") as tmpdir:
             script_path = Path(tmpdir) / "script.py"
             script_path.write_text(script.content)
             
-            if requirements:
-                req_path = Path(tmpdir) / "requirements.txt"
-                req_path.write_text("\n".join(requirements))
-            
             base_python = self._get_base_python_path()
             command = [
-                "uv", "run", "--isolated", "--no-project",
+                "uv", "run", "--isolated", "--no-project", "--no-config",
+                "--no-build", "--no-python-downloads",
                 "--python", base_python,
             ]
             for requirement in requirements or []:
                 command.extend(["--with", requirement])
+            resolve = [
+                *command, "--", base_python, "-I", "-S", "-c", "pass",
+            ]
+            await run_without_caller_environment(resolve)
+            command.append("--offline")
             command.append(str(script_path))
             env = {
                 key: value
@@ -532,9 +556,10 @@ POSIX). Every candidate must be an executable file. Resolution fails closed if
 Kestrel is not running in a Python `venv`/`virtualenv` (including when it is
 running in a Conda environment alone) or no base executable exists.
 The filtered child environment removes `PYTHONPATH`, and host `UV_*`/package
-index variables are not forwarded. Package installation remains limited to the
-requirements explicitly represented by repeated `--with` arguments on the
-reviewed script.
+index variables are not forwarded. Package installation remains limited to
+validated registry requirements explicitly represented by repeated `--with`
+arguments on the reviewed script, uses wheels only, and is reused offline by
+the sandboxed process.
 
 ### 4.2 Docker Executor (Bash/Python)
 

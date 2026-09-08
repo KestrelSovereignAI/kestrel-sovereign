@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -317,14 +318,18 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch,
     tmp_path,
 ) -> None:
-    """The full multi-agent startup order is preflight → load → host runner."""
+    """Hold state exists before preflight, agent load, and the host runner."""
     from kestrel_sovereign import host_features as hf
     from kestrel_sovereign.a2a import did_registry
     from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
     from kestrel_sovereign import phoenix_supervisor as phoenix_module
     from kestrel_sovereign.security import demo_isolation
 
-    config_path = tmp_path / "multi_agent.toml"
+    runtime_base = tmp_path / "runtime-project"
+    runtime_base.mkdir()
+    config_dir = tmp_path / "external-config"
+    config_dir.mkdir()
+    config_path = config_dir / "multi_agent.toml"
     root_config = ma_config.LocalAgentConfig(
         data_dir=tmp_path / "root",
         port=8898,
@@ -347,6 +352,14 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     events: list[str] = []
     removal_resolution_started = asyncio.Event()
     allow_removal_resolution = asyncio.Event()
+    hold_store = object()
+    host_context = SimpleNamespace(
+        hold_store=hold_store,
+        hold_db=None,
+        db=None,
+        session_factory=None,
+        feature_contribution_runtime=None,
+    )
 
     class _Manager:
         init_failures = []
@@ -368,6 +381,10 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             assert config is fake_config
             events.append("reconcile")
             return effective_config
+
+        def bind_shared_postgres_backend(self, backend) -> None:
+            assert backend is shared_backend
+            events.append("backend-bind")
 
         async def load_from_config(
             self,
@@ -423,22 +440,36 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is effective_config
         events.append("host-start")
 
+    async def _build_host_context(*, config):
+        assert isinstance(config, dict)
+        assert config["agents"] == ["Root", "ColdRoot", "RecoveredChild"]
+        events.append("context-build")
+        return host_context
+
     shared_backend = object()
 
     async def _shared_backend(_app):
+        events.append("backend-start")
         return shared_backend
 
     def _manager_factory(**kwargs):
-        assert kwargs["shared_postgres_backend"] is shared_backend
+        assert "shared_postgres_backend" not in kwargs
+        assert kwargs["base_data_dir"] == runtime_base
         return manager
 
+    def _load_config(*_args, **kwargs):
+        assert kwargs["runtime_base"] == runtime_base
+        assert kwargs["runtime_env"] is os.environ
+        return fake_config
+
+    monkeypatch.chdir(runtime_base)
     monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
     monkeypatch.setenv("KESTREL_API_KEY", "scheduler-host-test-key")
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
     monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://scheduler-test")
     monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
     monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
-    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *_a, **_k: fake_config)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", _load_config)
     monkeypatch.setattr(agent_manager, "AgentManager", _manager_factory)
     monkeypatch.setattr(
         server, "_prepare_shared_postgres_scheduler_protocol", _preflight
@@ -454,8 +485,10 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
     monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+    monkeypatch.setattr(hf, "build_host_context", _build_host_context)
 
-    async with server._lifespan_startup(FastAPI()):
+    app = FastAPI()
+    async with server._lifespan_startup(app):
         child_config = ma_config.LocalAgentConfig(
             data_dir=tmp_path / "persistent-child",
             port=8899,
@@ -537,6 +570,66 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert restored["ConcurrentChild"] == concurrent_config
         assert restored["ExternalChild"] == external_config
 
-    assert events == ["reconcile", "preflight", "load", "host-start"]
+    assert events == [
+        "reconcile",
+        "context-build",
+        "backend-start",
+        "backend-bind",
+        "preflight",
+        "load",
+        "host-start",
+    ]
     assert callable(manager.created_agent_persistence_hook)
     assert callable(manager.created_agent_registration_removal_hook)
+    assert app.state.host_context is host_context
+    assert app.state.host_context.hold_store is hold_store
+    assert app.state.multi_agent_runtime_base == runtime_base
+    assert app.state.multi_agent_runtime_env is os.environ
+
+
+@pytest.mark.asyncio
+async def test_single_agent_identity_conflict_precedes_hold_custody_binding(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A foreign runtime database is refused before Hold can bind its custody."""
+
+    from kestrel_sovereign import host_features as hf
+    from kestrel_sovereign import phoenix_supervisor as phoenix_module
+
+    events: list[str] = []
+
+    async def _reject_foreign_database(*_args, **_kwargs) -> str:
+        events.append("identity-preflight")
+        raise ValueError("Identity conflict: configured database belongs elsewhere")
+
+    async def _build_control_context(_app, _config) -> object:
+        events.append("hold-custody-binding")
+        return object()
+
+    missing_config = tmp_path / "missing-multi-agent.toml"
+    monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://foreign/runtime")
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "local-anchor"))
+    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
+    monkeypatch.setattr(
+        server,
+        "resolve_multi_agent_path",
+        lambda _env: missing_config,
+    )
+    monkeypatch.setattr(server, "get_agent_did_async", _reject_foreign_database)
+    monkeypatch.setattr(server, "_build_host_control_context", _build_control_context)
+    monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_kwargs: [])
+
+    app = FastAPI()
+    async with server._lifespan_startup(app):
+        pass
+
+    assert events == ["identity-preflight"]
+    assert "Identity conflict" in app.state.startup_error
+    assert app.state.host_context is None

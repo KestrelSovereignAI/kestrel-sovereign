@@ -66,6 +66,7 @@ def test_every_default_branch_behind_the_override_also_lands_in_the_root(
     assert host_runtime_isolation_root in paths.project_dir().parents
 
     monkeypatch.delenv(HOST_DB_PATH_ENV)
+    monkeypatch.delenv("KESTREL_DB_PATH")
     paths.reset_cache()
     fallback, uses_default = host_database_path()
 

@@ -9,11 +9,14 @@ their execution environment.
 import builtins as _builtins
 from contextvars import ContextVar as _ContextVar
 from datetime import datetime as _datetime, timezone as _timezone
+import io as _io
 import json as _json
 import os as _os
 from pathlib import Path as _Path
 import shutil as _shutil
+import stat as _stat
 import tempfile as _tempfile
+import unicodedata as _unicodedata
 
 
 class _KestrelAgentDataProtectionError(PermissionError):
@@ -23,6 +26,131 @@ class _KestrelAgentDataProtectionError(PermissionError):
 def _is_relative_to(path: _Path, parent: _Path) -> bool:
     """Use component-aware containment; string prefixes are never boundaries."""
     return path == parent or path.is_relative_to(parent)
+
+
+def _nearest_existing_path(path: _Path) -> _Path:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _alternate_case(name: str) -> str | None:
+    for position, character in enumerate(name):
+        swapped = character.swapcase()
+        if swapped != character:
+            return name[:position] + swapped + name[position + 1 :]
+    return None
+
+
+def _filesystem_is_case_insensitive(path: _Path) -> bool | None:
+    if _os.name == "nt":
+        return True
+    existing = _nearest_existing_path(path)
+    if existing.is_dir():
+        try:
+            candidates = existing.iterdir()
+        except OSError:
+            return None
+    else:
+        candidates = iter((existing,))
+    try:
+        for candidate in candidates:
+            alternate_name = _alternate_case(candidate.name)
+            if alternate_name is None:
+                continue
+            alternate = candidate.with_name(alternate_name)
+            try:
+                return candidate.samefile(alternate)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return None
+
+
+def _combined_case_insensitivity(*results: bool | None) -> bool | None:
+    if any(result is True for result in results):
+        return True
+    if all(result is False for result in results):
+        return False
+    return None
+
+
+def _normalized_parts(parts: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_unicodedata.normalize("NFD", part) for part in parts)
+
+
+def _parts_overlap(
+    first: tuple[str, ...],
+    second: tuple[str, ...],
+    *,
+    case_insensitive: bool | None,
+) -> bool:
+    first_normalized = _normalized_parts(first)
+    second_normalized = _normalized_parts(second)
+    shorter = min(len(first_normalized), len(second_normalized))
+    if first_normalized[:shorter] == second_normalized[:shorter]:
+        return True
+    if case_insensitive is False:
+        return False
+    return tuple(part.casefold() for part in first_normalized[:shorter]) == tuple(
+        part.casefold() for part in second_normalized[:shorter]
+    )
+
+
+def _same_existing_path(first: _Path, second: _Path) -> bool:
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _aliased_ancestor_suffixes(
+    first: _Path,
+    second: _Path,
+) -> tuple[tuple[str, ...], tuple[str, ...], _Path, _Path] | None:
+    first_ancestor = _nearest_existing_path(first)
+    second_ancestor = _nearest_existing_path(second)
+    if not _same_existing_path(first_ancestor, second_ancestor):
+        return None
+    return (
+        first.relative_to(first_ancestor).parts,
+        second.relative_to(second_ancestor).parts,
+        first_ancestor,
+        second_ancestor,
+    )
+
+
+def _paths_overlap_by_filesystem_identity(first: _Path, second: _Path) -> bool:
+    first = first.resolve(strict=False)
+    second = second.resolve(strict=False)
+    if _is_relative_to(first, second) or _is_relative_to(second, first):
+        return True
+    if first.exists() and second.exists() and _same_existing_path(first, second):
+        return True
+    aliased = _aliased_ancestor_suffixes(first, second)
+    if aliased is not None:
+        first_suffix, second_suffix, first_ancestor, second_ancestor = aliased
+        if _parts_overlap(
+            first_suffix,
+            second_suffix,
+            case_insensitive=_combined_case_insensitivity(
+                _filesystem_is_case_insensitive(first_ancestor),
+                _filesystem_is_case_insensitive(second_ancestor),
+            ),
+        ):
+            return True
+    return _parts_overlap(
+        first.parts,
+        second.parts,
+        case_insensitive=_combined_case_insensitivity(
+            _filesystem_is_case_insensitive(first),
+            _filesystem_is_case_insensitive(second),
+        ),
+    )
 
 
 def _is_agent_data_path(path: _Path) -> bool:
@@ -39,6 +167,7 @@ def _unique_trash_subdir(trash_root: _Path) -> _Path:
 def install_safe_delete_runtime(
     trash_dir: str,
     current_agent_data_path: str | None,
+    host_control_data_path: str,
     deletable_prefixes: list[str],
     workdir: str | None,
 ) -> None:
@@ -55,6 +184,9 @@ def install_safe_delete_runtime(
         if current_agent_data_path
         else None
     )
+    host_control_data = (
+        _Path(host_control_data_path).expanduser().resolve(strict=False)
+    )
     authorized_workdir = _Path(workdir) if workdir else None
     configured_prefixes = tuple(
         _Path(prefix).expanduser() for prefix in deletable_prefixes
@@ -62,10 +194,13 @@ def install_safe_delete_runtime(
     audit_log = trash_root / "agent_data_access_audit.jsonl"
 
     original_unlink = _os.unlink
+    original_link = _os.link
     original_rename = _os.rename
     original_replace = _os.replace
     original_truncate = _os.truncate
+    original_os_open = _os.open
     original_open = _builtins.open
+    original_io_open = _io.open
     original_rmtree = _shutil.rmtree
     original_path_open = _Path.open
     internal_filesystem_operation = _ContextVar(
@@ -96,6 +231,35 @@ def install_safe_delete_runtime(
             pass
 
     def assert_agent_data_allowed(path: _Path, action: str) -> None:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} path whose hard-link custody cannot be "
+                f"verified: {path}"
+            ) from exc
+        if (
+            metadata is not None
+            and _stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink != 1
+        ):
+            audit_agent_data(
+                path,
+                action,
+                "blocked",
+                "ambiguous_hard_link_custody",
+            )
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} multiply-linked file with ambiguous "
+                f"Hold custody: {path}"
+            )
+        if _paths_overlap_by_filesystem_identity(path, host_control_data):
+            audit_agent_data(path, action, "blocked", "host_hold_custody")
+            raise _KestrelAgentDataProtectionError(
+                f"Refusing to {action} host Hold custody: {path}"
+            )
         if not _is_agent_data_path(path):
             return
         if current_agent_data is not None and _is_relative_to(path, current_agent_data):
@@ -108,6 +272,8 @@ def install_safe_delete_runtime(
 
     def direct_delete_root(path: _Path) -> _Path | None:
         """Return the concrete root that owns ``path`` at operation time."""
+        if _paths_overlap_by_filesystem_identity(path, host_control_data):
+            return None
         for configured_prefix in configured_prefixes:
             prefix_parent = configured_prefix.parent.resolve(strict=False)
             try:
@@ -218,6 +384,17 @@ def install_safe_delete_runtime(
         assert_agent_data_allowed(_Path(dst).resolve(strict=False), "replace")
         return original_replace(src, dst)
 
+    def safe_link(src, dst, *args, **kwargs):
+        if internal_filesystem_operation.get():
+            return original_link(src, dst, *args, **kwargs)
+        if args or kwargs:
+            raise ValueError(
+                "Safe hard-link creation does not support dir_fd/options"
+            )
+        assert_agent_data_allowed(_Path(src).resolve(strict=False), "hard_link")
+        assert_agent_data_allowed(_Path(dst).resolve(strict=False), "hard_link")
+        return original_link(src, dst)
+
     def safe_truncate(path, length, *args, **kwargs):
         try:
             resolved = _Path(path).expanduser().resolve(strict=False)
@@ -227,19 +404,52 @@ def install_safe_delete_runtime(
         return original_truncate(resolved, length, *args, **kwargs)
 
     def safe_open(file, mode="r", *args, **kwargs):
-        if isinstance(mode, str) and "w" in mode:
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
             try:
                 resolved = _Path(file).expanduser().resolve(strict=False)
             except TypeError:
                 return original_open(file, mode, *args, **kwargs)
-            assert_agent_data_allowed(resolved, "open_truncate")
+            assert_agent_data_allowed(resolved, "open_write")
             return original_open(resolved, mode, *args, **kwargs)
         return original_open(file, mode, *args, **kwargs)
 
+    def safe_io_open(file, mode="r", *args, **kwargs):
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
+            try:
+                resolved = _Path(file).expanduser().resolve(strict=False)
+            except TypeError:
+                return original_io_open(file, mode, *args, **kwargs)
+            assert_agent_data_allowed(resolved, "open_write")
+            return original_io_open(resolved, mode, *args, **kwargs)
+        return original_io_open(file, mode, *args, **kwargs)
+
+    def safe_os_open(file, flags, mode=0o777, *, dir_fd=None):
+        mutation_flags = (
+            _os.O_WRONLY
+            | _os.O_RDWR
+            | _os.O_APPEND
+            | _os.O_CREAT
+            | _os.O_TRUNC
+            | getattr(_os, "O_TMPFILE", 0)
+        )
+        if isinstance(flags, int) and flags & mutation_flags:
+            try:
+                lexical = _Path(file).expanduser()
+            except TypeError:
+                return original_os_open(file, flags, mode, dir_fd=dir_fd)
+            if dir_fd is not None and not lexical.is_absolute():
+                raise ValueError(
+                    "Safe write open does not support relative paths with dir_fd"
+                )
+            resolved = lexical.resolve(strict=False)
+            assert_agent_data_allowed(resolved, "os_open_write")
+            return original_os_open(resolved, flags, mode, dir_fd=dir_fd)
+        return original_os_open(file, flags, mode, dir_fd=dir_fd)
+
     def path_safe_open(self, mode="r", *args, **kwargs):
-        if isinstance(mode, str) and "w" in mode:
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
             resolved = _Path(self).expanduser().resolve(strict=False)
-            assert_agent_data_allowed(resolved, "open_truncate")
+            assert_agent_data_allowed(resolved, "open_write")
             return original_path_open(resolved, mode, *args, **kwargs)
         return original_path_open(self, mode, *args, **kwargs)
 
@@ -264,10 +474,13 @@ def install_safe_delete_runtime(
 
     _os.remove = safe_remove
     _os.unlink = safe_remove
+    _os.link = safe_link
     _os.rename = safe_rename
     _os.replace = safe_replace
     _os.truncate = safe_truncate
+    _os.open = safe_os_open
     _builtins.open = safe_open
+    _io.open = safe_io_open
     _shutil.rmtree = safe_rmtree
 
     # Path is an alias of the platform's concrete Path class.  Patching that

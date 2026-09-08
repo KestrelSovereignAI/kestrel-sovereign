@@ -12,14 +12,20 @@ The multi_agent.toml file defines which agents exist and how to reach them.
 
 import logging
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, List, Mapping, Optional, Union
 
 import toml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from kestrel_sovereign.host_features.storage import host_database_path
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did_sync,
+)
+from kestrel_sovereign.paths import spawned_agent_env
+from kestrel_sovereign.security.path_identity import (
+    paths_equal_by_filesystem_identity,
+    paths_overlap_by_filesystem_identity,
 )
 from kestrel_sovereign.security.tenant_resolver import HOST_CONFIG_KEY
 
@@ -68,6 +74,22 @@ def spawn_retirement_denies_startup(data_dir: Path) -> bool:
     )
     return False
 
+
+def _host_control_directory(
+    *,
+    env: Mapping[str, str],
+    base_dir: Path,
+) -> Path:
+    """Resolve host custody for the target runtime, not this Python process."""
+
+    database_path, _uses_default = host_database_path(env=env, base_dir=base_dir)
+    return database_path.parent.resolve(strict=False)
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either custody root contains the other on its volume."""
+
+    return paths_overlap_by_filesystem_identity(first, second)
 
 # Canonical modules for the features that form every agent's sovereignty
 # foundation. Discovery imports these modules explicitly and fails closed, so
@@ -322,12 +344,21 @@ class MultiAgentConfig(BaseModel):
         return self
 
     @classmethod
-    def from_file(cls, config_path: Union[str, Path]) -> "MultiAgentConfig":
+    def from_file(
+        cls,
+        config_path: Union[str, Path],
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
+        runtime_base: Optional[Path] = None,
+    ) -> "MultiAgentConfig":
         """
         Load multi_agent config from a TOML file.
 
         Args:
             config_path: Path to multi_agent.toml
+            runtime_env: Environment used by the target runtime.
+            runtime_base: Project base used by the target runtime to resolve
+                relative agent paths. Defaults to the config file's parent.
 
         Returns:
             MultiAgentConfig instance
@@ -366,13 +397,101 @@ class MultiAgentConfig(BaseModel):
                     f"'data_dir' + 'port' (local)"
                 )
 
-        return cls(host=host, agents=agents)
+        config = cls(host=host, agents=agents)
+        target_base = (
+            path.parent.resolve(strict=False)
+            if runtime_base is None
+            else runtime_base.resolve(strict=False)
+        )
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        config.validate_host_custody_paths(
+            base_dir=target_base,
+            runtime_env=target_env,
+        )
+        return config
+
+    def validate_host_custody_paths(
+        self,
+        *,
+        base_dir: Path,
+        runtime_env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Reject agent-owned writable roots overlapping host-owned Hold state."""
+
+        target_base = base_dir.resolve(strict=False)
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
+        for name, agent in self.agents.items():
+            if not isinstance(agent, LocalAgentConfig):
+                continue
+            self.validate_local_agent_host_custody(
+                name,
+                agent,
+                base_dir=target_base,
+                runtime_env=target_env,
+            )
+
+    @staticmethod
+    def validate_local_agent_host_custody(
+        name: str,
+        agent: LocalAgentConfig,
+        *,
+        base_dir: Path,
+        runtime_env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Reject one candidate before an agent-owned path can be created.
+
+        Full configuration loading uses this same boundary, but dynamic and
+        setup creation must invoke it *before* inception creates the candidate
+        directory. Pydantic field validation alone has no target-runtime path
+        context and therefore cannot enforce this custody relation.
+        """
+
+        target_base = base_dir.resolve(strict=False)
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
+        agent_owned_paths = [
+            ("data directory", agent.resolve_data_dir(target_base)),
+        ]
+        identity_export_dir = agent.resolve_identity_export_dir(target_base)
+        if identity_export_dir is not None:
+            agent_owned_paths.append(
+                ("identity export directory", identity_export_dir)
+            )
+        for label, agent_owned_path in agent_owned_paths:
+            if _paths_overlap(agent_owned_path, host_control_dir):
+                raise ValueError(
+                    f"Agent '{name}' {label} {agent_owned_path} overlaps host "
+                    f"Hold custody at {host_control_dir}. Move the agent or set "
+                    "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
+                )
 
     @classmethod
     def auto_discover(
         cls,
         base_dir: Union[str, Path] = AGENT_DATA_DIR,
         include_empty: bool = False,
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
+        project_base: Optional[Path] = None,
     ) -> "MultiAgentConfig":
         """
         Auto-discover agents from agent_data/* subdirectories.
@@ -389,6 +508,20 @@ class MultiAgentConfig(BaseModel):
             MultiAgentConfig with auto-discovered agents
         """
         base_path = Path(base_dir)
+        target_base = (
+            project_base.resolve(strict=False)
+            if project_base is not None
+            else base_path.parent.resolve(strict=False)
+        )
+        target_env = (
+            spawned_agent_env(target_base)
+            if runtime_env is None
+            else runtime_env
+        )
+        host_control_dir = _host_control_directory(
+            env=target_env,
+            base_dir=target_base,
+        )
         agents: dict[str, LocalAgentConfig] = {}
         next_port = DEFAULT_AGENT_START_PORT
 
@@ -405,8 +538,35 @@ class MultiAgentConfig(BaseModel):
         for subdir in sorted(base_path.iterdir()):
             if not subdir.is_dir():
                 continue
-
             db_path = subdir / "kestrel_prime.db"
+            # The supported multi-agent image keeps the host-owned Hold store
+            # below the persistent agent-data volume. That directory is host
+            # infrastructure, never an agent, even when include_empty=True is
+            # selecting freshly provisioned agent directories.
+            resolved_subdir = subdir.resolve(strict=False)
+            collides_with_host_control = _paths_overlap(
+                resolved_subdir,
+                host_control_dir,
+            )
+            if collides_with_host_control:
+                if db_path.exists():
+                    raise ValueError(
+                        f"Host control directory {subdir} collides with an "
+                        f"existing agent database at {db_path}. Move that "
+                        "agent directory or set KESTREL_HOST_DB_PATH to a "
+                        "dedicated path outside agent_data before restarting"
+                    )
+                if paths_equal_by_filesystem_identity(
+                    resolved_subdir,
+                    host_control_dir,
+                ):
+                    continue
+                raise ValueError(
+                    f"Auto-discovered agent directory {subdir} overlaps host "
+                    f"Hold custody at {host_control_dir}, but is not its exact "
+                    "dedicated control directory. Move the agent or set "
+                    "KESTREL_HOST_DB_PATH to a dedicated non-overlapping path"
+                )
             if not db_path.exists() and not include_empty:
                 continue
             candidate = LocalAgentConfig(
@@ -437,6 +597,9 @@ class MultiAgentConfig(BaseModel):
         cls,
         config_path: Optional[Union[str, Path]] = None,
         auto_discover_fallback: bool = True,
+        *,
+        runtime_env: Optional[Mapping[str, str]] = None,
+        runtime_base: Optional[Path] = None,
     ) -> "MultiAgentConfig":
         """
         Load multi_agent config with auto-discovery fallback.
@@ -444,6 +607,9 @@ class MultiAgentConfig(BaseModel):
         Args:
             config_path: Path to multi_agent.toml (default: ./multi_agent.toml)
             auto_discover_fallback: If True and config doesn't exist, auto-discover agents
+            runtime_env: Environment used by the target runtime.
+            runtime_base: Project base used by the target runtime to resolve
+                relative agent paths. Defaults to the config file's parent.
 
         Returns:
             MultiAgentConfig instance
@@ -455,13 +621,24 @@ class MultiAgentConfig(BaseModel):
 
         if path.exists():
             logger.info(f"Loading multi_agent config from {path}")
-            return cls.from_file(path)
+            return cls.from_file(
+                path,
+                runtime_env=runtime_env,
+                runtime_base=runtime_base,
+            )
 
         if auto_discover_fallback:
             # Scan for agents relative to the config file's parent directory
-            base_dir = path.parent / AGENT_DATA_DIR
+            project_base = (
+                path.parent if runtime_base is None else runtime_base
+            ).resolve(strict=False)
+            base_dir = project_base / AGENT_DATA_DIR
             logger.info(f"No multi_agent config found at {path}, auto-discovering agents in {base_dir}...")
-            return cls.auto_discover(base_dir)
+            return cls.auto_discover(
+                base_dir,
+                runtime_env=runtime_env,
+                project_base=project_base,
+            )
 
         # No config and no auto-discovery
         logger.warning(f"No multi_agent config found at {path}")

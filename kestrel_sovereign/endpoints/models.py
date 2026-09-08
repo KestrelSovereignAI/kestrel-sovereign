@@ -51,6 +51,20 @@ router = APIRouter(tags=["models"])
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
 
 
+def _reload_multi_agent_config(request: Request, config_path):
+    """Reload a roster under the same path context accepted at host boot."""
+
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    runtime_env = getattr(request.app.state, "multi_agent_runtime_env", None)
+    runtime_base = getattr(request.app.state, "multi_agent_runtime_base", None)
+    return MultiAgentConfig.from_file(
+        config_path,
+        runtime_env=runtime_env,
+        runtime_base=runtime_base,
+    )
+
+
 def _key_storage_privacy_detail() -> str:
     return "Service key storage is unavailable in the current privacy mode."
 
@@ -314,9 +328,8 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         or clobber a malformed file mid-repair."""
         cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
         if cfg_path:
-            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
             try:
-                return _MAC.from_file(cfg_path), cfg_path, True
+                return _reload_multi_agent_config(request, cfg_path), cfg_path, True
             except Exception as reload_err:
                 logger.error(
                     f"Could not reload {cfg_path} ({reload_err}); refusing to "
@@ -422,10 +435,8 @@ def _read_persisted_agent_registration_for_offboarding(
                 "again on restart."
             ),
         )
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         logger.error(
             "Could not load multi-agent config before offboarding %r",
@@ -475,10 +486,8 @@ def _remove_persisted_agent_registration_for_offboarding(
     """Remove the previously witnessed registration with a narrow CAS check."""
 
     config_path, persisted_name, expected_config = registration
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         raise HTTPException(
             status_code=409,
@@ -526,9 +535,7 @@ def _restore_persisted_agent_registration(
     config_path, persisted_name, removed_config = rollback
     if removed_config is None:
         return
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
-    current = MultiAgentConfig.from_file(config_path)
+    current = _reload_multi_agent_config(request, config_path)
     if any(name.casefold() == persisted_name.casefold() for name in current.agents):
         raise RuntimeError(
             "agent registration changed concurrently; refusing rollback overwrite"
