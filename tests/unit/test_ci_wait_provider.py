@@ -17,6 +17,7 @@ import pytest
 
 from kestrel_sdk.tools import Outcome
 
+from kestrel_sovereign.signals.sources.github_pr_watch import CheckRollup
 from kestrel_sovereign.features.scheduler.ci_wait_provider import (
     CIWaitable,
     _check_verdict,
@@ -471,7 +472,7 @@ async def test_poll_merged_is_done(monkeypatch):
     provider = CIWaitable(feature=None)
 
     async def fake_fetch(repo, number, token):
-        return {"state": "closed", "merged": True}, None, None
+        return {"state": "closed", "merged": True}, CheckRollup()
 
     provider._fetch = fake_fetch
     status = await provider.poll("owner/repo#7")

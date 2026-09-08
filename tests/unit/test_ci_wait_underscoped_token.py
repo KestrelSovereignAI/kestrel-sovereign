@@ -115,20 +115,27 @@ async def test_the_message_names_the_missing_permission():
 # with the HTTP layer mocked to the exact shape measured on 2026-09-07.
 
 @pytest.mark.asyncio
-async def test_fetch_classifies_pr_ok_then_checks_403_as_underscoped(monkeypatch):
-    """The real discrimination: PR read succeeds, checks read is refused."""
+async def test_fetch_classifies_pr_ok_then_every_check_endpoint_403_as_underscoped(
+    monkeypatch,
+):
+    """The real discrimination: PR read succeeds, every check read is refused.
+
+    Note what this now takes. A refused Checks API alone is no longer blind —
+    the provider falls back to the Actions API — so reaching
+    ``_UnderscopedToken`` requires check-runs, actions-runs AND status to all
+    refuse, which is what this fake does for every non-``/pulls/`` URL.
+    """
     async def fake_get(url, *, token, timeout, ref):
         if "/pulls/" in url:
             return {"head": {"sha": "deadbeef"}}
-        raise PRWatchAuthError(f"GitHub returned 403 for {ref}")
-
-    async def fake_checks(base, sha, *, token, timeout, ref):
-        raise PRWatchAuthError(f"GitHub returned 403 for {ref}")
+        # ``status_code`` is load-bearing: only a 403 is an endpoint refusing
+        # a valid token, and only that becomes _UnderscopedToken. A 401 would
+        # mean the credential itself is finished and stays plain auth.
+        raise PRWatchAuthError(f"GitHub returned 403 for {ref}", status_code=403)
 
     monkeypatch.setattr(
         "kestrel_sovereign.signals.sources.github_pr_watch._github_get", fake_get
     )
-    monkeypatch.setattr(mod, "_github_get_check_runs", fake_checks)
 
     from unittest.mock import MagicMock
 
@@ -142,7 +149,7 @@ async def test_fetch_leaves_a_failing_pr_read_as_plain_auth(monkeypatch):
     bad or expired — that is the transient class, and must not be relabelled
     as a permission gap."""
     async def fake_get(url, *, token, timeout, ref):
-        raise PRWatchAuthError(f"GitHub returned 401 for {ref}")
+        raise PRWatchAuthError(f"GitHub returned 401 for {ref}", status_code=401)
 
     monkeypatch.setattr(
         "kestrel_sovereign.signals.sources.github_pr_watch._github_get", fake_get

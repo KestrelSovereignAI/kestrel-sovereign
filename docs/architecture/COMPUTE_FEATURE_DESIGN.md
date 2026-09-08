@@ -315,6 +315,55 @@ shutil.rmtree = _kestrel_safe_remove
         return content
 ```
 
+#### Trash staging under Docker
+
+A container never sees the shared trash root. Each Docker execution gets a
+**per-execution staging directory**, `~/.kestrel/trash/.staging-<hex>`, bound
+read/write into the container as its trash mount; the rewriter's `mv`-to-trash
+lands there. After the run, the host promotes every staged entry into the real
+root (same filesystem, atomic renames with a collision suffix) and removes the
+directory. The promotion is guarded from the moment the directory exists, so a
+refused rewrite, a failed script write, a missing docker binary at spawn, or a
+timeout all clean up (#3117).
+
+Beside the directory, outside the bind, sits an **owner record**
+`.staging-<hex>.owner` naming the process and the container that created it.
+Each script run sweeps the trash root before staging its own directory: a
+staging directory whose record names a running process is left alone however
+old it is; one whose process is gone is left alone while Docker still knows its
+container (`docker run --rm` is a foreground client, so a killed agent's
+container keeps running with the bind until the script ends; an inconclusive
+`docker inspect`, a wedged daemon or a client that could not be spawned, also
+leaves it alone), and otherwise promoted and removed at once, record included;
+one with no record at all is
+legacy (older code wrote none) and is swept once older than the compute
+policy's configured maximum script timeout plus a grace for the kill-and-capture
+tail. An orphan record whose directory is gone is reaped the same way. A record
+older than a week (or twice the configured maximum, whichever is longer) is
+treated as a reused pid, but still only reaped once Docker no longer knows its
+container; one sweep spends at most a bounded time asking Docker, and leaves the
+rest for the next run. This is a host-side effect across agents: on a host
+where several agents share the trash root, any agent's run reaps the directories
+that a crashed or killed process of another agent left behind, and the entries
+inside them become restorable from the shared root. The sweep never raises: a
+planted or damaged file must not turn every later run into a failure.
+
+The staging bind is the one writable mount a container gets, so nothing in the
+sweep or the promotion follows a symlink or trusts a hidden name: a link planted
+in the bind is unlinked rather than promoted, and a hidden entry is moved aside
+into `~/.kestrel/trash/.quarantine/` rather than deleted (no rewriter-made trash
+entry is ever hidden; a promoted `.staging-*` directory or `.owner` file would
+pass for one the sweep trusts; and a container can leave a directory the host
+user cannot remove, which must not keep the staging directory in the root). An entry the host user cannot move at all (a root-owned
+directory from a root container) does not stop the others from being promoted;
+the staging directory is then moved aside whole. Every move refuses to replace
+a concurrently created target. The quarantine is hidden from listings and its
+root-owned contents need an operator's `sudo rm`; each move logs how many
+entries it holds. A
+link wearing a staging name in the root is never a sweep candidate. Hidden
+`.staging-*` entries are never listed or restorable by `list_trash` /
+`restore_from_trash` before promotion, by design.
+
 ### 3.4 Security Review Patterns
 
 The `ComputeSecurityHook` analyzes scripts for dangerous patterns:
