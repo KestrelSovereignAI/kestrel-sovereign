@@ -142,7 +142,10 @@ class ComputeFeature(Feature):
         self.executors = {
             "uv": UvExecutor(current_agent_data_path=current_agent_data_path),
             "docker": (
-                DockerExecutor(current_agent_data_path=current_agent_data_path)
+                DockerExecutor(
+                    current_agent_data_path=current_agent_data_path,
+                    legacy_staging_age_seconds=self.policy.max_timeout_seconds,
+                )
                 if self._docker_available()
                 else None
             ),
