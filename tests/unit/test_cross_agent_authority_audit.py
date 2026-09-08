@@ -58,12 +58,18 @@ PERMISSION_NAME_TERMS = (
     "approv",
     "authoriz",
     "authority",
+    "capabilit",
     "delegat",
+    "entitle",
     "grant",
     "mandate",
     "owner",
     "permit",
     "permission",
+    "policy",
+    "privilege",
+    "role",
+    "rule",
     "allowed",
     "permitted",
     "forbid",
@@ -4267,9 +4273,14 @@ def _fastapi_generated_route_declarations(
         return resolved
 
     for statement in statements:
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = statement.value
+        value = (
+            statement.value
+            if isinstance(
+                statement,
+                (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return),
+            )
+            else None
+        )
         if not isinstance(value, ast.Call):
             continue
         constructor = _call_name(value)
@@ -5056,12 +5067,11 @@ def _route_declarations(
                 inherited_strings,
                 inherited_methods,
             )
-            if module_scope:
-                declarations.extend(
-                    _fastapi_generated_route_declarations(
-                        [statement], active_strings, active_methods
-                    )
+            declarations.extend(
+                _fastapi_generated_route_declarations(
+                    [statement], active_strings, active_methods
                 )
+            )
             new_prefixes = _scope_router_prefixes(
                 [statement], active_strings
             )
@@ -6913,6 +6923,18 @@ def test_fastapi_generated_routes_follow_constructor_configuration() -> None:
         (("WEBSOCKET",), "/api/agents/{name}/events"),
     ]
 
+    nested_router_routes = ast.parse(
+        "class Feature:\n"
+        "    def get_router(self):\n"
+        '        return APIRouter(prefix="/api", routes=['
+        'APIRoute("/agents/{name}/hold", endpoint, methods=["POST"]), '
+        'WebSocketRoute("/agents/{name}/events", socket_endpoint)])\n'
+    )
+    assert _route_declarations(nested_router_routes, {}, {}) == [
+        (("POST",), "/api/agents/{name}/hold"),
+        (("WEBSOCKET",), "/api/agents/{name}/events"),
+    ]
+
 
 def test_decorator_strings_resolve_keywords_and_module_constants() -> None:
     tree = ast.parse(
@@ -8164,6 +8186,90 @@ def _is_cross_agent_state_object_reference(
     return bool(
         _identifier_tokens(node).intersection(state_object_aliases or set())
     ) or _is_cross_agent_state_mutation_target(node, state_object_aliases)
+
+
+def _provenance_selected_cross_agent_read_lines(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    state_object_aliases: set[str],
+    provenance_aliases: set[str],
+    provenance_return_helpers: set[str],
+) -> set[int]:
+    """Locate reads through agent objects selected by provenance metadata."""
+
+    def selects_agent_state(value: ast.AST) -> bool:
+        if not _has_provenance_value(
+            value, provenance_aliases, provenance_return_helpers
+        ):
+            return False
+        for child in ast.walk(value):
+            if isinstance(child, ast.Call):
+                call_name = _call_name(child).casefold()
+                if any(
+                    call_name.startswith(f"{action}_{subject}")
+                    for action in ("find", "get", "lookup", "resolve", "select")
+                    for subject in ("agent", "child", "descendant", "peer")
+                ):
+                    return True
+                if (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr.casefold() in {"get", "lookup", "resolve"}
+                    and any(
+                        _is_cross_agent_state_collection_name(token)
+                        for token in _identifier_tokens(child.func.value)
+                    )
+                ):
+                    return True
+            if isinstance(child, ast.Subscript) and any(
+                _is_cross_agent_state_collection_name(token)
+                for token in _identifier_tokens(child.value)
+            ):
+                return True
+        return False
+
+    assignments: list[tuple[set[str], ast.AST]] = []
+    for node in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        target_names = {
+            name
+            for target in targets
+            for name in _binding_target_names(target)
+        }.intersection(state_object_aliases)
+        if target_names:
+            assignments.append((target_names, value))
+
+    selected_aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for target_names, value in assignments:
+            if not (
+                selects_agent_state(value)
+                or _identifier_tokens(value).intersection(selected_aliases)
+            ):
+                continue
+            new_aliases = target_names - selected_aliases
+            if new_aliases:
+                selected_aliases.update(new_aliases)
+                changed = True
+
+    lines: set[int] = set()
+    for node in _walk_lexical_scope(function):
+        if not isinstance(node, (ast.Attribute, ast.Subscript)):
+            continue
+        if _identifier_tokens(node.value).intersection(
+            selected_aliases
+        ) or selects_agent_state(node.value):
+            lines.add(node.lineno)
+    return lines
 
 
 def _is_cross_agent_state_mutation_call(
@@ -14962,6 +15068,14 @@ def _authority_provenance_lines(
             function_provenance[function]
         )
         lines.update(
+            _provenance_selected_cross_agent_read_lines(
+                function,
+                state_object_aliases,
+                provenance_aliases,
+                decision_provenance_helpers,
+            )
+        )
+        lines.update(
             _guard_clause_provenance_lines(
                 function,
                 provenance_aliases,
@@ -17023,6 +17137,21 @@ def test_provenance_scanner_recognizes_peer_targeted_control_calls() -> None:
     assert _authority_provenance_lines(tree) == {2, 6, 10, 18, 22}
 
 
+def test_provenance_scanner_recognizes_provenance_selected_agent_reads() -> None:
+    tree = ast.parse(
+        "def status(request, agent_manager):\n"
+        "    agent = agent_manager.get_agent(\n"
+        "        request.causation_chain[-1].agent_id\n"
+        "    )\n"
+        "    return agent.status\n\n"
+        "def indexed(request, peers):\n"
+        "    selected = peers[request.causation_chain[-1].agent_id]\n"
+        "    return selected.config\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {5, 9}
+
+
 def test_provenance_scanner_propagates_reflective_lifecycle_helper_names() -> None:
     tree = ast.parse(
         "def apply(obj, name):\n"
@@ -18328,8 +18457,10 @@ def test_permission_mutation_targets_are_provenance_inputs(
     assert _authority_provenance_lines(tree) == {2}
 
 
-@pytest.mark.parametrize("store_name", ("acl", "rbac"))
-def test_acl_and_rbac_mutation_targets_are_provenance_inputs(
+@pytest.mark.parametrize(
+    "store_name", ("acl", "rbac", "policy", "roles", "capabilities")
+)
+def test_common_permission_store_mutation_targets_are_provenance_inputs(
     store_name: str,
 ) -> None:
     tree = ast.parse(
