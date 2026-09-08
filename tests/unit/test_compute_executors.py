@@ -407,27 +407,30 @@ def test_uv_base_python_fails_closed_outside_supported_virtual_environment(
     assert "Conda environment alone is not sufficient" in str(exc_info.value)
 
 
-def test_uv_macos_sandbox_denies_writes_below_host_custody(
+def test_uv_macos_sandbox_rejects_preexisting_hard_link_aliases(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    custody = tmp_path / 'host data "quoted"'
+    custody = tmp_path / "host-data"
     custody.mkdir()
+    database = custody / "host-features.db"
+    database.write_bytes(b"intact")
+    external_alias = tmp_path / "outside-custody-alias"
+    os.link(database, external_alias)
     monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(custody / "host-features.db"))
     monkeypatch.setattr(uv_executor_module.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        uv_executor_module.shutil,
-        "which",
-        lambda command: "/usr/bin/sandbox-exec" if command == "sandbox-exec" else None,
-    )
+    executor = UvExecutor()
+    monkeypatch.setattr(executor, "_get_uv_path", lambda: "/fake/uv")
+    monkeypatch.setattr(executor, "_get_base_python_path", lambda: "/fake/python")
 
-    prefix = UvExecutor()._get_filesystem_sandbox_prefix()
+    assert database.stat().st_ino == external_alias.stat().st_ino
+    with pytest.raises(
+        executor_base.ExecutionEnvironmentError,
+        match="pre-existing hard-link aliases",
+    ):
+        executor._get_filesystem_sandbox_prefix()
 
-    assert prefix[:2] == ["/usr/bin/sandbox-exec", "-p"]
-    assert "(allow default)" in prefix[2]
-    assert "(deny file-link)" in prefix[2]
-    assert "(deny file-write*" in prefix[2]
-    assert json.dumps(str(custody.resolve())) in prefix[2]
+    assert executor.is_available is False
 
 
 def test_uv_linux_sandbox_remounts_host_custody_read_only(

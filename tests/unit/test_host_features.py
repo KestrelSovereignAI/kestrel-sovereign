@@ -663,6 +663,91 @@ async def test_build_host_context_provides_fleet_session_factory(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    (
+        (
+            {"KESTREL_HOLD_BACKEND": "bogus"},
+            "KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://primary.example/hold",
+                "KESTREL_HOLD_BACKEND": "postgres",
+            },
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://shared.example/hold",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                    "postgresql://shared.example/hold"
+                ),
+                "KESTREL_HOLD_BACKEND": "postgres",
+            },
+            "must identify an independent rollback domain",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://primary.example/hold",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                    "postgresql://evidence.example/hold"
+                ),
+                "KESTREL_HOLD_BACKEND": "postgres",
+                "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+            },
+            "KESTREL_HOLD_PAIR_ID is required",
+        ),
+    ),
+)
+async def test_invalid_hold_configuration_precedes_host_database_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, str],
+    error: str,
+):
+    """Rejected Hold settings cannot create, migrate, or open host storage."""
+
+    from kestrel_sovereign.host_features import storage as host_storage
+
+    for name in (
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_BACKEND",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "KESTREL_HOLD_PAIR_ID",
+        "KESTREL_DEPLOYMENT_PERSISTENCE",
+        "KESTREL_ENV",
+        "KESTREL_KITE_RELEASE_EVIDENCE",
+        "KESTREL_DEMO_SERVER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    preparation_calls: list[Optional[str]] = []
+    real_prepare = host_storage.prepare_host_database
+
+    def record_prepare(db_path: Optional[str] = None):
+        preparation_calls.append(db_path)
+        return real_prepare(db_path)
+
+    monkeypatch.setattr(host_storage, "prepare_host_database", record_prepare)
+    database = tmp_path / "host.db"
+
+    ctx = await build_host_context(db_path=str(database))
+
+    assert ctx.hold_store is None
+    assert error in ctx.backend_error
+    assert preparation_calls == []
+    assert not database.exists()
+    assert tuple(tmp_path.iterdir()) == ()
+
+
+@pytest.mark.asyncio
 async def test_postgres_kite_context_can_select_isolated_sqlite_hold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

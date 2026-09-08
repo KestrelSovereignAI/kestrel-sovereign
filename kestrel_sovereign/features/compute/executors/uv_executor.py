@@ -5,7 +5,6 @@ Execute Python scripts in project-free environments using `uv run`.
 """
 
 import asyncio
-import json
 import logging
 import os
 import shutil
@@ -212,26 +211,17 @@ class UvExecutor(BaseExecutor):
             )
 
         if sys.platform == "darwin":
-            sandbox_exec = shutil.which("sandbox-exec")
-            if not sandbox_exec:
-                raise ExecutionEnvironmentError(
-                    "UvExecutor requires sandbox-exec on macOS to protect host "
-                    "Hold custody; use the Docker executor when it is unavailable"
-                )
-            # The path is already canonical. JSON string quoting is also valid
-            # Seatbelt string syntax and prevents path characters from changing
-            # the policy expression.
-            profile = (
-                "(version 1)\n"
-                "(allow default)\n"
-                # Seatbelt models hard-link creation as ``file-link``, not as
-                # ``file-write*``. Deny it globally so caller code cannot give
-                # a protected inode an attacker-writable alias outside the
-                # custody subpath.
-                "(deny file-link)\n"
-                f"(deny file-write* (subpath {json.dumps(str(protected))}))\n"
+            # Seatbelt path filters cannot make an inode read-only. A
+            # pre-existing hard-link alias outside ``protected`` remains
+            # writable even when file-link is denied and every write below the
+            # canonical custody path is denied. There is no race-free way for
+            # this executor to enumerate every same-filesystem alias, so native
+            # macOS UV execution cannot uphold the Hold custody contract.
+            raise ExecutionEnvironmentError(
+                "UvExecutor is unavailable on macOS because sandbox-exec cannot "
+                "protect host Hold custody from pre-existing hard-link aliases; "
+                "use the Docker executor"
             )
-            return [sandbox_exec, "-p", profile]
 
         if sys.platform.startswith("linux"):
             bubblewrap = shutil.which("bwrap")

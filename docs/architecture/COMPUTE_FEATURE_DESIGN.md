@@ -449,16 +449,17 @@ runtime as defense-in-depth against uv resolver changes. The real-process test
 demonstrates the fresh and project-free behavior; the explicit pin makes that
 choice independent of the caller-selected working directory rather than
 depending on uv's future interpreter-resolution semantics.
-The child command is additionally wrapped in a mandatory OS filesystem
-sandbox: Seatbelt (`sandbox-exec`) on macOS or bubblewrap (`bwrap`) on Linux.
-That boundary denies writes below the resolved host-control directory at the
-kernel boundary, so native modules such as `sqlite3` cannot bypass the Python
-safe-delete runtime and modify Hold custody. The Seatbelt profile also denies
-hard-link creation, so protected inodes cannot acquire writable aliases outside
-the guarded subpath. The bubblewrap boundary mounts a private procfs in a PID
-namespace, so caller code cannot use a host process's root or file descriptors
-to re-enter the parent mount namespace. The executor fails unavailable if the
-platform has no verified sandbox; Docker remains the portable fallback.
+On Linux the child command is additionally wrapped in a mandatory bubblewrap
+(`bwrap`) filesystem sandbox. It imports the host filesystem read-only and
+reopens only the executor-owned workspace for writes, so native modules such as
+`sqlite3` cannot bypass the Python safe-delete runtime or mutate Hold through a
+pre-existing external hard-link alias. Its private procfs and PID namespace
+also prevent caller code from using a host process's root or file descriptors
+to re-enter the parent mount namespace. The UV executor is unavailable on
+macOS because Seatbelt (`sandbox-exec`) path filters do not make an inode
+read-only when it is reached through a pre-existing alias outside the protected
+directory. The executor fails unavailable if the verified Linux sandbox cannot
+be established; Docker remains the portable fallback.
 Kestrel must itself run inside a Python `venv` or `virtualenv` so that base
 interpreter cannot be Kestrel's own runtime. A Conda environment alone does not
 provide the distinct `sys.prefix`/`sys.base_prefix` boundary required here.

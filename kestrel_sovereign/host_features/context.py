@@ -348,15 +348,15 @@ async def build_host_context(
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
-        resolved = prepare_host_database(db_path)
-        db = await AsyncDatabase.sqlite(str(resolved))
-        validate_sqlite_family_private(resolved)
-        inner = make_session_factory(db)
-        session_factory = FleetSessionFactory(inner)
-
+        # Configuration validation is a read-only preflight. In particular it
+        # must precede ``prepare_host_database``: that function may securely
+        # create the SQLite file or migrate a legacy store, and a rejected Hold
+        # configuration has no authority to mutate either one.
         backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
         dsn = os.environ.get("KESTREL_DATABASE_URL")
         configured_hold_backend = os.environ.get("KESTREL_HOLD_BACKEND")
+        evidence_dsn = None
+        external_pair_id = None
         if configured_hold_backend is None:
             hold_backend = (
                 "postgres" if backend == "postgres" and dsn else "sqlite"
@@ -402,6 +402,14 @@ async def build_host_context(
                     == "durable_sovereign"
                 ),
             )
+
+        resolved = prepare_host_database(db_path)
+        db = await AsyncDatabase.sqlite(str(resolved))
+        validate_sqlite_family_private(resolved)
+        inner = make_session_factory(db)
+        session_factory = FleetSessionFactory(inner)
+
+        if hold_backend == "postgres":
             validate_hold_backend_custody(resolved, hold_backend)
             # Hold operations are serialized by their independent evidence
             # protocol, so wider pools add connection demand without adding
