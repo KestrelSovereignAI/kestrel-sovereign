@@ -603,9 +603,10 @@ def _postgres_source_sequence_counter_fence_definitions(
     # snapshot, so reading the copies first and ``seen`` second let a
     # concurrent writer commit in between: its copies were invisible to the
     # first read and its ``seen`` row visible to the second, and the fence
-    # raised the loss error for a scope that had lost nothing. The failing
-    # parity test races exactly that writer against a legacy counter advance,
-    # which is why it failed only under CI's timing (#3218).
+    # raised the loss error for a scope that had lost nothing. The parity
+    # test that failed in CI races exactly that writer against a legacy
+    # counter advance; measured on the two-statement body, it failed 5 of 30
+    # local runs and a 300-pair stress probe raised 13-22 times (#3218).
     before_body = f"""
     DECLARE
         recovered BIGINT;

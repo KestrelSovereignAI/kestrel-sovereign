@@ -5945,6 +5945,15 @@ def test_postgres_counter_fence_is_definition_fingerprinted_and_row_atomic():
     assert "NEW.current_sequence := recovered" in before.function_body
     assert "both exact counter copies were lost" in before.function_body
     assert "recovered < 1" in before.function_body
+    # #3218: the loss decision is taken from ONE statement. Under READ
+    # COMMITTED each PL/pgSQL statement has its own snapshot, so reading the
+    # copies in one statement and ``seen`` in another let a concurrent writer
+    # commit in between and the fence raised for a scope that lost nothing.
+    assert before.function_body.count("INTO ") == 1
+    assert "INTO seen_scope, recovered" in before.function_body
+    decision = before.function_body.split("INTO seen_scope, recovered")[0]
+    assert decision.count("SELECT") == 4  # one outer SELECT, three subqueries
+    assert "IF seen_scope AND recovered < 1 THEN" in before.function_body
     assert after.role == "after"
     assert "AFTER INSERT OR UPDATE" in after.trigger_ddl
     assert "GREATEST(" in after.function_body
