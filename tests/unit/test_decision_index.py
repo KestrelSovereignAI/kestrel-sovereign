@@ -112,7 +112,8 @@ class TestProjection:
             # Both are load-bearing: recall_decisions filters on agent_id and
             # orders on created_at, so a node missing either is unreachable.
             assert node.properties["agent_id"] == AGENT
-            assert node.properties["created_at"] == "2026-07-01"
+            # The entry's day at midnight UTC, per the graph contract (#3255).
+            assert node.properties["created_at"] == "2026-07-01T00:00:00+00:00"
             assert node.properties["claim_source"] == "strategy_yaml"
 
     @pytest.mark.asyncio

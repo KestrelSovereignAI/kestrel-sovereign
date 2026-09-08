@@ -29,6 +29,8 @@ import hashlib
 import logging
 from typing import Any, Dict, List, Optional, Set
 
+from .timestamps import stamp_created_at
+
 logger = logging.getLogger(__name__)
 
 DECISION_NODE_TYPE = "decision"
@@ -77,10 +79,9 @@ def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
     node missing either is written but unreachable.
     """
     text = str(entry.get("decision") or "").strip()
-    return {
+    properties = {
         "agent_id": agent_id,
         "text": text,
-        "created_at": str(entry.get("date") or ""),
         "rationale": str(entry.get("rationale") or ""),
         "impact": str(entry.get("impact") or ""),
         "session": str(entry.get("session") or ""),
@@ -89,6 +90,9 @@ def _entry_properties(agent_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "claim_source": "strategy_yaml",
         "source": _PROJECTION_SOURCE,
     }
+    # The entry's day at midnight UTC, in the graph contract; absent when the
+    # entry has no date (#3255).
+    return stamp_created_at(properties, entry.get("date"))
 
 
 def _label_for(entry: Dict[str, Any], limit: int = 120) -> str:

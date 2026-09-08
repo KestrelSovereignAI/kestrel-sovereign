@@ -1704,7 +1704,11 @@ class AsyncGraphStore:
         where = " AND ".join(clauses)
         order = ""
         if order_by_created:
-            order = f" ORDER BY {self._json_extract('properties', 'created_at')} DESC"
+            # A node with no created_at sorts LAST on both backends. Without
+            # NULLS LAST, SQLite puts NULL last under DESC and Postgres puts
+            # it first, so an unstamped projection row would lead a recall on
+            # one backend and trail it on the other (#3255).
+            order = f" ORDER BY {self._json_extract('properties', 'created_at')} DESC NULLS LAST"
 
         sql = (
             f"SELECT node_id, node_type, label, properties "
