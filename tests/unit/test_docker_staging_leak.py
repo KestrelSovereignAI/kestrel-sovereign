@@ -333,16 +333,20 @@ async def test_the_feature_passes_its_configured_maximum_to_the_executor(
     record-less directory two hours old may still be a live run."""
     from unittest.mock import MagicMock
 
+    from kestrel_sovereign.features.compute import destructive_policy, trash_manager
     from kestrel_sovereign.features.compute.feature import ComputeFeature
 
     monkeypatch.setenv("KESTREL_COMPUTE_MAX_TIMEOUT", "86400")
-    monkeypatch.setenv("KESTREL_TRASH_DIR", str(tmp_path / "trash"))
+    # DEFAULT_TRASH_DIR is frozen at import (#3104); the env var alone is inert.
+    monkeypatch.setattr(destructive_policy, "DEFAULT_TRASH_DIR", tmp_path / "trash")
+    monkeypatch.setattr(trash_manager, "DEFAULT_TRASH_DIR", tmp_path / "trash")
     monkeypatch.setattr(ComputeFeature, "_docker_available", lambda self: True)
     agent = MagicMock()
     agent.storage_path = str(tmp_path / "agent.db")
     feature = ComputeFeature(agent)
     await feature.initialize()
     assert feature.executors["docker"]._legacy_staging_age_seconds == 86400
+    assert (tmp_path / "trash").is_dir(), "the feature used the patched trash root"
 
 
 def test_an_unreadable_record_counts_as_no_record(tmp_path: Path):
@@ -580,3 +584,102 @@ async def test_a_dead_owner_whose_container_docker_still_knows_is_left_alone(
     assert (trash_root / f"{live_container.name}{OWNER}").is_file()
     assert not gone_container.exists()
     assert not (trash_root / f"{gone_container.name}{OWNER}").exists()
+
+
+# ---------------------------------------------------------------------------
+# Round 4: an inconclusive inspect, the listing window of the race, pid reuse
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_inconclusive_docker_inspect_leaves_a_dead_owners_directory_alone(
+    executor_with_trash, monkeypatch: pytest.MonkeyPatch,
+):
+    """A wedged daemon or an unspawnable client answers nothing; nothing must
+    not reap a bind a container may still be writing to."""
+    executor, trash_root = executor_with_trash
+    trash_root.mkdir()
+    unknown = trash_root / ".staging-unknowncont"
+    unknown.mkdir()
+    _write_owner(trash_root, unknown.name, _dead_pid(), container="kestrel_compute_unknown")
+
+    async def create_subprocess(*command: object, **_kwargs: object):
+        if _is_docker_command(command, "inspect"):
+            raise OSError("cannot spawn the docker client")
+        raise FileNotFoundError(2, "No such file or directory", "/fake/docker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+    await asyncio.wait_for(executor.execute(_script()), timeout=2)
+
+    assert unknown.is_dir()
+    assert (trash_root / f"{unknown.name}{OWNER}").is_file()
+
+
+def test_the_loser_of_a_promotion_race_is_quiet_when_the_listing_vanishes(tmp_path: Path, caplog):
+    """The other window: B's lstat succeeds, A promotes and removes, B's
+    listing finds nothing."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    stale = trash_root / ".staging-abcdefabcdef"
+    (stale / "rm_00000002").mkdir(parents=True)
+    (stale / "rm_00000002" / "f").write_text("x")
+    _write_owner(trash_root, stale.name, _dead_pid())
+
+    class _Racing:
+        def __init__(self, path):
+            self._path = path
+
+        def __getattr__(self, name):
+            return getattr(self._path, name)
+
+        def lstat(self):
+            st = self._path.lstat()
+            DockerExecutor._promote_staged_trash(self._path, trash_root)  # A wins now
+            return st
+
+    with caplog.at_level("DEBUG"):
+        DockerExecutor._promote_staged_trash(_Racing(stale), trash_root)  # B loses at iterdir
+
+    assert "NOT visible" not in caplog.text
+    assert (trash_root / "rm_00000002" / "f").read_text() == "x"
+    assert not (trash_root / f"{stale.name}{OWNER}").exists()
+
+
+def test_a_record_older_than_any_script_may_run_is_reaped_even_if_its_pid_answers(
+    tmp_path: Path, caplog,
+):
+    """After a reboot or a pid wraparound the recorded pid belongs to someone
+    else; a pid this user cannot signal counts as alive and would pin the
+    directory forever."""
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    reused = trash_root / ".staging-reusedpid000"
+    reused.mkdir()
+    record = trash_root / f"{reused.name}{OWNER}"
+    record.write_text(json.dumps({
+        "pid": 1,  # alive by PermissionError on every host
+        "container": "kestrel_compute_old",
+        "started": time.time() - DockerExecutor.OWNER_MAX_AGE_SECONDS - 60,
+    }))
+    fresh = trash_root / ".staging-freshpid000"
+    fresh.mkdir()
+    _write_owner(trash_root, fresh.name, 1)
+
+    with caplog.at_level("WARNING"):
+        _sweep(trash_root)
+
+    assert not reused.exists() and not record.exists()
+    assert "treated as reused" in caplog.text
+    assert fresh.is_dir(), "a young record naming a live pid is still an owner"
+
+
+def test_an_orphan_record_older_than_any_script_may_run_is_reaped_too(tmp_path: Path):
+    trash_root = tmp_path / "trash"
+    trash_root.mkdir()
+    record = trash_root / f".staging-oldorphan000{OWNER}"
+    record.write_text(json.dumps({
+        "pid": os.getpid(), "started": time.time() - DockerExecutor.OWNER_MAX_AGE_SECONDS - 60,
+    }))
+    _sweep(trash_root)
+    assert not record.exists()

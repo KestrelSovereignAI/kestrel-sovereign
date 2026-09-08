@@ -584,6 +584,14 @@ class DockerExecutor(BaseExecutor):
     #: (``.staging-<hex>.owner``), outside the container's bind mount.
     STAGING_OWNER_SUFFIX = ".owner"
 
+    #: A record-bearing directory older than this is swept even though its
+    #: recorded pid answers ``kill -0``: after a reboot or a pid wraparound
+    #: the pid belongs to another process (one this user cannot signal
+    #: counts as alive, which widens it), and no script runs for a week. The
+    #: record's ``started`` stamp is the age; the directory's mtime moves
+    #: with every staged entry and is not.
+    OWNER_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
     #: Default for ``legacy_staging_age_seconds``: the compute policy's
     #: shipped maximum script timeout. A staging directory with NO owner
     #: record was made by code that wrote none (the leak this ticket closes,
@@ -623,9 +631,11 @@ class DockerExecutor(BaseExecutor):
         if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid < 2**31:
             return None
         container = data.get("container")
+        started = data.get("started")
         return {
             "pid": pid,
             "container": container if isinstance(container, str) and container else None,
+            "started": float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None,
         }
 
     @staticmethod
@@ -659,6 +669,11 @@ class DockerExecutor(BaseExecutor):
         except Exception:  # noqa: BLE001 - a wedged daemon must not fail the sweep
             logger.debug("docker inspect %s failed", container_name, exc_info=True)
             return True  # unknown: leave the directory alone
+        if code is None:
+            # The client timed out or could not be spawned: inconclusive, and
+            # an inconclusive answer must never reap a bind a container may
+            # still be writing to.
+            return True
         return code == 0
 
     async def _promote_stale_staging_dirs(
@@ -715,7 +730,11 @@ class DockerExecutor(BaseExecutor):
                 if directory.exists() or directory.is_symlink():
                     continue
                 owner = self._read_owner_record(candidate)
-                if owner is not None and self._pid_is_alive(owner["pid"]):
+                if (
+                    owner is not None
+                    and not self._owner_record_expired(owner)
+                    and self._pid_is_alive(owner["pid"])
+                ):
                     continue
                 if owner is None and st.st_mtime > legacy_cutoff:
                     continue
@@ -727,15 +746,31 @@ class DockerExecutor(BaseExecutor):
                 continue
             owner = self._read_owner_record(candidate.with_name(name + suffix))
             if owner is not None:
-                if self._pid_is_alive(owner["pid"]):
+                if self._owner_record_expired(owner):
+                    logger.warning(
+                        "Staging directory %s is older than any script may run; "
+                        "its recorded pid %s is treated as reused and the "
+                        "directory is reaped.",
+                        candidate, owner["pid"],
+                    )
+                elif self._pid_is_alive(owner["pid"]):
                     continue
-                if owner["container"] and await self._container_exists(
+                elif owner["container"] and await self._container_exists(
                     docker_path, owner["container"]
                 ):
                     continue
             elif st.st_mtime > legacy_cutoff:
                 continue
             self._promote_staged_trash(candidate, host_trash_dir)
+
+    @classmethod
+    def _owner_record_expired(cls, owner: Dict[str, object]) -> bool:
+        """Whether the record is older than any script may run, so its pid
+        is no longer evidence of a live owner."""
+        started = owner.get("started")
+        if not isinstance(started, float):
+            return False
+        return time.time() - started > cls.OWNER_MAX_AGE_SECONDS
 
     @classmethod
     def _remove_staging_owner(cls, staging_dir: Path) -> None:
@@ -774,7 +809,15 @@ class DockerExecutor(BaseExecutor):
                     staging_dir,
                 )
                 return
-            for entry in staging_dir.iterdir():
+            try:
+                entries = list(staging_dir.iterdir())
+            except FileNotFoundError:
+                # Another sweep promoted and removed this directory between
+                # our lstat and our listing; its entries are in the root.
+                logger.debug("Staging directory %s already promoted by another process", staging_dir)
+                cls._remove_staging_owner(staging_dir)
+                return
+            for entry in entries:
                 if entry.is_symlink() or entry.name.startswith("."):
                     # Never promote a link or a hidden entry. A link's target
                     # is whatever the container chose; a hidden name is one

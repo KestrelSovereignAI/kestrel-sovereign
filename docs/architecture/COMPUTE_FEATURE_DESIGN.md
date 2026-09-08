@@ -332,8 +332,10 @@ Each script run sweeps the trash root before staging its own directory: a
 staging directory whose record names a running process is left alone however
 old it is; one whose process is gone is left alone while Docker still knows its
 container (`docker run --rm` is a foreground client, so a killed agent's
-container keeps running with the bind until the script ends), and otherwise
-promoted and removed at once, record included; one with no record at all is
+container keeps running with the bind until the script ends; an inconclusive
+`docker inspect`, a wedged daemon or a client that could not be spawned, also
+leaves it alone), and otherwise promoted and removed at once, record included;
+a record older than a week is treated as a reused pid and reaped regardless; one with no record at all is
 legacy (older code wrote none) and is swept once older than the compute
 policy's configured maximum script timeout. An orphan record whose directory is
 gone is reaped the same way. This is a host-side effect across agents: on a host
