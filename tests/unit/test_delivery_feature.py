@@ -576,7 +576,7 @@ class TestQueueTableCreation:
         # 3 tables + 5 indexes + the one-time v2 trigger cleanup + the scoped
         # SQLite atomic-compensation trigger. The v2 index is not rebuilt on an
         # already-v3 schema.
-        assert queue._db.execute.call_count == 11
+        assert queue._db.execute.call_count == 12
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1268,6 +1268,48 @@ class TestQueueIdempotency:
         assert ledger == (retried["entry_id"],)
 
     @pytest.mark.asyncio
+    async def test_failed_nested_dead_letter_transition_is_fail_closed(
+        self, real_queue
+    ):
+        queue, deliveries = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "dead-transition@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "dead-transition",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue._db.execute(
+            """
+            CREATE TRIGGER reject_dead_letter_queue_delete
+            BEFORE DELETE ON delivery_queue
+            BEGIN SELECT RAISE(ABORT, 'queue delete failed'); END
+            """
+        )
+
+        async with queue._db.transaction(immediate=True):
+            with pytest.raises(QueryError, match="queue delete failed"):
+                await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ?", (original_id,)
+        ) == (1,)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_dead_letter WHERE original_id = ?",
+            (original_id,),
+        ) == (1,)
+        assert await queue.process_pending() == 0
+        assert deliveries == []
+        with pytest.raises(DeliveryIdempotencyTerminal):
+            await queue.enqueue(**request)
+
+        await queue._db.execute("DROP TRIGGER reject_dead_letter_queue_delete")
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ?", (original_id,)
+        ) == (0,)
+
+    @pytest.mark.asyncio
     async def test_dead_letter_retry_preserves_policy_and_legacy_json(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
@@ -1590,6 +1632,27 @@ class TestQueueIdempotency:
             ),
         )
 
+    @pytest.mark.asyncio
+    async def test_schema_upgrade_backfills_canonical_hashes(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "upgrade-hash@example.com",
+            {"subject": "hello", "body": "world"},
+        )
+        await queue._db.execute(
+            "UPDATE delivery_queue SET canonical_content_hash = NULL WHERE id = ?",
+            (original_id,),
+        )
+
+        await queue._ensure_tables()
+
+        assert await queue.enqueue(
+            "email",
+            "upgrade-hash@example.com",
+            {"body": "world", "subject": "hello"},
+        ) == original_id
+
     def test_unrelated_exception_context_is_not_reported_as_conflict(self):
         try:
             raise DeliveryIdempotencyConflict("original conflict")
@@ -1709,12 +1772,13 @@ class TestQueueProcessPending:
         queue._db.fetchall = AsyncMock(return_value=[row])
 
         # For dead-lettering: fetchone returns the row data for move_to_dead_letter
-        queue._db.fetchone = AsyncMock(return_value=(
+        dead_letter_source = (
             "entry-1", "did:test:delivery-agent", "webhook",
             "https://example.com/hook", '{"text": "hello"}', 5,
             datetime.now(timezone.utc).isoformat(),
             5,
-        ))
+        )
+        queue._db.fetchone = AsyncMock(side_effect=[dead_letter_source, None])
 
         deliver_fn = AsyncMock(return_value=DeliveryResult(success=False, error="permanent failure"))
         queue._deliver = deliver_fn
@@ -1829,12 +1893,13 @@ class TestMoveToDeadLetter:
 
     @pytest.mark.asyncio
     async def test_move_to_dead_letter(self, queue):
-        queue._db.fetchone = AsyncMock(return_value=(
+        row = (
             "e1", "did:test:delivery-agent", "webhook",
             "http://example.com", '{"msg": "hi"}', 5,
             datetime.now(timezone.utc).isoformat(),
             5,
-        ))
+        )
+        queue._db.fetchone = AsyncMock(side_effect=[row, None])
 
         await queue.move_to_dead_letter("e1", "Max retries exceeded")
 
@@ -1848,7 +1913,9 @@ class TestMoveToDeadLetter:
         queue._db.fetchone = AsyncMock(return_value=None)
         # Should not raise, just log a warning
         await queue.move_to_dead_letter("nonexistent", "test")
-        queue._db.execute.assert_not_called()
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "INSERT INTO delivery_dead_letter" not in sql
+        assert "DELETE FROM delivery_queue" not in sql
 
 
 # =========================================================================

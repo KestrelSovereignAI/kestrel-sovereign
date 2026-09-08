@@ -35,7 +35,9 @@ readers from a rolling deployment and store the semantic JSON identity in
 `canonical_content_hash`. Current readers consult both identities. Keyed
 PostgreSQL enqueues also take a transaction-scoped lock on owner, recipient,
 and canonical content so distinct replay keys cannot race past short-window
-deduplication.
+deduplication. Schema initialization backfills a missing canonical identity and
+keeps an indexed null probe for rows written by an older process during a
+rolling deployment.
 
 `delivery_purge` expires successful replay claims with their delivered queue
 rows. Its age threshold is therefore also the completed-delivery replay-safety
@@ -49,4 +51,7 @@ operators race. Purge removes delivered rows before their replay claims, so a
 partially committed joined operation leaves a safe stale claim rather than two
 deliveries. Ordinary ledger deletion never deletes a live queue row; only a
 marker written by failed enqueue compensation invokes the SQLite cleanup
-trigger.
+trigger. The move into dead letter uses the same recoverable ordering: it writes
+the tombstone before deleting the live row, while queue processing and keyed
+replay treat any temporary dual-row state as terminal until the transition is
+resumed.

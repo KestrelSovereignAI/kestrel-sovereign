@@ -515,19 +515,6 @@ class DeliveryQueue:
                         )
 
                     canonical_id = existing[0]
-                    queue_row = await self._db.fetchone(
-                        """
-                        SELECT status FROM delivery_queue
-                        WHERE id = ? AND agent_id = ?
-                        """,
-                        (canonical_id, self._agent_id),
-                    )
-                    if queue_row is not None:
-                        logger.debug(
-                            "Adopted idempotent delivery entry: %s", canonical_id
-                        )
-                        return canonical_id
-
                     dead_letter = await self._db.fetchone(
                         """
                         SELECT id FROM delivery_dead_letter
@@ -540,6 +527,19 @@ class DeliveryQueue:
                             "idempotent delivery is in the dead-letter queue; "
                             "retry that entry explicitly before replaying it"
                         )
+
+                    queue_row = await self._db.fetchone(
+                        """
+                        SELECT status FROM delivery_queue
+                        WHERE id = ? AND agent_id = ?
+                        """,
+                        (canonical_id, self._agent_id),
+                    )
+                    if queue_row is not None:
+                        logger.debug(
+                            "Adopted idempotent delivery entry: %s", canonical_id
+                        )
+                        return canonical_id
 
                     if deduplicated is not None:
                         await self._db.execute(
@@ -667,6 +667,11 @@ class DeliveryQueue:
             WHERE agent_id = ?
                   AND status IN (?, ?)
                   AND next_retry_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                        AND delivery_dead_letter.original_id = delivery_queue.id
+                  )
             ORDER BY next_retry_at ASC
             LIMIT ?
             """,
@@ -831,48 +836,65 @@ class DeliveryQueue:
             entry_id: The queue entry ID to move.
             reason: Human-readable reason for dead-lettering.
         """
-        row = await self._db.fetchone(
-            """
-            SELECT id, agent_id, channel_type, recipient, content_json,
-                   attempts, created_at, max_retries
-            FROM delivery_queue
-            WHERE id = ? AND agent_id = ?
-            """,
-            (entry_id, self._agent_id),
-        )
-        if not row:
-            logger.warning("Cannot dead-letter unknown entry: %s", entry_id)
-            return
+        async with self._db.transaction(immediate=True):
+            locked = await self._db.execute(
+                """
+                UPDATE delivery_queue SET id = id
+                WHERE id = ? AND agent_id = ?
+                """,
+                (entry_id, self._agent_id),
+            )
+            if locked == 0:
+                logger.warning("Cannot dead-letter unknown entry: %s", entry_id)
+                return
+            row = await self._db.fetchone(
+                """
+                SELECT id, agent_id, channel_type, recipient, content_json,
+                       attempts, created_at, max_retries
+                FROM delivery_queue
+                WHERE id = ? AND agent_id = ?
+                """,
+                (entry_id, self._agent_id),
+            )
+            if not row:
+                logger.warning("Cannot dead-letter unknown entry: %s", entry_id)
+                return
 
-        dl_id = str(uuid.uuid4())
-        now_iso = datetime.now(timezone.utc).isoformat()
+            existing = await self._db.fetchone(
+                """
+                SELECT id FROM delivery_dead_letter
+                WHERE original_id = ? AND agent_id = ?
+                """,
+                (entry_id, self._agent_id),
+            )
+            if existing is None:
+                await self._db.execute(
+                    """
+                    INSERT INTO delivery_dead_letter
+                        (id, original_id, agent_id, channel_type, recipient,
+                         content_json, error, attempts, created_at, max_retries)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                        reason,
+                        row[5],
+                        datetime.now(timezone.utc).isoformat(),
+                        row[7],
+                    ),
+                )
 
-        await self._db.execute(
-            """
-            INSERT INTO delivery_dead_letter
-                (id, original_id, agent_id, channel_type, recipient,
-                 content_json, error, attempts, created_at, max_retries)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                dl_id,
-                row[0],       # original_id
-                row[1],       # agent_id
-                row[2],       # channel_type
-                row[3],       # recipient
-                row[4],       # content_json
-                reason,
-                row[5],       # attempts
-                now_iso,
-                row[7],       # max_retries
-            ),
-        )
-
-        # Remove from main queue
-        await self._db.execute(
-            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
-            (entry_id, self._agent_id),
-        )
+            # Final awaited mutation: if it fails, the dead-letter tombstone
+            # suppresses delivery and replay until this transition is resumed.
+            await self._db.execute(
+                "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+                (entry_id, self._agent_id),
+            )
 
         logger.info("Dead-lettered delivery %s: %s", entry_id, reason)
 
@@ -926,6 +948,11 @@ class DeliveryQueue:
                    created_at, delivered_at
             FROM delivery_queue
             WHERE agent_id = ? AND status IN (?, ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.original_id = delivery_queue.id
+              )
             ORDER BY next_retry_at ASC
             LIMIT ?
             """,
@@ -1247,6 +1274,29 @@ class DeliveryQueue:
                 ALTER TABLE delivery_queue
                 ADD COLUMN canonical_content_hash TEXT
                 """
+            )
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_delivery_queue_missing_canonical
+            ON delivery_queue(id) WHERE canonical_content_hash IS NULL
+            """
+        )
+        missing_canonical_hashes = await self._db.fetchall(
+            """
+            SELECT id, recipient, content_json FROM delivery_queue
+            WHERE canonical_content_hash IS NULL
+            """
+        )
+        for entry_id, recipient, content_json in missing_canonical_hashes:
+            _, canonical_hash = _persisted_content_hashes(
+                recipient, content_json or "{}"
+            )
+            await self._db.execute(
+                """
+                UPDATE delivery_queue SET canonical_content_hash = ?
+                WHERE id = ? AND canonical_content_hash IS NULL
+                """,
+                (canonical_hash, entry_id),
             )
         await self._db.execute(
             """
