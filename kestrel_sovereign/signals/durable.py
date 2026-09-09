@@ -54,6 +54,7 @@ TERMINAL_ACKABLE = "terminal_ackable"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
+_COGNITION_ADMISSION_PENDING = "cognition admission pending"
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
 # Callers that own a managed dispatcher normally supply their configured
@@ -3758,6 +3759,7 @@ class DurableSignalStore(UnifiedStoreBase):
         executor_id: str,
         now: Optional[datetime] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
+        cognition_admission_pending: bool = False,
     ) -> Optional[DurableDelivery]:
         """Atomically lease one due delivery for this scoped consumer.
 
@@ -3831,6 +3833,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 UPDATE {self.DELIVERIES}
                 SET status = ?, attempts = attempts + 1, lease_owner = ?,
                     lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
+                    last_error = CASE WHEN ? THEN ? ELSE last_error END,
                     updated_at = ?
                 WHERE delivery_id = ? AND agent_id = ? AND consumer_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
@@ -3842,6 +3845,8 @@ class DurableSignalStore(UnifiedStoreBase):
                     executor_id,
                     lease_token,
                     self.to_timestamp_param(lease_expires_at),
+                    self.to_bool_param(cognition_admission_pending),
+                    _COGNITION_ADMISSION_PENDING,
                     self.to_timestamp_param(effective_now),
                     delivery_id,
                     agent_id,
@@ -3866,6 +3871,7 @@ class DurableSignalStore(UnifiedStoreBase):
         executor_id: str,
         now: Optional[datetime] = None,
         runtime_owner_stale_before: Optional[datetime] = None,
+        cognition_admission_pending: bool = False,
     ) -> Optional[DurableDelivery]:
         """Atomically claim this consumer's delivery for one persisted event.
 
@@ -3918,6 +3924,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 UPDATE {self.DELIVERIES}
                 SET status = ?, attempts = attempts + 1, lease_owner = ?,
                     lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL,
+                    last_error = CASE WHEN ? THEN ? ELSE last_error END,
                     updated_at = ?
                 WHERE delivery_id = ? AND agent_id = ? AND consumer_id = ? AND event_id = ?
                   AND status IN ('{PENDING}', '{RETRY}')
@@ -3929,6 +3936,8 @@ class DurableSignalStore(UnifiedStoreBase):
                     executor_id,
                     lease_token,
                     self.to_timestamp_param(lease_expires_at),
+                    self.to_bool_param(cognition_admission_pending),
+                    _COGNITION_ADMISSION_PENDING,
                     self.to_timestamp_param(effective_now),
                     delivery_id,
                     agent_id,
@@ -4047,6 +4056,7 @@ class DurableSignalStore(UnifiedStoreBase):
         initial_lease_token: str,
         executor_id: str,
         now: Optional[datetime] = None,
+        cognition_admission_pending: bool = False,
     ) -> Optional[DurableDelivery]:
         """Transfer one activated emitting-dispatcher lease to a worker.
 
@@ -4096,7 +4106,9 @@ class DurableSignalStore(UnifiedStoreBase):
                 f"""
                 UPDATE {self.DELIVERIES}
                 SET attempts = attempts + 1, lease_owner = ?, lease_token = ?,
-                    lease_expires_at = ?, next_attempt_at = NULL, updated_at = ?
+                    lease_expires_at = ?, next_attempt_at = NULL,
+                    last_error = CASE WHEN ? THEN ? ELSE last_error END,
+                    updated_at = ?
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status = ? AND lease_owner = ? AND lease_token = ?
                   AND lease_expires_at > ?
@@ -4111,6 +4123,8 @@ class DurableSignalStore(UnifiedStoreBase):
                     executor_id,
                     lease_token,
                     self.to_timestamp_param(lease_expires_at),
+                    self.to_bool_param(cognition_admission_pending),
+                    _COGNITION_ADMISSION_PENDING,
                     self.to_timestamp_param(transfer_now),
                     agent_id,
                     consumer_id,
@@ -4442,17 +4456,40 @@ class DurableSignalStore(UnifiedStoreBase):
                 f"""
                 UPDATE {self.DELIVERIES}
                 SET status = CASE
-                        WHEN max_attempts > 0 AND attempts >= max_attempts THEN ?
+                        WHEN max_attempts > 0 AND (
+                            attempts - CASE
+                                WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                                     AND attempts > 0 THEN 1 ELSE 0
+                            END
+                        ) >= max_attempts THEN ?
                         ELSE ?
+                    END,
+                    attempts = attempts - CASE
+                        WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                             AND attempts > 0 THEN 1 ELSE 0
                     END,
                     lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                     next_attempt_at = CASE
-                        WHEN max_attempts > 0 AND attempts >= max_attempts THEN NULL
+                        WHEN max_attempts > 0 AND (
+                            attempts - CASE
+                                WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                                     AND attempts > 0 THEN 1 ELSE 0
+                            END
+                        ) >= max_attempts THEN NULL
                         ELSE {timestamp}
                     END,
-                    last_error = 'lease owner unavailable before acknowledgement',
+                    last_error = CASE
+                        WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                            THEN 'cognition admission owner unavailable before execution'
+                        ELSE 'lease owner unavailable before acknowledgement'
+                    END,
                     terminal_at = CASE
-                        WHEN max_attempts > 0 AND attempts >= max_attempts
+                        WHEN max_attempts > 0 AND (
+                            attempts - CASE
+                                WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                                     AND attempts > 0 THEN 1 ELSE 0
+                            END
+                        ) >= max_attempts
                         THEN {timestamp} ELSE NULL
                     END,
                     updated_at = ?
@@ -4481,6 +4518,99 @@ class DurableSignalStore(UnifiedStoreBase):
                 ),
             )
         return released
+
+    async def recover_owned_pending_cognition_admissions(
+        self,
+        *,
+        agent_id: str,
+        owner_id: str,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Return this live runtime's unstarted cognition leases.
+
+        A Hold refusal can be observed after the lease claim. The direct exact
+        release normally resolves it immediately, but cancellation or a
+        transient backend failure must not make that compensation the only
+        copy of the fact. Claims stamp the pending phase atomically; the owner
+        heartbeat can therefore repair its own unfinished release without
+        stealing a lease whose cognition actually began.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("owner_id", owner_id)
+        now = _as_utc(now or self.now_utc())
+        async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
+            return await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET status = ?, attempts = CASE
+                        WHEN attempts > 0 THEN attempts - 1 ELSE 0
+                    END,
+                    lease_owner = NULL, lease_token = NULL,
+                    lease_expires_at = NULL, next_attempt_at = ?,
+                    last_error = 'hold_deferred', terminal_at = NULL,
+                    updated_at = ?
+                WHERE agent_id = ? AND status = ? AND lease_owner = ?
+                  AND last_error = ?
+                """,
+                (
+                    RETRY,
+                    self.to_timestamp_param(now),
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    LEASED,
+                    owner_id,
+                    _COGNITION_ADMISSION_PENDING,
+                ),
+            )
+
+    async def begin_cognition_execution(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        owner_id: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Commit that one leased delivery crossed its final Hold admission.
+
+        Managed cognition keeps the marker until the turn handoff. Public
+        claimants clear it immediately before the lease is published to their
+        executor. In both cases the marker makes a failed/cancelled Hold
+        rollback attempt-neutral during lease recovery.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("lease_token", lease_token)
+        self._require_nonempty("owner_id", owner_id)
+        now = _as_utc(now or self.now_utc())
+        async with self._backend.transaction():
+            await self._lock_runtime_owner_scope(agent_id=agent_id)
+            updated = await self._backend.execute(
+                f"""
+                UPDATE {self.DELIVERIES}
+                SET last_error = NULL, updated_at = ?
+                WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+                  AND status = ? AND lease_owner = ? AND lease_token = ?
+                  AND last_error = ?
+                """,
+                (
+                    self.to_timestamp_param(now),
+                    agent_id,
+                    consumer_id,
+                    delivery_id,
+                    LEASED,
+                    owner_id,
+                    lease_token,
+                    _COGNITION_ADMISSION_PENDING,
+                ),
+            )
+        return updated == 1
 
     async def ack_delivery(
         self,
@@ -4592,6 +4722,53 @@ class DurableSignalStore(UnifiedStoreBase):
         return await self.get_delivery(
             agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id
         )
+
+    async def release_delivery_for_hold(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        delivery_id: str,
+        lease_token: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Undo an exact lease transfer when Hold wins admission.
+
+        Claim increments ``attempts`` as part of the ownership handoff. Hold
+        observed before an executor receives the work must atomically restore
+        both the claimable state and that finite retry budget.
+        """
+
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("consumer_id", consumer_id)
+        self._require_nonempty("delivery_id", delivery_id)
+        self._require_nonempty("lease_token", lease_token)
+        now = _as_utc(now or self.now_utc())
+        updated = await self._backend.execute(
+            f"""
+            UPDATE {self.DELIVERIES}
+            SET status = ?, attempts = CASE
+                    WHEN attempts > 0 THEN attempts - 1 ELSE 0
+                END,
+                lease_owner = NULL, lease_token = NULL,
+                lease_expires_at = NULL, next_attempt_at = ?,
+                last_error = 'hold_deferred', terminal_at = NULL,
+                updated_at = ?
+            WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
+              AND status = ? AND lease_token = ?
+            """,
+            (
+                RETRY,
+                self.to_timestamp_param(now),
+                self.to_timestamp_param(now),
+                agent_id,
+                consumer_id,
+                delivery_id,
+                LEASED,
+                lease_token,
+            ),
+        )
+        return updated == 1
 
     async def release_managed_delivery_after_task(
         self,
@@ -5314,12 +5491,35 @@ class DurableSignalStore(UnifiedStoreBase):
         await self._backend.execute(
             f"""
             UPDATE {self.DELIVERIES}
-            SET status = CASE WHEN max_attempts > 0 AND attempts >= max_attempts THEN ? ELSE ? END,
+            SET status = CASE WHEN max_attempts > 0 AND (
+                    attempts - CASE
+                        WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                             AND attempts > 0 THEN 1 ELSE 0
+                    END
+                ) >= max_attempts THEN ? ELSE ? END,
+                attempts = attempts - CASE
+                    WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                         AND attempts > 0 THEN 1 ELSE 0
+                END,
                 lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
-                next_attempt_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
+                next_attempt_at = CASE WHEN max_attempts > 0 AND (
+                        attempts - CASE
+                            WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                                 AND attempts > 0 THEN 1 ELSE 0
+                        END
+                    ) >= max_attempts
                     THEN NULL ELSE {timestamp} END,
-                last_error = 'lease expired before acknowledgement',
-                terminal_at = CASE WHEN max_attempts > 0 AND attempts >= max_attempts
+                last_error = CASE
+                    WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                        THEN 'cognition admission lease expired before execution'
+                    ELSE 'lease expired before acknowledgement'
+                END,
+                terminal_at = CASE WHEN max_attempts > 0 AND (
+                        attempts - CASE
+                            WHEN last_error = '{_COGNITION_ADMISSION_PENDING}'
+                                 AND attempts > 0 THEN 1 ELSE 0
+                        END
+                    ) >= max_attempts
                     THEN {timestamp} ELSE NULL END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND status = ?

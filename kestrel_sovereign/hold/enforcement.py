@@ -13,6 +13,7 @@ import logging
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,15 @@ logger = logging.getLogger(__name__)
 _turn_admission_snapshot: ContextVar[
     tuple[Any, asyncio.Task[Any], EffectiveHoldState | None] | None
 ] = ContextVar("kestrel_hold_turn_admission_snapshot", default=None)
+
+# Signal dispatch owns a source-specific disposition (skip or defer), while a
+# direct caller owns the interactive refusal.  Context is copied into child
+# tasks, so bind the waiver to the exact task executing ``process_input``;
+# otherwise an unrelated child turn could inherit permission to suppress its
+# own refusal metric.
+_source_disposition_owner: ContextVar[
+    tuple[Any, asyncio.Task[Any]] | None
+] = ContextVar("kestrel_hold_source_disposition_owner", default=None)
 
 
 @contextmanager
@@ -76,8 +86,48 @@ def _adopt_turn_admission_snapshot(
             _turn_admission_snapshot.reset(token)
 
 
+@contextmanager
+def _adopt_source_disposition_owner(
+    agent: Any,
+    *,
+    from_task: asyncio.Task[Any] | None,
+):
+    """Transfer source disposition ownership to the invocation execution task.
+
+    ``bind_async_invocation`` deliberately moves production work into one
+    isolated child task.  That child is part of the same ingress attempt, but
+    arbitrary descendants are not: require an exact parent-task match before
+    rebinding the ownership tuple.
+    """
+
+    current_task = asyncio.current_task()
+    inherited = _source_disposition_owner.get()
+    token = None
+    if (
+        current_task is not None
+        and from_task is not None
+        and inherited is not None
+        and inherited[0] is agent
+        and inherited[1] is from_task
+    ):
+        token = _source_disposition_owner.set((agent, current_task))
+    try:
+        yield
+    finally:
+        if token is not None:
+            _source_disposition_owner.reset(token)
+
+
 class HoldEnforcementUnavailableError(HoldStateError):
     """A production runtime could not bind its load-bearing Hold store."""
+
+
+class HeldWorkDisposition(str, Enum):
+    """The exhaustive treatment of work observed while Hold is active."""
+
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+    REFUSED = "refused"
 
 
 class HoldTurnRefusal(RuntimeError):
@@ -104,6 +154,7 @@ class HoldTurnRefusal(RuntimeError):
         self.agent_hold = effective_state.agent
         self.metadata = {
             "code": self.code,
+            "disposition": HeldWorkDisposition.REFUSED.value,
             "agent_id": agent_id,
             "host_hold": effective_state.host,
             "agent_hold": effective_state.agent,
@@ -129,6 +180,7 @@ class HoldTurnRefusal(RuntimeError):
 
         return {
             "code": self.code,
+            "disposition": HeldWorkDisposition.REFUSED.value,
             "message": str(self),
             "agent_id": self.agent_id,
             "host_hold": self._latch_payload(self.host_hold),
@@ -284,6 +336,36 @@ async def initialize_with_bound_hold_context(
     return context
 
 
+async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:
+    """Read the effective Hold snapshot for an explicitly bound runtime."""
+
+    # Use the instance namespace so proxy objects cannot fabricate a binding
+    # through ``__getattr__`` and accidentally activate this authority seam.
+    try:
+        store = vars(agent).get("_hold_store")
+    except TypeError:
+        store = None
+    if store is None:
+        return None
+
+    agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
+    if not isinstance(agent_id, str) or not agent_id:
+        raise HoldEnforcementUnavailableError(
+            "Cannot enforce Hold without a concrete agent DID"
+        )
+    try:
+        return await store.get_effective(agent_id)
+    except HoldStateError:
+        raise
+    except Exception as exc:
+        # Backend failures at the willingness boundary are not ordinary turn
+        # failures.  Preserve the typed outage so durable ingress can return
+        # its exact lease without spending an execution attempt.
+        raise HoldEnforcementUnavailableError(
+            "Durable Hold state could not be read"
+        ) from exc
+
+
 async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     """Linearize one turn admission against host and agent Hold latches.
 
@@ -305,32 +387,50 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     ):
         return reused[2]
 
-    # Use the instance namespace so proxy objects cannot fabricate a missing
-    # binding through ``__getattr__`` and accidentally activate this seam.
-    try:
-        store = vars(agent).get("_hold_store")
-    except TypeError:
-        store = None
-    if store is None:
-        return None
-
     agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
-    if not isinstance(agent_id, str) or not agent_id:
-        raise HoldEnforcementUnavailableError(
-            "Cannot enforce Hold without a concrete agent DID"
-        )
-    effective = await store.get_effective(agent_id)
+    effective = await get_effective_hold_state(agent)
+    if effective is None:
+        return None
     if effective.held:
+        owner = _source_disposition_owner.get()
+        if not (
+            owner is not None
+            and owner[0] is agent
+            and owner[1] is asyncio.current_task()
+        ):
+            from .metrics import record_held_work_disposition
+
+            record_held_work_disposition(
+                disposition=HeldWorkDisposition.REFUSED.value,
+                source="interactive",
+            )
         raise HoldTurnRefusal(agent_id=agent_id, effective_state=effective)
     return effective
 
 
+@contextmanager
+def source_owns_hold_disposition(agent: Any):
+    """Let one exact signal-execution task own its final Hold disposition."""
+
+    owner_task = asyncio.current_task()
+    if owner_task is None:
+        raise RuntimeError("Hold source disposition requires an asyncio task")
+    token = _source_disposition_owner.set((agent, owner_task))
+    try:
+        yield
+    finally:
+        _source_disposition_owner.reset(token)
+
+
 __all__ = [
+    "HeldWorkDisposition",
     "HoldEnforcementUnavailableError",
     "HoldTurnRefusal",
     "build_bound_host_context",
     "close_bound_host_context",
+    "get_effective_hold_state",
     "initialize_with_bound_hold_context",
     "require_context_hold_store",
     "require_turn_start_allowed",
+    "source_owns_hold_disposition",
 ]
