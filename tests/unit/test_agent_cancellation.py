@@ -389,6 +389,80 @@ async def test_owned_tool_batch_marks_completed_invocation_effect():
 
 
 @pytest.mark.asyncio
+async def test_stream_reuses_effect_checkpoint_and_persists_on_late_cancel():
+    """A yielded stream cannot forget an effect before its next await cancels."""
+
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_generator_invocation,
+        current_invocation_effect_checkpoint,
+        mark_current_invocation_effect_completed,
+    )
+
+    second_advance_started = asyncio.Event()
+    observed_checkpoints = []
+    persisted = []
+
+    class Owner:
+        async def _persist_completed_tool_stop_checkpoint(
+            self, *, session_id, request_id
+        ):
+            persisted.append((session_id, request_id))
+
+        @bind_async_generator_invocation("request_id")
+        async def stream(self, *, request_id=None):
+            observed_checkpoints.append(current_invocation_effect_checkpoint())
+            mark_current_invocation_effect_completed("stream-session")
+            yield "effect completed"
+            observed_checkpoints.append(current_invocation_effect_checkpoint())
+            second_advance_started.set()
+            await asyncio.Event().wait()
+
+    stream = Owner().stream(request_id="stream-late-cancel")
+    assert await anext(stream) == "effect completed"
+    advance = asyncio.create_task(anext(stream))
+    await second_advance_started.wait()
+    advance.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await advance
+
+    assert observed_checkpoints[0] is observed_checkpoints[1]
+    assert persisted == [("stream-session", "stream-late-cancel")]
+
+
+@pytest.mark.asyncio
+async def test_stream_checkpoint_failure_wins_over_late_cancellation():
+    """A failed anti-repeat write cannot be reported as a clean stream Stop."""
+
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_generator_invocation,
+        mark_current_invocation_effect_completed,
+    )
+
+    second_advance_started = asyncio.Event()
+
+    class Owner:
+        async def _persist_completed_tool_stop_checkpoint(self, **_kwargs):
+            raise RuntimeError("stream checkpoint unavailable")
+
+        @bind_async_generator_invocation("request_id")
+        async def stream(self, *, request_id=None):
+            mark_current_invocation_effect_completed("stream-session")
+            yield "effect completed"
+            second_advance_started.set()
+            await asyncio.Event().wait()
+
+    stream = Owner().stream(request_id="stream-checkpoint-failure")
+    assert await anext(stream) == "effect completed"
+    advance = asyncio.create_task(anext(stream))
+    await second_advance_started.wait()
+    advance.cancel()
+
+    with pytest.raises(RuntimeError, match="stream checkpoint unavailable"):
+        await advance
+
+
+@pytest.mark.asyncio
 async def test_tool_batch_owner_preserves_transition_lock_reentry():
     """The lifecycle owner cannot deadlock a transition-locked tool."""
 

@@ -2117,6 +2117,16 @@ class StreamingMixin:
             else:
                 stop_tool_calls = None
         elif inline_executed:
+            async def persist_strict_cancelled_inline_turn() -> None:
+                await self._persist_assistant_turn_safely(
+                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+                    metadata=_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=True,
+                )
+
             # #2674 finding 2: a strict (buffered) inline-executed turn stopped
             # before its reviewed release withheld every byte and never audited
             # the synthesis. Discard the withheld buffer and persist an EMPTY
@@ -2127,10 +2137,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # Inline-executed branch: the adapter ran tools mid-call
             # (codex app-server's item/tool/call RPC). No
@@ -2242,10 +2249,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             inline_denied = getattr(final_text, "denied", False)
@@ -2301,6 +2305,7 @@ class StreamingMixin:
                 ),
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
+                require_success=True,
             )
             # #2674: strict-audit release (inline-executed path) — only the
             # reviewed text; the withheld raw buffer is never replayed.

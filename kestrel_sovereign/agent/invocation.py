@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, T
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
     caller_context_lifetime,
@@ -303,12 +304,15 @@ def current_invocation_provenance() -> InvocationProvenance | None:
 def _exact_invocation_scope(
     invocation_id: str,
     provenance: InvocationProvenance | None,
+    effect_checkpoint: InvocationEffectCheckpoint | None = None,
 ) -> Iterator[str]:
     """Bind an already-resolved identity and an exact provenance value."""
 
     id_token = _current_invocation_id.set(invocation_id)
     provenance_token = _current_invocation_provenance.set(provenance)
-    effect_token = _current_effect_checkpoint.set(InvocationEffectCheckpoint())
+    effect_token = _current_effect_checkpoint.set(
+        effect_checkpoint or InvocationEffectCheckpoint()
+    )
     try:
         yield invocation_id
     finally:
@@ -691,6 +695,45 @@ def bind_async_generator_invocation(
             )
             lifecycle_owner = args[0] if args else None
             registered = False
+            cleanup_abandoned = False
+            effect_checkpoint = InvocationEffectCheckpoint()
+
+            async def checkpoint_completed_effects() -> None:
+                if (
+                    not effect_checkpoint.completed
+                    or effect_checkpoint.checkpointed
+                    or lifecycle_owner is None
+                ):
+                    return
+                checkpoint = getattr(
+                    lifecycle_owner,
+                    "_persist_completed_tool_stop_checkpoint",
+                    None,
+                )
+                if not callable(checkpoint):
+                    return
+                persistence = asyncio.create_task(
+                    checkpoint(
+                        session_id=effect_checkpoint.session_id,
+                        request_id=effective_id,
+                    ),
+                    name=(
+                        "stream-effect-checkpoint:"
+                        f"{invocation_log_correlation(effective_id)}"
+                    ),
+                )
+                outcome = await await_owned_task(persistence)
+                if outcome.error is not None:
+                    if outcome.cancellation is not None:
+                        outcome.error.add_note(
+                            "caller cancellation remained pending while the "
+                            "required streaming effect checkpoint failed"
+                        )
+                    raise outcome.error
+                effect_checkpoint.checkpointed = True
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+
             if track_request_lifecycle and lifecycle_owner is not None:
                 register = getattr(
                     type(lifecycle_owner),
@@ -724,6 +767,7 @@ def bind_async_generator_invocation(
                         with _exact_invocation_scope(
                             effective_id,
                             effective_provenance,
+                            effect_checkpoint,
                         ), caller_context_binding_scope(caller_binding):
                             try:
                                 item = await anext(iterator)
@@ -732,16 +776,39 @@ def bind_async_generator_invocation(
                         yield item
                 finally:
                     try:
-                        close_iterator = getattr(iterator, "aclose", None)
-                        if callable(close_iterator):
-                            with _exact_invocation_scope(
-                                effective_id,
-                                effective_provenance,
-                            ), caller_context_binding_scope(caller_binding):
-                                await close_iterator()
+                        with _exact_invocation_scope(
+                            effective_id,
+                            effective_provenance,
+                            effect_checkpoint,
+                        ), caller_context_binding_scope(caller_binding):
+                            try:
+                                close_iterator = getattr(iterator, "aclose", None)
+                                if callable(close_iterator):
+                                    await close_iterator()
+                            finally:
+                                try:
+                                    await checkpoint_completed_effects()
+                                except BaseException:
+                                    cleanup_abandoned = (
+                                        effect_checkpoint.completed
+                                        and not effect_checkpoint.checkpointed
+                                    )
+                                    raise
                     finally:
                         if registered:
-                            lifecycle_owner._cleanup_cancelled_request(effective_id)
+                            if cleanup_abandoned:
+                                from .request_lifecycle import (
+                                    RequestCompletionDisposition,
+                                )
+
+                                lifecycle_owner._cleanup_cancelled_request(
+                                    effective_id,
+                                    disposition=(
+                                        RequestCompletionDisposition.ABANDONED
+                                    ),
+                                )
+                            else:
+                                lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 

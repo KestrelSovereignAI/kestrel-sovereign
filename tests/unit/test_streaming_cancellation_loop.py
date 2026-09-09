@@ -620,6 +620,47 @@ async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
 
 
 @pytest.mark.asyncio
+async def test_inline_effect_requires_successful_history_persistence():
+    """Codex inline effects cannot complete behind a best-effort history write."""
+
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    agent = _build_mock_agent(cancel_on_call=None)
+
+    async def fail_assistant_persistence(role, _content, **_kwargs):
+        if role == "assistant":
+            raise RuntimeError("history unavailable")
+
+    agent.privacy_agent.add_conversation = AsyncMock(
+        side_effect=fail_assistant_persistence
+    )
+    response = LLMResponse(content="", tool_calls=[])
+    response.executed_tool_calls = [
+        {
+            "id": "inline-effect",
+            "name": "send_message",
+            "arguments": {"text": "sent once"},
+            "result": {"success": True},
+        }
+    ]
+
+    async def stream(**_kwargs):
+        yield "sent"
+        yield response
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        async for _chunk in agent.process_input_streaming(
+            "send it",
+            session_id="inline-session",
+            request_id="inline-required-persist",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_no_cancel_path_unaffected_for_normal_completion():
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking
