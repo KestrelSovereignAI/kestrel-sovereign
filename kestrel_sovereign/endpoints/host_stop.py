@@ -124,7 +124,7 @@ def _host_targets(request: Request) -> tuple[CooperativeStopTarget, ...]:
 
 
 @router.get("/stop/status")
-async def host_stop_status(request: Request):
+async def host_stop_status(request: Request, response: Response):
     """Expose caller authority and authoritative live-agent work count."""
 
     try:
@@ -135,9 +135,49 @@ async def host_stop_status(request: Request):
             code="host_stop_inventory_unavailable",
             message="Host Stop target inventory is unavailable.",
         ) from error
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+    distributed_registry = getattr(
+        request.app.state,
+        "distributed_invocation_registry",
+        None,
+    )
+    durable_has_work = None
+    if distributed_registry is not None:
+        durable_has_work = getattr(
+            distributed_registry,
+            "agent_has_unsettled_work",
+            None,
+        )
+        if not callable(durable_has_work):
+            raise ApiHTTPException(
+                status_code=503,
+                code="host_stop_inventory_unavailable",
+                message="Host Stop target inventory is unavailable.",
+            )
+
+    in_flight_count = 0
+    for target in targets:
+        active = bool(target.turn_ids)
+        if not active and durable_has_work is not None:
+            try:
+                active = await durable_has_work(target.agent_id)
+            except Exception as error:  # noqa: BLE001 - durable inventory boundary
+                raise ApiHTTPException(
+                    status_code=503,
+                    code="host_stop_inventory_unavailable",
+                    message="Host Stop target inventory is unavailable.",
+                ) from error
+            if not isinstance(active, bool):
+                raise ApiHTTPException(
+                    status_code=503,
+                    code="host_stop_inventory_unavailable",
+                    message="Host Stop target inventory is unavailable.",
+                )
+        in_flight_count += int(active)
     return {
         "can_stop": _caller_can_stop_host(request),
-        "in_flight_count": sum(bool(target.turn_ids) for target in targets),
+        "in_flight_count": in_flight_count,
     }
 
 

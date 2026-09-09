@@ -15,6 +15,7 @@ import {
     mountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
+import { validateHostStopEnvelope } from './stop_evidence.js';
 import {
     installScrollFollow,
     getFollowState,
@@ -121,6 +122,15 @@ function unconfirmedStopCorrelationIds() {
         currentState.unconfirmedStopCorrelationIds = new Map();
     }
     return currentState.unconfirmedStopCorrelationIds;
+}
+
+function hostStopGeneration() {
+    const currentState = deps().state;
+    if (!Number.isSafeInteger(currentState.hostStopGeneration)
+        || currentState.hostStopGeneration < 0) {
+        currentState.hostStopGeneration = 0;
+    }
+    return currentState.hostStopGeneration;
 }
 
 function isAgentBusy(agentName) {
@@ -1179,6 +1189,7 @@ function chatComponentApi() {
         updateThinkingIndicator,
         refreshAgentThinkingDot,
         stopAgent,
+        prepareHostStop,
         updateComposerModeToggle,
         sendMessage,
         updateContextStatus,
@@ -1531,6 +1542,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     // belonged to the conversation the user just left. The chip DOM
     // goes with the innerHTML reset below; null the field too.
     pane.queuedMessage = null;
+    pane.queuedHostStopGeneration = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
     // #2909: a cleared pane is a fresh conversation — follow its tail,
@@ -2643,33 +2655,9 @@ export async function stopAgentDetailed(agentName) {
     // letting the turn run; that path is in renderQueuedChip.) Use
     // the map directly so we don't conjure a pane for an agent that
     // never had one.
-    const pane = deps().state.chatPanes.get(agentName);
-    if (pane) {
-        pane.queuedMessage = null;
-        clearQueuedChip(pane);
-    }
-
-    // The server-side turn may outlive the locally aborted response stream.
-    // Set this before abort() so the prior stream's microtask/finally cannot
-    // erase the only guard against opening an overlapping backend turn.
-    unconfirmedStopAgents().add(agentName);
-    refreshAgentThinkingDot(agentName);
-    if (agentName === deps().api.getHostAgent()) {
-        updateThinkingIndicator();
-    }
-
-    const abortController = deps().api.getStreamAbortController(agentName);
-    if (abortController) {
-        try { abortController.abort(); } catch (_) { /* noop */ }
-    }
-
+    const requestId = fenceLocalAgentStop(agentName);
     const retainedRequestIds = unconfirmedStopRequestIds();
     const retainedCorrelationIds = unconfirmedStopCorrelationIds();
-    let requestId = retainedRequestIds.get(agentName) || null;
-    if (!requestId) {
-        requestId = deps().api.getCurrentStreamRequestId(agentName);
-        if (requestId) retainedRequestIds.set(agentName, requestId);
-    }
     let correlationId = retainedCorrelationIds.get(agentName) || null;
     if (!correlationId) {
         correlationId = newChatRequestId();
@@ -2771,6 +2759,127 @@ export async function stopAgent(agentName) {
     return result.confirmed;
 }
 
+/**
+ * Fence browser-owned work for one agent before cooperative Stop can yield.
+ * This performs no HTTP request and never touches process lifecycle.
+ */
+function fenceLocalAgentStop(agentName) {
+    const pane = deps().state.chatPanes.get(agentName);
+    if (pane) {
+        pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
+        clearQueuedChip(pane);
+    }
+
+    // The server-side turn may outlive the locally aborted response stream.
+    // Set this before abort() so the prior stream's microtask/finally cannot
+    // erase the only guard against opening an overlapping backend turn.
+    unconfirmedStopAgents().add(agentName);
+    refreshAgentThinkingDot(agentName);
+    if (agentName === deps().api.getHostAgent()) {
+        updateThinkingIndicator();
+    }
+
+    const abortController = deps().api.getStreamAbortController(agentName);
+    if (abortController) {
+        try { abortController.abort(); } catch (_) { /* noop */ }
+    }
+
+    const retainedRequestIds = unconfirmedStopRequestIds();
+    let requestId = retainedRequestIds.get(agentName) || null;
+    if (!requestId) {
+        requestId = deps().api.getCurrentStreamRequestId(agentName);
+        if (requestId) retainedRequestIds.set(agentName, requestId);
+    }
+    return requestId;
+}
+
+/**
+ * Fence every browser-owned stream and queued follow-up before Host Stop.
+ * Returns a settlement hook for the component to call with typed outcomes.
+ */
+export function prepareHostStop(items = []) {
+    const currentState = deps().state;
+    // Invalidate every send that started before the host fence. Those sends may
+    // currently be awaiting an attachment upload or a per-agent Stop and have
+    // not yet published a request for the host snapshot to observe.
+    currentState.hostStopGeneration = hostStopGeneration() + 1;
+    const localNames = new Set([
+        ...currentState.waitingAgents,
+        ...unconfirmedStopAgents(),
+    ]);
+    const stopGeneration = currentState.hostStopGeneration;
+    const fencedRequestIds = new Map();
+
+    // A queue belongs to the work being stopped even if its stream has already
+    // left waitingAgents during the same event-loop turn. Clear all pane queues
+    // before the host request is allowed to yield.
+    for (const pane of currentState.chatPanes.values()) {
+        pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
+        clearQueuedChip(pane);
+    }
+    for (const name of localNames) {
+        fencedRequestIds.set(name, fenceLocalAgentStop(name));
+    }
+
+    const addressToName = new Map();
+    for (const item of Array.isArray(items) ? items : []) {
+        if (!item || typeof item.name !== 'string' || !item.name) continue;
+        const localKey = localNames.has(item.name)
+            ? item.name
+            : (localNames.size === 1 && localNames.has(null) ? null : item.name);
+        for (const address of [
+            item.name,
+            item.id,
+            item.raw && item.raw.id,
+            item.raw && item.raw.did,
+            item.raw && item.raw.routing_name,
+        ]) {
+            if (typeof address === 'string' && address) {
+                addressToName.set(address, localKey);
+            }
+        }
+    }
+
+    return (response, _error, expectedCorrelationId = null) => {
+        const evidence = validateHostStopEnvelope(response, expectedCorrelationId);
+        const outcomes = evidence ? evidence.outcomes : [];
+        const correlationId = evidence ? evidence.correlationId : null;
+        const confirmedNames = new Set();
+        for (const outcome of outcomes) {
+            if (!['stopped', 'already_complete'].includes(outcome.disposition)) {
+                continue;
+            }
+            for (const address of [outcome.agent_id, outcome.resolved_target]) {
+                if (addressToName.has(address)) {
+                    confirmedNames.add(addressToName.get(address));
+                }
+            }
+        }
+        const retainedRequestIds = unconfirmedStopRequestIds();
+        const retainedCorrelationIds = unconfirmedStopCorrelationIds();
+        for (const name of localNames) {
+            // A host receipt belongs to the browser fence that created this
+            // settlement hook, not to every later turn sharing the same agent
+            // name. A per-agent reconciliation can release the old fence and
+            // start a new turn while Host Stop is still waiting on another
+            // target; a second Host Stop can likewise supersede this one.
+            const stillOwnsFence = hostStopGeneration() === stopGeneration
+                && unconfirmedStopAgents().has(name)
+                && (retainedRequestIds.get(name) ?? null) === fencedRequestIds.get(name);
+            if (confirmedNames.has(name) && stillOwnsFence) {
+                unconfirmedStopAgents().delete(name);
+                retainedRequestIds.delete(name);
+                retainedCorrelationIds.delete(name);
+                currentState.waitingAgents.delete(name);
+            }
+            refreshAgentThinkingDot(name);
+        }
+        updateThinkingIndicator();
+    };
+}
+
 function newChatRequestId() {
     const randomUuid = globalThis.crypto?.randomUUID;
     if (typeof randomUuid === 'function') {
@@ -2813,6 +2922,7 @@ function renderQueuedChip(pane, agentName, text) {
     // running. (The big Stop button cancels both; see stopAgent.)
     cancel.addEventListener('click', () => {
         pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
         clearQueuedChip(pane);
     });
     chip.appendChild(label);
@@ -2876,7 +2986,11 @@ function toggleComposerMode() {
  * the explicit agent, an agent switch between queueing and dispatch
  * would misroute the message.
  */
-export async function sendMessage(overrideText, overrideAgent) {
+export async function sendMessage(
+    overrideText,
+    overrideAgent,
+    expectedHostStopGeneration = undefined,
+) {
     const fromComposer = overrideText === undefined;
     const text = (fromComposer ? messageInput.value : overrideText).trim();
 
@@ -2887,7 +3001,13 @@ export async function sendMessage(overrideText, overrideAgent) {
     const dispatchAgent = overrideAgent !== undefined
         ? overrideAgent
         : deps().api.getHostAgent();
-    if (!text) return;
+    const dispatchHostStopGeneration = expectedHostStopGeneration === undefined
+        ? hostStopGeneration()
+        : expectedHostStopGeneration;
+    const hostStopInvalidatedDispatch = () => (
+        hostStopGeneration() !== dispatchHostStopGeneration
+    );
+    if (!text || hostStopInvalidatedDispatch()) return;
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
 
@@ -2895,6 +3015,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // uploading, wait for it so the turn carries the attachment instead of
     // dropping it (and leaving it staged for the next turn).
     if (fromComposer) await awaitPendingUploads(pane);
+    if (hostStopInvalidatedDispatch()) return;
 
     // A failed/unreachable Stop is not an ordinary busy turn: the local
     // stream was already aborted, so there is no completion ``finally`` left
@@ -2902,7 +3023,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // the composer or staged attachments. Only a confirmed Stop may proceed.
     if (unconfirmedStopAgents().has(dispatchAgent)) {
         const stopConfirmed = await stopAgent(dispatchAgent);
-        if (!stopConfirmed) return;
+        if (!stopConfirmed || hostStopInvalidatedDispatch()) return;
     }
 
     // Send-while-busy. Behavior depends on the pane's composerMode.
@@ -2914,6 +3035,7 @@ export async function sendMessage(overrideText, overrideAgent) {
             // it — single-slot queue (multi-message queue is a
             // deferred follow-up). Do NOT interrupt the in-flight turn.
             pane.queuedMessage = text;
+            pane.queuedHostStopGeneration = dispatchHostStopGeneration;
             // #1662: stash this turn's staged attachments with the queued
             // message so they ride the eventual re-dispatch; clear the tray now.
             if (fromComposer) pane.queuedAttachments = takeStagedAttachments(pane);
@@ -2937,7 +3059,7 @@ export async function sendMessage(overrideText, overrideAgent) {
         // ``state.waitingAgents`` itself, so the subsequent ``add``
         // below is the correct next state.
         const stopConfirmed = await stopAgent(dispatchAgent);
-        if (!stopConfirmed) return;
+        if (!stopConfirmed || hostStopInvalidatedDispatch()) return;
     }
 
     // #1573: claim this turn's ownership of the pane's stream paint
@@ -2994,7 +3116,11 @@ export async function sendMessage(overrideText, overrideAgent) {
         : (pane.queuedAttachments || []);
     pane.queuedAttachments = [];
 
-    await addMessage('user', text, pane.element, turnAttachments);
+    const userMessage = await addMessage('user', text, pane.element, turnAttachments);
+    if (hostStopInvalidatedDispatch()) {
+        if (userMessage && typeof userMessage.remove === 'function') userMessage.remove();
+        return;
+    }
     // Only clear the composer when the text CAME from it. A #1257
     // queued re-dispatch passes overrideText and must not wipe
     // whatever the user has since typed for the (possibly different)
@@ -3533,15 +3659,23 @@ export async function sendMessage(overrideText, overrideAgent) {
         // queued against the ACTIVE turn.
         if (ownsStream() && pane.queuedMessage != null) {
             const queued = pane.queuedMessage;
+            const queuedHostStopGeneration = pane.queuedHostStopGeneration
+                ?? dispatchHostStopGeneration;
             pane.queuedMessage = null;
+            pane.queuedHostStopGeneration = null;
             clearQueuedChip(pane);
             if (!wasAborted && isPaneFresh()) {
                 queueMicrotask(() => {
                     // Re-check generation at fire time — a conversation
                     // switch could land between this finally and the
                     // microtask draining.
-                    if (pane.generation !== dispatchGeneration) return;
-                    sendMessage(queued, dispatchAgent);
+                    if (pane.generation !== dispatchGeneration
+                        || hostStopGeneration() !== queuedHostStopGeneration) return;
+                    sendMessage(
+                        queued,
+                        dispatchAgent,
+                        queuedHostStopGeneration,
+                    );
                 });
             }
         }

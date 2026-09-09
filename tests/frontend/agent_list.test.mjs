@@ -401,6 +401,11 @@ test('source-contract: identity.js drives mountAgentListPane, no hand-rolled age
         /onStop: \(name\) => stopAgentDetailed\(name\)/,
         'the production card preserves typed Stop outcomes instead of the boolean chat wrapper',
     );
+    assert.match(
+        src,
+        /onPrepareStopAll:\s*\(items\)\s*=>\s*prepareHostStop\(items\)/,
+        'the production console fences browser-owned queues before Host Stop',
+    );
     // The bespoke per-agent innerHTML loop is gone (the tell-tale inline markup).
     assert.ok(!src.includes('class="agent-status-dot'), 'no hand-rolled status-dot markup');
     assert.ok(!/for \(const agent of agents\)/.test(src), 'no hand-rolled agent loop');

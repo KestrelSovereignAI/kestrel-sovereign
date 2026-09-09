@@ -6,7 +6,7 @@
 import API from './api.js';
 import { state, PRIVACY_MODES, Toast, Modal, loadCommands, renderTextError } from './ui.js';
 import { renderIdentityDangerZone } from './identity-danger-zone.js';
-import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession, refreshAgentThinkingDot, stopAgentDetailed, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
+import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, setPaneAwaitingNewSession, refreshAgentThinkingDot, stopAgentDetailed, prepareHostStop, renderModelFooterHtml, appendMessagePart, renderSignalWakeChip, handleRestartStatus, renderAgentContentHtml, mountToolRenderers, messageAttachmentsHtml } from './chat.js';
 import { forceScrollToBottom } from './chat_scroll.js';
 import { generateIdenticon } from './identicon.js';
 // #2199: the standalone conversations pane is now a `mountConversations`
@@ -1040,10 +1040,11 @@ export async function loadAgents() {
             selectedName: selectedAgentName,
             // Per-agent thinking pulse is driven by `state.waitingAgents` (the
             // Set sendMessage adds to on dispatch); the stop control aborts that
-            // exact agent's stream via stopAgent().
+            // exact agent's stream via stopAgentDetailed().
             isThinking: (name) => state.waitingAgents.has(name)
                 || state.unconfirmedStopAgents.has(name),
             onStop: (name) => stopAgentDetailed(name),
+            onPrepareStopAll: (items) => prepareHostStop(items),
             // Selecting a card runs the full product wiring (capability refresh,
             // chat mount, agent:switch bus emit); the component already pinned
             // routing via setHostAgent before this fires.

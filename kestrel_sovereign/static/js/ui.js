@@ -141,6 +141,7 @@ export async function loadCommands(apiModule, expectedAgent = apiModule?.getHost
 //                                        //   'queue' = stash the message and dispatch
 //                                        //   it when the in-flight turn finishes.
 //     queuedMessage: string|null,        // #1257: the single pending message in queue
+//     queuedHostStopGeneration: number|null, // host fence captured with queued work
 //                                        //   mode. Re-Enter replaces it. Dispatched from
 //                                        //   the completing turn's finally; cleared by
 //                                        //   Stop and by a conversation switch.
@@ -240,6 +241,7 @@ export function getOrCreateChatPane(agentName) {
         reviseConsumedRequestId: null,
         composerMode: 'interrupt',
         queuedMessage: null,
+        queuedHostStopGeneration: null,
         // The user asked for a new conversation and its session is still
         // being minted. Such a pane is CLAIMED even though it is empty and
         // carries no session id yet — #714's auto-load must not read that
