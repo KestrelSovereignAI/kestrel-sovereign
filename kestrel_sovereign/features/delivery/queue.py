@@ -649,6 +649,30 @@ class DeliveryQueue:
             )
         return rows[0][0] if rows else None
 
+    async def _lock_dead_letter(self, entry_id: str) -> Optional[tuple[Any, ...]]:
+        """Lock and return a tombstone addressed by any durable queue identity."""
+        locked = await self._db.execute(
+            """
+            UPDATE delivery_dead_letter SET id = id
+            WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
+                  AND agent_id = ?
+            """,
+            (entry_id, entry_id, entry_id, self._agent_id),
+        )
+        if locked == 0:
+            return None
+        return await self._db.fetchone(
+            """
+            SELECT id, original_id, agent_id, channel_type, recipient,
+                   content_json, error, attempts, created_at, max_retries,
+                   retry_entry_id, legacy_content_hash
+            FROM delivery_dead_letter
+            WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
+                  AND agent_id = ?
+            """,
+            (entry_id, entry_id, entry_id, self._agent_id),
+        )
+
     async def _enqueue_idempotent(
         self,
         *,
@@ -828,6 +852,19 @@ class DeliveryQueue:
                             "Adopted idempotent delivery entry: %s", canonical_id
                         )
                         return canonical_id
+
+                    # PostgreSQL READ COMMITTED takes a new snapshot for each
+                    # statement. A dead-letter move may therefore commit after
+                    # the optimistic tombstone read above but before the queue
+                    # lookup. Lock and re-check the tombstone before treating
+                    # the missing row as stale; SQLite's writer transaction
+                    # makes this harmless but keeps the contract identical.
+                    dead_letter = await self._lock_dead_letter(canonical_id)
+                    if dead_letter is not None:
+                        raise DeliveryIdempotencyTerminal(
+                            "idempotent delivery is in the dead-letter queue; "
+                            "retry that entry explicitly before replaying it"
+                        )
 
                     if stored_retries is None:
                         # A pre-upgrade orphan contains no recoverable record
@@ -1111,30 +1148,7 @@ class DeliveryQueue:
         # caller committed the recoverable live+tombstone intermediate state.
         # Check and lock it before considering the main queue row.
         async with self._db.transaction(immediate=True):
-            async def lock_dead_letter():
-                locked = await self._db.execute(
-                    """
-                    UPDATE delivery_dead_letter SET id = id
-                    WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
-                          AND agent_id = ?
-                    """,
-                    (entry_id, entry_id, entry_id, self._agent_id),
-                )
-                if locked == 0:
-                    return None
-                return await self._db.fetchone(
-                    """
-                    SELECT id, original_id, agent_id, channel_type, recipient,
-                           content_json, error, attempts, created_at, max_retries,
-                           retry_entry_id, legacy_content_hash
-                    FROM delivery_dead_letter
-                    WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
-                          AND agent_id = ?
-                    """,
-                    (entry_id, entry_id, entry_id, self._agent_id),
-                )
-
-            dl_row = await lock_dead_letter()
+            dl_row = await self._lock_dead_letter(entry_id)
             queue_locked = None
             if dl_row is None:
                 # Lock the live row before deciding its status. A concurrent
@@ -1149,7 +1163,7 @@ class DeliveryQueue:
                     (entry_id, self._agent_id),
                 )
                 if queue_locked == 0:
-                    dl_row = await lock_dead_letter()
+                    dl_row = await self._lock_dead_letter(entry_id)
                     if dl_row is None:
                         return {
                             "success": False,

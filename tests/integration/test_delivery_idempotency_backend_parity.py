@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from kestrel_sovereign.features.delivery.queue import (
     DeliveryIdempotencyTerminal,
     DeliveryQueue,
 )
+from kestrel_sovereign.features.delivery.models import QueueEntry
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.interface import QueryError
 
@@ -591,6 +594,187 @@ async def test_delivery_idempotency_lifecycle_backend_parity(db_backend):
         await database.execute(
             "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_replay_cannot_miss_concurrent_dead_letter_commit(
+    db_backend, monkeypatch
+):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-dead-letter-race:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner)
+    await queue._ensure_tables()
+    request = (
+        "email",
+        "dead-letter-race@example.com",
+        {"body": "terminal"},
+    )
+
+    try:
+        original_id = await queue.enqueue(
+            *request, idempotency_key="dead-letter-race"
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await database.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, original_id),
+        )
+
+        if db_backend.backend_type == "sqlite":
+            # BEGIN IMMEDIATE serializes the two writers. PostgreSQL's
+            # statement snapshots are the backend-specific race under test.
+            await queue.move_to_dead_letter(original_id, "provider rejected")
+            with pytest.raises(DeliveryIdempotencyTerminal):
+                await queue.enqueue(*request, idempotency_key="dead-letter-race")
+            return
+
+        first_tombstone_read = asyncio.Event()
+        resume_replay = asyncio.Event()
+        original_fetchone = database.fetchone
+        replay_task = None
+        paused = False
+
+        async def pause_after_tombstone_miss(sql, params=()):
+            nonlocal paused
+            row = await original_fetchone(sql, params)
+            if (
+                asyncio.current_task() is replay_task
+                and "SELECT id FROM delivery_dead_letter" in sql
+                and not paused
+            ):
+                paused = True
+                assert row is None
+                first_tombstone_read.set()
+                await resume_replay.wait()
+            return row
+
+        monkeypatch.setattr(database, "fetchone", pause_after_tombstone_miss)
+        replay_task = asyncio.create_task(
+            queue.enqueue(*request, idempotency_key="dead-letter-race")
+        )
+        await asyncio.wait_for(first_tombstone_read.wait(), timeout=5)
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        resume_replay.set()
+
+        with pytest.raises(DeliveryIdempotencyTerminal):
+            await asyncio.wait_for(replay_task, timeout=5)
+        assert await original_fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?", (owner,)
+        ) == (0,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_legacy_delivery_queue_schema_upgrade_converges(
+    db_backend, tmp_path
+):
+    """Upgrade an actual pre-canonical-hash table on both supported backends."""
+    scoped_backend = None
+    schema = None
+    if db_backend.backend_type == "sqlite":
+        database = await AsyncDatabase.sqlite(str(tmp_path / "legacy-delivery.db"))
+    else:
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        postgres_url = (
+            os.environ.get("TEST_POSTGRES_URL")
+            or os.environ.get("KESTREL_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        )
+        assert postgres_url
+        schema = f"delivery_upgrade_{uuid4().hex}"
+        await db_backend.execute(f'CREATE SCHEMA "{schema}"')
+        separator = "&" if "?" in postgres_url else "?"
+        scoped_dsn = (
+            f"{postgres_url}{separator}options=-csearch_path%3D{schema}"
+        )
+        scoped_backend = PostgresBackend(
+            scoped_dsn, min_pool_size=1, max_pool_size=1
+        )
+        await scoped_backend.connect()
+        database = AsyncDatabase(scoped_backend)
+
+    owner = f"did:test:delivery-schema-upgrade:{uuid4().hex}"
+    content_json = json.dumps({"subject": "hello", "body": "world"})
+    entry_id = f"legacy-{uuid4().hex}"
+    try:
+        await database.execute(
+            """
+            CREATE TABLE delivery_queue (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                next_retry_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT
+            )
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, status, attempts, max_retries,
+                 next_retry_at, created_at)
+            VALUES (?, ?, 'email', ?, ?, ?, 'pending', 0, 5, ?, ?)
+            """,
+            (
+                entry_id,
+                owner,
+                "legacy-schema@example.com",
+                content_json,
+                QueueEntry.compute_content_hash(
+                    "legacy-schema@example.com", content_json
+                ),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        queue = DeliveryQueue(database, owner)
+        await queue._ensure_tables()
+        assert await database.column_exists(
+            "delivery_queue", "canonical_content_hash"
+        )
+        canonical_row = await database.fetchone(
+            "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
+            (entry_id,),
+        )
+        assert canonical_row[0] is not None
+        assert await queue.enqueue(
+            "email",
+            "legacy-schema@example.com",
+            {"body": "world", "subject": "hello"},
+        ) == entry_id
+        assert await queue.enqueue(
+            "email",
+            "legacy-schema@example.com",
+            {"body": "world", "subject": "hello"},
+            idempotency_key="legacy-schema-adoption",
+        ) == entry_id
+        await queue._ensure_tables()
+    finally:
+        await database.close()
+        if schema is not None:
+            await db_backend.execute(f'DROP SCHEMA "{schema}" CASCADE')
 
 
 @pytest.mark.asyncio

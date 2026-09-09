@@ -912,6 +912,37 @@ class TestQueueIdempotency:
             )
 
     @pytest.mark.asyncio
+    async def test_pre_upgrade_live_claim_backfills_replay_metadata(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "live-upgrade@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "live-upgrade",
+        }
+        entry_id = await queue.enqueue(**request)
+        content_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (entry_id,)
+        )
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency
+            SET effective_max_retries = NULL, legacy_content_hash = NULL
+            WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        )
+
+        assert await queue.enqueue(**request) == entry_id
+        assert await queue._db.fetchone(
+            """
+            SELECT effective_max_retries, legacy_content_hash
+            FROM delivery_idempotency WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        ) == (queue._max_retries, content_hash[0])
+
+    @pytest.mark.asyncio
     async def test_explicit_default_is_distinct_from_omitted_default(
         self, real_queue
     ):
@@ -1511,6 +1542,112 @@ class TestQueueIdempotency:
         ) == (1,)
 
     @pytest.mark.asyncio
+    async def test_stale_claim_adopts_existing_anchored_replacement(self, real_queue):
+        queue, _ = real_queue
+        request = ("email", "anchored-adoption@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="anchored-adoption-stale"
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        replacement = await queue.enqueue(
+            *request, idempotency_key="anchored-adoption-replacement"
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, replacement),
+        )
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET previous_entry_id = ?
+            WHERE agent_id = ? AND entry_id = ?
+            """,
+            (original_id, queue._agent_id, replacement),
+        )
+
+        assert await queue.enqueue(
+            *request, idempotency_key="anchored-adoption-stale"
+        ) == replacement
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_idempotency
+            WHERE agent_id = ? AND entry_id = ? AND previous_entry_id = ?
+            """,
+            (queue._agent_id, replacement, original_id),
+        ) == (2,)
+
+    @pytest.mark.asyncio
+    async def test_stale_claim_rejects_multiple_anchored_replacements(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = ("email", "ambiguous-anchor@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="ambiguous-anchor-stale"
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        first = await queue.enqueue(
+            *request, idempotency_key="ambiguous-anchor-first"
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, first),
+        )
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET previous_entry_id = ?
+            WHERE agent_id = ? AND entry_id = ?
+            """,
+            (original_id, queue._agent_id, first),
+        )
+        second = "ambiguous-anchor-second-entry"
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            SELECT ?, agent_id, channel_type, recipient, content_json,
+                   content_hash, canonical_content_hash, status, attempts,
+                   max_retries, next_retry_at, ?
+            FROM delivery_queue WHERE id = ?
+            """,
+            (second, old, first),
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_idempotency
+                (agent_id, idempotency_key_digest, entry_id, payload_digest,
+                 created_at, previous_entry_id, effective_max_retries,
+                 legacy_content_hash)
+            SELECT agent_id, ?, ?, payload_digest, ?, ?,
+                   effective_max_retries, legacy_content_hash
+            FROM delivery_idempotency
+            WHERE agent_id = ? AND entry_id = ?
+            """,
+            (
+                "f" * 64,
+                second,
+                old,
+                original_id,
+                queue._agent_id,
+                first,
+            ),
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="multiple anchored"):
+            await queue.enqueue(
+                *request, idempotency_key="ambiguous-anchor-stale"
+            )
+
+    @pytest.mark.asyncio
     async def test_shared_stale_claims_adopt_recent_plain_delivery(self, real_queue):
         queue, _ = real_queue
         request = ("email", "shared-plain@example.com", {"body": "hello"})
@@ -1868,6 +2005,31 @@ class TestQueueIdempotency:
             (queue._agent_id,),
         )
         assert ledger == (retried["entry_id"],)
+
+    @pytest.mark.asyncio
+    async def test_purge_retains_aged_dead_letter_replay_claim(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "retained-terminal@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "retained-terminal",
+        }
+        original_id = await queue.enqueue(**request)
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_idempotency SET created_at = ? WHERE agent_id = ?",
+            (old, queue._agent_id),
+        )
+
+        assert await queue.purge_delivered(older_than_hours=24) == 0
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+        with pytest.raises(DeliveryIdempotencyTerminal):
+            await queue.enqueue(**request)
 
     @pytest.mark.asyncio
     async def test_failed_nested_dead_letter_transition_is_fail_closed(
