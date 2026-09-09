@@ -435,6 +435,11 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert config is effective_config
         events.append("preflight")
 
+    async def _stop_receipts(app) -> None:
+        events.append("stop-receipts")
+        app.state.stop_receipt_store = object()
+        app.state.stop_receipt_db = None
+
     async def _start(app, supplied_manager, config) -> None:
         assert supplied_manager is manager
         assert config is effective_config
@@ -477,6 +482,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
     monkeypatch.setattr(
         server, "_start_shared_agent_postgres_backend", _shared_backend
     )
+    monkeypatch.setattr(server, "_initialize_stop_receipts", _stop_receipts)
     monkeypatch.setattr(server, "_start_host_scheduler", _start)
     monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *_a, **_k: None)
     monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
@@ -571,6 +577,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         assert restored["ExternalChild"] == external_config
 
     assert events == [
+        "stop-receipts",
         "reconcile",
         "context-build",
         "backend-start",
@@ -607,6 +614,9 @@ async def test_single_agent_identity_conflict_precedes_hold_custody_binding(
         events.append("hold-custody-binding")
         return object()
 
+    async def _initialize_stop_receipts(_app) -> None:
+        return None
+
     missing_config = tmp_path / "missing-multi-agent.toml"
     monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
@@ -620,6 +630,7 @@ async def test_single_agent_identity_conflict_precedes_hold_custody_binding(
     )
     monkeypatch.setattr(server, "get_agent_did_async", _reject_foreign_database)
     monkeypatch.setattr(server, "_build_host_control_context", _build_control_context)
+    monkeypatch.setattr(server, "_initialize_stop_receipts", _initialize_stop_receipts)
     monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
     monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
     monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)

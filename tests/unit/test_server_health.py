@@ -100,6 +100,72 @@ def test_health_returns_503_when_agent_missing():
     assert "must-not-leak" not in response.text
 
 
+def test_health_rejects_permanently_self_fenced_invocation_owner():
+    """A replica which cannot admit invocations must leave the load balancer."""
+
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    app.router.lifespan_context = noop_lifespan
+    app.state.agent = SimpleNamespace(
+        features={},
+        _distributed_invocation_registry=SimpleNamespace(
+            owner_lifecycle_status="self_fenced"
+        ),
+    )
+    app.state.agent_manager = None
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unhealthy",
+        "agent_initialized": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_names_permanently_self_fenced_invocation_owner():
+    """Authenticated health consumes the same owner lifecycle invariant."""
+
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    health_feature = type("HealthFeature", (), {})()
+    health_feature.get_latest = AsyncMock(
+        return_value={"status": "healthy", "checks": []}
+    )
+    agent = SimpleNamespace(
+        features={"HealthFeature": health_feature},
+        _distributed_invocation_registry=SimpleNamespace(
+            owner_lifecycle_status="self_fenced"
+        ),
+    )
+
+    result = await _agent_detailed_health(agent)
+
+    assert result["status"] == "unhealthy"
+    assert result["overall_healthy"] is False
+    assert result["checks"] == [
+        {
+            "name": "distributed_invocation_owner",
+            "status": "fail",
+            "message": "Invocation owner lease was lost; replica is fenced",
+            "duration_ms": 0.0,
+        }
+    ]
+
+
 def test_health_startup_error_dominates_retained_cleanup_manager():
     """A manager retained solely for rollback cleanup can never pass readiness."""
     from server import app

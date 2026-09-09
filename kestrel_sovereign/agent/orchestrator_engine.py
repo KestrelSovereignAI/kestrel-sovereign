@@ -20,6 +20,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
@@ -49,6 +53,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     bind_transition_lock_reentry,
 )
 from kestrel_sovereign.agent.streaming import (
+    _DeferredToolBatchCancellation,
     _build_revise_sentinel,
     _build_tool_sentinel,
 )
@@ -2296,6 +2301,44 @@ class OrchestratorEngineMixin:
                 # parts once after the gather and attach to the last event.
                 _collect_parts()
 
+    async def _execute_tool_batch_at_stop_boundary(
+        self,
+        *args,
+        defer_cancellation_to_persistence: bool = False,
+        **kwargs,
+    ):
+        """Finish a side-effecting batch before propagating cancellation.
+
+        Cooperative Stop may cancel the top-level invocation task at any
+        await.  A tool batch is not such a boundary: cancelling it halfway can
+        leave an external effect committed while the corresponding tool result
+        is absent from history.  Give the batch its own lifecycle owner, join
+        it through repeated caller cancellation, and only then let Stop unwind
+        the turn.  The next loop checkpoint observes the cancellation flag and
+        prevents another tool or provider round-trip.
+        """
+
+        capture_reentry = getattr(self, "_capture_transition_reentry_token", None)
+        transition_reentry_token = (
+            capture_reentry() if callable(capture_reentry) else None
+        )
+
+        async def run_owned_batch():
+            with bind_transition_lock_reentry(transition_reentry_token):
+                return await self._execute_tool_batch(*args, **kwargs)
+
+        owner = asyncio.create_task(
+            run_owned_batch(),
+            name="orchestrator-tool-batch",
+        )
+        outcome = await await_owned_task(owner)
+        if defer_cancellation_to_persistence and outcome.cancellation is not None:
+            return _DeferredToolBatchCancellation(outcome)
+        return raise_owned_outcome(
+            outcome,
+            operation="side-effecting orchestrator tool batch",
+        )
+
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
@@ -2486,7 +2529,7 @@ class OrchestratorEngineMixin:
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
-            await self._execute_tool_batch(
+            await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_results=tool_results,
@@ -2967,13 +3010,22 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
-            await self._execute_tool_batch(
+            batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id, part_emit_buffer=part_emit_buffer,
                 effective_model=effective_model,
+                defer_cancellation_to_persistence=True,
             )
+            if isinstance(batch_result, _DeferredToolBatchCancellation):
+                # The side effect and its result are complete, but Stop cancelled
+                # the invocation owner while this batch was in flight. Hand the
+                # captured cancellation to StreamingMixin without emitting any
+                # more client-visible bytes; it re-raises only after durable
+                # conversation history contains the completed result.
+                yield batch_result
+                return
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:
                 _parts_by_event_index.setdefault(_evt_idx, []).extend(_evt_parts)

@@ -30,7 +30,9 @@ from uuid import uuid4
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     current_invocation_id,
+    invocation_log_correlation,
     validate_invocation_id,
 )
 from kestrel_sovereign.signals import OrderedLockManager
@@ -488,6 +490,47 @@ class TurnLifecycleMixin:
         finally:
             _COMMITTED_FEATURE_TRANSITION_AGENT.reset(token)
 
+    def _capture_committed_feature_transition_delegation(
+        self,
+    ) -> _FeatureTransitionAncestry | None:
+        """Capture authority that an isolated invocation child may re-own."""
+
+        ancestry = _FEATURE_TRANSITION_ANCESTRY.get()
+        if (
+            ancestry is None
+            or ancestry.agent is not self
+            or not ancestry.active
+            or ancestry.owner_task is not asyncio.current_task()
+            or _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self
+        ):
+            return None
+        return ancestry
+
+    @contextmanager
+    def _bind_committed_feature_transition_delegation(
+        self,
+        ancestry: _FeatureTransitionAncestry,
+    ) -> Iterator[None]:
+        """Re-own captured committed-transition authority in one child task."""
+
+        if (
+            not isinstance(ancestry, _FeatureTransitionAncestry)
+            or ancestry.agent is not self
+            or not ancestry.active
+            or _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self
+        ):
+            raise RuntimeError("committed feature-transition authority expired")
+        delegated = _FeatureTransitionAncestry(
+            agent=self,
+            owner_task=asyncio.current_task(),
+        )
+        token = _FEATURE_TRANSITION_ANCESTRY.set(delegated)
+        try:
+            yield
+        finally:
+            delegated.active = False
+            _FEATURE_TRANSITION_ANCESTRY.reset(token)
+
     def _caller_belongs_to_live_turn(self) -> bool:
         """Whether this task is executing as part of this agent's live turn.
 
@@ -586,7 +629,7 @@ class TurnLifecycleMixin:
                 )
         if (
             holder is not None
-            and holder.owner_task is current_task
+            and mgr.is_owned_by_current_task(ResourceLock.CONVERSATION)
             and current_task is not getattr(self, "_live_turn_task", None)
         ):
             if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
@@ -594,10 +637,11 @@ class TurnLifecycleMixin:
                     "cognition cannot start before the feature transition "
                     "generation is fully committed"
                 )
-            # The committed ready phase still owns CONVERSATION in this task.
-            # Reuse that exact boundary; an arbitrary mid-transition hook is
-            # rejected above, and a genuine live turn is excluded so recursive
-            # process_input cannot replace the outer turn's authority.
+            # The committed ready phase still owns CONVERSATION in this task,
+            # or has explicitly delegated that exact hold to the isolated
+            # invocation child. Reuse that boundary; an arbitrary mid-transition
+            # hook is rejected above, and a genuine live turn is excluded so
+            # recursive process_input cannot replace the outer turn's authority.
             async with self._active_turn_scope(turn_id, label, started):
                 yield turn_id
             return
@@ -642,6 +686,22 @@ class TurnLifecycleMixin:
                     request_generation,
                 )
                 request_binding_registered = True
+                await_turn_admission = getattr(
+                    self,
+                    "await_durable_turn_admission",
+                    None,
+                )
+                if callable(await_turn_admission):
+                    durable_binding_admitted = await await_turn_admission(
+                        turn_id,
+                        request_id,
+                        request_generation,
+                    )
+                    if not durable_binding_admitted:
+                        raise InvocationCancelledError(
+                            "turn was stopped before durable admission "
+                            f"({invocation_log_correlation(turn_id)})"
+                        )
             yield
         finally:
             try:

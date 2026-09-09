@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.agent.streaming import StreamingMixin
 
 
@@ -72,8 +73,41 @@ async def test_persist_completes_when_outer_task_is_cancelled_mid_insert():
     # The shielded inner coroutine should still complete.
     await asyncio.wait_for(persist_completed.wait(), timeout=0.5)
     assert persist_completed.is_set(), (
-        "asyncio.shield must keep add_conversation alive past outer cancel"
+        "owned persistence must finish before outer cancellation returns"
     )
+
+
+@pytest.mark.asyncio
+async def test_stream_owner_close_joins_persistence_before_terminal_cleanup():
+    persist_started = asyncio.Event()
+    release_persist = asyncio.Event()
+
+    async def slow_persist(role, content, **kw):
+        persist_started.set()
+        await release_persist.wait()
+
+    agent = _make_agent_with_persist(slow_persist)
+
+    async def source():
+        await agent._persist_assistant_turn_safely(
+            "partial answer",
+            metadata={"cancelled": True},
+            session_id="s-stop",
+        )
+        if False:
+            yield "unreachable"
+
+    owned = OwnedAsyncIterator(source, operation="persisting test stream")
+    consumer = asyncio.create_task(anext(owned))
+    await persist_started.wait()
+    close = asyncio.create_task(owned.aclose())
+    await asyncio.sleep(0.05)
+
+    assert close.done() is False
+
+    release_persist.set()
+    await close
+    await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -100,6 +134,26 @@ async def test_persist_failure_logs_metric_and_swallows_exception():
     assert args.kwargs["metadata"]["session_id"] == "s1"
     assert args.kwargs["metadata"]["error_type"] == "RuntimeError"
     assert "DB unavailable" in args.kwargs["metadata"]["error_msg"]
+
+
+@pytest.mark.asyncio
+async def test_required_persist_failure_propagates_after_telemetry():
+    """A completed external effect cannot settle on a missing checkpoint."""
+
+    async def failing_persist(role, content, **kw):
+        raise RuntimeError("checkpoint unavailable")
+
+    agent = _make_agent_with_persist(failing_persist)
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await agent._persist_assistant_turn_safely(
+            "completed effect",
+            metadata={"tool_batch_checkpoint": {"status": "completed"}},
+            session_id="s-required",
+            require_success=True,
+        )
+
+    agent.observability_store.log_metric.assert_awaited_once()
 
 
 @pytest.mark.asyncio
