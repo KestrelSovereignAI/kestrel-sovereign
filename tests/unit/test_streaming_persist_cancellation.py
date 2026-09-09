@@ -157,6 +157,39 @@ async def test_required_persist_failure_propagates_after_telemetry():
 
 
 @pytest.mark.asyncio
+async def test_required_persist_failure_wins_over_pending_cancellation():
+    """Stop cannot acknowledge when its completed-effect checkpoint failed."""
+
+    persist_started = asyncio.Event()
+    release_persist = asyncio.Event()
+
+    async def failing_persist(role, content, **kw):
+        persist_started.set()
+        await release_persist.wait()
+        raise RuntimeError("required checkpoint unavailable")
+
+    agent = _make_agent_with_persist(failing_persist)
+
+    async def outer():
+        await agent._persist_assistant_turn_safely(
+            "completed effect",
+            metadata={"tool_batch_checkpoint": {"status": "completed"}},
+            session_id="s-required-cancelled",
+            require_success=True,
+        )
+
+    task = asyncio.create_task(outer())
+    await persist_started.wait()
+    task.cancel()
+    release_persist.set()
+
+    with pytest.raises(RuntimeError, match="required checkpoint unavailable"):
+        await task
+
+    agent.observability_store.log_metric.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_with_broken_telemetry_does_not_raise():
     """Last-line-of-defense: if add_conversation fails AND
     log_metric also fails, the helper must still not raise. The error

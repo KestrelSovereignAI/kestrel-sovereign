@@ -443,6 +443,95 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
 
 
 @pytest.mark.asyncio
+async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
+    """The non-streaming orchestrator cannot strand a completed effect."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _make_persist_agent(cancelled_request_id=None)
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+    required = []
+    persist = agent._persist_assistant_turn_safely
+
+    async def capture_required(*args, **kwargs):
+        required.append(kwargs.get("require_success", False))
+        return await persist(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_required
+    agent._persist_completed_tool_stop_checkpoint = (
+        OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+
+    async def execute_batch(*_args, **kwargs):
+        batch_started.set()
+        await release_batch.wait()
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc-nonstream",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+        batch_completed.set()
+
+    agent._execute_tool_batch = execute_batch
+    response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="tc-nonstream",
+                name="send_message",
+                arguments={"text": "sent once"},
+            )
+        ],
+    )
+
+    turn = asyncio.create_task(
+        OrchestratorEngineMixin._handle_orchestrator_response(
+            agent,
+            response=response,
+            feature_tools=[],
+            system_prompt="system",
+            force_local_only=False,
+            effective_model="test",
+            user_message="send it",
+            session_id="s-nonstream",
+            tool_results=[],
+        )
+    )
+    await batch_started.wait()
+    turn.cancel()
+    release_batch.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert batch_completed.is_set()
+    assert required == [True]
+    assert len(agent._captured) == 1
+    assert agent._captured[0]["metadata"] == {
+        "tool_batch_checkpoint": {
+            "status": "completed",
+            "details_withheld": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_no_cancel_path_unaffected_for_normal_completion():
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking

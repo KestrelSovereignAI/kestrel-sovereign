@@ -25,6 +25,7 @@ from kestrel_sovereign.stop import (
     StopRequest,
     StopScope,
 )
+from kestrel_sovereign.stop.receipt import opaque_stop_identifier
 
 
 class _EndpointReplayStore:
@@ -119,7 +120,7 @@ async def test_receipt_store_roundtrips_exact_evidence_on_available_backends(
     assert receipt.operation_id == request.correlation_id
     assert receipt.actor_id == request.actor_id
     assert receipt.reason == request.reason
-    assert receipt.turn_id == request.target
+    assert receipt.turn_id == opaque_stop_identifier("target", request.target)
     assert receipt.span_id == request.span_id
     assert receipt.trace_id == request.trace_id
     assert receipt.occurred_at
@@ -205,7 +206,9 @@ async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_pat
         assert await store.load(request) == receipt
         assert receipt.operation_id == request.correlation_id
         assert receipt.requested_target == request.target
-        assert receipt.turn_id == request.turn_id
+        assert receipt.turn_id == opaque_stop_identifier(
+            "target", request.turn_id
+        )
         assert receipt.outcomes[0].correlation_id == request.correlation_id
         assert receipt.outcomes[0].requested_target == request.target
     finally:
@@ -332,8 +335,14 @@ async def test_exact_retry_preserves_first_transport_trace_evidence(tmp_path):
         )
 
         replay = await store.load(retry)
+        stored_turn_id = await db.fetchval(
+            "SELECT turn_id FROM stop_receipts WHERE receipt_id = ?",
+            (written.receipt_id,),
+        )
 
         assert replay == written
+        assert replay.turn_id == stored_turn_id
+        assert replay.turn_id != retry.turn_id
         assert replay.span_id == first.span_id
         assert replay.trace_id == first.trace_id
     finally:

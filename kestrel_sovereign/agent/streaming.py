@@ -2616,16 +2616,21 @@ class StreamingMixin:
                 # broken, the logged ERROR above is the last line of
                 # defense.
                 pass
-        if outcome.cancellation is not None:
-            if outcome.error is not None:
-                outcome.cancellation.add_note(
-                    f"assistant turn persistence also failed: {outcome.error}"
+        # A required checkpoint is the evidence that makes a completed
+        # external effect safe to stop/retry.  Its storage failure must win
+        # over a simultaneously pending caller cancellation: reporting only
+        # CancelledError would let the Stop lifecycle acknowledge a clean
+        # unwind even though the anti-repeat record never became durable.
+        if require_success and outcome.error is not None:
+            if outcome.cancellation is not None:
+                outcome.error.add_note(
+                    "caller cancellation remained pending while the required "
+                    "assistant-turn checkpoint failed"
                 )
-                raise outcome.cancellation from outcome.error
+            raise outcome.error
+        if outcome.cancellation is not None:
             raise outcome.cancellation
         if isinstance(outcome.error, asyncio.CancelledError):
-            raise outcome.error
-        if require_success and outcome.error is not None:
             raise outcome.error
 
     async def _fire_post_response_hook(
