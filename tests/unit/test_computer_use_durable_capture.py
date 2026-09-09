@@ -2416,3 +2416,70 @@ async def test_the_fallback_degrades_to_a_run_id_when_even_the_path_is_too_long(
     assert env.data.get("run_id"), "the last pointer was dropped too"
     assert "manifest_path" not in env.data
     assert "complete" in env.data
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_fits_at_every_cap_that_triggers_it(
+    tmp_path: Path, queue, monkeypatch
+):
+    """Surviving mutant: putting the artifact path back into the confirmation
+    alongside ``data`` could be done with nothing failing, because the two
+    tests reaching the fallback sit either side of the band where it matters
+    — one small enough that duplication still fits, one so large the path is
+    dropped anyway.
+
+    A first attempt measured the band and hardcoded a cap. The measurement
+    used a different capture-directory name than the fixture, so the number
+    did not transfer and the test failed on a clean build — the third time on
+    this branch that a boundary computed in one context was applied in
+    another.
+
+    So it asserts the invariant across every cap in the range instead of
+    locating one: whatever the fallback returns must fit the cap that
+    produced it. That holds in all three regimes — preview, path-only,
+    run-id-only — and needs no arithmetic to stay true."""
+    from kestrel_sovereign.features.base import serialized_result_len
+
+    deep = tmp_path
+    for _ in range(8):
+        deep = deep / ("d" * 30)
+    deep.mkdir(parents=True)
+    (deep / "secret").mkdir()
+
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(deep)
+    await f.initialize()
+    real_backend = f._backend
+
+    smallest_cap_with_path = None
+    path_len = 0
+    for cap in range(400, 1400, 25):
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.computer_use.feature."
+            "orchestrator_result_cap",
+            lambda cap=cap: cap,
+        )
+        f._backend = real_backend
+        env = await f.shell(
+            command="python3 -c \"print('q' * 50000)\"",
+            capture_output=True,
+            timeout=60,
+        )
+        size = serialized_result_len(env, tool_name="shell")
+        assert size <= cap, f"cap={cap} produced {size} chars"
+        pointer = env.data.get("manifest_path")
+        if pointer and "facts only" in (env.confirmation or ""):
+            if smallest_cap_with_path is None:
+                smallest_cap_with_path = cap
+                path_len = len(pointer)
+
+    # Fitting is not the only thing that matters. Carrying the pointer twice
+    # still FITS — the re-measure step just degrades to the run id sooner —
+    # so the cost of duplication is that the path stops being affordable
+    # while it easily could be. Once is affordable a little above the path's
+    # own length; twice needs more than double it.
+    assert smallest_cap_with_path is not None, "no cap kept the path"
+    assert smallest_cap_with_path < 2 * path_len, (
+        f"the path only became affordable at cap={smallest_cap_with_path} "
+        f"for a {path_len}-char path — it is being carried more than once"
+    )
