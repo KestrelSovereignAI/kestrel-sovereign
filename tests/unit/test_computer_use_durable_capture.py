@@ -2638,3 +2638,52 @@ async def test_clean_docker_output_is_not_called_lossy():
     )
 
     assert result.truncated_stdout is False
+
+
+@pytest.mark.asyncio
+async def test_a_write_cancelled_after_both_graces_counts_as_lost(
+    tmp_path: Path, monkeypatch
+):
+    """Surviving mutant. Flushing gets extra time, so the tests never
+    exhausted BOTH graces and a mid-write cancellation never happened — the
+    branch that classifies it was asserted by nobody.
+
+    When the extra time is spent too, the bytes in that write really are
+    gone. That is lost output, not a writer still holding the pipe, and the
+    difference is the whole reason the two are tracked apart."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+    monkeypatch.setattr(local_mod, "_DRAIN_GRACE", 0.05)
+    monkeypatch.setattr(local_mod, "_FLUSH_GRACE", 0.05)
+
+    def glacial_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_write = out_fh.write
+
+        def glacial_write(b):
+            import time as _t
+
+            _t.sleep(3)
+            return real_write(b)
+
+        out_fh.write = glacial_write
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", glacial_open)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('never-lands')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True, "a discarded write was not called lost"
+    # It was writing, not waiting on the pipe — the labels are not
+    # interchangeable.
+    assert result.writers_remaining is False
