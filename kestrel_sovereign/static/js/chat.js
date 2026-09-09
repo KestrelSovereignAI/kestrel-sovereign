@@ -2563,12 +2563,13 @@ export function updateThinkingIndicator() {
  * sendMessage start / finally / catch so the dot lights up while the
  * agent has work in flight, even when a different agent is visible.
  *
- * Selector matches the row rendered in identity.js loadAgents().
- * No-op if the row hasn't been rendered yet (early init).
+ * Selector matches the shared card shell rendered by mountAgentList(), whether
+ * the host uses the default console row or an adopted companion renderer.
+ * No-op if the card hasn't been rendered yet (early init).
  */
 export function refreshAgentThinkingDot(agentName) {
     if (typeof document === 'undefined') return;
-    const row = document.querySelector(`.agent-item[data-agent-name="${CSS.escape(String(agentName))}"]`);
+    const row = document.querySelector(`.agent-card[data-agent-name="${CSS.escape(String(agentName))}"]`);
     if (!row) return;
     const busy = isAgentBusy(agentName);
     row.classList.toggle('agent-thinking', busy);

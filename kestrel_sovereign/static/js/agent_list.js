@@ -288,9 +288,9 @@ export function mountAgentList(containerEl, config = {}) {
         const shell = doc.createElement('div');
         const classes = [];
         // The default renderer IS the console row, so tag the shell `.agent-item`
-        // so identity.js/chat.js selectors (refreshAgentThinkingDot's
-        // `.agent-item[data-agent-name]`, the CSS state rules) keep matching. A
-        // host renderer gets a clean `.agent-card` shell without the row layout.
+        // for its row layout. Every renderer retains `.agent-card`, which is the
+        // shared live-state selector used by refreshAgentThinkingDot. A host
+        // renderer therefore gets a clean shell without console-row layout.
         if (usingDefaultRenderer) classes.push('agent-item');
         classes.push('agent-card');
         if (selected) classes.push('selected');

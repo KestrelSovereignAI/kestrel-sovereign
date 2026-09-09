@@ -31,6 +31,8 @@ const { mountAgentList, createDefaultAgentAdapter } = await import(
     '../../kestrel_sovereign/static/js/agent_list.js'
 );
 const { UI } = await import('../../kestrel_sovereign/static/js/ui-ext/registry.js');
+const { state } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { refreshAgentThinkingDot } = await import('../../kestrel_sovereign/static/js/chat.js');
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
 
@@ -189,6 +191,40 @@ test('custom companion renderer retains the shared busy-only Stop affordance', a
         css,
         /\.agent-card\.agent-thinking \.agent-stop-btn/,
         'busy-only visibility applies to custom companion cards',
+    );
+    handle.destroy();
+});
+
+test('custom companion Stop tracks live busy-state repaint', async () => {
+    const agent = 'frinz-live-route';
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{ name: agent, status: 'online' }]),
+        isThinking: (name) => state.waitingAgents.has(name),
+        onStop: async () => ({ outcomes: [{ disposition: 'stopped' }] }),
+        renderCard: (_item, ctx) => {
+            const portrait = document.createElement('div');
+            portrait.className = 'portrait-card';
+            portrait.appendChild(ctx.actionsAnchor);
+            return portrait;
+        },
+    });
+    await tick();
+
+    const shell = el.querySelector('.agent-card');
+    assert.ok(!shell.classList.contains('agent-thinking'), 'custom card mounts idle');
+
+    state.waitingAgents.add(agent);
+    refreshAgentThinkingDot(agent);
+    assert.ok(
+        shell.classList.contains('agent-thinking'),
+        'custom card exposes Stop when work begins after mount',
+    );
+
+    state.waitingAgents.delete(agent);
+    refreshAgentThinkingDot(agent);
+    assert.ok(
+        !shell.classList.contains('agent-thinking'),
+        'custom card hides Stop when work completes after mount',
     );
     handle.destroy();
 });
