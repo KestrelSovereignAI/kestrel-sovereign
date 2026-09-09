@@ -22,6 +22,7 @@ cannot show that a 2 MiB review survives, which is the entire claim.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -36,7 +37,10 @@ from kestrel_sovereign.features.computer_use.backends.base import (
     CompletedRun,
 )
 from kestrel_sovereign.features.computer_use.backends.local import LocalSandboxBackend
-from kestrel_sovereign.features.computer_use.feature import ComputerUseFeature
+from kestrel_sovereign.features.computer_use.feature import (
+    _MIN_PREVIEW_CHARS,
+    ComputerUseFeature,
+)
 from kestrel_sovereign.privacy import PrivacyConfig
 
 
@@ -2955,3 +2959,58 @@ async def test_the_audit_keeps_the_truncation_flag_through_minimisation(
     row = [r for r in rows if r["tool"] == "shell"][-1]
     assert row["args"]["complete"] is False
     assert row["args"]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_fit_loop_ends_and_each_attempt_is_strictly_smaller(
+    workspace: Path, queue, monkeypatch
+):
+    """Round 12 replaced the fit loop's ``for _ in range(_FIT_ATTEMPTS)`` with
+    a ``while``, so nothing but the assignment in the body stops it. The
+    mutation harness found this the hard way: the long-standing
+    ``chars = chars`` mutant had been a five-iteration no-op and became an
+    infinite loop, and with no per-mutant timeout the harness hung until it
+    was killed, losing the run.
+
+    A hang is not an assertion. This puts a deadline on the call so a loop
+    that stops shrinking FAILS here rather than hanging, and records the
+    budget each attempt was given so the shrinking is asserted rather than
+    inferred from the call having returned at all."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    budgets: list[int] = []
+    real_preview = capture.preview
+
+    async def spy(path, *, max_chars):
+        budgets.append(max_chars)
+        return await real_preview(path, max_chars=max_chars)
+
+    monkeypatch.setattr(capture, "preview", spy)
+
+    script = workspace / "big.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.write(chr(34) * 60000)\n"
+        "sys.stderr.write(chr(34) * 60000)\n"
+    )
+    f = await _feature(workspace, queue)
+
+    async with asyncio.timeout(60):
+        env = await f.shell(
+            command=f"python3 {script}", capture_output=True, timeout=30
+        )
+
+    # One budget per stream per attempt, so the per-attempt budget is every
+    # second entry. Strictly decreasing is the property termination rests on;
+    # asserting only that the call returned would pass a loop that happened
+    # to fit on its first measurement.
+    attempts = budgets[::2]
+    assert len(attempts) > 1, f"the loop never shrank at all: {budgets}"
+    assert all(
+        b < a for a, b in zip(attempts, attempts[1:])
+    ), f"a budget did not shrink: {attempts}"
+    assert attempts[-1] >= _MIN_PREVIEW_CHARS
+    assert serialized_result_len(env, tool_name="shell") <= orchestrator_result_cap()
