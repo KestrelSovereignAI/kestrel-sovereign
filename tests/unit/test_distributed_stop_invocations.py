@@ -1070,7 +1070,11 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
         assert await registry.register(agent, "older-turn", 1)
         store.poll_owner = pause_after_snapshot
         registry.start()
-        await asyncio.wait_for(snapshot_taken.wait(), timeout=1)
+        # Generous on purpose: this waits for a real task to reach a barrier,
+        # and under `-n auto` a one-second budget times out on scheduling delay
+        # rather than on the behavior under test. A genuine failure never sets
+        # the event at all, so a larger ceiling costs nothing but patience.
+        await asyncio.wait_for(snapshot_taken.wait(), timeout=30)
 
         assert await registry.register(agent, "newer-turn", 2)
         release_snapshot.set()
