@@ -156,8 +156,14 @@ runtime rather than by a shell it does not have. Two parameters:
   written to runtime-owned files; the result carries `stdout_path`,
   `stderr_path` and a `manifest_path`, and the inline text becomes a bounded
   preview showing the head *and the tail*, so a verdict at the end of a long
-  review is visible without opening the file. There is no cap on the file: the
-  child writes to it directly.
+  review is visible without opening the file. On the **local** backend the
+  child writes to the file directly and there is no cap on it. On the
+  **docker** backend — which is the DEFAULT — there is: the capture is
+  written from a string the executor already clipped at `max_output_bytes`
+  (1 MiB unless `[features.computer_use.docker].max_output_bytes` says
+  otherwise), so a review past that ceiling still comes back clipped and
+  PARTIAL. Streaming it is #3277. Check `complete`, as below, rather than
+  assuming the file is whole.
 
 The manifest records what ran, where, how it ended, and the git `HEAD` before
 and after. **A verdict is about one tree.** During the 2026-08-31 run the head
@@ -180,11 +186,12 @@ unfollowable, not merely hard. If a rule here names a field, and the field is
 not in what you get back, that is a defect to file, not an instruction to
 approximate.
 
-**Measured 2026-09-09, running the form once end to end.** A 3.2 MB review
-captured to a file came back `complete: true` with the artifact at 3,348,905
-bytes — past the 1 MiB ToolResult cap this was filed against — and a
-4,222-character preview carrying both the opening line and the closing
-`VERDICT:` line, so the verdict was readable without opening the file. The
+**Measured 2026-09-09, running the form once end to end on the LOCAL
+backend.** A 3.2 MB review captured to a file came back `complete: true` with
+the artifact at 3,348,905 bytes — past the 1 MiB ToolResult cap this was filed
+against — and a 4,222-character preview carrying both the opening line and the
+closing `VERDICT:` line, so the verdict was readable without opening the
+file. The
 same command killed at a 2-second timeout came back PARTIAL with
 `complete: false`, rc −9, and an error saying the output must not be read as a
 finished result. A run that committed while it ran recorded
@@ -193,10 +200,15 @@ this section was present in the result with that spelling.
 
 What that run did NOT cover: it called `shell` directly rather than through
 the tool executor, so the approval queue and the LLM-facing schema are still
-unexercised. Note when you first use this that `capture_output` is advertised
-to the model as a *string* (its annotation is `bool | str`, which no JSON
-schema type fits); `"true"` is accepted and coerced, and anything else is
-refused by name rather than silently read as false.
+unexercised; and it ran on the local backend, so it says nothing about the
+docker ceiling above. Review round 12 caught that generalisation — one
+backend's measurement written up as an unqualified promise — which is the same
+defect this section warns about two paragraphs down.
+
+Note when you first use this that `capture_output` is advertised to the model
+as a *string* (its annotation is `bool | str`, which no JSON schema type
+fits); `"true"` is accepted and coerced, and anything else is refused by name
+rather than silently read as false.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been

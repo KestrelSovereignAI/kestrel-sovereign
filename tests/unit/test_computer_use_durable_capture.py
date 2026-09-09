@@ -3014,3 +3014,265 @@ async def test_the_fit_loop_ends_and_each_attempt_is_strictly_smaller(
     ), f"a budget did not shrink: {attempts}"
     assert attempts[-1] >= _MIN_PREVIEW_CHARS
     assert serialized_result_len(env, tool_name="shell") <= orchestrator_result_cap()
+
+
+# ---------------------------------------------------------------------------
+# Review round 12
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_capture_does_not_leak_the_pipe_either(tmp_path: Path):
+    """Round 12 closed the abandoned pipes on the drain's own timeout and left
+    the cancellation handler -- the sibling path, cancelling the same two
+    pumps -- untouched. Round 11's defect, one path over: the fix went in
+    beside the bug rather than at the thing both paths share."""
+    import os as _os
+
+    def open_fds():
+        try:
+            return len(_os.listdir(f"/dev/fd/{_os.getpid()}"))
+        except OSError:
+            return len(_os.listdir("/dev/fd"))
+
+    script = tmp_path / "daemon.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid(); time.sleep(20); os._exit(0)\n"
+        "time.sleep(20)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    before = open_fds()
+    for i in range(4):
+        bundle = capture.allocate(tmp_path / f"cancelled{i}")
+        task = asyncio.create_task(
+            backend.exec(
+                ["python3", str(script)],
+                cwd=None,
+                env=None,
+                timeout=30,
+                capture=CaptureTarget(
+                    stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+                ),
+            )
+        )
+        # Land the cancel inside the drain, not before the call has begun.
+        await asyncio.sleep(0.6)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    after = open_fds()
+
+    assert after - before < 4, f"leaked {after - before} descriptors over 4 cancels"
+
+
+@pytest.mark.asyncio
+async def test_the_audit_agrees_with_the_envelope_through_the_zero_budget_build(
+    tmp_path: Path, queue, monkeypatch
+):
+    """Round 12's own regression, and the fourth appearance of one
+    contradiction. ``clipped_for_audit`` was captured before minimisation --
+    correct as far as it went -- but ``_build(0)`` runs after it and clips
+    again, so the audit row said ``truncated: false`` while the envelope it
+    described said ``truncated_stdout: true``.
+
+    The reviewer's mutation run also found the ``_build(0)`` step itself was
+    covered by no test at all, which is why the re-clip went unnoticed."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 1000,
+    )
+    ws = tmp_path / "ws"
+    (ws / "captures").mkdir(parents=True)
+    (ws / "secret").mkdir()
+
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(ws)
+    await f.initialize()
+    # The reviewer's own reproduction. Both streams at exactly
+    # _MIN_PREVIEW_CHARS, so the fit loop reaches its floor without clipping
+    # (200 > 200 is false) and the envelope still measures 1,200 against the
+    # 1,000 cap -- so only _build(0) clips. Measured, not guessed: at 150 the
+    # envelope is exactly 1,000 and the fallback never fires.
+    f._backend = _StubBackend(_run(stdout="a" * 200, stderr="b" * 200))
+
+    env = await f.shell(command="echo hi")
+
+    rows = [
+        json.loads(line)
+        for line in (ws / "audit.jsonl").read_text().splitlines()
+    ]
+    row = [r for r in rows if r["tool"] == "shell"][-1]
+    envelope_clipped = bool(
+        (env.data or {}).get("truncated_stdout")
+        or (env.data or {}).get("truncated_stderr")
+    )
+    assert row["args"]["truncated"] == envelope_clipped, (
+        row["args"]["truncated"], envelope_clipped
+    )
+    # And the run really did go through the zero-budget build, or this
+    # asserts agreement on a path it never took.
+    assert envelope_clipped is True
+    assert row["args"]["complete"] is False
+
+
+def _manifest(tmp_path: Path, **over: Any) -> dict:
+    bundle = capture.allocate(tmp_path / "captures")
+    bundle.stdout_path.write_text("out")
+    bundle.stderr_path.write_text("err")
+    kw: dict[str, Any] = dict(
+        bundle=bundle,
+        argv=["echo", "hi"],
+        cwd=None,
+        backend="local",
+        started_at=capture.utcnow(),
+        finished_at=capture.utcnow(),
+        duration_ms=5,
+        returncode=0,
+        timed_out=False,
+        truncated_stdout=False,
+        truncated_stderr=False,
+        writers_remaining=False,
+        head_before=None,
+        head_after=None,
+    )
+    kw.update(over)
+    return capture.build_manifest(**kw)
+
+
+@pytest.mark.parametrize(
+    "term",
+    ["timed_out", "truncated_stdout", "truncated_stderr", "writers_remaining"],
+)
+def test_every_term_alone_makes_the_manifest_incomplete(tmp_path: Path, term):
+    """Review round 12's mutation run: two of the four terms in the MANIFEST's
+    ``complete`` were asserted by nothing (`complete_drops_timeout`,
+    `complete_drops_stderr_clip` both survived). The feature-level ``complete``
+    was fully pinned; this is the other one -- and it is the field AGENTS.md
+    tells an agent to read.
+
+    Each term is turned on alone, so dropping any one of them from the
+    conjunction fails here rather than only when it happens to coincide with
+    another."""
+    assert _manifest(tmp_path)["complete"] is True, "the all-clear case moved"
+
+    value = None if term == "writers_remaining" else True
+    body = _manifest(tmp_path, **{term: value})
+
+    assert body["complete"] is False, term
+    assert body[term] == value
+
+
+def test_a_writer_that_could_not_be_checked_is_not_a_cleared_one(tmp_path: Path):
+    """``writers_remaining is not False``, not a truthiness test: the third
+    state is "could not check", and an unchecked claim is not a cleared one."""
+    assert _manifest(tmp_path, writers_remaining=None)["complete"] is False
+    assert _manifest(tmp_path, writers_remaining=True)["complete"] is False
+    assert _manifest(tmp_path, writers_remaining=False)["complete"] is True
+
+
+@pytest.mark.parametrize(
+    "before,after,expected",
+    [
+        ("a" * 40, "a" * 40, False),
+        ("a" * 40, "b" * 40, True),
+        (None, "b" * 40, None),
+        ("a" * 40, None, None),
+        (None, None, None),
+    ],
+)
+def test_head_moved_claims_nothing_when_either_end_is_unknown(
+    tmp_path: Path, before, after, expected
+):
+    """Surviving mutant `head_moved_unknown_guard_and`: with ``and`` in place
+    of ``or``, a ONE-sided unknown compares None against a SHA and reports
+    ``head_moved: true`` -- a verdict declared stale on no evidence. Both
+    one-sided cases are covered, not just the symmetric both-unknown one."""
+    body = _manifest(tmp_path, head_before=before, head_after=after)
+    assert body["git"]["head_moved"] is expected
+
+
+def test_the_manifest_records_the_bytes_actually_on_disk(tmp_path: Path):
+    """Surviving mutant `file_size_zero`: the byte counts were asserted by
+    nothing, so a manifest could report an empty artifact beside a full one."""
+    bundle = capture.allocate(tmp_path / "captures")
+    bundle.stdout_path.write_text("x" * 1234)
+    bundle.stderr_path.write_text("y" * 56)
+    body = capture.build_manifest(
+        bundle=bundle, argv=["echo"], cwd=None, backend="local",
+        started_at=capture.utcnow(), finished_at=capture.utcnow(),
+        duration_ms=1, returncode=0, timed_out=False,
+        truncated_stdout=False, truncated_stderr=False,
+        writers_remaining=False, head_before=None, head_after=None,
+    )
+    assert body["stdout_bytes"] == 1234
+    assert body["stderr_bytes"] == 56
+
+
+@pytest.mark.asyncio
+async def test_a_git_command_that_fails_yields_no_sha_even_if_it_printed(
+    tmp_path: Path, monkeypatch
+):
+    """Surviving mutant `git_head_ignores_returncode`. A manifest carrying a
+    WRONG sha is worse than one carrying none: the whole point of the field is
+    that a verdict can be tied to a tree."""
+    class _Proc:
+        returncode = 128
+
+        async def communicate(self):
+            return b"not-a-sha-but-printed-anyway\n", b""
+
+    async def fake_exec(*a, **k):
+        return _Proc()
+
+    monkeypatch.setattr(capture.asyncio, "create_subprocess_exec", fake_exec)
+    assert await capture.git_head(tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_an_unrecognised_capture_output_string_is_refused_not_ignored(
+    workspace: Path, queue
+):
+    """Surviving mutant `capture_output_bad_string_is_false`. The parameter
+    reaches the model as a STRING (its annotation is ``bool | str``, which no
+    JSON schema type fits), so a wrong value is a live possibility. Silently
+    reading it as false is how a caller ends up reasoning from a clipped
+    result believing it has a file."""
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", capture_output="yes-please")
+
+    assert env.status is ToolResultStatus.ERROR
+    assert "capture_output" in (env.error or "")
+    # And the recognised spellings still work, or this passes by refusing
+    # everything.
+    assert (await f.shell(command="echo hi", capture_output="true")).data[
+        "stdout_path"
+    ]
+
+
+@pytest.mark.parametrize(
+    "configured,expected",
+    [
+        (None, 1024 * 1024),
+        (4 * 1024 * 1024, 4 * 1024 * 1024),
+        ("2097152", 2097152),
+        (0, 1024 * 1024),
+        (-1, 1024 * 1024),
+        ("not-a-number", 1024 * 1024),
+        ([], 1024 * 1024),
+    ],
+)
+def test_a_configured_capture_ceiling_is_read_or_refused_never_guessed(
+    configured, expected
+):
+    """The docker capture ceiling became configurable in round 13, and
+    ``int()`` straight onto operator input is the wrong boundary discipline
+    for this file -- ``timeout`` and ``capture_output`` both refuse what they
+    cannot read. A ceiling of 0 is the one that matters: it would clip every
+    capture to nothing while every flag still called the run complete."""
+    from kestrel_sovereign.features.computer_use.feature import _positive_int
+
+    assert _positive_int(configured, default=1024 * 1024, name="x") == expected

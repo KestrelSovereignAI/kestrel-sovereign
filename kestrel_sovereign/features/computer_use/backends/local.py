@@ -291,6 +291,11 @@ class LocalSandboxBackend(SandboxBackend):
                         await _kill_tree(proc.pid)
                         for task in pumps:
                             task.cancel()
+                        # The same abandonment as the drain's timeout, and it
+                        # leaks the same two descriptors: killing the direct
+                        # child does not close pipes a surviving descendant
+                        # still holds.
+                        _close_pipe_transports(proc)
                         raise
                     # A pump cancelled mid-write loses whatever that write held,
                     # so it is lost output rather than a writer still holding the
@@ -307,20 +312,7 @@ class LocalSandboxBackend(SandboxBackend):
                     for task in pending:
                         task.cancel()
                     if pending:
-                        # Cancelling the task does not close the pipe. The
-                        # descendant still holds the other end, so without
-                        # this the server keeps two descriptors for as long
-                        # as that process lives — which for a daemon is
-                        # indefinitely, and a few such captures exhaust the
-                        # process's limit.
-                        for stream in (proc.stdout, proc.stderr):
-                            transport = getattr(stream, "_transport", None)
-                            if transport is None:
-                                continue
-                            try:
-                                transport.close()
-                            except Exception:  # noqa: BLE001 - cleanup
-                                pass
+                        _close_pipe_transports(proc)
                     # A pump that raised — a full disk, a vanished directory —
                     # finishes and lands in ``done`` like any other. Not asking
                     # for its exception meant a capture missing everything after
@@ -432,6 +424,31 @@ class LocalSandboxBackend(SandboxBackend):
             timed_out=timed_out,
             cwd=effective_cwd,
         )
+
+
+def _close_pipe_transports(proc) -> None:
+    """Close the subprocess pipes whose pumps we are abandoning.
+
+    Cancelling a pump task does not close the pipe. A descendant that
+    escaped the process group still holds the other end, so the server keeps
+    two descriptors for as long as that process lives — indefinitely for a
+    daemon, and a few such captures exhaust the process's limit.
+
+    This is a function rather than a loop at the call site because there are
+    two places that abandon pumps — the drain's own timeout and a
+    cancellation arriving during the drain — and round 12 fixed only the
+    first. The second is the same defect one path over, which is how this
+    branch has repeatedly lost a round: the fix went in beside the bug
+    rather than at the thing both paths share.
+    """
+    for stream in (proc.stdout, proc.stderr):
+        transport = getattr(stream, "_transport", None)
+        if transport is None:
+            continue
+        try:
+            transport.close()
+        except Exception:  # noqa: BLE001 - cleanup
+            pass
 
 
 async def _await_exit(proc, timeout: float, pumps: list | None = None) -> bool:

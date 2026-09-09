@@ -74,11 +74,6 @@ from .policy import (
 
 logger = logging.getLogger(__name__)
 
-# Halvings allowed while fitting. Five takes a 2,750-char preview to 85,
-# which is past useful; if the envelope still does not fit by then the
-# overflow is not the preview and shrinking further only hides that.
-_FIT_ATTEMPTS = 5
-
 # Below this a preview shows nothing worth reading, so the loop stops rather
 # than trading a verdict for a fit.
 _MIN_PREVIEW_CHARS = 200
@@ -359,9 +354,25 @@ class ComputerUseFeature(Feature):
             if backend_name == "local":
                 self._backend = LocalSandboxBackend(granted)
             else:
+                # ``max_output_bytes`` is the docker backend's capture
+                # ceiling, and it was not reachable from configuration at
+                # all: the capture is written from strings the executor has
+                # already clipped, so on this backend a review longer than
+                # the ceiling comes back clipped and PARTIAL — the 1 MiB cap
+                # #3243 was filed against, still in force on the DEFAULT
+                # backend. Passing it through does not make the capture a
+                # stream; it makes the ceiling an operator's decision instead
+                # of a constant. Streaming it to the file, as the local
+                # backend does, is #3277.
+                docker_cfg = self._cfg.get("docker", {})
                 self._backend = DockerSandboxBackend(
                     granted_capabilities=granted,
-                    memory_limit=self._cfg.get("docker", {}).get("memory_limit", "256m"),
+                    memory_limit=docker_cfg.get("memory_limit", "256m"),
+                    max_output_bytes=_positive_int(
+                        docker_cfg.get("max_output_bytes"),
+                        default=1024 * 1024,
+                        name="features.computer_use.docker.max_output_bytes",
+                    ),
                 )
         except CapabilityBlocked as exc:
             logger.warning("ComputerUseFeature: backend refused init: %s", exc)
@@ -1582,10 +1593,7 @@ class ComputerUseFeature(Feature):
             while chars > _MIN_PREVIEW_CHARS and _size(envelope) > cap:
                 chars = max(_MIN_PREVIEW_CHARS, chars // 2)
                 envelope, run_incomplete = await _build(chars)
-            clipped_for_audit = bool(
-                (envelope.data or {}).get("truncated_stdout")
-                or (envelope.data or {}).get("truncated_stderr")
-            )
+            clipped_for_audit = _clip_state(envelope)
             if _size(envelope) > cap:
                 # Still too big with no preview left: a very small configured
                 # cap (KESTREL_MAX_TOOL_RESULT_CHARS is settable, and 1000 is
@@ -1601,6 +1609,11 @@ class ComputerUseFeature(Feature):
                 # the run, so one path is enough to find the rest — which is
                 # the whole premise of having an artifact.
                 envelope, run_incomplete = await _build(0)
+                # A build with a zero budget is itself a clip: for an
+                # uncaptured run it drops every byte of output. Auditing the
+                # value taken before this step reported the run as untruncated
+                # while the envelope it returned said otherwise.
+                clipped_for_audit = _clip_state(envelope)
                 if _size(envelope) > cap:
                     envelope = _minimal_envelope(
                         envelope, manifest_path, run_incomplete
@@ -1623,10 +1636,9 @@ class ComputerUseFeature(Feature):
                     **payload,
                     "returncode": result.returncode,
                     "timed_out": result.timed_out,
-                    # The envelope's view, not the backend's: an uncaptured
-                    # stream trimmed to fit is truncation too, and auditing
-                    # the backend flag alone recorded ``truncated: false``
-                    # beside ``complete: false`` with nothing saying why.
+                    # The envelope's view as of the LAST build, not the
+                    # backend's and not a value captured earlier. See
+                    # ``_clip_state``.
                     "truncated": clipped_for_audit,
                     "writers_remaining": result.writers_remaining,
                     "complete": not run_incomplete,
@@ -1657,6 +1669,52 @@ class ComputerUseFeature(Feature):
                 error=str(exc),
             )
             return ToolResult.failed(error=str(exc))
+
+
+def _positive_int(value: Any, *, default: int, name: str) -> int:
+    """A configured byte ceiling, or the default when it is not usable.
+
+    ``int()`` straight onto an operator-supplied value is the wrong boundary
+    discipline for this file: ``timeout`` and ``capture_output`` a few hundred
+    lines up both refuse a value they cannot read rather than guessing. Config
+    differs from a tool argument in one way that matters -- there is no caller
+    to hand the refusal to, and raising here happens inside ``initialize`` and
+    takes the whole feature down over a typo. So it warns and falls back,
+    which is what an unreadable ceiling should cost.
+
+    Zero and negatives are rejected too: a ceiling of 0 would clip every
+    capture to nothing while every flag still reported the run complete.
+    """
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning("%s is not an integer (%r); using %d", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("%s must be positive (got %d); using %d", name, parsed, default)
+        return default
+    return parsed
+
+
+def _clip_state(envelope: ToolResult) -> bool:
+    """Whether this envelope reports either stream clipped.
+
+    Read from the envelope and never from the backend result: an uncaptured
+    stream trimmed to fit is truncation too. It has to be re-read after
+    EVERY build, because each build sets these flags for the budget it was
+    given — capturing it once before the fallback recorded ``truncated:
+    false`` beside ``complete: false`` for a run whose returned envelope said
+    ``truncated_stdout: true``. That contradiction has now been fixed in
+    round 5, reintroduced in round 8, fixed in round 11 and reintroduced by
+    the fallback in the same commit, so it lives in one named place.
+
+    It must also be read BEFORE ``_minimal_envelope``, which deliberately
+    strips these flags.
+    """
+    data = envelope.data or {}
+    return bool(data.get("truncated_stdout") or data.get("truncated_stderr"))
 
 
 def _minimal_envelope(
