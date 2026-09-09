@@ -5,11 +5,15 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskOutcome,
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -41,6 +45,13 @@ from kestrel_sovereign.telemetry import (
     start_span,
     end_span,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredToolBatchCancellation:
+    """Carry Stop across the streaming turn's history checkpoint."""
+
+    outcome: OwnedTaskOutcome[Any]
 
 
 def resolve_turn_invocation_context(
@@ -1744,6 +1755,9 @@ class StreamingMixin:
             # stripped, so the orchestrator sets ``timed_out`` here instead and we
             # substitute a deterministic safe block below.
             strict_timeout_state: Dict[str, Any] = {}
+            deferred_tool_batch_cancellation: Optional[
+                _DeferredToolBatchCancellation
+            ] = None
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1769,6 +1783,9 @@ class StreamingMixin:
                 # speech for dispatched subagents.
                 continuation_user_content=prompt + lazy_hint,
             ):
+                if isinstance(chunk, _DeferredToolBatchCancellation):
+                    deferred_tool_batch_cancellation = chunk
+                    break
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:
                         yield _build_thinking_sentinel(chunk)
@@ -1804,6 +1821,11 @@ class StreamingMixin:
                     "", metadata=None, session_id=session_id,
                     request_id=request_id, response=tool_response,
                 )
+                if deferred_tool_batch_cancellation is not None:
+                    raise_owned_outcome(
+                        deferred_tool_batch_cancellation.outcome,
+                        operation="side-effecting orchestrator tool batch",
+                    )
                 return
             # #2674 finding 2: a strict (buffered) continuation that TIMED OUT
             # withheld every byte and yielded no reviewable text. Discard the
@@ -2005,6 +2027,11 @@ class StreamingMixin:
                 request_id=request_id,
                 response=tool_response,
             )
+            if deferred_tool_batch_cancellation is not None:
+                raise_owned_outcome(
+                    deferred_tool_batch_cancellation.outcome,
+                    operation="side-effecting orchestrator tool batch",
+                )
             # #2674: strict-audit release. Nothing visible was streamed live this
             # turn; now that the POST_RESPONSE verdict exists, release ONLY the
             # reviewed text (block message on DENY, reviewed prose on
