@@ -8,6 +8,7 @@ not reimplement cancellation, generation fencing, or completion evidence.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from typing import Any
 
 from kestrel_sovereign.agent.invocation import validate_invocation_id
@@ -99,6 +100,61 @@ def _turn_request_bindings(
     except ValueError as error:
         raise TypeError("agent turn request inventory is malformed") from error
     return dict(raw_index), {}
+
+
+def resolve_runtime_stop_identity(
+    agent: object,
+    *,
+    explicit_request_id: str | None = None,
+    explicit_turn_id: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve a Stop address to its canonical turn and trace identity."""
+
+    turn_request_ids, _generations = _turn_request_bindings(agent)
+    trace_accessor = vars(agent).get("active_turn_trace_identities")
+    if not callable(trace_accessor):
+        class_accessor = getattr(type(agent), "active_turn_trace_identities", None)
+        raw_trace_identities = (
+            class_accessor(agent) if callable(class_accessor) else {}
+        )
+    else:
+        raw_trace_identities = trace_accessor()
+    if not isinstance(raw_trace_identities, dict):
+        raise TypeError("agent turn trace inventory has an invalid type")
+
+    turn_trace_identities: dict[str, tuple[str, str]] = {}
+    for turn_id, identity in raw_trace_identities.items():
+        if (
+            turn_id not in turn_request_ids
+            or not isinstance(identity, tuple)
+            or len(identity) != 2
+            or not isinstance(identity[0], str)
+            or re.fullmatch(r"[0-9a-f]{32}", identity[0]) is None
+            or not isinstance(identity[1], str)
+            or re.fullmatch(r"[0-9a-f]{16}", identity[1]) is None
+        ):
+            raise TypeError("agent turn trace inventory is malformed")
+        turn_trace_identities[turn_id] = identity
+
+    canonical_turn_id = explicit_turn_id
+    if canonical_turn_id is None and explicit_request_id is not None:
+        matching_turn_ids = [
+            turn_id
+            for turn_id, request_id in turn_request_ids.items()
+            if request_id == explicit_request_id
+        ]
+        if len(matching_turn_ids) == 1:
+            canonical_turn_id = matching_turn_ids[0]
+    trace_identity = (
+        turn_trace_identities.get(canonical_turn_id)
+        if canonical_turn_id is not None
+        else None
+    )
+    return (
+        canonical_turn_id,
+        trace_identity[0] if trace_identity is not None else None,
+        trace_identity[1] if trace_identity is not None else None,
+    )
 
 
 def build_runtime_stop_target(
@@ -270,4 +326,4 @@ def build_runtime_stop_target(
     )
 
 
-__all__ = ["build_runtime_stop_target"]
+__all__ = ["build_runtime_stop_target", "resolve_runtime_stop_identity"]

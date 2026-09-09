@@ -6,6 +6,7 @@ Verifies:
 - optional_span() context manager works as no-op without OTEL
 - setup_tracing() returns False when disabled
 """
+import asyncio
 import os
 import pytest
 from unittest.mock import patch, MagicMock
@@ -99,6 +100,74 @@ class TestCurrentTraceIdentity:
 
         with patch.object(telemetry, "_OTEL_AVAILABLE", False):
             assert telemetry.current_trace_identity() == (None, None)
+
+    def test_reads_identity_from_a_concrete_noncurrent_span(self):
+        from kestrel_sovereign import telemetry
+
+        context = MagicMock(is_valid=True, trace_id=0xABCD, span_id=0x1234)
+        span = MagicMock()
+        span.get_span_context.return_value = context
+
+        assert telemetry.span_trace_identity(span) == (
+            "0000000000000000000000000000abcd",
+            "0000000000001234",
+        )
+
+
+class TestTurnSpanAddress:
+    def test_optional_span_stamps_canonical_turn_over_caller_metadata(self):
+        from kestrel_sovereign import telemetry
+
+        span = MagicMock()
+        span_context = MagicMock()
+        span_context.__enter__.return_value = span
+        tracer = MagicMock()
+        tracer.start_as_current_span.return_value = span_context
+
+        with patch.object(telemetry, "get_tracer", return_value=tracer):
+            with telemetry.turn_span_scope("turn-canonical"):
+                with telemetry.optional_span(
+                    "child",
+                    {telemetry.KESTREL_TURN_ID: "display-only"},
+                ):
+                    pass
+
+        span.set_attribute.assert_any_call(
+            telemetry.KESTREL_TURN_ID,
+            "turn-canonical",
+        )
+
+    def test_start_span_stamps_canonical_turn(self):
+        from kestrel_sovereign import telemetry
+
+        span = MagicMock()
+        tracer = MagicMock()
+        tracer.start_span.return_value = span
+
+        with patch.object(telemetry, "get_tracer", return_value=tracer):
+            with telemetry.turn_span_scope("turn-stream"):
+                assert telemetry.start_span("stream") is span
+
+        span.set_attribute.assert_any_call(
+            telemetry.KESTREL_TURN_ID,
+            "turn-stream",
+        )
+
+    @pytest.mark.asyncio
+    async def test_turn_address_propagates_to_orchestrated_child_tasks(self):
+        from kestrel_sovereign import telemetry
+
+        async def child():
+            await asyncio.sleep(0)
+            return telemetry.current_turn_span_attributes()
+
+        with telemetry.turn_span_scope("turn-orchestrated"):
+            attributes = await asyncio.create_task(child())
+
+        assert attributes == {
+            telemetry.KESTREL_TURN_ID: "turn-orchestrated"
+        }
+        assert telemetry.current_turn_id() is None
 
 
 class TestOptionalSpan:

@@ -431,6 +431,41 @@ async def test_exact_retry_preserves_first_transport_trace_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_request_id_retry_replays_after_inferred_turn_index_is_gone(tmp_path):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stop-turn-correlation-retry.db"))
+    try:
+        store = StopReceiptStore(db)
+        await store.ensure_schema()
+        first = StopRequest(
+            scope=StopScope.TURN,
+            actor_id="did:test:operator",
+            target="request-private",
+            target_agent_id="did:test:agent",
+            correlation_id="same-request-id-stop",
+            turn_id="turn-visible-while-live",
+            target_is_turn_id=False,
+        )
+        written = await store.persist(first, _outcomes(first))
+        retry = replace(first, turn_id=None)
+
+        loaded = await store.load(retry)
+        replayed = await store.persist(
+            retry,
+            _outcomes(retry, StopDisposition.ALREADY_COMPLETE),
+        )
+
+        assert loaded is not None
+        assert loaded.receipt_id == written.receipt_id
+        assert loaded.outcomes == written.outcomes
+        assert replayed.receipt_id == written.receipt_id
+        assert replayed.outcomes == written.outcomes
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_operation_reuse_for_different_request_fails_closed(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -1046,6 +1081,123 @@ def test_live_endpoint_without_receipt_store_refuses_before_cancellation():
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+    agent.cancel_current_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("body", "target_is_turn_id"),
+    [
+        ({"turn_id": "turn-public"}, True),
+        ({"request_id": "request-private"}, False),
+    ],
+)
+def test_live_turn_receipt_uses_lifecycle_address_and_target_span(
+    body,
+    target_is_turn_id,
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _EndpointReplayStore()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = store
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"request-private"}
+    agent._current_request_id = "request-private"
+    agent.active_turn_request_bindings = MagicMock(
+        return_value={"turn-public": ("request-private", 7)}
+    )
+    agent.active_turn_trace_identities = MagicMock(
+        return_value={
+            "turn-public": (
+                "0123456789abcdef0123456789abcdef",
+                "0123456789abcdef",
+            )
+        }
+    )
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+    app.state.agent = agent
+    # Caller-supplied display/correlation claims are deliberately ignored.
+    body = {**body, "trace_id": "forged", "span_id": "forged"}
+
+    response = TestClient(app).post("/api/agent/stop", json=body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["turn_id"] == "turn-public"
+    assert store.request.turn_id == "turn-public"
+    assert store.request.trace_id == "0123456789abcdef0123456789abcdef"
+    assert store.request.span_id == "0123456789abcdef"
+    assert store.request.target_is_turn_id is target_is_turn_id
+    expected_cancel = {"request_id": "request-private"}
+    if target_is_turn_id:
+        expected_cancel["generation"] = 7
+    agent.cancel_current_request.assert_called_once_with(**expected_cancel)
+
+
+def test_missing_turn_trace_evidence_does_not_weaken_stop_or_receipt():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _EndpointReplayStore()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.stop_receipt_store = store
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"request-private"}
+    agent.active_turn_request_bindings = MagicMock(
+        return_value={"turn-public": ("request-private", 1)}
+    )
+    agent.active_turn_trace_identities = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-public"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert store.request.turn_id == "turn-public"
+    assert store.request.trace_id is None
+    assert store.request.span_id is None
+    assert response.json()["stop_outcomes"][0]["receipt_id"]
+
+
+def test_malformed_internal_turn_trace_inventory_fails_closed():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = {"request-private"}
+    agent.active_turn_request_bindings = MagicMock(
+        return_value={"turn-public": ("request-private", 1)}
+    )
+    agent.active_turn_trace_identities = MagicMock(
+        return_value={"turn-public": ("not-w3c", "not-w3c")}
+    )
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "turn-public"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Error stopping agent."
     agent.cancel_current_request.assert_not_called()
 
 
