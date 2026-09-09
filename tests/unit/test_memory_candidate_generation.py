@@ -201,6 +201,7 @@ async def test_oversize_query_uses_complete_fallback_instead_of_partial_ranking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)  # 10k-row corpus: ~4s alone, far longer under `-n auto`
 async def test_large_corpus_backfill_removes_recall_time_full_scan(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
     db = await AsyncDatabase.sqlite(str(tmp_path / "large-index.db"))

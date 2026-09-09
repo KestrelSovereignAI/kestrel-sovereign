@@ -2546,7 +2546,10 @@ class TestAsyncDatabase:
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla import make_session_factory
 
-        timeout_seconds = 0.03
+        # Shared close+join deadline; the worker here is held, so the JOIN is
+        # the stage that must expire. Too small and a loaded machine cannot
+        # finish the CLOSE either, which is why this file's siblings flaked.
+        timeout_seconds = 0.5
         monkeypatch.setattr(
             sqlite_backend_module,
             "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
