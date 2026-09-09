@@ -581,7 +581,11 @@ class StopReceiptStore:
             reason=row[7],
             cascade=bool(cascade_int),
             occurred_at=occurred_at,
-            turn_id=request.turn_id,
+            # Durable evidence must come from the receipt row, not from the
+            # retry object used to locate it. The stored value is the blinded
+            # canonical identity; the clear caller token remains on
+            # ``StopRequest`` and was proven equal by the digest check above.
+            turn_id=row[10],
             span_id=row[11],
             trace_id=row[12],
             outcomes=tuple(outcomes),
@@ -607,6 +611,10 @@ class StopReceiptStore:
             receipt.cascade,
             receipt.turn_id,
         )
+        stored_turn_id = _optional_identifier_digest(
+            _request_target_digest_kind(request),
+            request.turn_id,
+        )
         supplied = (
             request.correlation_id,
             request.scope.value,
@@ -615,7 +623,7 @@ class StopReceiptStore:
             request.target_agent_id,
             request.reason,
             request.cascade,
-            request.turn_id,
+            stored_turn_id,
         )
         if recorded != supplied:
             raise StopReceiptCorruptError(

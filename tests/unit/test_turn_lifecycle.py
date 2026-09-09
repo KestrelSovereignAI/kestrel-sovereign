@@ -358,6 +358,18 @@ async def test_conversation_lock_is_held_inside_turn():
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
     async with agent._turn_lifecycle():
         assert agent._lock_manager.is_held(ResourceLock.CONVERSATION)
+
+
+@pytest.mark.asyncio
+async def test_public_turn_address_keeps_full_uuid_entropy():
+    """Durable Stop addresses must not truncate UUID collision resistance."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle() as turn_id:
+        prefix, value = turn_id.split("_", 1)
+        assert prefix == "turn"
+        assert len(value) == 32
+        assert set(value) <= set("0123456789abcdef")
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
 
 

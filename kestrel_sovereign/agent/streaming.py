@@ -28,6 +28,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
+    mark_current_invocation_effect_checkpointed,
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
@@ -2127,6 +2128,16 @@ class StreamingMixin:
             else:
                 stop_tool_calls = None
         elif inline_executed:
+            async def persist_strict_cancelled_inline_turn() -> None:
+                await self._persist_assistant_turn_safely(
+                    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+                    metadata=_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=True,
+                )
+
             # #2674 finding 2: a strict (buffered) inline-executed turn stopped
             # before its reviewed release withheld every byte and never audited
             # the synthesis. Discard the withheld buffer and persist an EMPTY
@@ -2137,10 +2148,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # Inline-executed branch: the adapter ran tools mid-call
             # (codex app-server's item/tool/call RPC). No
@@ -2252,10 +2260,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_inline_turn()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             inline_denied = getattr(final_text, "denied", False)
@@ -2311,6 +2316,7 @@ class StreamingMixin:
                 ),
                 session_id=session_id, request_id=request_id,
                 response=tool_response,
+                require_success=True,
             )
             # #2674: strict-audit release (inline-executed path) — only the
             # reviewed text; the withheld raw buffer is never replayed.
@@ -2601,6 +2607,7 @@ class StreamingMixin:
             name="persist-assistant-turn",
         )
         outcome = await await_owned_task(persistence)
+        pending_cancellation = outcome.cancellation
         if outcome.error is not None and not isinstance(
             outcome.error,
             asyncio.CancelledError,
@@ -2610,8 +2617,8 @@ class StreamingMixin:
                 "Failed to persist assistant turn (session_id=%s): %s",
                 session_id, exc, exc_info=True,
             )
-            try:
-                await self.observability_store.log_metric(
+            telemetry = asyncio.create_task(
+                self.observability_store.log_metric(
                     agent_name=self.did,
                     metric_name="assistant_turn_persist_failed",
                     metric_value=1.0,
@@ -2620,23 +2627,40 @@ class StreamingMixin:
                         "error_type": type(exc).__name__,
                         "error_msg": str(exc)[:500],
                     },
-                )
-            except Exception:
+                ),
+                name="assistant-turn-persist-failure-telemetry",
+            )
+            telemetry_outcome = await await_owned_task(
+                telemetry,
+                pending_cancellation,
+            )
+            pending_cancellation = telemetry_outcome.cancellation
+            if (
+                telemetry_outcome.error is not None
+                and not isinstance(telemetry_outcome.error, asyncio.CancelledError)
+            ):
                 # Telemetry failures must never propagate from a
                 # post-response persist path. If observability is also
                 # broken, the logged ERROR above is the last line of
                 # defense.
                 pass
-        if outcome.cancellation is not None:
-            if outcome.error is not None:
-                outcome.cancellation.add_note(
-                    f"assistant turn persistence also failed: {outcome.error}"
-                )
-                raise outcome.cancellation from outcome.error
-            raise outcome.cancellation
-        if isinstance(outcome.error, asyncio.CancelledError):
-            raise outcome.error
+        # A required checkpoint is the evidence that makes a completed
+        # external effect safe to stop/retry.  Its storage failure must win
+        # over a simultaneously pending caller cancellation: reporting only
+        # CancelledError would let the Stop lifecycle acknowledge a clean
+        # unwind even though the anti-repeat record never became durable.
         if require_success and outcome.error is not None:
+            if pending_cancellation is not None:
+                outcome.error.add_note(
+                    "caller cancellation remained pending while the required "
+                    "assistant-turn checkpoint failed"
+                )
+            raise outcome.error
+        if outcome.error is None:
+            mark_current_invocation_effect_checkpointed()
+        if pending_cancellation is not None:
+            raise pending_cancellation
+        if isinstance(outcome.error, asyncio.CancelledError):
             raise outcome.error
 
     async def _fire_post_response_hook(

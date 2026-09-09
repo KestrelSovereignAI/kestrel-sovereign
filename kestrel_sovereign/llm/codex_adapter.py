@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import random
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -3253,7 +3254,12 @@ class CodexAdapter(LLMAdapter):
                     _unreg()
                 except Exception:  # noqa: BLE001 - cleanup is best-effort
                     pass
-            pending_cleanup_cancellation = None
+            unwind_error = sys.exception()
+            pending_cleanup_cancellation = (
+                unwind_error
+                if isinstance(unwind_error, asyncio.CancelledError)
+                else None
+            )
             try:
                 if active_inline_tool_handlers:
                     async def settle_inline_tools() -> None:
@@ -3267,7 +3273,10 @@ class CodexAdapter(LLMAdapter):
                         settle_inline_tools(),
                         name="codex-inline-tool-stop-boundary",
                     )
-                    outcome = await await_owned_task(owner)
+                    outcome = await await_owned_task(
+                        owner,
+                        pending_cleanup_cancellation,
+                    )
                     pending_cleanup_cancellation = outcome.cancellation
                     if outcome.error is not None:
                         logger.warning(
@@ -3276,6 +3285,32 @@ class CodexAdapter(LLMAdapter):
                         )
             finally:
                 lock.release()
+            if pending_cleanup_cancellation is not None and executed_log:
+                checkpoint = getattr(
+                    tool_executor,
+                    "persist_completed_effects",
+                    None,
+                )
+                if callable(checkpoint):
+                    checkpoint_owner = asyncio.create_task(
+                        checkpoint(list(executed_log)),
+                        name="codex-inline-tool-stop-checkpoint",
+                    )
+                    checkpoint_outcome = await await_owned_task(
+                        checkpoint_owner,
+                        pending_cleanup_cancellation,
+                    )
+                    if checkpoint_outcome.error is not None:
+                        checkpoint_outcome.error.add_note(
+                            "caller cancellation remained pending after an "
+                            "inline tool effect completed"
+                        )
+                        raise checkpoint_outcome.error
+                    setattr(
+                        pending_cleanup_cancellation,
+                        "_kestrel_completed_effect_checkpointed",
+                        True,
+                    )
             if pending_cleanup_cancellation is not None:
                 raise pending_cleanup_cancellation
 

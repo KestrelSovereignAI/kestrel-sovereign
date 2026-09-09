@@ -597,7 +597,10 @@ class TurnLifecycleMixin:
         region that can otherwise silently hold an agent hostage for minutes.
         """
         await self._await_host_context_publication()
-        turn_id = f"turn_{uuid4().hex[:12]}"
+        # This identifier is now a durable public Stop address, not a log-only
+        # convenience token.  Keep the full UUID entropy so fleet-scale turns
+        # cannot collide onto the same cancellation target.
+        turn_id = f"turn_{uuid4().hex}"
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"
         started = time.monotonic()

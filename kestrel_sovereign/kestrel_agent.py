@@ -98,7 +98,10 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestLifecycleMixin,
 )
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.agent.invocation import bind_async_invocation
+from kestrel_sovereign.agent.invocation import (
+    bind_async_invocation,
+    mark_current_invocation_effect_checkpointed,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
@@ -6551,6 +6554,7 @@ Expected Duration: {expected_duration}
             content,
             **kwargs,
         )
+        mark_current_invocation_effect_checkpointed()
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],

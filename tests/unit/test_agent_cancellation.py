@@ -123,6 +123,58 @@ async def test_process_input_is_the_canonical_active_turn_inventory():
 
 
 @pytest.mark.asyncio
+async def test_late_caller_cancel_checkpoints_completed_invocation_effect():
+    """Cancellation at a post-effect await cannot outrun durability."""
+
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_invocation,
+        mark_current_invocation_effect_completed,
+    )
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+
+    effect_completed = asyncio.Event()
+    checkpoints = []
+
+    class Owner(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_generations = {}
+            self._next_request_generation = 0
+            self._abandoned_request_generations = {}
+            self._abandoned_request_dispositions = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._cancelled_request_generations = set()
+            self._pending_request_cancellations = {}
+            self._request_completion_events = {}
+
+        async def _persist_completed_tool_stop_checkpoint(
+            self, *, session_id, request_id
+        ):
+            checkpoints.append((session_id, request_id))
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def run(self, *, invocation_id=None):
+            mark_current_invocation_effect_completed("late-cancel-session")
+            effect_completed.set()
+            await asyncio.Event().wait()
+
+    owner = Owner()
+    turn = asyncio.create_task(owner.run(invocation_id="late-cancel-invocation"))
+    await effect_completed.wait()
+    turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert checkpoints == [
+        ("late-cancel-session", "late-cancel-invocation")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stale_caller_cancellation_count_does_not_escape_isolated_stop():
     """Only cancellation added during the child await belongs to the caller."""
 
@@ -305,6 +357,112 @@ async def test_stop_waits_for_side_effecting_tool_batch_boundary():
 
 
 @pytest.mark.asyncio
+async def test_owned_tool_batch_marks_completed_invocation_effect():
+    """A normal batch return arms the later top-level cancellation fence."""
+
+    from kestrel_sovereign.agent.invocation import (
+        current_invocation_effect_checkpoint,
+        invocation_scope,
+    )
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    class Owner:
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+
+        async def _execute_tool_batch(self, *, tool_results, session_id):
+            tool_results.append({"result": {"success": True}})
+
+    with invocation_scope("completed-batch"):
+        state = current_invocation_effect_checkpoint()
+        await Owner()._execute_tool_batch_at_stop_boundary(
+            tool_results=[],
+            session_id="batch-session",
+        )
+
+        assert state is not None
+        assert state.completed is True
+        assert state.session_id == "batch-session"
+
+
+@pytest.mark.asyncio
+async def test_stream_reuses_effect_checkpoint_and_persists_on_late_cancel():
+    """A yielded stream cannot forget an effect before its next await cancels."""
+
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_generator_invocation,
+        current_invocation_effect_checkpoint,
+        mark_current_invocation_effect_completed,
+    )
+
+    second_advance_started = asyncio.Event()
+    observed_checkpoints = []
+    persisted = []
+
+    class Owner:
+        async def _persist_completed_tool_stop_checkpoint(
+            self, *, session_id, request_id
+        ):
+            persisted.append((session_id, request_id))
+
+        @bind_async_generator_invocation("request_id")
+        async def stream(self, *, request_id=None):
+            observed_checkpoints.append(current_invocation_effect_checkpoint())
+            mark_current_invocation_effect_completed("stream-session")
+            yield "effect completed"
+            observed_checkpoints.append(current_invocation_effect_checkpoint())
+            second_advance_started.set()
+            await asyncio.Event().wait()
+
+    stream = Owner().stream(request_id="stream-late-cancel")
+    assert await anext(stream) == "effect completed"
+    advance = asyncio.create_task(anext(stream))
+    await second_advance_started.wait()
+    advance.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await advance
+
+    assert observed_checkpoints[0] is observed_checkpoints[1]
+    assert persisted == [("stream-session", "stream-late-cancel")]
+
+
+@pytest.mark.asyncio
+async def test_stream_checkpoint_failure_wins_over_late_cancellation():
+    """A failed anti-repeat write cannot be reported as a clean stream Stop."""
+
+    from kestrel_sovereign.agent.invocation import (
+        bind_async_generator_invocation,
+        mark_current_invocation_effect_completed,
+    )
+
+    second_advance_started = asyncio.Event()
+
+    class Owner:
+        async def _persist_completed_tool_stop_checkpoint(self, **_kwargs):
+            raise RuntimeError("stream checkpoint unavailable")
+
+        @bind_async_generator_invocation("request_id")
+        async def stream(self, *, request_id=None):
+            mark_current_invocation_effect_completed("stream-session")
+            yield "effect completed"
+            second_advance_started.set()
+            await asyncio.Event().wait()
+
+    stream = Owner().stream(request_id="stream-checkpoint-failure")
+    assert await anext(stream) == "effect completed"
+    advance = asyncio.create_task(anext(stream))
+    await second_advance_started.wait()
+    advance.cancel()
+
+    with pytest.raises(RuntimeError, match="stream checkpoint unavailable"):
+        await advance
+
+
+@pytest.mark.asyncio
 async def test_tool_batch_owner_preserves_transition_lock_reentry():
     """The lifecycle owner cannot deadlock a transition-locked tool."""
 
@@ -353,12 +511,16 @@ def test_orchestrator_paths_wire_every_tool_batch_through_stop_boundary():
     )
 
     for handler in (
-        OrchestratorEngineMixin._handle_orchestrator_response,
+        OrchestratorEngineMixin._handle_orchestrator_response_impl,
         OrchestratorEngineMixin._handle_orchestrator_response_streaming,
     ):
         source = inspect.getsource(handler)
         assert "await self._execute_tool_batch_at_stop_boundary(" in source
         assert "await self._execute_tool_batch(" not in source
+    public_source = inspect.getsource(
+        OrchestratorEngineMixin._handle_orchestrator_response
+    )
+    assert "_handle_orchestrator_response_impl(" in public_source
 
 
 @pytest.mark.asyncio
