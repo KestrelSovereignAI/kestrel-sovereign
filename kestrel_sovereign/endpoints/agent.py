@@ -2858,7 +2858,7 @@ async def _create_a2a_task_under_lifecycle_lease(
                     status_code=403,
                     detail="A2A sender authorization context is invalid",
                 )
-            if sender_witness is not None:
+            if sender_verdict.verified and sender_witness is not None:
                 current_witness = manager.a2a_sender_identity_witness(
                     sender_verdict.sender
                 )

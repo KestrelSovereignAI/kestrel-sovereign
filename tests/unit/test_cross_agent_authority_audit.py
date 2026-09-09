@@ -17,6 +17,8 @@ from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.command_handler import BUILTIN_COMMAND_SPECS
 from kestrel_sovereign.endpoints.models import require_sovereign_host_lifecycle
 
+pytestmark = pytest.mark.authority_audit
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_PATH = REPO_ROOT / "docs/architecture/CROSS_AGENT_AUTHORITY_AUDIT.md"
 AUTH_SURFACE_MATRIX_PATH = REPO_ROOT / "docs/audit/AUTH_SURFACE_MATRIX.md"
@@ -134,6 +136,7 @@ UNVERIFIED_ATTRIBUTION_METADATA_KEYS = frozenset(
         "claimed_sender",
         "requested_by",
         "sender",
+        "sender_verified",
         "source_agent",
         "source_agent_id",
     }
@@ -238,6 +241,15 @@ def _parsed_module(source_path: Path) -> ast.Module:
         _source_text(source_path),
         filename=str(source_path),
     )
+
+
+def _clear_authority_analysis_annotations(tree: ast.AST) -> None:
+    """Remove transient dataflow facts before a cached AST is reused."""
+
+    for node in ast.walk(tree):
+        for attribute in tuple(vars(node)):
+            if attribute.startswith("_authority_"):
+                delattr(node, attribute)
 
 
 def _resolved_string(
@@ -7527,17 +7539,14 @@ def test_repository_discovery_results_are_cached_and_immutable() -> None:
 def test_exhaustive_repository_scan_is_an_explicit_ci_gate() -> None:
     source = Path(__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
-    scan = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name
-        == "test_causation_and_orchestrator_metadata_are_not_permission_inputs"
-    )
     assert any(
-        isinstance(decorator, ast.Attribute)
-        and ast.unparse(decorator) == "pytest.mark.authority_audit"
-        for decorator in scan.decorator_list
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in node.targets
+        )
+        and ast.unparse(node.value) == "pytest.mark.authority_audit"
+        for node in tree.body
     )
 
     conftest = (REPO_ROOT / "tests/conftest.py").read_text(encoding="utf-8")
@@ -9045,50 +9054,100 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
     provenance when code tries to use it as an authority decision.
     """
 
-    if getattr(node, "_authority_unverified_attribution", False):
-        return True
-    if getattr(node, "_authority_verified_attribution", False):
+    descendants = tuple(ast.walk(node))
+    has_explicit_unverified = any(
+        getattr(child, "_authority_unverified_attribution", False)
+        for child in descendants
+    )
+    has_verified = any(
+        getattr(child, "_authority_verified_attribution", False)
+        for child in descendants
+    )
+    has_witness = any(
+        getattr(child, "_authority_identity_witness", False)
+        for child in descendants
+    )
+    if (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.And)
+        and has_verified
+        and has_witness
+        and not has_explicit_unverified
+    ):
         return False
-    for child in ast.walk(node):
-        if getattr(child, "_authority_unverified_attribution", False):
+    if (
+        isinstance(node, ast.Call)
+        and _call_name(node).casefold() == "_a2a_sender_witness_unchanged"
+        and has_witness
+        and not has_explicit_unverified
+    ):
+        return False
+
+    def visit(current: ast.AST) -> bool:
+        if (
+            isinstance(current, ast.Call)
+            and _call_name(current).casefold()
+            == "_a2a_sender_witness_unchanged"
+            and any(
+                getattr(child, "_authority_identity_witness", False)
+                for child in ast.walk(current)
+            )
+            and not any(
+                getattr(child, "_authority_unverified_attribution", False)
+                for child in ast.walk(current)
+            )
+        ):
+            return False
+        if getattr(current, "_authority_unverified_attribution", False):
             return True
-        if getattr(child, "_authority_verified_attribution", False):
-            continue
+        # A field resolved from a trusted verdict or identity witness shields
+        # the receiver marker beneath it. Walk recursively rather than through
+        # ``ast.walk`` so descendants of this proven value are not re-tainted.
+        if getattr(current, "_authority_verified_attribution", False):
+            return False
+        if getattr(current, "_authority_identity_witness", False):
+            return True
+        if getattr(current, "_authority_verification_result", False):
+            return True
         receiver: ast.AST | None = None
         key: str | None = None
-        if isinstance(child, ast.Subscript):
-            receiver = child.value
-            key = _resolved_string(child.slice)
+        if isinstance(current, ast.Subscript):
+            receiver = current.value
+            key = _resolved_string(current.slice)
         elif (
-            isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr.casefold() in {"get", "pop", "setdefault"}
-            and child.args
+            isinstance(current, ast.Call)
+            and isinstance(current.func, ast.Attribute)
+            and current.func.attr.casefold() in {"get", "pop", "setdefault"}
+            and current.args
         ):
-            receiver = child.func.value
-            key = _resolved_string(child.args[0])
-        elif isinstance(child, ast.Attribute):
-            receiver = child.value
-            key = child.attr
-        if receiver is None or key is None:
-            continue
-        receiver_tokens = _identifier_tokens(receiver)
-        is_metadata_receiver = any(
-            token == "metadata" or token.endswith(".metadata")
-            for token in receiver_tokens
-        )
+            receiver = current.func.value
+            key = _resolved_string(current.args[0])
+        elif isinstance(current, ast.Attribute):
+            receiver = current.value
+            key = current.attr
         if (
-            is_metadata_receiver
+            receiver is not None
+            and key is not None
+            and any(
+                token == "metadata" or token.endswith(".metadata")
+                for token in _identifier_tokens(receiver)
+            )
             and key.casefold() in UNVERIFIED_ATTRIBUTION_METADATA_KEYS
         ):
             return True
-    return False
+        return any(visit(child) for child in ast.iter_child_nodes(current))
+
+    return visit(node)
 
 
 _ATTRIBUTION_UNTRUSTED_MAPPING = ("identity", "untrusted-mapping")
 _ATTRIBUTION_UNTRUSTED_CLAIM = ("identity", "untrusted-claim")
 _ATTRIBUTION_VERIFIED_MAPPING = ("identity", "verified-mapping")
 _ATTRIBUTION_VERIFIED_VALUE = ("identity", "verified-value")
+_ATTRIBUTION_VERIFICATION_RESULT = ("identity", "verification-result")
+_ATTRIBUTION_ENVELOPE_VERIFIER = ("identity", "envelope-verifier")
+_ATTRIBUTION_IDENTITY_WITNESS = ("identity", "identity-witness")
+_ATTRIBUTION_WITNESS_FACTORY = ("identity", "witness-factory")
 _ATTRIBUTION_VALIDATOR = ("identity", "validator")
 _ATTRIBUTION_UNKNOWN = ("identity", "unknown")
 
@@ -9096,8 +9155,10 @@ _TRUSTED_ATTRIBUTION_VALIDATOR_IMPORTS = {
     "kestrel_sovereign.a2a.envelope_signing": {"verify_inbound_envelope"},
 }
 _TRUSTED_ATTRIBUTION_VALIDATOR_MEMBERS = {
-    "a2a_sender_identity_witness",
     "authorize_a2a_legacy_unsigned_sender",
+}
+_TRUSTED_ATTRIBUTION_WITNESS_MEMBERS = {
+    "a2a_sender_identity_witness",
 }
 
 
@@ -9206,6 +9267,40 @@ def _attribution_projection_helpers(
     return helpers
 
 
+def _local_attribution_authorization_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Find local seams that combine envelope and legacy sender authorization."""
+
+    helpers: set[str] = set()
+    for function in functions:
+        nodes = _walk_lexical_scope(function)
+        calls = {
+            _call_name(node).casefold()
+            for node in nodes
+            if isinstance(node, ast.Call)
+        }
+        constants = {
+            node.value.casefold()
+            for node in nodes
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+        }
+        has_verified_branch = any(
+            isinstance(node, ast.Attribute)
+            and node.attr.casefold() == "verified"
+            for node in nodes
+        )
+        if (
+            "verify_inbound_envelope" in calls
+            and "authorize_legacy" in calls
+            and "authorize_a2a_legacy_unsigned_sender" in constants
+            and has_verified_branch
+        ):
+            helpers.add(function.name.casefold())
+    return helpers
+
+
 def _unverified_attribution_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     *,
@@ -9225,6 +9320,8 @@ def _unverified_attribution_aliases(
             "_authority_attribution_validator",
             "_authority_static_string",
             "_authority_unverified_attribution",
+            "_authority_identity_witness",
+            "_authority_verification_result",
             "_authority_verified_attribution",
         ):
             if hasattr(node, attribute):
@@ -9293,7 +9390,7 @@ def _unverified_attribution_aliases(
         _ATTRIBUTION_VERIFIED_VALUE,
     }
     initial: dict[str, _StaticBinding] = dict.fromkeys(
-        trusted_validator_aliases or set(), _ATTRIBUTION_VALIDATOR
+        trusted_validator_aliases or set(), _ATTRIBUTION_ENVELOPE_VERIFIER
     )
     initial.update({
         parameter.arg: _ATTRIBUTION_UNTRUSTED_MAPPING
@@ -9309,6 +9406,8 @@ def _unverified_attribution_aliases(
     ) -> _StaticBinding | None:
         if isinstance(value, ast.Subscript):
             receiver = value.value
+            if flow.resolve(receiver) == _ATTRIBUTION_IDENTITY_WITNESS:
+                return _ATTRIBUTION_VERIFIED_VALUE
             field = resolved_key(value.slice)
             if field is None:
                 return None
@@ -9321,6 +9420,17 @@ def _unverified_attribution_aliases(
         if field == "metadata":
             return _ATTRIBUTION_UNTRUSTED_MAPPING
         receiver_binding = flow.resolve(receiver)
+        if receiver_binding == _ATTRIBUTION_IDENTITY_WITNESS:
+            return _ATTRIBUTION_VERIFIED_VALUE
+        if receiver_binding == _ATTRIBUTION_VERIFICATION_RESULT:
+            if field in {
+                "nonce",
+                "sender",
+                "verification_document_fingerprint",
+                "verified",
+            }:
+                return _ATTRIBUTION_VERIFIED_VALUE
+            return _ATTRIBUTION_UNTRUSTED_CLAIM
         if field in UNVERIFIED_ATTRIBUTION_METADATA_KEYS:
             if receiver_binding in untrusted:
                 return _ATTRIBUTION_UNTRUSTED_CLAIM
@@ -9335,6 +9445,15 @@ def _unverified_attribution_aliases(
             )
         ):
             return _ATTRIBUTION_VALIDATOR
+        if (
+            field in _TRUSTED_ATTRIBUTION_WITNESS_MEMBERS
+            and any(
+                token in {"manager", "agent_manager"}
+                or token.endswith(".manager")
+                for token in _identifier_tokens(receiver)
+            )
+        ):
+            return _ATTRIBUTION_WITNESS_FACTORY
         return None
 
     def direct(
@@ -9347,7 +9466,20 @@ def _unverified_attribution_aliases(
             return member_binding
         if isinstance(value, ast.Call):
             callable_binding = flow.resolve(value.func)
+            if callable_binding == _ATTRIBUTION_ENVELOPE_VERIFIER:
+                return _ATTRIBUTION_VERIFICATION_RESULT
+            if callable_binding == _ATTRIBUTION_WITNESS_FACTORY:
+                return _ATTRIBUTION_IDENTITY_WITNESS
             if callable_binding == _ATTRIBUTION_VALIDATOR:
+                return _ATTRIBUTION_VERIFIED_VALUE
+            if (
+                _call_name(value).casefold()
+                == "_a2a_sender_witness_unchanged"
+                and any(
+                    flow.resolve(argument) == _ATTRIBUTION_IDENTITY_WITNESS
+                    for argument in value.args
+                )
+            ):
                 return _ATTRIBUTION_VERIFIED_VALUE
             parameter_flow = (parameter_return_flows or {}).get(
                 _call_name(value).casefold()
@@ -9434,6 +9566,22 @@ def _unverified_attribution_aliases(
             nested = [flow.resolve(child) for child in ast.iter_child_nodes(value)]
             if _ATTRIBUTION_UNTRUSTED_CLAIM in nested:
                 return _ATTRIBUTION_UNTRUSTED_CLAIM
+            if (
+                isinstance(value, ast.BoolOp)
+                and isinstance(value.op, ast.And)
+                and _ATTRIBUTION_VERIFIED_VALUE in nested
+                and all(
+                    binding in verified
+                    or binding == _ATTRIBUTION_IDENTITY_WITNESS
+                    for binding in nested
+                )
+            ):
+                return _ATTRIBUTION_VERIFIED_VALUE
+            if (
+                isinstance(value, ast.Compare)
+                and _ATTRIBUTION_IDENTITY_WITNESS in nested
+            ):
+                return _ATTRIBUTION_IDENTITY_WITNESS
             if nested and all(binding in verified for binding in nested):
                 return _ATTRIBUTION_VERIFIED_VALUE
         return None
@@ -9457,7 +9605,15 @@ def _unverified_attribution_aliases(
             setattr(value, "_authority_unverified_attribution", True)
         elif binding == _ATTRIBUTION_VERIFIED_VALUE:
             setattr(value, "_authority_verified_attribution", True)
-        elif binding == _ATTRIBUTION_VALIDATOR:
+        elif binding == _ATTRIBUTION_VERIFICATION_RESULT:
+            setattr(value, "_authority_verification_result", True)
+        elif binding == _ATTRIBUTION_IDENTITY_WITNESS:
+            setattr(value, "_authority_identity_witness", True)
+        elif binding in {
+            _ATTRIBUTION_ENVELOPE_VERIFIER,
+            _ATTRIBUTION_WITNESS_FACTORY,
+            _ATTRIBUTION_VALIDATOR,
+        }:
             setattr(value, "_authority_attribution_validator", True)
 
     identity_flow = _StaticBindingFlow(
@@ -9482,8 +9638,13 @@ def _is_attribution_validation_call(
 ) -> bool:
     """Return only calls resolved to an audited identity-verification seam."""
 
-    del attribution_aliases
-    return bool(getattr(call, "_authority_verified_attribution", False))
+    return bool(
+        _call_name(call).casefold() in (attribution_aliases or set())
+        or getattr(call, "_authority_local_attribution_authorizer", False)
+        or getattr(call, "_authority_verification_result", False)
+        or getattr(call, "_authority_verified_attribution", False)
+        or getattr(call, "_authority_identity_witness", False)
+    )
 
 
 def _has_provenance_token(
@@ -10778,6 +10939,14 @@ def _is_unambiguous_control_sink(
     return any(
         _is_unambiguous_control_token(token)
         for token in {call_name, *selector_tokens}
+    )
+
+
+def _is_recipient_scoped_task_read(call: ast.Call) -> bool:
+    """Recognize task reads whose explicit recipient is an authority input."""
+
+    return _call_name(call).casefold() in {"get_task", "list_tasks"} and any(
+        keyword.arg == "recipient_agent_id" for keyword in call.keywords
     )
 
 
@@ -13928,6 +14097,51 @@ def _try_flow_uses_provenance_as_control(
     )
 
 
+def _is_fail_closed_envelope_acceptance_guard(
+    node: ast.AST,
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Whether a negative ``verdict.ok`` guard precedes real sender auth."""
+
+    if not (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and any(
+            isinstance(child, ast.Attribute)
+            and child.attr.casefold() == "ok"
+            and getattr(child, "_authority_unverified_attribution", False)
+            for child in ast.walk(node.test)
+        )
+    ):
+        return False
+    return any(
+        getattr(candidate, "lineno", 0) > node.lineno
+        and (
+            (
+                isinstance(candidate, ast.If)
+                and any(
+                    isinstance(child, ast.Attribute)
+                    and child.attr.casefold() == "verified"
+                    and getattr(
+                        child, "_authority_verified_attribution", False
+                    )
+                    for child in ast.walk(candidate.test)
+                )
+            )
+            or (
+                isinstance(candidate, ast.Call)
+                and _call_name(candidate).casefold()
+                in {
+                    "authorize_a2a_legacy_unsigned_sender",
+                    "authorize_legacy",
+                }
+            )
+        )
+        for candidate in _walk_lexical_scope(function)
+    )
+
+
 def _guard_clause_provenance_lines(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     provenance_aliases: set[str],
@@ -13938,6 +14152,45 @@ def _guard_clause_provenance_lines(
     """Find provenance conditions that gate a later control by exiting early."""
 
     lines: set[int] = set()
+
+    def rejects_unaccepted_envelope(test: ast.AST) -> bool:
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and any(
+                isinstance(child, ast.Attribute)
+                and child.attr.casefold() == "ok"
+                and getattr(
+                    child, "_authority_unverified_attribution", False
+                )
+                for child in ast.walk(test)
+            )
+        )
+
+    def later_identity_authorization(statements: list[ast.stmt]) -> bool:
+        return any(
+            (
+                isinstance(candidate, ast.If)
+                and any(
+                    isinstance(child, ast.Attribute)
+                    and child.attr.casefold() == "verified"
+                    and getattr(
+                        child, "_authority_verified_attribution", False
+                    )
+                    for child in ast.walk(candidate.test)
+                )
+            )
+            or (
+                isinstance(candidate, ast.Call)
+                and _call_name(candidate).casefold()
+                in {
+                    "authorize_a2a_legacy_unsigned_sender",
+                    "authorize_legacy",
+                }
+            )
+            for statement in statements
+            for candidate in ast.walk(statement)
+        )
 
     def scan_block(
         statements: list[ast.stmt],
@@ -14038,7 +14291,12 @@ def _guard_clause_provenance_lines(
                     statement.test,
                     provenance_aliases,
                     provenance_return_helpers,
-                ) and not only_suppresses_cycle:
+                ) and not only_suppresses_cycle and not (
+                    rejects_unaccepted_envelope(statement.test)
+                    and later_identity_authorization(
+                        statements[index + 1 :]
+                    )
+                ):
                     lines.add(statement.lineno)
             elif controls_continuation and isinstance(statement, ast.Match):
                 has_catch_all = any(
@@ -16676,7 +16934,12 @@ def _permission_store_call_uses_provenance(
         and call.func.attr.casefold() in _MUTABLE_CONTAINER_WRITE_ARGUMENTS
     ):
         receiver = call.func.value
-    elif _call_name(call).casefold().strip("_") in {"delitem", "setitem"}:
+    elif _call_name(call).casefold().strip("_") in {
+        "delattr",
+        "delitem",
+        "setattr",
+        "setitem",
+    }:
         receiver = call.args[0] if call.args else None
     if receiver is None or not _identifier_tokens(receiver).intersection(
         permission_store_aliases
@@ -16704,6 +16967,17 @@ def _authority_provenance_lines(
     ]
     executable_scopes = _executable_body_functions(tree)
     functions = [*real_functions, *executable_scopes]
+    local_attribution_authorizers = _local_attribution_authorization_helpers(
+        functions
+    )
+    for call in (
+        node
+        for function in functions
+        for node in _walk_lexical_scope(function)
+        if isinstance(node, ast.Call)
+        and _call_name(node).casefold() in local_attribution_authorizers
+    ):
+        setattr(call, "_authority_local_attribution_authorizer", True)
     function_parents = _nested_function_parents(tree)
     module_attribution_validators = _trusted_attribution_validator_aliases(tree)
     function_attribution_validators: dict[
@@ -17411,7 +17685,7 @@ def _authority_provenance_lines(
                     _is_permission_name(token) for token in function_tokens
                 )
                 validates_attribution = _is_attribution_validation_call(
-                    node, attribution_aliases
+                    node, local_attribution_authorizers
                 )
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if (
@@ -17437,11 +17711,14 @@ def _authority_provenance_lines(
                 is_control_call = _is_cross_agent_control_call(
                     node, control_aliases, state_object_aliases
                 )
+                is_direct_control_call = (
+                    is_control_call or _is_recipient_scoped_task_read(node)
+                )
                 is_state_mutation_call = _is_cross_agent_state_mutation_call(
                     node, state_object_aliases
                 )
                 if (
-                    is_control_call or is_state_mutation_call
+                    is_direct_control_call or is_state_mutation_call
                 ) and not validates_attribution:
                     # Parameter spelling is not an authority boundary.  A
                     # known control sink may call its target ``candidate``,
@@ -17568,6 +17845,21 @@ def _authority_provenance_lines(
             if isinstance(node, ast.Return):
                 if (
                     node.value is not None
+                    and not (
+                        (
+                            isinstance(node.value, ast.Call)
+                            or (
+                                isinstance(node.value, ast.Await)
+                                and isinstance(node.value.value, ast.Call)
+                            )
+                        )
+                        and _is_attribution_validation_call(
+                            node.value.value
+                            if isinstance(node.value, ast.Await)
+                            else node.value,
+                            local_attribution_authorizers,
+                        )
+                    )
                     and _has_provenance_value(
                         node.value,
                         provenance_aliases,
@@ -17721,7 +18013,7 @@ def _authority_provenance_lines(
                 and any(
                     isinstance(child, ast.Call)
                     and _is_attribution_validation_call(
-                        child, attribution_aliases
+                        child, local_attribution_authorizers
                     )
                     for branch in (node.body, node.orelse)
                     for child in ast.walk(branch)
@@ -17745,6 +18037,9 @@ def _authority_provenance_lines(
                 has_provenance
                 and not only_suppresses_cycle
                 and not only_selects_attribution_validation
+                and not _is_fail_closed_envelope_acceptance_guard(
+                    node, function
+                )
                 and (
                     has_permission
                     or function_is_permission_boundary
@@ -17755,7 +18050,9 @@ def _authority_provenance_lines(
                 )
             ):
                 lines.add(node.lineno)
-    return lines
+    result = set(lines)
+    _clear_authority_analysis_annotations(tree)
+    return result
 
 
 @lru_cache(maxsize=None)
@@ -20116,7 +20413,7 @@ def test_unverified_attribution_metadata_is_provenance(
     assert _authority_provenance_lines(tree) == {2}
 
 
-def test_verified_sender_principals_are_not_transport_provenance() -> None:
+def test_verified_sender_principals_require_verified_verdict_fields() -> None:
     verified = ast.parse(
         "from kestrel_sovereign.a2a.envelope_signing import (\n"
         "    verify_inbound_envelope,\n"
@@ -20131,9 +20428,29 @@ def test_verified_sender_principals_are_not_transport_provenance() -> None:
         "    if task.metadata.get('sender_verified'):\n"
         "        target.shutdown()\n"
     )
+    accepted_only = ast.parse(
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target):\n"
+        "    sender_verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if sender_verdict.ok:\n"
+        "        target.shutdown()\n"
+    )
+    verified_only = ast.parse(
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target):\n"
+        "    sender_verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if sender_verdict.verified:\n"
+        "        target.shutdown()\n"
+    )
 
     assert _authority_provenance_lines(verified) == set()
-    assert _authority_provenance_lines(verification_flag) == set()
+    assert _authority_provenance_lines(verification_flag) == {2}
+    assert _authority_provenance_lines(accepted_only) == {7}
+    assert _authority_provenance_lines(verified_only) == set()
 
 
 def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
@@ -20185,7 +20502,7 @@ def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
     assert _authority_provenance_lines(guarded) == {3}
     assert _authority_provenance_lines(validation) == set()
     assert _authority_provenance_lines(inline_validation) == set()
-    assert _authority_provenance_lines(manager_witness) == set()
+    assert _authority_provenance_lines(manager_witness) == {4}
     assert _authority_provenance_lines(fake_validation) == {3, 5, 7}
 
 
@@ -20244,6 +20561,26 @@ def test_unverified_attribution_flows_through_neutral_return_helpers() -> None:
     assert _authority_provenance_lines(tree) == {guard.lineno}
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        "task_manager.list_tasks(recipient_agent_id=params.metadata['sender'])",
+        "task_manager.get_task(\n"
+        "        params.id, recipient_agent_id=params.metadata['sender']\n"
+        "    )",
+    ),
+)
+def test_unverified_recipient_scoped_task_reads_are_authority_sinks(
+    invocation: str,
+) -> None:
+    tree = ast.parse(
+        "async def read(params, task_manager):\n"
+        f"    return await {invocation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
 def test_cached_a2a_sender_claim_guard_reaches_the_ci_gate(
     tmp_path: Path,
 ) -> None:
@@ -20278,10 +20615,12 @@ def test_attribution_analysis_discards_annotations_from_prior_passes() -> None:
     }
 
     verified_tree = ast.parse(
-        "def dispatch(task, target, manager):\n"
+        "async def dispatch(task, target, manager):\n"
         "    claimed = task.metadata['sender']\n"
-        "    witness = manager.a2a_sender_identity_witness(claimed)\n"
-        "    if witness:\n"
+        "    authorized = await manager.authorize_a2a_legacy_unsigned_sender(\n"
+        "        target, claimed\n"
+        "    )\n"
+        "    if authorized:\n"
         "        target.shutdown()\n"
     )
     verified_guard = next(
@@ -20299,6 +20638,27 @@ def test_unverified_attribution_dominates_conflicting_annotation() -> None:
     setattr(value, "_authority_unverified_attribution", True)
 
     assert _is_unverified_attribution_metadata_lookup(value)
+
+
+def test_cached_ast_and_import_summaries_ignore_analysis_annotations() -> None:
+    verifier_path = (
+        REPO_ROOT / "kestrel_sovereign/a2a/envelope_signing.py"
+    ).resolve()
+    _direct_provenance_helper_names.cache_clear()
+    try:
+        cached_tree = _parsed_module(verifier_path)
+        _authority_provenance_lines(
+            cached_tree, verifier_path
+        )
+        assert not any(
+            any(name.startswith("_authority_") for name in vars(node))
+            for node in ast.walk(cached_tree)
+        )
+        assert "verify_inbound_envelope" not in (
+            _direct_provenance_helper_names(verifier_path)
+        )
+    finally:
+        _direct_provenance_helper_names.cache_clear()
 
 
 def test_provenance_scanner_resolves_module_level_metadata_keys(
@@ -21073,6 +21433,24 @@ def test_permission_mutation_targets_are_provenance_inputs(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    (
+        "setattr(permissions, 'allowed', bool(request.causation_chain))",
+        "delattr(permissions, request.causation_chain[-1].agent_id)",
+    ),
+)
+def test_functional_permission_attribute_mutations_use_provenance(
+    mutation: str,
+) -> None:
+    tree = ast.parse(
+        "def configure(request, permissions):\n"
+        f"    {mutation}\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize(
     "store_name",
     (
         "acl",
@@ -21769,7 +22147,6 @@ def test_provenance_scanner_excludes_benign_task_and_host_calls() -> None:
         f"{paths[-1].relative_to(REPO_ROOT).as_posix()}"
     ),
 )
-@pytest.mark.authority_audit
 def test_causation_and_orchestrator_metadata_are_not_permission_inputs(
     paths: tuple[Path, ...],
 ) -> None:
