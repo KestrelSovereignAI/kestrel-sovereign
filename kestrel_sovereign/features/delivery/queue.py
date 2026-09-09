@@ -111,10 +111,9 @@ def _persisted_content_hashes(recipient: str, content_json: str) -> tuple[str, s
         content = json.loads(content_json)
     except (json.JSONDecodeError, TypeError):
         return raw_hash, raw_hash
-    legacy_json = json.dumps(content, default=str)
     canonical_json = _canonical_content_json(content, allow_string_fallback=True)
     return (
-        QueueEntry.compute_content_hash(recipient, legacy_json),
+        raw_hash,
         QueueEntry.compute_content_hash(recipient, canonical_json),
     )
 
@@ -353,14 +352,14 @@ class DeliveryQueue:
                 idempotency_key=idempotency_key,
             )
 
+        # Snapshot permissive legacy values exactly once. Some supported
+        # ``default=str`` objects are stateful, so serializing the caller's
+        # object again could assign this row a hash for content it did not
+        # persist.
         content_json = json.dumps(content, default=str)
-        canonical_content = _canonical_content_json(
-            content, allow_string_fallback=True
+        legacy_content_hash, canonical_content_hash = _persisted_content_hashes(
+            recipient, content_json
         )
-        canonical_content_hash = QueueEntry.compute_content_hash(
-            recipient, canonical_content
-        )
-        legacy_content_hash = QueueEntry.compute_content_hash(recipient, content_json)
 
         dedup_cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=DEDUP_WINDOW_SECONDS)

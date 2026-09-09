@@ -1087,6 +1087,40 @@ class TestQueueIdempotency:
         ) == (10,)
 
     @pytest.mark.asyncio
+    async def test_legacy_dead_letter_retry_preserves_exact_raw_hash(self, real_queue):
+        queue, _ = real_queue
+        content_json = '{"1":"first","1":"second"}'
+        recipient = "legacy-duplicate-key@example.com"
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-duplicate-key-dl",
+                "legacy-duplicate-key-original",
+                queue._agent_id,
+                "email",
+                recipient,
+                content_json,
+                "legacy writer failure",
+                4,
+                datetime.now(timezone.utc).isoformat(),
+                5,
+            ),
+        )
+
+        retried = await queue.retry("legacy-duplicate-key-original")
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == (QueueEntry.compute_content_hash(recipient, content_json),)
+
+    @pytest.mark.asyncio
     async def test_v3_upgrade_removes_unscoped_v2_delete_trigger(self, real_queue):
         queue, _ = real_queue
         await queue._db.execute(
@@ -2435,6 +2469,38 @@ class TestQueueIdempotency:
             {"body": "world", "subject": "hello"},
         )
         assert plain_after == keyed_id
+
+    @pytest.mark.asyncio
+    async def test_plain_enqueue_hashes_its_single_serialized_snapshot(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+
+        class ChangingString:
+            def __init__(self):
+                self.calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return str(self.calls)
+
+        changing = ChangingString()
+        first_id = await queue.enqueue(
+            "email", "stateful-string@example.com", {"value": changing}
+        )
+        second_id = await queue.enqueue(
+            "email", "stateful-string@example.com", {"value": "2"}
+        )
+
+        assert changing.calls == 1
+        assert second_id != first_id
+        assert await queue._db.fetchall(
+            """
+            SELECT content_json FROM delivery_queue
+            WHERE agent_id = ? ORDER BY created_at, id
+            """,
+            (queue._agent_id,),
+        ) == [('{"value": "1"}',), ('{"value": "2"}',)]
 
     @pytest.mark.asyncio
     async def test_keyed_adoption_requires_matching_delivery_semantics(
