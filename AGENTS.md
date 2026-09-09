@@ -180,9 +180,23 @@ unfollowable, not merely hard. If a rule here names a field, and the field is
 not in what you get back, that is a defect to file, not an instruction to
 approximate.
 
-**This form has not yet been run by an agent.** Run it once and report what
-came back — the parameter names, the preview shape, whether the verdict was
-visible without opening the file — before it is treated as settled procedure.
+**Measured 2026-09-09, running the form once end to end.** A 3.2 MB review
+captured to a file came back `complete: true` with the artifact at 3,348,905
+bytes — past the 1 MiB ToolResult cap this was filed against — and a
+4,222-character preview carrying both the opening line and the closing
+`VERDICT:` line, so the verdict was readable without opening the file. The
+same command killed at a 2-second timeout came back PARTIAL with
+`complete: false`, rc −9, and an error saying the output must not be read as a
+finished result. A run that committed while it ran recorded
+`git.head_moved: true` with differing before/after SHAs. Every field named in
+this section was present in the result with that spelling.
+
+What that run did NOT cover: it called `shell` directly rather than through
+the tool executor, so the approval queue and the LLM-facing schema are still
+unexercised. Note when you first use this that `capture_output` is advertised
+to the model as a *string* (its annotation is `bool | str`, which no JSON
+schema type fits); `"true"` is accepted and coerced, and anything else is
+refused by name rather than silently read as false.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been
