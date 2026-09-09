@@ -13,18 +13,14 @@ from kestrel_sovereign.rate_limit import (
     stop_admission_rate_limit,
 )
 from kestrel_sovereign.stop import (
-    CancellationAuthority,
-    CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
+    CooperativeStopTarget,
     StopCleanupRegistry,
-    StopDisposition,
-    StopRequest,
-    StopScope,
     UnavailableStopReceiptStore,
+    execute_fleet_stop,
+    fleet_in_flight_count,
 )
 from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
-from kestrel_sovereign.telemetry import current_trace_identity
-
 
 router = APIRouter(prefix="/api/host", tags=["host"])
 
@@ -156,25 +152,17 @@ async def host_stop_status(request: Request, response: Response):
                 message="Host Stop target inventory is unavailable.",
             )
 
-    in_flight_count = 0
-    for target in targets:
-        active = bool(target.turn_ids)
-        if not active and durable_has_work is not None:
-            try:
-                active = await durable_has_work(target.agent_id)
-            except Exception as error:  # noqa: BLE001 - durable inventory boundary
-                raise ApiHTTPException(
-                    status_code=503,
-                    code="host_stop_inventory_unavailable",
-                    message="Host Stop target inventory is unavailable.",
-                ) from error
-            if not isinstance(active, bool):
-                raise ApiHTTPException(
-                    status_code=503,
-                    code="host_stop_inventory_unavailable",
-                    message="Host Stop target inventory is unavailable.",
-                )
-        in_flight_count += int(active)
+    try:
+        in_flight_count = await fleet_in_flight_count(
+            targets,
+            durable_has_work=durable_has_work,
+        )
+    except Exception as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="host_stop_inventory_unavailable",
+            message="Host Stop target inventory is unavailable.",
+        ) from error
     return {
         "can_stop": _caller_can_stop_host(request),
         "in_flight_count": in_flight_count,
@@ -211,65 +199,19 @@ async def stop_host(
             message="Host Stop cleanup ownership is unavailable.",
         )
 
-    authority = CancellationAuthority(
-        lambda: targets,
+    return await execute_fleet_stop(
+        targets,
+        actor_id=actor_id,
         cleanup_registry=cleanup_registry,
         receipt_store=(
             getattr(request.app.state, "stop_receipt_store", None)
             or UnavailableStopReceiptStore()
         ),
-    )
-    trace_id, span_id = current_trace_identity()
-    stop_request = StopRequest(
-        scope=StopScope.HOST,
-        actor_id=actor_id,
         reason=body.reason if body is not None else None,
-        trace_id=trace_id,
-        span_id=span_id,
-        **(
-            {"correlation_id": body.correlation_id}
-            if body is not None and body.correlation_id is not None
-            else {}
+        correlation_id=(
+            body.correlation_id if body is not None else None
         ),
     )
-    outcomes = await authority.stop(stop_request)
-    confirmed = tuple(
-        outcome
-        for outcome in outcomes
-        if outcome.disposition
-        in {StopDisposition.STOPPED, StopDisposition.ALREADY_COMPLETE}
-    )
-    unconfirmed = tuple(
-        outcome
-        for outcome in outcomes
-        if outcome.disposition
-        in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
-    )
-    empty_inventory = (
-        len(outcomes) == 1
-        and outcomes[0].scope is StopScope.HOST
-        and outcomes[0].requested_target is None
-        and outcomes[0].resolved_target == StopScope.HOST.value
-        and outcomes[0].agent_id == StopScope.HOST.value
-    )
-    target_count = 0 if empty_inventory else len(outcomes)
-    if empty_inventory:
-        state = "empty"
-    elif confirmed and unconfirmed:
-        state = "partial"
-    elif unconfirmed:
-        state = "unconfirmed"
-    else:
-        state = "confirmed"
-    return {
-        "success": target_count > 0 and not unconfirmed,
-        "state": state,
-        "target_count": target_count,
-        "confirmed_count": len(confirmed),
-        "unconfirmed_count": len(unconfirmed),
-        "correlation_id": stop_request.correlation_id,
-        "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
-    }
 
 
 __all__ = ["HostStopBody", "host_stop_status", "router", "stop_host"]
