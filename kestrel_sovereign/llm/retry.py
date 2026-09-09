@@ -483,9 +483,11 @@ async def with_retry(
     when it does not: eight capped waits against advice to come back in hours
     are attempts that cannot succeed, and they held a turn's conversation lock
     for the whole budget before failing anyway (#3127). A non-throttle error
-    that advises more than the tight budget keeps the old behaviour, a wait
-    clamped to what is left and a retry: a proxy that stamps a fixed
-    ``Retry-After`` on every 502 is not a reset time. A guessed delay (no
+    that advises more than the per-attempt cap keeps the old behaviour, a
+    wait clamped to that cap (and to what is left) and a retry: a proxy that
+    stamps a fixed ``Retry-After`` on every 502 is not a reset time, and
+    spending the whole budget on one sleep puts every attempt outside the
+    orchestrator's 180s watchdog. A guessed delay (no
     advice) is clamped to the per-attempt cap and to what is left.
 
     Returns:
@@ -553,12 +555,32 @@ async def with_retry(
                         waited, getattr(e, "status_code", None), type(e).__name__, e,
                     )
                     raise
-                if advised > remaining_budget and not _is_throttle_error(e):
+                if not _is_throttle_error(e):
                     # Not a throttle: the advice is not a reset time to
-                    # report, so it is clamped to what is left, as before.
+                    # report, so it is clamped and retried rather than
+                    # declined.
+                    #
+                    # Clamped to the PER-ATTEMPT cap, and clamped on EVERY
+                    # non-throttle advice rather than only advice that
+                    # exceeds the budget. Both halves matter and the first
+                    # fix only had one: clamping to the budget spent it in
+                    # one uninterrupted sleep (a 503 advising 400s slept 240s
+                    # once and got two attempts, where main slept 4 x 60s and
+                    # got five), and gating the clamp on "advice above the
+                    # budget" let advice BELOW the budget but above the cap
+                    # through whole (400s was fixed while 200s still slept
+                    # 200s in one go). The totals match either way; the
+                    # distribution is the regression. The orchestrator
+                    # wraps the provider call in a 180s watchdog (see the
+                    # note above this function), so
+                    # the first retry moved from t=60s to t=240s and every
+                    # attempt fell outside the window -- a 503 that clears in
+                    # ninety seconds is now killed as `timeout after 180s`
+                    # instead of recovered. That is the outcome that note
+                    # calls worse than the hard failure this retry replaces.
                     if remaining_budget <= 0:
                         raise
-                    advised = remaining_budget
+                    advised = min(advised, eff_max_delay, remaining_budget)
                 if advised > remaining_budget:
                     retry_at = datetime.now(UTC) + timedelta(
                         seconds=min(advised, float(ADVISED_WAIT_HORIZON_SECONDS))

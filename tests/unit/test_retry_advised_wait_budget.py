@@ -162,7 +162,15 @@ async def test_the_budget_is_what_the_loop_could_still_wait_not_the_whole_budget
 @pytest.mark.asyncio
 async def test_a_non_throttle_transient_with_advice_is_clamped_not_declined():
     """A 503 advising 400 s against 5 x 60 s: not a throttle, so the advice is
-    not a reset time to report; it is clamped to what is left and retried."""
+    not a reset time to report; it is clamped and retried.
+
+    Clamped to the PER-ATTEMPT cap, which is what main did. This test used to
+    assert one 240 s sleep -- the whole remaining budget spent at once -- and
+    called it "as it always was". It was not: main slept 4 x 60 s. Review
+    round 6 caught it. The totals are identical, so only the distribution
+    tells them apart, and the distribution is the whole point: the
+    orchestrator's watchdog kills the turn at 180 s, so a single 240 s sleep
+    puts every attempt outside the window a 503 could have cleared in."""
 
     class _Overloaded(Exception):
         status_code = 503
@@ -173,9 +181,10 @@ async def test_a_non_throttle_transient_with_advice_is_clamped_not_declined():
 
     result, sleeps, _ = await _run([_Overloaded(), "ok"])
     assert result == "ok"
-    # Not a throttle: no decline; the advice is clamped to the tight budget
-    # and the call is retried, as it always was.
-    assert sleeps == [60.0 * 4]
+    assert sleeps == [60.0]
+    # The regression this pins is invisible in the total, so assert the bound
+    # that matters: no single wait may outlast the 180 s watchdog.
+    assert all(s < 180.0 for s in sleeps), sleeps
 
 
 # ---------------------------------------------------------------------------

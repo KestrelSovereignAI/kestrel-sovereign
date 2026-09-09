@@ -519,7 +519,11 @@ async def test_advice_that_arrives_on_the_final_attempt_is_declined_not_discarde
 @pytest.mark.asyncio
 async def test_a_non_throttle_never_declines_even_beyond_the_budget():
     """The scope is a 429: a proxy stamping a fixed Retry-After on every 502
-    is not a reset time, so the old clamp-and-retry stays for those."""
+    is not a reset time, so the old clamp-and-retry stays for those.
+
+    "The old clamp" is the per-attempt cap. Asserting the tight budget here
+    made this test pass on a loop that slept it in one go, which is not what
+    it says and not what main did."""
 
     class _Bad(Exception):
         status_code = 502
@@ -529,10 +533,11 @@ async def test_a_non_throttle_never_declines_even_beyond_the_budget():
             self.response = _FakeResponse({"retry-after": "300"})
 
     result, sleeps = await _drive([_Bad(), "ok"])
-    assert result == "ok" and sleeps == [TIGHT_BUDGET]
-    # And once the tight budget is spent, the provider error itself.
+    assert result == "ok" and sleeps == [MAX_DELAY]
+    assert sum(sleeps) <= TIGHT_BUDGET
+    # And once the whole tight budget is spent, the provider error itself.
     with pytest.raises(_Bad):
-        await _drive([_Bad(), _Bad(), "ok"])
+        await _drive([_Bad()] * 10)
 
 
 @pytest.mark.asyncio
@@ -559,3 +564,38 @@ async def test_the_final_attempt_without_advice_raises_the_provider_error():
     ):
         await with_retry(op)
     assert calls["n"] == THROTTLE_MAX_RETRIES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advised", [30, 59, 60, 61, 120, 200, 239, 240, 241, 400, 6832])
+async def test_no_single_non_throttle_wait_outlasts_the_watchdog(advised):
+    """Review round 6. The regression was invisible in the total -- 240 s of
+    sleep either way -- and visible only in how it was spent: one 240 s wait
+    instead of four 60 s ones, which puts every attempt past the
+    orchestrator's 180 s watchdog and kills a 503 that would have cleared.
+
+    The first fix closed one end of that boundary and not the other: it
+    clamped advice ABOVE the remaining budget (400 s) and left advice below
+    the budget but above the per-attempt cap (200 s) sleeping whole. So this
+    sweeps across the cap, the budget, and both sides of each, and asserts
+    the property rather than a value -- no single non-throttle wait may reach
+    the watchdog, whatever the advice says."""
+
+    class _Bad(Exception):
+        status_code = 502
+
+        def __init__(self):
+            super().__init__("502 bad gateway")
+            self.response = _FakeResponse({"retry-after": str(advised)})
+
+    # Fail until the loop has spent every retry it will spend, then succeed,
+    # so the call returns and every sleep it took is observable.
+    _, sleeps = await _drive([_Bad()] * (MAX_RETRIES - 1) + ["ok"])
+
+    assert sleeps, "the loop declined a non-throttle instead of retrying it"
+    # The exact wait, not merely a bounded one: asserting only the bound let
+    # a mutant that ignores the advice entirely and always sleeps the cap
+    # survive, which over-waits every 502 that asks for five seconds.
+    expected = min(float(advised), MAX_DELAY)
+    assert all(s == expected for s in sleeps), (sleeps, expected)
+    assert sum(sleeps) <= TIGHT_BUDGET, sleeps
