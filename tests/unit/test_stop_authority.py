@@ -1780,6 +1780,34 @@ def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
     agent.wait_for_request_completion.assert_awaited_once_with("collision")
 
 
+def test_unknown_public_turn_cannot_cancel_same_named_private_request() -> None:
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    register_api_error_handlers(app)
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"collision"}
+    agent._current_request_id = "collision"
+    agent.active_turn_request_ids = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "collision"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["details"][0]["disposition"] == (
+        "unreachable"
+    )
+    agent.cancel_current_request.assert_not_called()
+
+
 def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
@@ -2084,3 +2112,26 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+
+
+def test_turn_stop_capability_endpoint_is_explicit_and_versioned() -> None:
+    """External inspectors can fail closed against older agent-wide doors."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    response = TestClient(app).get("/api/agent/stop/capabilities")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "protocol": "kestrel.cooperative_stop",
+        "version": 1,
+        "scopes": ["agent", "turn"],
+        "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
+        "typed_outcomes": True,
+        "durable_receipts": True,
+    }

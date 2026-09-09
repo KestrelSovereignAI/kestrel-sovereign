@@ -1085,6 +1085,22 @@ async def stream_agent_response(request: Request):
         )
 
 
+@router.get("/stop/capabilities")
+async def get_stop_capabilities():
+    """Advertise the exact cooperative Stop wire contract this host accepts."""
+
+    return {
+        "protocol": "kestrel.cooperative_stop",
+        "version": 1,
+        "scopes": ["agent", "turn"],
+        "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
+        "typed_outcomes": True,
+        "durable_receipts": True,
+    }
+
+
 @router.post("/stop")
 @stop_admission_rate_limit
 async def stop_agent_request(request: Request):

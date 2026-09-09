@@ -31,6 +31,8 @@ const { mountAgentList, createDefaultAgentAdapter } = await import(
     '../../kestrel_sovereign/static/js/agent_list.js'
 );
 const { UI } = await import('../../kestrel_sovereign/static/js/ui-ext/registry.js');
+const { state } = await import('../../kestrel_sovereign/static/js/ui.js');
+const { refreshAgentThinkingDot } = await import('../../kestrel_sovereign/static/js/chat.js');
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
 
@@ -66,6 +68,51 @@ test('adapter feed → rows render with the default console-row renderer', async
     handle.destroy();
 });
 
+test('per-card Stop preserves its routed target and renders every typed outcome distinctly', async () => {
+    const calls = [];
+    const outcomes = ['refused', 'unreachable', 'already_complete', 'stopped'];
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{
+            name: 'EmmaRoute',
+            displayName: 'Renamed Emma',
+            id: 'did:agent:emma',
+            status: 'online',
+        }]),
+        isThinking: () => true,
+        onStop: async (target) => {
+            calls.push(target);
+            return {
+                outcomes: [{
+                    resolved_target: 'did:agent:emma',
+                    disposition: outcomes.shift(),
+                }],
+            };
+        },
+    });
+    await tick();
+
+    const button = el.querySelector('.agent-stop-btn');
+    const status = el.querySelector('.agent-stop-outcome');
+    const expected = [
+        ['refused', 'Stop refused'],
+        ['unreachable', 'Stop unreachable'],
+        ['already_complete', 'Already complete'],
+        ['stopped', 'Stopped'],
+    ];
+    for (const [disposition, label] of expected) {
+        button.click();
+        await tick();
+        assert.equal(status.dataset.disposition, disposition);
+        assert.equal(status.textContent, label);
+    }
+    assert.deepEqual(
+        calls,
+        ['EmmaRoute', 'EmmaRoute', 'EmmaRoute', 'EmmaRoute'],
+        'display renames and retries never drift from the captured routing key',
+    );
+    handle.destroy();
+});
+
 test('renderCard override replaces the body and receives ctx (actionsAnchor + escapeHtml)', async () => {
     let seenCtx = null;
     const { el, handle } = mountInto({
@@ -92,6 +139,93 @@ test('renderCard override replaces the body and receives ctx (actionsAnchor + es
     // The host placed the anchor inside its body — the component must not
     // re-append it to the shell.
     assert.equal(seenCtx.actionsAnchor.parentNode.className, 'portrait-card');
+    handle.destroy();
+});
+
+test('custom companion renderer retains the shared busy-only Stop affordance', async () => {
+    const calls = [];
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{
+            name: 'frinz-route',
+            displayName: 'Frinz Companion',
+            id: 'did:agent:frinz',
+            status: 'online',
+        }]),
+        isThinking: () => true,
+        onStop: async (target) => {
+            calls.push(target);
+            return {
+                outcomes: [{
+                    resolved_target: 'did:agent:frinz',
+                    disposition: 'refused',
+                    detail: 'durable receipt unavailable',
+                }],
+            };
+        },
+        renderCard: (_item, ctx) => {
+            const portrait = document.createElement('div');
+            portrait.className = 'portrait-card';
+            portrait.appendChild(ctx.actionsAnchor);
+            return portrait;
+        },
+    });
+    await tick();
+
+    const shell = el.querySelector('.agent-card');
+    const button = el.querySelector('.agent-stop-btn');
+    const status = el.querySelector('.agent-stop-outcome');
+    assert.ok(shell.classList.contains('agent-thinking'));
+    assert.ok(button, 'custom card keeps the component-owned Stop control');
+    assert.equal(button.closest('.agent-card-actions'), el.querySelector('.agent-card-actions'));
+    button.click();
+    await tick();
+    assert.deepEqual(calls, ['frinz-route']);
+    assert.equal(status.dataset.disposition, 'refused');
+    assert.equal(status.textContent, 'Stop refused');
+
+    const css = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/index.css'),
+        'utf8',
+    );
+    assert.match(
+        css,
+        /\.agent-card\.agent-thinking \.agent-stop-btn/,
+        'busy-only visibility applies to custom companion cards',
+    );
+    handle.destroy();
+});
+
+test('custom companion Stop tracks live busy-state repaint', async () => {
+    const agent = 'frinz-live-route';
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{ name: agent, status: 'online' }]),
+        isThinking: (name) => state.waitingAgents.has(name),
+        onStop: async () => ({ outcomes: [{ disposition: 'stopped' }] }),
+        renderCard: (_item, ctx) => {
+            const portrait = document.createElement('div');
+            portrait.className = 'portrait-card';
+            portrait.appendChild(ctx.actionsAnchor);
+            return portrait;
+        },
+    });
+    await tick();
+
+    const shell = el.querySelector('.agent-card');
+    assert.ok(!shell.classList.contains('agent-thinking'), 'custom card mounts idle');
+
+    state.waitingAgents.add(agent);
+    refreshAgentThinkingDot(agent);
+    assert.ok(
+        shell.classList.contains('agent-thinking'),
+        'custom card exposes Stop when work begins after mount',
+    );
+
+    state.waitingAgents.delete(agent);
+    refreshAgentThinkingDot(agent);
+    assert.ok(
+        !shell.classList.contains('agent-thinking'),
+        'custom card hides Stop when work completes after mount',
+    );
     handle.destroy();
 });
 
@@ -262,6 +396,11 @@ test('source-contract: identity.js drives mountAgentListPane, no hand-rolled age
     // wraps the shared list surface.
     assert.match(src, /import \{ mountAgentListPane, createDefaultAgentAdapter \} from '\.\/agent_list\.js'/);
     assert.match(src, /mountAgentListPane\(container, \{/, 'loadAgents mounts the pane component');
+    assert.match(
+        src,
+        /onStop: \(name\) => stopAgentDetailed\(name\)/,
+        'the production card preserves typed Stop outcomes instead of the boolean chat wrapper',
+    );
     // The bespoke per-agent innerHTML loop is gone (the tell-tale inline markup).
     assert.ok(!src.includes('class="agent-status-dot'), 'no hand-rolled status-dot markup');
     assert.ok(!/for \(const agent of agents\)/.test(src), 'no hand-rolled agent loop');
