@@ -228,8 +228,11 @@ class LocalSandboxBackend(SandboxBackend):
                 # separates "the command finished" from "nothing can write
                 # any more" — the two facts this needs to tell apart.
                 try:
-                    timed_out = not await _await_exit(proc, timeout)
-                    if timed_out:
+                    timed_out = not await _await_exit(proc, timeout, pumps)
+                    if timed_out or proc.returncode is None:
+                        # Either the deadline passed, or a pump failed while
+                        # the child was still running. Both end the same way:
+                        # the tree goes, and what is left is reported.
                         _kill_tree(proc.pid)
                         await _await_exit(proc, _REAP_GRACE)
                     done, pending = await asyncio.wait(
@@ -333,14 +336,25 @@ class LocalSandboxBackend(SandboxBackend):
         )
 
 
-async def _await_exit(proc, timeout: float) -> bool:
+async def _await_exit(proc, timeout: float, pumps: list | None = None) -> bool:
     """Wait for the process itself to exit. True if it did, False on timeout.
 
     Polls ``returncode`` rather than awaiting ``proc.wait()``: see the call
     site for why the difference is load-bearing.
+
+    A failed pump ends the wait early. Once a capture write has raised, the
+    artifact is already unrecoverable, so running the command to its full
+    timeout buys nothing — and with nothing draining the pipe a high-output
+    command blocks on it, turning a disk error into a hang. Returning here
+    lets the caller kill the tree and report the loss while it is still
+    news.
     """
     deadline = time.monotonic() + timeout
     while proc.returncode is None:
+        if pumps and any(
+            t.done() and t.exception() is not None for t in pumps
+        ):
+            return True
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(_EXIT_POLL_SECONDS)

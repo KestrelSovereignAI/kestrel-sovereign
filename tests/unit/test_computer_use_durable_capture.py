@@ -2231,3 +2231,129 @@ async def test_a_failing_stderr_pump_indicts_only_stderr(
 
     assert result.truncated_stderr is True
     assert result.truncated_stdout is False
+
+
+# ---------------------------------------------------------------------------
+# Review round 8
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_missing_cwd_is_refused_before_docker_can_create_it(
+    workspace: Path, queue
+):
+    """Review round 8, and a capability escape I opened by adding ``cwd``.
+
+    The docker backend mounts it with ``-v <cwd>:/workspace:ro``, and ``-v``
+    CREATES a missing source directory on the host. So a cwd that passed only
+    the READ policy performed a filesystem write — the gate it never went
+    through — on an auto-approved command like ``ls``.
+
+    Refused at the gate rather than in the backend, because it is wrong
+    everywhere: the local backend merely fails louder."""
+    missing = workspace / "does" / "not" / "exist"
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", cwd=str(missing))
+
+    assert env.status is not ToolResultStatus.OK
+    assert "existing directory" in (env.error or "")
+    assert not missing.exists(), "the refused cwd was created anyway"
+
+
+@pytest.mark.asyncio
+async def test_a_file_as_cwd_is_refused_too(workspace: Path, queue):
+    """Exists is not enough — it has to be a directory."""
+    a_file = workspace / "notadir.txt"
+    a_file.write_text("x")
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(command="echo hi", cwd=str(a_file))
+
+    assert env.status is not ToolResultStatus.OK
+    assert "existing directory" in (env.error or "")
+
+
+@pytest.mark.asyncio
+async def test_an_existing_cwd_is_still_accepted(workspace: Path, queue):
+    """Control: the check must reject what does not exist, not everything."""
+    sub = workspace / "real"
+    sub.mkdir()
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command="python3 -c 'import os; print(os.getcwd())'", cwd=str(sub)
+    )
+
+    assert env.data["stdout"].strip() == str(sub.resolve())
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pump_ends_the_run_immediately(tmp_path: Path, monkeypatch):
+    """Review round 8. Once a capture write has raised the artifact is
+    already unrecoverable, so running the command to its full timeout buys
+    nothing — and with nothing draining the pipe a high-output command blocks
+    on it, turning a disk error into a hang."""
+    import time as _t
+
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+
+    async def failing_pump(reader, fh):
+        await reader.read(10)
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(local_mod, "_pump", failing_pump)
+
+    began = _t.monotonic()
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "import time; print('x' * 1000, flush=True); time.sleep(30)"],
+        cwd=None,
+        env=None,
+        timeout=25,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+    elapsed = _t.monotonic() - began
+
+    assert result.truncated_stdout is True
+    assert elapsed < 10, f"waited {elapsed:.1f}s after the capture was already lost"
+
+
+@pytest.mark.asyncio
+async def test_the_facts_only_envelope_fits_even_with_a_long_path(
+    tmp_path: Path, queue, monkeypatch
+):
+    """Review round 8. The fallback's size was never re-checked, and it
+    carried the artifact path TWICE — in the confirmation and in data — so
+    the one part that cannot be shortened was doubled. A valid long path was
+    enough to push it back over the cap it exists to get under."""
+    from kestrel_sovereign.features.base import serialized_result_len
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 1000,
+    )
+    deep = tmp_path
+    for _ in range(12):
+        deep = deep / ("d" * 30)
+    deep.mkdir(parents=True)
+    (deep / "secret").mkdir()
+
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(deep)
+    await f.initialize()
+
+    env = await f.shell(
+        command="python3 -c \"print('q' * 100000)\"",
+        capture_output=True,
+        timeout=60,
+    )
+
+    size = serialized_result_len(env, tool_name="shell")
+    assert size <= 1000, f"fallback is {size} chars"
+    # The pointer survives in one form or another.
+    assert env.data.get("manifest_path") or env.data.get("run_id")
+    assert "complete" in env.data

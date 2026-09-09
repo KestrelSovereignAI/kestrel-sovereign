@@ -652,6 +652,25 @@ class ComputerUseFeature(Feature):
                     )
                     return _GateOutcome(False, allowed_by, f"path_safety:{exc}")
                 payload["cwd"] = str(resolved_cwd)
+                # It has to already be a directory. The docker backend mounts
+                # it with ``-v <cwd>:/workspace:ro``, and ``-v`` CREATES a
+                # missing source on the host — so a cwd that only passed the
+                # READ policy would perform a filesystem write, which is the
+                # gate it never went through. Refused here rather than in the
+                # backend because it is wrong on every backend: the local one
+                # merely fails louder.
+                if not resolved_cwd.is_dir():
+                    await self._audit_denied(
+                        tool_name,
+                        payload,
+                        allowed_by + ["denied:path_safety:cwd_missing"],
+                    )
+                    return _GateOutcome(
+                        False,
+                        allowed_by,
+                        f"path_safety:cwd is not an existing directory: "
+                        f"{resolved_cwd}",
+                    )
                 cwd_decision = self._path_policy.evaluate(resolved_cwd, write=False)
                 if cwd_decision.decision is Decision.DENY:
                     payload["rule"] = cwd_decision.rule
@@ -1561,6 +1580,17 @@ class ComputerUseFeature(Feature):
                     envelope = _minimal_envelope(
                         envelope, manifest_path, run_incomplete
                     )
+                if _size(envelope) > cap:
+                    # Even the path did not fit. A run id is a fixed 32 chars
+                    # and the capture directory is configuration, so the two
+                    # together still locate the artifact — which is the last
+                    # thing worth spending bytes on.
+                    envelope = _minimal_envelope(
+                        envelope,
+                        None,
+                        run_incomplete,
+                        run_id=bundle.run_id if bundle else None,
+                    )
 
             await self._audit_run(
                 tool_name="shell",
@@ -1608,7 +1638,11 @@ class ComputerUseFeature(Feature):
 
 
 def _minimal_envelope(
-    envelope: ToolResult, manifest_path: Optional[str], incomplete: bool
+    envelope: ToolResult,
+    manifest_path: Optional[str],
+    incomplete: bool,
+    *,
+    run_id: Optional[str] = None,
 ) -> ToolResult:
     """Strip a result to what a caller cannot act without.
 
@@ -1626,12 +1660,16 @@ def _minimal_envelope(
     data = {
         "returncode": returncode,
         "complete": not incomplete,
-        "manifest_path": manifest_path,
     }
-    summary = (
-        f"Result too large for this agent's tool-result cap; "
-        f"facts only. Full output: {manifest_path}"
-    )
+    if manifest_path is not None:
+        data["manifest_path"] = manifest_path
+    elif run_id is not None:
+        data["run_id"] = run_id
+    # The pointer lives in ``data`` only. Repeating it in the confirmation
+    # doubled the one part of this envelope that cannot be shortened, and a
+    # long-but-valid path was enough to push the fallback back over the cap
+    # it exists to get under.
+    summary = "Result too large for this agent's tool-result cap; facts only."
     if envelope.status is ToolResultStatus.OK:
         return ToolResult.ok(summary, data=data)
     return ToolResult.partial(
