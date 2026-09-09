@@ -1,6 +1,7 @@
 """CLI contract for cooperative Stop and separate process termination (#3160)."""
 
 import inspect
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -219,6 +220,51 @@ def test_connected_socket_proof_binds_exact_flow_to_attested_server_pid():
     assert inspect_process.call_count == 2
 
 
+@pytest.mark.parametrize(
+    ("connect_host", "resolved_host", "peer_host"),
+    [
+        ("localhost", "127.0.0.1", "127.0.0.1"),
+        ("0:0:0:0:0:0:0:1", "::1", "::1"),
+    ],
+)
+def test_connected_socket_proof_accepts_resolved_canonical_peer(
+    connect_host,
+    resolved_host,
+    peer_host,
+):
+    import psutil
+
+    connection = MagicMock()
+    connection.sock.getsockname.return_value = (peer_host, 54321)
+    connection.sock.getpeername.return_value = (peer_host, 8888)
+    server_flow = SimpleNamespace(
+        status=psutil.CONN_ESTABLISHED,
+        laddr=(peer_host, 8888),
+        raddr=(peer_host, 54321),
+    )
+    attestation = _attestation(
+        bind_host=connect_host,
+        connect_host=connect_host,
+    )
+    addrinfo = [
+        (
+            socket.AF_INET6 if ":" in resolved_host else socket.AF_INET,
+            socket.SOCK_STREAM,
+            socket.IPPROTO_TCP,
+            "",
+            (resolved_host, 8888),
+        )
+    ]
+    with (
+        patch("socket.getaddrinfo", return_value=addrinfo),
+        patch.object(
+            cli_stop,
+            "_process_connections",
+            return_value=[server_flow],
+        ),
+    ):
+        assert cli_stop._connected_socket_is_owned_by(connection, attestation)
+
 def test_connected_socket_proof_honors_ipv6_bind():
     import psutil
 
@@ -318,7 +364,7 @@ def test_host_stop_resolution_probes_live_host_for_accepted_sovereign_key(tmp_pa
 
     config = SimpleNamespace(host=SimpleNamespace(port=8888))
     config.get_local_agents = lambda: {}
-    config.get_remote_agents = lambda: {}
+    config.get_remote_agents = dict
     with (
         patch.object(cli, "_get_project_dir", return_value=tmp_path),
         patch.object(cli.MultiAgentConfig, "load", return_value=config),
@@ -450,6 +496,49 @@ def test_named_stop_resolution_delegates_agent_routing_to_live_http_probe(tmp_pa
         "http://127.0.0.1:8888/api/agents/Emma/api/agent/info",
         ("operator-key",),
         expected_agent_id="did:emma",
+    )
+
+
+def test_named_stop_quotes_the_agent_as_one_url_path_segment(tmp_path):
+    from kestrel_sovereign import cli
+
+    data_dir = tmp_path / "agents" / "emma bird"
+    agent_config = SimpleNamespace(
+        port=8801,
+        resolve_data_dir=lambda _project: data_dir,
+    )
+    config = SimpleNamespace(host=SimpleNamespace(port=8888))
+    config.get_local_agents = lambda: {"Emma bird/\N{SNOWMAN}": agent_config}
+    config.get_remote_agents = lambda: {}
+    with (
+        patch.object(cli, "_get_project_dir", return_value=tmp_path),
+        patch.object(cli.MultiAgentConfig, "load", return_value=config),
+        patch.object(cli, "_operator_api_keys", return_value=("operator-key",)),
+        patch.object(
+            cli_stop,
+            "read_anchor_agent_did_sync",
+            return_value="did:emma",
+        ),
+        patch.object(
+            cli_stop,
+            "_attested_local_process",
+            side_effect=[_attestation(), None],
+        ),
+        patch.object(
+            cli_stop,
+            "_agent_operator_key",
+            return_value="key",
+        ) as detect,
+    ):
+        resolved = cli_stop._stop_endpoint(
+            _args(name="Emma bird/\N{SNOWMAN}")
+        )
+
+    encoded = "Emma%20bird%2F%E2%98%83"
+    assert resolved is not None
+    assert resolved.url.endswith(f"/api/agents/{encoded}/api/agent/stop")
+    assert detect.call_args.args[1].endswith(
+        f"/api/agents/{encoded}/api/agent/info"
     )
 
 

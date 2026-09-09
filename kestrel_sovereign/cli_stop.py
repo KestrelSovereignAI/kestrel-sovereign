@@ -8,6 +8,7 @@ teardown is the separate ``kestrel terminate`` command.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json as json_module
 import socket
 import time
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -91,6 +92,42 @@ def _address_parts(address: object) -> tuple[str, int] | None:
     return host, port
 
 
+def _canonical_ip(host: str) -> str:
+    """Canonicalize a numeric socket address without discarding its family."""
+
+    bare_host = host.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(bare_host).compressed
+    except ValueError:
+        return host.casefold()
+
+
+def _resolved_tcp_addresses(host: str, port: int) -> frozenset[tuple[str, int]]:
+    """Resolve a configured host to the numeric peers a socket may report."""
+
+    try:
+        addresses = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except OSError:
+        return frozenset()
+    return frozenset(
+        (_canonical_ip(str(sockaddr[0])), int(sockaddr[1]))
+        for _family, _type, _proto, _canonname, sockaddr in addresses
+    )
+
+
+def _canonical_socket_address(address: object) -> tuple[str, int] | None:
+    parts = _address_parts(address)
+    if parts is None:
+        return None
+    return _canonical_ip(parts[0]), parts[1]
+
+
 def _connect_host(bind_host: str) -> str:
     """Select an address accepted by a server's configured bind."""
 
@@ -153,7 +190,12 @@ def _connected_socket_is_owned_by(
         server = _address_parts(sock.getpeername())
     except OSError:
         return False
-    if client is None or server != (attestation.connect_host, attestation.port):
+    expected_servers = _resolved_tcp_addresses(
+        attestation.connect_host,
+        attestation.port,
+    )
+    canonical_server = _canonical_socket_address(server)
+    if client is None or canonical_server not in expected_servers:
         return False
 
     # The handshake can complete just before the server event loop accepts it.
@@ -167,8 +209,10 @@ def _connected_socket_is_owned_by(
             for candidate in _process_connections(attestation.pid):
                 if (
                     candidate.status == psutil.CONN_ESTABLISHED
-                    and _address_parts(candidate.laddr) == server
-                    and _address_parts(candidate.raddr) == client
+                    and _canonical_socket_address(candidate.laddr)
+                    == canonical_server
+                    and _canonical_socket_address(candidate.raddr)
+                    == _canonical_socket_address(client)
                 ):
                     peers.append(candidate)
         except Exception:  # noqa: BLE001 - inability to prove ownership is refusal
@@ -226,7 +270,7 @@ def _local_request(
         connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         return _LocalResponse(response.status, response.read())
-    except (OSError, http.client.HTTPException, socket.timeout) as error:
+    except (TimeoutError, OSError, http.client.HTTPException) as error:
         raise _LocalRequestError(str(error)) from error
     finally:
         connection.close()
@@ -458,7 +502,10 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
                 )
 
         if host_attestation is not None:
-            origin = f"{_origin(host_attestation)}/api/agents/{args.name}"
+            agent_segment = quote(args.name, safe="")
+            origin = (
+                f"{_origin(host_attestation)}/api/agents/{agent_segment}"
+            )
             key = _agent_operator_key(
                 host_attestation,
                 f"{origin}/api/agent/info",
