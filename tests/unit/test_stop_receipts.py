@@ -1231,3 +1231,86 @@ def test_live_endpoint_replays_client_stop_correlation_without_recancelling():
     assert first.json()["stop_outcomes"] == retry.json()["stop_outcomes"]
     assert first.json()["stop_outcomes"][0]["receipt_id"]
     agent.cancel_current_request.assert_called_once_with(request_id="turn-7")
+
+
+def test_live_endpoint_bounds_durable_admissions_per_authenticated_caller():
+    from fastapi import FastAPI, Request
+    from fastapi.testclient import TestClient
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.rate_limit import limiter
+
+    class _StatelessReceiptStore:
+        async def load(self, _request):
+            return None
+
+        async def persist(self, request, outcomes):
+            receipt_id = f"receipt-{request.correlation_id}"
+            return StopReceipt(
+                receipt_id=receipt_id,
+                operation_id=request.correlation_id,
+                request_fingerprint="test-fingerprint",
+                scope=request.scope.value,
+                actor_id=request.actor_id,
+                requested_target=request.target,
+                target_agent_id=request.target_agent_id,
+                reason=request.reason,
+                cascade=request.cascade,
+                occurred_at="2026-08-30T00:00:00+00:00",
+                turn_id=request.turn_id,
+                span_id=request.span_id,
+                trace_id=request.trace_id,
+                outcomes=tuple(
+                    replace(outcome, receipt_id=receipt_id)
+                    for outcome in outcomes
+                ),
+            )
+
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.add_exception_handler(
+        RateLimitExceeded,
+        _rate_limit_exceeded_handler,
+    )
+    app.include_router(router)
+    app.state.stop_receipt_store = _StatelessReceiptStore()
+    agent = MagicMock()
+    agent.agent_id = "did:test:agent"
+    agent._active_request_ids = set()
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    @app.middleware("http")
+    async def bind_caller(request: Request, call_next):
+        request.state.caller = CallerContext.authenticated(
+            request.headers["X-Test-Caller"]
+        )
+        return await call_next(request)
+
+    client = TestClient(app)
+    first_caller = f"caller-a-{uuid4()}"
+    statuses = [
+        client.post(
+            "/api/agent/stop",
+            headers={"X-Test-Caller": first_caller},
+            json={
+                "request_id": f"missing-request-{index}",
+                "correlation_id": f"bounded-stop-{index}-{uuid4()}",
+            },
+        ).status_code
+        for index in range(121)
+    ]
+
+    assert statuses[:120] == [200] * 120
+    assert statuses[120] == 429
+    assert client.post(
+        "/api/agent/stop",
+        headers={"X-Test-Caller": f"caller-b-{uuid4()}"},
+        json={
+            "request_id": "other-callers-request",
+            "correlation_id": f"other-callers-stop-{uuid4()}",
+        },
+    ).status_code == 200
