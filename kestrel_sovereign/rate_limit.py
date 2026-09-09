@@ -12,8 +12,9 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.requests import Request
 
-
-STOP_ADMISSION_RATE_LIMIT = "120/minute"
+STOP_ADMISSION_RATE_LIMIT_COUNT = 120
+STOP_ADMISSION_RATE_LIMIT_WINDOW_SECONDS = 60
+STOP_ADMISSION_RATE_LIMIT = f"{STOP_ADMISSION_RATE_LIMIT_COUNT}/minute"
 STOP_ADMISSION_RATE_LIMIT_SCOPE = "durable-stop-admission"
 _STOP_RATE_KEY_DOMAIN = b"kestrel:durable-stop-rate-limit:v1\0"
 
@@ -57,7 +58,9 @@ stop_admission_rate_limit = limiter.shared_limit(
 
 __all__ = [
     "STOP_ADMISSION_RATE_LIMIT",
+    "STOP_ADMISSION_RATE_LIMIT_COUNT",
     "STOP_ADMISSION_RATE_LIMIT_SCOPE",
+    "STOP_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
     "durable_stop_rate_limit_key",
     "limiter",
     "stop_admission_rate_limit",
