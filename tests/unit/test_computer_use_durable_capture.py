@@ -995,7 +995,8 @@ async def test_a_capture_under_both_bounds_is_still_whole(tmp_path: Path):
     assert await capture.preview(path, max_chars=4000) == "VERDICT: APPROVE"
 
 
-def test_the_kill_path_does_not_reach_a_posix_only_call_on_windows(monkeypatch):
+@pytest.mark.asyncio
+async def test_the_kill_path_does_not_reach_a_posix_only_call_on_windows(monkeypatch):
     """``os.killpg`` does not exist on Windows and the guard around it caught
     only ``OSError``, so on a platform this package declares support for the
     kill raised ``AttributeError`` out of the timeout path.
@@ -1018,13 +1019,14 @@ def test_the_kill_path_does_not_reach_a_posix_only_call_on_windows(monkeypatch):
     monkeypatch.setattr(local_mod.os, "killpg", _boom)
     monkeypatch.setattr(local_mod.os, "kill", _boom)
 
-    local_mod._kill_tree(4321)
+    await local_mod._kill_tree(4321)
 
     assert calls and calls[0][:2] == ["taskkill", "/F"]
     assert "4321" in calls[0]
 
 
-def test_the_kill_path_on_posix_kills_the_group(monkeypatch):
+@pytest.mark.asyncio
+async def test_the_kill_path_on_posix_kills_the_group(monkeypatch):
     """Control for the pair: the Windows branch must be a branch, not a
     replacement."""
     import kestrel_sovereign.features.computer_use.backends.local as local_mod
@@ -1035,7 +1037,7 @@ def test_the_kill_path_on_posix_kills_the_group(monkeypatch):
         local_mod.os, "killpg", lambda pid, sig: killed.append((pid, sig))
     )
 
-    local_mod._kill_tree(4321)
+    await local_mod._kill_tree(4321)
 
     assert killed == [(4321, local_mod.signal.SIGKILL)]
 
@@ -2687,3 +2689,129 @@ async def test_a_write_cancelled_after_both_graces_counts_as_lost(
     # It was writing, not waiting on the pipe — the labels are not
     # interchangeable.
     assert result.writers_remaining is False
+
+
+# ---------------------------------------------------------------------------
+# Review round 10
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_slow_close_does_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 10. A close flushes, so it blocks exactly as a write
+    does — the pump's writes were moved off the loop and the closes were
+    left on it, which is the same defect surviving in the line next door."""
+    import asyncio as _a
+    import time as _t
+
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+
+    def slow_closing_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_close = out_fh.close
+
+        def slow_close():
+            _t.sleep(0.5)
+            return real_close()
+
+        out_fh.close = slow_close
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", slow_closing_open)
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await _a.sleep(0.01)
+            ticks += 1
+
+    beat = _a.create_task(heartbeat())
+    try:
+        await LocalSandboxBackend(GRANTS).exec(
+            ["python3", "-c", "print('done')"],
+            cwd=None,
+            env=None,
+            timeout=30,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    finally:
+        beat.cancel()
+
+    assert ticks > 20, f"the loop ticked only {ticks} times across a 0.5s close"
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_failure_reports_a_close_that_also_failed(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 10. The spawn-failure result was constructed before the
+    ``finally`` closed the handles, so a close that then failed under disk
+    pressure had nowhere to go — the diagnostic was filed as fully persisted
+    when it was not."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+
+    def failing_close_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_close = err_fh.close
+
+        def failing_close():
+            real_close()
+            raise OSError("No space left on device")
+
+        err_fh.close = failing_close
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", failing_close_open)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["definitely-not-a-real-binary-xyz"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.returncode == 127
+    assert result.truncated_stderr is True
+    assert "No space left on device" in result.stderr
+    # The original diagnostic must survive alongside it.
+    assert "definitely-not-a-real-binary-xyz" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_the_windows_kill_is_bounded_and_off_the_loop(monkeypatch):
+    """Review round 10. ``taskkill`` ran synchronously with no timeout on
+    every timeout and every cancellation, so a wedged terminator blocked the
+    server indefinitely — defeating the very timeout that called it."""
+    import asyncio as _a
+    import time as _t
+
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    monkeypatch.setattr(local_mod, "is_windows", lambda: True)
+    monkeypatch.setattr(local_mod, "_KILL_TIMEOUT", 0.3)
+
+    def wedged_run(*a, **k):
+        _t.sleep(30)
+
+    monkeypatch.setattr(local_mod.subprocess, "run", wedged_run)
+
+    began = _t.monotonic()
+    await local_mod._kill_tree(4321)
+    elapsed = _t.monotonic() - began
+
+    assert elapsed < 5, f"a wedged taskkill held the caller for {elapsed:.1f}s"

@@ -58,6 +58,10 @@ _REAP_GRACE = 5.0
 # first means someone else can still write.
 _FLUSH_GRACE = 5.0
 
+# Bound on the platform kill itself, so a wedged terminator cannot outlast
+# the timeout that invoked it.
+_KILL_TIMEOUT = 10.0
+
 
 class LocalSandboxBackend(SandboxBackend):
     """Host-process backend.
@@ -145,6 +149,8 @@ class LocalSandboxBackend(SandboxBackend):
 
         close_errors: dict[str, OSError] = {}
         out_error = err_error = None
+        spawn_failed = False
+        spawn_error = ""
         out_fh = err_fh = None
         if capture is not None:
             try:
@@ -182,146 +188,173 @@ class LocalSandboxBackend(SandboxBackend):
             except (FileNotFoundError, OSError) as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 message = str(exc)
+                spawn_failed = True
                 if capture is not None and err_fh is not None:
                     # The diagnostic is the only useful thing this run
                     # produced. Written INTO the capture, because the caller
                     # reads the artifact when there is one and would
                     # otherwise get rc=127 beside an empty file.
                     err_fh.write((message + "\n").encode("utf-8"))
-                return CompletedRun(
-                    argv=list(argv),
-                    returncode=127,
-                    stdout="",
-                    stderr=message,
-                    duration_ms=duration_ms,
-                    stdout_path=str(capture.stdout_path) if capture else None,
-                    stderr_path=str(capture.stderr_path) if capture else None,
-                    cwd=str(cwd) if cwd else os.getcwd(),
-                    writers_remaining=False if capture else None,
-                )
+                # Deliberately NOT returned here. The handles close in the
+                # ``finally`` below, and a close that fails under disk
+                # pressure would have had nowhere to go in a result already
+                # constructed — the diagnostic would be filed as fully
+                # persisted when it was not.
+                spawn_error = message
 
-            timed_out = False
-            writers_remaining: bool | None = None
-            if capture is None:
-                try:
-                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                        proc.communicate(), timeout=timeout
-                    )
-                except asyncio.TimeoutError:
-                    timed_out = True
-                    _kill_tree(proc.pid)
+            # Only when there is a process to wait for. The spawn-failure
+            # branch above no longer returns, so this has to be skipped
+            # explicitly rather than by falling out of the function.
+            if not spawn_failed:
+                timed_out = False
+                writers_remaining: bool | None = None
+                if capture is None:
                     try:
-                        stdout_bytes, stderr_bytes = await proc.communicate()
-                    except Exception:  # noqa: BLE001
-                        stdout_bytes, stderr_bytes = b"", b""
-            else:
-                # A pump reports whether it is waiting on the pipe or
-                # flushing bytes it already read. Pending means "still
-                # writing" as often as it means "someone still holds the
-                # pipe", and cancelling a flush throws away bytes that were
-                # read successfully — measured on a slow filesystem, a
-                # one-second final write left an empty file behind a
-                # ``writers_remaining`` flag and a clean truncation flag.
-                states: list[dict] = [{"flushing": False}, {"flushing": False}]
-                pumps = [
-                    asyncio.create_task(_pump(proc.stdout, out_fh, states[0])),
-                    asyncio.create_task(_pump(proc.stderr, err_fh, states[1])),
-                ]
-                # NOT ``proc.wait()``. asyncio finishes a subprocess only
-                # once the process has exited AND every pipe transport has
-                # closed, so awaiting it waits for the descendants too — the
-                # grace below would never apply and a command that
-                # legitimately daemonizes would hold the tool for its whole
-                # timeout. Measured: a forked child sleeping 3s kept
-                # ``proc.wait()`` pending for 3s and the capture was then
-                # reported final, because by then it was.
-                #
-                # ``returncode`` is set by the child watcher when the process
-                # itself exits, independent of the pipes, so polling it
-                # separates "the command finished" from "nothing can write
-                # any more" — the two facts this needs to tell apart.
-                try:
-                    timed_out = not await _await_exit(proc, timeout, pumps)
-                    if timed_out or proc.returncode is None:
-                        # Either the deadline passed, or a pump failed while
-                        # the child was still running. Both end the same way:
-                        # the tree goes, and what is left is reported.
-                        _kill_tree(proc.pid)
-                        await _await_exit(proc, _REAP_GRACE)
-                    done, pending = await asyncio.wait(
-                        pumps, timeout=_DRAIN_GRACE
-                    )
-                    # Anything still flushing gets the rest of the budget:
-                    # it has the bytes and only needs to land them, which is
-                    # a different condition from waiting on a pipe nobody
-                    # has closed.
-                    if any(
-                        states[i]["flushing"]
-                        for i, t in enumerate(pumps)
-                        if t in pending
-                    ):
-                        done, pending = await asyncio.wait(
-                            pumps, timeout=_FLUSH_GRACE
+                        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                            proc.communicate(), timeout=timeout
                         )
-                except asyncio.CancelledError:
-                    # Every post-spawn await, not just the first. The drain
-                    # is its own wait and can be cancelled in its own right —
-                    # a descendant holding the pipes is exactly when it takes
-                    # long enough to be — and teardown that guarded only the
-                    # exit wait left the pumps running into handles the
-                    # ``finally`` was about to close.
+                    except asyncio.TimeoutError:
+                        timed_out = True
+                        await _kill_tree(proc.pid)
+                        try:
+                            stdout_bytes, stderr_bytes = await proc.communicate()
+                        except Exception:  # noqa: BLE001
+                            stdout_bytes, stderr_bytes = b"", b""
+                else:
+                    # A pump reports whether it is waiting on the pipe or
+                    # flushing bytes it already read. Pending means "still
+                    # writing" as often as it means "someone still holds the
+                    # pipe", and cancelling a flush throws away bytes that were
+                    # read successfully — measured on a slow filesystem, a
+                    # one-second final write left an empty file behind a
+                    # ``writers_remaining`` flag and a clean truncation flag.
+                    states: list[dict] = [{"flushing": False}, {"flushing": False}]
+                    pumps = [
+                        asyncio.create_task(_pump(proc.stdout, out_fh, states[0])),
+                        asyncio.create_task(_pump(proc.stderr, err_fh, states[1])),
+                    ]
+                    # NOT ``proc.wait()``. asyncio finishes a subprocess only
+                    # once the process has exited AND every pipe transport has
+                    # closed, so awaiting it waits for the descendants too — the
+                    # grace below would never apply and a command that
+                    # legitimately daemonizes would hold the tool for its whole
+                    # timeout. Measured: a forked child sleeping 3s kept
+                    # ``proc.wait()`` pending for 3s and the capture was then
+                    # reported final, because by then it was.
                     #
-                    # A shutdown, a client disconnect, an outer deadline:
-                    # without teardown the host process runs on with nobody
-                    # waiting for it, which for the long side-effecting
-                    # commands this feature exists to run is worse than the
-                    # timeout it mirrors.
-                    _kill_tree(proc.pid)
-                    for task in pumps:
+                    # ``returncode`` is set by the child watcher when the process
+                    # itself exits, independent of the pipes, so polling it
+                    # separates "the command finished" from "nothing can write
+                    # any more" — the two facts this needs to tell apart.
+                    try:
+                        timed_out = not await _await_exit(proc, timeout, pumps)
+                        if timed_out or proc.returncode is None:
+                            # Either the deadline passed, or a pump failed while
+                            # the child was still running. Both end the same way:
+                            # the tree goes, and what is left is reported.
+                            await _kill_tree(proc.pid)
+                            await _await_exit(proc, _REAP_GRACE)
+                        done, pending = await asyncio.wait(
+                            pumps, timeout=_DRAIN_GRACE
+                        )
+                        # Anything still flushing gets the rest of the budget:
+                        # it has the bytes and only needs to land them, which is
+                        # a different condition from waiting on a pipe nobody
+                        # has closed.
+                        if any(
+                            states[i]["flushing"]
+                            for i, t in enumerate(pumps)
+                            if t in pending
+                        ):
+                            done, pending = await asyncio.wait(
+                                pumps, timeout=_FLUSH_GRACE
+                            )
+                    except asyncio.CancelledError:
+                        # Every post-spawn await, not just the first. The drain
+                        # is its own wait and can be cancelled in its own right —
+                        # a descendant holding the pipes is exactly when it takes
+                        # long enough to be — and teardown that guarded only the
+                        # exit wait left the pumps running into handles the
+                        # ``finally`` was about to close.
+                        #
+                        # A shutdown, a client disconnect, an outer deadline:
+                        # without teardown the host process runs on with nobody
+                        # waiting for it, which for the long side-effecting
+                        # commands this feature exists to run is worse than the
+                        # timeout it mirrors.
+                        await _kill_tree(proc.pid)
+                        for task in pumps:
+                            task.cancel()
+                        raise
+                    # A pump cancelled mid-write loses whatever that write held,
+                    # so it is lost output rather than a writer still holding the
+                    # pipe. The two are reported differently because they mean
+                    # different things to a reader of the manifest.
+                    cancelled_mid_write: list[int] = [
+                        i for i, t in enumerate(pumps)
+                        if t in pending and states[i]["flushing"]
+                    ]
+                    writers_remaining = bool(
+                        [t for i, t in enumerate(pumps)
+                         if t in pending and not states[i]["flushing"]]
+                    )
+                    for task in pending:
                         task.cancel()
-                    raise
-                # A pump cancelled mid-write loses whatever that write held,
-                # so it is lost output rather than a writer still holding the
-                # pipe. The two are reported differently because they mean
-                # different things to a reader of the manifest.
-                cancelled_mid_write: list[int] = [
-                    i for i, t in enumerate(pumps)
-                    if t in pending and states[i]["flushing"]
-                ]
-                writers_remaining = bool(
-                    [t for i, t in enumerate(pumps)
-                     if t in pending and not states[i]["flushing"]]
-                )
-                for task in pending:
-                    task.cancel()
-                # A pump that raised — a full disk, a vanished directory —
-                # finishes and lands in ``done`` like any other. Not asking
-                # for its exception meant a capture missing everything after
-                # the failure was reported complete: silent loss wearing a
-                # clean result. asyncio only logs it, at teardown, to a place
-                # no caller reads.
-                # Per stream, because the streams fail independently and
-                # saying stderr was clipped when stdout's disk write failed
-                # is the false claim the per-stream contract exists to
-                # prevent — collapsed here once already after being split
-                # one layer up.
-                out_error = pumps[0].exception() if pumps[0] in done else None
-                err_error = pumps[1].exception() if pumps[1] in done else None
-                stdout_bytes = stderr_bytes = b""
+                    # A pump that raised — a full disk, a vanished directory —
+                    # finishes and lands in ``done`` like any other. Not asking
+                    # for its exception meant a capture missing everything after
+                    # the failure was reported complete: silent loss wearing a
+                    # clean result. asyncio only logs it, at teardown, to a place
+                    # no caller reads.
+                    # Per stream, because the streams fail independently and
+                    # saying stderr was clipped when stdout's disk write failed
+                    # is the false claim the per-stream contract exists to
+                    # prevent — collapsed here once already after being split
+                    # one layer up.
+                    out_error = pumps[0].exception() if pumps[0] in done else None
+                    err_error = pumps[1].exception() if pumps[1] in done else None
+                    stdout_bytes = stderr_bytes = b""
         finally:
             # A close flushes, and a flush can fail — a full disk surfaces
             # here rather than at any write. Swallowing it discarded the
             # buffered tail of a capture and called the file complete, the
             # same shape as the unread pump exception.
+            # Off the loop for the same reason the writes are: a close
+            # flushes, and a flush on a slow or full filesystem blocks
+            # everything else in the process — including the timeout that is
+            # supposed to bound this very call.
             for slot, fh in (("out", out_fh), ("err", err_fh)):
                 if fh is not None:
                     try:
-                        fh.close()
+                        await asyncio.to_thread(fh.close)
                     except OSError as exc:  # pragma: no cover - disk-full path
                         close_errors[slot] = exc
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
+        if spawn_failed:
+            failed_close = bool(close_errors)
+            return CompletedRun(
+                argv=list(argv),
+                returncode=127,
+                stdout="",
+                stderr=(
+                    spawn_error
+                    + (
+                        f"; capture close failed: "
+                        f"{'; '.join(str(e) for e in close_errors.values())}"
+                        if failed_close
+                        else ""
+                    )
+                ),
+                duration_ms=duration_ms,
+                truncated_stdout="out" in close_errors,
+                truncated_stderr="err" in close_errors,
+                stdout_path=str(capture.stdout_path) if capture else None,
+                stderr_path=str(capture.stderr_path) if capture else None,
+                cwd=effective_cwd,
+                writers_remaining=False if capture else None,
+            )
         if capture is not None:
             # A failed pump is lost output, which is what ``truncated_*``
             # already means and already folds into completeness — a second
@@ -432,7 +465,7 @@ async def _pump(reader, fh, state: dict | None = None) -> None:
 
 
 
-def _kill_tree(pid: int) -> None:
+async def _kill_tree(pid: int) -> None:
     """Kill the process and everything under it, best effort.
 
     ``os.killpg`` does not exist on Windows, and reaching it unguarded raised
@@ -441,11 +474,20 @@ def _kill_tree(pid: int) -> None:
     :func:`kestrel_sovereign._subprocess_helpers.stop_process`.
     """
     if is_windows():
+        # In a worker and bounded: this runs on every timeout and every
+        # cancellation, and a wedged ``taskkill`` on the event loop would
+        # block the server indefinitely — defeating the very timeout that
+        # called it.
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)], check=False
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    check=False,
+                ),
+                timeout=_KILL_TIMEOUT,
             )
-        except OSError:  # pragma: no cover - windows-only path
+        except (OSError, asyncio.TimeoutError):  # pragma: no cover - windows
             pass
         return
     try:
