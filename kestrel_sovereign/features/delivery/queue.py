@@ -264,10 +264,12 @@ class DeliveryQueue:
               AND NOT EXISTS (
                   SELECT 1 FROM delivery_dead_letter
                   WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                    AND (
-                        delivery_dead_letter.original_id = delivery_queue.id
-                        OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                    )
+                    AND delivery_dead_letter.original_id = delivery_queue.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.retry_entry_id = delivery_queue.id
               )
             """,
             (self._agent_id, DeliveryStatus.IN_FLIGHT.value),
@@ -283,10 +285,12 @@ class DeliveryQueue:
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
                       WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                        AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                        )
+                        AND delivery_dead_letter.original_id = delivery_queue.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                        AND delivery_dead_letter.retry_entry_id = delivery_queue.id
                   )
                 """,
                 (
@@ -459,10 +463,12 @@ class DeliveryQueue:
                       AND NOT EXISTS (
                           SELECT 1 FROM delivery_dead_letter
                           WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                            AND (
-                                delivery_dead_letter.original_id = delivery_queue.id
-                                OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                            )
+                            AND delivery_dead_letter.original_id = delivery_queue.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_dead_letter
+                          WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                            AND delivery_dead_letter.retry_entry_id = delivery_queue.id
                       )
                 UNION ALL
                 SELECT delivery_queue.id, delivery_queue.created_at
@@ -475,10 +481,12 @@ class DeliveryQueue:
                       AND NOT EXISTS (
                           SELECT 1 FROM delivery_dead_letter
                           WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                            AND (
-                                delivery_dead_letter.original_id = delivery_queue.id
-                                OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                            )
+                            AND delivery_dead_letter.original_id = delivery_queue.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM delivery_dead_letter
+                          WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                            AND delivery_dead_letter.retry_entry_id = delivery_queue.id
                       )
             ) AS candidates
             ORDER BY created_at DESC
@@ -516,10 +524,12 @@ class DeliveryQueue:
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
                       WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                        AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                        )
+                        AND delivery_dead_letter.original_id = delivery_queue.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                        AND delivery_dead_letter.retry_entry_id = delivery_queue.id
                   )
             ORDER BY delivery_queue.created_at DESC
             """,
@@ -571,10 +581,12 @@ class DeliveryQueue:
               AND NOT EXISTS (
                     SELECT 1 FROM delivery_dead_letter
                     WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                      AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                      )
+                      AND delivery_dead_letter.original_id = delivery_queue.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_dead_letter
+                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                      AND delivery_dead_letter.retry_entry_id = delivery_queue.id
               )
               AND NOT EXISTS (
                     SELECT 1 FROM delivery_idempotency
@@ -625,10 +637,12 @@ class DeliveryQueue:
               AND NOT EXISTS (
                     SELECT 1 FROM delivery_dead_letter
                     WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                      AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                      )
+                      AND delivery_dead_letter.original_id = delivery_queue.id
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_dead_letter
+                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                      AND delivery_dead_letter.retry_entry_id = delivery_queue.id
               )
             LIMIT 2
             """,
@@ -651,26 +665,70 @@ class DeliveryQueue:
 
     async def _lock_dead_letter(self, entry_id: str) -> Optional[tuple[Any, ...]]:
         """Lock and return a tombstone addressed by any durable queue identity."""
+        identity_lookup = """
+            SELECT id FROM (
+                SELECT id, 0 AS identity_priority
+                FROM delivery_dead_letter
+                WHERE agent_id = ? AND id = ?
+                UNION ALL
+                SELECT id, 1 AS identity_priority
+                FROM delivery_dead_letter
+                WHERE agent_id = ? AND original_id = ?
+                UNION ALL
+                SELECT id, 2 AS identity_priority
+                FROM delivery_dead_letter
+                WHERE agent_id = ? AND retry_entry_id = ?
+            ) AS matching_dead_letter
+            ORDER BY identity_priority
+            LIMIT 1
+        """
+        identity_params = (
+            self._agent_id,
+            entry_id,
+            self._agent_id,
+            entry_id,
+            self._agent_id,
+            entry_id,
+        )
         locked = await self._db.execute(
-            """
+            f"""
             UPDATE delivery_dead_letter SET id = id
-            WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
-                  AND agent_id = ?
+            WHERE agent_id = ? AND id = ({identity_lookup})
             """,
-            (entry_id, entry_id, entry_id, self._agent_id),
+            (self._agent_id, *identity_params),
         )
         if locked == 0:
             return None
         return await self._db.fetchone(
-            """
+            f"""
             SELECT id, original_id, agent_id, channel_type, recipient,
                    content_json, error, attempts, created_at, max_retries,
                    retry_entry_id, legacy_content_hash
             FROM delivery_dead_letter
-            WHERE (id = ? OR original_id = ? OR retry_entry_id = ?)
-                  AND agent_id = ?
+            WHERE agent_id = ? AND id = ({identity_lookup})
             """,
-            (entry_id, entry_id, entry_id, self._agent_id),
+            (self._agent_id, *identity_params),
+        )
+
+    async def _find_dead_letter_for_queue_id(
+        self, entry_id: str
+    ) -> Optional[tuple[Any, ...]]:
+        """Find a tombstone through independently indexable queue identities."""
+        return await self._db.fetchone(
+            """
+            SELECT id FROM (
+                SELECT id, 0 AS identity_priority
+                FROM delivery_dead_letter
+                WHERE agent_id = ? AND original_id = ?
+                UNION ALL
+                SELECT id, 1 AS identity_priority
+                FROM delivery_dead_letter
+                WHERE agent_id = ? AND retry_entry_id = ?
+            ) AS matching_dead_letter
+            ORDER BY identity_priority
+            LIMIT 1
+            """,
+            (self._agent_id, entry_id, self._agent_id, entry_id),
         )
 
     async def _enqueue_idempotent(
@@ -798,13 +856,8 @@ class DeliveryQueue:
                     stored_legacy_hash = existing[4]
 
                     canonical_id = existing[0]
-                    dead_letter = await self._db.fetchone(
-                        """
-                        SELECT id FROM delivery_dead_letter
-                        WHERE (original_id = ? OR retry_entry_id = ?)
-                              AND agent_id = ?
-                        """,
-                        (canonical_id, canonical_id, self._agent_id),
+                    dead_letter = await self._find_dead_letter_for_queue_id(
+                        canonical_id
                     )
                     if dead_letter is not None:
                         raise DeliveryIdempotencyTerminal(
@@ -1094,10 +1147,12 @@ class DeliveryQueue:
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
                       WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                        AND (
-                            delivery_dead_letter.original_id = delivery_queue.id
-                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                        )
+                        AND delivery_dead_letter.original_id = delivery_queue.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                        AND delivery_dead_letter.retry_entry_id = delivery_queue.id
                   )
             ORDER BY next_retry_at ASC
             LIMIT ?
@@ -1345,13 +1400,7 @@ class DeliveryQueue:
                 logger.warning("Cannot dead-letter unknown entry: %s", entry_id)
                 return
 
-            existing = await self._db.fetchone(
-                """
-                SELECT id FROM delivery_dead_letter
-                WHERE (original_id = ? OR retry_entry_id = ?) AND agent_id = ?
-                """,
-                (entry_id, entry_id, self._agent_id),
-            )
+            existing = await self._find_dead_letter_for_queue_id(entry_id)
             if existing is None:
                 await self._db.execute(
                     """
@@ -1405,10 +1454,12 @@ class DeliveryQueue:
               AND NOT EXISTS (
                   SELECT 1 FROM delivery_dead_letter
                   WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                    AND (
-                        delivery_dead_letter.original_id = delivery_queue.id
-                        OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                    )
+                    AND delivery_dead_letter.original_id = delivery_queue.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.retry_entry_id = delivery_queue.id
               )
             GROUP BY status
             """,
@@ -1446,10 +1497,12 @@ class DeliveryQueue:
               AND NOT EXISTS (
                   SELECT 1 FROM delivery_dead_letter
                   WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                    AND (
-                        delivery_dead_letter.original_id = delivery_queue.id
-                        OR delivery_dead_letter.retry_entry_id = delivery_queue.id
-                    )
+                    AND delivery_dead_letter.original_id = delivery_queue.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.retry_entry_id = delivery_queue.id
               )
             ORDER BY next_retry_at ASC
             LIMIT ?
@@ -1578,10 +1631,12 @@ class DeliveryQueue:
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
                       WHERE delivery_dead_letter.agent_id = delivery_idempotency.agent_id
-                        AND (
-                            delivery_dead_letter.original_id = delivery_idempotency.entry_id
-                            OR delivery_dead_letter.retry_entry_id = delivery_idempotency.entry_id
-                        )
+                        AND delivery_dead_letter.original_id = delivery_idempotency.entry_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_dead_letter
+                      WHERE delivery_dead_letter.agent_id = delivery_idempotency.agent_id
+                        AND delivery_dead_letter.retry_entry_id = delivery_idempotency.entry_id
                   )
                 """,
                 (self._agent_id, cutoff),
@@ -1917,6 +1972,12 @@ class DeliveryQueue:
             """
             CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_entry
             ON delivery_idempotency(agent_id, entry_id)
+            """
+        )
+        await self._db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_previous
+            ON delivery_idempotency(agent_id, previous_entry_id)
             """
         )
         await self._db.execute(

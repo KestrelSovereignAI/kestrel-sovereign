@@ -640,7 +640,7 @@ async def test_replay_cannot_miss_concurrent_dead_letter_commit(
             row = await original_fetchone(sql, params)
             if (
                 asyncio.current_task() is replay_task
-                and "SELECT id FROM delivery_dead_letter" in sql
+                and "AS matching_dead_letter" in sql
                 and not paused
             ):
                 paused = True

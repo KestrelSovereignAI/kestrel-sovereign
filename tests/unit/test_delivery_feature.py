@@ -575,10 +575,10 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 5 indexes + the one-time v2 trigger cleanup + replacement
+        # 3 tables + 6 indexes + the one-time v2 trigger cleanup + replacement
         # of the scoped SQLite atomic-compensation trigger. The v2 index is not
         # rebuilt on an already-v3 schema.
-        assert queue._db.execute.call_count == 15
+        assert queue._db.execute.call_count == 16
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1198,6 +1198,7 @@ class TestQueueIdempotency:
         )
         names = {row[0] for row in indexes}
         assert "idx_delivery_idempotency_entry" in names
+        assert "idx_delivery_idempotency_previous" in names
         assert "idx_delivery_idempotency_retention" in names
 
     @pytest.mark.asyncio
@@ -2724,6 +2725,54 @@ class TestQueueIdempotency:
         details = "\n".join(str(column) for row in plan for column in row)
         assert "idx_delivery_queue_dedup" in details
         assert "idx_delivery_queue_canonical_dedup" in details
+
+    @pytest.mark.asyncio
+    async def test_status_dead_letter_antijoins_use_identity_indexes(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_fetchall = queue._db.fetchall
+        captured = {}
+
+        async def capture_status_query(sql, params=()):
+            if "GROUP BY status" in sql:
+                captured["sql"] = sql
+                captured["params"] = params
+            return await original_fetchall(sql, params)
+
+        with patch.object(queue._db, "fetchall", side_effect=capture_status_query):
+            await queue.get_status_counts()
+
+        normalized = " ".join(captured["sql"].split())
+        assert " OR " not in normalized
+        plan = await queue._db.fetchall(
+            f"EXPLAIN QUERY PLAN {captured['sql']}", captured["params"]
+        )
+        details = "\n".join(str(column) for row in plan for column in row)
+        assert "idx_delivery_dead_letter_original" in details
+        assert "idx_delivery_dead_letter_retry" in details
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_lock_probes_each_identity_without_or(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+
+        with patch.object(queue._db, "execute", wraps=original_execute) as execute:
+            assert await queue._lock_dead_letter("missing-entry") is None
+
+        updates = [
+            " ".join(call.args[0].split())
+            for call in execute.call_args_list
+            if "UPDATE delivery_dead_letter" in call.args[0]
+        ]
+        assert len(updates) == 1
+        assert all(" OR " not in sql for sql in updates)
+        assert "UNION ALL" in updates[0]
+        assert "AND id = ?" in updates[0]
+        assert "AND original_id = ?" in updates[0]
+        assert "AND retry_entry_id = ?" in updates[0]
 
     @pytest.mark.asyncio
     async def test_pre_upgrade_legacy_hash_still_deduplicates(self, real_queue):
