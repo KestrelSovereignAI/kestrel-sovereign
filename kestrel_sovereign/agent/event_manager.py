@@ -289,6 +289,31 @@ class EventManagerMixin:
 
         delay = A2A_WAKE_RETRY_INITIAL_SECONDS
         pending = vars(self).setdefault("_a2a_submitted_signal_handles", {})
+        # A retry loop must terminate on a condition retrying cannot change.
+        # Durable admission needs a registered durable cognition consumer;
+        # an agent that never registered one (the ordinary non-durable
+        # configuration) can never admit this wake, and NOT_ADMITTED there is
+        # permanent, not transient. Before #3163 this path was a plain
+        # enqueue_signal wake -- "nothing durable advances on delivery here,
+        # the task row is already persisted, this signal is only the wake."
+        # Keep that contract for those agents instead of spinning at the 5s
+        # cap forever.
+        has_durable = getattr(self.dispatcher, "has_durable_consumer", None)
+        if callable(has_durable) and not has_durable(consumer_id):
+            signal = signal_factory()
+            handle = await self.dispatcher.enqueue_signal(signal)
+            outcome = await await_terminal_delivery(
+                handle,
+                label=label,
+                delivered_statuses=ACCEPTED_STATUSES,
+            )
+            if not outcome.delivered:
+                logging.warning(
+                    "%s: non-durable wake was not delivered (%s)",
+                    label,
+                    outcome.describe(),
+                )
+            return
         while True:
             if cancellation_aware:
                 try:
