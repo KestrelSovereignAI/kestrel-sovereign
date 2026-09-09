@@ -1159,6 +1159,19 @@ async def stop_agent_request(request: Request):
                     "Stop correlation_id must be a non-empty valid Unicode string."
                 ),
             )
+        reason = data.get("reason")
+        if reason is not None and (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 1024
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_stop_reason",
+                message=(
+                    "Stop reason must be non-empty text no longer than 1024 characters."
+                ),
+            )
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():
@@ -1221,6 +1234,7 @@ async def stop_agent_request(request: Request):
             ),
             target_is_turn_id=turn_id is not None,
             turn_id=turn_id,
+            reason=reason,
             trace_id=trace_id,
             span_id=span_id,
             **(

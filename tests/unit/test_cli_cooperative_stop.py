@@ -1,13 +1,14 @@
 """CLI contract for cooperative Stop and separate process termination (#3160)."""
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
 
-from kestrel_sovereign.cli import build_parser
 from kestrel_sovereign import cli_stop
+from kestrel_sovereign.cli import build_parser
 from kestrel_sovereign.cli_stop import cmd_stop
 
 
@@ -21,16 +22,47 @@ def _response(*, status=200, payload):
     return response
 
 
-def _outcome(disposition="stopped", *, receipt="receipt-1", agent="did:emma"):
+def _outcome(
+    disposition="stopped",
+    *,
+    receipt="receipt-1",
+    agent="did:emma",
+    scope="agent",
+):
     return {
-        "scope": "agent",
-        "requested_target": agent,
+        "scope": scope,
+        "requested_target": agent if scope == "agent" else None,
         "resolved_target": agent,
         "agent_id": agent,
         "disposition": disposition,
         "correlation_id": "cli:fixed",
         "receipt_id": receipt,
     }
+
+
+def _attestation(*, port=8888):
+    project = Path("/project")
+    return cli_stop._LocalProcessAttestation(
+        project_root=project,
+        pid_file=project / "logs" / ".host.pid",
+        pid=123,
+        port=port,
+    )
+
+
+def _endpoint(
+    url="http://host/api/agent/stop",
+    *,
+    key="secret",
+    expected_agent_id="did:emma",
+    port=8888,
+):
+    return cli_stop._StopEndpoint(
+        url=url,
+        api_key=key,
+        attestation=_attestation(port=port),
+        expected_agent_id=expected_agent_id,
+    )
 
 
 def test_parser_separates_cooperative_stop_from_process_termination():
@@ -67,6 +99,75 @@ def test_unreachable_fleet_stop_names_all_agents_not_none(capsys):
     assert "None" not in output
 
 
+def test_local_request_ignores_ambient_proxy_configuration():
+    client = MagicMock()
+    client.__enter__.return_value = client
+    with patch("httpx.Client", return_value=client) as client_type:
+        cli_stop._local_request("GET", "http://127.0.0.1:8888/probe")
+
+    client_type.assert_called_once_with(trust_env=False)
+    client.request.assert_called_once_with(
+        "GET",
+        "http://127.0.0.1:8888/probe",
+    )
+
+
+def test_attestation_requires_matching_live_project_process_and_listener(tmp_path):
+    from kestrel_sovereign.multi_agent.process_manager import PidStatus
+
+    pid_file = tmp_path / "logs" / ".host.pid"
+    record = SimpleNamespace(
+        status=PidStatus.LIVE,
+        pid=123,
+        root=str(tmp_path),
+        port=8888,
+    )
+    with (
+        patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
+        patch.object(
+            cli_stop.ProcessManager,
+            "find_pids_on_port",
+            return_value=[123],
+        ),
+    ):
+        attestation = cli_stop._attested_local_process(
+            tmp_path,
+            pid_file=pid_file,
+            port=8888,
+        )
+
+    assert attestation == cli_stop._LocalProcessAttestation(
+        project_root=tmp_path.resolve(),
+        pid_file=pid_file,
+        pid=123,
+        port=8888,
+    )
+
+
+def test_attestation_rejects_listener_owned_by_another_process(tmp_path):
+    from kestrel_sovereign.multi_agent.process_manager import PidStatus
+
+    record = SimpleNamespace(
+        status=PidStatus.LIVE,
+        pid=123,
+        root=str(tmp_path),
+        port=8888,
+    )
+    with (
+        patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
+        patch.object(
+            cli_stop.ProcessManager,
+            "find_pids_on_port",
+            return_value=[999],
+        ),
+    ):
+        assert cli_stop._attested_local_process(
+            tmp_path,
+            pid_file=tmp_path / ".host.pid",
+            port=8888,
+        ) is None
+
+
 def test_host_stop_resolution_probes_live_host_for_accepted_sovereign_key(tmp_path):
     from kestrel_sovereign import cli
 
@@ -82,63 +183,128 @@ def test_host_stop_resolution_probes_live_host_for_accepted_sovereign_key(tmp_pa
             return_value=("exported-secret", "file-secret"),
         ),
         patch(
+            "kestrel_sovereign.cli_stop._attested_local_process",
+            return_value=_attestation(),
+        ),
+        patch(
             "kestrel_sovereign.cli_stop._host_operator_key",
             return_value="exported-secret",
         ) as detect,
     ):
-        assert cli_stop._stop_endpoint(
-            _args(name=None, all_agents=True)
-        ) == ("http://localhost:8888/api/host/stop", "exported-secret")
-    detect.assert_called_once_with(8888, ("exported-secret", "file-secret"))
+        resolved = cli_stop._stop_endpoint(_args(name=None, all_agents=True))
+    assert resolved == _endpoint(
+        "http://127.0.0.1:8888/api/host/stop",
+        key="exported-secret",
+        expected_agent_id=None,
+    )
+    detect.assert_called_once_with(
+        _attestation(),
+        ("exported-secret", "file-secret"),
+    )
 
 
 def test_host_operator_key_uses_authenticated_read_only_probe():
-    with patch("httpx.get") as get:
-        get.side_effect = [
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch("kestrel_sovereign.cli_stop._local_request") as request,
+    ):
+        request.side_effect = [
             _response(status=401, payload={}),
-            _response(status=200, payload={"contributions": []}),
+            _response(status=200, payload={"can_stop": True}),
         ]
 
         assert cli_stop._host_operator_key(
-            8888,
+            _attestation(),
             ("stale", "accepted"),
         ) == "accepted"
 
-    assert [call.args[0] for call in get.call_args_list] == [
-        "http://localhost:8888/api/host/ui/contributions",
-        "http://localhost:8888/api/host/ui/contributions",
+    assert [call.args[:2] for call in request.call_args_list] == [
+        ("GET", "http://127.0.0.1:8888/api/host/stop/status"),
+        ("GET", "http://127.0.0.1:8888/api/host/stop/status"),
     ]
-    assert get.call_args_list[0].kwargs["headers"] == {"X-API-Key": "stale"}
-    assert get.call_args_list[1].kwargs["headers"] == {"X-API-Key": "accepted"}
+    assert request.call_args_list[0].kwargs["headers"] == {"X-API-Key": "stale"}
+    assert request.call_args_list[1].kwargs["headers"] == {
+        "X-API-Key": "accepted"
+    }
+
+
+def test_operator_key_is_not_sent_after_process_attestation_changes():
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=False,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            side_effect=AssertionError("secret crossed an unattested socket"),
+        ),
+    ):
+        assert cli_stop._host_operator_key(_attestation(), ("secret",)) is None
+
+
+def test_agent_probe_requires_the_expected_durable_identity():
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            return_value=_response(
+                status=200,
+                payload={"agent_id": "did:other", "status": "healthy"},
+            ),
+        ),
+    ):
+        assert cli_stop._agent_operator_key(
+            _attestation(),
+            "http://127.0.0.1:8888/api/agent/info",
+            ("secret",),
+            expected_agent_id="did:emma",
+        ) is None
 
 
 def test_named_stop_resolution_delegates_agent_routing_to_live_http_probe(tmp_path):
     from kestrel_sovereign import cli
 
-    agent_config = SimpleNamespace(port=8801)
+    data_dir = tmp_path / "agents" / "emma"
+    agent_config = SimpleNamespace(
+        port=8801,
+        resolve_data_dir=lambda _project: data_dir,
+    )
     config = SimpleNamespace(host=SimpleNamespace(port=8888))
     config.get_local_agents = lambda: {"Emma": agent_config}
     config.get_remote_agents = lambda: {}
     with (
         patch.object(cli, "_get_project_dir", return_value=tmp_path),
         patch.object(cli.MultiAgentConfig, "load", return_value=config),
-        patch.object(
-            cli,
-            "_detect_running_agent_server",
-            return_value=("http://localhost:8888/api/agents/Emma", "key"),
-        ) as detect,
         patch.object(cli, "_operator_api_keys", return_value=("operator-key",)),
+        patch(
+            "kestrel_sovereign.cli_stop.read_anchor_agent_did_sync",
+            return_value="did:emma",
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._attested_local_process",
+            side_effect=[_attestation(), None],
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._agent_operator_key",
+            return_value="key",
+        ) as detect,
     ):
         resolved = cli_stop._stop_endpoint(_args())
-    assert resolved == (
-        "http://localhost:8888/api/agents/Emma/api/agent/stop",
-        "key",
+    assert resolved == _endpoint(
+        "http://127.0.0.1:8888/api/agents/Emma/api/agent/stop",
+        key="key",
     )
     detect.assert_called_once_with(
-        "Emma",
-        agent_config,
-        config,
-        operator_api_keys=("operator-key",),
+        _attestation(),
+        "http://127.0.0.1:8888/api/agents/Emma/api/agent/info",
+        ("operator-key",),
+        expected_agent_id="did:emma",
     )
 
 
@@ -175,18 +341,25 @@ def test_named_stop_posts_only_intent_and_prints_receipted_outcome(capsys):
     with (
         patch(
             "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=("http://host/api/agent/stop", "secret"),
+            return_value=_endpoint(),
         ),
         patch(
             "kestrel_sovereign.cli_stop._operation_id",
             return_value="cli:fixed",
         ),
-        patch("httpx.post", return_value=response) as post,
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            return_value=response,
+        ) as post,
     ):
         assert cmd_stop(_args(reason="andon")) == 0
 
     post.assert_called_once()
-    assert post.call_args.args == ("http://host/api/agent/stop",)
+    assert post.call_args.args == ("POST", "http://host/api/agent/stop")
     assert post.call_args.kwargs["json"] == {
         "correlation_id": "cli:fixed",
         "reason": "andon",
@@ -198,6 +371,99 @@ def test_named_stop_posts_only_intent_and_prints_receipted_outcome(capsys):
     assert "receipt-1" in output
 
 
+def test_successful_fleet_stop_requires_complete_host_evidence(capsys):
+    outcomes = [
+        _outcome(agent="did:alpha", scope="host"),
+        _outcome(agent="did:beta", receipt="receipt-2", scope="host"),
+    ]
+    response = _response(
+        payload={
+            "success": True,
+            "state": "confirmed",
+            "target_count": 2,
+            "confirmed_count": 2,
+            "unconfirmed_count": 0,
+            "correlation_id": "cli:fixed",
+            "stop_outcomes": outcomes,
+        },
+    )
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._stop_endpoint",
+            return_value=_endpoint(
+                "http://host/api/host/stop",
+                expected_agent_id=None,
+            ),
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._operation_id",
+            return_value="cli:fixed",
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            return_value=response,
+        ),
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 0
+
+    output = capsys.readouterr().out
+    assert "did:alpha" in output and "did:beta" in output
+
+
+def test_success_with_malformed_or_mismatched_outcomes_fails_closed(capsys):
+    response = _response(
+        payload={
+            "success": True,
+            "stop_outcomes": [_outcome(), "not-an-outcome"],
+        },
+    )
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._stop_endpoint",
+            return_value=_endpoint(),
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._operation_id",
+            return_value="cli:fixed",
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            return_value=response,
+        ),
+    ):
+        assert cmd_stop(_args()) == 1
+
+    assert "inconsistent" in capsys.readouterr().out
+
+
+def test_changed_process_attestation_prevents_credential_dispatch(capsys):
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._stop_endpoint",
+            return_value=_endpoint(),
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=False,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            side_effect=AssertionError("credential crossed an untrusted socket"),
+        ),
+    ):
+        assert cmd_stop(_args()) == 1
+
+    assert "identity changed" in capsys.readouterr().out
+
+
 def test_refused_agent_error_prints_typed_outcome_and_fails(capsys):
     refused = _outcome("refused", receipt="receipt-refused")
     response = _response(
@@ -207,9 +473,13 @@ def test_refused_agent_error_prints_typed_outcome_and_fails(capsys):
     with (
         patch(
             "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=("http://host/api/agent/stop", "secret"),
+            return_value=_endpoint(),
         ),
-        patch("httpx.post", return_value=response),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
     ):
         assert cmd_stop(_args()) == 1
 
@@ -237,9 +507,16 @@ def test_stop_all_preserves_partial_outcomes_and_nonzero_exit(capsys):
     with (
         patch(
             "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=("http://host/api/host/stop", "secret"),
+            return_value=_endpoint(
+                "http://host/api/host/stop",
+                expected_agent_id=None,
+            ),
         ),
-        patch("httpx.post", return_value=response),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
     ):
         assert cmd_stop(_args(name=None, all_agents=True)) == 1
 
@@ -253,10 +530,14 @@ def test_transport_failure_is_indeterminate(capsys):
     with (
         patch(
             "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=("http://host/api/agent/stop", "secret"),
+            return_value=_endpoint(),
         ),
         patch(
-            "httpx.post",
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
             side_effect=httpx.ConnectError("offline", request=request),
         ),
     ):
@@ -274,9 +555,13 @@ def test_success_without_a_durable_receipt_is_nonzero(capsys):
     with (
         patch(
             "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=("http://host/api/agent/stop", "secret"),
+            return_value=_endpoint(),
         ),
-        patch("httpx.post", return_value=response),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
     ):
         assert cmd_stop(_args()) == 1
     assert "stopped" in capsys.readouterr().out

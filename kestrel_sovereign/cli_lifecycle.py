@@ -1719,7 +1719,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
     restart_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
     restart_p.add_argument(
         "--force", action="store_true",
-        help="Force-kill existing processes during the stop phase",
+        help="Force-kill existing processes during the termination phase",
     )
     _add_startup_timeout_argument(restart_p)
 
