@@ -3435,15 +3435,19 @@ def _runtime_generated_tool_class_surfaces(
     """Find concrete runtime-tool boundaries in a complete shipped package."""
 
     surfaces: set[str] = set()
+    class_records: list[
+        tuple[str, tuple[str, ...], ast.ClassDef, set[str]]
+    ] = []
+    alias_edges: list[tuple[str, str]] = []
 
     def base_name(base: ast.expr) -> str:
         if isinstance(base, ast.Name):
-            return base.id
+            return base.id.casefold()
         if isinstance(base, ast.Attribute):
-            return base.attr
+            return base.attr.casefold()
         return ""
 
-    def walk_statements(
+    def collect_statements(
         statements: list[ast.stmt],
         relative: str,
         parents: tuple[str, ...] = (),
@@ -3451,39 +3455,89 @@ def _runtime_generated_tool_class_surfaces(
         for node in statements:
             if isinstance(node, ast.ClassDef):
                 qualified = (*parents, node.name)
-                if any(base_name(base) == "AgentTool" for base in node.bases):
-                    for member in node.body:
-                        if (
-                            isinstance(
-                                member,
-                                (ast.FunctionDef, ast.AsyncFunctionDef),
-                            )
-                            and member.name == "execute"
-                        ):
-                            surfaces.add(
-                                f"{relative}::"
-                                f"{'.'.join((*qualified, member.name))}"
-                            )
-                walk_statements(node.body, relative, qualified)
+                class_records.append(
+                    (
+                        relative,
+                        qualified,
+                        node,
+                        {
+                            name
+                            for base in node.bases
+                            if (name := base_name(base))
+                        },
+                    )
+                )
+                collect_statements(node.body, relative, qualified)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualified = (*parents, node.name)
                 if node.name in {"to_orchestrator_tool", "execute_as_subagent"}:
                     surfaces.add(f"{relative}::{'.'.join(qualified)}")
-                walk_statements(node.body, relative, qualified)
+                collect_statements(node.body, relative, qualified)
             else:
                 nested_statements = [
                     child
                     for child in ast.iter_child_nodes(node)
                     if isinstance(child, ast.stmt)
                 ]
-                walk_statements(nested_statements, relative, parents)
+                collect_statements(nested_statements, relative, parents)
 
     for path in package_root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        walk_statements(
+        relative = path.relative_to(repository_root).as_posix()
+        collect_statements(
             tree.body,
-            path.relative_to(repository_root).as_posix(),
+            relative,
         )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                alias_edges.extend(
+                    (
+                        (alias.asname or alias.name).casefold(),
+                        alias.name.casefold(),
+                    )
+                    for alias in node.names
+                )
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    list(node.targets)
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                value_name = base_name(node.value) if node.value is not None else ""
+                if value_name:
+                    alias_edges.extend(
+                        (name.casefold(), value_name)
+                        for target in targets
+                        for name in _binding_target_names(target)
+                    )
+
+    tool_class_names = {"agenttool"}
+    tool_classes: set[ast.ClassDef] = set()
+    changed = True
+    while changed:
+        changed = False
+        for alias, source in alias_edges:
+            if source in tool_class_names and alias not in tool_class_names:
+                tool_class_names.add(alias)
+                changed = True
+        for _relative, _qualified, node, bases in class_records:
+            if node in tool_classes or not bases.intersection(tool_class_names):
+                continue
+            tool_classes.add(node)
+            tool_class_names.add(node.name.casefold())
+            changed = True
+
+    for relative, qualified, node, _bases in class_records:
+        if node not in tool_classes:
+            continue
+        for member in node.body:
+            if (
+                isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name == "execute"
+            ):
+                surfaces.add(
+                    f"{relative}::{'.'.join((*qualified, member.name))}"
+                )
     return surfaces
 
 
@@ -9377,6 +9431,82 @@ def _local_attribution_authorization_helpers(
     return helpers
 
 
+def _local_verified_sender_authorizers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Resolve the concrete local DID-authorizer seam by implementation shape."""
+
+    helpers: set[str] = set()
+    for function in functions:
+        if function.name.casefold() != "_authorize_verified_a2a_sender":
+            continue
+        nodes = _walk_lexical_scope(function)
+        calls = {
+            _call_name(node).casefold()
+            for node in nodes
+            if isinstance(node, ast.Call)
+        }
+        constants = {
+            node.value.casefold()
+            for node in nodes
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        parameter_names = {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            ]
+        }
+        if (
+            {"authorizer", "sender_did"} <= parameter_names
+            and "authorize" in calls
+            and "authorize_principal" in constants
+            and "authorize_with_policy" in constants
+        ):
+            helpers.add(function.name.casefold())
+    return helpers
+
+
+_LOCAL_A2A_IDENTITY_PLUMBING_HELPERS = frozenset(
+    {
+        "_a2a_inbound_current_scope_is_valid",
+        "_a2a_inbound_requires_verified_sender",
+        "_a2a_inbound_scope_snapshot",
+        "_a2a_inbound_scope_unchanged",
+        "_a2a_inbound_sender_authorizer",
+        "_a2a_replay_store",
+        "_a2a_sender_witness_unchanged",
+        "_authorize_verified_a2a_sender",
+    }
+)
+
+
+def _local_a2a_identity_plumbing_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Resolve concrete local identity helpers without trusting their spelling."""
+
+    by_name: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for function in functions:
+        by_name.setdefault(function.name.casefold(), []).append(function)
+    return {
+        name
+        for name in _LOCAL_A2A_IDENTITY_PLUMBING_HELPERS
+        if len(by_name.get(name, ())) == 1
+        and not any(
+            isinstance(node, ast.Call)
+            and (
+                _is_cross_agent_lifecycle_action(_call_name(node))
+                or _call_name(node).casefold()
+                in {"delegate", "offboard", "spawn", "withdraw"}
+            )
+            for node in _walk_lexical_scope(by_name[name][0])
+        )
+    }
+
+
 def _unverified_attribution_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     *,
@@ -9742,6 +9872,7 @@ def _is_attribution_validation_call(
         or getattr(call, "_authority_verification_result", False)
         or getattr(call, "_authority_verified_attribution", False)
         or getattr(call, "_authority_identity_witness", False)
+        or getattr(call, "_authority_trusted_identity_plumbing", False)
     )
 
 
@@ -10184,6 +10315,23 @@ def _cross_agent_control_aliases(
     assignments: list[tuple[str, str]] = []
     container_aliases = _mutable_container_alias_snapshots(function)
     callable_alias_edges = _scope_callable_alias_edges(function)
+    lambda_bindings: dict[str, ast.Lambda] = {}
+    for candidate in _walk_lexical_scope(function):
+        targets: list[ast.AST] = []
+        value: ast.AST | None = None
+        if isinstance(candidate, ast.Assign):
+            targets = list(candidate.targets)
+            value = candidate.value
+        elif isinstance(candidate, ast.AnnAssign):
+            targets = [candidate.target]
+            value = candidate.value
+        elif isinstance(candidate, ast.NamedExpr):
+            targets = [candidate.target]
+            value = candidate.value
+        if isinstance(value, ast.Lambda):
+            for target in targets:
+                for name in _binding_target_names(target):
+                    lambda_bindings[name.casefold()] = value
 
     def reference_sources(value: ast.AST) -> set[str]:
         sources = set(
@@ -10193,10 +10341,29 @@ def _cross_agent_control_aliases(
             value = value.value
         if not isinstance(value, ast.Call):
             return sources
-        for source_name in _expanded_callable_sources(
+        source_names = _expanded_callable_sources(
             _call_name(value),
             callable_alias_edges,
+        )
+        lambda_nodes = (
+            [value.func] if isinstance(value.func, ast.Lambda) else []
+        )
+        lambda_nodes.extend(
+            lambda_bindings[source_name]
+            for source_name in source_names
+            if source_name in lambda_bindings
+        )
+        for lambda_node in lambda_nodes:
+            flow = _lambda_callback_invocation_flow(lambda_node)
+            for argument in _bound_parameter_flow_arguments(value, flow):
+                sources.update(reference_sources(argument))
+        if lambda_nodes and any(
+            _is_unambiguous_control_token(source)
+            or source in (control_helpers or set())
+            for source in sources
         ):
+            setattr(value, "_authority_lambda_control_call", True)
+        for source_name in source_names:
             flow = (parameter_return_flows or {}).get(source_name)
             if flow is None:
                 continue
@@ -10266,6 +10433,11 @@ def _cross_agent_control_aliases(
                     for target_name in target_names
                     for source in sources
                 )
+            # Resolve local lambda adapters for this concrete call site. The
+            # resolver annotates only calls whose bound callback is a control;
+            # it must not promote the callable name globally, because another
+            # invocation may bind an ordinary callback.
+            reference_sources(node)
             continue
         if value is None:
             continue
@@ -10426,6 +10598,39 @@ def _invoked_lambda_bodies(
         if name in invoked_names
     )
     return tuple(invoked)
+
+
+def _lambda_callback_invocation_flow(
+    lambda_node: ast.Lambda,
+) -> _ParameterReturnFlow:
+    """Describe lambda parameters invoked as callbacks by its body."""
+
+    parameter_names = {
+        parameter.arg.casefold()
+        for parameter in [
+            *lambda_node.args.posonlyargs,
+            *lambda_node.args.args,
+            *lambda_node.args.kwonlyargs,
+            *(
+                [lambda_node.args.vararg]
+                if lambda_node.args.vararg is not None
+                else []
+            ),
+            *(
+                [lambda_node.args.kwarg]
+                if lambda_node.args.kwarg is not None
+                else []
+            ),
+        ]
+    }
+    invoked = {
+        node.func.id.casefold()
+        for node in ast.walk(lambda_node.body)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id.casefold() in parameter_names
+    }
+    return _parameter_return_flow(lambda_node, invoked)
 
 
 def _control_reference_sources(
@@ -10749,7 +10954,8 @@ def _is_cross_agent_control_call(
         )
     )
     return (
-        _CALLABLE_CONTROL in _callable_semantics(node.func)
+        getattr(node, "_authority_lambda_control_call", False)
+        or _CALLABLE_CONTROL in _callable_semantics(node.func)
         or _is_unambiguous_control_sink(node, control_aliases)
         or _shell_adapter_invokes_kestrel_lifecycle(node)
         or kills_agent_process
@@ -12288,7 +12494,7 @@ class _ParameterMutationFlow(NamedTuple):
 
 
 def _parameter_return_flow(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
     flowed_parameters: set[str],
 ) -> _ParameterReturnFlow:
     """Convert flowed formal names into a caller-facing immutable summary."""
@@ -14217,22 +14423,6 @@ def _try_flow_uses_provenance_as_control(
     )
 
 
-_A2A_IDENTITY_PLUMBING_CALLS = frozenset(
-    {
-        "_a2a_inbound_current_scope_is_valid",
-        "_a2a_inbound_requires_verified_sender",
-        "_a2a_inbound_scope_snapshot",
-        "_a2a_inbound_scope_unchanged",
-        "_a2a_sender_witness_unchanged",
-        "_authorize_verified_a2a_sender",
-        "a2a_hosted_policy_for",
-        "a2a_sender_identity_witness",
-        "authorize_a2a_legacy_unsigned_sender",
-        "authorize_legacy",
-    }
-)
-
-
 def _authenticated_identity_selects_protected_control(
     roots: ast.AST | list[ast.AST],
     control_aliases: set[str],
@@ -14249,8 +14439,6 @@ def _authenticated_identity_selects_protected_control(
         found = False
 
         def visit_Call(self, call: ast.Call) -> None:  # noqa: N802
-            if _call_name(call).casefold() in _A2A_IDENTITY_PLUMBING_CALLS:
-                return
             if _is_cross_agent_control_call(
                 call, control_aliases, state_object_aliases
             ) or _is_cross_agent_state_mutation_call(
@@ -14322,9 +14510,15 @@ def _is_fail_closed_envelope_acceptance_guard(
             found = False
 
             def visit_Call(self, call: ast.Call) -> None:  # noqa: N802
-                if _call_name(call).casefold() in (
-                    _A2A_IDENTITY_PLUMBING_CALLS | allowed_calls
-                ):
+                if _call_name(call).casefold() in allowed_calls:
+                    # The exempted operation is the call itself. Python still
+                    # evaluates its receiver and arguments first, so inspect
+                    # those expressions for nested governed effects.
+                    self.visit(call.func)
+                    for argument in call.args:
+                        self.visit(argument)
+                    for keyword in call.keywords:
+                        self.visit(keyword.value)
                     return
                 if _is_cross_agent_control_call(
                     call, control_aliases, state_object_aliases
@@ -14430,11 +14624,16 @@ def _is_fail_closed_envelope_acceptance_guard(
                 value = candidate.value
             if value is None:
                 continue
-            calls = [child for child in ast.walk(value) if isinstance(child, ast.Call)]
-            if not any(
-                _call_name(call).casefold() in accepted_call_names
-                or getattr(call, "_authority_verified_attribution", False)
-                for call in calls
+            while isinstance(value, (ast.Await, ast.Expr)):
+                value = value.value
+            if not (
+                isinstance(value, ast.Call)
+                and (
+                    _call_name(value).casefold() in accepted_call_names
+                    and _is_attribution_validation_call(
+                        value, local_attribution_authorizers
+                    )
+                )
             ):
                 continue
             names.update(
@@ -14471,6 +14670,39 @@ def _is_fail_closed_envelope_acceptance_guard(
             return any(checks) if isinstance(test.op, ast.Or) else all(checks)
         return False
 
+    def assignment_kind(
+        assignment: ast.Assign | ast.AnnAssign | ast.NamedExpr,
+        name: str,
+        accepted_call_names: frozenset[str],
+    ) -> str | None:
+        """Classify one write to a candidate authorization-result binding."""
+
+        targets = (
+            list(assignment.targets)
+            if isinstance(assignment, ast.Assign)
+            else [assignment.target]
+        )
+        if name not in {
+            bound.casefold()
+            for target in targets
+            for bound in _binding_target_names(target)
+        }:
+            return None
+        value = assignment.value
+        if isinstance(value, ast.Constant) and value.value in {None, False, ""}:
+            return "invalid"
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        if (
+            isinstance(value, ast.Call)
+            and _call_name(value).casefold() in accepted_call_names
+            and _is_attribution_validation_call(
+                value, local_attribution_authorizers
+            )
+        ):
+            return "authorizer"
+        return "unknown"
+
     def branch_has_fail_closed_authorization(
         statements: list[ast.stmt],
         accepted_call_names: frozenset[str],
@@ -14485,35 +14717,35 @@ def _is_fail_closed_envelope_acceptance_guard(
             )
         }
         for name in result_names:
-            assignment_lines = [
-                getattr(candidate, "lineno", 0)
-                for statement in statements
-                for candidate in lexical_nodes(statement)
-                if isinstance(
-                    candidate, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
-                )
-                and name
-                in {
-                    bound.casefold()
-                    for target in (
-                        list(candidate.targets)
-                        if isinstance(candidate, ast.Assign)
-                        else [candidate.target]
-                    )
-                    for bound in _binding_target_names(target)
-                }
-                and authorization_result_names(candidate, accepted_call_names)
-            ]
             for statement in lexical_nodes(
                 ast.Module(body=statements, type_ignores=[])
             ):
-                if (
+                if not (
                     isinstance(statement, ast.If)
                     and rejects_authorization_result(statement.test, name)
                     and _block_guaranteed_function_exit(statement.body)
-                    and assignment_lines
-                    and max(assignment_lines) < statement.lineno
                 ):
+                    continue
+                kinds = [
+                    kind
+                    for prior in statements
+                    if getattr(prior, "lineno", 0) < statement.lineno
+                    for candidate in lexical_nodes(prior)
+                    if getattr(candidate, "lineno", 0) < statement.lineno
+                    if isinstance(
+                        candidate, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+                    )
+                    if (
+                        kind := assignment_kind(
+                            candidate, name, accepted_call_names
+                        )
+                    )
+                    is not None
+                ]
+                if "authorizer" in kinds and set(kinds) <= {
+                    "authorizer",
+                    "invalid",
+                }:
                     return True
         return False
 
@@ -14523,32 +14755,19 @@ def _is_fail_closed_envelope_acceptance_guard(
     ) -> bool:
         """Conservatively prove every path past ``statements`` authorized."""
 
-        def assignment_kind(
-            assignment: ast.Assign | ast.AnnAssign | ast.NamedExpr,
-            name: str,
-        ) -> str | None:
-            targets = (
-                list(assignment.targets)
-                if isinstance(assignment, ast.Assign)
-                else [assignment.target]
+        def is_explicit_unscoped_policy_continuation(
+            branch: list[ast.stmt],
+        ) -> bool:
+            """Recognize the recipient's explicit open-policy false arm."""
+
+            return bool(
+                len(branch) == 1
+                and isinstance(branch[0], ast.If)
+                and not branch[0].orelse
+                and _block_guaranteed_function_exit(branch[0].body)
+                and _identifier_tokens(branch[0].test)
+                == frozenset({"scoped_sender_required"})
             )
-            if name not in {
-                bound.casefold()
-                for target in targets
-                for bound in _binding_target_names(target)
-            }:
-                return None
-            value = assignment.value
-            if isinstance(value, ast.Constant) and value.value in {None, False, ""}:
-                return "invalid"
-            calls = [child for child in ast.walk(value) if isinstance(child, ast.Call)]
-            if any(
-                _call_name(call).casefold() in accepted_call_names
-                or getattr(call, "_authority_verified_attribution", False)
-                for call in calls
-            ):
-                return "authorizer"
-            return "unknown"
 
         result_names = {
             name
@@ -14573,7 +14792,12 @@ def _is_fail_closed_envelope_acceptance_guard(
                     if isinstance(
                         candidate, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
                     )
-                    if (kind := assignment_kind(candidate, name)) is not None
+                    if (
+                        kind := assignment_kind(
+                            candidate, name, accepted_call_names
+                        )
+                    )
+                    is not None
                 ]
                 if "authorizer" in kinds and set(kinds) <= {
                     "authorizer",
@@ -14595,7 +14819,7 @@ def _is_fail_closed_envelope_acceptance_guard(
                 statement.orelse
             ) or branch_all_continuing_paths_authorized(
                 statement.orelse, accepted_call_names
-            )
+            ) or is_explicit_unscoped_policy_continuation(statement.orelse)
             if body_safe and orelse_safe:
                 return True
         return _block_guaranteed_function_exit(statements)
@@ -14635,16 +14859,16 @@ def _is_fail_closed_envelope_acceptance_guard(
             and not contains_protected_control(statement.orelse)
         ):
             return None
-        return (
-            "strong"
-            if branch_all_continuing_paths_authorized(
+        if not (
+            branch_all_continuing_paths_authorized(
                 statement.body, verified_call_names
             )
             and branch_all_continuing_paths_authorized(
                 statement.orelse, legacy_call_names
             )
-            else "a2a-only"
-        )
+        ):
+            return None
+        return "strong"
 
     def containing_block(
         statements: list[ast.stmt],
@@ -14675,9 +14899,10 @@ def _is_fail_closed_envelope_acceptance_guard(
     )
     if partition is None:
         return False
-    partition_index, _partition_strength = partition
+    partition_index, partition_strength = partition
     return (
-        not contains_protected_control(suffix[:partition_index])
+        partition_strength == "strong"
+        and not contains_protected_control(suffix[:partition_index])
         and not contains_protected_control(
             suffix[partition_index + 1 :],
             allowed_calls=frozenset({"commit", "create_task"}),
@@ -17496,14 +17721,29 @@ def _authority_provenance_lines(
     local_attribution_authorizers = _local_attribution_authorization_helpers(
         functions
     )
+    local_verified_sender_authorizers = _local_verified_sender_authorizers(
+        functions
+    )
+    local_identity_plumbing_helpers = _local_a2a_identity_plumbing_helpers(
+        functions
+    )
     for call in (
         node
         for function in functions
         for node in _walk_lexical_scope(function)
         if isinstance(node, ast.Call)
-        and _call_name(node).casefold() in local_attribution_authorizers
+        and _call_name(node).casefold()
+        in local_attribution_authorizers | local_verified_sender_authorizers
     ):
         setattr(call, "_authority_local_attribution_authorizer", True)
+    for call in (
+        node
+        for function in functions
+        for node in _walk_lexical_scope(function)
+        if isinstance(node, ast.Call)
+        and _call_name(node).casefold() in local_identity_plumbing_helpers
+    ):
+        setattr(call, "_authority_trusted_identity_plumbing", True)
     function_parents = _nested_function_parents(tree)
     module_attribution_validators = _trusted_attribution_validator_aliases(tree)
     function_attribution_validators: dict[
@@ -18213,7 +18453,7 @@ def _authority_provenance_lines(
                 )
                 validates_attribution = _is_attribution_validation_call(
                     node, local_attribution_authorizers
-                ) or _call_name(node).casefold() in _A2A_IDENTITY_PLUMBING_CALLS
+                )
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if (
                     is_permission_call
@@ -20516,6 +20756,17 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
         "    adapter = callback\n"
         "    adapter()\n"
     )
+    lambda_callback_adapter = ast.parse(
+        "def dispatch(request, target):\n"
+        "    invoke = lambda callback: callback()\n"
+        "    if request.causation_chain:\n"
+        "        invoke(target.shutdown)\n"
+    )
+    immediate_lambda_callback_adapter = ast.parse(
+        "def dispatch(request, target):\n"
+        "    if request.causation_chain:\n"
+        "        (lambda callback: callback())(target.shutdown)\n"
+    )
 
     assert _authority_provenance_lines(imported_alias) == {4}
     assert _authority_provenance_lines(imported_remove_alias) == {4}
@@ -20524,6 +20775,8 @@ def test_provenance_scanner_follows_imported_controls_and_control_lambdas() -> N
     assert _authority_provenance_lines(lambda_authority) == {2}
     assert _authority_provenance_lines(conditional_lambda_authority) == {2}
     assert _authority_provenance_lines(aliased_lambda_authority) == {2}
+    assert _authority_provenance_lines(lambda_callback_adapter) == {3}
+    assert _authority_provenance_lines(immediate_lambda_callback_adapter) == {2}
 
 
 def test_provenance_scanner_reuses_central_lifecycle_for_imports() -> None:
@@ -21003,6 +21256,18 @@ def test_verified_sender_principals_require_verified_verdict_fields() -> None:
 
 
 def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
+    trusted_authorizer = (
+        "\nasync def _authorize_verified_a2a_sender(\n"
+        "    authorizer, sender_did, hosted_policy=None,\n"
+        "):\n"
+        "    getattr(authorizer, 'authorize_principal', None)\n"
+        "    getattr(authorizer, 'authorize_with_policy', None)\n"
+        "    return authorizer.authorize(sender_did)\n"
+    )
+
+    def parse_dispatch(source: str) -> ast.Module:
+        return ast.parse(source + trusted_authorizer)
+
     authorization = (
         "    if verdict.verified:\n"
         "        verified_sender = await _authorize_verified_a2a_sender(\n"
@@ -21031,23 +21296,23 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         + "    if not verdict.ok:\n"
         "        raise PermissionError\n"
     )
-    safe_a2a_delivery = ast.parse(
+    safe_a2a_delivery = parse_dispatch(
         prefix + authorization + "    await manager.create_task()\n"
     )
-    unauthorized_lifecycle = ast.parse(
+    unauthorized_lifecycle = parse_dispatch(
         prefix + authorization + "    target.shutdown()\n"
     )
-    unsafe = ast.parse(
+    unsafe = parse_dispatch(
         prefix + "    target.shutdown()\n" + authorization
     )
-    unsafe_rejection = ast.parse(
+    unsafe_rejection = parse_dispatch(
         header
         + "    if not verdict.ok:\n"
         "        target.shutdown()\n"
         "        raise PermissionError\n"
         + authorization
     )
-    unauthenticated_verified_arm = ast.parse(
+    unauthenticated_verified_arm = parse_dispatch(
         prefix
         + "    if verdict.verified:\n"
         "        pass\n"
@@ -21078,13 +21343,13 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         "        if debug:\n"
         "            raise PermissionError\n"
     )
-    unrelated_legacy_raise = ast.parse(
+    unrelated_legacy_raise = parse_dispatch(
         unrelated_legacy_source + "    target.shutdown()\n"
     )
-    unrelated_legacy_a2a_commit = ast.parse(
+    unrelated_legacy_a2a_commit = parse_dispatch(
         unrelated_legacy_source + "    await manager.create_task()\n"
     )
-    conditional_legacy_authorizer = ast.parse(
+    conditional_legacy_authorizer = parse_dispatch(
         prefix
         + "    if verdict.verified:\n"
         "        verified_sender = await _authorize_verified_a2a_sender(\n"
@@ -21103,6 +21368,54 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         "            raise PermissionError\n"
         "    target.shutdown()\n"
     )
+    overwritten_authorizer = parse_dispatch(
+        prefix
+        + authorization.replace(
+            "        if not verified_sender:\n",
+            "        verified_sender = verdict.sender\n"
+            "        if not verified_sender:\n",
+        )
+        + "    await manager.create_task()\n"
+    )
+    discarded_authorizer_result = parse_dispatch(
+        prefix
+        + authorization.replace(
+            "        verified_sender = await _authorize_verified_a2a_sender(\n"
+            "            manager, verdict.sender\n"
+            "        )\n",
+            "        verified_sender = (\n"
+            "            await _authorize_verified_a2a_sender(\n"
+            "                manager, verdict.sender\n"
+            "            ),\n"
+            "            verdict.sender,\n"
+            "        )[1]\n",
+        )
+        + "    await manager.create_task()\n"
+    )
+    nested_a2a_control = parse_dispatch(
+        prefix
+        + authorization
+        + "    await manager.create_task(payload=target.shutdown())\n"
+    )
+    conditionally_checked_authorizer = parse_dispatch(
+        prefix
+        + "    if verdict.verified:\n"
+        "        if debug:\n"
+        "            verified_sender = await _authorize_verified_a2a_sender(\n"
+        "                manager, verdict.sender\n"
+        "            )\n"
+        "            if not verified_sender:\n"
+        "                raise PermissionError\n"
+        "    else:\n"
+        "        authorize_legacy = getattr(\n"
+        "            manager,\n"
+        "            'authorize_a2a_legacy_unsigned_sender',\n"
+        "        )\n"
+        "        authorized = await authorize_legacy(task)\n"
+        "        if not authorized:\n"
+        "            raise PermissionError\n"
+        "    await manager.create_task()\n"
+    )
 
     assert _authority_provenance_lines(safe_a2a_delivery) == set()
     assert _authority_provenance_lines(unauthorized_lifecycle) == {7}
@@ -21112,6 +21425,61 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
     assert _authority_provenance_lines(unrelated_legacy_raise) == {7}
     assert _authority_provenance_lines(unrelated_legacy_a2a_commit) == {7}
     assert _authority_provenance_lines(conditional_legacy_authorizer) == {7}
+    assert _authority_provenance_lines(overwritten_authorizer) == {7}
+    assert _authority_provenance_lines(discarded_authorizer_result) == {7}
+    assert _authority_provenance_lines(nested_a2a_control) == {7}
+    assert _authority_provenance_lines(conditionally_checked_authorizer) == {7}
+
+
+def test_identity_helper_exemptions_are_resolved_and_scan_arguments(
+    tmp_path: Path,
+) -> None:
+    helper_argument = ast.parse(
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target, manager):\n"
+        "    verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if verdict.verified:\n"
+        "        await _authorize_verified_a2a_sender(\n"
+        "            manager, target.shutdown()\n"
+        "        )\n"
+    )
+    shadowed_helper = ast.parse(
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "def authorize_legacy(target):\n"
+        "    target.shutdown()\n\n"
+        "async def dispatch(task, target):\n"
+        "    verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if verdict.verified:\n"
+        "        authorize_legacy(target)\n"
+    )
+
+    assert _authority_provenance_lines(helper_argument) == {7}
+    assert _authority_provenance_lines(shadowed_helper) == {10}
+
+    helper_path = tmp_path / "shadowed_identity.py"
+    helper_path.write_text(
+        "def authorize_legacy(target):\n"
+        "    target.shutdown()\n",
+        encoding="utf-8",
+    )
+    controller_path = tmp_path / "controller.py"
+    controller_path.write_text(
+        "from shadowed_identity import authorize_legacy\n"
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target):\n"
+        "    verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if verdict.verified:\n"
+        "        authorize_legacy(target)\n",
+        encoding="utf-8",
+    )
+    _cached_authority_provenance_lines.cache_clear()
+    assert _cached_authority_provenance_lines(controller_path) == frozenset({8})
 
 
 def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
@@ -22582,12 +22950,22 @@ def test_runtime_agent_tool_scan_uses_complete_core_package(
     provider.write_text(
         "class OutsideFeatureTool(AgentTool):\n"
         "    async def execute(self, **kwargs):\n"
+        "        return kwargs\n\n"
+        "ToolBase = OutsideFeatureTool\n\n"
+        "class IndirectFeatureTool(ToolBase):\n"
+        "    async def execute(self, **kwargs):\n"
+        "        return kwargs\n\n"
+        "from elsewhere import AgentTool as ImportedToolBase\n\n"
+        "class ImportedFeatureTool(ImportedToolBase):\n"
+        "    async def execute(self, **kwargs):\n"
         "        return kwargs\n",
         encoding="utf-8",
     )
 
     assert _runtime_generated_tool_class_surfaces(package_root, tmp_path) == {
-        "kestrel_sovereign/agent/provider.py::OutsideFeatureTool.execute"
+        "kestrel_sovereign/agent/provider.py::ImportedFeatureTool.execute",
+        "kestrel_sovereign/agent/provider.py::IndirectFeatureTool.execute",
+        "kestrel_sovereign/agent/provider.py::OutsideFeatureTool.execute",
     }
 
     scanned_roots: list[tuple[Path, Path]] = []
