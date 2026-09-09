@@ -488,18 +488,18 @@ def test_named_stop_resolution_delegates_agent_routing_to_live_http_probe(tmp_pa
     ):
         resolved = cli_stop._stop_endpoint(_args())
     assert resolved == _endpoint(
-        "http://127.0.0.1:8888/api/agents/Emma/api/agent/stop",
+        "http://127.0.0.1:8888/api/agent-routes/RW1tYQ/api/agent/stop",
         key="key",
     )
     detect.assert_called_once_with(
         _attestation(),
-        "http://127.0.0.1:8888/api/agents/Emma/api/agent/info",
+        "http://127.0.0.1:8888/api/agent-routes/RW1tYQ/api/agent/info",
         ("operator-key",),
         expected_agent_id="did:emma",
     )
 
 
-def test_named_stop_quotes_the_agent_as_one_url_path_segment(tmp_path):
+def test_named_stop_encodes_any_agent_as_one_url_path_segment(tmp_path):
     from kestrel_sovereign import cli
 
     data_dir = tmp_path / "agents" / "emma bird"
@@ -534,12 +534,76 @@ def test_named_stop_quotes_the_agent_as_one_url_path_segment(tmp_path):
             _args(name="Emma bird/\N{SNOWMAN}")
         )
 
-    encoded = "Emma%20bird%2F%E2%98%83"
+    encoded = "RW1tYSBiaXJkL-KYgw"
     assert resolved is not None
-    assert resolved.url.endswith(f"/api/agents/{encoded}/api/agent/stop")
+    assert resolved.url.endswith(f"/api/agent-routes/{encoded}/api/agent/stop")
     assert detect.call_args.args[1].endswith(
-        f"/api/agents/{encoded}/api/agent/info"
+        f"/api/agent-routes/{encoded}/api/agent/info"
     )
+
+
+def test_standalone_bootstrap_key_is_cached_for_exact_process(tmp_path):
+    pid_file = tmp_path / "logs" / ".agent.pid"
+    attestation = cli_stop._LocalProcessAttestation(
+        project_root=tmp_path,
+        pid_file=pid_file,
+        pid=321,
+        port=8801,
+        started_at=123.5,
+        bind_host="127.0.0.1",
+        connect_host="127.0.0.1",
+    )
+    with (
+        patch.object(cli_stop, "_attestation_is_current", return_value=True),
+        patch.object(
+            cli_stop,
+            "_local_request",
+            return_value=_response(payload={"key": "ephemeral-key"}),
+        ) as request,
+    ):
+        assert cli_stop._standalone_bootstrap_key(attestation) == "ephemeral-key"
+        assert cli_stop._standalone_bootstrap_key(attestation) == "ephemeral-key"
+
+    request.assert_called_once()
+    cache = cli_stop._bootstrap_key_cache_path(attestation)
+    assert cache.stat().st_mode & 0o077 == 0
+
+
+def test_standalone_bootstrap_cache_is_bound_to_process_start(tmp_path):
+    pid_file = tmp_path / "logs" / ".agent.pid"
+    first = cli_stop._LocalProcessAttestation(
+        project_root=tmp_path,
+        pid_file=pid_file,
+        pid=321,
+        port=8801,
+        started_at=123.5,
+        bind_host="127.0.0.1",
+        connect_host="127.0.0.1",
+    )
+    restarted = cli_stop._LocalProcessAttestation(
+        project_root=tmp_path,
+        pid_file=pid_file,
+        pid=321,
+        port=8801,
+        started_at=124.5,
+        bind_host="127.0.0.1",
+        connect_host="127.0.0.1",
+    )
+    with (
+        patch.object(cli_stop, "_attestation_is_current", return_value=True),
+        patch.object(
+            cli_stop,
+            "_local_request",
+            side_effect=[
+                _response(payload={"key": "old-key"}),
+                _response(payload={"key": "new-key"}),
+            ],
+        ) as request,
+    ):
+        assert cli_stop._standalone_bootstrap_key(first) == "old-key"
+        assert cli_stop._standalone_bootstrap_key(restarted) == "new-key"
+
+    assert request.call_count == 2
 
 
 def test_remote_stop_never_sends_the_local_sovereign_key(tmp_path):

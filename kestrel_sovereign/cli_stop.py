@@ -10,14 +10,16 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json as json_module
+import os
 import socket
+import stat
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -25,6 +27,7 @@ from kestrel_sovereign.identity.local_anchor import (
 )
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.process_manager import PidStatus, ProcessManager
+from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 
 _CONFIRMED_DISPOSITIONS = frozenset({"stopped", "already_complete"})
 
@@ -404,12 +407,15 @@ def _agent_operator_key(
 def _standalone_bootstrap_key(
     attestation: _LocalProcessAttestation,
 ) -> str | None:
-    """Read a standalone bootstrap key only from the attested local process."""
+    """Reuse or read the key belonging to this exact standalone process."""
 
     import httpx
 
     if not _attestation_is_current(attestation):
         return None
+    cached = _read_bootstrap_key_cache(attestation)
+    if cached is not None:
+        return cached
     try:
         response = _local_request(
             "GET",
@@ -426,7 +432,95 @@ def _standalone_bootstrap_key(
     except ValueError:
         return None
     key = payload.get("key") if isinstance(payload, dict) else None
-    return key if isinstance(key, str) and key else None
+    if not isinstance(key, str) or not key:
+        return None
+    return key if _write_bootstrap_key_cache(attestation, key) else None
+
+
+def _bootstrap_key_cache_path(attestation: _LocalProcessAttestation) -> Path:
+    return attestation.pid_file.with_name(f"{attestation.pid_file.name}.stop-key.json")
+
+
+def _read_bootstrap_key_cache(
+    attestation: _LocalProcessAttestation,
+) -> str | None:
+    """Read a private cache only when it is bound to the attested process."""
+
+    path = _bootstrap_key_cache_path(attestation)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o077
+            or metadata.st_uid != os.getuid()
+        ):
+            return None
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            fd = -1
+            encoded = stream.read(16_385)
+        if len(encoded) > 16_384:
+            return None
+        payload = json_module.loads(encoded)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(payload, dict):
+        return None
+    key = payload.get("key")
+    if (
+        payload.get("pid") != attestation.pid
+        or payload.get("started_at") != attestation.started_at
+        or not isinstance(key, str)
+        or not key
+    ):
+        return None
+    return key
+
+
+def _write_bootstrap_key_cache(
+    attestation: _LocalProcessAttestation,
+    key: str,
+) -> bool:
+    """Atomically preserve a process-bound credential with owner-only mode."""
+
+    path = _bootstrap_key_cache_path(attestation)
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, flags, 0o600)
+        try:
+            payload = json_module.dumps(
+                {
+                    "pid": attestation.pid,
+                    "started_at": attestation.started_at,
+                    "key": key,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        # Reuse is load-bearing because bootstrap is deliberately rate-limited.
+        # Refuse this key instead of silently entering a later-call failure mode.
+        try:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _stop_endpoint(args) -> _StopEndpoint | None:
@@ -502,9 +596,9 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
                 )
 
         if host_attestation is not None:
-            agent_segment = quote(args.name, safe="")
+            agent_segment = encode_agent_route_name(args.name)
             origin = (
-                f"{_origin(host_attestation)}/api/agents/{agent_segment}"
+                f"{_origin(host_attestation)}/api/agent-routes/{agent_segment}"
             )
             key = _agent_operator_key(
                 host_attestation,
