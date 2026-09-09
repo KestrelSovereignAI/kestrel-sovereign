@@ -7,10 +7,15 @@ teardown is the separate ``kestrel terminate`` command.
 
 from __future__ import annotations
 
+import http.client
+import json as json_module
+import socket
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
@@ -30,6 +35,7 @@ class _LocalProcessAttestation:
     pid_file: Path
     pid: int
     port: int
+    started_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,13 +50,148 @@ def _operation_id() -> str:
     return f"cli:{uuid.uuid4()}"
 
 
-def _local_request(method: str, url: str, **kwargs):
-    """Send local control traffic without honoring ambient proxy variables."""
+@dataclass(frozen=True, slots=True)
+class _LocalResponse:
+    status_code: int
+    body: bytes
 
-    import httpx
+    @property
+    def text(self) -> str:
+        return self.body.decode("utf-8", errors="replace")
 
-    with httpx.Client(trust_env=False) as client:
-        return client.request(method, url, **kwargs)
+    def json(self) -> Any:
+        return json_module.loads(self.body)
+
+
+class _LocalRequestError(RuntimeError):
+    """The attested local control connection could not complete safely."""
+
+
+def _address_parts(address: object) -> tuple[str, int] | None:
+    try:
+        host = getattr(address, "ip", None)
+        port = getattr(address, "port", None)
+        if host is None or port is None:
+            host = address[0]  # type: ignore[index]
+            port = address[1]  # type: ignore[index]
+        host = str(host)
+        port = int(port)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return host, port
+
+
+def _exclusive_listener_is_owned_by(port: int, pid: int) -> bool:
+    """Fail closed unless every loopback-capable listener names ``pid``."""
+
+    try:
+        import psutil
+
+        listeners = []
+        for connection in psutil.net_connections(kind="tcp"):
+            local = _address_parts(connection.laddr)
+            if (
+                connection.status == psutil.CONN_LISTEN
+                and local is not None
+                and local[1] == port
+                and local[0] in {"127.0.0.1", "0.0.0.0", "::", "::1"}
+            ):
+                listeners.append(connection)
+    except Exception:  # noqa: BLE001 - inability to prove ownership is refusal
+        return False
+    return bool(listeners) and all(connection.pid == pid for connection in listeners)
+
+
+def _connected_socket_is_owned_by(
+    connection: http.client.HTTPConnection,
+    attestation: _LocalProcessAttestation,
+) -> bool:
+    """Bind the exact connected TCP flow to the recorded server process."""
+
+    sock = connection.sock
+    if sock is None:
+        return False
+    try:
+        client = _address_parts(sock.getsockname())
+        server = _address_parts(sock.getpeername())
+    except OSError:
+        return False
+    if client is None or server != ("127.0.0.1", attestation.port):
+        return False
+
+    # The handshake can complete just before the server event loop accepts it.
+    # No HTTP bytes (and therefore no credential) are sent during this bounded
+    # wait for the exact server-side socket to acquire a process owner.
+    for _ in range(20):
+        try:
+            import psutil
+
+            peers = []
+            for candidate in psutil.net_connections(kind="tcp"):
+                if (
+                    candidate.status == psutil.CONN_ESTABLISHED
+                    and _address_parts(candidate.laddr) == server
+                    and _address_parts(candidate.raddr) == client
+                ):
+                    peers.append(candidate)
+        except Exception:  # noqa: BLE001 - inability to prove ownership is refusal
+            return False
+        if peers:
+            return all(candidate.pid == attestation.pid for candidate in peers)
+        time.sleep(0.005)
+    return False
+
+
+def _local_request(
+    method: str,
+    url: str,
+    *,
+    attestation: _LocalProcessAttestation,
+    json: Any = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 2.0,
+) -> _LocalResponse:
+    """Send credentials only over an exact, process-attested TCP connection."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != attestation.port
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise _LocalRequestError("local control URL is not attested loopback")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    request_headers = dict(headers or {})
+    body = None
+    if json is not None:
+        body = json_module.dumps(json).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        attestation.port,
+        timeout=timeout,
+    )
+    try:
+        connection.connect()
+        if (
+            not _attestation_is_current(attestation)
+            or not _connected_socket_is_owned_by(connection, attestation)
+        ):
+            raise _LocalRequestError(
+                "local control connection does not belong to the attested process"
+            )
+        connection.request(method, path, body=body, headers=request_headers)
+        response = connection.getresponse()
+        return _LocalResponse(response.status, response.read())
+    except (OSError, http.client.HTTPException, socket.timeout) as error:
+        raise _LocalRequestError(str(error)) from error
+    finally:
+        connection.close()
 
 
 def _attested_local_process(
@@ -68,6 +209,7 @@ def _attested_local_process(
         or record.pid is None
         or record.root is None
         or record.port != port
+        or record.started_at is None
     ):
         return None
     try:
@@ -78,13 +220,14 @@ def _attested_local_process(
         return None
     # A PID file establishes process identity, not socket ownership. Refuse if
     # the configured listener cannot be attributed exclusively to that process.
-    if set(ProcessManager.find_pids_on_port(port)) != {record.pid}:
+    if not _exclusive_listener_is_owned_by(port, record.pid):
         return None
     return _LocalProcessAttestation(
         project_root=project_root,
         pid_file=pid_file,
         pid=record.pid,
         port=port,
+        started_at=record.started_at,
     )
 
 
@@ -113,10 +256,11 @@ def _host_operator_key(
             response = _local_request(
                 "GET",
                 probe_url,
+                attestation=attestation,
                 headers={"X-API-Key": candidate},
                 timeout=2.0,
             )
-        except httpx.RequestError:
+        except (httpx.RequestError, _LocalRequestError):
             continue
         if response.status_code != 200:
             continue
@@ -147,10 +291,11 @@ def _agent_operator_key(
             response = _local_request(
                 "GET",
                 info_url,
+                attestation=attestation,
                 headers={"X-API-Key": candidate},
                 timeout=2.0,
             )
-        except httpx.RequestError:
+        except (httpx.RequestError, _LocalRequestError):
             continue
         if response.status_code != 200:
             continue
@@ -179,9 +324,10 @@ def _standalone_bootstrap_key(
         response = _local_request(
             "GET",
             f"http://127.0.0.1:{attestation.port}/api/auth/key",
+            attestation=attestation,
             timeout=2.0,
         )
-    except httpx.RequestError:
+    except (httpx.RequestError, _LocalRequestError):
         return None
     if response.status_code != 200 or not _attestation_is_current(attestation):
         return None
@@ -357,17 +503,25 @@ def _valid_success_outcomes(
         return None
     outcomes: list[dict[str, Any]] = list(direct)
     if all_agents:
+        count_fields = (
+            payload.get("target_count"),
+            payload.get("confirmed_count"),
+            payload.get("unconfirmed_count"),
+        )
         if (
-            not isinstance(payload.get("target_count"), int)
-            or isinstance(payload.get("target_count"), bool)
+            not all(type(value) is int for value in count_fields)
             or payload["target_count"] != len(outcomes)
             or payload.get("confirmed_count") != len(outcomes)
             or payload.get("unconfirmed_count") != 0
             or payload.get("correlation_id") != operation_id
+            or payload.get("state") != "confirmed"
         ):
             return None
     elif expected_agent_id is None or len(outcomes) != 1:
         return None
+    agent_ids: set[str] = set()
+    resolved_targets: set[str] = set()
+    receipt_ids: set[str] = set()
     for outcome in outcomes:
         required_text = (
             outcome.get("agent_id"),
@@ -375,7 +529,7 @@ def _valid_success_outcomes(
             outcome.get("receipt_id"),
         )
         if (
-            not all(isinstance(value, str) and value for value in required_text)
+            not all(isinstance(value, str) and value.strip() for value in required_text)
             or outcome.get("correlation_id") != operation_id
             or outcome.get("disposition") not in _CONFIRMED_DISPOSITIONS
             or outcome.get("scope") != ("host" if all_agents else "agent")
@@ -383,12 +537,22 @@ def _valid_success_outcomes(
             return None
         if all_agents and outcome.get("requested_target") is not None:
             return None
+        if all_agents:
+            agent_ids.add(outcome["agent_id"])
+            resolved_targets.add(outcome["resolved_target"])
+            receipt_ids.add(outcome["receipt_id"])
         if not all_agents and (
             outcome.get("requested_target") != expected_agent_id
             or outcome["agent_id"] != expected_agent_id
             or outcome["resolved_target"] != expected_agent_id
         ):
             return None
+    if all_agents and (
+        len(agent_ids) != len(outcomes)
+        or len(resolved_targets) != len(outcomes)
+        or len(receipt_ids) != 1
+    ):
+        return None
     return outcomes
 
 
@@ -422,11 +586,12 @@ def cmd_stop(args) -> int:
         response = _local_request(
             "POST",
             url,
+            attestation=resolved.attestation,
             json=body,
             headers={"X-API-Key": api_key},
-            timeout=httpx.Timeout(60.0, connect=5.0),
+            timeout=60.0,
         )
-    except httpx.RequestError as error:
+    except (httpx.RequestError, _LocalRequestError) as error:
         target = "all agents" if args.all else args.name
         print(f"{target}: indeterminate — Stop request failed: {error}")
         return 1
@@ -437,7 +602,10 @@ def cmd_stop(args) -> int:
         except ValueError:
             error_payload = None
         error_outcomes = _response_outcomes(error_payload)
-        if error_outcomes:
+        if error_outcomes and all(
+            isinstance(outcome, dict) and outcome.get("disposition")
+            for outcome in error_outcomes
+        ):
             for outcome in error_outcomes:
                 _print_outcome(outcome)
             return 1

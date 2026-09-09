@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from kestrel_sovereign import cli_stop
 from kestrel_sovereign.cli import build_parser
@@ -47,6 +48,7 @@ def _attestation(*, port=8888):
         pid_file=project / "logs" / ".host.pid",
         pid=123,
         port=port,
+        started_at=100.0,
     )
 
 
@@ -99,17 +101,100 @@ def test_unreachable_fleet_stop_names_all_agents_not_none(capsys):
     assert "None" not in output
 
 
-def test_local_request_ignores_ambient_proxy_configuration():
-    client = MagicMock()
-    client.__enter__.return_value = client
-    with patch("httpx.Client", return_value=client) as client_type:
-        cli_stop._local_request("GET", "http://127.0.0.1:8888/probe")
+def test_local_request_attests_the_connected_socket_before_sending_credentials():
+    connection = MagicMock()
+    response = MagicMock(status=200)
+    response.read.return_value = b'{"ok": true}'
+    connection.getresponse.return_value = response
+    with (
+        patch("http.client.HTTPConnection", return_value=connection),
+        patch.object(cli_stop, "_attestation_is_current", return_value=True),
+        patch.object(
+            cli_stop,
+            "_connected_socket_is_owned_by",
+            return_value=True,
+        ) as connected_owner,
+    ):
+        result = cli_stop._local_request(
+            "GET",
+            "http://127.0.0.1:8888/probe",
+            attestation=_attestation(),
+            headers={"X-API-Key": "secret"},
+        )
 
-    client_type.assert_called_once_with(trust_env=False)
-    client.request.assert_called_once_with(
+    connection.connect.assert_called_once_with()
+    connected_owner.assert_called_once_with(connection, _attestation())
+    connection.request.assert_called_once_with(
         "GET",
-        "http://127.0.0.1:8888/probe",
+        "/probe",
+        body=None,
+        headers={"X-API-Key": "secret"},
     )
+    assert result.json() == {"ok": True}
+
+
+def test_local_request_never_sends_when_connected_socket_owner_is_unproven():
+    connection = MagicMock()
+    with (
+        patch("http.client.HTTPConnection", return_value=connection),
+        patch.object(cli_stop, "_attestation_is_current", return_value=True),
+        patch.object(
+            cli_stop,
+            "_connected_socket_is_owned_by",
+            return_value=False,
+        ),
+        pytest.raises(cli_stop._LocalRequestError, match="does not belong"),
+    ):
+        cli_stop._local_request(
+            "POST",
+            "http://127.0.0.1:8888/api/agent/stop",
+            attestation=_attestation(),
+            headers={"X-API-Key": "secret"},
+        )
+    connection.request.assert_not_called()
+
+
+def test_connected_socket_proof_binds_exact_flow_to_attested_server_pid():
+    import psutil
+
+    connection = MagicMock()
+    connection.sock.getsockname.return_value = ("127.0.0.1", 54321)
+    connection.sock.getpeername.return_value = ("127.0.0.1", 8888)
+    server_flow = SimpleNamespace(
+        status=psutil.CONN_ESTABLISHED,
+        laddr=("127.0.0.1", 8888),
+        raddr=("127.0.0.1", 54321),
+        pid=123,
+    )
+    unrelated = SimpleNamespace(
+        status=psutil.CONN_ESTABLISHED,
+        laddr=("127.0.0.1", 9999),
+        raddr=("127.0.0.1", 54321),
+        pid=999,
+    )
+    with patch("psutil.net_connections", return_value=[unrelated, server_flow]):
+        assert cli_stop._connected_socket_is_owned_by(connection, _attestation())
+
+    server_flow.pid = None
+    with patch("psutil.net_connections", return_value=[server_flow]):
+        assert not cli_stop._connected_socket_is_owned_by(connection, _attestation())
+
+
+def test_listener_proof_rejects_an_unknown_co_listener():
+    import psutil
+
+    owned = SimpleNamespace(
+        status=psutil.CONN_LISTEN,
+        laddr=("127.0.0.1", 8888),
+        pid=123,
+    )
+    unknown = SimpleNamespace(
+        status=psutil.CONN_LISTEN,
+        laddr=("0.0.0.0", 8888),
+        pid=None,
+    )
+    with patch("psutil.net_connections", return_value=[owned, unknown]):
+        assert not cli_stop._exclusive_listener_is_owned_by(8888, 123)
 
 
 def test_attestation_requires_matching_live_project_process_and_listener(tmp_path):
@@ -121,14 +206,11 @@ def test_attestation_requires_matching_live_project_process_and_listener(tmp_pat
         pid=123,
         root=str(tmp_path),
         port=8888,
+        started_at=100.0,
     )
     with (
         patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
-        patch.object(
-            cli_stop.ProcessManager,
-            "find_pids_on_port",
-            return_value=[123],
-        ),
+        patch.object(cli_stop, "_exclusive_listener_is_owned_by", return_value=True),
     ):
         attestation = cli_stop._attested_local_process(
             tmp_path,
@@ -141,6 +223,7 @@ def test_attestation_requires_matching_live_project_process_and_listener(tmp_pat
         pid_file=pid_file,
         pid=123,
         port=8888,
+        started_at=100.0,
     )
 
 
@@ -152,14 +235,11 @@ def test_attestation_rejects_listener_owned_by_another_process(tmp_path):
         pid=123,
         root=str(tmp_path),
         port=8888,
+        started_at=100.0,
     )
     with (
         patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
-        patch.object(
-            cli_stop.ProcessManager,
-            "find_pids_on_port",
-            return_value=[999],
-        ),
+        patch.object(cli_stop, "_exclusive_listener_is_owned_by", return_value=False),
     ):
         assert cli_stop._attested_local_process(
             tmp_path,
@@ -374,7 +454,7 @@ def test_named_stop_posts_only_intent_and_prints_receipted_outcome(capsys):
 def test_successful_fleet_stop_requires_complete_host_evidence(capsys):
     outcomes = [
         _outcome(agent="did:alpha", scope="host"),
-        _outcome(agent="did:beta", receipt="receipt-2", scope="host"),
+        _outcome(agent="did:beta", scope="host"),
     ]
     response = _response(
         payload={
@@ -412,6 +492,92 @@ def test_successful_fleet_stop_requires_complete_host_evidence(capsys):
 
     output = capsys.readouterr().out
     assert "did:alpha" in output and "did:beta" in output
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("state", "partial"),
+        ("confirmed_count", True),
+        ("unconfirmed_count", 0.0),
+    ],
+)
+def test_fleet_success_rejects_noncanonical_envelope_fields(
+    mutation,
+    value,
+    capsys,
+):
+    payload = {
+        "success": True,
+        "state": "confirmed",
+        "target_count": 1,
+        "confirmed_count": 1,
+        "unconfirmed_count": 0,
+        "correlation_id": "cli:fixed",
+        "stop_outcomes": [_outcome(agent="did:alpha", scope="host")],
+    }
+    payload[mutation] = value
+    response = _response(payload=payload)
+    with (
+        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint(
+            "http://host/api/host/stop", expected_agent_id=None
+        )),
+        patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
+        patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 1
+    assert "inconsistent" in capsys.readouterr().out
+
+
+def test_fleet_success_rejects_duplicate_targets_and_mixed_receipts(capsys):
+    first = _outcome(agent="did:alpha", scope="host")
+    duplicate = dict(first, receipt_id="receipt-2")
+    response = _response(
+        payload={
+            "success": True,
+            "state": "confirmed",
+            "target_count": 2,
+            "confirmed_count": 2,
+            "unconfirmed_count": 0,
+            "correlation_id": "cli:fixed",
+            "stop_outcomes": [first, duplicate],
+        }
+    )
+    with (
+        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint(
+            "http://host/api/host/stop", expected_agent_id=None
+        )),
+        patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
+        patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 1
+    assert "inconsistent" in capsys.readouterr().out
+
+
+def test_success_rejects_whitespace_only_typed_evidence(capsys):
+    response = _response(
+        payload={
+            "success": True,
+            "stop_outcomes": [
+                dict(
+                    _outcome(),
+                    agent_id=" ",
+                    resolved_target=" ",
+                    receipt_id=" ",
+                )
+            ],
+        }
+    )
+    with (
+        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint()),
+        patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
+        patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
+    ):
+        assert cmd_stop(_args()) == 1
+    assert "inconsistent" in capsys.readouterr().out
 
 
 def test_success_with_malformed_or_mismatched_outcomes_fails_closed(capsys):
@@ -487,6 +653,20 @@ def test_refused_agent_error_prints_typed_outcome_and_fails(capsys):
     assert "did:emma" in output
     assert "refused" in output
     assert "receipt-refused" in output
+
+
+def test_malformed_error_details_use_indeterminate_path_without_traceback(capsys):
+    response = _response(
+        status=422,
+        payload={"error": {"details": ["malformed"]}},
+    )
+    with (
+        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint()),
+        patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
+    ):
+        assert cmd_stop(_args()) == 1
+    assert "indeterminate" in capsys.readouterr().out
 
 
 def test_stop_all_preserves_partial_outcomes_and_nonzero_exit(capsys):
