@@ -2743,6 +2743,31 @@ class KestrelAgent(
             lambda names=list(core_source_names): self._boot_teardown_signal_sources(names),
         )
 
+        # The A2A callbacks fire once, after their task transition commits.
+        # Core-owned durable cognition consumers preserve those wakes across
+        # Hold and restart; their drainers observe Release and resume the
+        # unclaimed ledger rows without requiring a peer retry.
+        from kestrel_sovereign.signals import DurableConsumerRegistration
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        )
+
+        for consumer_id, source in (
+            (A2A_COMPLETE_COGNITION_CONSUMER_ID, "a2a.task_complete"),
+            (A2A_SUBMITTED_COGNITION_CONSUMER_ID, "a2a.task_submitted"),
+        ):
+            await self.dispatcher.register_durable_consumer(
+                DurableConsumerRegistration(
+                    consumer_id=consumer_id,
+                    source=source,
+                    agent_id=self.did,
+                    max_attempts=0,
+                )
+            )
+
         # Sender-side store for in-flight send_a2a_question
         # correlation rows (#1444). PeersFeature.send_a2a_question
         # inserts here on POST; the subscription supervisor marks
@@ -3851,6 +3876,24 @@ class KestrelAgent(
         )
         verify_llm_providers_initialized(self.llm_service)
         await verify_llm_providers_reachable(self.llm_service)
+
+        # TaskStore is the authoritative outbox for the two one-shot A2A
+        # callbacks. Repair any commit->callback crash gap before starting the
+        # consumers: privacy-elided durable rows need the live task envelope
+        # presented once before a drainer may claim their marker-only replay.
+        await self.reconcile_a2a_cognition_wakes()
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        )
+
+        for consumer_id in (
+            A2A_COMPLETE_COGNITION_CONSUMER_ID,
+            A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        ):
+            await self.dispatcher.start_durable_cognition_consumer(consumer_id)
 
         # All subsystems are now up (memory system, context manager, dispatcher,
         # LLM). On direct-agent boots, notify features now. Server-owned agents

@@ -308,13 +308,18 @@ async def test_cli_shell_prints_typed_hold_refusal(
 
 
 @pytest.mark.asyncio
-async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
+async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch) -> None:
     """Mutation tripwire: deleting the non-streaming check must run onward."""
 
     host = _latch(HoldScope.HOST, "hold:host", target="host")
     agent_hold = _latch(HoldScope.AGENT, "hold:agent", target="did:test:held")
     store = _Store(EffectiveHoldState(host=host, agent=agent_hold))
     agent = _bare_agent(store)  # deliberately has no hooks manager or turn state
+    dispositions: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        lambda *, disposition, source: dispositions.append((disposition, source)),
+    )
 
     with pytest.raises(HoldTurnRefusal) as caught:
         await agent.process_input("do not begin")
@@ -324,6 +329,9 @@ async def test_process_input_refuses_at_unconditional_hold_seam() -> None:
     assert caught.value.effective_state.agent is agent_hold
     assert caught.value.metadata["host_hold"] is host
     assert caught.value.metadata["agent_hold"] is agent_hold
+    assert caught.value.metadata["disposition"] == "refused"
+    assert caught.value.wire_payload()["disposition"] == "refused"
+    assert dispositions == [("refused", "interactive")]
 
 
 @pytest.mark.asyncio
@@ -466,6 +474,48 @@ async def test_streamed_command_transfers_admission_to_decorated_execution_task(
 
     assert chunks == ["decorated command complete"]
     assert store.calls == ["did:test:held"]
+
+
+@pytest.mark.asyncio
+async def test_signal_disposition_owner_transfers_to_decorated_execution_task(
+    monkeypatch,
+) -> None:
+    """A production signal refusal is not also counted as interactive."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.hold import source_owns_hold_disposition
+
+    class _ProductionShapeAgent(RequestLifecycleMixin):
+        did = "did:test:held"
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(self, _user_input, *, invocation_id=None):
+            assert asyncio.current_task() is not outer_task
+            await require_turn_start_allowed(self)
+
+    agent = _ProductionShapeAgent()
+    agent._hold_store = _Store(
+        EffectiveHoldState(
+            host=None,
+            agent=_latch(
+                HoldScope.AGENT,
+                "hold:decorated-signal",
+                target=agent.did,
+            ),
+        )
+    )
+    dispositions: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        lambda *, disposition, source: dispositions.append((disposition, source)),
+    )
+    outer_task = asyncio.current_task()
+
+    with source_owns_hold_disposition(agent), pytest.raises(HoldTurnRefusal):
+        await agent.process_input("held signal")
+
+    assert dispositions == []
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 SOURCE_NAME = "a2a.task_complete"
+DURABLE_COGNITION_CONSUMER_ID = "core.a2a-task-complete-cognition-v1"
 PROMPT_TEMPLATE = (
     # Inside the package (#1415). ``parents[2]`` resolves to
     # ``<package>/kestrel_sovereign/`` so the template ships with the

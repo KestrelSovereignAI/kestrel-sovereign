@@ -47,6 +47,14 @@ class TaskCancellationSnapshot:
     actor_agent_id: Optional[str]
 
 
+@dataclass(frozen=True)
+class TaskCognitionWakeCandidate:
+    """Authoritative task row plus the revision that selected its wake."""
+
+    task: Task
+    lifecycle_revision: int
+
+
 def without_reserved_cancellation_receipt(
     metadata: Mapping[str, object] | None,
 ) -> dict:
@@ -100,7 +108,8 @@ class TaskStore(UnifiedStoreBase):
                 cancel_reason TEXT,
                 cancel_previous_status TEXT,
                 cancel_operation_id TEXT,
-                terminal_operation_id TEXT
+                terminal_operation_id TEXT,
+                lifecycle_revision BIGINT NOT NULL DEFAULT 0
             )
         """)
 
@@ -159,6 +168,7 @@ class TaskStore(UnifiedStoreBase):
             UPDATE a2a_tasks
             SET status = 'failed',
                 message = ?,
+                lifecycle_revision = lifecycle_revision + 1,
                 updated_at = {self.now_sql()}
             WHERE status IN ('submitted', 'working', 'input-required')
               AND (creator_agent_id IS NULL OR recipient_agent_id IS NULL)
@@ -179,7 +189,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 7
+                    SELECT COUNT(*) = 8
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -190,7 +200,8 @@ class TaskStore(UnifiedStoreBase):
                           'cancel_reason',
                           'cancel_previous_status',
                           'cancel_operation_id',
-                          'terminal_operation_id'
+                          'terminal_operation_id',
+                          'lifecycle_revision'
                       )
                 )
                 AND EXISTS (
@@ -212,6 +223,10 @@ class TaskStore(UnifiedStoreBase):
                       AND procedure.proname =
                           'a2a_tasks_enforce_authority_fence_v4'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
+                      AND position(
+                          'lifecycle_revision'
+                          IN pg_get_functiondef(procedure.oid)
+                      ) > 0
                 )
                 AND (
                     SELECT COUNT(*) = 5
@@ -248,6 +263,11 @@ class TaskStore(UnifiedStoreBase):
         )
         for column in authority_columns:
             await self.add_column_if_missing("a2a_tasks", column, "TEXT")
+        await self.add_column_if_missing(
+            "a2a_tasks",
+            "lifecycle_revision",
+            "BIGINT NOT NULL DEFAULT 0",
+        )
 
         # Cancellation is terminal at the storage boundary, including for
         # pre-upgrade writers still running during a PostgreSQL rollout. The
@@ -301,6 +321,14 @@ class TaskStore(UnifiedStoreBase):
                             OR NEW.recipient_agent_id IS NULL) THEN
                         RAISE EXCEPTION 'live A2A task requires durable authority'
                             USING ERRCODE = 'check_violation';
+                    END IF;
+                    -- A v3/v4 worker does not know about lifecycle_revision.
+                    -- Advance it at the shared database boundary so a status
+                    -- transition by that worker cannot reuse a cognition-wake
+                    -- identity minted for an earlier state of the same task.
+                    IF TG_OP = 'UPDATE'
+                       AND NEW.status IS DISTINCT FROM OLD.status THEN
+                        NEW.lifecycle_revision := OLD.lifecycle_revision + 1;
                     END IF;
                     RETURN NEW;
                 END;
@@ -507,6 +535,7 @@ class TaskStore(UnifiedStoreBase):
                 history = ?,
                 metadata = ?,
                 terminal_operation_id = ?,
+                lifecycle_revision = lifecycle_revision + 1,
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
@@ -772,7 +801,9 @@ class TaskStore(UnifiedStoreBase):
         rows_affected = await self._backend.execute(
             f"""
             UPDATE a2a_tasks
-            SET status = ?, message = ?, updated_at = {self.now_sql()}
+            SET status = ?, message = ?,
+                lifecycle_revision = lifecycle_revision + 1,
+                updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
               AND status = ?
@@ -936,6 +967,7 @@ class TaskStore(UnifiedStoreBase):
                     canceled_by = ?,
                     cancel_reason = ?,
                     cancel_operation_id = ?,
+                    lifecycle_revision = lifecycle_revision + 1,
                     updated_at = {self.now_sql()}
                 WHERE {live_authority_predicate}
                 """,
@@ -1079,6 +1111,60 @@ class TaskStore(UnifiedStoreBase):
         )
         return [self._row_to_task(row) for row in rows]
 
+    async def list_cognition_wake_candidates(
+        self,
+        *,
+        recipient_agent_id: str,
+        terminal_updated_since: datetime,
+    ) -> list[TaskCognitionWakeCandidate]:
+        """List authoritative rows whose one-shot cognition wake may be absent.
+
+        Live SUBMITTED/WORKING work is never aged out. Terminal rows are
+        bounded to the signal source's retention horizon so an expired signal
+        is not recreated forever from the longer-lived task ledger.
+        """
+
+        if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
+            raise ValueError("Task wake reconciliation requires a concrete recipient")
+        terminal_cutoff = self.to_timestamp_param(terminal_updated_since)
+        terminal_predicate = "updated_at >= ?"
+        if self.is_sqlite:
+            # Task writes use SQLite's ``datetime('now')`` (space separator),
+            # while Python's canonical ISO form contains ``T`` and an offset.
+            # TEXT comparison orders those representations incorrectly around
+            # the retention boundary; SQLite's datetime parser normalizes both.
+            terminal_predicate = "datetime(updated_at) >= datetime(?)"
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT * FROM a2a_tasks
+            WHERE recipient_agent_id = ?
+              AND (
+                    status IN ('submitted', 'working')
+                    OR (
+                        status IN ('completed', 'failed', 'canceled')
+                        AND {terminal_predicate}
+                    )
+                  )
+            ORDER BY created_at ASC
+            """,
+            (
+                recipient_agent_id,
+                terminal_cutoff,
+            ),
+        )
+        candidates: list[TaskCognitionWakeCandidate] = []
+        for row in rows:
+            lifecycle_revision = int(row[18])
+            if lifecycle_revision < 0:
+                raise RuntimeError("A2A wake candidate has a negative lifecycle revision")
+            candidates.append(
+                TaskCognitionWakeCandidate(
+                    task=self._row_to_task(row),
+                    lifecycle_revision=lifecycle_revision,
+                )
+            )
+        return candidates
+
     async def delete(self, task_id: str) -> bool:
         """Delete a task. Returns True if deleted."""
         rows_affected = await self._backend.execute(
@@ -1127,7 +1213,7 @@ class TaskStore(UnifiedStoreBase):
         9: created_at, 10: updated_at, 11: creator_agent_id,
         12: recipient_agent_id, 13: canceled_by, 14: cancel_reason,
         15: cancel_previous_status, 16: cancel_operation_id,
-        17: terminal_operation_id
+        17: terminal_operation_id, 18: lifecycle_revision
         """
         artifacts_data = json_loads(row[6]) if row[6] else []
         history_data = json_loads(row[7]) if row[7] else []
