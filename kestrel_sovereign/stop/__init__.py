@@ -23,6 +23,7 @@ from .invocation import (
     DistributedStopTicket,
 )
 from .types import (
+    AuthoritativeStopDescendant,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopOutcome,
@@ -31,6 +32,7 @@ from .types import (
 )
 
 __all__ = [
+    "AuthoritativeStopDescendant",
     "CancellationAuthority",
     "CooperativeStopTarget",
     "DistributedInvocationRegistry",

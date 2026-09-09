@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
     StopCleanupRegistry,
@@ -224,7 +225,13 @@ async def test_agent_stop_cascades_in_authoritative_descendant_order() -> None:
 
         return CooperativeStopTarget(name, did, cancel)
 
-    resolve = AsyncMock(return_value=["child", "missing", "grandchild"])
+    resolve = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant("child", "did:test:child"),
+            AuthoritativeStopDescendant("missing", "did:test:missing"),
+            AuthoritativeStopDescendant("grandchild", "did:test:grandchild"),
+        ]
+    )
     authority = _authority(
         lambda: [
             target("peer", "did:test:peer", StopDisposition.STOPPED),
@@ -255,9 +262,9 @@ async def test_agent_stop_cascades_in_authoritative_descendant_order() -> None:
     resolve.assert_awaited_once_with("did:test:root")
     assert [outcome.resolved_target for outcome in outcomes] == [
         "root",
-        "child",
-        "missing",
-        "grandchild",
+        "did:test:child",
+        "did:test:missing",
+        "did:test:grandchild",
     ]
     assert [outcome.disposition for outcome in outcomes] == [
         StopDisposition.STOPPED,
@@ -295,9 +302,12 @@ async def test_descendant_resolution_fails_closed_before_any_stop() -> None:
 @pytest.mark.parametrize(
     "descendants",
     [
-        ["child", "child"],
-        ["root"],
-        ["did:test:root"],
+        [
+            AuthoritativeStopDescendant("child", "did:test:child"),
+            AuthoritativeStopDescendant("child", "did:test:other"),
+        ],
+        [AuthoritativeStopDescendant("root", "did:test:child")],
+        [AuthoritativeStopDescendant("child", "did:test:root")],
     ],
 )
 async def test_repeated_or_cyclic_descendant_plan_fails_before_stop(
@@ -397,6 +407,46 @@ async def test_host_fanout_converts_target_failure_and_continues() -> None:
         StopDisposition.STOPPED,
     ]
     assert "private remote detail" not in outcomes[0].detail
+
+
+@pytest.mark.asyncio
+async def test_target_base_exception_group_isolated_and_receipted() -> None:
+    calls: list[str] = []
+
+    async def grouped_failure(_request: StopRequest) -> StopDisposition:
+        calls.append("broken")
+        raise BaseExceptionGroup(
+            "target cleanup",
+            [asyncio.CancelledError(), RuntimeError("private failure")],
+        )
+
+    async def stopped(_request: StopRequest) -> StopDisposition:
+        calls.append("healthy")
+        return StopDisposition.STOPPED
+
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget("broken", "did:test:broken", grouped_failure),
+            CooperativeStopTarget("healthy", "did:test:healthy", stopped),
+        ]
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.HOST,
+            "did:test:operator",
+            correlation_id="grouped-target-failure",
+        )
+    )
+
+    assert set(calls) == {"broken", "healthy"}
+    assert [outcome.disposition for outcome in outcomes] == [
+        StopDisposition.UNREACHABLE,
+        StopDisposition.STOPPED,
+    ]
+    assert {outcome.receipt_id for outcome in outcomes} == {
+        "receipt-grouped-target-failure"
+    }
 
 
 @pytest.mark.asyncio
@@ -1238,7 +1288,11 @@ def test_live_agent_stop_cascades_only_through_signed_descendant_query() -> None
         "Child": child,
         "Peer": peer,
     }
-    manager.get_authoritative_descendants = AsyncMock(return_value=["Child"])
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant("Child", "did:test:child")
+        ]
+    )
     # Neither this mutable projection nor display metadata grants Stop.
     manager._parent_children = {"did:test:root": ["Peer"]}
     peer.kestrel = SimpleNamespace(orchestrator="did:test:root")
@@ -1254,13 +1308,72 @@ def test_live_agent_stop_cascades_only_through_signed_descendant_query() -> None
     assert [
         outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
     ] == ["did:test:root", "did:test:child"]
-    manager.get_authoritative_descendants.assert_awaited_once_with(
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
         "did:test:root"
     )
     root.cancel_current_request.assert_called_once_with(request_id="root-turn")
     child.cancel_current_request.assert_called_once_with(request_id="child-turn")
     peer.cancel_current_request.assert_not_called()
     peer.active_turn_request_bindings.assert_not_called()
+
+
+def test_live_cascade_binds_signed_did_not_colliding_routing_name() -> None:
+    """An unloaded child's name cannot select an unrelated peer DID."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    def live_agent(agent_id: str, turn_id: str):
+        return SimpleNamespace(
+            agent_id=agent_id,
+            _active_request_ids={turn_id},
+            _current_request_id=turn_id,
+            cancel_current_request=MagicMock(return_value=True),
+            wait_for_request_completion=AsyncMock(return_value=None),
+        )
+
+    root = live_agent("did:test:root", "root-turn")
+    peer = live_agent("did:test:peer", "peer-turn")
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Root": root, "Peer": peer}
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant(
+                "did:test:peer",
+                "did:test:signed-unloaded-child",
+            )
+        ]
+    )
+
+    class DistributedStop:
+        def __init__(self) -> None:
+            self.requested: list[str] = []
+
+        async def request_agent(self, candidate_id: str):
+            self.requested.append(candidate_id)
+            return candidate_id
+
+        async def wait_for_stop(self, _ticket):
+            return StopDisposition.STOPPED
+
+    distributed = DistributedStop()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.distributed_invocation_registry = distributed
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert [
+        outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
+    ] == ["did:test:root", "did:test:signed-unloaded-child"]
+    assert distributed.requested == [
+        "did:test:root",
+        "did:test:signed-unloaded-child",
+    ]
+    peer.cancel_current_request.assert_not_called()
 
 
 def test_live_child_stop_does_not_walk_to_parent_or_peer() -> None:
@@ -1284,7 +1397,7 @@ def test_live_child_stop_does_not_walk_to_parent_or_peer() -> None:
         "Child": child,
         "Peer": peer,
     }
-    manager.get_authoritative_descendants = AsyncMock(return_value=[])
+    manager.get_authoritative_stop_descendants = AsyncMock(return_value=[])
     app = FastAPI()
     app.include_router(router)
     app.state.agent = child
@@ -1294,7 +1407,7 @@ def test_live_child_stop_does_not_walk_to_parent_or_peer() -> None:
     response = TestClient(app).post("/api/agent/stop")
 
     assert response.status_code == 200
-    manager.get_authoritative_descendants.assert_awaited_once_with(
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
         "did:test:child"
     )
     child.cancel_current_request.assert_called_once_with(request_id="child-turn")
@@ -1323,7 +1436,14 @@ def test_live_agent_stop_uses_agent_attached_manager_after_load() -> None:
     )
     manager = MagicMock()
     manager.list_agents.return_value = {"Root": root, "Child": child}
-    manager.get_authoritative_descendants = AsyncMock(return_value=["Child"])
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant(
+                "Child",
+                "did:test:standalone-child",
+            )
+        ]
+    )
     class RestoringReceiptStore(_MemoryReceiptStore):
         async def load(self, request):
             root._agent_manager = manager
@@ -1340,7 +1460,7 @@ def test_live_agent_stop_uses_agent_attached_manager_after_load() -> None:
     assert [
         outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
     ] == ["did:test:standalone-root", "did:test:standalone-child"]
-    manager.get_authoritative_descendants.assert_awaited_once_with(
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
         "did:test:standalone-root"
     )
     child.cancel_current_request.assert_called_once_with(request_id="child-turn")
@@ -1365,7 +1485,7 @@ def test_live_agent_stop_rejects_tampered_descendant_graph_before_effects() -> N
     )
     manager = MagicMock()
     manager.list_agents.return_value = {"Root": root, "Child": child}
-    manager.get_authoritative_descendants = AsyncMock(
+    manager.get_authoritative_stop_descendants = AsyncMock(
         side_effect=RuntimeError("tampered signed spawn receipt")
     )
     app = FastAPI()
@@ -1413,7 +1533,7 @@ def test_live_descendant_stop_has_no_projection_or_display_authority() -> None:
 
     source = inspect.getsource(stop_agent_request)
 
-    assert "get_authoritative_descendants" in source
+    assert "get_authoritative_stop_descendants" in source
     assert "_parent_children" not in source
     assert "orchestrator" not in source
     assert "causation" not in source

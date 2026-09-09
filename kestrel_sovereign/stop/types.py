@@ -35,6 +35,24 @@ class StopDisposition(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class AuthoritativeStopDescendant:
+    """One descendant identity proven by the durable signed lineage graph.
+
+    ``routing_name`` is deterministic presentation/routing metadata only.
+    ``agent_id`` is the signed child DID and is the sole cancellation binding.
+    """
+
+    routing_name: str
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.routing_name, str) or not self.routing_name.strip():
+            raise ValueError("authoritative descendant requires a routing name")
+        if not isinstance(self.agent_id, str) or not self.agent_id.strip():
+            raise ValueError("authoritative descendant requires a signed agent DID")
+
+
+@dataclass(frozen=True, slots=True)
 class StopRequest:
     """A typed request to cooperatively stop work, never a process."""
 

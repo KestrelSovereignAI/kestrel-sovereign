@@ -64,6 +64,7 @@ from kestrel_sovereign.spawn.mandate import (
     validate_spawn_max_child_depth,
     verify_mandate,
 )
+from kestrel_sovereign.stop.types import AuthoritativeStopDescendant
 
 from .config import (
     RETIRED_SPAWN_MARKER,
@@ -13125,8 +13126,11 @@ class AgentManager:
             key=lambda name: (name.casefold(), name),
         )
 
-    async def get_authoritative_descendants(self, parent_did: str) -> list[str]:
-        """Return deterministic breadth-first descendants, cycle-safe."""
+    async def get_authoritative_descendants(
+        self,
+        parent_did: str,
+    ) -> list[str]:
+        """Return deterministic breadth-first descendant names, cycle-safe."""
 
         if not isinstance(parent_did, str) or not parent_did:
             return []
@@ -13148,6 +13152,264 @@ class AgentManager:
                 )
             visited.add(child_did)
             descendants.append(child_name)
+            queue.extend(by_parent.get(child_did, ()))
+        return descendants
+
+    async def get_authoritative_stop_descendants(
+        self,
+        parent_did: str,
+    ) -> list[AuthoritativeStopDescendant]:
+        """Return every signed descendant DID addressable by cooperative Stop.
+
+        Ordinary relationship mutations require a live governance projection.
+        Stop is different: an active host witness must keep a cold or
+        replica-owned descendant on the andon rail.  This query therefore
+        extends the live verified graph with active, committed, signed restart
+        witnesses while still binding every edge to its exact child DID.
+        """
+
+        if not isinstance(parent_did, str) or not parent_did:
+            return []
+        async with self.a2a_execution_lease():
+            live_relations = await self._verified_spawn_relations_under_lease()
+            return await self._authoritative_stop_descendants_under_lease(
+                parent_did,
+                live_relations,
+            )
+
+    async def _authoritative_stop_descendants_under_lease(
+        self,
+        parent_did: str,
+        live_relations: Mapping[str, tuple[str, str]],
+    ) -> list[AuthoritativeStopDescendant]:
+        """Extend a verified live graph with exact active restart witnesses."""
+
+        from kestrel_sovereign.identity.runtime_identity import load_agent_identity
+        from kestrel_sovereign.identity.signing import get_key_id
+        from kestrel_sovereign.spawn.scoped_constitution import ScopedConstitution
+
+        try:
+            records = self._spawn_authority_registry.records()
+        except Exception as error:
+            raise SpawnAuthorityGraphError(
+                "Durable Stop descendant authority registry is unreadable"
+            ) from error
+
+        witnesses: dict[str, SpawnAuthorityWitness] = {}
+        for witness in records:
+            mandate = witness.mandate
+            if (
+                not isinstance(mandate, SpawnMandate)
+                or mandate.child_did != witness.child_did
+                or mandate.parent_did != witness.parent_did
+            ):
+                raise SpawnAuthorityGraphError(
+                    "Durable Stop descendant witness has mismatched identity"
+                )
+            prior = witnesses.setdefault(witness.child_did, witness)
+            if prior != witness:
+                raise SpawnAuthorityGraphError(
+                    "Durable Stop descendant graph repeats a child DID"
+                )
+
+        relations = dict(live_relations)
+        restart_witnesses: dict[str, SpawnAuthorityWitness] = {}
+        for witness in records:
+            mandate = witness.mandate
+            if (
+                not witness.active
+                or not mandate.parent_signature
+                or not mandate.authority_committed
+                or (
+                    mandate.ttl_seconds > 0
+                    and remaining_spawn_ttl_seconds(
+                        mandate.created_at,
+                        mandate.ttl_seconds,
+                    )
+                    <= 0
+                )
+            ):
+                continue
+            child = self.get_agent(witness.child_name)
+            if child is not None:
+                # The live verifier re-read the child-owned durable receipt.
+                # Its withdrawal dominates an older active host witness.
+                live = relations.get(witness.child_did)
+                if live is None:
+                    continue
+                if (
+                    live[0] != witness.parent_did
+                    or self._canonical_agent_name(live[1])
+                    != self._canonical_agent_name(witness.child_name)
+                ):
+                    raise SpawnAuthorityGraphError(
+                        "Live and restart Stop descendant authority disagree"
+                    )
+                continue
+            prior = relations.get(witness.child_did)
+            relation = (witness.parent_did, witness.child_name)
+            if prior is not None and prior != relation:
+                raise SpawnAuthorityGraphError(
+                    "Stop descendant authority assigns one child DID more than once"
+                )
+            relations[witness.child_did] = relation
+            restart_witnesses[witness.child_did] = witness
+
+        parent_by_child = {
+            child_did: relation_parent
+            for child_did, (relation_parent, _name) in relations.items()
+        }
+        for child_did in sorted(parent_by_child):
+            cursor = child_did
+            visited: set[str] = set()
+            while cursor in parent_by_child:
+                if cursor in visited:
+                    raise SpawnAuthorityGraphError(
+                        "Durable Stop descendant authority contains a cycle"
+                    )
+                visited.add(cursor)
+                cursor = parent_by_child[cursor]
+
+        loaded_candidates: list[KestrelAgent] = []
+        candidate_ids: set[int] = set()
+        for candidate in (*self._agents.values(), *_STANDALONE_AUTHORITY_ROOTS.get()):
+            if id(candidate) in candidate_ids:
+                continue
+            candidate_ids.add(id(candidate))
+            loaded_candidates.append(candidate)
+        cold_identities: dict[str, object] = {}
+
+        async def verifier_for(
+            parent_id: str,
+        ) -> tuple[object | None, object | None, KestrelAgent | None]:
+            loaded = [
+                candidate
+                for candidate in loaded_candidates
+                if parent_id in _loaded_agent_bound_dids(candidate)
+            ]
+            if len(loaded) > 1:
+                raise SpawnAuthorityGraphError(
+                    "Stop descendant authority has an ambiguous parent identity"
+                )
+            if loaded:
+                parent = loaded[0]
+                state = vars(parent)
+                private_key = state.get("_private_key")
+                public_key_getter = getattr(private_key, "public_key", None)
+                public_key = (
+                    public_key_getter() if callable(public_key_getter) else None
+                )
+                identity = state.get("identity")
+                if public_key is None and identity is not None:
+                    legacy_keypair = getattr(identity, "legacy_keypair", None)
+                    public_key = getattr(legacy_keypair, "public_key", None)
+                return public_key, identity, parent
+
+            parent_witness = witnesses.get(parent_id)
+            if parent_witness is None or not parent_witness.active:
+                raise SpawnAuthorityGraphError(
+                    "Stop descendant authority has no verifiable parent identity"
+                )
+            identity = cold_identities.get(parent_id)
+            if identity is None:
+                try:
+                    storage_dir = parent_witness.config.resolve_data_dir(
+                        self._base_data_dir
+                    )
+                    anchored_did = await read_anchor_agent_did(
+                        str(storage_dir),
+                        mode=AgentDIDLookupMode.INSPECTION,
+                    )
+                    legacy_key_id = (
+                        None
+                        if anchored_did.startswith("did:web:")
+                        else get_key_id(anchored_did)
+                    )
+                    identity = await asyncio.to_thread(
+                        load_agent_identity,
+                        legacy_key_id,
+                        storage_dir=storage_dir,
+                    )
+                except Exception as error:
+                    raise SpawnAuthorityGraphError(
+                        "Stop descendant cold parent identity is unreadable"
+                    ) from error
+                if parent_id not in _identity_bound_dids(anchored_did, identity):
+                    raise SpawnAuthorityGraphError(
+                        "Stop descendant cold parent identity does not match its DID"
+                    )
+                cold_identities[parent_id] = identity
+            legacy_keypair = getattr(identity, "legacy_keypair", None)
+            return getattr(legacy_keypair, "public_key", None), identity, None
+
+        by_parent: dict[str, list[tuple[str, str]]] = {}
+        for child_did, (relation_parent, child_name) in relations.items():
+            by_parent.setdefault(relation_parent, []).append((child_did, child_name))
+        for children in by_parent.values():
+            children.sort(key=lambda item: (item[1].casefold(), item[1], item[0]))
+
+        descendants: list[AuthoritativeStopDescendant] = []
+        queue = list(by_parent.get(parent_did, ()))
+        visited: set[str] = set()
+        while queue:
+            child_did, child_name = queue.pop(0)
+            if child_did in visited:
+                raise SpawnAuthorityGraphError(
+                    "Durable Stop descendant authority repeats a descendant"
+                )
+            visited.add(child_did)
+            witness = restart_witnesses.get(child_did)
+            if witness is not None:
+                public_key, identity, loaded_parent = await verifier_for(
+                    witness.parent_did
+                )
+                if not verify_mandate(
+                    witness.mandate,
+                    public_key,
+                    parent_identity=identity,
+                ):
+                    raise SpawnAuthorityGraphError(
+                        "Durable Stop descendant witness has an invalid signature"
+                    )
+                try:
+                    if loaded_parent is not None:
+                        self._validate_restored_mandate_ceiling(
+                            loaded_parent,
+                            witness.mandate,
+                        )
+                    else:
+                        parent_witness = witnesses[witness.parent_did]
+                        scoped = ScopedConstitution(
+                            base_constitution="",
+                            additional_constraints=(
+                                witness.mandate.additional_constraints or {}
+                            ),
+                            features_allowed=list(
+                                witness.mandate.features_allowed or []
+                            ),
+                            parent_features=set(
+                                parent_witness.mandate.features_allowed or []
+                            ),
+                        )
+                        valid, message = scoped.validate_constraints()
+                        if not valid:
+                            raise RuntimeError(message)
+                        allowed_depth = parent_witness.mandate.max_child_depth - 1
+                        if (
+                            allowed_depth < 0
+                            or witness.mandate.max_child_depth > allowed_depth
+                        ):
+                            raise RuntimeError(
+                                "Persisted spawn mandate exceeds its parent's depth ceiling"
+                            )
+                except RuntimeError as error:
+                    raise SpawnAuthorityGraphError(str(error)) from error
+            descendants.append(
+                AuthoritativeStopDescendant(
+                    routing_name=child_name,
+                    agent_id=child_did,
+                )
+            )
             queue.extend(by_parent.get(child_did, ()))
         return descendants
 

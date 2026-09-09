@@ -12,6 +12,7 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
 )
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
     DistributedStopTicket,
@@ -294,7 +295,13 @@ async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(
 
         return CooperativeStopTarget(address, f"did:test:{address}", cancel)
 
-    resolve = AsyncMock(return_value=["child", "grandchild", "unloaded"])
+    resolve = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant("child", "did:test:child"),
+            AuthoritativeStopDescendant("grandchild", "did:test:grandchild"),
+            AuthoritativeStopDescendant("unloaded", "did:test:unloaded"),
+        ]
+    )
     first_authority = CancellationAuthority(
         lambda: (
             target("root", StopDisposition.STOPPED),
@@ -308,9 +315,9 @@ async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(
     written = await first_authority.stop(request)
     assert [outcome.resolved_target for outcome in written] == [
         "root",
-        "child",
-        "grandchild",
-        "unloaded",
+        "did:test:child",
+        "did:test:grandchild",
+        "did:test:unloaded",
     ]
     rows = await first_db.fetchall(
         "SELECT ordinal FROM stop_receipt_outcomes "

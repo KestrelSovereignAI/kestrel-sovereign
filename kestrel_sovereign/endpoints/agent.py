@@ -56,6 +56,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyViolationError,
 )
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
@@ -1483,7 +1484,6 @@ async def stop_agent_request(request: Request):
                 ),
             )
 
-        managed_address_by_name: dict[str, str] = {}
         descendant_manager: list[object | None] = [None]
         descendant_query: list[object | None] = [None]
 
@@ -1508,7 +1508,7 @@ async def stop_agent_request(request: Request):
             descendant_manager[0] = manager
             descendant_query[0] = getattr(
                 manager,
-                "get_authoritative_descendants",
+                "get_authoritative_stop_descendants",
                 None,
             )
             list_managed_agents = getattr(manager, "list_agents", None)
@@ -1522,7 +1522,7 @@ async def stop_agent_request(request: Request):
             candidates_by_id: dict[str, tuple[object, bool]] = {
                 agent_id: (agent, True)
             }
-            managed_address_by_name.clear()
+            managed_names: dict[str, str] = {}
             for name, candidate in sorted(
                 managed_agents.items(),
                 key=lambda item: (str(item[0]).casefold(), str(item[0])),
@@ -1533,7 +1533,7 @@ async def stop_agent_request(request: Request):
                 if not isinstance(candidate_id, str) or not candidate_id.strip():
                     continue
                 canonical_name = name.casefold()
-                prior_address = managed_address_by_name.setdefault(
+                prior_address = managed_names.setdefault(
                     canonical_name,
                     candidate_id,
                 )
@@ -1555,7 +1555,9 @@ async def stop_agent_request(request: Request):
                 ) in candidates_by_id.items()
             )
 
-        async def resolve_descendants(root_agent_id: str) -> tuple[str, ...]:
+        async def resolve_descendants(
+            root_agent_id: str,
+        ) -> tuple[AuthoritativeStopDescendant, ...]:
             authoritative_descendants = descendant_query[0]
             if descendant_manager[0] is None:
                 return ()
@@ -1563,21 +1565,36 @@ async def stop_agent_request(request: Request):
                 raise TypeError(
                     "agent manager lacks authoritative descendant query"
                 )
-            names = await authoritative_descendants(root_agent_id)
-            if isinstance(names, (str, bytes)):
+            descendants = await authoritative_descendants(root_agent_id)
+            if isinstance(descendants, (str, bytes)):
                 raise TypeError("authoritative descendant query returned a scalar")
-            addresses: list[str] = []
-            for name in names:
-                if not isinstance(name, str) or not name.strip():
+            resolved: list[AuthoritativeStopDescendant] = []
+            for descendant in descendants:
+                if not isinstance(descendant, AuthoritativeStopDescendant):
                     raise TypeError(
-                        "authoritative descendant query returned an invalid name"
+                        "authoritative descendant query returned an untyped identity"
                     )
-                # The signed query grants authority. This lookup only maps its
-                # returned name to a loaded cooperative endpoint.
-                addresses.append(
-                    managed_address_by_name.get(name.casefold(), name)
+                resolved.append(descendant)
+            return tuple(resolved)
+
+        async def stop_unloaded_descendant(agent_did: str) -> StopDisposition:
+            """Route one signed, unloaded descendant over the durable rail."""
+
+            distributed_stop = getattr(
+                request.app.state,
+                "distributed_invocation_registry",
+                None,
+            )
+            if distributed_stop is None:
+                return StopDisposition.UNREACHABLE
+            request_agent = getattr(distributed_stop, "request_agent", None)
+            wait_for_stop = getattr(distributed_stop, "wait_for_stop", None)
+            if not callable(request_agent) or not callable(wait_for_stop):
+                raise TypeError(
+                    "distributed Stop registry lacks agent cancellation operations"
                 )
-            return tuple(addresses)
+            ticket = await request_agent(agent_did)
+            return await wait_for_stop(ticket)
 
         cleanup_registry = getattr(
             request.app.state,
@@ -1598,6 +1615,7 @@ async def stop_agent_request(request: Request):
                 or UnavailableStopReceiptStore()
             ),
             descendant_resolver=resolve_descendants,
+            unloaded_agent_stop=stop_unloaded_descendant,
         )
         trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
