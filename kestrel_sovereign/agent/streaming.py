@@ -1778,6 +1778,35 @@ class StreamingMixin:
             deferred_tool_batch_cancellation: Optional[
                 _DeferredToolBatchCancellation
             ] = None
+
+            def tool_batch_completed() -> bool:
+                # ``tool_results`` is populated only after each dispatch returns;
+                # the deferred marker covers the narrower cancellation race where
+                # the owned batch completed but its result channel is unexpectedly
+                # empty. Either is evidence that persistence is now load-bearing.
+                return bool(
+                    deferred_tool_batch_cancellation is not None or tool_results
+                )
+
+            async def persist_strict_cancelled_tool_turn() -> None:
+                checkpointed_batch = tool_batch_completed()
+                await self._persist_assistant_turn_safely(
+                    (
+                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+                        if checkpointed_batch
+                        else ""
+                    ),
+                    metadata=(
+                        _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA
+                        if checkpointed_batch
+                        else None
+                    ),
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=checkpointed_batch,
+                )
+
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1840,22 +1869,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                checkpointed_batch = deferred_tool_batch_cancellation is not None
-                await self._persist_assistant_turn_safely(
-                    (
-                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
-                        if checkpointed_batch
-                        else ""
-                    ),
-                    metadata=(
-                        _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA
-                        if checkpointed_batch
-                        else None
-                    ),
-                    session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                    require_success=checkpointed_batch,
-                )
+                await persist_strict_cancelled_tool_turn()
                 if deferred_tool_batch_cancellation is not None:
                     raise_owned_outcome(
                         deferred_tool_batch_cancellation.outcome,
@@ -1976,10 +1990,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_tool_turn()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)
@@ -2061,7 +2072,7 @@ class StreamingMixin:
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
-                require_success=deferred_tool_batch_cancellation is not None,
+                require_success=tool_batch_completed(),
             )
             if deferred_tool_batch_cancellation is not None:
                 raise_owned_outcome(

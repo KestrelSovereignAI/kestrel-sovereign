@@ -3485,8 +3485,11 @@ class TestP0CancellationDuringAudit:
         agent._post_response_pipeline.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_tool_cancel_during_audit_persists_empty_cancelled_row(self):
+    async def test_tool_cancel_during_audit_persists_redacted_checkpoint(self):
         from kestrel_sdk.llm import ToolCallStarted
+        from kestrel_sovereign.agent.streaming import (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+        )
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
         prose_marker = "SECRET_POST_TOOL_ALLOWED_SYNTHESIS_cancelled_mid_audit"
@@ -3540,13 +3543,19 @@ class TestP0CancellationDuringAudit:
         assert prose_marker not in joined
         assert tool_secret not in joined
         assert "[Response blocked by audit:" not in joined
-        # One empty cancelled row; the withheld synthesis AND the raw tool_results
-        # side channel are discarded.
+        # The withheld synthesis and raw tool side channel are discarded, while
+        # the host-authored completion checkpoint prevents a later repeat.
         persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
         assert len(persisted) == 1
-        assert persisted[0]["content"] == ""
+        assert persisted[0]["content"] == (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+        )
         meta = persisted[0].get("metadata") or {}
         assert meta.get("cancelled") is True
+        assert meta.get("tool_batch_checkpoint") == {
+            "status": "completed",
+            "details_withheld": True,
+        }
         for leaky in ("parts", "tool_events", "tool_results", "pre_tool_reasoning"):
             assert leaky not in meta
         import json as _json
@@ -3665,10 +3674,8 @@ async def test_strict_stop_during_owned_tool_batch_persists_redacted_checkpoint(
 class TestFinding2StrictCancellationDiscardsWithheldProse:
     """#2674 finding 2: a strict (buffered) turn cancelled BEFORE its reviewed
     release must discard ALL withheld prose / parts / metadata / tool side
-    channels and persist an EMPTY cancelled row for cancellations outside an
-    already-running side-effecting batch — matching the strict
-    cancel-before-dispatch path — for both the no-tool and post-tool continuation
-    cancellation cases."""
+    channels. A no-tool cancellation persists an empty row; a completed tool
+    batch persists only the fixed redacted anti-repeat checkpoint."""
 
     @pytest.mark.asyncio
     async def test_strict_no_tool_cancellation_discards_withheld_prose(self):
@@ -3723,6 +3730,9 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
     @pytest.mark.asyncio
     async def test_strict_post_tool_continuation_cancellation_discards_withheld_prose(self):
         from kestrel_sdk.llm import ToolCallStarted
+        from kestrel_sovereign.agent.streaming import (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+        )
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
         marker = "SECRET_POST_TOOL_CONTINUATION_PROSE_must_never_persist"
@@ -3769,13 +3779,20 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
         # No withheld continuation prose reached the client on any channel.
         assert marker not in joined
         assert "[Response blocked by audit:" not in joined
-        # Empty cancelled row — the unfinished synthesis is not persisted.
+        # The unfinished synthesis is not persisted; the fixed completion
+        # checkpoint tells the next turn not to repeat the finished action.
         persisted = [c for c in add_convo_calls if c["role"] == "assistant"]
         assert len(persisted) == 1
-        assert persisted[0]["content"] == ""
+        assert persisted[0]["content"] == (
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+        )
         assert marker not in (persisted[0]["content"] or "")
         meta = persisted[0].get("metadata") or {}
         assert meta.get("cancelled") is True
+        assert meta.get("tool_batch_checkpoint") == {
+            "status": "completed",
+            "details_withheld": True,
+        }
         for leaky in ("pre_tool_reasoning", "parts", "tool_events", "tool_results"):
             assert leaky not in meta
         # STOP never fired over the discarded, unreviewed content.
