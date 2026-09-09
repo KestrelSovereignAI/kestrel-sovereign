@@ -459,6 +459,17 @@ def get_router() -> APIRouter:
                 })
                 yield f"data: {complete_data}\n\n"
 
+                # Yielding ``done`` suspends this serializer after the model
+                # owner has already reached EOF. An exact Stop can linearize
+                # while the transport is paused there, so re-check before
+                # beginning the remaining outbound audit side effect. There is
+                # deliberately no await between this verdict and the call.
+                if (
+                    callable(request_cancelled)
+                    and request_cancelled(request_id) is True
+                ):
+                    return
+
                 # Log outbound response
                 response_text = "".join(full_response)
                 await bridge.log_invocation(

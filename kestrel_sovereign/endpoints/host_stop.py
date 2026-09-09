@@ -10,9 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.rate_limit import (
-    STOP_ADMISSION_RATE_LIMIT,
-    durable_stop_rate_limit_key,
-    limiter,
+    stop_admission_rate_limit,
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
@@ -144,10 +142,7 @@ async def host_stop_status(request: Request):
 
 
 @router.post("/stop")
-@limiter.limit(
-    STOP_ADMISSION_RATE_LIMIT,
-    key_func=durable_stop_rate_limit_key,
-)
+@stop_admission_rate_limit
 async def stop_host(
     request: Request,
     response: Response,

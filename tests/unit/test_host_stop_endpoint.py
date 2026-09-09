@@ -3,6 +3,7 @@
 from dataclasses import replace
 import inspect
 from unittest.mock import AsyncMock, MagicMock, call
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -301,3 +302,46 @@ def test_server_mounts_host_stop_and_implementation_has_no_process_lifecycle():
     assert "process_manager" not in source
     assert ".terminate" not in source
     assert ".shutdown" not in source
+
+
+def test_host_and_agent_stop_share_one_caller_admission_budget():
+    from slowapi import _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+
+    from kestrel_sovereign.endpoints.agent import router as agent_router
+    from kestrel_sovereign.rate_limit import limiter
+
+    agent = _agent("did:test:agent")
+    caller_name = f"shared-stop-budget-{uuid4()}"
+    app, _manager = _app(
+        agents={"Agent": agent},
+        caller=CallerContext.sovereign(identity=caller_name),
+    )
+    app.state.agent = agent
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.include_router(agent_router)
+    client = TestClient(app)
+
+    statuses = []
+    for index in range(120):
+        if index % 2:
+            response = client.post(
+                "/api/host/stop",
+                json={"correlation_id": f"host-{index}-{uuid4()}"},
+            )
+        else:
+            response = client.post(
+                "/api/agent/stop",
+                json={
+                    "request_id": f"missing-{index}",
+                    "correlation_id": f"agent-{index}-{uuid4()}",
+                },
+            )
+        statuses.append(response.status_code)
+
+    assert statuses == [200] * 120
+    assert client.post(
+        "/api/host/stop",
+        json={"correlation_id": f"blocked-{uuid4()}"},
+    ).status_code == 429

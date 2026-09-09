@@ -14,6 +14,7 @@ from starlette.requests import Request
 
 
 STOP_ADMISSION_RATE_LIMIT = "120/minute"
+STOP_ADMISSION_RATE_LIMIT_SCOPE = "durable-stop-admission"
 _STOP_RATE_KEY_DOMAIN = b"kestrel:durable-stop-rate-limit:v1\0"
 
 
@@ -47,10 +48,17 @@ def durable_stop_rate_limit_key(request: Request) -> str:
     ).hexdigest()
 
 limiter = Limiter(key_func=get_remote_address)
+stop_admission_rate_limit = limiter.shared_limit(
+    STOP_ADMISSION_RATE_LIMIT,
+    scope=STOP_ADMISSION_RATE_LIMIT_SCOPE,
+    key_func=durable_stop_rate_limit_key,
+)
 
 
 __all__ = [
     "STOP_ADMISSION_RATE_LIMIT",
+    "STOP_ADMISSION_RATE_LIMIT_SCOPE",
     "durable_stop_rate_limit_key",
     "limiter",
+    "stop_admission_rate_limit",
 ]
