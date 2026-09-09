@@ -27,7 +27,8 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     resolve_request_invocation_id,
     validate_request_invocation_id,
 )
-from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.api_errors import ApiHTTPException, rate_limited_until
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
@@ -567,7 +568,18 @@ async def invoke_agent(request: Request, http_response: Response):
         }
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
+        # A retry loop that declined a server-advised wait is not an internal
+        # error: the route is rate limited until a known time, and the caller
+        # can act on that (#3127). The reset time is the provider's number,
+        # not caller content or provider prose, so it may cross this boundary.
+        declined = advised_wait_exceeding_budget(exc)
+        if declined is not None:
+            logger.error(
+                "Agent invocation declined: model route rate limited until %s",
+                declined.retry_at.isoformat(timespec="seconds"),
+            )
+            raise rate_limited_until(declined)
         # Invocation failures can wrap caller content, provider errors, or a
         # client-controlled retry id.  Keep the operator event useful without
         # recording any of those values outside the governed request path.

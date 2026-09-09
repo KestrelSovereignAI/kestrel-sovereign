@@ -48,6 +48,7 @@ from kestrel_sdk.llm import (
     ToolCallStarted,
 )
 
+from kestrel_sovereign.llm.retry import common_declined_wait
 from .adapter import (
     LLMResponse,
     ThinkingDelta,
@@ -1199,6 +1200,7 @@ class StreamingMixin:
         explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers_to_use):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1286,6 +1288,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 if _is_harness_owned_transport_error(e):
                     # Harness-owned transport error (codex app-server idle
                     # stall, app-server connection closed, etc.). Don't
@@ -1323,13 +1326,17 @@ class StreamingMixin:
                         "vendor. Error: %s",
                         providers_to_use[0].get("vendor"), provider_name, e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider_name} failed and the only "
                         f"remaining routes are unconfigured vendors; refusing to "
                         f"silently swap vendors: {e}",
                         provider=provider_name,
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 # Default multi-provider chain: log the fallback server-side;
                 # don't corrupt the stream with a note about it.
                 logger.warning(
@@ -1340,11 +1347,14 @@ class StreamingMixin:
 
         provider_type = "local" if force_local_only else "all"
         logger.error(f"All {provider_type} providers failed for streaming. Last error: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All {provider_type} providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
         )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate
 
     async def generate_stream(
         self,
@@ -1494,6 +1504,7 @@ class StreamingMixin:
         explicit_selection, configured_vendors = resolution.meta
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1561,6 +1572,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 if _is_harness_owned_transport_error(e):
                     # See #1429: skip _maybe_disable_route too — harness
                     # owns auth, kestrel doesn't disable the route on its
@@ -1586,24 +1598,31 @@ class StreamingMixin:
                         "route is an unconfigured vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
                 )
                 continue
 
         logger.error(f"All providers failed for stream_with_messages: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
         )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate
 
     @staticmethod
     def _adapter_supports_vision(adapter: Any) -> bool:
@@ -1821,6 +1840,7 @@ class StreamingMixin:
         tools = self._check_model_tool_support(providers, tools, model_override)
 
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -1937,6 +1957,7 @@ class StreamingMixin:
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 last_error = e
+                route_errors.append(e)
                 last_provider_name = provider["name"]
                 if _is_harness_owned_transport_error(e):
                     # See #1429: skip _maybe_disable_route too — harness
@@ -1964,21 +1985,28 @@ class StreamingMixin:
                         "vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMStreamingError(
+                    exhausted = LLMStreamingError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors: {e}",
                         provider=provider["name"],
                         underlying=e,
                     )
+                    # An aggregate of every attempted route: the verdict is
+                    # the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted
                 logger.warning(
                     "Falling through from %s: %s", provider["name"], e,
                 )
                 continue
 
         logger.error(f"All providers failed for stream_with_tool_detection: {last_error}")
-        raise LLMStreamingError(
+        aggregate = LLMStreamingError(
             f"All providers failed: {last_error}",
             provider=last_provider_name,
             underlying=last_error,
         )
+        # The aggregate states its own verdict (see common_declined_wait).
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate
