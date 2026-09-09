@@ -572,8 +572,10 @@ export function mountAgentListPane(containerEl, config = {}) {
 
     // --- Mount the shared list surface into the body -----------------------
     let loadedItems = [];
+    let listLoaded = false;
     let stopAllPending = false;
     let refreshStopAllState = async () => false;
+    let invalidateStopAllState = () => {};
     const listHandle = mountAgentList(body, {
         api: config.api,
         adapter: config.adapter,
@@ -584,12 +586,17 @@ export function mountAgentListPane(containerEl, config = {}) {
         onSelect: config.onSelect,
         onLoaded: (items, meta) => {
             loadedItems = Array.isArray(items) ? items : [];
+            listLoaded = true;
             if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
                 void refreshStopAllState();
             }
             if (typeof config.onLoaded === 'function') config.onLoaded(items, meta);
         },
-        onError: config.onError,
+        onError: (error) => {
+            listLoaded = false;
+            invalidateStopAllState();
+            if (typeof config.onError === 'function') config.onError(error);
+        },
         autoLoad: config.autoLoad,
         autoSelectFirst: config.autoSelectFirst,
         selectedName: config.selectedName,
@@ -604,42 +611,49 @@ export function mountAgentListPane(containerEl, config = {}) {
     // server owns target resolution and fan-out; this component submits one
     // host request and renders every typed result without collapsing partial
     // refusal/unreachability into success.
+    const stopAllOptIn = typeof config.onPrepareStopAll === 'function'
+        && api && typeof api.getHostStopStatus === 'function'
+        && typeof api.stopHost === 'function';
     let stopAllBtn = header.querySelector('.agent-stop-all-btn');
-    const builtStopAllBtn = !stopAllBtn;
-    if (!stopAllBtn) {
+    const builtStopAllBtn = stopAllOptIn && !stopAllBtn;
+    if (stopAllOptIn && !stopAllBtn) {
         stopAllBtn = doc.createElement('button');
         stopAllBtn.type = 'button';
         stopAllBtn.className = 'agent-stop-all-btn';
         stopAllBtn.textContent = 'Stop all';
         header.insertBefore(stopAllBtn, collapseBtn);
     }
-    stopAllBtn.title = 'Cooperatively stop all in-flight agent work';
-    stopAllBtn.setAttribute('aria-label', 'Stop all in-flight agents');
+    if (stopAllBtn) {
+        stopAllBtn.hidden = !stopAllOptIn;
+        stopAllBtn.disabled = !stopAllOptIn;
+        stopAllBtn.title = 'Cooperatively stop all in-flight agent work';
+        stopAllBtn.setAttribute('aria-label', 'Stop all in-flight agents');
+    }
 
-    const stopAllResults = doc.createElement('div');
-    stopAllResults.className = 'agent-stop-all-results';
-    stopAllResults.setAttribute('role', 'status');
-    stopAllResults.setAttribute('aria-live', 'polite');
-    stopAllResults.hidden = true;
-    body.insertBefore(stopAllResults, listHandle.element);
+    const stopAllResults = stopAllOptIn ? doc.createElement('div') : null;
+    if (stopAllResults) {
+        stopAllResults.className = 'agent-stop-all-results';
+        stopAllResults.setAttribute('role', 'status');
+        stopAllResults.setAttribute('aria-live', 'polite');
+        stopAllResults.hidden = true;
+        body.insertBefore(stopAllResults, listHandle.element);
+    }
 
     let stopAllStatusSeq = 0;
     let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
     function renderStopAllState() {
+        if (!stopAllOptIn || !stopAllBtn) return;
         const { loaded, canStop, inFlightCount } = stopAllStatus;
-        const canFenceBrowserWork = typeof config.onPrepareStopAll === 'function';
         const retryPending = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string';
         stopAllBtn.disabled = stopAllPending
             || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
-            || !loaded || !canStop || !canFenceBrowserWork
+            || !listLoaded || !loaded || !canStop
             || (inFlightCount === 0 && !retryPending);
         stopAllBtn.dataset.inFlightCount = String(inFlightCount);
         if (!loaded) {
             stopAllBtn.title = 'Checking cooperative Stop availability';
         } else if (!canStop) {
             stopAllBtn.title = 'Sovereign host authority is required to Stop all agents';
-        } else if (!canFenceBrowserWork) {
-            stopAllBtn.title = 'A browser-work Stop fence is required to Stop all agents';
         } else if (retryPending && inFlightCount === 0) {
             stopAllBtn.title = 'Recover the durable result of the prior Stop All request';
         } else if (inFlightCount > 0) {
@@ -648,13 +662,13 @@ export function mountAgentListPane(containerEl, config = {}) {
             stopAllBtn.title = 'No agent work is currently in flight';
         }
     }
+    invalidateStopAllState = () => {
+        stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
+        renderStopAllState();
+    };
     refreshStopAllState = async () => {
+        if (!stopAllOptIn || !listLoaded) return false;
         const seq = ++stopAllStatusSeq;
-        if (!api || typeof api.getHostStopStatus !== 'function') {
-            stopAllStatus = { loaded: true, canStop: false, inFlightCount: 0 };
-            renderStopAllState();
-            return false;
-        }
         try {
             const status = await api.getHostStopStatus();
             if (seq !== stopAllStatusSeq) return false;
@@ -730,63 +744,48 @@ export function mountAgentListPane(containerEl, config = {}) {
                 : false
         ));
     const onStopAllClick = async () => {
-        if (stopAllPending || containerEl[AGENT_LIST_STOP_ALL_OPERATION]
-            || !api || typeof api.stopHost !== 'function') return;
+        if (!stopAllOptIn || !listLoaded || stopAllPending
+            || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
         const operation = {
             correlationId: containerEl[AGENT_LIST_STOP_ALL_RETRY]
                 || newStopAllCorrelationId(),
         };
-        containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
-        stopAllPending = true;
-        renderStopAllState();
-        const statusAvailable = await refreshStopAllState();
-        if (destroyed || containerEl[AGENT_LIST_STOP_ALL_OPERATION] !== operation) {
-            stopAllPending = false;
-            if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
-                delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
-            }
-            const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
-            if (currentOwner && typeof currentOwner.refreshStopAllState === 'function') {
-                void currentOwner.refreshStopAllState();
-            }
-            return;
-        }
         const count = stopAllStatus.inFlightCount;
         const retryPending = containerEl[AGENT_LIST_STOP_ALL_RETRY] === operation.correlationId;
-        if (!statusAvailable || (count === 0 && !retryPending)) {
-            stopAllPending = false;
-            delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
-            renderStopAllState();
-            return;
-        }
         const noun = count === 1 ? 'agent' : 'agents';
         const confirmation = retryPending && count === 0
             ? 'Recover the durable result of the prior Stop All request?'
             : `Stop all ${count} in-flight ${noun}?`;
-        if (!confirmStopAll(confirmation)) {
-            stopAllPending = false;
-            delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
-            renderStopAllState();
-            return;
-        }
+        if (!confirmStopAll(confirmation)) return;
+
+        containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
+        stopAllPending = true;
+        renderStopAllState();
         // Browser-owned queues and streams must be fenced synchronously before
-        // the POST can yield. The callback may return a settlement hook that
-        // reconciles locally-addressed streams with the typed host outcomes.
+        // even the fresh status read can yield. The callback may return a
+        // settlement hook that reconciles locally-addressed streams with the
+        // typed host outcomes.
         let settleLocalStop = null;
         let response = null;
         let stopError = null;
         try {
             settleLocalStop = config.onPrepareStopAll(loadedItems);
+            const statusAvailable = await refreshStopAllState();
+            if (destroyed || containerEl[AGENT_LIST_STOP_ALL_OPERATION] !== operation) {
+                return;
+            }
+            const freshCount = stopAllStatus.inFlightCount;
+            if (!statusAvailable || (freshCount === 0 && !retryPending)) return;
+
             containerEl[AGENT_LIST_STOP_ALL_RETRY] = operation.correlationId;
             response = await api.stopHost({
                 reason: config.stopAllReason || 'Stopped from the agents banner',
                 correlation_id: operation.correlationId,
             });
-            const evidence = validateHostStopEnvelope(
-                response,
-                operation.correlationId,
-            );
-            if (evidence) delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
+            // A response, even malformed or unreceipted, is terminal for this
+            // attempt. Only a transport-ambiguous failure replays one durable
+            // correlation; a terminal refusal/conflict gets a fresh operation.
+            delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
             if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
                 renderStopAllOutcomes(response, operation.correlationId);
             }
@@ -796,6 +795,9 @@ export function mountAgentListPane(containerEl, config = {}) {
             }
         } catch (error) {
             stopError = error;
+            if (Number.isSafeInteger(error && error.status) && error.status > 0) {
+                delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
+            }
             if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
                 stopAllResults.hidden = false;
                 stopAllResults.textContent = `Stop All failed: ${error && error.message ? error.message : 'request failed'}`;
@@ -824,7 +826,7 @@ export function mountAgentListPane(containerEl, config = {}) {
             }
         }
     };
-    stopAllBtn.addEventListener('click', onStopAllClick);
+    if (stopAllOptIn) stopAllBtn.addEventListener('click', onStopAllClick);
 
     // Host work can originate in another tab, through the API, or from a
     // signal. Poll the authoritative read-only status instead of treating this
@@ -834,9 +836,10 @@ export function mountAgentListPane(containerEl, config = {}) {
         : 2000;
     const setIntervalFn = doc.defaultView && doc.defaultView.setInterval;
     const clearIntervalFn = doc.defaultView && doc.defaultView.clearInterval;
-    const statusInterval = typeof setIntervalFn === 'function'
+    const statusInterval = stopAllOptIn && typeof setIntervalFn === 'function'
         ? setIntervalFn.call(doc.defaultView, () => {
-            if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
+            if (listLoaded && !stopAllPending
+                && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
                 void refreshStopAllState();
             }
         }, statusIntervalMs)
@@ -956,7 +959,7 @@ export function mountAgentListPane(containerEl, config = {}) {
             delete paneEl[AGENT_LIST_PANE_OWNER];
         }
         collapseBtn.removeEventListener('click', onCollapseClick);
-        stopAllBtn.removeEventListener('click', onStopAllClick);
+        if (stopAllBtn) stopAllBtn.removeEventListener('click', onStopAllClick);
         stopAllStatusSeq++;
         if (statusInterval !== null && typeof clearIntervalFn === 'function') {
             clearIntervalFn.call(doc.defaultView, statusInterval);
@@ -970,7 +973,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
         if (builtNewBtn && newBtn) newBtn.remove();
         if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
-        if (stopAllResults.parentNode) stopAllResults.remove();
+        if (stopAllResults && stopAllResults.parentNode) stopAllResults.remove();
         // The built resize handle too (codex P2): a leaked absolutely-positioned
         // .resize-handle overlays the container edge and gets ADOPTED by the
         // next mount into the same container, doubling listeners over time.

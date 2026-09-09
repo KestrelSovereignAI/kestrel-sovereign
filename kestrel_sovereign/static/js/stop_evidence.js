@@ -19,22 +19,29 @@ export function validateHostStopEnvelope(response, expectedCorrelationId = null)
     let confirmedCount = 0;
     let unconfirmedCount = 0;
     const receiptIds = new Set();
+    const agentIds = new Set();
+    const resolvedTargets = new Set();
     for (const outcome of outcomes) {
         if (!outcome || typeof outcome !== 'object'
             || outcome.scope !== 'host'
             || outcome.requested_target !== null
-            || typeof outcome.agent_id !== 'string' || outcome.agent_id.length === 0
-            || typeof outcome.resolved_target !== 'string' || outcome.resolved_target.length === 0
-            || typeof outcome.receipt_id !== 'string' || outcome.receipt_id.length === 0
+            || typeof outcome.agent_id !== 'string' || outcome.agent_id.trim().length === 0
+            || typeof outcome.resolved_target !== 'string' || outcome.resolved_target.trim().length === 0
+            || typeof outcome.receipt_id !== 'string' || outcome.receipt_id.trim().length === 0
+            || outcome.agent_id !== outcome.resolved_target
             || outcome.correlation_id !== correlationId) {
             return null;
         }
         receiptIds.add(outcome.receipt_id);
+        agentIds.add(outcome.agent_id);
+        resolvedTargets.add(outcome.resolved_target);
         if (CONFIRMED.has(outcome.disposition)) confirmedCount += 1;
         else if (UNCONFIRMED.has(outcome.disposition)) unconfirmedCount += 1;
         else return null;
     }
     if (receiptIds.size !== 1
+        || agentIds.size !== outcomes.length
+        || resolvedTargets.size !== outcomes.length
         || response.confirmed_count !== confirmedCount
         || response.unconfirmed_count !== unconfirmedCount
         || confirmedCount + unconfirmedCount !== outcomes.length) {

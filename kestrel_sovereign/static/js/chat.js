@@ -1189,6 +1189,7 @@ function chatComponentApi() {
         updateThinkingIndicator,
         refreshAgentThinkingDot,
         stopAgent,
+        prepareHostStop,
         updateComposerModeToggle,
         sendMessage,
         updateContextStatus,

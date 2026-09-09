@@ -40,6 +40,9 @@ function makeStorage() {
 globalThis.localStorage = makeStorage();
 
 const { mountAgentListPane } = await import('../../kestrel_sovereign/static/js/agent_list.js');
+const { validateHostStopEnvelope } = await import(
+    '../../kestrel_sovereign/static/js/stop_evidence.js'
+);
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
 
@@ -462,14 +465,111 @@ test('Stop All never calls the host seam when no agent is in flight', async () =
     handle.destroy();
 });
 
+test('a click fences browser work even when the fresh host count reaches zero', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let statusCalls = 0;
+    let fenceCalls = 0;
+    let stopCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: async () => ({
+                can_stop: true,
+                in_flight_count: ++statusCalls === 1 ? 1 : 0,
+            }),
+            stopHost: async () => { stopCalls += 1; },
+        },
+        onPrepareStopAll: () => { fenceCalls += 1; return () => {}; },
+        confirmStopAll: () => true,
+        stopAllStatusIntervalMs: 999999,
+    });
+    await tick();
+    await tick();
+
+    el.querySelector('.agent-stop-all-btn').click();
+    await tick();
+    await tick();
+
+    handle.destroy();
+    assert.equal(fenceCalls, 1, 'the accepted user intent fences local queued work');
+    assert.equal(stopCalls, 0, 'fresh empty host inventory needs no network mutation');
+});
+
+test('Stop All waits for adapter identity inventory before status or enablement', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let resolveItems;
+    const items = new Promise((resolve) => { resolveItems = resolve; });
+    let statusCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: { mode: 'multi_agent', listAgents: () => items },
+        api: {
+            getHostStopStatus: async () => {
+                statusCalls += 1;
+                return { can_stop: true, in_flight_count: 1 };
+            },
+            stopHost: async () => ({}),
+        },
+        onPrepareStopAll: browserStopFence,
+        stopAllStatusIntervalMs: 250,
+    });
+    const button = el.querySelector('.agent-stop-all-btn');
+    await tick();
+    const statusCallsBeforeInventory = statusCalls;
+    const disabledBeforeInventory = button.disabled;
+
+    resolveItems([{ name: 'Emma', id: 'did:agent:emma' }]);
+    await tick();
+    await tick();
+    handle.destroy();
+    assert.equal(statusCallsBeforeInventory, 0,
+        'identity inventory is load-bearing for settlement');
+    assert.equal(disabledBeforeInventory, true);
+    assert.equal(statusCalls, 1);
+    assert.equal(button.disabled, false);
+});
+
+test('autoLoad false defers Stop All authority polling until explicit refresh', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let statusCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        autoLoad: false,
+        api: {
+            getHostStopStatus: async () => {
+                statusCalls += 1;
+                return { can_stop: true, in_flight_count: 1 };
+            },
+            stopHost: async () => ({}),
+        },
+        onPrepareStopAll: browserStopFence,
+        stopAllStatusIntervalMs: 250,
+    });
+    await tick();
+    assert.equal(statusCalls, 0);
+    assert.equal(el.querySelector('.agent-stop-all-btn').disabled, true);
+
+    await handle.refresh();
+    await tick();
+    assert.equal(statusCalls, 1);
+    assert.equal(el.querySelector('.agent-stop-all-btn').disabled, false);
+    handle.destroy();
+});
+
 test('Stop All fails closed when an embed omits the browser-work fence contract', async () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
     let calls = 0;
+    let statusCalls = 0;
     const handle = mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', status: 'online' }]),
         api: {
-            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            getHostStopStatus: async () => {
+                statusCalls += 1;
+                return { can_stop: true, in_flight_count: 1 };
+            },
             stopHost: async () => { calls += 1; },
         },
         confirmStopAll: () => true,
@@ -477,12 +577,10 @@ test('Stop All fails closed when an embed omits the browser-work fence contract'
     });
     await tick();
 
-    const button = el.querySelector('.agent-stop-all-btn');
     try {
-        assert.equal(button.disabled, true);
-        assert.match(button.title, /browser-work Stop fence is required/);
-        button.click();
-        await tick();
+        assert.equal(el.querySelector('.agent-stop-all-btn'), null,
+            'Stop All is an explicit embed opt-in, not dead default chrome');
+        assert.equal(statusCalls, 0, 'unopted embeds never poll a host authority door');
         assert.equal(calls, 0, 'an unfenced embed cannot issue Host Stop');
     } finally {
         handle.destroy();
@@ -563,6 +661,57 @@ test('an ambiguous Host Stop retry reuses the browser-owned correlation id', asy
         'retry replays the exact durable Stop identity');
     assert.equal(button.disabled, true, 'recovered evidence clears the retry handle');
     handle.destroy();
+});
+
+test('a terminal unreceipted response gets a fresh operation identity', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const operationIds = [];
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async (payload) => {
+                operationIds.push(payload.correlation_id);
+                const response = hostStopEnvelope(payload.correlation_id, [
+                    { agent: 'did:agent:emma', disposition: 'refused' },
+                ]);
+                response.stop_outcomes[0].receipt_id = null;
+                return response;
+            },
+        },
+        onPrepareStopAll: browserStopFence,
+        confirmStopAll: () => true,
+        stopAllStatusIntervalMs: 999999,
+    });
+    await tick();
+    await tick();
+    const button = el.querySelector('.agent-stop-all-btn');
+    button.click();
+    await tick();
+    await tick();
+    button.click();
+    await tick();
+    await tick();
+
+    handle.destroy();
+    assert.equal(operationIds.length, 2);
+    assert.notEqual(operationIds[1], operationIds[0],
+        'a received terminal refusal is not an ambiguous replay');
+});
+
+test('canonical host evidence rejects duplicate and cross-wired target identities', () => {
+    const duplicate = hostStopEnvelope('stop:duplicate', [
+        { agent: 'did:agent:emma', disposition: 'stopped' },
+        { agent: 'did:agent:emma', disposition: 'stopped' },
+    ]);
+    assert.equal(validateHostStopEnvelope(duplicate, 'stop:duplicate'), null);
+
+    const crossWired = hostStopEnvelope('stop:cross-wired', [
+        { agent: 'did:agent:emma', disposition: 'stopped' },
+    ]);
+    crossWired.stop_outcomes[0].resolved_target = 'did:agent:kite';
+    assert.equal(validateHostStopEnvelope(crossWired, 'stop:cross-wired'), null);
 });
 
 test('re-mounting an adopted pane replaces Stop All ownership without duplicate controls or handlers', async () => {
