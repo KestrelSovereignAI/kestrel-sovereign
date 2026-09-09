@@ -333,6 +333,116 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_tool_batch_persists_completed_result_before_unwind():
+    """A completed external effect must cross the history checkpoint on Stop."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _build_mock_agent(cancel_on_call=None)
+    cancelled = False
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+
+    agent.is_request_cancelled = lambda _request_id=None: cancelled
+    persist_assistant_turn = agent._persist_assistant_turn_safely
+    persistence_requirements = []
+
+    async def capture_persistence_requirement(*args, **kwargs):
+        persistence_requirements.append(kwargs.get("require_success", False))
+        return await persist_assistant_turn(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_persistence_requirement
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+    agent._handle_orchestrator_response_streaming = (
+        OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+
+    async def execute_batch(*_args, **kwargs):
+        batch_started.set()
+        await release_batch.wait()
+        kwargs["tool_events"].extend(
+            [
+                {"type": "start", "tool": "send_message"},
+                {"type": "complete", "tool": "send_message", "ms": 1},
+            ]
+        )
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc1",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+        batch_completed.set()
+
+    agent._execute_tool_batch = execute_batch
+
+    async def stream(**_kwargs):
+        yield LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="send_message",
+                    arguments={"text": "sent once"},
+                )
+            ],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+
+    async def consume():
+        return [
+            chunk
+            async for chunk in agent.process_input_streaming(
+                "send it", request_id="req-stop-in-batch"
+            )
+        ]
+
+    turn = asyncio.create_task(consume())
+    await batch_started.wait()
+    cancelled = True
+    turn.cancel()
+    await asyncio.sleep(0)
+    assert batch_completed.is_set() is False
+
+    release_batch.set()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert batch_completed.is_set() is True
+    assistant_calls = [
+        call
+        for call in agent.privacy_agent.add_conversation.await_args_list
+        if call.args and call.args[0] == "assistant"
+    ]
+    assert len(assistant_calls) == 1
+    assert persistence_requirements == [True]
+    assert assistant_calls[0].kwargs["metadata"]["cancelled"] is True
+    assert assistant_calls[0].kwargs["metadata"]["tool_results"] == [
+        {
+            "tool_call_id": "tc1",
+            "name": "send_message",
+            "arguments": {"text": "sent once"},
+            "result": {"success": True},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_no_cancel_path_unaffected_for_normal_completion():
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking

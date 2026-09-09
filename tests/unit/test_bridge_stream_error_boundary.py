@@ -305,6 +305,77 @@ async def test_bridge_stop_interrupts_producer_blocked_before_first_event():
     )
 
 
+@pytest.mark.asyncio
+async def test_bridge_stop_after_done_does_not_begin_outbound_audit():
+    """Stop at the ``done`` suspension point fences later bridge side effects."""
+
+    bridge = MagicMock()
+    bridge.get_or_create_session = AsyncMock(
+        return_value=SimpleNamespace(id="bridge-session")
+    )
+    bridge.log_invocation = AsyncMock()
+
+    class CompletedBridgeAgent(RequestLifecycleMixin):
+        def __init__(self):
+            self._current_request_id = None
+            self._active_request_ids = set()
+            self._active_request_counts = {}
+            self._active_request_started_at = {}
+            self._cancelled_requests = set()
+            self._request_completion_events = {}
+            self.features = {"BridgeFeature": bridge}
+
+        async def process_input_streaming(self, *_args, **_kwargs):
+            yield "complete answer"
+
+    agent = CompletedBridgeAgent()
+    app = FastAPI()
+    app.state.agent = agent
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/bridge/stream",
+            "raw_path": b"/api/bridge/stream",
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1),
+            "server": ("test", 80),
+            "app": app,
+        }
+    )
+    route = next(
+        route
+        for route in get_router().routes
+        if getattr(route, "path", None) == "/api/bridge/stream"
+    )
+    endpoint = getattr(route.endpoint, "__wrapped__", route.endpoint)
+    response = await endpoint(
+        request,
+        BridgeRequest(message="work", request_id="done-boundary"),
+    )
+
+    chunk = json.loads((await anext(response.body_iterator))[len("data: ") :])
+    done = json.loads((await anext(response.body_iterator))[len("data: ") :])
+    assert chunk == {"type": "chunk", "content": "complete answer"}
+    assert done["type"] == "done"
+    assert bridge.log_invocation.await_count == 1
+
+    assert agent.cancel_current_request("done-boundary") is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(response.body_iterator)
+
+    # Only the inbound audit ran. The outbound audit must not begin after the
+    # exact Stop linearized while the generator was suspended at ``done``.
+    assert bridge.log_invocation.await_count == 1
+    await asyncio.wait_for(
+        agent.wait_for_request_completion("done-boundary"),
+        timeout=1,
+    )
+
+
 def test_bridge_stream_withholds_chunk_queued_before_stop():
     """The bridge owner rechecks Stop before publishing a producer chunk."""
 

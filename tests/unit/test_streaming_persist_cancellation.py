@@ -137,6 +137,26 @@ async def test_persist_failure_logs_metric_and_swallows_exception():
 
 
 @pytest.mark.asyncio
+async def test_required_persist_failure_propagates_after_telemetry():
+    """A completed external effect cannot settle on a missing checkpoint."""
+
+    async def failing_persist(role, content, **kw):
+        raise RuntimeError("checkpoint unavailable")
+
+    agent = _make_agent_with_persist(failing_persist)
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await agent._persist_assistant_turn_safely(
+            "completed effect",
+            metadata={"tool_batch_checkpoint": {"status": "completed"}},
+            session_id="s-required",
+            require_success=True,
+        )
+
+    agent.observability_store.log_metric.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_with_broken_telemetry_does_not_raise():
     """Last-line-of-defense: if add_conversation fails AND
     log_metric also fails, the helper must still not raise. The error
