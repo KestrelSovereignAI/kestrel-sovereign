@@ -45,7 +45,11 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
-from kestrel_sovereign.agent.invocation import current_invocation_id
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_effect_checkpoint,
+    current_invocation_id,
+    mark_current_invocation_effect_completed,
+)
 from kestrel_sovereign.agent.turn_lifecycle import (
     bind_turn_session,
     capture_turn_session_binding,
@@ -700,6 +704,7 @@ class OrchestratorEngineMixin:
 
         turn_caller_binding = capture_caller_context_binding()
         request_id = current_invocation_id()
+        effect_checkpoint = current_invocation_effect_checkpoint()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -717,6 +722,13 @@ class OrchestratorEngineMixin:
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
+            # The Codex reader owns this callback on an old task context.  Pass
+            # the turn's captured mutable state explicitly: a ContextVar lookup
+            # here would see the reader's stale pre-turn snapshot.
+            mark_current_invocation_effect_completed(
+                session_id,
+                checkpoint=effect_checkpoint,
+            )
             return capture.get("effective_args", args), result
 
         async def _persist_completed_effects(executed: list[dict]) -> None:
@@ -2374,7 +2386,14 @@ class OrchestratorEngineMixin:
             run_owned_batch(),
             name="orchestrator-tool-batch",
         )
+        tool_results = kwargs.get("tool_results")
+        result_count = len(tool_results) if isinstance(tool_results, list) else None
         outcome = await await_owned_task(owner)
+        if (
+            result_count is not None
+            and len(tool_results) > result_count
+        ):
+            mark_current_invocation_effect_completed(kwargs.get("session_id"))
         if defer_cancellation_to_persistence and outcome.cancellation is not None:
             return _DeferredToolBatchCancellation(outcome)
         return raise_owned_outcome(
@@ -2469,6 +2488,57 @@ class OrchestratorEngineMixin:
         return 1 + history_len + (1 if has_user_message else 0), history_len
 
     async def _handle_orchestrator_response(
+        self,
+        response: Union[str, LLMResponse],
+        feature_tools: List[Dict[str, Any]],
+        system_prompt: str,
+        force_local_only: bool,
+        effective_model: str,
+        max_iterations: int = None,
+        user_message: str = None,
+        session_id: Optional[str] = None,
+        tool_results: Optional[list] = None,
+        invocation_context=None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
+    ) -> str:
+        """Run the non-streaming loop behind a completed-effect Stop fence."""
+
+        captured_results = tool_results if tool_results is not None else []
+        had_inline_effect = bool(getattr(response, "executed_tool_calls", None))
+        try:
+            return await OrchestratorEngineMixin._handle_orchestrator_response_impl(
+                self,
+                response=response,
+                feature_tools=feature_tools,
+                system_prompt=system_prompt,
+                force_local_only=force_local_only,
+                effective_model=effective_model,
+                max_iterations=max_iterations,
+                user_message=user_message,
+                session_id=session_id,
+                tool_results=captured_results,
+                invocation_context=invocation_context,
+                conversation_history=conversation_history,
+                continuation_user_content=continuation_user_content,
+            )
+        except asyncio.CancelledError as error:
+            state = current_invocation_effect_checkpoint()
+            already_checkpointed = bool(
+                getattr(error, "_kestrel_completed_effect_checkpointed", False)
+                or (state is not None and state.checkpointed)
+            )
+            if (had_inline_effect or captured_results) and not already_checkpointed:
+                await self._persist_completed_tool_stop_checkpoint(
+                    session_id=session_id,
+                    request_id=current_invocation_id(),
+                )
+                if state is not None:
+                    state.checkpointed = True
+                setattr(error, "_kestrel_completed_effect_checkpointed", True)
+            raise
+
+    async def _handle_orchestrator_response_impl(
         self,
         response: Union[str, LLMResponse],
         feature_tools: List[Dict[str, Any]],
@@ -2581,10 +2651,6 @@ class OrchestratorEngineMixin:
                 defer_cancellation_to_persistence=True,
             )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
-                await self._persist_completed_tool_stop_checkpoint(
-                    session_id=session_id,
-                    request_id=current_invocation_id(),
-                )
                 raise_owned_outcome(
                     batch_result.outcome,
                     operation="side-effecting orchestrator tool batch",

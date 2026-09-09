@@ -28,6 +28,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     bind_async_generator_invocation,
     current_invocation_id,
+    mark_current_invocation_effect_checkpointed,
 )
 from kestrel_sovereign.agent.context_manager import CONTEXT_HISTORY_LIMIT
 from kestrel_sovereign.agent.semantic_recall import persistence_dependency_metadata
@@ -2590,6 +2591,7 @@ class StreamingMixin:
             name="persist-assistant-turn",
         )
         outcome = await await_owned_task(persistence)
+        pending_cancellation = outcome.cancellation
         if outcome.error is not None and not isinstance(
             outcome.error,
             asyncio.CancelledError,
@@ -2599,8 +2601,8 @@ class StreamingMixin:
                 "Failed to persist assistant turn (session_id=%s): %s",
                 session_id, exc, exc_info=True,
             )
-            try:
-                await self.observability_store.log_metric(
+            telemetry = asyncio.create_task(
+                self.observability_store.log_metric(
                     agent_name=self.did,
                     metric_name="assistant_turn_persist_failed",
                     metric_value=1.0,
@@ -2609,8 +2611,18 @@ class StreamingMixin:
                         "error_type": type(exc).__name__,
                         "error_msg": str(exc)[:500],
                     },
-                )
-            except Exception:
+                ),
+                name="assistant-turn-persist-failure-telemetry",
+            )
+            telemetry_outcome = await await_owned_task(
+                telemetry,
+                pending_cancellation,
+            )
+            pending_cancellation = telemetry_outcome.cancellation
+            if (
+                telemetry_outcome.error is not None
+                and not isinstance(telemetry_outcome.error, asyncio.CancelledError)
+            ):
                 # Telemetry failures must never propagate from a
                 # post-response persist path. If observability is also
                 # broken, the logged ERROR above is the last line of
@@ -2622,14 +2634,16 @@ class StreamingMixin:
         # CancelledError would let the Stop lifecycle acknowledge a clean
         # unwind even though the anti-repeat record never became durable.
         if require_success and outcome.error is not None:
-            if outcome.cancellation is not None:
+            if pending_cancellation is not None:
                 outcome.error.add_note(
                     "caller cancellation remained pending while the required "
                     "assistant-turn checkpoint failed"
                 )
             raise outcome.error
-        if outcome.cancellation is not None:
-            raise outcome.cancellation
+        if outcome.error is None:
+            mark_current_invocation_effect_checkpointed()
+        if pending_cancellation is not None:
+            raise pending_cancellation
         if isinstance(outcome.error, asyncio.CancelledError):
             raise outcome.error
 

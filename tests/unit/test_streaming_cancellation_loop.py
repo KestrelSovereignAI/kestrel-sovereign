@@ -532,6 +532,94 @@ async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
 
 
 @pytest.mark.asyncio
+async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
+    """A later provider await remains behind the completed-batch fence."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _make_persist_agent(cancelled_request_id=None)
+    synthesis_started = asyncio.Event()
+    required = []
+    persist = agent._persist_assistant_turn_safely
+
+    async def capture_required(*args, **kwargs):
+        required.append(kwargs.get("require_success", False))
+        return await persist(*args, **kwargs)
+
+    async def execute_batch(*_args, **kwargs):
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc-late-cancel",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+
+    async def wait_for_synthesis(**_kwargs):
+        synthesis_started.set()
+        await asyncio.Event().wait()
+
+    agent._persist_assistant_turn_safely = capture_required
+    agent._persist_completed_tool_stop_checkpoint = (
+        OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch = execute_batch
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+    agent._build_all_tools = MagicMock(return_value=[])
+    agent._prune_orchestrator_messages = MagicMock(
+        side_effect=lambda messages, *_args, **_kwargs: messages
+    )
+    agent._make_inline_tool_executor = MagicMock(return_value=None)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        side_effect=wait_for_synthesis
+    )
+    response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="tc-late-cancel",
+                name="send_message",
+                arguments={"text": "sent once"},
+            )
+        ],
+    )
+
+    turn = asyncio.create_task(
+        OrchestratorEngineMixin._handle_orchestrator_response(
+            agent,
+            response=response,
+            feature_tools=[],
+            system_prompt="system",
+            force_local_only=False,
+            effective_model="test",
+            user_message="send it",
+            session_id="s-late-cancel",
+            tool_results=[],
+        )
+    )
+    await synthesis_started.wait()
+    turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert required == [True]
+    assert len(agent._captured) == 1
+
+
+@pytest.mark.asyncio
 async def test_no_cancel_path_unaffected_for_normal_completion():
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking

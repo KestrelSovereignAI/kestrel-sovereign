@@ -3306,6 +3306,11 @@ class CodexAdapter(LLMAdapter):
                             "inline tool effect completed"
                         )
                         raise checkpoint_outcome.error
+                    setattr(
+                        pending_cleanup_cancellation,
+                        "_kestrel_completed_effect_checkpointed",
+                        True,
+                    )
             if pending_cleanup_cancellation is not None:
                 raise pending_cleanup_cancellation
 

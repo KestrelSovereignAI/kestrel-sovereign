@@ -38,6 +38,20 @@ _current_invocation_id: ContextVar[str | None] = ContextVar(
 )
 
 
+@dataclass(slots=True)
+class InvocationEffectCheckpoint:
+    """Mutable durability state shared by every task owned by one turn."""
+
+    completed: bool = False
+    checkpointed: bool = False
+    session_id: str | None = None
+
+
+_current_effect_checkpoint: ContextVar[InvocationEffectCheckpoint | None] = (
+    ContextVar("kestrel_current_effect_checkpoint", default=None)
+)
+
+
 @dataclass(frozen=True, slots=True)
 class InvocationProvenance:
     """Trusted transport context bound to one top-level agent invocation.
@@ -251,6 +265,35 @@ def current_invocation_id() -> str | None:
     return _current_invocation_id.get()
 
 
+def current_invocation_effect_checkpoint() -> InvocationEffectCheckpoint | None:
+    """Return the turn's shared completed-effect durability state, if bound."""
+
+    return _current_effect_checkpoint.get()
+
+
+def mark_current_invocation_effect_completed(
+    session_id: str | None,
+    *,
+    checkpoint: InvocationEffectCheckpoint | None = None,
+) -> None:
+    """Record that this turn completed an externally visible tool effect."""
+
+    state = checkpoint or _current_effect_checkpoint.get()
+    if state is not None:
+        state.completed = True
+        state.checkpointed = False
+        if state.session_id is None:
+            state.session_id = session_id
+
+
+def mark_current_invocation_effect_checkpointed() -> None:
+    """Record that the turn's completed effects now have durable evidence."""
+
+    state = _current_effect_checkpoint.get()
+    if state is not None and state.completed:
+        state.checkpointed = True
+
+
 def current_invocation_provenance() -> InvocationProvenance | None:
     """Return task-local trusted request provenance, if the entry point bound it."""
     return _current_invocation_provenance.get()
@@ -265,9 +308,11 @@ def _exact_invocation_scope(
 
     id_token = _current_invocation_id.set(invocation_id)
     provenance_token = _current_invocation_provenance.set(provenance)
+    effect_token = _current_effect_checkpoint.set(InvocationEffectCheckpoint())
     try:
         yield invocation_id
     finally:
+        _current_effect_checkpoint.reset(effect_token)
         _current_invocation_provenance.reset(provenance_token)
         _current_invocation_id.reset(id_token)
 
@@ -324,6 +369,29 @@ def bind_async_invocation(
                 caller_cancellation_baseline = (
                     caller_task.cancelling() if caller_task is not None else 0
                 )
+
+                async def checkpoint_completed_effects() -> None:
+                    state = _current_effect_checkpoint.get()
+                    if (
+                        state is None
+                        or not state.completed
+                        or state.checkpointed
+                        or lifecycle_owner is None
+                    ):
+                        return
+                    checkpoint = getattr(
+                        lifecycle_owner,
+                        "_persist_completed_tool_stop_checkpoint",
+                        None,
+                    )
+                    if not callable(checkpoint):
+                        return
+                    await checkpoint(
+                        session_id=state.session_id,
+                        request_id=invocation_id,
+                    )
+                    state.checkpointed = True
+
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -457,6 +525,12 @@ def bind_async_invocation(
                                 )
                             return result
                         except asyncio.CancelledError as error:
+                            # An adapter/tool batch may have returned normally
+                            # before cancellation lands at a later await in the
+                            # turn.  The mutable checkpoint state is shared with
+                            # every owned child task, so this top-level boundary
+                            # closes that post-effect/pre-response window too.
+                            await checkpoint_completed_effects()
                             if (
                                 caller_task is not None
                                 and caller_task.cancelling()
