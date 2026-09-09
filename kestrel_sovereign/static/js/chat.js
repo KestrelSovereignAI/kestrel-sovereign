@@ -123,6 +123,15 @@ function unconfirmedStopCorrelationIds() {
     return currentState.unconfirmedStopCorrelationIds;
 }
 
+function hostStopGeneration() {
+    const currentState = deps().state;
+    if (!Number.isSafeInteger(currentState.hostStopGeneration)
+        || currentState.hostStopGeneration < 0) {
+        currentState.hostStopGeneration = 0;
+    }
+    return currentState.hostStopGeneration;
+}
+
 function isAgentBusy(agentName) {
     return deps().state.waitingAgents.has(agentName)
         || unconfirmedStopAgents().has(agentName);
@@ -2739,6 +2748,10 @@ function fenceLocalAgentStop(agentName) {
  */
 export function prepareHostStop(items = []) {
     const currentState = deps().state;
+    // Invalidate every send that started before the host fence. Those sends may
+    // currently be awaiting an attachment upload or a per-agent Stop and have
+    // not yet published a request for the host snapshot to observe.
+    currentState.hostStopGeneration = hostStopGeneration() + 1;
     const localNames = new Set([
         ...currentState.waitingAgents,
         ...unconfirmedStopAgents(),
@@ -2756,6 +2769,9 @@ export function prepareHostStop(items = []) {
     const addressToName = new Map();
     for (const item of Array.isArray(items) ? items : []) {
         if (!item || typeof item.name !== 'string' || !item.name) continue;
+        const localKey = localNames.has(item.name)
+            ? item.name
+            : (localNames.size === 1 && localNames.has(null) ? null : item.name);
         for (const address of [
             item.name,
             item.id,
@@ -2764,7 +2780,7 @@ export function prepareHostStop(items = []) {
             item.raw && item.raw.routing_name,
         ]) {
             if (typeof address === 'string' && address) {
-                addressToName.set(address, item.name);
+                addressToName.set(address, localKey);
             }
         }
     }
@@ -2773,21 +2789,38 @@ export function prepareHostStop(items = []) {
         const outcomes = Array.isArray(response && response.stop_outcomes)
             ? response.stop_outcomes
             : [];
+        const correlationId = response && response.correlation_id;
+        const validEnvelope = response
+            && typeof correlationId === 'string'
+            && correlationId.length > 0
+            && Number.isSafeInteger(response.target_count)
+            && response.target_count === outcomes.length
+            && Number.isSafeInteger(response.confirmed_count)
+            && Number.isSafeInteger(response.unconfirmed_count)
+            && response.confirmed_count + response.unconfirmed_count === outcomes.length;
         const confirmedNames = new Set();
         for (const outcome of outcomes) {
-            if (!outcome || !['stopped', 'already_complete'].includes(outcome.disposition)) {
+            if (!validEnvelope
+                || !outcome
+                || !['stopped', 'already_complete'].includes(outcome.disposition)
+                || typeof outcome.receipt_id !== 'string'
+                || outcome.receipt_id.length === 0
+                || outcome.correlation_id !== correlationId) {
                 continue;
             }
             for (const address of [outcome.agent_id, outcome.resolved_target]) {
-                const name = addressToName.get(address);
-                if (name) confirmedNames.add(name);
+                if (addressToName.has(address)) {
+                    confirmedNames.add(addressToName.get(address));
+                }
             }
         }
         const retainedRequestIds = unconfirmedStopRequestIds();
+        const retainedCorrelationIds = unconfirmedStopCorrelationIds();
         for (const name of localNames) {
             if (confirmedNames.has(name)) {
                 unconfirmedStopAgents().delete(name);
                 retainedRequestIds.delete(name);
+                retainedCorrelationIds.delete(name);
                 currentState.waitingAgents.delete(name);
             }
             refreshAgentThinkingDot(name);
@@ -2912,6 +2945,10 @@ export async function sendMessage(overrideText, overrideAgent) {
     const dispatchAgent = overrideAgent !== undefined
         ? overrideAgent
         : deps().api.getHostAgent();
+    const dispatchHostStopGeneration = hostStopGeneration();
+    const hostStopInvalidatedDispatch = () => (
+        hostStopGeneration() !== dispatchHostStopGeneration
+    );
     if (!text) return;
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
@@ -2920,6 +2957,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // uploading, wait for it so the turn carries the attachment instead of
     // dropping it (and leaving it staged for the next turn).
     if (fromComposer) await awaitPendingUploads(pane);
+    if (hostStopInvalidatedDispatch()) return;
 
     // A failed/unreachable Stop is not an ordinary busy turn: the local
     // stream was already aborted, so there is no completion ``finally`` left
@@ -2927,7 +2965,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // the composer or staged attachments. Only a confirmed Stop may proceed.
     if (unconfirmedStopAgents().has(dispatchAgent)) {
         const stopConfirmed = await stopAgent(dispatchAgent);
-        if (!stopConfirmed) return;
+        if (!stopConfirmed || hostStopInvalidatedDispatch()) return;
     }
 
     // Send-while-busy. Behavior depends on the pane's composerMode.
@@ -2962,7 +3000,7 @@ export async function sendMessage(overrideText, overrideAgent) {
         // ``state.waitingAgents`` itself, so the subsequent ``add``
         // below is the correct next state.
         const stopConfirmed = await stopAgent(dispatchAgent);
-        if (!stopConfirmed) return;
+        if (!stopConfirmed || hostStopInvalidatedDispatch()) return;
     }
 
     // #1573: claim this turn's ownership of the pane's stream paint

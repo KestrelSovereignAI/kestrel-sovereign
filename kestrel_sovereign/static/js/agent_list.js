@@ -33,6 +33,7 @@ import { storeGet, storeSet } from './ui_state.mjs';
 // ownership on the container lets the new mount retire the old listeners
 // before adopting the same buttons (#3155).
 const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
+const AGENT_LIST_STOP_ALL_OPERATION = Symbol.for('kestrel.agentListPane.stopAllOperation');
 
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
@@ -573,7 +574,9 @@ export function mountAgentListPane(containerEl, config = {}) {
         onSelect: config.onSelect,
         onLoaded: (items, meta) => {
             loadedItems = Array.isArray(items) ? items : [];
-            if (!stopAllPending) void refreshStopAllState();
+            if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
+                void refreshStopAllState();
+            }
             if (typeof config.onLoaded === 'function') config.onLoaded(items, meta);
         },
         onError: config.onError,
@@ -614,7 +617,9 @@ export function mountAgentListPane(containerEl, config = {}) {
     let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
     function renderStopAllState() {
         const { loaded, canStop, inFlightCount } = stopAllStatus;
-        stopAllBtn.disabled = stopAllPending || !loaded || !canStop || inFlightCount === 0;
+        stopAllBtn.disabled = stopAllPending
+            || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
+            || !loaded || !canStop || inFlightCount === 0;
         stopAllBtn.dataset.inFlightCount = String(inFlightCount);
         if (!loaded) {
             stopAllBtn.title = 'Checking cooperative Stop availability';
@@ -712,19 +717,35 @@ export function mountAgentListPane(containerEl, config = {}) {
                 : false
         ));
     const onStopAllClick = async () => {
-        if (stopAllPending || !api || typeof api.stopHost !== 'function') return;
+        if (stopAllPending || containerEl[AGENT_LIST_STOP_ALL_OPERATION]
+            || !api || typeof api.stopHost !== 'function') return;
+        const operation = {};
+        containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
         stopAllPending = true;
         renderStopAllState();
         const statusAvailable = await refreshStopAllState();
+        if (destroyed || containerEl[AGENT_LIST_STOP_ALL_OPERATION] !== operation) {
+            stopAllPending = false;
+            if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+            }
+            const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
+            if (currentOwner && typeof currentOwner.refreshStopAllState === 'function') {
+                void currentOwner.refreshStopAllState();
+            }
+            return;
+        }
         const count = stopAllStatus.inFlightCount;
         if (!statusAvailable || count === 0) {
             stopAllPending = false;
+            delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
             renderStopAllState();
             return;
         }
         const noun = count === 1 ? 'agent' : 'agents';
         if (!confirmStopAll(`Stop all ${count} in-flight ${noun}?`)) {
             stopAllPending = false;
+            delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
             renderStopAllState();
             return;
         }
@@ -740,20 +761,33 @@ export function mountAgentListPane(containerEl, config = {}) {
             response = await api.stopHost({
                 reason: config.stopAllReason || 'Stopped from the agents banner',
             });
-            renderStopAllOutcomes(response);
-            if (typeof config.onStopAllOutcomes === 'function') {
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                renderStopAllOutcomes(response);
+            }
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation
+                && typeof config.onStopAllOutcomes === 'function') {
                 config.onStopAllOutcomes(response);
             }
         } catch (error) {
             stopError = error;
-            stopAllResults.hidden = false;
-            stopAllResults.textContent = `Stop All failed: ${error && error.message ? error.message : 'request failed'}`;
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                stopAllResults.hidden = false;
+                stopAllResults.textContent = `Stop All failed: ${error && error.message ? error.message : 'request failed'}`;
+            }
         } finally {
             if (typeof settleLocalStop === 'function') {
                 settleLocalStop(response, stopError);
             }
             stopAllPending = false;
-            await refreshStopAllState();
+            if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+            }
+            const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
+            if (!destroyed && currentOwner === handle) {
+                await refreshStopAllState();
+            } else if (currentOwner && typeof currentOwner.refreshStopAllState === 'function') {
+                void currentOwner.refreshStopAllState();
+            }
         }
     };
     stopAllBtn.addEventListener('click', onStopAllClick);
@@ -768,7 +802,9 @@ export function mountAgentListPane(containerEl, config = {}) {
     const clearIntervalFn = doc.defaultView && doc.defaultView.clearInterval;
     const statusInterval = typeof setIntervalFn === 'function'
         ? setIntervalFn.call(doc.defaultView, () => {
-            if (!stopAllPending) void refreshStopAllState();
+            if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
+                void refreshStopAllState();
+            }
         }, statusIntervalMs)
         : null;
     renderStopAllState();
@@ -900,6 +936,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
         if (builtNewBtn && newBtn) newBtn.remove();
         if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
+        if (stopAllResults.parentNode) stopAllResults.remove();
         // The built resize handle too (codex P2): a leaked absolutely-positioned
         // .resize-handle overlays the container edge and gets ADOPTED by the
         // next mount into the same container, doubling listeners over time.

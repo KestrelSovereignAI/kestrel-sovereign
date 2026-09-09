@@ -495,6 +495,52 @@ test('re-mounting an adopted pane replaces Stop All ownership without duplicate 
     second.destroy();
 });
 
+test('re-mounting during Stop All preserves the operation fence and retires stale UI continuations', async () => {
+    const el = makeConsolePane();
+    let finishStop;
+    const stopPromise = new Promise((resolve) => { finishStop = resolve; });
+    let firstOutcomeRenders = 0;
+    const first = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma', status: 'online' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async () => stopPromise,
+        },
+        onStopAllOutcomes: () => { firstOutcomeRenders += 1; },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-active-remount-one',
+    });
+    await tick();
+    el.querySelector('.agent-stop-all-btn').click();
+    await tick();
+
+    const second = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma', status: 'online' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async () => { throw new Error('overlapping Stop must stay fenced'); },
+        },
+        confirmStopAll: () => true,
+        storageKey: 'a:test-stop-all-active-remount-two',
+    });
+    await tick();
+    const adoptedButton = el.querySelector('.agent-stop-all-btn');
+    assert.equal(adoptedButton.disabled, true,
+        'the new owner inherits the still-running host operation fence');
+
+    finishStop({ stop_outcomes: [] });
+    await tick();
+    await tick();
+
+    assert.equal(firstOutcomeRenders, 0, 'retired owner cannot render after its awaited POST');
+    assert.equal(adoptedButton.disabled, false,
+        'the current owner refreshes after the inherited operation settles');
+    assert.equal(el.querySelectorAll('.agent-stop-all-results').length, 1,
+        'retired result surfaces are removed during adoption');
+    first.destroy();
+    second.destroy();
+});
+
 test('Stop All uses sovereign host status rather than this tab\'s busy cards', async () => {
     const el = document.createElement('div');
     document.body.appendChild(el);

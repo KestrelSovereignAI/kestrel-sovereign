@@ -162,6 +162,28 @@ function setQueueMode(agent) {
     return pane;
 }
 
+function hostStopEnvelope(agentId, {
+    correlationId = 'host-stop-correlation',
+    disposition = 'stopped',
+    receiptId = 'receipt-host-stop',
+} = {}) {
+    const confirmed = ['stopped', 'already_complete'].includes(disposition) ? 1 : 0;
+    return {
+        success: confirmed === 1,
+        correlation_id: correlationId,
+        target_count: 1,
+        confirmed_count: confirmed,
+        unconfirmed_count: 1 - confirmed,
+        stop_outcomes: [{
+            agent_id: agentId,
+            resolved_target: agentId,
+            disposition,
+            correlation_id: correlationId,
+            receipt_id: receiptId,
+        }],
+    };
+}
+
 test('host Stop fences queued follow-ups before I/O and settles typed local outcomes', () => {
     const agent = 'host-stop-local';
     const agentId = 'did:agent:host-stop-local';
@@ -181,6 +203,7 @@ test('host Stop fences queued follow-ups before I/O and settles typed local outc
         name === agent ? { abort() { aborted = true; } } : null
     );
     apiModule.default.getCurrentStreamRequestId = () => 'host-stop-request';
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'prior-operation']]);
 
     const settle = prepareHostStop([{ name: agent, id: agentId }]);
 
@@ -189,18 +212,72 @@ test('host Stop fences queued follow-ups before I/O and settles typed local outc
     assert.equal(aborted, true, 'browser stream is aborted synchronously');
     assert.equal(state.unconfirmedStopAgents.has(agent), true, 'new turns remain fenced pending evidence');
 
-    settle({
-        stop_outcomes: [{
-            agent_id: agentId,
-            resolved_target: agentId,
-            disposition: 'stopped',
-        }],
-    });
+    settle(hostStopEnvelope(agentId));
 
     assert.equal(state.unconfirmedStopAgents.has(agent), false);
     assert.equal(state.waitingAgents.has(agent), false);
+    assert.equal(state.unconfirmedStopCorrelationIds.has(agent), false,
+        'successful Host Stop cannot leak an old operation id into the next turn');
     apiModule.default.getStreamAbortController = priorAbortLookup;
     apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
+test('host Stop keeps local work fenced when receipt or envelope evidence is malformed', () => {
+    const agent = 'host-stop-malformed';
+    const agentId = 'did:agent:host-stop-malformed';
+    state.waitingAgents.add(agent);
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'retained-operation']]);
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+    const malformed = hostStopEnvelope(agentId);
+    delete malformed.stop_outcomes[0].receipt_id;
+    settle(malformed);
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'a disposition string without its durable receipt never releases the fence');
+    assert.equal(state.unconfirmedStopCorrelationIds.get(agent), 'retained-operation');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
+});
+
+test('host Stop maps its one receipted outcome onto the standalone null chat key', () => {
+    const agentId = 'did:agent:standalone';
+    state.waitingAgents.add(null);
+    state.unconfirmedStopCorrelationIds = new Map([[null, 'standalone-operation']]);
+
+    const settle = prepareHostStop([{ name: 'Standalone', id: agentId }]);
+    settle(hostStopEnvelope(agentId));
+
+    assert.equal(state.unconfirmedStopAgents.has(null), false);
+    assert.equal(state.waitingAgents.has(null), false);
+    assert.equal(state.unconfirmedStopCorrelationIds.has(null), false);
+});
+
+test('host Stop generation cancels a send that was still awaiting its upload', async () => {
+    const agent = 'host-stop-upload-race';
+    const agentId = 'did:agent:host-stop-upload-race';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = getOrCreateChatPane(agent);
+    let finishUpload;
+    const upload = new Promise((resolve) => { finishUpload = resolve; });
+    pane.pendingUploads = new Set([upload]);
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => (async function* () {
+        dispatched.push(input);
+    }());
+
+    messageInput.value = 'must remain outside the stopped host snapshot';
+    const send = sendMessage();
+    await Promise.resolve();
+    prepareHostStop([{ name: agent, id: agentId }]);
+    finishUpload();
+    await send;
+
+    assert.deepEqual(dispatched, [],
+        'a pre-fence send cannot resume and publish work after Host Stop');
+    pane.pendingUploads.clear();
 });
 
 

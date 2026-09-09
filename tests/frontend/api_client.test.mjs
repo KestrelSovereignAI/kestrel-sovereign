@@ -846,6 +846,7 @@ test('getHostStopStatus reads caller-scoped host authority and live inventory', 
     assert.equal(fetchFn.calls.length, 1);
     assert.equal(fetchFn.calls[0].url, '/api/host/stop/status');
     assert.equal(fetchFn.calls[0].options.method, undefined);
+    assert.equal(fetchFn.calls[0].options.cache, 'no-store');
     assert.equal(result.can_stop, true);
     assert.equal(result.in_flight_count, 2);
 });

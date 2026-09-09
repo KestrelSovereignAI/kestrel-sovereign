@@ -124,7 +124,7 @@ def _host_targets(request: Request) -> tuple[CooperativeStopTarget, ...]:
 
 
 @router.get("/stop/status")
-async def host_stop_status(request: Request):
+async def host_stop_status(request: Request, response: Response):
     """Expose caller authority and authoritative live-agent work count."""
 
     try:
@@ -135,6 +135,8 @@ async def host_stop_status(request: Request):
             code="host_stop_inventory_unavailable",
             message="Host Stop target inventory is unavailable.",
         ) from error
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
     return {
         "can_stop": _caller_can_stop_host(request),
         "in_flight_count": sum(bool(target.turn_ids) for target in targets),
