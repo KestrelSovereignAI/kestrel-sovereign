@@ -2760,6 +2760,9 @@ export function prepareHostStop(items = []) {
         ...currentState.waitingAgents,
         ...unconfirmedStopAgents(),
     ]);
+    const stopGeneration = currentState.hostStopGeneration;
+    const fencedRequestIds = new Map();
+    const fencedCorrelationIds = new Map();
 
     // A queue belongs to the work being stopped even if its stream has already
     // left waitingAgents during the same event-loop turn. Clear all pane queues
@@ -2769,7 +2772,10 @@ export function prepareHostStop(items = []) {
         pane.queuedHostStopGeneration = null;
         clearQueuedChip(pane);
     }
-    for (const name of localNames) fenceLocalAgentStop(name);
+    for (const name of localNames) {
+        fencedRequestIds.set(name, fenceLocalAgentStop(name));
+        fencedCorrelationIds.set(name, unconfirmedStopCorrelationIds().get(name) ?? null);
+    }
 
     const addressToName = new Map();
     for (const item of Array.isArray(items) ? items : []) {
@@ -2808,7 +2814,16 @@ export function prepareHostStop(items = []) {
         const retainedRequestIds = unconfirmedStopRequestIds();
         const retainedCorrelationIds = unconfirmedStopCorrelationIds();
         for (const name of localNames) {
-            if (confirmedNames.has(name)) {
+            // A host receipt belongs to the browser fence that created this
+            // settlement hook, not to every later turn sharing the same agent
+            // name. A per-agent reconciliation can release the old fence and
+            // start a new turn while Host Stop is still waiting on another
+            // target; a second Host Stop can likewise supersede this one.
+            const stillOwnsFence = hostStopGeneration() === stopGeneration
+                && unconfirmedStopAgents().has(name)
+                && (retainedRequestIds.get(name) ?? null) === fencedRequestIds.get(name)
+                && (retainedCorrelationIds.get(name) ?? null) === fencedCorrelationIds.get(name);
+            if (confirmedNames.has(name) && stillOwnsFence) {
                 unconfirmedStopAgents().delete(name);
                 retainedRequestIds.delete(name);
                 retainedCorrelationIds.delete(name);

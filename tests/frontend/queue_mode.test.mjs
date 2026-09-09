@@ -225,6 +225,33 @@ test('host Stop fences queued follow-ups before I/O and settles typed local outc
     apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
 });
 
+test('an old host Stop receipt cannot clear a newer turn for the same agent', () => {
+    const agent = 'host-stop-newer-turn';
+    const agentId = 'did:agent:host-stop-newer-turn';
+    let currentRequestId = 'old-request';
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    apiModule.default.getCurrentStreamRequestId = () => currentRequestId;
+    state.waitingAgents.add(agent);
+
+    const settleOldHostStop = prepareHostStop([{ name: agent, id: agentId }]);
+
+    // Model a successful per-agent reconciliation followed by a new turn while
+    // the fleet request is still waiting for some other target to settle.
+    state.unconfirmedStopAgents.delete(agent);
+    state.unconfirmedStopRequestIds.delete(agent);
+    state.unconfirmedStopCorrelationIds.delete(agent);
+    currentRequestId = 'new-request';
+    state.waitingAgents.add(agent);
+
+    settleOldHostStop(hostStopEnvelope(agentId));
+
+    assert.equal(state.waitingAgents.has(agent), true,
+        'evidence for the old request must not settle the newer active turn');
+    assert.equal(apiModule.default.getCurrentStreamRequestId(agent), 'new-request');
+    state.waitingAgents.delete(agent);
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
 test('host Stop keeps local work fenced when receipt or envelope evidence is malformed', () => {
     const agent = 'host-stop-malformed';
     const agentId = 'did:agent:host-stop-malformed';
