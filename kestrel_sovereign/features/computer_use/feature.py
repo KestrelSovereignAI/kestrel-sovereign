@@ -43,7 +43,7 @@ from kestrel_sovereign.constitution.hierarchy import (
     parse_amendment_ix_grants,
 )
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.base import ToolCategory
 
 from . import capture
@@ -1615,9 +1615,16 @@ def _minimal_envelope(
     The exit status, whether the run was whole, and where to read it. Paths
     for the individual streams go too: the manifest carries them, and one
     pointer that survives beats three that do not.
+
+    Status is carried over rather than re-derived. Deciding it here from
+    ``incomplete`` alone dropped the exit code on the floor: a command that
+    exited non-zero without timing out or clipping is complete, so it came
+    back OK, and the wrapper published ``success: true`` for a review that
+    failed. Shrinking a result must not change what it says.
     """
+    returncode = (envelope.data or {}).get("returncode")
     data = {
-        "returncode": (envelope.data or {}).get("returncode"),
+        "returncode": returncode,
         "complete": not incomplete,
         "manifest_path": manifest_path,
     }
@@ -1625,11 +1632,13 @@ def _minimal_envelope(
         f"Result too large for this agent's tool-result cap; "
         f"facts only. Full output: {manifest_path}"
     )
-    if incomplete:
-        return ToolResult.partial(
-            summary, envelope.error or "run did not complete", data=data
-        )
-    return ToolResult.ok(summary, data=data)
+    if envelope.status is ToolResultStatus.OK:
+        return ToolResult.ok(summary, data=data)
+    return ToolResult.partial(
+        summary,
+        envelope.error or f"run did not complete (rc={returncode})",
+        data=data,
+    )
 
 
 def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str:

@@ -2001,3 +2001,187 @@ async def test_the_feature_does_not_call_an_unopenable_capture_complete(
 
     assert env.status is ToolResultStatus.PARTIAL
     assert env.data["complete"] is False
+
+
+# ---------------------------------------------------------------------------
+# Review round 7
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_facts_only_fallback_keeps_a_failure_a_failure(
+    workspace: Path, queue, monkeypatch
+):
+    """Review round 7. ``_minimal_envelope`` re-derived status from
+    completeness alone, so a command that exited non-zero without timing out
+    or clipping came back OK — and the wrapper then published
+    ``success: true`` for a review that failed. Shrinking a result must not
+    change what it says."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 1000,
+    )
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(returncode=7, stdout="x" * 5000))
+
+    env = await f.shell(command="echo hi", capture_output=True)
+
+    assert env.status is not ToolResultStatus.OK
+    assert env.data["returncode"] == 7
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_the_drain_also_tears_down(
+    tmp_path: Path, monkeypatch
+):
+    """The guard covered the exit wait and not the drain — which is its own
+    await, and is exactly where a descendant holding the pipes makes the call
+    take long enough to be cancelled. The pumps were then left running into
+    handles the ``finally`` was about to close."""
+    import asyncio as _a
+
+    bundle = capture.allocate(tmp_path / "captures")
+    marker = tmp_path / "descendant_ran.txt"
+    script = tmp_path / "daemon.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(5)\n"
+        f"    open({str(marker)!r}, 'w').write('x')\n"
+        "    os._exit(0)\n"
+        "print('parent done', flush=True)\n"
+    )
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    # A long drain makes it unambiguous which await is live when the cancel
+    # lands. At the default 0.5s the call had already returned, and the test
+    # was cancelling nothing.
+    monkeypatch.setattr(local_mod, "_DRAIN_GRACE", 10.0)
+    backend = LocalSandboxBackend(GRANTS)
+
+    task = _a.create_task(
+        backend.exec(
+            ["python3", str(script)],
+            cwd=None,
+            env=None,
+            timeout=60,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    )
+    # The parent exits almost at once; with the drain stretched, this lands
+    # inside it.
+    await _a.sleep(1.5)
+    task.cancel()
+    with pytest.raises(_a.CancelledError):
+        await task
+
+    await _a.sleep(6)
+    assert not marker.exists(), "a descendant outlived cancellation during the drain"
+
+
+@pytest.mark.asyncio
+async def test_one_stream_failing_does_not_indict_the_other(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 7. The aggregate ``lost`` marked BOTH streams truncated
+    when either write failed, so the manifest and the caveat claimed a clean
+    stream was clipped. That is the per-stream contract broken in the backend
+    after being broken once already in the feature."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_pump = local_mod._pump
+
+    async def selective_pump(reader, fh):
+        # Fail only the stream whose handle is the stdout capture.
+        if getattr(fh, "_is_stdout", False):
+            await reader.read(10)
+            raise OSError("No space left on device")
+        await real_pump(reader, fh)
+
+    real_open = local_mod._open_capture
+
+    def tagging_open(cap):
+        out_fh, err_fh = real_open(cap)
+        out_fh._is_stdout = True
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", tagging_open)
+    monkeypatch.setattr(local_mod, "_pump", selective_pump)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "import sys; sys.stdout.write('o'*100); sys.stderr.write('e'*100)"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True
+    assert result.truncated_stderr is False
+
+
+@pytest.mark.asyncio
+async def test_capture_writes_do_not_block_the_event_loop(
+    tmp_path: Path, monkeypatch
+):
+    """Every chunk was written synchronously from an async task, so a slow or
+    full capture filesystem blocked every other task in the process —
+    including the poll that enforces this command's own timeout, making the
+    bound exceedable by the work it exists to bound.
+
+    The write is slowed deliberately. The first version just wrote 4 MB and
+    counted heartbeats, which measured how fast the local SSD is: the whole
+    capture finished inside two ticks and the test proved nothing either
+    way."""
+    import asyncio as _a
+    import time as _t
+
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+
+    def slow_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_write = out_fh.write
+
+        def slow_write(b):
+            _t.sleep(0.05)
+            return real_write(b)
+
+        out_fh.write = slow_write
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", slow_open)
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await _a.sleep(0.01)
+            ticks += 1
+
+    beat = _a.create_task(heartbeat())
+    try:
+        await LocalSandboxBackend(GRANTS).exec(
+            ["python3", "-c", "print('y' * 500_000)"],
+            cwd=None,
+            env=None,
+            timeout=60,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+    finally:
+        beat.cancel()
+
+    # ~8 chunks at 50ms each. Written on the loop that is 400ms of total
+    # starvation; written off it, the heartbeat keeps its 10ms cadence.
+    assert ticks > 20, f"event loop only ticked {ticks} times during the capture"
+    assert bundle.stdout_path.stat().st_size > 500_000

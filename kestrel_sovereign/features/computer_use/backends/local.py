@@ -138,7 +138,8 @@ class LocalSandboxBackend(SandboxBackend):
         full_argv = [binary, *argv[1:]]
         started = time.monotonic()
 
-        close_error: OSError | None = None
+        close_errors: dict[str, OSError] = {}
+        out_error = err_error = None
         out_fh = err_fh = None
         if capture is not None:
             try:
@@ -228,20 +229,29 @@ class LocalSandboxBackend(SandboxBackend):
                 # any more" — the two facts this needs to tell apart.
                 try:
                     timed_out = not await _await_exit(proc, timeout)
+                    if timed_out:
+                        _kill_tree(proc.pid)
+                        await _await_exit(proc, _REAP_GRACE)
+                    done, pending = await asyncio.wait(
+                        pumps, timeout=_DRAIN_GRACE
+                    )
                 except asyncio.CancelledError:
-                    # The tool task was cancelled — a shutdown, a client
-                    # disconnect, an outer deadline. Without teardown the
-                    # host process runs on with nobody waiting for it, which
-                    # for the long side-effecting commands this feature
-                    # exists to run is worse than the timeout it mirrors.
+                    # Every post-spawn await, not just the first. The drain
+                    # is its own wait and can be cancelled in its own right —
+                    # a descendant holding the pipes is exactly when it takes
+                    # long enough to be — and teardown that guarded only the
+                    # exit wait left the pumps running into handles the
+                    # ``finally`` was about to close.
+                    #
+                    # A shutdown, a client disconnect, an outer deadline:
+                    # without teardown the host process runs on with nobody
+                    # waiting for it, which for the long side-effecting
+                    # commands this feature exists to run is worse than the
+                    # timeout it mirrors.
                     _kill_tree(proc.pid)
                     for task in pumps:
                         task.cancel()
                     raise
-                if timed_out:
-                    _kill_tree(proc.pid)
-                    await _await_exit(proc, _REAP_GRACE)
-                done, pending = await asyncio.wait(pumps, timeout=_DRAIN_GRACE)
                 writers_remaining = bool(pending)
                 for task in pending:
                     task.cancel()
@@ -251,21 +261,25 @@ class LocalSandboxBackend(SandboxBackend):
                 # the failure was reported complete: silent loss wearing a
                 # clean result. asyncio only logs it, at teardown, to a place
                 # no caller reads.
-                pump_error = next(
-                    (t.exception() for t in done if t.exception() is not None), None
-                )
+                # Per stream, because the streams fail independently and
+                # saying stderr was clipped when stdout's disk write failed
+                # is the false claim the per-stream contract exists to
+                # prevent — collapsed here once already after being split
+                # one layer up.
+                out_error = pumps[0].exception() if pumps[0] in done else None
+                err_error = pumps[1].exception() if pumps[1] in done else None
                 stdout_bytes = stderr_bytes = b""
         finally:
             # A close flushes, and a flush can fail — a full disk surfaces
             # here rather than at any write. Swallowing it discarded the
             # buffered tail of a capture and called the file complete, the
             # same shape as the unread pump exception.
-            for fh in (out_fh, err_fh):
+            for slot, fh in (("out", out_fh), ("err", err_fh)):
                 if fh is not None:
                     try:
                         fh.close()
                     except OSError as exc:  # pragma: no cover - disk-full path
-                        close_error = close_error or exc
+                        close_errors[slot] = exc
 
         duration_ms = int((time.monotonic() - started) * 1000)
         effective_cwd = str(cwd) if cwd else os.getcwd()
@@ -273,19 +287,30 @@ class LocalSandboxBackend(SandboxBackend):
             # A failed pump is lost output, which is what ``truncated_*``
             # already means and already folds into completeness — a second
             # field for the same fact would be a second thing to forget.
-            lost = pump_error is not None or close_error is not None
+            out_lost = out_error is not None or "out" in close_errors
+            err_lost = err_error is not None or "err" in close_errors
+            failures = [
+                str(e)
+                for e in (
+                    out_error,
+                    err_error,
+                    close_errors.get("out"),
+                    close_errors.get("err"),
+                )
+                if e is not None
+            ]
             return CompletedRun(
                 argv=list(argv),
                 returncode=proc.returncode if proc.returncode is not None else -1,
                 stdout="",
                 stderr=(
-                    f"capture write failed: {pump_error or close_error}"
-                    if lost
+                    "capture write failed: " + "; ".join(failures)
+                    if failures
                     else ""
                 ),
                 duration_ms=duration_ms,
-                truncated_stdout=lost,
-                truncated_stderr=lost,
+                truncated_stdout=out_lost,
+                truncated_stderr=err_lost,
                 timed_out=timed_out,
                 stdout_path=str(capture.stdout_path),
                 stderr_path=str(capture.stderr_path),
@@ -335,7 +360,11 @@ async def _pump(reader, fh) -> None:
         chunk = await reader.read(_PUMP_CHUNK_BYTES)
         if not chunk:
             return
-        fh.write(chunk)
+        # Off the loop: a high-output command writing to a slow or full
+        # filesystem would otherwise block every other task in this process,
+        # including the poll that enforces this command's own timeout — the
+        # bound exceeded by the work it exists to bound.
+        await asyncio.to_thread(fh.write, chunk)
 
 
 
