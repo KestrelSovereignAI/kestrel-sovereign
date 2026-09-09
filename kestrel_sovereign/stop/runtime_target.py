@@ -108,6 +108,7 @@ def build_runtime_stop_target(
     explicit_request_id: str | None = None,
     explicit_turn_id: str | None = None,
     distributed_registry: Any | None = None,
+    resolve_turn_addresses: bool = True,
 ) -> CooperativeStopTarget:
     """Snapshot one agent and bind its typed cooperative cancellation action."""
 
@@ -121,15 +122,22 @@ def build_runtime_stop_target(
         not isinstance(explicit_turn_id, str) or not explicit_turn_id
     ):
         raise ValueError("explicit Stop turn identity must be concrete")
+    if not isinstance(resolve_turn_addresses, bool):
+        raise TypeError("resolve_turn_addresses must be a boolean")
 
     active_at_resolution = _active_request_snapshot(
         agent,
         explicit_request_id=explicit_request_id,
     )
-    turn_request_ids, turn_request_generations = _turn_request_bindings(agent)
-    turn_addresses = active_at_resolution.union(turn_request_ids)
-    if explicit_turn_id is not None and distributed_registry is not None:
-        turn_addresses = turn_addresses.union((explicit_turn_id,))
+    if resolve_turn_addresses:
+        turn_request_ids, turn_request_generations = _turn_request_bindings(agent)
+        turn_addresses = active_at_resolution.union(turn_request_ids)
+        if explicit_turn_id is not None and distributed_registry is not None:
+            turn_addresses = turn_addresses.union((explicit_turn_id,))
+    else:
+        turn_request_ids = {}
+        turn_request_generations = {}
+        turn_addresses = frozenset()
 
     async def cancel(stop_request: StopRequest) -> StopDisposition:
         distributed_ticket = None

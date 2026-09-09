@@ -74,6 +74,7 @@ from kestrel_sovereign.spawn.lifecycle import (
     TerminationRefusalState,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 
 
@@ -4145,6 +4146,41 @@ async def test_authoritative_descendants_rebuild_from_signed_receipts_not_cache(
         "Alpha",
         "Zeta",
         "Leaf",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_descendants_include_registry_only_signed_child(
+    tmp_path,
+):
+    """A partial restart does not erase an unloaded child's Stop authority."""
+
+    root_did = "did:pkh:eip155:1:0xRegistryQueryRoot"
+    child_did = "did:pkh:eip155:1:0xRegistryQueryChild"
+    root_private, _ = generate_secp256k1_keypair()
+    root = _make_mock_agent(root_did)
+    root._private_key = root_private
+    root.identity = None
+    mandate = sign_mandate(
+        SpawnMandate(parent_did=root_did, child_did=child_did, ttl_seconds=0),
+        root_private,
+    )
+    SpawnAuthorityRegistry(tmp_path).record_active(
+        child_name="ColdChild",
+        child_did=child_did,
+        mandate=mandate,
+        config=LocalAgentConfig(
+            data_dir=Path("agent_data") / "ColdChild",
+            port=8802,
+            autostart=False,
+        ),
+    )
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager._register_agent("Root", root)
+
+    assert manager.get_agent("ColdChild") is None
+    assert await manager.get_authoritative_stop_descendants(root_did) == [
+        AuthoritativeStopDescendant("ColdChild", child_did)
     ]
 
 

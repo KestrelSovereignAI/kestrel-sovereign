@@ -16,9 +16,19 @@ from kestrel_sovereign._async_ownership import (
 )
 
 from .receipt import StopOperationClaim, StopReceipt, StopReceiptConflict
-from .types import StopDisposition, StopOutcome, StopRequest, StopScope
+from .types import (
+    AuthoritativeStopDescendant,
+    StopDisposition,
+    StopOutcome,
+    StopRequest,
+    StopScope,
+)
 
 StopOperation = Callable[[StopRequest], Awaitable[StopDisposition]]
+DescendantResolver = Callable[
+    [str], Awaitable[Iterable[AuthoritativeStopDescendant]]
+]
+UnloadedAgentStop = Callable[[str], Awaitable[StopDisposition]]
 DEFAULT_STOP_TARGET_TIMEOUT_SECONDS = 5.0
 
 
@@ -100,6 +110,15 @@ class CooperativeStopTarget:
             raise TypeError("durable public-turn resolution flag must be boolean")
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedStopAddress:
+    """One ordered cascade address, whether loaded locally or not."""
+
+    target_id: str
+    agent_id: str
+    target: CooperativeStopTarget | None
+
+
 class StopCleanupRegistry:
     """Application-lifetime owner for cleanup tails beyond one Stop request."""
 
@@ -149,6 +168,8 @@ class CancellationAuthority:
         *,
         cleanup_registry: StopCleanupRegistry,
         receipt_store: Any,
+        descendant_resolver: DescendantResolver | None = None,
+        unloaded_agent_stop: UnloadedAgentStop | None = None,
         target_timeout_seconds: float = DEFAULT_STOP_TARGET_TIMEOUT_SECONDS,
     ) -> None:
         if not callable(target_inventory):
@@ -162,6 +183,12 @@ class CancellationAuthority:
         self._target_inventory = target_inventory
         self._cleanup_registry = cleanup_registry
         self._receipt_store = receipt_store
+        if descendant_resolver is not None and not callable(descendant_resolver):
+            raise TypeError("descendant_resolver must be callable when supplied")
+        self._descendant_resolver = descendant_resolver
+        if unloaded_agent_stop is not None and not callable(unloaded_agent_stop):
+            raise TypeError("unloaded_agent_stop must be callable when supplied")
+        self._unloaded_agent_stop = unloaded_agent_stop
         if (
             not isinstance(target_timeout_seconds, (int, float))
             or isinstance(target_timeout_seconds, bool)
@@ -178,25 +205,25 @@ class CancellationAuthority:
         except StopReceiptConflict:
             return self._receipt_preflight_refusal(
                 request,
-                self._resolve(request),
+                await self._resolve(request),
                 detail="Stop operation identity conflicts with durable evidence",
             )
         except Exception:  # noqa: BLE001 - durable evidence boundary
             return self._receipt_preflight_refusal(
                 request,
-                self._resolve(request),
+                await self._resolve(request),
                 detail="Stop receipt storage is unavailable; cancellation not attempted",
             )
         if replay is not None:
             if not isinstance(replay, StopReceipt):
                 return self._receipt_preflight_refusal(
                     request,
-                    self._resolve(request),
+                    await self._resolve(request),
                     detail="Stop receipt storage returned invalid evidence",
                 )
             return replay.outcomes
 
-        targets = self._resolve(request)
+        targets = await self._resolve(request)
         owner = asyncio.create_task(
             self._claim_stop_and_persist(request, targets),
             name="cooperative-stop-operation",
@@ -207,7 +234,7 @@ class CancellationAuthority:
     async def _claim_stop_and_persist(
         self,
         request: StopRequest,
-        targets: tuple[CooperativeStopTarget, ...],
+        targets: tuple[_ResolvedStopAddress, ...],
     ) -> tuple[StopOutcome, ...]:
         """Own the durable claim through its effects and terminal receipt.
 
@@ -261,7 +288,7 @@ class CancellationAuthority:
     async def _stop_and_persist(
         self,
         request: StopRequest,
-        targets: tuple[CooperativeStopTarget, ...],
+        targets: tuple[_ResolvedStopAddress, ...],
         *,
         claim_id: str | None,
     ) -> tuple[StopOutcome, ...]:
@@ -337,7 +364,7 @@ class CancellationAuthority:
     async def _stop_targets(
         self,
         request: StopRequest,
-        targets: tuple[CooperativeStopTarget, ...],
+        targets: tuple[_ResolvedStopAddress, ...],
     ) -> tuple[StopOutcome, ...]:
         async def stop_one(
             target: CooperativeStopTarget,
@@ -352,6 +379,13 @@ class CancellationAuthority:
             except asyncio.CancelledError:
                 disposition = StopDisposition.UNREACHABLE
                 detail = "Cooperative Stop target was canceled"
+            except BaseExceptionGroup as error:
+                # A cancellation-safe target may preserve cancellation beside
+                # its own cleanup failure.  That group belongs to this target,
+                # not to the fan-out owner task, so isolate it just like any
+                # other target failure and still durably settle every sibling.
+                disposition = StopDisposition.UNREACHABLE
+                detail = f"Cooperative Stop target failed ({type(error).__name__})"
             except Exception as error:  # noqa: BLE001 - target boundary
                 disposition = StopDisposition.UNREACHABLE
                 detail = f"Cooperative Stop target failed ({type(error).__name__})"
@@ -365,32 +399,56 @@ class CancellationAuthority:
                 detail=detail,
             )
 
-        resolved_targets = tuple(
-            (target, *self._request_for_target(request, target))
-            for target in targets
+        live_targets = tuple(
+            (
+                resolved,
+                *self._request_for_target(
+                    request,
+                    resolved.target,
+                    resolved_target=resolved.target_id,
+                ),
+            )
+            for resolved in targets
+            if resolved.target is not None
         )
         tasks = {
             asyncio.create_task(
-                stop_one(target, target_request, resolved_target),
-                name=f"cooperative-stop:{target.target_id}",
-            ): (target, resolved_target)
-            for target, target_request, resolved_target in resolved_targets
+                stop_one(resolved.target, target_request, resolved_target),
+                name=f"cooperative-stop:{resolved.target_id}",
+            ): (resolved, resolved_target)
+            for resolved, target_request, resolved_target in live_targets
         }
-        try:
-            done, pending = await asyncio.wait(
-                tasks,
-                timeout=self._target_timeout_seconds,
-            )
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-                self._detach_cleanup(task)
-            raise
+        done: set[asyncio.Task[StopOutcome]] = set()
+        pending: set[asyncio.Task[StopOutcome]] = set()
+        if tasks:
+            try:
+                done, pending = await asyncio.wait(
+                    tasks,
+                    timeout=self._target_timeout_seconds,
+                )
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                    self._detach_cleanup(task)
+                raise
 
         completed = {
+            resolved.target_id: StopOutcome(
+                scope=request.scope,
+                requested_target=request.target,
+                resolved_target=resolved.target_id,
+                agent_id=resolved.agent_id,
+                disposition=StopDisposition.UNREACHABLE,
+                correlation_id=request.correlation_id,
+                detail="Authoritative descendant has no cooperative Stop target",
+            )
+            for resolved in targets
+            if resolved.target is None
+        }
+        completed.update({
             tasks[task][0].target_id: task.result()
             for task in done
-        }
+        })
         for task in pending:
             task.cancel()
             self._detach_cleanup(task)
@@ -411,6 +469,8 @@ class CancellationAuthority:
     def _request_for_target(
         request: StopRequest,
         target: CooperativeStopTarget,
+        *,
+        resolved_target: str,
     ) -> tuple[StopRequest, str]:
         """Resolve a public turn address behind the single authority seam."""
 
@@ -419,10 +479,10 @@ class CancellationAuthority:
             or request.target is None
             or not request.target_is_turn_id
         ):
-            return request, target.target_id
+            return request, resolved_target
         request_id = target.turn_request_ids.get(request.target)
         if request_id is None:
-            return request, target.target_id
+            return request, resolved_target
         return (
             StopRequest(
                 scope=request.scope,
@@ -444,7 +504,7 @@ class CancellationAuthority:
     @staticmethod
     def _receipt_preflight_refusal(
         request: StopRequest,
-        targets: tuple[CooperativeStopTarget, ...],
+        targets: tuple[_ResolvedStopAddress, ...],
         *,
         detail: str,
     ) -> tuple[StopOutcome, ...]:
@@ -513,7 +573,10 @@ class CancellationAuthority:
 
         self._cleanup_registry.retain(task)
 
-    def _resolve(self, request: StopRequest) -> tuple[CooperativeStopTarget, ...]:
+    async def _resolve(
+        self,
+        request: StopRequest,
+    ) -> tuple[_ResolvedStopAddress, ...]:
         inventory = tuple(self._target_inventory())
         self._validate_inventory(inventory)
         if request.scope is StopScope.HOST:
@@ -550,7 +613,67 @@ class CancellationAuthority:
                 if target.agent_id == request.target_agent_id
                 and request.target in target.tool_call_ids
             )
-        return tuple(sorted(matches, key=lambda target: target.target_id))
+        ordered = tuple(sorted(matches, key=lambda target: target.target_id))
+        resolved = [
+            _ResolvedStopAddress(target.target_id, target.agent_id, target)
+            for target in ordered
+        ]
+        if (
+            request.scope is not StopScope.AGENT
+            or not request.cascade
+            or self._descendant_resolver is None
+            or not ordered
+        ):
+            return tuple(resolved)
+
+        root = ordered[0]
+        descendants = await self._descendant_resolver(root.agent_id)
+        if isinstance(descendants, (str, bytes)):
+            raise TypeError("descendant_resolver returned a scalar address")
+        by_agent_id = {target.agent_id: target for target in inventory}
+
+        seen_agent_ids = {root.agent_id}
+        seen_names = {root.target_id.casefold()}
+        for descendant in descendants:
+            if not isinstance(descendant, AuthoritativeStopDescendant):
+                raise TypeError(
+                    "descendant_resolver returned an untyped descendant"
+                )
+            canonical_name = descendant.routing_name.casefold()
+            if canonical_name in seen_names:
+                raise ValueError(
+                    "descendant_resolver returned a repeated descendant"
+                )
+            seen_names.add(canonical_name)
+            if descendant.agent_id in seen_agent_ids:
+                raise ValueError(
+                    "descendant_resolver returned a cycle or duplicate agent"
+                )
+            seen_agent_ids.add(descendant.agent_id)
+            target = by_agent_id.get(descendant.agent_id)
+            if target is None and self._unloaded_agent_stop is not None:
+                async def stop_unloaded(
+                    _request: StopRequest,
+                    *,
+                    agent_id: str = descendant.agent_id,
+                ) -> StopDisposition:
+                    return await self._unloaded_agent_stop(agent_id)
+
+                target = CooperativeStopTarget(
+                    target_id=descendant.agent_id,
+                    agent_id=descendant.agent_id,
+                    cancel=stop_unloaded,
+                )
+            resolved.append(
+                _ResolvedStopAddress(
+                    # A routing name never becomes a Stop address. Bind the
+                    # outcome and every local/remote operation to the signed DID.
+                    target_id=descendant.agent_id,
+                    agent_id=descendant.agent_id,
+                    target=target,
+                )
+            )
+        return tuple(resolved)
 
     @staticmethod
     def _validate_inventory(

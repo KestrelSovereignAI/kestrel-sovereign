@@ -59,7 +59,9 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyViolationError,
 )
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
+    CooperativeStopTarget,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
@@ -1175,17 +1177,119 @@ async def stop_agent_request(request: Request):
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        runtime_target = build_runtime_stop_target(
-            agent,
-            agent_id=agent_id,
-            explicit_request_id=request_id,
-            explicit_turn_id=turn_id,
-            distributed_registry=getattr(
+        descendant_manager: list[object | None] = [None]
+        descendant_query: list[object | None] = [None]
+
+        def target_inventory() -> tuple[CooperativeStopTarget, ...]:
+            """Snapshot live candidates only after durable receipt preflight."""
+
+            distributed_registry = getattr(
                 request.app.state,
                 "distributed_invocation_registry",
                 None,
-            ),
-        )
+            )
+            if request_id is not None or turn_id is not None:
+                descendant_manager[0] = None
+                descendant_query[0] = None
+                return (
+                    build_runtime_stop_target(
+                        agent,
+                        agent_id=agent_id,
+                        explicit_request_id=request_id,
+                        explicit_turn_id=turn_id,
+                        distributed_registry=distributed_registry,
+                    ),
+                )
+
+            manager = getattr(request.app.state, "agent_manager", None)
+            if manager is None:
+                manager = vars(agent).get("_agent_manager")
+            descendant_manager[0] = manager
+            descendant_query[0] = getattr(
+                manager,
+                "get_authoritative_stop_descendants",
+                None,
+            )
+            list_managed_agents = getattr(manager, "list_agents", None)
+            managed_agents: dict[str, object] = {}
+            if callable(list_managed_agents):
+                listed_agents = list_managed_agents()
+                if not isinstance(listed_agents, dict):
+                    raise TypeError("agent manager returned an invalid inventory")
+                managed_agents = listed_agents
+
+            candidates_by_id: dict[str, object] = {agent_id: agent}
+            managed_names: dict[str, str] = {}
+            for name, candidate in sorted(
+                managed_agents.items(),
+                key=lambda item: (str(item[0]).casefold(), str(item[0])),
+            ):
+                if not isinstance(name, str) or not name.strip():
+                    raise TypeError("agent manager returned an invalid agent name")
+                candidate_id = getattr(candidate, "agent_id", None)
+                if not isinstance(candidate_id, str) or not candidate_id.strip():
+                    continue
+                canonical_name = name.casefold()
+                prior_address = managed_names.setdefault(
+                    canonical_name,
+                    candidate_id,
+                )
+                if prior_address != candidate_id:
+                    raise TypeError("agent manager returned an ambiguous agent name")
+                candidates_by_id.setdefault(candidate_id, candidate)
+
+            return tuple(
+                build_runtime_stop_target(
+                    candidate,
+                    agent_id=candidate_id,
+                    distributed_registry=distributed_registry,
+                    resolve_turn_addresses=False,
+                )
+                for candidate_id, candidate in candidates_by_id.items()
+            )
+
+        async def resolve_descendants(
+            root_agent_id: str,
+        ) -> tuple[AuthoritativeStopDescendant, ...]:
+            authoritative_descendants = descendant_query[0]
+            if descendant_manager[0] is None:
+                return ()
+            if not callable(authoritative_descendants):
+                raise TypeError(
+                    "agent manager lacks authoritative descendant query"
+                )
+            descendants = await authoritative_descendants(root_agent_id)
+            if isinstance(descendants, (str, bytes)):
+                raise TypeError(
+                    "authoritative descendant query returned a scalar"
+                )
+            resolved: list[AuthoritativeStopDescendant] = []
+            for descendant in descendants:
+                if not isinstance(descendant, AuthoritativeStopDescendant):
+                    raise TypeError(
+                        "authoritative descendant query returned an untyped identity"
+                    )
+                resolved.append(descendant)
+            return tuple(resolved)
+
+        async def stop_unloaded_descendant(
+            descendant_agent_id: str,
+        ) -> StopDisposition:
+            distributed_registry = getattr(
+                request.app.state,
+                "distributed_invocation_registry",
+                None,
+            )
+            if distributed_registry is None:
+                return StopDisposition.UNREACHABLE
+            request_agent = getattr(distributed_registry, "request_agent", None)
+            wait_for_stop = getattr(distributed_registry, "wait_for_stop", None)
+            if not callable(request_agent) or not callable(wait_for_stop):
+                raise TypeError(
+                    "distributed Stop registry lacks agent cancellation operations"
+                )
+            ticket = await request_agent(descendant_agent_id)
+            return await wait_for_stop(ticket)
 
         cleanup_registry = getattr(
             request.app.state,
@@ -1199,12 +1303,14 @@ async def stop_agent_request(request: Request):
             raise TypeError("app Stop cleanup registry has an invalid type")
 
         authority = CancellationAuthority(
-            lambda: (runtime_target,),
+            target_inventory,
             cleanup_registry=cleanup_registry,
             receipt_store=(
                 getattr(request.app.state, "stop_receipt_store", None)
                 or UnavailableStopReceiptStore()
             ),
+            descendant_resolver=resolve_descendants,
+            unloaded_agent_stop=stop_unloaded_descendant,
         )
         trace_id, span_id = current_trace_identity()
         stop_request = StopRequest(
