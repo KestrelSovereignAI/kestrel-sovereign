@@ -8246,6 +8246,7 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "cancel",
         "close",
         "delete",
+        "deactivate",
         "destroy",
         "disable",
         "enable",
@@ -14100,46 +14101,152 @@ def _try_flow_uses_provenance_as_control(
 def _is_fail_closed_envelope_acceptance_guard(
     node: ast.AST,
     function: ast.FunctionDef | ast.AsyncFunctionDef,
+    local_attribution_authorizers: set[str],
+    control_aliases: set[str],
+    state_object_aliases: set[str],
 ) -> bool:
-    """Whether a negative ``verdict.ok`` guard precedes real sender auth."""
+    """Whether a negative ``verdict.ok`` guard is dominated by sender auth."""
 
     if not (
-        isinstance(node, ast.If)
+        function.name.casefold() in local_attribution_authorizers
+        and isinstance(node, ast.If)
+        and not node.orelse
         and isinstance(node.test, ast.UnaryOp)
         and isinstance(node.test.op, ast.Not)
-        and any(
-            isinstance(child, ast.Attribute)
-            and child.attr.casefold() == "ok"
-            and getattr(child, "_authority_unverified_attribution", False)
-            for child in ast.walk(node.test)
-        )
+        and _block_guaranteed_function_exit(node.body)
     ):
         return False
-    return any(
-        getattr(candidate, "lineno", 0) > node.lineno
-        and (
-            (
-                isinstance(candidate, ast.If)
-                and any(
-                    isinstance(child, ast.Attribute)
-                    and child.attr.casefold() == "verified"
-                    and getattr(
-                        child, "_authority_verified_attribution", False
-                    )
-                    for child in ast.walk(candidate.test)
-                )
+
+    def contains_protected_control(statements: list[ast.stmt]) -> bool:
+        """Find executed controls without treating callable wiring as one."""
+
+        class ProtectedControlVisitor(ast.NodeVisitor):
+            found = False
+
+            def visit_Call(self, call: ast.Call) -> None:  # noqa: N802
+                if _call_name(call).casefold() in {
+                    "_a2a_inbound_requires_verified_sender",
+                    "_a2a_inbound_scope_snapshot",
+                    "_a2a_inbound_scope_unchanged",
+                }:
+                    return
+                if _is_cross_agent_control_call(
+                    call, control_aliases, state_object_aliases
+                ) or _is_cross_agent_state_mutation_call(
+                    call, state_object_aliases
+                ):
+                    self.found = True
+                    return
+                self.generic_visit(call)
+
+            def generic_visit(self, current: ast.AST) -> None:
+                if self.found:
+                    return
+                if _is_cross_agent_state_mutation_node(
+                    current, state_object_aliases
+                ):
+                    self.found = True
+                    return
+                super().generic_visit(current)
+
+            def visit_FunctionDef(self, _node: ast.FunctionDef) -> None:  # noqa: N802
+                return
+
+            def visit_AsyncFunctionDef(  # noqa: N802
+                self, _node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, _node: ast.ClassDef) -> None:  # noqa: N802
+                return
+
+            def visit_Lambda(self, _node: ast.Lambda) -> None:  # noqa: N802
+                return
+
+        visitor = ProtectedControlVisitor()
+        for statement in statements:
+            visitor.visit(statement)
+            if visitor.found:
+                return True
+        return False
+
+    accepted_field = next(
+        (
+            child
+            for child in ast.walk(node.test)
+            if isinstance(child, ast.Attribute)
+            and child.attr.casefold() == "ok"
+            and getattr(child, "_authority_unverified_attribution", False)
+        ),
+        None,
+    )
+    if accepted_field is None or contains_protected_control(node.body):
+        return False
+    verdict_receiver = ast.unparse(accepted_field.value).casefold()
+
+    def authorization_partition(statement: ast.stmt) -> bool:
+        if not isinstance(statement, ast.If):
+            return False
+        if not (
+            isinstance(statement.test, ast.Attribute)
+            and statement.test.attr.casefold() == "verified"
+            and ast.unparse(statement.test.value).casefold()
+            == verdict_receiver
+            and getattr(
+                statement.test, "_authority_verified_attribution", False
             )
-            or (
-                isinstance(candidate, ast.Call)
-                and _call_name(candidate).casefold()
+        ):
+            return False
+        # The verified arm is authenticated by the condition. The alternate
+        # arm may establish the narrow legacy identity or exit, but must not
+        # execute a protected control before doing either.
+        return (
+            any(
+                isinstance(child, ast.Call)
+                and _call_name(child).casefold()
                 in {
                     "authorize_a2a_legacy_unsigned_sender",
                     "authorize_legacy",
                 }
+                for alternative in statement.orelse
+                for child in ast.walk(alternative)
             )
+            and any(
+                isinstance(child, ast.Raise)
+                for alternative in statement.orelse
+                for child in ast.walk(alternative)
+            )
+            and not contains_protected_control(statement.orelse)
         )
-        for candidate in _walk_lexical_scope(function)
+
+    def containing_block(
+        statements: list[ast.stmt],
+    ) -> tuple[list[ast.stmt], int] | None:
+        for index, statement in enumerate(statements):
+            if statement is node:
+                return statements, index
+            for block in _child_statement_blocks(statement):
+                found = containing_block(block)
+                if found is not None:
+                    return found
+        return None
+
+    location = containing_block(function.body)
+    if location is None:
+        return False
+    statements, guard_index = location
+    suffix = statements[guard_index + 1 :]
+    partition_index = next(
+        (
+            index
+            for index, statement in enumerate(suffix)
+            if authorization_partition(statement)
+        ),
+        None,
     )
+    if partition_index is None:
+        return False
+    return not contains_protected_control(suffix[:partition_index])
 
 
 def _guard_clause_provenance_lines(
@@ -14148,49 +14255,11 @@ def _guard_clause_provenance_lines(
     control_aliases: set[str],
     provenance_return_helpers: set[str] | None = None,
     state_object_aliases: set[str] | None = None,
+    local_attribution_authorizers: set[str] | None = None,
 ) -> set[int]:
     """Find provenance conditions that gate a later control by exiting early."""
 
     lines: set[int] = set()
-
-    def rejects_unaccepted_envelope(test: ast.AST) -> bool:
-        return (
-            isinstance(test, ast.UnaryOp)
-            and isinstance(test.op, ast.Not)
-            and any(
-                isinstance(child, ast.Attribute)
-                and child.attr.casefold() == "ok"
-                and getattr(
-                    child, "_authority_unverified_attribution", False
-                )
-                for child in ast.walk(test)
-            )
-        )
-
-    def later_identity_authorization(statements: list[ast.stmt]) -> bool:
-        return any(
-            (
-                isinstance(candidate, ast.If)
-                and any(
-                    isinstance(child, ast.Attribute)
-                    and child.attr.casefold() == "verified"
-                    and getattr(
-                        child, "_authority_verified_attribution", False
-                    )
-                    for child in ast.walk(candidate.test)
-                )
-            )
-            or (
-                isinstance(candidate, ast.Call)
-                and _call_name(candidate).casefold()
-                in {
-                    "authorize_a2a_legacy_unsigned_sender",
-                    "authorize_legacy",
-                }
-            )
-            for statement in statements
-            for candidate in ast.walk(statement)
-        )
 
     def scan_block(
         statements: list[ast.stmt],
@@ -14292,9 +14361,12 @@ def _guard_clause_provenance_lines(
                     provenance_aliases,
                     provenance_return_helpers,
                 ) and not only_suppresses_cycle and not (
-                    rejects_unaccepted_envelope(statement.test)
-                    and later_identity_authorization(
-                        statements[index + 1 :]
+                    _is_fail_closed_envelope_acceptance_guard(
+                        statement,
+                        function,
+                        local_attribution_authorizers or set(),
+                        control_aliases,
+                        state_object_aliases or set(),
                     )
                 ):
                     lines.add(statement.lineno)
@@ -17629,6 +17701,7 @@ def _authority_provenance_lines(
                 control_aliases,
                 decision_provenance_helpers,
                 state_object_aliases,
+                local_attribution_authorizers,
             )
         )
         function_is_permission_boundary = (
@@ -18038,7 +18111,11 @@ def _authority_provenance_lines(
                 and not only_suppresses_cycle
                 and not only_selects_attribution_validation
                 and not _is_fail_closed_envelope_acceptance_guard(
-                    node, function
+                    node,
+                    function,
+                    local_attribution_authorizers,
+                    control_aliases,
+                    state_object_aliases,
                 )
                 and (
                     has_permission
@@ -20453,6 +20530,48 @@ def test_verified_sender_principals_require_verified_verdict_fields() -> None:
     assert _authority_provenance_lines(verified_only) == set()
 
 
+def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
+    authorization = (
+        "    if verdict.verified:\n"
+        "        pass\n"
+        "    else:\n"
+        "        authorize_legacy = getattr(\n"
+        "            manager,\n"
+        "            'authorize_a2a_legacy_unsigned_sender',\n"
+        "        )\n"
+        "        authorized = await authorize_legacy(task)\n"
+        "        if not authorized:\n"
+        "            raise PermissionError\n"
+    )
+    header = (
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target, manager):\n"
+        "    verdict = await verify_inbound_envelope(task.metadata)\n"
+    )
+    prefix = (
+        header
+        + "    if not verdict.ok:\n"
+        "        raise PermissionError\n"
+    )
+    safe = ast.parse(prefix + authorization + "    target.shutdown()\n")
+    unsafe = ast.parse(
+        prefix + "    target.shutdown()\n" + authorization
+    )
+    unsafe_rejection = ast.parse(
+        header
+        + "    if not verdict.ok:\n"
+        "        target.shutdown()\n"
+        "        raise PermissionError\n"
+        + authorization
+    )
+
+    assert _authority_provenance_lines(safe) == set()
+    assert _authority_provenance_lines(unsafe) == {7}
+    assert _authority_provenance_lines(unsafe_rejection) == {7}
+
+
 def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
     guarded = ast.parse(
         "def dispatch(task, target):\n"
@@ -21016,6 +21135,7 @@ def test_provenance_scanner_classifies_delegation_and_approval_boundaries() -> N
         "start",
         "pause",
         "resume",
+        "deactivate",
         "disable",
         "enable",
         "delete",
@@ -21066,6 +21186,7 @@ def test_provenance_scanner_classifies_async_lifecycle_method_variants(
     "dispatch",
     [
         "manager.start(child)",
+        "runtime.deactivate(child)",
         "manager.suspend(target=peer)",
         "restart(child)",
     ],
