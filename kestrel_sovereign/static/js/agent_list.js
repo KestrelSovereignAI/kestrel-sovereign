@@ -640,6 +640,7 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     let stopAllStatusSeq = 0;
+    let stopAllStatusPromise = null;
     let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
     function renderStopAllState() {
         if (!stopAllOptIn || !stopAllBtn) return;
@@ -668,26 +669,35 @@ export function mountAgentListPane(containerEl, config = {}) {
     };
     refreshStopAllState = async () => {
         if (!stopAllOptIn || !listLoaded) return false;
-        const seq = ++stopAllStatusSeq;
+        if (stopAllStatusPromise) return stopAllStatusPromise;
+        const request = (async () => {
+            const seq = ++stopAllStatusSeq;
+            try {
+                const status = await api.getHostStopStatus();
+                if (seq !== stopAllStatusSeq) return false;
+                const rawCount = status && status.in_flight_count;
+                const validCount = Number.isSafeInteger(rawCount) && rawCount >= 0;
+                stopAllStatus = {
+                    loaded: true,
+                    canStop: status && status.can_stop === true,
+                    inFlightCount: validCount ? rawCount : 0,
+                };
+            } catch (_) {
+                if (seq !== stopAllStatusSeq) return false;
+                // Status is an authority and inventory gate. A failed read must not
+                // fall back to browser-local cards or expose a knowingly doomed
+                // control to an unauthorized caller.
+                stopAllStatus = { loaded: true, canStop: false, inFlightCount: 0 };
+            }
+            renderStopAllState();
+            return stopAllStatus.canStop;
+        })();
+        stopAllStatusPromise = request;
         try {
-            const status = await api.getHostStopStatus();
-            if (seq !== stopAllStatusSeq) return false;
-            const rawCount = status && status.in_flight_count;
-            const validCount = Number.isSafeInteger(rawCount) && rawCount >= 0;
-            stopAllStatus = {
-                loaded: true,
-                canStop: status && status.can_stop === true,
-                inFlightCount: validCount ? rawCount : 0,
-            };
-        } catch (_) {
-            if (seq !== stopAllStatusSeq) return false;
-            // Status is an authority and inventory gate. A failed read must not
-            // fall back to browser-local cards or expose a knowingly doomed
-            // control to an unauthorized caller.
-            stopAllStatus = { loaded: true, canStop: false, inFlightCount: 0 };
+            return await request;
+        } finally {
+            if (stopAllStatusPromise === request) stopAllStatusPromise = null;
         }
-        renderStopAllState();
-        return stopAllStatus.canStop;
     };
 
     function displayTarget(outcome) {
@@ -784,10 +794,13 @@ export function mountAgentListPane(containerEl, config = {}) {
                 // current work. Recovery failure cannot safely substitute its
                 // stale identity for the new Stop attempt.
                 try {
-                    await api.stopHost({
+                    const recovery = api.stopHost({
                         reason: config.stopAllReason || 'Stopped from the agents banner',
                         correlation_id: operation.recoveryCorrelationId,
                     });
+                    if (recovery && typeof recovery.catch === 'function') {
+                        void recovery.catch(() => {});
+                    }
                 } catch (_) { /* the fresh operation remains authoritative */ }
             }
             response = await api.stopHost({

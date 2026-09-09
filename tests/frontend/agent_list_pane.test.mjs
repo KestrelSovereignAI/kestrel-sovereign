@@ -567,6 +567,36 @@ test('autoLoad false defers Stop All authority polling until explicit refresh', 
     handle.destroy();
 });
 
+test('slow Stop All status polling serializes one authoritative request', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let resolveStatus;
+    const status = new Promise((resolve) => { resolveStatus = resolve; });
+    let statusCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: () => {
+                statusCalls += 1;
+                return status;
+            },
+            stopHost: async () => ({}),
+        },
+        onPrepareStopAll: browserStopFence,
+        stopAllStatusIntervalMs: 250,
+    });
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const callsBeforeSettlement = statusCalls;
+    resolveStatus({ can_stop: true, in_flight_count: 1 });
+    await tick();
+    assert.equal(el.querySelector('.agent-stop-all-btn').disabled, false);
+    handle.destroy();
+    assert.equal(callsBeforeSettlement, 1,
+        'an interval tick joins the in-flight status request instead of superseding it');
+});
+
 test('Stop All fails closed when an embed omits the browser-work fence contract', async () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
@@ -717,6 +747,48 @@ test('new work after an ambiguous Host Stop gets a fresh operation after recover
     assert.equal(operationIds[1], operationIds[0], 'the ambiguous operation is recovered');
     assert.notEqual(operationIds[2], operationIds[0], 'current work receives a fresh operation');
     assert.equal(fenceCalls, 2, 'recovery does not create a second browser fence');
+});
+
+test('a hung recovery cannot delay the fresh Stop for current work', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const operationIds = [];
+    let stopCalls = 0;
+    const never = new Promise(() => {});
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async (payload) => {
+                operationIds.push(payload.correlation_id);
+                stopCalls += 1;
+                if (stopCalls === 1) throw new Error('response lost');
+                if (stopCalls === 2) return never;
+                return hostStopEnvelope(payload.correlation_id, [
+                    { agent: 'did:agent:emma', disposition: 'stopped' },
+                ]);
+            },
+        },
+        onPrepareStopAll: browserStopFence,
+        confirmStopAll: () => true,
+        stopAllStatusIntervalMs: 999999,
+    });
+    await tick();
+    await tick();
+
+    const button = el.querySelector('.agent-stop-all-btn');
+    button.click();
+    await tick();
+    await tick();
+    button.click();
+    await tick();
+    await tick();
+
+    const callsBeforeDestroy = stopCalls;
+    handle.destroy();
+    assert.equal(callsBeforeDestroy, 3, 'fresh Stop is issued without awaiting old recovery');
+    assert.equal(operationIds[1], operationIds[0]);
+    assert.notEqual(operationIds[2], operationIds[0]);
 });
 
 test('an ambiguous gateway response is recovered before a fresh current-work Stop', async () => {
