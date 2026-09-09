@@ -112,8 +112,6 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
-from kestrel_sovereign.agent.invocation import register_request_delivery
-from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.security.encryption import (
@@ -1131,6 +1129,17 @@ class SignalDispatcher:
         waiter is released by this task's callback after the durable NACK/ACK
         boundary has run.
         """
+
+        # Deferred: kestrel_sovereign.agent.* pulls agent/__init__, which
+        # reaches back into kestrel_sovereign.signals for OrderedLockManager.
+        # At module scope that closes an import cycle, and any importer that
+        # reaches signals first (features/wait, contribution_runtime, the
+        # inventory generator) fails. Every other agent import in this module
+        # is function-local for the same reason.
+        from kestrel_sovereign.agent.invocation import register_request_delivery
+        from kestrel_sovereign.agent.request_lifecycle import (
+            RequestCompletionDisposition,
+        )
 
         if not _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
             return None

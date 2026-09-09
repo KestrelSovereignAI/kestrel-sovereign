@@ -123,3 +123,39 @@ def test_kestrel_setup_check_cli_runs_without_circular_import(tmp_path):
     combined = (result.stdout + result.stderr).lower()
     assert "circular import" not in combined
     assert "traceback" not in combined
+
+
+def test_feature_modules_import_before_the_agent_package():
+    """The Stop/Hold epic reopened this cycle one package over.
+
+    ``signals.dispatcher`` gained a MODULE-level ``kestrel_sovereign.agent``
+    import. ``agent/__init__`` reaches back into ``kestrel_sovereign.signals``
+    for ``OrderedLockManager``, so any importer that arrives at ``signals``
+    first sees a partially initialized module::
+
+        features.wait.feature → waits.reconciler → signals.dispatcher
+          → agent.invocation → agent/__init__ → agent.turn_lifecycle
+          → signals (OrderedLockManager)  ← still initializing
+
+    The unit suite never saw it: conftest imports the agent package first,
+    which resolves the cycle before any feature module is loaded. The
+    inventory generator does not, and silently dropped ``wait`` from
+    KESTREL_FEATURES.md — a feature disappearing from the canonical
+    surface, with a warning as the only tell.
+
+    Each module is imported FIRST in its own interpreter, which is the
+    only order that reproduces it.
+    """
+    for module in (
+        "kestrel_sovereign.features.wait.feature",
+        "kestrel_sovereign.features.contribution_runtime",
+        "kestrel_sovereign.signals",
+        "kestrel_sovereign.waits.reconciler",
+    ):
+        result = _run(f"import {module}")
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, (
+            f"{module} must import in a fresh interpreter, before anything "
+            f"else pulls in kestrel_sovereign.agent: {combined}"
+        )
+        assert "partially initialized" not in combined

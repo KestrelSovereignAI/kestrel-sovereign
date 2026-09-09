@@ -85,8 +85,9 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     the inbound-scope gate's recipient (``a2a/inbound_authorization``),
     the task feature's own durable identity, the task wait provider's
     ownership check, the pre-turn state sections, the restart
-    status-events route, and (#3240) the feature-route mount owner's
-    stable identity across a reload. They had drifted — one gated on truthiness alone,
+    status-events route, (#3240) the feature-route mount owner's
+    stable identity across a reload, and the turn-start Hold latch's own
+    scope (``hold/enforcement.py``). They had drifted — one gated on truthiness alone,
     so a non-string truthy value was bound as a query parameter; the task
     routes and the inbound-scope gate read ``agent_id`` before ``did``; the
     cancel route tried the task manager's ``host_agent_id`` first; creation

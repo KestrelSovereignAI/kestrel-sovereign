@@ -314,11 +314,21 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     if store is None:
         return None
 
-    agent_id = getattr(agent, "did", None) or getattr(agent, "agent_id", None)
-    if not isinstance(agent_id, str) or not agent_id:
+    # Hold scopes a shared table to the calling agent, so its identity comes
+    # from the one guard (#3251), not an inline did/agent_id chain. The guard
+    # raises a sibling of ValueError; converting here keeps this seam's
+    # documented failure type, which callers fail closed on.
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        agent_id = resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable as error:
         raise HoldEnforcementUnavailableError(
             "Cannot enforce Hold without a concrete agent DID"
-        )
+        ) from error
     effective = await store.get_effective(agent_id)
     if effective.held:
         raise HoldTurnRefusal(agent_id=agent_id, effective_state=effective)
