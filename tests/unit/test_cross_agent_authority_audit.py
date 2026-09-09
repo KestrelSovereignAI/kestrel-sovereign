@@ -8920,6 +8920,59 @@ def _block_guaranteed_function_exit(statements: list[ast.stmt]) -> bool:
     return False
 
 
+def _block_guaranteed_current_loop_break(statements: list[ast.stmt]) -> bool:
+    """Whether every path through a block breaks its immediately owning loop."""
+
+    if not statements:
+        return False
+    terminal = statements[-1]
+    if isinstance(terminal, ast.Break):
+        return True
+    if isinstance(terminal, (ast.Continue, ast.Raise, ast.Return)):
+        return False
+    if isinstance(terminal, ast.If):
+        return _block_guaranteed_current_loop_break(
+            terminal.body
+        ) and _block_guaranteed_current_loop_break(terminal.orelse)
+    if isinstance(terminal, (ast.With, ast.AsyncWith)):
+        return _block_guaranteed_current_loop_break(terminal.body)
+    if isinstance(terminal, (ast.Try, ast.TryStar)):
+        if _block_guaranteed_current_loop_break(terminal.finalbody):
+            return True
+        normal_path_breaks = _block_guaranteed_current_loop_break(
+            terminal.body
+        ) or (
+            not _block_guaranteed_exits(terminal.body)
+            and _block_guaranteed_current_loop_break(terminal.orelse)
+        )
+        return normal_path_breaks and all(
+            _block_guaranteed_current_loop_break(handler.body)
+            for handler in terminal.handlers
+        )
+    if isinstance(terminal, ast.Match):
+        has_catch_all = any(
+            case.guard is None
+            and isinstance(case.pattern, ast.MatchAs)
+            and case.pattern.pattern is None
+            for case in terminal.cases
+        )
+        return has_catch_all and all(
+            _block_guaranteed_current_loop_break(case.body)
+            for case in terminal.cases
+        )
+    return False
+
+
+def _loop_requires_break_for_continuation(statement: ast.stmt) -> bool:
+    """Whether a loop's normal condition cannot reach following siblings."""
+
+    return (
+        isinstance(statement, ast.While)
+        and isinstance(statement.test, ast.Constant)
+        and bool(statement.test.value)
+    )
+
+
 def _contains_current_loop_transfer(
     statements: list[ast.stmt],
     *,
@@ -11436,6 +11489,7 @@ def _provenance_aliases(
         statements: list[ast.stmt],
         enclosing_continuation_controls: bool = False,
         enclosing_loop_continuation_controls: bool = False,
+        enclosing_loop_break_controls: bool = False,
     ) -> None:
         suffix_controls = [False] * (len(statements) + 1)
         for index in range(len(statements) - 1, -1, -1):
@@ -11452,6 +11506,7 @@ def _provenance_aliases(
             controls_continuation = (
                 local_continuation_controls
                 or enclosing_loop_continuation_controls
+                or enclosing_loop_break_controls
             )
             if controls_continuation:
                 if isinstance(statement, ast.Assert):
@@ -11475,7 +11530,16 @@ def _provenance_aliases(
                             statements[index + 1 :],
                         )
                     )
-                    if local_exit_differs or loop_exit_differs:
+                    loop_break_differs = (
+                        enclosing_loop_break_controls
+                        and _block_guaranteed_current_loop_break(statement.body)
+                        != _block_guaranteed_current_loop_break(statement.orelse)
+                    )
+                    if (
+                        local_exit_differs
+                        or loop_exit_differs
+                        or loop_break_differs
+                    ):
                         authority_decision_names.update(
                             _identifier_tokens(statement.test)
                         )
@@ -11503,11 +11567,22 @@ def _provenance_aliases(
                 if is_loop
                 else enclosing_loop_continuation_controls
             )
+            child_loop_break_controls = (
+                _loop_requires_break_for_continuation(statement)
+                and (
+                    local_continuation_controls
+                    or enclosing_loop_continuation_controls
+                    or enclosing_loop_break_controls
+                )
+                if is_loop
+                else enclosing_loop_break_controls
+            )
             for block in _child_statement_blocks(statement):
                 collect_guard_decisions(
                     block,
                     child_continuation_controls,
                     child_loop_continuation_controls,
+                    child_loop_break_controls,
                 )
 
     if authority_analysis:
@@ -14600,15 +14675,12 @@ def _is_fail_closed_envelope_acceptance_guard(
     )
     if partition is None:
         return False
-    partition_index, partition_strength = partition
+    partition_index, _partition_strength = partition
     return (
         not contains_protected_control(suffix[:partition_index])
-        and (
-            partition_strength == "strong"
-            or not contains_protected_control(
-                suffix[partition_index + 1 :],
-                allowed_calls=frozenset({"commit", "create_task"}),
-            )
+        and not contains_protected_control(
+            suffix[partition_index + 1 :],
+            allowed_calls=frozenset({"commit", "create_task"}),
         )
     )
 
@@ -14629,6 +14701,7 @@ def _guard_clause_provenance_lines(
         statements: list[ast.stmt],
         enclosing_continuation_controls: bool = False,
         enclosing_loop_continuation_controls: bool = False,
+        enclosing_loop_break_controls: bool = False,
     ) -> None:
         suffix_controls = [False] * (len(statements) + 1)
         for index in range(len(statements) - 1, -1, -1):
@@ -14645,6 +14718,7 @@ def _guard_clause_provenance_lines(
             controls_continuation = (
                 local_continuation_controls
                 or enclosing_loop_continuation_controls
+                or enclosing_loop_break_controls
             )
             if controls_continuation and isinstance(statement, ast.Assert):
                 if _has_provenance_value(
@@ -14719,6 +14793,11 @@ def _guard_clause_provenance_lines(
                     or (
                         enclosing_loop_continuation_controls
                         and body_function_exits != orelse_function_exits
+                    )
+                    or (
+                        enclosing_loop_break_controls
+                        and _block_guaranteed_current_loop_break(statement.body)
+                        != _block_guaranteed_current_loop_break(statement.orelse)
                     )
                 ) and _has_provenance_value(
                     statement.test,
@@ -14868,11 +14947,22 @@ def _guard_clause_provenance_lines(
                 if is_loop
                 else enclosing_loop_continuation_controls
             )
+            child_loop_break_controls = (
+                _loop_requires_break_for_continuation(statement)
+                and (
+                    local_continuation_controls
+                    or enclosing_loop_continuation_controls
+                    or enclosing_loop_break_controls
+                )
+                if is_loop
+                else enclosing_loop_break_controls
+            )
             for block in _child_statement_blocks(statement):
                 scan_block(
                     block,
                     child_continuation_controls,
                     child_loop_continuation_controls,
+                    child_loop_break_controls,
                 )
 
     scan_block(function.body)
@@ -20750,9 +20840,17 @@ def test_provenance_scanner_preserves_post_loop_control_reachability() -> None:
         "        return\n"
         "    terminate_child(target)\n"
     )
+    break_is_only_continuation = ast.parse(
+        "def dispatch(request, target):\n"
+        "    while True:\n"
+        "        if request.causation_chain:\n"
+        "            break\n"
+        "    terminate_child(target)\n"
+    )
 
     assert _authority_provenance_lines(break_reaches_control) == {3}
     assert _authority_provenance_lines(both_paths_return) == set()
+    assert _authority_provenance_lines(break_is_only_continuation) == {3}
 
 
 def test_provenance_scanner_tracks_augmented_assignment_decisions() -> None:
@@ -20933,7 +21031,12 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         + "    if not verdict.ok:\n"
         "        raise PermissionError\n"
     )
-    safe = ast.parse(prefix + authorization + "    target.shutdown()\n")
+    safe_a2a_delivery = ast.parse(
+        prefix + authorization + "    await manager.create_task()\n"
+    )
+    unauthorized_lifecycle = ast.parse(
+        prefix + authorization + "    target.shutdown()\n"
+    )
     unsafe = ast.parse(
         prefix + "    target.shutdown()\n" + authorization
     )
@@ -21001,7 +21104,8 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         "    target.shutdown()\n"
     )
 
-    assert _authority_provenance_lines(safe) == set()
+    assert _authority_provenance_lines(safe_a2a_delivery) == set()
+    assert _authority_provenance_lines(unauthorized_lifecycle) == {7}
     assert _authority_provenance_lines(unsafe) == {7}
     assert _authority_provenance_lines(unsafe_rejection) == {7}
     assert _authority_provenance_lines(unauthenticated_verified_arm) == {7}
