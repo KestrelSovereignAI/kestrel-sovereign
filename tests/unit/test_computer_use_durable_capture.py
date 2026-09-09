@@ -2294,6 +2294,7 @@ async def test_a_failed_pump_ends_the_run_immediately(tmp_path: Path, monkeypatc
     already unrecoverable, so running the command to its full timeout buys
     nothing — and with nothing draining the pipe a high-output command blocks
     on it, turning a disk error into a hang."""
+    import asyncio as _a
     import time as _t
 
     import kestrel_sovereign.features.computer_use.backends.local as local_mod
@@ -2306,9 +2307,21 @@ async def test_a_failed_pump_ends_the_run_immediately(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(local_mod, "_pump", failing_pump)
 
+    marker = tmp_path / "child_survived.txt"
+    script = tmp_path / "long.py"
+    script.write_text(
+        "import time\n"
+        "print('x' * 1000, flush=True)\n"
+        "time.sleep(2)\n"
+        f"open({str(marker)!r}, 'w').write('x')\n"
+    )
+
+    def marker_gone():
+        return not marker.exists()
+
     began = _t.monotonic()
     result = await LocalSandboxBackend(GRANTS).exec(
-        ["python3", "-c", "import time; print('x' * 1000, flush=True); time.sleep(30)"],
+        ["python3", str(script)],
         cwd=None,
         env=None,
         timeout=25,
@@ -2320,6 +2333,11 @@ async def test_a_failed_pump_ends_the_run_immediately(tmp_path: Path, monkeypatc
 
     assert result.truncated_stdout is True
     assert elapsed < 10, f"waited {elapsed:.1f}s after the capture was already lost"
+    # Returning fast is not the same as ending the run. Without the kill the
+    # call still returns promptly and the child keeps going — which the first
+    # version of this test could not tell apart.
+    await _a.sleep(3)
+    assert marker_gone(), "the child outlived the capture failure"
 
 
 @pytest.mark.asyncio
@@ -2356,4 +2374,45 @@ async def test_the_facts_only_envelope_fits_even_with_a_long_path(
     assert size <= 1000, f"fallback is {size} chars"
     # The pointer survives in one form or another.
     assert env.data.get("manifest_path") or env.data.get("run_id")
+    assert "complete" in env.data
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_degrades_to_a_run_id_when_even_the_path_is_too_long(
+    tmp_path: Path, queue, monkeypatch
+):
+    """Surviving mutants. Two of round 8's fixes — re-measuring the fallback,
+    and carrying the pointer once instead of twice — could both be undone
+    with nothing failing, because the only test that reached the fallback had
+    a path short enough that neither mattered.
+
+    A path long enough to dominate is the case they exist for: then the
+    envelope must shed the path too and keep the 32-character run id, which
+    with the configured capture directory still locates the artifact."""
+    from kestrel_sovereign.features.base import serialized_result_len
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 400,
+    )
+    deep = tmp_path
+    for _ in range(8):
+        deep = deep / ("d" * 30)
+    deep.mkdir(parents=True)
+    (deep / "secret").mkdir()
+
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(deep)
+    await f.initialize()
+
+    env = await f.shell(
+        command="python3 -c \"print('q' * 50000)\"",
+        capture_output=True,
+        timeout=60,
+    )
+
+    size = serialized_result_len(env, tool_name="shell")
+    assert size <= 400, f"fallback is {size} chars"
+    assert env.data.get("run_id"), "the last pointer was dropped too"
+    assert "manifest_path" not in env.data
     assert "complete" in env.data
