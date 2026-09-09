@@ -165,7 +165,8 @@ runtime rather than by a shell it does not have. Two parameters:
   PARTIAL. Streaming it is #3277. Check `complete`, as below, rather than
   assuming the file is whole.
 
-The manifest records what ran, where, how it ended, and the git `HEAD` before
+The manifest records what ran, where, how it ended, which backend ran it
+(`backend` — the result itself does not carry it), and the git `HEAD` before
 and after. **A verdict is about one tree.** During the 2026-08-31 run the head
 moved three times in eight hours; `git.head_moved` is how you can tell a
 verdict was about a tree that no longer exists, and re-running is the answer
@@ -174,9 +175,12 @@ when it is `true`.
 **A truncated or timed-out review is a gate FAILURE, not a verdict** — the same
 shape as the dead-reviewer case above: plausible text, no completed judgement.
 Read **`complete`** on the result. It is the conjunction of every way the run
-could be less than whole (timed out, stdout clipped, stderr clipped), so
-checking it cannot be satisfied by remembering only one of them, and the same
-field is on the manifest. Such a run now also comes back PARTIAL rather than
+could be less than whole — timed out, stdout clipped, stderr clipped, or a
+writer still holding the pipes (`writers_remaining` anything but `false`,
+which is what a review that daemonizes leaves behind) — so checking it cannot
+be satisfied by remembering only one of them, and the same field is on the
+manifest. All four are named here deliberately: a `complete: false` whose
+reason you cannot name is the case this paragraph exists for. Such a run now also comes back PARTIAL rather than
 OK even when the process exited 0 — "the process exited 0" and "the work
 finished" are different claims, and only the second is a verdict.
 

@@ -3276,3 +3276,157 @@ def test_a_configured_capture_ceiling_is_read_or_refused_never_guessed(
     from kestrel_sovereign.features.computer_use.feature import _positive_int
 
     assert _positive_int(configured, default=1024 * 1024, name="x") == expected
+
+
+# ---------------------------------------------------------------------------
+# Review round 13
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_manifest_carries_what_the_run_actually_did(
+    workspace: Path, queue
+):
+    """Round 13 finding 1. ``build_manifest`` was right in isolation and its
+    CALL SITE was unconstrained: `timed_out=False`, `returncode=0`, `argv=[]`
+    and `backend="unknown"` all survived mutation. So the artifact's
+    ``complete`` -- the field AGENTS.md tells a gate to read -- could have
+    reported a killed review as whole and nothing would have failed.
+
+    The sibling arguments were already pinned. This asserts the four that
+    were not, against a run whose real outcome is known: a command killed at
+    its own timeout."""
+    script = workspace / "slow.py"
+    script.write_text("import time\nprint('starting', flush=True)\ntime.sleep(30)\n")
+    f = await _feature(workspace, queue)
+
+    env = await f.shell(
+        command=f"python3 {script}", capture_output=True, timeout=1
+    )
+
+    body = json.loads(Path(env.data["manifest_path"]).read_text())
+    # Each of these is a separate mutant that survived; asserting them
+    # together is fine, asserting only one of them is not.
+    assert body["timed_out"] is True
+    assert body["complete"] is False
+    assert body["returncode"] == env.data["returncode"] != 0
+    assert body["argv"] == ["python3", str(script)]
+    assert body["backend"] == "local"
+    assert body["duration_ms"] > 0
+    # And the whole point of the field: a killed review is not a whole one.
+    assert env.status is ToolResultStatus.PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_the_configured_docker_ceiling_reaches_the_executor(workspace: Path, queue):
+    """Round 13 finding 2. The round-12 fix was tested only at the coercion
+    helper, so four separate mutations of the WIRING survived: the config key
+    never read, the kwarg deleted, and the backend hardcoding or defaulting
+    the value instead of forwarding it. A helper that is never called is not
+    a fix."""
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(
+        workspace, backend="docker", docker={"max_output_bytes": 4 * 1024 * 1024}
+    )
+    await f.initialize()
+
+    assert f._backend.name == "docker"
+    assert f._backend._executor._max_output_bytes == 4 * 1024 * 1024
+
+    # And an unusable value falls back rather than reaching the executor.
+    g = ComputerUseFeature(FakeAgent(queue=queue))
+    g._cfg = _config(workspace, backend="docker", docker={"max_output_bytes": 0})
+    await g.initialize()
+    assert g._backend._executor._max_output_bytes == 1024 * 1024
+
+
+def test_the_clip_state_reports_a_clipped_stderr_too(tmp_path: Path):
+    """Round 13 finding 4. ``_clip_state`` dropping its ``truncated_stderr``
+    term survived: every test that reached it clipped stdout. This is the
+    per-stream contract broken on the stdout-pinned/stderr-unpinned pattern
+    for -- by the reviewer's count -- the fourth time on this branch, in code
+    whose stated purpose is that the two are not interchangeable."""
+    from kestrel_sovereign.features.computer_use.feature import _clip_state
+
+    def env(**flags):
+        return ToolResult.ok("ran", data={"stdout": "", **flags})
+
+    assert _clip_state(env()) is False
+    assert _clip_state(env(truncated_stdout=True)) is True
+    assert _clip_state(env(truncated_stderr=True)) is True
+    assert _clip_state(env(truncated_stdout=True, truncated_stderr=True)) is True
+
+
+@pytest.mark.asyncio
+async def test_an_empty_rev_parse_is_not_a_sha(tmp_path: Path, monkeypatch):
+    """Surviving mutant `m8`: ``return sha`` instead of ``return sha or None``.
+    An empty successful ``rev-parse`` would land as ``""``, and ``head_moved``
+    would then compute ``"" != ""`` -> ``false`` -- a positive claim that the
+    tree did not move, manufactured from two unknowns. The whole reason
+    ``head_moved`` is three-valued is to refuse exactly that."""
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"\n", b""
+
+    async def fake_exec(*a, **k):
+        return _Proc()
+
+    monkeypatch.setattr(capture.asyncio, "create_subprocess_exec", fake_exec)
+    assert await capture.git_head(tmp_path) is None
+
+    body = _manifest(tmp_path, head_before=None, head_after=None)
+    assert body["git"]["head_moved"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_stderr_write_is_lost_on_its_own_side(
+    tmp_path: Path, monkeypatch
+):
+    """Round 13 finding 4, the other half. Dropping ``0 in cancelled_mid_write``
+    from ``out_lost`` is killed; dropping ``1 in cancelled_mid_write`` from
+    ``err_lost`` survived, because every test that stalled a write stalled
+    stdout's.
+
+    This is the per-stream contract's stderr side going untested for the
+    fourth time on this branch, in code whose whole purpose is that saying
+    stderr was clipped when stdout's write failed is a false claim. A mirror
+    test is what stops it recurring a fifth time."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+    monkeypatch.setattr(local_mod, "_DRAIN_GRACE", 0.05)
+    monkeypatch.setattr(local_mod, "_FLUSH_GRACE", 0.05)
+
+    def glacial_err_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_write = err_fh.write
+
+        def glacial_write(b):
+            import time as _t
+
+            _t.sleep(3)
+            return real_write(b)
+
+        err_fh.write = glacial_write
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", glacial_err_open)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "import sys; sys.stderr.write('never-lands\\n')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stderr is True, "a discarded stderr write was not called lost"
+    # And it did NOT contaminate the other stream: that collapse is the exact
+    # false claim the per-stream split exists to prevent.
+    assert result.truncated_stdout is False
+    assert result.writers_remaining is False
