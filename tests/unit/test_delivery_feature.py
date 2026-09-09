@@ -1430,7 +1430,7 @@ class TestQueueIdempotency:
                 original[2],
                 None,
                 DeliveryStatus.PENDING.value,
-                original[3],
+                original[3] + 1,
                 candidate_time,
                 candidate_time,
             ),
@@ -1442,6 +1442,67 @@ class TestQueueIdempotency:
             "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
             (queue._agent_id,),
         ) == (1,)
+
+    @pytest.mark.asyncio
+    async def test_shared_stale_claims_adopt_one_anchored_replacement(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = ("email", "shared-stale@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="shared-stale-one"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-stale-two"
+        ) == original_id
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        replacement = await queue.enqueue(
+            *request, idempotency_key="shared-stale-one"
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, replacement),
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-stale-two"
+        ) == replacement
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+
+    @pytest.mark.asyncio
+    async def test_stale_repair_preserves_durable_legacy_hash(self, real_queue):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "stale-hash@example.com",
+            {"z": 1, "a": 2},
+            idempotency_key="stale-hash",
+        )
+        original_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (original_id,)
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        repaired = await queue.enqueue(
+            "email",
+            "stale-hash@example.com",
+            {"a": 2, "z": 1},
+            idempotency_key="stale-hash",
+        )
+
+        assert await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (repaired,)
+        ) == original_hash
 
     @pytest.mark.asyncio
     async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
@@ -1789,6 +1850,36 @@ class TestQueueIdempotency:
         assert await queue.enqueue(
             "email", "rolling-hash@example.com", payload
         ) == retried["entry_id"]
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_authoritative_hash_allows_alias_hashes(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "alias-hash@example.com",
+            {"z": 1, "a": 2},
+            idempotency_key="alias-hash-one",
+        )
+        assert await queue.enqueue(
+            "email",
+            "alias-hash@example.com",
+            {"a": 2, "z": 1},
+            idempotency_key="alias-hash-two",
+        ) == original_id
+        original_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (original_id,)
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?",
+            (retried["entry_id"],),
+        ) == original_hash
 
     @pytest.mark.asyncio
     async def test_concurrent_dead_letter_retry_creates_one_live_row(self, real_queue):

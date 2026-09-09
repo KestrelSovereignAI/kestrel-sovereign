@@ -537,7 +537,6 @@ class DeliveryQueue:
         canonical_content_hash: str,
         legacy_content_hash: str,
         channel_type: str,
-        max_retries: int,
         claim_created_at: str,
     ) -> bool:
         """Detect an unreconciled rolling-writer retry outside dedup time.
@@ -553,7 +552,6 @@ class DeliveryQueue:
             WHERE delivery_queue.agent_id = ?
               AND delivery_queue.recipient = ?
               AND delivery_queue.channel_type = ?
-              AND delivery_queue.max_retries = ?
               AND delivery_queue.created_at >= ?
               AND (
                     delivery_queue.canonical_content_hash = ?
@@ -578,7 +576,6 @@ class DeliveryQueue:
                 self._agent_id,
                 recipient,
                 channel_type,
-                max_retries,
                 claim_created_at,
                 canonical_content_hash,
                 canonical_content_hash,
@@ -586,6 +583,60 @@ class DeliveryQueue:
             ),
         )
         return row is not None
+
+    async def _find_replacement_for_prior_entry(
+        self,
+        *,
+        prior_entry_id: str,
+        recipient: str,
+        canonical_content_hash: str,
+        legacy_content_hash: str,
+        channel_type: str,
+        max_retries: int,
+    ) -> Optional[str]:
+        """Find a replacement durably anchored to a shared prior queue ID."""
+        rows = await self._db.fetchall(
+            """
+            SELECT DISTINCT delivery_queue.id
+            FROM delivery_queue
+            JOIN delivery_idempotency replacement_claim
+              ON replacement_claim.agent_id = delivery_queue.agent_id
+             AND replacement_claim.entry_id = delivery_queue.id
+            WHERE delivery_queue.agent_id = ?
+              AND replacement_claim.previous_entry_id = ?
+              AND delivery_queue.recipient = ?
+              AND delivery_queue.channel_type = ?
+              AND delivery_queue.max_retries = ?
+              AND (
+                    delivery_queue.canonical_content_hash = ?
+                    OR delivery_queue.content_hash IN (?, ?)
+              )
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_dead_letter
+                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                      AND (
+                            delivery_dead_letter.original_id = delivery_queue.id
+                            OR delivery_dead_letter.retry_entry_id = delivery_queue.id
+                      )
+              )
+            LIMIT 2
+            """,
+            (
+                self._agent_id,
+                prior_entry_id,
+                recipient,
+                channel_type,
+                max_retries,
+                canonical_content_hash,
+                canonical_content_hash,
+                legacy_content_hash,
+            ),
+        )
+        if len(rows) > 1:
+            raise DeliveryIdempotencyStateError(
+                "stale delivery claim has multiple anchored replacements"
+            )
+        return rows[0][0] if rows else None
 
     async def _enqueue_idempotent(
         self,
@@ -814,13 +865,41 @@ class DeliveryQueue:
                         )
                         return deduplicated
 
-                    if await self._has_unlinked_compatible_queue_row(
+                    anchored_replacement = await self._find_replacement_for_prior_entry(
+                        prior_entry_id=canonical_id,
                         recipient=recipient,
                         canonical_content_hash=canonical_content_hash,
                         legacy_content_hash=stored_legacy_hash
                         or legacy_content_hash,
                         channel_type=channel_type,
                         max_retries=stored_retries,
+                    )
+                    if anchored_replacement is not None:
+                        await self._db.execute(
+                            """
+                            UPDATE delivery_idempotency
+                            SET entry_id = ?, created_at = ?, compensating = 0,
+                                previous_entry_id = ?
+                            WHERE agent_id = ? AND idempotency_key_digest = ?
+                              AND entry_id = ?
+                            """,
+                            (
+                                anchored_replacement,
+                                now_iso,
+                                canonical_id,
+                                self._agent_id,
+                                key_digest,
+                                canonical_id,
+                            ),
+                        )
+                        return anchored_replacement
+
+                    if await self._has_unlinked_compatible_queue_row(
+                        recipient=recipient,
+                        canonical_content_hash=canonical_content_hash,
+                        legacy_content_hash=stored_legacy_hash
+                        or legacy_content_hash,
+                        channel_type=channel_type,
                         claim_created_at=claim_created_at,
                     ):
                         raise DeliveryIdempotencyStateError(
@@ -865,7 +944,7 @@ class DeliveryQueue:
                             channel_type,
                             recipient,
                             content_json,
-                            legacy_content_hash,
+                            stored_legacy_hash or legacy_content_hash,
                             canonical_content_hash,
                             DeliveryStatus.PENDING.value,
                             stored_retries,
@@ -1060,15 +1139,17 @@ class DeliveryQueue:
                 ledger_hashes = {
                     row[1] for row in ledger_rows if row[1] is not None
                 }
-                if len(ledger_policies) > 1 or len(ledger_hashes) > 1:
+                if len(ledger_policies) > 1:
                     raise DeliveryIdempotencyStateError(
                         "dead-letter retry found inconsistent replay metadata"
                     )
                 ledger_policy = next(iter(ledger_policies), None)
                 ledger_legacy_hash = next(iter(ledger_hashes), None)
-                legacy_hash = (
-                    dl_row[11] or ledger_legacy_hash or computed_legacy_hash
-                )
+                if dl_row[11] is None and len(ledger_hashes) > 1:
+                    raise DeliveryIdempotencyStateError(
+                        "dead-letter retry has no authoritative compatibility hash"
+                    )
+                legacy_hash = dl_row[11] or ledger_legacy_hash or computed_legacy_hash
                 retry_policy = (
                     dl_row[9]
                     if dl_row[9] is not None
@@ -1844,12 +1925,22 @@ class DeliveryQueue:
             # rolling old writer cannot persist the new value, so the durable
             # ledger recovery path requires the compatibility column to remain
             # nullable on upgraded PostgreSQL databases too.
-            await self._db.execute(
+            nullable = await self._db.fetchone(
                 """
-                ALTER TABLE delivery_dead_letter
-                ALTER COLUMN max_retries DROP NOT NULL
-                """
+                SELECT NOT attnotnull
+                FROM pg_attribute
+                WHERE attrelid = to_regclass(?) AND attname = ?
+                  AND attnum > 0 AND NOT attisdropped
+                """,
+                ("delivery_dead_letter", "max_retries"),
             )
+            if nullable == (False,):
+                await self._db.execute(
+                    """
+                    ALTER TABLE delivery_dead_letter
+                    ALTER COLUMN max_retries DROP NOT NULL
+                    """
+                )
         if not await self._db.column_exists(
             "delivery_dead_letter", "retry_entry_id"
         ):
