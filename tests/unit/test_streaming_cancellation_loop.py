@@ -347,6 +347,14 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
     batch_completed = asyncio.Event()
 
     agent.is_request_cancelled = lambda _request_id=None: cancelled
+    persist_assistant_turn = agent._persist_assistant_turn_safely
+    persistence_requirements = []
+
+    async def capture_persistence_requirement(*args, **kwargs):
+        persistence_requirements.append(kwargs.get("require_success", False))
+        return await persist_assistant_turn(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_persistence_requirement
     agent._visible_features_by_tool_name = MagicMock(return_value={})
     agent._known_tool_names = MagicMock(return_value=set())
     agent._handle_orchestrator_response_streaming = (
@@ -422,6 +430,7 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
         if call.args and call.args[0] == "assistant"
     ]
     assert len(assistant_calls) == 1
+    assert persistence_requirements == [True]
     assert assistant_calls[0].kwargs["metadata"]["cancelled"] is True
     assert assistant_calls[0].kwargs["metadata"]["tool_results"] == [
         {
