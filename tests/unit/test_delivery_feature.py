@@ -1505,6 +1505,43 @@ class TestQueueIdempotency:
         ) == original_hash
 
     @pytest.mark.asyncio
+    async def test_adopted_key_persists_queue_legacy_hash_for_stale_repair(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email", "adopted-hash@example.com", {"z": 1, "a": 2}
+        )
+        original_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (original_id,)
+        )
+        assert await queue.enqueue(
+            "email",
+            "adopted-hash@example.com",
+            {"a": 2, "z": 1},
+            idempotency_key="adopted-hash",
+        ) == original_id
+        assert await queue._db.fetchone(
+            "SELECT legacy_content_hash FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == original_hash
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        repaired = await queue.enqueue(
+            "email",
+            "adopted-hash@example.com",
+            {"a": 2, "z": 1},
+            idempotency_key="adopted-hash",
+        )
+
+        assert await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?", (repaired,)
+        ) == original_hash
+
+    @pytest.mark.asyncio
     async def test_postgres_failure_relies_on_transaction_rollback(self, queue):
         queue._db.backend_type = "postgres"
         queue._db.nested_transaction_strategy = "savepoint"

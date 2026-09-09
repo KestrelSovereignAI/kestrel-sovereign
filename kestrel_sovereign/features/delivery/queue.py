@@ -842,17 +842,30 @@ class DeliveryQueue:
                         )
 
                     if deduplicated is not None:
+                        adopted_row = await self._db.fetchone(
+                            """
+                            SELECT content_hash FROM delivery_queue
+                            WHERE id = ? AND agent_id = ?
+                            """,
+                            (deduplicated, self._agent_id),
+                        )
+                        if adopted_row is None:
+                            raise DeliveryIdempotencyStateError(
+                                "deduplicated delivery disappeared while locked"
+                            )
                         await self._db.execute(
                             """
                             UPDATE delivery_idempotency
                             SET entry_id = ?, created_at = ?, compensating = 0,
-                                previous_entry_id = NULL
+                                previous_entry_id = NULL,
+                                legacy_content_hash = ?
                             WHERE agent_id = ? AND idempotency_key_digest = ?
                                   AND entry_id = ?
                             """,
                             (
                                 deduplicated,
                                 now_iso,
+                                adopted_row[0],
                                 self._agent_id,
                                 key_digest,
                                 canonical_id,
