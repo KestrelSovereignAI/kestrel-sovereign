@@ -2185,3 +2185,49 @@ async def test_capture_writes_do_not_block_the_event_loop(
     # starvation; written off it, the heartbeat keeps its 10ms cadence.
     assert ticks > 20, f"event loop only ticked {ticks} times during the capture"
     assert bundle.stdout_path.stat().st_size > 500_000
+
+
+@pytest.mark.asyncio
+async def test_a_failing_stderr_pump_indicts_only_stderr(
+    tmp_path: Path, monkeypatch
+):
+    """Surviving mutant, and the mirror of the test above it. Dropping the
+    pump-error term from the STDERR side changed nothing, because every test
+    that failed a pump failed stdout's. A per-stream contract needs both
+    sides covered or half of it is asserted by nobody."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_pump = local_mod._pump
+    real_open = local_mod._open_capture
+
+    def tagging_open(cap):
+        out_fh, err_fh = real_open(cap)
+        err_fh._is_stderr = True
+        return out_fh, err_fh
+
+    async def selective_pump(reader, fh):
+        if getattr(fh, "_is_stderr", False):
+            await reader.read(10)
+            raise OSError("No space left on device")
+        await real_pump(reader, fh)
+
+    monkeypatch.setattr(local_mod, "_open_capture", tagging_open)
+    monkeypatch.setattr(local_mod, "_pump", selective_pump)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        [
+            "python3",
+            "-c",
+            "import sys; sys.stdout.write('o'*100); sys.stderr.write('e'*100)",
+        ],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stderr is True
+    assert result.truncated_stdout is False
