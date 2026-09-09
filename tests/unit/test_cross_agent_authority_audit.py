@@ -812,19 +812,32 @@ class _StaticBindingFlow:
 
     def __init__(
         self,
-        direct_resolver: Callable[[ast.AST], _StaticBinding | None],
+        direct_resolver: Callable[..., _StaticBinding | None],
         ambiguous: Callable[[list[_StaticBinding]], _StaticBinding],
         bindings: dict[str, _StaticBinding] | None = None,
+        *,
+        normalize_name: Callable[[str], str] | None = None,
+        on_resolve: Callable[[ast.AST, _StaticBinding], None] | None = None,
+        stateful_resolver: bool = False,
     ) -> None:
         self.direct_resolver = direct_resolver
         self.ambiguous = ambiguous
-        self.bindings = dict(bindings or {})
+        self.normalize_name = normalize_name or (lambda name: name)
+        self.on_resolve = on_resolve
+        self.stateful_resolver = stateful_resolver
+        self.bindings = {
+            self.normalize_name(name): binding
+            for name, binding in (bindings or {}).items()
+        }
 
     def fork(self) -> _StaticBindingFlow:
         return _StaticBindingFlow(
             self.direct_resolver,
             self.ambiguous,
             self.bindings,
+            normalize_name=self.normalize_name,
+            on_resolve=self.on_resolve,
+            stateful_resolver=self.stateful_resolver,
         )
 
     def resolve(
@@ -834,30 +847,36 @@ class _StaticBindingFlow:
             [ast.AST], _StaticBinding | None
         ] | None = None,
     ) -> _StaticBinding | None:
-        direct = (
+        binding = (
             supplemental_resolver(value)
             if supplemental_resolver is not None
             else None
         )
-        if direct is None:
-            direct = self.direct_resolver(value)
-        if direct is not None:
-            return direct
-        if isinstance(value, ast.NamedExpr):
-            return self.resolve(
+        if binding is None:
+            binding = (
+                self.direct_resolver(self, value)
+                if self.stateful_resolver
+                else self.direct_resolver(value)
+            )
+        if binding is None and isinstance(value, ast.NamedExpr):
+            binding = self.resolve(
                 value.target,
                 supplemental_resolver,
             ) or self.resolve(value.value, supplemental_resolver)
-        if isinstance(value, ast.Name):
-            return self.bindings.get(value.id)
-        if isinstance(value, ast.Attribute):
-            return self.bindings.get(ast.unparse(value))
-        if isinstance(value, ast.IfExp):
-            return self._merge_values([
+        elif binding is None and isinstance(value, ast.Name):
+            binding = self.bindings.get(self.normalize_name(value.id))
+        elif binding is None and isinstance(value, ast.Attribute):
+            binding = self.bindings.get(
+                self.normalize_name(ast.unparse(value))
+            )
+        elif binding is None and isinstance(value, ast.IfExp):
+            binding = self._merge_values([
                 self.resolve(value.body, supplemental_resolver),
                 self.resolve(value.orelse, supplemental_resolver),
             ])
-        return None
+        if binding is not None and self.on_resolve is not None:
+            self.on_resolve(value, binding)
+        return binding
 
     def _merge_values(
         self, values: list[_StaticBinding | None]
@@ -886,7 +905,7 @@ class _StaticBindingFlow:
         ]
         if pairs:
             return {
-                name: binding
+                self.normalize_name(name): binding
                 for name, paired_value in pairs
                 if (
                     binding := self.resolve(
@@ -908,7 +927,7 @@ class _StaticBindingFlow:
             return {}
         unresolved = self.ambiguous(nested)
         return {
-            name: unresolved
+            self.normalize_name(name): unresolved
             for target in targets
             for name in _static_binding_target_names(target)
         }
@@ -921,6 +940,8 @@ class _StaticBindingFlow:
             [ast.AST], _StaticBinding | None
         ] | None = None,
     ) -> None:
+        if value is not None and self.on_resolve is not None:
+            self.replay_expression_bindings(value, supplemental_resolver)
         assigned = (
             self.assignment_bindings(
                 targets,
@@ -931,7 +952,7 @@ class _StaticBindingFlow:
             else {}
         )
         rebound = {
-            name
+            self.normalize_name(name)
             for target in targets
             for name in _static_binding_target_names(target)
         }
@@ -951,6 +972,11 @@ class _StaticBindingFlow:
         flow = self
 
         class NamedExpressionVisitor(ast.NodeVisitor):
+            def generic_visit(self, node: ast.AST) -> None:
+                if isinstance(node, ast.expr):
+                    flow.resolve(node, supplemental_resolver)
+                super().generic_visit(node)
+
             def visit_NamedExpr(self, node: ast.NamedExpr) -> None:  # noqa: N802
                 self.visit(node.value)
                 flow.assign(
@@ -980,7 +1006,7 @@ class _StaticBindingFlow:
 
         branch = self.fork()
         for name in _compound_binding_names(statement, set()):
-            branch.bindings.pop(name, None)
+            branch.bindings.pop(self.normalize_name(name), None)
         return branch
 
     def join(self, branches: list[_StaticBindingFlow]) -> None:
@@ -1003,7 +1029,7 @@ class _StaticBindingFlow:
     ) -> None:
         """Replay a declaration; specialized domains may preserve semantics."""
 
-        self.bindings.pop(statement.name, None)
+        self.bindings.pop(self.normalize_name(statement.name), None)
 
     def replay(
         self,
@@ -1027,6 +1053,13 @@ class _StaticBindingFlow:
                         _bind_static_loop_target(
                             branch,
                             statement,
+                            supplemental_resolver,
+                        )
+                    if isinstance(statement, ast.Match):
+                        _bind_static_match_pattern(
+                            branch,
+                            statement.cases[index].pattern,
+                            statement.subject,
                             supplemental_resolver,
                         )
                     branch.replay(block, supplemental_resolver)
@@ -1071,7 +1104,7 @@ def _bind_static_loop_target(
         return
     target_names = _assignment_target_names(statement.target)
     for name in target_names:
-        flow.bindings.pop(name, None)
+        flow.bindings.pop(flow.normalize_name(name), None)
     if not isinstance(statement.iter, (ast.List, ast.Tuple, ast.Set)):
         return
     candidates = [
@@ -1088,6 +1121,68 @@ def _bind_static_loop_target(
         and all(candidate == candidates[0] for candidate in candidates[1:])
     ):
         flow.bindings.update(candidates[0])
+
+
+def _bind_static_match_pattern(
+    flow: _StaticBindingFlow,
+    pattern: ast.pattern,
+    subject: ast.AST,
+    supplemental_resolver: Callable[
+        [ast.AST], _StaticBinding | None
+    ] | None = None,
+) -> None:
+    """Bind exact structural-pattern captures through the shared lattice."""
+
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.name is not None:
+            flow.assign(
+                [ast.Name(id=pattern.name, ctx=ast.Store())],
+                subject,
+                supplemental_resolver,
+            )
+        if pattern.pattern is not None:
+            _bind_static_match_pattern(
+                flow, pattern.pattern, subject, supplemental_resolver
+            )
+        return
+    if isinstance(pattern, ast.MatchMapping):
+        for key, child in zip(pattern.keys, pattern.patterns):
+            selected = ast.Subscript(
+                value=subject,
+                slice=key,
+                ctx=ast.Load(),
+            )
+            _bind_static_match_pattern(
+                flow, child, selected, supplemental_resolver
+            )
+        if pattern.rest is not None:
+            flow.assign(
+                [ast.Name(id=pattern.rest, ctx=ast.Store())],
+                subject,
+                supplemental_resolver,
+            )
+        return
+    if isinstance(pattern, ast.MatchSequence):
+        for index, child in enumerate(pattern.patterns):
+            selected = ast.Subscript(
+                value=subject,
+                slice=ast.Constant(value=index),
+                ctx=ast.Load(),
+            )
+            _bind_static_match_pattern(
+                flow, child, selected, supplemental_resolver
+            )
+        return
+    if isinstance(pattern, ast.MatchClass):
+        for attribute, child in zip(pattern.kwd_attrs, pattern.kwd_patterns):
+            selected = ast.Attribute(
+                value=subject,
+                attr=attribute,
+                ctx=ast.Load(),
+            )
+            _bind_static_match_pattern(
+                flow, child, selected, supplemental_resolver
+            )
 
 
 def _unique_module_functions(
@@ -8166,6 +8261,10 @@ _CROSS_AGENT_LIFECYCLE_ACTIONS = frozenset(
         "withdraw",
     }
 )
+_KESTREL_CLI_LIFECYCLE_ACTIONS = _CROSS_AGENT_LIFECYCLE_ACTIONS | {
+    "create",
+    "update",
+}
 
 
 _CROSS_AGENT_TARGETED_CONTROL_ACTIONS = frozenset(
@@ -8946,7 +9045,15 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
     provenance when code tries to use it as an authority decision.
     """
 
+    if getattr(node, "_authority_verified_attribution", False):
+        return False
+    if getattr(node, "_authority_unverified_attribution", False):
+        return True
     for child in ast.walk(node):
+        if getattr(child, "_authority_verified_attribution", False):
+            continue
+        if getattr(child, "_authority_unverified_attribution", False):
+            return True
         receiver: ast.AST | None = None
         key: str | None = None
         if isinstance(child, ast.Subscript):
@@ -8978,97 +9085,391 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
     return False
 
 
-def _unverified_attribution_aliases(
-    function: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> set[str]:
-    """Track local aliases of caller-supplied attribution claims only."""
+_ATTRIBUTION_UNTRUSTED_MAPPING = ("identity", "untrusted-mapping")
+_ATTRIBUTION_UNTRUSTED_CLAIM = ("identity", "untrusted-claim")
+_ATTRIBUTION_VERIFIED_MAPPING = ("identity", "verified-mapping")
+_ATTRIBUTION_VERIFIED_VALUE = ("identity", "verified-value")
+_ATTRIBUTION_VALIDATOR = ("identity", "validator")
+_ATTRIBUTION_UNKNOWN = ("identity", "unknown")
 
-    assignments: list[tuple[set[str], ast.AST]] = []
-    for node in _walk_lexical_scope(function):
-        targets: list[ast.AST] = []
-        value: ast.AST | None = None
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-            value = node.value
-        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
-            targets = [node.target]
-            value = node.value
-        if value is not None:
-            assignments.append(
-                (
-                    {
-                        name
-                        for target in targets
-                        for name in _binding_target_names(target)
-                    },
-                    value,
-                )
-            )
+_TRUSTED_ATTRIBUTION_VALIDATOR_IMPORTS = {
+    "kestrel_sovereign.a2a.envelope_signing": {"verify_inbound_envelope"},
+}
+_TRUSTED_ATTRIBUTION_VALIDATOR_MEMBERS = {
+    "a2a_sender_identity_witness",
+    "authorize_a2a_legacy_unsigned_sender",
+}
+
+
+def _trusted_attribution_validator_aliases(tree: ast.AST) -> set[str]:
+    """Return bindings proven to import the canonical envelope verifier."""
 
     aliases: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for targets, value in assignments:
-            while isinstance(value, (ast.Await, ast.Expr)):
-                value = value.value
-            direct_claim = _is_unverified_attribution_metadata_lookup(value)
-            validates_claim = any(
-                isinstance(child, ast.Call)
-                and _is_attribution_validation_call(child, aliases)
-                for child in ast.walk(value)
-            )
-            transformed_claim = bool(
-                _identifier_tokens(value).intersection(aliases)
-            ) and not validates_claim and (
-                isinstance(
-                    value,
-                    (
-                        ast.BinOp,
-                        ast.BoolOp,
-                        ast.Compare,
-                        ast.IfExp,
-                        ast.Name,
-                        ast.Subscript,
-                        ast.UnaryOp,
-                    ),
-                )
-                or isinstance(value, ast.Call)
-                and _is_provenance_transform_call(value)
-            )
-            if (direct_claim and not validates_claim) or transformed_claim:
-                new_aliases = targets - aliases
-                if new_aliases:
-                    aliases.update(new_aliases)
-                    changed = True
+    nodes: list[ast.AST] = (
+        list(tree.body)
+        if isinstance(tree, ast.Module)
+        else _walk_lexical_scope(tree)
+    )
+    for node in nodes:
+        if not isinstance(node, ast.ImportFrom) or node.module is None:
+            continue
+        trusted = _TRUSTED_ATTRIBUTION_VALIDATOR_IMPORTS.get(node.module, set())
+        aliases.update(
+            (imported.asname or imported.name).casefold()
+            for imported in node.names
+            if imported.name in trusted
+        )
     return aliases
+
+
+def _attribution_projection_helpers(
+    functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
+) -> set[str]:
+    """Return local helpers that extract an identity field from a parameter."""
+
+    helpers: set[str] = set()
+    for function in functions:
+        aliases = {
+            parameter.arg.casefold()
+            for parameter in [
+                *function.args.posonlyargs,
+                *function.args.args,
+                *function.args.kwonlyargs,
+            ]
+        }
+        strings: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            for node in _walk_lexical_scope(function):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                )
+                value = node.value
+                if value is None:
+                    continue
+                resolved = _resolved_string(value, strings)
+                for target in targets:
+                    for name in _assignment_target_names(target):
+                        normalized = name.casefold()
+                        if resolved is not None:
+                            current = strings.get(normalized)
+                            if current is None:
+                                strings[normalized] = resolved
+                                changed = True
+                            elif current not in {
+                                resolved,
+                                "<ambiguous>",
+                            }:
+                                strings[normalized] = "<ambiguous>"
+                                changed = True
+                        if (
+                            _identifier_tokens(value).intersection(aliases)
+                            and normalized not in aliases
+                        ):
+                            aliases.add(normalized)
+                            changed = True
+
+        for returned in (
+            node.value
+            for node in _walk_lexical_scope(function)
+            if isinstance(node, ast.Return) and node.value is not None
+        ):
+            for child in ast.walk(returned):
+                receiver: ast.AST | None = None
+                key: str | None = None
+                if isinstance(child, ast.Subscript):
+                    receiver = child.value
+                    key = _resolved_string(child.slice, strings)
+                elif (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr.casefold() in {"get", "pop", "setdefault"}
+                    and child.args
+                ):
+                    receiver = child.func.value
+                    key = _resolved_string(child.args[0], strings)
+                if (
+                    receiver is not None
+                    and key is not None
+                    and key.casefold() in UNVERIFIED_ATTRIBUTION_METADATA_KEYS
+                    and _identifier_tokens(receiver).intersection(aliases)
+                ):
+                    helpers.add(function.name.casefold())
+                    break
+            if function.name.casefold() in helpers:
+                break
+    return helpers
+
+
+def _unverified_attribution_aliases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    trusted_validator_aliases: set[str] | None = None,
+    string_constants: dict[str, str] | None = None,
+    parameter_return_flows: dict[str, _ParameterReturnFlow] | None = None,
+    projection_helpers: set[str] | None = None,
+) -> set[str]:
+    """Track untrusted and verified identity in the shared binding lattice."""
+
+    static_strings = {
+        name: ("static-string", value)
+        for name, value in (string_constants or {}).items()
+    }
+    positional_parameters = [
+        *function.args.posonlyargs,
+        *function.args.args,
+    ]
+    for parameter, default in [
+        *zip(
+            positional_parameters[-len(function.args.defaults) :],
+            function.args.defaults,
+        ),
+        *(
+            (parameter, default)
+            for parameter, default in zip(
+                function.args.kwonlyargs,
+                function.args.kw_defaults,
+            )
+            if default is not None
+        ),
+    ]:
+        resolved = _resolved_string(default, string_constants or {})
+        if resolved is not None:
+            static_strings[parameter.arg] = ("static-string", resolved)
+
+    def static_string_direct(value: ast.AST) -> _StaticBinding | None:
+        resolved = _resolved_string(value)
+        return ("static-string", resolved) if resolved is not None else None
+
+    def annotate_static_string(
+        value: ast.AST, binding: _StaticBinding
+    ) -> None:
+        if binding[0] == "static-string" and binding[1] != "<ambiguous>":
+            setattr(value, "_authority_static_string", binding[1])
+
+    string_flow = _StaticBindingFlow(
+        static_string_direct,
+        lambda bindings: (
+            bindings[0]
+            if bindings and all(binding == bindings[0] for binding in bindings[1:])
+            else ("static-string", "<ambiguous>")
+        ),
+        static_strings,
+        normalize_name=str.casefold,
+        on_resolve=annotate_static_string,
+    )
+    string_flow.replay(function.body)
+
+    def resolved_key(value: ast.AST) -> str | None:
+        return _resolved_string(value) or getattr(
+            value, "_authority_static_string", None
+        )
+
+    untrusted = {
+        _ATTRIBUTION_UNTRUSTED_MAPPING,
+        _ATTRIBUTION_UNTRUSTED_CLAIM,
+    }
+    verified = {
+        _ATTRIBUTION_VERIFIED_MAPPING,
+        _ATTRIBUTION_VERIFIED_VALUE,
+    }
+    initial: dict[str, _StaticBinding] = dict.fromkeys(
+        trusted_validator_aliases or set(), _ATTRIBUTION_VALIDATOR
+    )
+    initial.update({
+        parameter.arg: _ATTRIBUTION_UNTRUSTED_MAPPING
+        for parameter in [
+            *function.args.posonlyargs,
+            *function.args.args,
+            *function.args.kwonlyargs,
+        ]
+        if parameter.arg.casefold() == "metadata"
+    })
+    def lookup_binding(
+        flow: _StaticBindingFlow, value: ast.AST
+    ) -> _StaticBinding | None:
+        if isinstance(value, ast.Subscript):
+            receiver = value.value
+            field = resolved_key(value.slice)
+            if field is None:
+                return None
+        else:
+            member = _static_member_reference(value)
+            if member is None:
+                return None
+            receiver, field = member
+        field = field.casefold()
+        if field == "metadata":
+            return _ATTRIBUTION_UNTRUSTED_MAPPING
+        receiver_binding = flow.resolve(receiver)
+        if field in UNVERIFIED_ATTRIBUTION_METADATA_KEYS:
+            if receiver_binding in untrusted:
+                return _ATTRIBUTION_UNTRUSTED_CLAIM
+            if receiver_binding in verified:
+                return _ATTRIBUTION_VERIFIED_VALUE
+        if (
+            field in _TRUSTED_ATTRIBUTION_VALIDATOR_MEMBERS
+            and any(
+                token in {"manager", "agent_manager"}
+                or token.endswith(".manager")
+                for token in _identifier_tokens(receiver)
+            )
+        ):
+            return _ATTRIBUTION_VALIDATOR
+        return None
+
+    def direct(
+        flow: _StaticBindingFlow, value: ast.AST
+    ) -> _StaticBinding | None:
+        while isinstance(value, (ast.Await, ast.Expr)):
+            value = value.value
+        member_binding = lookup_binding(flow, value)
+        if member_binding is not None:
+            return member_binding
+        if isinstance(value, ast.Call):
+            callable_binding = flow.resolve(value.func)
+            if callable_binding == _ATTRIBUTION_VALIDATOR:
+                return _ATTRIBUTION_VERIFIED_VALUE
+            parameter_flow = (parameter_return_flows or {}).get(
+                _call_name(value).casefold()
+            )
+            if parameter_flow is not None:
+                returned = [
+                    flow.resolve(argument)
+                    for argument in _bound_parameter_flow_arguments(
+                        value, parameter_flow
+                    )
+                ]
+                if _ATTRIBUTION_UNTRUSTED_CLAIM in returned:
+                    return _ATTRIBUTION_UNTRUSTED_CLAIM
+                if _ATTRIBUTION_UNTRUSTED_MAPPING in returned:
+                    if _call_name(value).casefold() in (
+                        projection_helpers or set()
+                    ):
+                        return _ATTRIBUTION_UNTRUSTED_CLAIM
+                    return _ATTRIBUTION_UNTRUSTED_MAPPING
+                if returned and all(binding in verified for binding in returned):
+                    return _ATTRIBUTION_VERIFIED_VALUE
+            if isinstance(value.func, ast.Attribute):
+                receiver_binding = flow.resolve(value.func.value)
+                if (
+                    value.func.attr.casefold() in {"get", "pop", "setdefault"}
+                    and value.args
+                    and (key := resolved_key(value.args[0])) is not None
+                    and key.casefold() in UNVERIFIED_ATTRIBUTION_METADATA_KEYS
+                ):
+                    if receiver_binding in untrusted:
+                        return _ATTRIBUTION_UNTRUSTED_CLAIM
+                    if receiver_binding in verified:
+                        return _ATTRIBUTION_VERIFIED_VALUE
+                if value.func.attr.casefold() == "copy":
+                    if receiver_binding == _ATTRIBUTION_UNTRUSTED_MAPPING:
+                        return receiver_binding
+                    if receiver_binding == _ATTRIBUTION_VERIFIED_MAPPING:
+                        return receiver_binding
+            supplied = [
+                flow.resolve(argument)
+                for argument in [
+                    *value.args,
+                    *(keyword.value for keyword in value.keywords),
+                ]
+            ]
+            # An opaque consumer of the entire metadata mapping does not, by
+            # itself, turn its result into a claimed sender identity.  Only a
+            # value already extracted as an identity claim propagates through
+            # an unknown call; parameter-return flow above handles proven
+            # passthrough helpers.
+            if _ATTRIBUTION_UNTRUSTED_CLAIM in supplied:
+                return _ATTRIBUTION_UNTRUSTED_CLAIM
+            if (
+                _is_provenance_transform_call(value)
+                and any(binding in verified for binding in supplied)
+            ):
+                return _ATTRIBUTION_VERIFIED_VALUE
+        if isinstance(value, ast.Dict):
+            identity_entries = [
+                flow.resolve(item)
+                for key, item in zip(value.keys, value.values)
+                if key is not None
+                and (resolved := resolved_key(key)) is not None
+                and resolved.casefold() in UNVERIFIED_ATTRIBUTION_METADATA_KEYS
+            ]
+            if any(binding in untrusted for binding in identity_entries):
+                return _ATTRIBUTION_UNTRUSTED_MAPPING
+            if identity_entries and all(
+                binding in verified for binding in identity_entries
+            ):
+                return _ATTRIBUTION_VERIFIED_MAPPING
+        if isinstance(
+            value,
+            (
+                ast.BinOp,
+                ast.BoolOp,
+                ast.Compare,
+                ast.List,
+                ast.Set,
+                ast.Tuple,
+                ast.UnaryOp,
+            ),
+        ):
+            nested = [flow.resolve(child) for child in ast.iter_child_nodes(value)]
+            if _ATTRIBUTION_UNTRUSTED_CLAIM in nested:
+                return _ATTRIBUTION_UNTRUSTED_CLAIM
+            if nested and all(binding in verified for binding in nested):
+                return _ATTRIBUTION_VERIFIED_VALUE
+        return None
+
+    def ambiguous(bindings: list[_StaticBinding]) -> _StaticBinding:
+        if _ATTRIBUTION_UNTRUSTED_CLAIM in bindings:
+            return _ATTRIBUTION_UNTRUSTED_CLAIM
+        # Preserve the distinction between an entire caller-controlled
+        # metadata container and an extracted identity claim across branches.
+        # Promoting the container to a claim taints every unrelated field and
+        # every helper that consumes metadata.
+        if _ATTRIBUTION_UNTRUSTED_MAPPING in bindings:
+            return _ATTRIBUTION_UNTRUSTED_MAPPING
+        if bindings and all(binding == bindings[0] for binding in bindings[1:]):
+            return bindings[0]
+        # Mixed or partially-bound validators are not proof of identity.
+        return _ATTRIBUTION_UNKNOWN
+
+    def annotate(value: ast.AST, binding: _StaticBinding) -> None:
+        if binding == _ATTRIBUTION_UNTRUSTED_CLAIM:
+            setattr(value, "_authority_unverified_attribution", True)
+        elif binding == _ATTRIBUTION_VERIFIED_VALUE:
+            setattr(value, "_authority_verified_attribution", True)
+        elif binding == _ATTRIBUTION_VALIDATOR:
+            setattr(value, "_authority_attribution_validator", True)
+
+    identity_flow = _StaticBindingFlow(
+        direct,
+        ambiguous,
+        initial,
+        normalize_name=str.casefold,
+        on_resolve=annotate,
+        stateful_resolver=True,
+    )
+    identity_flow.replay(function.body)
+    return {
+        name
+        for name, binding in identity_flow.bindings.items()
+        if binding == _ATTRIBUTION_UNTRUSTED_CLAIM
+    }
 
 
 def _is_attribution_validation_call(
     call: ast.Call,
     attribution_aliases: set[str] | None = None,
 ) -> bool:
-    """Return trusted verification operations that consume an untrusted claim."""
+    """Return only calls resolved to an audited identity-verification seam."""
 
-    call_name = _call_name(call).casefold()
-    words = set(call_name.replace(".", "_").split("_"))
-    witness_or_verifier = bool(
-        words.intersection({"attest", "authenticate", "verify", "witness"})
-        and words.intersection({"a2a", "identity", "sender"})
-    )
-    authorization_of_claim = "authorize" in words and any(
-        _is_unverified_attribution_metadata_lookup(argument)
-        or bool(
-            _identifier_tokens(argument).intersection(
-                attribution_aliases or set()
-            )
-        )
-        for argument in [
-            *call.args,
-            *(keyword.value for keyword in call.keywords),
-        ]
-    )
-    return witness_or_verifier or authorization_of_claim
+    del attribution_aliases
+    return bool(getattr(call, "_authority_verified_attribution", False))
 
 
 def _has_provenance_token(
@@ -9116,15 +9517,13 @@ def _has_provenance_token(
     invoked_accessor_names = {
         ast.unparse(child.func).casefold()
         for child in ast.walk(node)
-        if isinstance(node, ast.Call)
-        and isinstance(child, ast.Call)
+        if isinstance(child, ast.Call)
         and _is_provenance_accessor_reference(child.func)
     }
     referenced_accessor_names = {
         ast.unparse(child).casefold()
         for child in ast.walk(node)
-        if isinstance(node, ast.Call)
-        and isinstance(child, (ast.Name, ast.Attribute))
+        if isinstance(child, (ast.Name, ast.Attribute))
         and "provide" in ast.unparse(child).casefold().split("_")
         and _is_provenance_accessor_reference(child)
     }
@@ -9213,6 +9612,30 @@ def _function_provenance_accessor_aliases(
     """Return callable aliases whose invocation reads provenance metadata."""
 
     aliases = set(inherited_aliases or ())
+    positional_parameters = [
+        *function.args.posonlyargs,
+        *function.args.args,
+    ]
+    default_bindings = [
+        *zip(
+            positional_parameters[-len(function.args.defaults) :],
+            function.args.defaults,
+        ),
+        *(
+            (parameter, default)
+            for parameter, default in zip(
+                function.args.kwonlyargs,
+                function.args.kw_defaults,
+            )
+            if default is not None
+        ),
+    ]
+    aliases.update(
+        parameter.arg.casefold()
+        for parameter, default in default_bindings
+        if _is_provenance_accessor_reference(default)
+        or _is_provenance_accessor_getattr_reference(default)
+    )
     bindings: list[tuple[set[str], ast.AST]] = []
     for node in _walk_lexical_scope(function):
         targets: list[ast.AST] = []
@@ -9367,11 +9790,19 @@ def _mutable_container_write(
 
 def _mutable_container_alias_snapshots(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
+    inherited_bindings: set[str] | None = None,
 ) -> dict[ast.AST, frozenset[str]]:
-    """Capture live mutable-container aliases at each individual write."""
+    """Capture live aliases, including shared bindings from outer scopes."""
 
     groups: dict[str, set[str]] = {}
     snapshots: dict[ast.AST, frozenset[str]] = {}
+
+    for binding in inherited_bindings or set():
+        root = _state_alias_root(binding)
+        group = groups.setdefault(root, {root})
+        group.add(binding)
+        for member in group:
+            groups[member] = group
 
     def detach(name: str) -> None:
         group = groups.pop(name, None)
@@ -9383,15 +9814,14 @@ def _mutable_container_alias_snapshots(
             detach(target_name)
         if not target_names:
             return
-        source_group = next(
-            (
-                groups[source_name]
-                for source_name in source_names or set()
-                if source_name in groups
-            ),
-            None,
-        )
-        group = source_group if source_group is not None else set()
+        source_groups = [
+            groups[source_name]
+            for source_name in source_names or set()
+            if source_name in groups
+        ]
+        group = set(source_names or set())
+        for source_group in source_groups:
+            group.update(source_group)
         group.update(target_names)
         for member in group:
             groups[member] = group
@@ -9434,9 +9864,15 @@ def _mutable_container_alias_snapshots(
                 and _call_name(value).casefold()
                 in {"defaultdict", "deque", "dict", "list", "set"}
             )
-            if creates_container or any(
+            # Python reference assignment aliases a mutable object only after
+            # this analysis has evidence that the source is a tracked
+            # container. Outer shared bindings are seeded above, so module,
+            # class, and closure aliases participate without treating every
+            # ordinary object assignment as a container alias.
+            aliases_tracked_container = any(
                 source_name in groups for source_name in source_names
-            ):
+            )
+            if creates_container or aliases_tracked_container:
                 bind(target_names, source_names)
             else:
                 for target_name in target_names:
@@ -10141,17 +10577,17 @@ def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
         normalized = [word.strip("'\"") for word in words]
         executable = executable_name(normalized[0])
         operation_index = 1
-        if executable == "uv" and len(normalized) >= 4:
-            if normalized[1].casefold() != "run":
+        # Launchers compose (``uv run python -m ...``), so consume them as a
+        # grammar instead of making their alternatives mutually exclusive.
+        if executable == "uv":
+            if len(normalized) < 3 or normalized[1].casefold() != "run":
                 return False
-            executable = executable_name(normalized[2])
-            operation_index = 3
-        elif (
-            executable == "py"
-            or executable.startswith("python")
-        ) and len(normalized) >= 4:
+            normalized = normalized[2:]
+            executable = executable_name(normalized[0])
+        if executable == "py" or executable.startswith("python"):
             if (
-                normalized[1] != "-m"
+                len(normalized) < 4
+                or normalized[1] != "-m"
                 or normalized[2].casefold() != "kestrel_sovereign.cli"
             ):
                 return False
@@ -10160,9 +10596,8 @@ def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
         return (
             executable == "kestrel"
             and len(normalized) > operation_index
-            and _is_cross_agent_lifecycle_action(
-                executable_name(normalized[operation_index])
-            )
+            and executable_name(normalized[operation_index])
+            in _KESTREL_CLI_LIFECYCLE_ACTIONS
         )
 
     def literal_tokens(node: ast.AST) -> list[str]:
@@ -10174,11 +10609,18 @@ def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
         ]
 
     if isinstance(command, (ast.List, ast.Tuple)):
-        words = [
-            resolved
-            for element in command.elts
-            if (resolved := _resolved_string(element)) is not None
-        ]
+        words: list[str] = []
+        for element in command.elts:
+            resolved = _resolved_string(element)
+            if resolved is None and (
+                isinstance(element, ast.Attribute)
+                and isinstance(element.value, ast.Name)
+                and element.value.id == "sys"
+                and element.attr == "executable"
+            ):
+                resolved = "python"
+            if resolved is not None:
+                words.append(resolved)
         if len(words) == len(command.elts) and denotes_lifecycle(words):
             return True
         return denotes_lifecycle(literal_tokens(command))
@@ -10219,53 +10661,40 @@ def _annotate_shell_lifecycle_command_aliases(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     inherited_aliases: set[str] | None = None,
 ) -> set[str]:
-    """Propagate lifecycle command values through one lexical scope."""
+    """Propagate and kill lifecycle values with the shared binding lattice."""
 
-    assignments: list[tuple[set[str], ast.AST]] = []
     local_bindings = _scope_local_binding_names(function)
-    aliases = {
+    inherited = {
         alias
         for alias in inherited_aliases or set()
         if _state_alias_root(alias) not in local_bindings
     }
-    for node in _walk_lexical_scope(function):
-        targets: list[ast.AST] = []
-        value: ast.AST | None = None
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-            value = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        elif isinstance(node, ast.NamedExpr):
-            targets = [node.target]
-            value = node.value
-        if value is None:
-            continue
-        target_names = {
-            name
-            for target in targets
-            for name in _reference_binding_names(target)
-        }
-        assignments.append((target_names, value))
+    lifecycle = ("command-effect", "kestrel-lifecycle")
+    def direct(
+        current: _StaticBindingFlow, value: ast.AST
+    ) -> _StaticBinding | None:
         if _is_kestrel_lifecycle_command(value):
-            aliases.update(target_names)
+            return lifecycle
+        if isinstance(value, ast.Attribute):
+            return current.bindings.get(value.attr.casefold())
+        return None
 
-    changed = True
-    while changed:
-        changed = False
-        for target_names, value in assignments:
-            if not _identifier_tokens(value).intersection(aliases):
-                continue
-            new_aliases = target_names - aliases
-            if new_aliases:
-                aliases.update(new_aliases)
-                changed = True
+    def annotate(value: ast.AST, binding: _StaticBinding) -> None:
+        if binding == lifecycle:
+            setattr(value, "_authority_shell_lifecycle", True)
 
-    for node in _walk_lexical_scope(function):
-        if _identifier_tokens(node).intersection(aliases):
-            setattr(node, "_authority_shell_lifecycle", True)
-    return aliases
+    flow = _StaticBindingFlow(
+        direct,
+        lambda bindings: lifecycle,
+        dict.fromkeys(inherited, lifecycle),
+        normalize_name=str.casefold,
+        on_resolve=annotate,
+        stateful_resolver=True,
+    )
+    flow.replay(function.body)
+    return {
+        name for name, binding in flow.bindings.items() if binding == lifecycle
+    }
 
 
 def _is_unambiguous_control_token(token: str) -> bool:
@@ -10375,6 +10804,7 @@ def _provenance_aliases(
     control_parameter_return_flows: dict[
         str, _ParameterReturnFlow
     ] | None = None,
+    shared_state_bindings: set[str] | None = None,
 ) -> tuple[set[str], set[str]]:
     """Resolve provenance aliases and provenance-selected control arguments."""
 
@@ -10417,9 +10847,7 @@ def _provenance_aliases(
                 ast.Dict,
             ),
         ):
-            return _is_provenance_accessor_reference(
-                value
-            ) or _has_provenance_token(
+            return _has_provenance_token(
                 value,
                 aliases,
                 include_unverified_attribution=False,
@@ -10581,7 +11009,10 @@ def _provenance_aliases(
         else set()
     )
     assignments: list[tuple[set[str], ast.AST, ast.AST]] = []
-    container_aliases = _mutable_container_alias_snapshots(function)
+    container_aliases = _mutable_container_alias_snapshots(
+        function,
+        set(shared_state_bindings or ()),
+    )
     callable_alias_edges = _scope_callable_alias_edges(function)
 
     def expand_container_aliases(
@@ -11020,6 +11451,50 @@ def _class_provenance_state_aliases(
             for statement in class_node.body
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
+        class_name = class_node.name.casefold()
+
+        def is_container_creation(value: ast.AST | None) -> bool:
+            return isinstance(value, (ast.Dict, ast.List, ast.Set)) or (
+                isinstance(value, ast.Call)
+                and _call_name(value).casefold()
+                in {"defaultdict", "deque", "dict", "list", "set"}
+            )
+
+        mutable_members: set[str] = set()
+        declaration_nodes: list[ast.AST] = [
+            *class_node.body,
+            *(node for method in methods for node in _walk_lexical_scope(method)),
+        ]
+        for declaration in declaration_nodes:
+            if isinstance(declaration, ast.Assign):
+                targets = declaration.targets
+                value = declaration.value
+            elif isinstance(declaration, ast.AnnAssign):
+                targets = [declaration.target]
+                value = declaration.value
+            else:
+                continue
+            if not is_container_creation(value):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name) and declaration in class_node.body:
+                    member = target.id.casefold()
+                elif (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in {"self", "cls", class_node.name}
+                ):
+                    member = target.attr.casefold()
+                else:
+                    continue
+                mutable_members.update(
+                    {
+                        member,
+                        f"self.{member}",
+                        f"cls.{member}",
+                        f"{class_name}.{member}",
+                    }
+                )
         shared: set[str] = set()
         changed = True
         while changed:
@@ -11031,7 +11506,9 @@ def _class_provenance_state_aliases(
                         method, ()
                     )
                 )
-                container_aliases = _mutable_container_alias_snapshots(method)
+                container_aliases = _mutable_container_alias_snapshots(
+                    method, mutable_members
+                )
                 method_changed = True
                 while method_changed:
                     method_changed = False
@@ -11087,7 +11564,6 @@ def _class_provenance_state_aliases(
                                 aliases,
                                 include_unverified_attribution=False,
                             )
-                            or _is_provenance_accessor_reference(value)
                             or _is_provenance_accessor_call(value)
                             or calls_helper
                             or tokens.intersection(aliases)
@@ -11097,6 +11573,9 @@ def _class_provenance_state_aliases(
                             name
                             for target in targets
                             for name in _binding_target_names(target)
+                        )
+                        target_names.update(
+                            container_aliases.get(statement, ())
                         )
                         new_targets = target_names - aliases
                         if new_targets:
@@ -14125,6 +14604,33 @@ def _module_shared_binding_names(tree: ast.AST) -> set[str]:
     return _scope_local_binding_names(scope)
 
 
+def _scope_mutable_container_bindings(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    """Resolve bindings proven to hold a mutable container in one scope."""
+
+    container = ("object-kind", "mutable-container")
+
+    def direct(value: ast.AST) -> _StaticBinding | None:
+        if isinstance(value, (ast.Dict, ast.List, ast.Set)) or (
+            isinstance(value, ast.Call)
+            and _call_name(value).casefold()
+            in {"defaultdict", "deque", "dict", "list", "set"}
+        ):
+            return container
+        return None
+
+    flow = _StaticBindingFlow(
+        direct,
+        lambda bindings: container,
+        normalize_name=str.casefold,
+    )
+    flow.replay(function.body)
+    return {
+        name for name, binding in flow.bindings.items() if binding == container
+    }
+
+
 def _lexical_provenance_state_aliases(
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef],
     function_parents: dict[
@@ -14171,6 +14677,11 @@ def _lexical_provenance_state_aliases(
                 if binding_owner(function, root) is ancestor:
                     captured_cells.add((ancestor, root))
             ancestor = function_parents.get(ancestor)
+    mutable_cells = {
+        (owner, root)
+        for owner, root in captured_cells
+        if root in _scope_mutable_container_bindings(owner)
+    }
 
     shared_by_owner: dict[
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
@@ -14208,6 +14719,12 @@ def _lexical_provenance_state_aliases(
                 provenance_accessor_aliases=function_accessor_aliases.get(
                     function, set()
                 ),
+                shared_state_bindings={
+                    root
+                    for owner, root in mutable_cells
+                    if function is owner
+                    or binding_owner(function, root) is owner
+                },
             )
             for alias in resolved:
                 root = _state_alias_root(alias)
@@ -14243,6 +14760,7 @@ def _module_provenance_state_aliases(
         ast.FunctionDef | ast.AsyncFunctionDef, set[str]
     ] | None = None,
     module_shared_bindings: set[str] | None = None,
+    module_mutable_bindings: set[str] | None = None,
 ) -> set[str]:
     """Share provenance stored through module bindings and mutable objects."""
 
@@ -14300,6 +14818,7 @@ def _module_provenance_state_aliases(
                 provenance_accessor_aliases=function_accessor_aliases.get(
                     function, set()
                 ),
+                shared_state_bindings=set(module_mutable_bindings or ()),
             )
             function_aliases[function] = resolved
             return resolved
@@ -16172,6 +16691,32 @@ def _authority_provenance_lines(
     executable_scopes = _executable_body_functions(tree)
     functions = [*real_functions, *executable_scopes]
     function_parents = _nested_function_parents(tree)
+    module_attribution_validators = _trusted_attribution_validator_aliases(tree)
+    function_attribution_validators: dict[
+        ast.FunctionDef | ast.AsyncFunctionDef, set[str]
+    ] = {}
+
+    def attribution_validators_for(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        cached = function_attribution_validators.get(function)
+        if cached is not None:
+            return cached
+        parent = function_parents.get(function)
+        inherited = (
+            attribution_validators_for(parent)
+            if parent is not None
+            else module_attribution_validators
+        )
+        local_bindings = _scope_local_binding_names(function)
+        resolved = {
+            alias
+            for alias in inherited
+            if _state_alias_root(alias) not in local_bindings
+        } | _trusted_attribution_validator_aliases(function)
+        function_attribution_validators[function] = resolved
+        return resolved
+
     module_shell_aliases: set[str] = set()
     class_shell_aliases: dict[ast.ClassDef, set[str]] = {}
     if isinstance(tree, ast.Module) and executable_scopes:
@@ -16181,10 +16726,20 @@ def _authority_provenance_lines(
         class_nodes = [
             node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
         ]
+        classes_by_name = {
+            class_node.name.casefold(): class_node for class_node in class_nodes
+        }
         for class_node, scope in zip(class_nodes, executable_scopes[1:]):
+            inherited_class_aliases = {
+                alias
+                for base in class_node.bases
+                for token in _identifier_tokens(base)
+                if (base_class := classes_by_name.get(token)) is not None
+                for alias in class_shell_aliases.get(base_class, set())
+            }
             class_shell_aliases[class_node] = (
                 _annotate_shell_lifecycle_command_aliases(
-                    scope, module_shell_aliases
+                    scope, module_shell_aliases | inherited_class_aliases
                 )
             )
     function_class_owners = _function_class_owners(tree)
@@ -16270,12 +16825,36 @@ def _authority_provenance_lines(
         )
         for function in functions
     }
+    attribution_projection_helpers = _attribution_projection_helpers(
+        functions
+    )
+    function_attribution_aliases = {
+        function: _unverified_attribution_aliases(
+            function,
+            trusted_validator_aliases=attribution_validators_for(function),
+            string_constants=(
+                _module_strings_at_definition(tree, function, source_path)
+                if isinstance(tree, ast.Module)
+                else {}
+            ),
+            parameter_return_flows=(
+                function_control_parameter_return_flows[function]
+            ),
+            projection_helpers=attribution_projection_helpers,
+        )
+        for function in functions
+    }
     module_provenance_aliases = (
         _module_provenance_constant_aliases(tree, source_path)
         | _module_imported_provenance_annotation_aliases(tree)
         | _module_imported_provenance_accessor_aliases(tree)
     )
     module_shared_bindings = _module_shared_binding_names(tree)
+    module_mutable_bindings = (
+        _scope_mutable_container_bindings(executable_scopes[0])
+        if isinstance(tree, ast.Module) and executable_scopes
+        else set()
+    )
     imported_provenance_helpers = (
         _module_imported_provenance_return_helper_aliases(tree, source_path)
     )
@@ -16487,6 +17066,7 @@ def _authority_provenance_lines(
             function_accessor_aliases,
             function_imported_provenance_helpers,
             module_shared_bindings,
+            module_mutable_bindings,
         )
         lexical_provenance_aliases = _lexical_provenance_state_aliases(
             functions,
@@ -16632,6 +17212,7 @@ def _authority_provenance_lines(
             function_accessor_aliases,
             function_imported_provenance_helpers,
             module_shared_bindings,
+            module_mutable_bindings,
         )
         lexical_provenance_aliases = _lexical_provenance_state_aliases(
             functions,
@@ -16744,7 +17325,7 @@ def _authority_provenance_lines(
         provenance_aliases, provenance_selected_targets = (
             function_provenance[function]
         )
-        attribution_aliases = _unverified_attribution_aliases(function)
+        attribution_aliases = function_attribution_aliases[function]
         lines.update(
             _provenance_selected_cross_agent_read_lines(
                 function,
@@ -17814,6 +18395,29 @@ def test_provenance_scanner_propagates_state_through_module_globals() -> None:
         "        flags.update({'allowed': bool(request.causation_chain)})\n"
         "    def run(target):\n"
         "        if flags['allowed']:\n"
+        "            target.stop()\n",
+        "FLAGS = {}\n"
+        "def capture(request):\n"
+        "    alias = FLAGS\n"
+        "    alias['ready'] = bool(request.causation_chain)\n\n"
+        "def run(target):\n"
+        "    if FLAGS['ready']:\n"
+        "        target.stop()\n",
+        "def build():\n"
+        "    flags = {}\n"
+        "    def capture(request):\n"
+        "        alias = flags\n"
+        "        alias['ready'] = bool(request.causation_chain)\n"
+        "    def run(target):\n"
+        "        if flags['ready']:\n"
+        "            target.stop()\n",
+        "class Gate:\n"
+        "    flags = {}\n"
+        "    def capture(self, request):\n"
+        "        alias = self.flags\n"
+        "        alias['ready'] = bool(request.causation_chain)\n"
+        "    def run(self, target):\n"
+        "        if self.flags['ready']:\n"
         "            target.stop()\n",
     ),
 )
@@ -19500,7 +20104,11 @@ def test_unverified_attribution_metadata_is_provenance(
 
 def test_verified_sender_principals_are_not_transport_provenance() -> None:
     verified = ast.parse(
-        "def dispatch(sender_verdict, target):\n"
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target):\n"
+        "    sender_verdict = await verify_inbound_envelope(task.metadata)\n"
         "    if sender_verdict.sender:\n"
         "        target.shutdown()\n"
     )
@@ -19522,30 +20130,104 @@ def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
         "        target.shutdown()\n"
     )
     validation = ast.parse(
-        "async def validate(task, target, manager, authorize_legacy):\n"
+        "async def validate(task, target, manager):\n"
         "    claimed = str(task.metadata.get('sender') or '')\n"
-        "    witness = (\n"
-        "        manager.a2a_sender_identity_witness(claimed)\n"
-        "        if manager is not None and claimed\n"
-        "        else None\n"
+        "    authorize_legacy = getattr(\n"
+        "        manager,\n"
+        "        'authorize_a2a_legacy_unsigned_sender',\n"
+        "        None,\n"
         "    )\n"
-        "    if witness:\n"
-        "        target.observe_verified_peer(witness)\n"
         "    authorized = await authorize_legacy(target, claimed)\n"
-        "    return witness, authorized\n"
+        "    if authorized:\n"
+        "        target.shutdown()\n"
     )
     inline_validation = ast.parse(
-        "def dispatch(task, target, verify_a2a_sender_identity):\n"
-        "    verified = verify_a2a_sender_identity(\n"
-        "        task.metadata.get('sender')\n"
-        "    )\n"
-        "    if verified:\n"
+        "from kestrel_sovereign.a2a.envelope_signing import (\n"
+        "    verify_inbound_envelope,\n"
+        ")\n\n"
+        "async def dispatch(task, target):\n"
+        "    verdict = await verify_inbound_envelope(task.metadata)\n"
+        "    if verdict.sender:\n"
+        "        target.shutdown()\n"
+    )
+    manager_witness = ast.parse(
+        "def dispatch(task, target, manager):\n"
+        "    claimed = task.metadata['sender']\n"
+        "    witness = manager.a2a_sender_identity_witness(claimed)\n"
+        "    if witness:\n"
+        "        target.shutdown()\n"
+    )
+    fake_validation = ast.parse(
+        "def dispatch(task, target, verify_sender, authorize_agent, peer):\n"
+        "    claimed = task.metadata['sender']\n"
+        "    if verify_sender(claimed):\n"
+        "        target.shutdown()\n"
+        "    if authorize_agent(claimed):\n"
+        "        target.shutdown()\n"
+        "    if peer.a2a_sender_identity_witness(claimed):\n"
         "        target.shutdown()\n"
     )
 
     assert _authority_provenance_lines(guarded) == {3}
     assert _authority_provenance_lines(validation) == set()
     assert _authority_provenance_lines(inline_validation) == set()
+    assert _authority_provenance_lines(manager_witness) == set()
+    assert _authority_provenance_lines(fake_validation) == {3, 5, 7}
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "def dispatch(task, target):\n"
+        "    attrs = task.metadata\n"
+        "    claimed = attrs['sender']\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n",
+        "SENDER_KEY = 'sender'\n\n"
+        "def dispatch(task, target):\n"
+        "    attrs = task.metadata\n"
+        "    claimed = attrs[SENDER_KEY]\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n",
+        "def dispatch(task, target, sender_key='sender'):\n"
+        "    attrs = task.metadata\n"
+        "    claimed = attrs[sender_key]\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n",
+        "def dispatch(task, target):\n"
+        "    sender_key = 'sender'\n"
+        "    attrs = task.metadata\n"
+        "    claimed = attrs[sender_key]\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n",
+        "def dispatch(task, target):\n"
+        "    match task.metadata:\n"
+        "        case {'sender': claimed}:\n"
+        "            if claimed:\n"
+        "                target.shutdown()\n",
+    ),
+)
+def test_unverified_attribution_preserves_mapping_and_key_aliases(
+    source: str,
+) -> None:
+    tree = ast.parse(source)
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+def test_unverified_attribution_flows_through_neutral_return_helpers() -> None:
+    tree = ast.parse(
+        "def select(attrs):\n"
+        "    return attrs['sender']\n\n"
+        "def dispatch(task, target):\n"
+        "    claimed = select(task.metadata)\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n"
+    )
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+
+    assert _authority_provenance_lines(tree) == {guard.lineno}
 
 
 def test_cached_a2a_sender_claim_guard_reaches_the_ci_gate(
@@ -19603,6 +20285,12 @@ def test_provenance_scanner_resolves_module_level_metadata_keys(
 
 
 def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -> None:
+    direct_accessor_reference = ast.parse(
+        "def dispatch(request, target):\n"
+        "    provider = request._provide_causation_chain\n"
+        "    if callable(provider):\n"
+        "        target.shutdown()\n"
+    )
     accessor_reference = ast.parse(
         "def dispatch(self):\n"
         "    provider = getattr(self.agent, '_provide_causation_chain', None)\n"
@@ -19636,6 +20324,7 @@ def test_provenance_scanner_does_not_promote_metadata_transport_to_authority() -
         "            await self.manager.close()\n"
     )
 
+    assert _authority_provenance_lines(direct_accessor_reference) == set()
     assert _authority_provenance_lines(accessor_reference) == set()
     assert _authority_provenance_lines(accessor_transport) == set()
     assert _authority_provenance_lines(local_task_plumbing) == set()
@@ -20475,6 +21164,8 @@ def test_shell_lifecycle_recognizes_kestrel_executable_basenames(
     "command",
     (
         "uv run kestrel terminate Bob",
+        "uv run python -m kestrel_sovereign.cli restart Bob",
+        ["uv", "run", "python", "-m", "kestrel_sovereign.cli", "stop", "Bob"],
         "python -m kestrel_sovereign.cli restart Bob",
         [r"C:\\venv\\Scripts\\kestrel.exe", "stop", "Bob"],
     ),
@@ -20486,6 +21177,40 @@ def test_shell_lifecycle_unwraps_supported_cli_launchers(
         "def govern(request):\n"
         "    if request.causation_chain:\n"
         f"        subprocess.run({command!r}, shell=True)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize("operation", ("create", "update"))
+def test_shell_lifecycle_includes_all_cli_state_transitions(operation: str) -> None:
+    tree = ast.parse(
+        "def govern(request):\n"
+        "    if request.causation_chain:\n"
+        f"        subprocess.run('kestrel {operation} Bob', shell=True)\n"
+    )
+
+    assert _authority_provenance_lines(tree) == {2}
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        "subprocess.run([sys.executable, '-m', "
+        "'kestrel_sovereign.cli', 'restart', 'Bob'])",
+        "subprocess.run(['uv', 'run', sys.executable, '-m', "
+        "'kestrel_sovereign.cli', 'stop', 'Bob'])",
+        "asyncio.create_subprocess_exec(sys.executable, '-m', "
+        "'kestrel_sovereign.cli', 'terminate', 'Bob')",
+    ),
+)
+def test_shell_lifecycle_resolves_the_active_python_executable(
+    invocation: str,
+) -> None:
+    tree = ast.parse(
+        "def govern(request):\n"
+        "    if request.causation_chain:\n"
+        f"        {invocation}\n"
     )
 
     assert _authority_provenance_lines(tree) == {2}
@@ -20579,6 +21304,33 @@ def test_shell_lifecycle_command_aliases_inherit_outer_scopes(
     guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
 
     assert _authority_provenance_lines(tree) == {guard.lineno}
+
+
+def test_shell_lifecycle_command_aliases_follow_rebinding_and_inheritance() -> None:
+    reassigned = ast.parse(
+        "COMMAND = 'kestrel restart Bob'\n"
+        "COMMAND = 'echo safe'\n\n"
+        "def govern(request):\n"
+        "    command = 'kestrel stop Bob'\n"
+        "    command = 'echo safe'\n"
+        "    if request.causation_chain:\n"
+        "        subprocess.run(COMMAND, shell=True)\n"
+        "        subprocess.run(command, shell=True)\n"
+    )
+    inherited = ast.parse(
+        "class Base:\n"
+        "    COMMAND = 'kestrel restart Bob'\n\n"
+        "class Child(Base):\n"
+        "    def govern(self, request):\n"
+        "        if request.causation_chain:\n"
+        "            subprocess.run(self.COMMAND, shell=True)\n"
+    )
+    guard = next(
+        node for node in ast.walk(inherited) if isinstance(node, ast.If)
+    )
+
+    assert _authority_provenance_lines(reassigned) == set()
+    assert _authority_provenance_lines(inherited) == {guard.lineno}
 
 
 @pytest.mark.parametrize(
