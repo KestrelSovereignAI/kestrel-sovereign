@@ -770,13 +770,6 @@ export function mountAgentListPane(containerEl, config = {}) {
         let stopError = null;
         try {
             settleLocalStop = config.onPrepareStopAll(loadedItems);
-            const statusAvailable = await refreshStopAllState();
-            if (destroyed || containerEl[AGENT_LIST_STOP_ALL_OPERATION] !== operation) {
-                return;
-            }
-            const freshCount = stopAllStatus.inFlightCount;
-            if (!statusAvailable || (freshCount === 0 && !retryPending)) return;
-
             containerEl[AGENT_LIST_STOP_ALL_RETRY] = operation.correlationId;
             response = await api.stopHost({
                 reason: config.stopAllReason || 'Stopped from the agents banner',
@@ -795,7 +788,8 @@ export function mountAgentListPane(containerEl, config = {}) {
             }
         } catch (error) {
             stopError = error;
-            if (Number.isSafeInteger(error && error.status) && error.status > 0) {
+            if (Number.isSafeInteger(error && error.status)
+                && error.status >= 400 && error.status < 500) {
                 delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
             }
             if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {

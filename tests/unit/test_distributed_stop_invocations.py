@@ -114,11 +114,13 @@ async def test_distributed_protocol_has_sqlite_postgres_parity(db_backend):
         owner_id=owner_id,
         request_generation=1,
     )
+    assert await store.agent_has_unsettled_work(agent_id) is True
     ticket = await store.mark_turn(agent_id, turn_id)
     assert ticket.generation_ids == (generation_id,)
     assert len(await store.remaining(ticket.generation_ids)) == 1
     await store.complete(generation_id, owner_id)
     assert await store.remaining(ticket.generation_ids) == ()
+    assert await store.agent_has_unsettled_work(agent_id) is False
     assert (
         await store.register(
             generation_id=f"retry-{generation_id}",

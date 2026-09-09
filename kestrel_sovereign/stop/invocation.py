@@ -201,6 +201,19 @@ class DistributedInvocationStore:
             (f"kestrel:stop:active-agent:{agent_id}",),
         )
 
+    async def agent_has_unsettled_work(self, agent_id: str) -> bool:
+        """Report whether any replica still owns or preserves this agent's work."""
+
+        agent_id = _required_identity(agent_id, "agent identity")
+        row = await self._db.fetchone(
+            "SELECT generation_id FROM stop_active_invocations "
+            "WHERE agent_id = ? UNION ALL "
+            "SELECT generation_id FROM stop_unresolved_invocations "
+            "WHERE agent_id = ? LIMIT 1",
+            (agent_id, agent_id),
+        )
+        return row is not None
+
     async def register(
         self,
         *,
@@ -1100,6 +1113,11 @@ class DistributedInvocationRegistry:
 
     async def request_agent(self, agent_id: str) -> DistributedStopTicket:
         return await self._store.mark_agent(agent_id)
+
+    async def agent_has_unsettled_work(self, agent_id: str) -> bool:
+        """Expose the durable fleet inventory without marking it for Stop."""
+
+        return await self._store.agent_has_unsettled_work(agent_id)
 
     def cancel_local_ticket(
         self,

@@ -146,6 +146,23 @@ def test_host_stop_status_is_caller_scoped_and_counts_live_agents():
     idle.cancel_current_request.assert_not_called()
 
 
+def test_host_stop_status_counts_work_owned_by_another_replica():
+    remote = _agent("did:test:remote")
+    app, _manager = _app(
+        agents={"Remote": remote},
+        caller=CallerContext.sovereign(identity="sovereign-key"),
+    )
+    registry = MagicMock()
+    registry.agent_has_unsettled_work = AsyncMock(return_value=True)
+    app.state.distributed_invocation_registry = registry
+
+    response = TestClient(app).get("/api/host/stop/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"can_stop": True, "in_flight_count": 1}
+    registry.agent_has_unsettled_work.assert_awaited_once_with("did:test:remote")
+
+
 def test_host_stop_status_denies_control_without_hiding_live_inventory():
     active = _agent("did:test:active", {"turn"})
     app, _manager = _app(

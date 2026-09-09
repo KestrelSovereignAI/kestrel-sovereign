@@ -465,12 +465,13 @@ test('Stop All never calls the host seam when no agent is in flight', async () =
     handle.destroy();
 });
 
-test('a click fences browser work even when the fresh host count reaches zero', async () => {
+test('a click does not abandon accepted Stop intent to a second status read', async () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
     let statusCalls = 0;
     let fenceCalls = 0;
     let stopCalls = 0;
+    let statusCallsAtStop = null;
     const handle = mountAgentListPane(el, {
         adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
         api: {
@@ -478,7 +479,13 @@ test('a click fences browser work even when the fresh host count reaches zero', 
                 can_stop: true,
                 in_flight_count: ++statusCalls === 1 ? 1 : 0,
             }),
-            stopHost: async () => { stopCalls += 1; },
+            stopHost: async (payload) => {
+                statusCallsAtStop = statusCalls;
+                stopCalls += 1;
+                return hostStopEnvelope(payload.correlation_id, [
+                    { agent: 'did:agent:emma', disposition: 'already_complete' },
+                ]);
+            },
         },
         onPrepareStopAll: () => { fenceCalls += 1; return () => {}; },
         confirmStopAll: () => true,
@@ -493,7 +500,9 @@ test('a click fences browser work even when the fresh host count reaches zero', 
 
     handle.destroy();
     assert.equal(fenceCalls, 1, 'the accepted user intent fences local queued work');
-    assert.equal(stopCalls, 0, 'fresh empty host inventory needs no network mutation');
+    assert.equal(statusCallsAtStop, 1,
+        'the accepted action does not depend on a racy second read');
+    assert.equal(stopCalls, 1, 'the host authority resolves the accepted Stop intent');
 });
 
 test('Stop All waits for adapter identity inventory before status or enablement', async () => {
@@ -661,6 +670,49 @@ test('an ambiguous Host Stop retry reuses the browser-owned correlation id', asy
         'retry replays the exact durable Stop identity');
     assert.equal(button.disabled, true, 'recovered evidence clears the retry handle');
     handle.destroy();
+});
+
+test('an ambiguous gateway response retains the browser-owned correlation id', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const operationIds = [];
+    let stopCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async (payload) => {
+                operationIds.push(payload.correlation_id);
+                stopCalls += 1;
+                if (stopCalls === 1) {
+                    const error = new Error('gateway lost the upstream response');
+                    error.status = 504;
+                    throw error;
+                }
+                return hostStopEnvelope(payload.correlation_id, [
+                    { agent: 'did:agent:emma', disposition: 'stopped' },
+                ]);
+            },
+        },
+        onPrepareStopAll: browserStopFence,
+        confirmStopAll: () => true,
+        stopAllStatusIntervalMs: 999999,
+    });
+    await tick();
+    await tick();
+
+    const button = el.querySelector('.agent-stop-all-btn');
+    button.click();
+    await tick();
+    await tick();
+    button.click();
+    await tick();
+    await tick();
+
+    handle.destroy();
+    assert.equal(operationIds.length, 2);
+    assert.equal(operationIds[1], operationIds[0],
+        'an upstream gateway failure is transport-ambiguous, not terminal evidence');
 });
 
 test('a terminal unreceipted response gets a fresh operation identity', async () => {
