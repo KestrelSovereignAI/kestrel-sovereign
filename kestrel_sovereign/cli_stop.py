@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -36,6 +37,8 @@ class _LocalProcessAttestation:
     pid: int
     port: int
     started_at: float
+    bind_host: str
+    connect_host: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,13 @@ class _StopEndpoint:
     api_key: str
     attestation: _LocalProcessAttestation
     expected_agent_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AllStopTarget:
+    endpoint: _StopEndpoint
+    all_agents: bool
+    label: str
 
 
 def _operation_id() -> str:
@@ -81,25 +91,52 @@ def _address_parts(address: object) -> tuple[str, int] | None:
     return host, port
 
 
-def _exclusive_listener_is_owned_by(port: int, pid: int) -> bool:
-    """Fail closed unless every loopback-capable listener names ``pid``."""
+def _connect_host(bind_host: str) -> str:
+    """Select an address accepted by a server's configured bind."""
+
+    bind_host = str(bind_host).strip()
+    if not bind_host:
+        raise ValueError("server bind host must be concrete")
+    if bind_host == "0.0.0.0":
+        return "127.0.0.1"
+    if bind_host == "::":
+        return "::1"
+    return bind_host
+
+
+def _origin(attestation: _LocalProcessAttestation) -> str:
+    host = attestation.connect_host
+    rendered = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{rendered}:{attestation.port}"
+
+
+def _process_connections(pid: int) -> list[Any]:
+    """Inspect one recorded process without macOS's root-only fleet query."""
+
+    import psutil
+
+    process = psutil.Process(pid)
+    return list(process.net_connections(kind="tcp"))
+
+
+def _listener_is_owned_by(port: int, pid: int) -> bool:
+    """Fail closed unless the recorded process owns the configured listener."""
 
     try:
         import psutil
 
         listeners = []
-        for connection in psutil.net_connections(kind="tcp"):
+        for connection in _process_connections(pid):
             local = _address_parts(connection.laddr)
             if (
                 connection.status == psutil.CONN_LISTEN
                 and local is not None
                 and local[1] == port
-                and local[0] in {"127.0.0.1", "0.0.0.0", "::", "::1"}
             ):
                 listeners.append(connection)
     except Exception:  # noqa: BLE001 - inability to prove ownership is refusal
         return False
-    return bool(listeners) and all(connection.pid == pid for connection in listeners)
+    return bool(listeners)
 
 
 def _connected_socket_is_owned_by(
@@ -116,7 +153,7 @@ def _connected_socket_is_owned_by(
         server = _address_parts(sock.getpeername())
     except OSError:
         return False
-    if client is None or server != ("127.0.0.1", attestation.port):
+    if client is None or server != (attestation.connect_host, attestation.port):
         return False
 
     # The handshake can complete just before the server event loop accepts it.
@@ -127,7 +164,7 @@ def _connected_socket_is_owned_by(
             import psutil
 
             peers = []
-            for candidate in psutil.net_connections(kind="tcp"):
+            for candidate in _process_connections(attestation.pid):
                 if (
                     candidate.status == psutil.CONN_ESTABLISHED
                     and _address_parts(candidate.laddr) == server
@@ -137,7 +174,7 @@ def _connected_socket_is_owned_by(
         except Exception:  # noqa: BLE001 - inability to prove ownership is refusal
             return False
         if peers:
-            return all(candidate.pid == attestation.pid for candidate in peers)
+            return True
         time.sleep(0.005)
     return False
 
@@ -156,7 +193,8 @@ def _local_request(
     parsed = urlsplit(url)
     if (
         parsed.scheme != "http"
-        or parsed.hostname != "127.0.0.1"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != attestation.connect_host.casefold()
         or parsed.port != attestation.port
         or parsed.username is not None
         or parsed.password is not None
@@ -172,7 +210,7 @@ def _local_request(
         request_headers.setdefault("Content-Type", "application/json")
 
     connection = http.client.HTTPConnection(
-        "127.0.0.1",
+        attestation.connect_host,
         attestation.port,
         timeout=timeout,
     )
@@ -199,6 +237,7 @@ def _attested_local_process(
     *,
     pid_file: Path,
     port: int,
+    bind_host: str = "127.0.0.1",
 ) -> _LocalProcessAttestation | None:
     """Bind a configured port to this project's live, recorded process."""
 
@@ -218,9 +257,13 @@ def _attested_local_process(
         return None
     if recorded_root != project_root:
         return None
+    try:
+        connect_host = _connect_host(bind_host)
+    except ValueError:
+        return None
     # A PID file establishes process identity, not socket ownership. Refuse if
-    # the configured listener cannot be attributed exclusively to that process.
-    if not _exclusive_listener_is_owned_by(port, record.pid):
+    # the configured listener cannot be attributed to that exact process.
+    if not _listener_is_owned_by(port, record.pid):
         return None
     return _LocalProcessAttestation(
         project_root=project_root,
@@ -228,6 +271,8 @@ def _attested_local_process(
         pid=record.pid,
         port=port,
         started_at=record.started_at,
+        bind_host=bind_host,
+        connect_host=connect_host,
     )
 
 
@@ -236,6 +281,7 @@ def _attestation_is_current(attestation: _LocalProcessAttestation) -> bool:
         attestation.project_root,
         pid_file=attestation.pid_file,
         port=attestation.port,
+        bind_host=attestation.bind_host,
     )
     return current == attestation
 
@@ -248,7 +294,7 @@ def _host_operator_key(
 
     import httpx
 
-    probe_url = f"http://127.0.0.1:{attestation.port}/api/host/stop/status"
+    probe_url = f"{_origin(attestation)}/api/host/stop/status"
     for candidate in candidates:
         if not _attestation_is_current(attestation):
             return None
@@ -323,7 +369,7 @@ def _standalone_bootstrap_key(
     try:
         response = _local_request(
             "GET",
-            f"http://127.0.0.1:{attestation.port}/api/auth/key",
+            f"{_origin(attestation)}/api/auth/key",
             attestation=attestation,
             timeout=2.0,
         )
@@ -353,6 +399,7 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
         project_dir,
         pid_file=project_dir / "logs" / ".host.pid",
         port=config.host.port,
+        bind_host=getattr(config.host, "bind", "0.0.0.0"),
     )
     if args.all:
         if host_attestation is None:
@@ -364,7 +411,7 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
         if operator_key is None:
             return None
         return _StopEndpoint(
-            url=f"http://127.0.0.1:{config.host.port}/api/host/stop",
+            url=f"{_origin(host_attestation)}/api/host/stop",
             api_key=operator_key,
             attestation=host_attestation,
         )
@@ -386,6 +433,7 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
             project_dir,
             pid_file=ProcessManager.agent_pid_file(data_dir),
             port=local.port,
+            bind_host=getattr(config.host, "bind", "0.0.0.0"),
         )
         if standalone_attestation is not None:
             bootstrap_key = _standalone_bootstrap_key(standalone_attestation)
@@ -394,7 +442,7 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
                     key for key in (bootstrap_key, *operator_keys) if key
                 )
             )
-            origin = f"http://127.0.0.1:{local.port}"
+            origin = _origin(standalone_attestation)
             key = _agent_operator_key(
                 standalone_attestation,
                 f"{origin}/api/agent/info",
@@ -410,10 +458,7 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
                 )
 
         if host_attestation is not None:
-            origin = (
-                f"http://127.0.0.1:{config.host.port}"
-                f"/api/agents/{args.name}"
-            )
+            origin = f"{_origin(host_attestation)}/api/agents/{args.name}"
             key = _agent_operator_key(
                 host_attestation,
                 f"{origin}/api/agent/info",
@@ -436,6 +481,46 @@ def _stop_endpoint(args) -> _StopEndpoint | None:
     if args.name in config.get_remote_agents():
         return None
     return None
+
+
+def _all_stop_targets(args) -> tuple[tuple[_AllStopTarget, ...], tuple[str, ...]]:
+    """Resolve every live local control process participating in ``--all``."""
+
+    from kestrel_sovereign import cli
+
+    project_dir = cli._get_project_dir()
+    config = cli.MultiAgentConfig.load(
+        project_dir / MULTI_AGENT_CONFIG_FILENAME
+    )
+    targets: list[_AllStopTarget] = []
+    unreachable: list[str] = []
+
+    host_pid_file = project_dir / "logs" / ".host.pid"
+    host_record = ProcessManager.read_pid_record(host_pid_file)
+    host_endpoint = _stop_endpoint(args)
+    if host_endpoint is not None:
+        targets.append(_AllStopTarget(host_endpoint, True, "host fleet"))
+    elif host_record.is_running:
+        unreachable.append("host fleet")
+
+    for name, local in sorted(
+        config.get_local_agents().items(),
+        key=lambda item: (item[0].casefold(), item[0]),
+    ):
+        data_dir = local.resolve_data_dir(project_dir)
+        pid_file = ProcessManager.agent_pid_file(data_dir)
+        record = ProcessManager.read_pid_record(pid_file)
+        if not record.is_running:
+            continue
+        endpoint = _stop_endpoint(
+            SimpleNamespace(name=name, all=False, reason=args.reason)
+        )
+        if endpoint is None or endpoint.attestation.pid_file != pid_file:
+            unreachable.append(name)
+            continue
+        targets.append(_AllStopTarget(endpoint, False, name))
+
+    return tuple(targets), tuple(unreachable)
 
 
 def _error_message(response: Any) -> str:
@@ -537,6 +622,8 @@ def _valid_success_outcomes(
             return None
         if all_agents and outcome.get("requested_target") is not None:
             return None
+        if all_agents and outcome["agent_id"] != outcome["resolved_target"]:
+            return None
         if all_agents:
             agent_ids.add(outcome["agent_id"])
             resolved_targets.add(outcome["resolved_target"])
@@ -556,18 +643,15 @@ def _valid_success_outcomes(
     return outcomes
 
 
-def cmd_stop(args) -> int:
-    """Cooperatively stop one named agent or all host-owned in-flight work."""
+def _stop_one(
+    resolved: _StopEndpoint,
+    *,
+    reason: str | None,
+    all_agents: bool,
+    label: str,
+) -> int:
+    """Submit and verify one process-bound cooperative Stop operation."""
 
-    if bool(args.all) == bool(args.name):
-        print("Choose exactly one Stop target: an agent name or --all.")
-        return 2
-
-    resolved = _stop_endpoint(args)
-    if resolved is None:
-        target = "all agents" if args.all else f"'{args.name}'"
-        print(f"Stop target {target} is not configured or is unreachable.")
-        return 1
     url, api_key = resolved.url, resolved.api_key
     if not api_key:
         print("Stop requires a locally configured KESTREL_API_KEY.")
@@ -577,8 +661,10 @@ def cmd_stop(args) -> int:
 
     operation_id = _operation_id()
     body = {"correlation_id": operation_id}
-    if args.reason is not None:
-        body["reason"] = args.reason
+    if reason is not None:
+        body["reason"] = reason
+    if resolved.expected_agent_id is not None:
+        body["expected_agent_id"] = resolved.expected_agent_id
     if not _attestation_is_current(resolved.attestation):
         print("Stop target identity changed before dispatch; outcome is indeterminate.")
         return 1
@@ -592,8 +678,7 @@ def cmd_stop(args) -> int:
             timeout=60.0,
         )
     except (httpx.RequestError, _LocalRequestError) as error:
-        target = "all agents" if args.all else args.name
-        print(f"{target}: indeterminate — Stop request failed: {error}")
+        print(f"{label}: indeterminate — Stop request failed: {error}")
         return 1
 
     if response.status_code != 200:
@@ -609,9 +694,8 @@ def cmd_stop(args) -> int:
             for outcome in error_outcomes:
                 _print_outcome(outcome)
             return 1
-        target = "all agents" if args.all else args.name
         print(
-            f"{target}: indeterminate — HTTP {response.status_code}: "
+            f"{label}: indeterminate — HTTP {response.status_code}: "
             f"{_error_message(response)}"
         )
         return 1
@@ -631,7 +715,7 @@ def cmd_stop(args) -> int:
     verified = _valid_success_outcomes(
         payload,
         operation_id=operation_id,
-        all_agents=bool(args.all),
+        all_agents=all_agents,
         expected_agent_id=resolved.expected_agent_id,
     )
     if verified is None:
@@ -650,6 +734,47 @@ def cmd_stop(args) -> int:
             continue
         confirmed = _print_outcome(outcome) and confirmed
     return 0 if confirmed else 1
+
+
+def cmd_stop(args) -> int:
+    """Cooperatively stop one named agent or every live local control process."""
+
+    if bool(args.all) == bool(args.name):
+        print("Choose exactly one Stop target: an agent name or --all.")
+        return 2
+
+    if args.all:
+        targets, unreachable = _all_stop_targets(args)
+        if not targets and not unreachable:
+            print("Stop target all agents is not configured or is unreachable.")
+            return 1
+        print("Stopping all agents cooperatively:")
+        result = 0
+        for target in targets:
+            result = max(
+                result,
+                _stop_one(
+                    target.endpoint,
+                    reason=args.reason,
+                    all_agents=target.all_agents,
+                    label=target.label,
+                ),
+            )
+        for label in unreachable:
+            print(f"{label}: unreachable — local Stop authority could not be proven")
+            result = 1
+        return result
+
+    resolved = _stop_endpoint(args)
+    if resolved is None:
+        print(f"Stop target '{args.name}' is not configured or is unreachable.")
+        return 1
+    return _stop_one(
+        resolved,
+        reason=args.reason,
+        all_agents=False,
+        label=args.name,
+    )
 
 
 def add_stop_subparser(subparsers) -> None:

@@ -1044,6 +1044,32 @@ def test_agent_stop_persists_cli_reason_in_durable_request() -> None:
     assert receipt.reason == "andon cord"
 
 
+def test_agent_stop_expected_identity_precondition_blocks_replacement() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _MemoryReceiptStore()
+    app = FastAPI()
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+    replacement = MagicMock()
+    replacement.agent_id = "did:test:replacement"
+    replacement.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = replacement
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={
+            "correlation_id": "cli:stale-route",
+            "expected_agent_id": "did:test:original",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "routed agent identity changed" in response.json()["detail"]
+    replacement.cancel_current_request.assert_not_called()
+    assert store.records == {}
+
+
 def test_live_agent_stop_rechecks_turns_after_receipt_preflight() -> None:
     """A turn admitted during receipt I/O belongs to the same agent Stop."""
     from kestrel_sovereign.endpoints.agent import router

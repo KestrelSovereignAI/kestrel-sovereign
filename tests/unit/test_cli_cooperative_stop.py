@@ -41,7 +41,7 @@ def _outcome(
     }
 
 
-def _attestation(*, port=8888):
+def _attestation(*, port=8888, bind_host="0.0.0.0", connect_host="127.0.0.1"):
     project = Path("/project")
     return cli_stop._LocalProcessAttestation(
         project_root=project,
@@ -49,6 +49,8 @@ def _attestation(*, port=8888):
         pid=123,
         port=port,
         started_at=100.0,
+        bind_host=bind_host,
+        connect_host=connect_host,
     )
 
 
@@ -65,6 +67,13 @@ def _endpoint(
         attestation=_attestation(port=port),
         expected_agent_id=expected_agent_id,
     )
+
+
+def _all_targets(endpoint=None, *, unreachable=()):
+    targets = () if endpoint is None else (
+        cli_stop._AllStopTarget(endpoint, True, "host fleet"),
+    )
+    return targets, tuple(unreachable)
 
 
 def test_parser_separates_cooperative_stop_from_process_termination():
@@ -91,8 +100,8 @@ def test_stop_requires_exactly_one_agent_or_all(capsys):
 
 def test_unreachable_fleet_stop_names_all_agents_not_none(capsys):
     with patch(
-        "kestrel_sovereign.cli_stop._stop_endpoint",
-        return_value=None,
+        "kestrel_sovereign.cli_stop._all_stop_targets",
+        return_value=_all_targets(unreachable=("host fleet",)),
     ):
         assert cmd_stop(_args(name=None, all_agents=True)) == 1
 
@@ -154,6 +163,27 @@ def test_local_request_never_sends_when_connected_socket_owner_is_unproven():
     connection.request.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("bind_host", "connect_host", "origin"),
+    [
+        ("0.0.0.0", "127.0.0.1", "http://127.0.0.1:8888"),
+        ("::", "::1", "http://[::1]:8888"),
+        ("192.0.2.10", "192.0.2.10", "http://192.0.2.10:8888"),
+    ],
+)
+def test_attested_origin_honors_supported_bind_addresses(
+    bind_host,
+    connect_host,
+    origin,
+):
+    attestation = _attestation(
+        bind_host=bind_host,
+        connect_host=connect_host,
+    )
+    assert cli_stop._connect_host(bind_host) == connect_host
+    assert cli_stop._origin(attestation) == origin
+
+
 def test_connected_socket_proof_binds_exact_flow_to_attested_server_pid():
     import psutil
 
@@ -164,37 +194,70 @@ def test_connected_socket_proof_binds_exact_flow_to_attested_server_pid():
         status=psutil.CONN_ESTABLISHED,
         laddr=("127.0.0.1", 8888),
         raddr=("127.0.0.1", 54321),
-        pid=123,
     )
     unrelated = SimpleNamespace(
         status=psutil.CONN_ESTABLISHED,
         laddr=("127.0.0.1", 9999),
         raddr=("127.0.0.1", 54321),
-        pid=999,
     )
-    with patch("psutil.net_connections", return_value=[unrelated, server_flow]):
+    with patch.object(
+        cli_stop,
+        "_process_connections",
+        return_value=[unrelated, server_flow],
+    ):
         assert cli_stop._connected_socket_is_owned_by(connection, _attestation())
 
-    server_flow.pid = None
-    with patch("psutil.net_connections", return_value=[server_flow]):
-        assert not cli_stop._connected_socket_is_owned_by(connection, _attestation())
+    with (
+        patch.object(
+            cli_stop,
+            "_process_connections",
+            side_effect=[[], [server_flow]],
+        ) as inspect_process,
+        patch("time.sleep"),
+    ):
+        assert cli_stop._connected_socket_is_owned_by(connection, _attestation())
+    assert inspect_process.call_count == 2
 
 
-def test_listener_proof_rejects_an_unknown_co_listener():
+def test_connected_socket_proof_honors_ipv6_bind():
+    import psutil
+
+    connection = MagicMock()
+    connection.sock.getsockname.return_value = ("::1", 54321, 0, 0)
+    connection.sock.getpeername.return_value = ("::1", 8888, 0, 0)
+    server_flow = SimpleNamespace(
+        status=psutil.CONN_ESTABLISHED,
+        laddr=("::1", 8888),
+        raddr=("::1", 54321),
+    )
+    attestation = _attestation(bind_host="::", connect_host="::1")
+    with patch.object(
+        cli_stop,
+        "_process_connections",
+        return_value=[server_flow],
+    ):
+        assert cli_stop._connected_socket_is_owned_by(connection, attestation)
+
+
+def test_listener_proof_uses_the_recorded_process_not_root_only_system_query():
     import psutil
 
     owned = SimpleNamespace(
         status=psutil.CONN_LISTEN,
         laddr=("127.0.0.1", 8888),
-        pid=123,
     )
-    unknown = SimpleNamespace(
-        status=psutil.CONN_LISTEN,
-        laddr=("0.0.0.0", 8888),
-        pid=None,
-    )
-    with patch("psutil.net_connections", return_value=[owned, unknown]):
-        assert not cli_stop._exclusive_listener_is_owned_by(8888, 123)
+    process = MagicMock()
+    process.net_connections.return_value = [owned]
+    with (
+        patch("psutil.Process", return_value=process) as process_cls,
+        patch(
+            "psutil.net_connections",
+            side_effect=AssertionError("root-only system query used"),
+        ),
+    ):
+        assert cli_stop._listener_is_owned_by(8888, 123)
+    process_cls.assert_called_once_with(123)
+    process.net_connections.assert_called_once_with(kind="tcp")
 
 
 def test_attestation_requires_matching_live_project_process_and_listener(tmp_path):
@@ -210,7 +273,7 @@ def test_attestation_requires_matching_live_project_process_and_listener(tmp_pat
     )
     with (
         patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
-        patch.object(cli_stop, "_exclusive_listener_is_owned_by", return_value=True),
+        patch.object(cli_stop, "_listener_is_owned_by", return_value=True),
     ):
         attestation = cli_stop._attested_local_process(
             tmp_path,
@@ -224,6 +287,8 @@ def test_attestation_requires_matching_live_project_process_and_listener(tmp_pat
         pid=123,
         port=8888,
         started_at=100.0,
+        bind_host="127.0.0.1",
+        connect_host="127.0.0.1",
     )
 
 
@@ -239,7 +304,7 @@ def test_attestation_rejects_listener_owned_by_another_process(tmp_path):
     )
     with (
         patch.object(cli_stop.ProcessManager, "read_pid_record", return_value=record),
-        patch.object(cli_stop, "_exclusive_listener_is_owned_by", return_value=False),
+        patch.object(cli_stop, "_listener_is_owned_by", return_value=False),
     ):
         assert cli_stop._attested_local_process(
             tmp_path,
@@ -406,6 +471,63 @@ def test_remote_stop_never_sends_the_local_sovereign_key(tmp_path):
         assert cli_stop._stop_endpoint(_args(name="Peer")) is None
 
 
+def test_stop_all_resolution_includes_each_live_standalone_process(tmp_path):
+    from kestrel_sovereign import cli
+
+    alpha_dir = tmp_path / "agents" / "alpha"
+    beta_dir = tmp_path / "agents" / "beta"
+    alpha = SimpleNamespace(
+        port=8801,
+        resolve_data_dir=lambda _project: alpha_dir,
+    )
+    beta = SimpleNamespace(
+        port=8802,
+        resolve_data_dir=lambda _project: beta_dir,
+    )
+    config = SimpleNamespace(host=SimpleNamespace(port=8888, bind="0.0.0.0"))
+    config.get_local_agents = lambda: {"Alpha": alpha, "Beta": beta}
+    alpha_pid_file = cli_stop.ProcessManager.agent_pid_file(alpha_dir)
+    alpha_attestation = cli_stop._LocalProcessAttestation(
+        project_root=tmp_path,
+        pid_file=alpha_pid_file,
+        pid=101,
+        port=8801,
+        started_at=100.0,
+        bind_host="0.0.0.0",
+        connect_host="127.0.0.1",
+    )
+    alpha_endpoint = cli_stop._StopEndpoint(
+        url="http://127.0.0.1:8801/api/agent/stop",
+        api_key="alpha-key",
+        attestation=alpha_attestation,
+        expected_agent_id="did:alpha",
+    )
+    absent = SimpleNamespace(is_running=False)
+    live = SimpleNamespace(is_running=True)
+
+    def resolve(args):
+        return alpha_endpoint if args.name == "Alpha" else None
+
+    with (
+        patch.object(cli, "_get_project_dir", return_value=tmp_path),
+        patch.object(cli.MultiAgentConfig, "load", return_value=config),
+        patch.object(
+            cli_stop.ProcessManager,
+            "read_pid_record",
+            side_effect=[absent, live, absent],
+        ),
+        patch.object(cli_stop, "_stop_endpoint", side_effect=resolve),
+    ):
+        targets, unreachable = cli_stop._all_stop_targets(
+            _args(name=None, all_agents=True)
+        )
+
+    assert targets == (
+        cli_stop._AllStopTarget(alpha_endpoint, False, "Alpha"),
+    )
+    assert unreachable == ()
+
+
 def test_cooperative_stop_module_has_no_process_mutation_door():
     source = inspect.getsource(cli_stop)
     assert "stop_agent(" not in source
@@ -443,12 +565,77 @@ def test_named_stop_posts_only_intent_and_prints_receipted_outcome(capsys):
     assert post.call_args.kwargs["json"] == {
         "correlation_id": "cli:fixed",
         "reason": "andon",
+        "expected_agent_id": "did:emma",
     }
     assert post.call_args.kwargs["headers"] == {"X-API-Key": "secret"}
     output = capsys.readouterr().out
     assert "did:emma" in output
     assert "stopped" in output
     assert "receipt-1" in output
+
+
+def test_stop_all_fans_out_to_host_and_live_standalone_processes(capsys):
+    host = _endpoint(
+        "http://host/api/host/stop",
+        expected_agent_id=None,
+    )
+    standalone = _endpoint(
+        "http://standalone/api/agent/stop",
+        expected_agent_id="did:beta",
+        port=8802,
+    )
+    host_payload = {
+        "success": True,
+        "state": "confirmed",
+        "target_count": 1,
+        "confirmed_count": 1,
+        "unconfirmed_count": 0,
+        "correlation_id": "cli:host",
+        "stop_outcomes": [dict(
+            _outcome(agent="did:alpha", scope="host"),
+            correlation_id="cli:host",
+        )],
+    }
+    standalone_payload = {
+        "success": True,
+        "stop_outcomes": [dict(
+            _outcome(agent="did:beta"),
+            correlation_id="cli:beta",
+        )],
+    }
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._all_stop_targets",
+            return_value=(
+                (
+                    cli_stop._AllStopTarget(host, True, "host fleet"),
+                    cli_stop._AllStopTarget(standalone, False, "Beta"),
+                ),
+                (),
+            ),
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._operation_id",
+            side_effect=["cli:host", "cli:beta"],
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._attestation_is_current",
+            return_value=True,
+        ),
+        patch(
+            "kestrel_sovereign.cli_stop._local_request",
+            side_effect=[
+                _response(payload=host_payload),
+                _response(payload=standalone_payload),
+            ],
+        ) as post,
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 0
+
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["json"]["expected_agent_id"] == "did:beta"
+    output = capsys.readouterr().out
+    assert "did:alpha" in output and "did:beta" in output
 
 
 def test_successful_fleet_stop_requires_complete_host_evidence(capsys):
@@ -469,11 +656,10 @@ def test_successful_fleet_stop_requires_complete_host_evidence(capsys):
     )
     with (
         patch(
-            "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=_endpoint(
-                "http://host/api/host/stop",
-                expected_agent_id=None,
-            ),
+            "kestrel_sovereign.cli_stop._all_stop_targets",
+            return_value=_all_targets(_endpoint(
+                "http://host/api/host/stop", expected_agent_id=None
+            )),
         ),
         patch(
             "kestrel_sovereign.cli_stop._operation_id",
@@ -519,8 +705,8 @@ def test_fleet_success_rejects_noncanonical_envelope_fields(
     payload[mutation] = value
     response = _response(payload=payload)
     with (
-        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint(
-            "http://host/api/host/stop", expected_agent_id=None
+        patch("kestrel_sovereign.cli_stop._all_stop_targets", return_value=_all_targets(
+            _endpoint("http://host/api/host/stop", expected_agent_id=None)
         )),
         patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
         patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
@@ -545,9 +731,38 @@ def test_fleet_success_rejects_duplicate_targets_and_mixed_receipts(capsys):
         }
     )
     with (
-        patch("kestrel_sovereign.cli_stop._stop_endpoint", return_value=_endpoint(
-            "http://host/api/host/stop", expected_agent_id=None
+        patch("kestrel_sovereign.cli_stop._all_stop_targets", return_value=_all_targets(
+            _endpoint("http://host/api/host/stop", expected_agent_id=None)
         )),
+        patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
+        patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
+        patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
+    ):
+        assert cmd_stop(_args(name=None, all_agents=True)) == 1
+    assert "inconsistent" in capsys.readouterr().out
+
+
+def test_fleet_success_rejects_cross_wired_target_identities(capsys):
+    first = _outcome(agent="did:alpha", scope="host")
+    second = _outcome(agent="did:beta", scope="host")
+    first["resolved_target"] = "did:beta"
+    second["resolved_target"] = "did:alpha"
+    response = _response(payload={
+        "success": True,
+        "state": "confirmed",
+        "target_count": 2,
+        "confirmed_count": 2,
+        "unconfirmed_count": 0,
+        "correlation_id": "cli:fixed",
+        "stop_outcomes": [first, second],
+    })
+    with (
+        patch(
+            "kestrel_sovereign.cli_stop._all_stop_targets",
+            return_value=_all_targets(_endpoint(
+                "http://host/api/host/stop", expected_agent_id=None
+            )),
+        ),
         patch("kestrel_sovereign.cli_stop._operation_id", return_value="cli:fixed"),
         patch("kestrel_sovereign.cli_stop._attestation_is_current", return_value=True),
         patch("kestrel_sovereign.cli_stop._local_request", return_value=response),
@@ -686,11 +901,10 @@ def test_stop_all_preserves_partial_outcomes_and_nonzero_exit(capsys):
     )
     with (
         patch(
-            "kestrel_sovereign.cli_stop._stop_endpoint",
-            return_value=_endpoint(
-                "http://host/api/host/stop",
-                expected_agent_id=None,
-            ),
+            "kestrel_sovereign.cli_stop._all_stop_targets",
+            return_value=_all_targets(_endpoint(
+                "http://host/api/host/stop", expected_agent_id=None
+            )),
         ),
         patch(
             "kestrel_sovereign.cli_stop._attestation_is_current",
