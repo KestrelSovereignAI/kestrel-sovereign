@@ -170,11 +170,14 @@ function hostStopEnvelope(agentId, {
     const confirmed = ['stopped', 'already_complete'].includes(disposition) ? 1 : 0;
     return {
         success: confirmed === 1,
+        state: confirmed === 1 ? 'confirmed' : 'unconfirmed',
         correlation_id: correlationId,
         target_count: 1,
         confirmed_count: confirmed,
         unconfirmed_count: 1 - confirmed,
         stop_outcomes: [{
+            scope: 'host',
+            requested_target: null,
             agent_id: agentId,
             resolved_target: agentId,
             disposition,
@@ -239,6 +242,23 @@ test('host Stop keeps local work fenced when receipt or envelope evidence is mal
     state.waitingAgents.delete(agent);
     state.unconfirmedStopAgents.delete(agent);
     state.unconfirmedStopCorrelationIds.delete(agent);
+});
+
+test('host Stop rejects a contradictory success envelope before releasing fences', () => {
+    const agent = 'host-stop-contradictory';
+    const agentId = 'did:agent:host-stop-contradictory';
+    state.waitingAgents.add(agent);
+
+    const settle = prepareHostStop([{ name: agent, id: agentId }]);
+    const contradictory = hostStopEnvelope(agentId);
+    contradictory.success = false;
+    contradictory.state = 'unconfirmed';
+    settle(contradictory, null, contradictory.correlation_id);
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), true,
+        'envelope fields must agree with receipted dispositions');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
 });
 
 test('host Stop maps its one receipted outcome onto the standalone null chat key', () => {
@@ -364,6 +384,72 @@ test('queued message dispatches when the in-flight turn finishes', async () => {
 
     ctrl2.end();
     await new Promise((r) => setTimeout(r, 5));
+});
+
+
+test('Host Stop between queue drain and its microtask prevents redispatch', async () => {
+    const agent = 'q-host-stop-microtask';
+    const agentId = 'did:agent:q-host-stop-microtask';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    setQueueMode(agent);
+
+    const ctrl = controlledStream();
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => {
+        dispatched.push(input);
+        return ctrl.iter;
+    };
+    messageInput.value = 'first';
+    const first = sendMessage();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    messageInput.value = 'queued';
+    await sendMessage();
+
+    const pendingMicrotasks = [];
+    const priorQueueMicrotask = globalThis.queueMicrotask;
+    globalThis.queueMicrotask = (callback) => pendingMicrotasks.push(callback);
+    try {
+        ctrl.end();
+        await first;
+        assert.equal(pendingMicrotasks.length, 1, 'queue drain scheduled one dispatch');
+        prepareHostStop([{ name: agent, id: agentId }]);
+        pendingMicrotasks[0]();
+        await Promise.resolve();
+    } finally {
+        globalThis.queueMicrotask = priorQueueMicrotask;
+    }
+
+    assert.deepEqual(dispatched, ['first'],
+        'queued work retains the generation from before Host Stop');
+    state.waitingAgents.delete(agent);
+    state.unconfirmedStopAgents.delete(agent);
+});
+
+
+test('Host Stop during the pre-publication user-message await cancels dispatch', async () => {
+    const agent = 'q-host-stop-add-message';
+    const agentId = 'did:agent:q-host-stop-add-message';
+    apiModule.default.setHostAgent(agent);
+    mountChatPane(agent);
+    const pane = getOrCreateChatPane(agent);
+    const dispatched = [];
+    apiModule.default.streamInvoke = (input) => (async function* () {
+        dispatched.push(input);
+    }());
+
+    const capturedGeneration = state.hostStopGeneration || 0;
+    const send = sendMessage('queued', agent, capturedGeneration);
+    prepareHostStop([{ name: agent, id: agentId }]);
+    await send;
+
+    assert.deepEqual(dispatched, [], 'no request publishes after the host fence');
+    assert.equal(
+        pane.element.children.some((child) => child.classList.contains('user-message')),
+        false,
+        'the pre-publication user bubble is rolled back with the canceled send',
+    );
+    state.unconfirmedStopAgents.delete(agent);
 });
 
 

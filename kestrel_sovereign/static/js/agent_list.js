@@ -27,6 +27,7 @@ import API from './api.js';
 import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import { storeGet, storeSet } from './ui_state.mjs';
+import { validateHostStopEnvelope } from './stop_evidence.js';
 
 // One pane owns one set of component listeners. A host may remount into
 // adopted chrome without first retaining/destroying the old handle; carrying
@@ -34,6 +35,14 @@ import { storeGet, storeSet } from './ui_state.mjs';
 // before adopting the same buttons (#3155).
 const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
 const AGENT_LIST_STOP_ALL_OPERATION = Symbol.for('kestrel.agentListPane.stopAllOperation');
+const AGENT_LIST_STOP_ALL_RETRY = Symbol.for('kestrel.agentListPane.stopAllRetry');
+
+function newStopAllCorrelationId() {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+        return `ui-host-stop:${globalThis.crypto.randomUUID()}`;
+    }
+    return `ui-host-stop:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
 
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
@@ -451,8 +460,9 @@ export function mountAgentList(containerEl, config = {}) {
  *     emptyText, errorText — forwarded verbatim to `mountAgentList`.
  *   - onNew()          — the "+ New" header action (Add-a-Companion / new agent).
  *                        The New button is only built/adopted when this is a fn.
- *   - onPrepareStopAll(items) — synchronous browser-work fence; may return a
- *                        settlement callback invoked with (response, error).
+ *   - onPrepareStopAll(items) — REQUIRED to enable Stop All: synchronous
+ *                        browser-work fence returning an optional settlement
+ *                        callback invoked with (response, error, correlationId).
  *   - confirmStopAll(message) — host confirmation override (defaults to confirm).
  *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence.
  *   - newLabel         — accessible label / tooltip for the New button.
@@ -617,14 +627,21 @@ export function mountAgentListPane(containerEl, config = {}) {
     let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
     function renderStopAllState() {
         const { loaded, canStop, inFlightCount } = stopAllStatus;
+        const canFenceBrowserWork = typeof config.onPrepareStopAll === 'function';
+        const retryPending = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string';
         stopAllBtn.disabled = stopAllPending
             || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
-            || !loaded || !canStop || inFlightCount === 0;
+            || !loaded || !canStop || !canFenceBrowserWork
+            || (inFlightCount === 0 && !retryPending);
         stopAllBtn.dataset.inFlightCount = String(inFlightCount);
         if (!loaded) {
             stopAllBtn.title = 'Checking cooperative Stop availability';
         } else if (!canStop) {
             stopAllBtn.title = 'Sovereign host authority is required to Stop all agents';
+        } else if (!canFenceBrowserWork) {
+            stopAllBtn.title = 'A browser-work Stop fence is required to Stop all agents';
+        } else if (retryPending && inFlightCount === 0) {
+            stopAllBtn.title = 'Recover the durable result of the prior Stop All request';
         } else if (inFlightCount > 0) {
             stopAllBtn.title = `Cooperatively stop ${inFlightCount} in-flight agent${inFlightCount === 1 ? '' : 's'}`;
         } else {
@@ -675,23 +692,19 @@ export function mountAgentListPane(containerEl, config = {}) {
         return (item && (item.displayName || item.name)) || ids[0] || 'Unknown target';
     }
 
-    function renderStopAllOutcomes(response) {
-        const outcomes = response && Array.isArray(response.stop_outcomes)
-            ? response.stop_outcomes
-            : null;
+    function renderStopAllOutcomes(response, expectedCorrelationId) {
+        const evidence = validateHostStopEnvelope(response, expectedCorrelationId);
         stopAllResults.hidden = false;
         stopAllResults.textContent = '';
-        if (!outcomes || outcomes.length === 0) {
-            stopAllResults.textContent = 'No cooperative Stop target resolved; outcome is indeterminate.';
+        if (!evidence) {
+            stopAllResults.textContent = 'Cooperative Stop evidence was malformed or incomplete; outcome is indeterminate.';
             return;
         }
 
         const counts = new Map();
         const list = doc.createElement('ul');
-        for (const outcome of outcomes) {
-            const disposition = outcome && typeof outcome.disposition === 'string'
-                ? outcome.disposition
-                : 'indeterminate';
+        for (const outcome of evidence.outcomes) {
+            const disposition = outcome.disposition;
             counts.set(disposition, (counts.get(disposition) || 0) + 1);
             const row = doc.createElement('li');
             row.dataset.disposition = disposition;
@@ -719,7 +732,10 @@ export function mountAgentListPane(containerEl, config = {}) {
     const onStopAllClick = async () => {
         if (stopAllPending || containerEl[AGENT_LIST_STOP_ALL_OPERATION]
             || !api || typeof api.stopHost !== 'function') return;
-        const operation = {};
+        const operation = {
+            correlationId: containerEl[AGENT_LIST_STOP_ALL_RETRY]
+                || newStopAllCorrelationId(),
+        };
         containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
         stopAllPending = true;
         renderStopAllState();
@@ -736,14 +752,18 @@ export function mountAgentListPane(containerEl, config = {}) {
             return;
         }
         const count = stopAllStatus.inFlightCount;
-        if (!statusAvailable || count === 0) {
+        const retryPending = containerEl[AGENT_LIST_STOP_ALL_RETRY] === operation.correlationId;
+        if (!statusAvailable || (count === 0 && !retryPending)) {
             stopAllPending = false;
             delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
             renderStopAllState();
             return;
         }
         const noun = count === 1 ? 'agent' : 'agents';
-        if (!confirmStopAll(`Stop all ${count} in-flight ${noun}?`)) {
+        const confirmation = retryPending && count === 0
+            ? 'Recover the durable result of the prior Stop All request?'
+            : `Stop all ${count} in-flight ${noun}?`;
+        if (!confirmStopAll(confirmation)) {
             stopAllPending = false;
             delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
             renderStopAllState();
@@ -752,17 +772,23 @@ export function mountAgentListPane(containerEl, config = {}) {
         // Browser-owned queues and streams must be fenced synchronously before
         // the POST can yield. The callback may return a settlement hook that
         // reconciles locally-addressed streams with the typed host outcomes.
-        const settleLocalStop = typeof config.onPrepareStopAll === 'function'
-            ? config.onPrepareStopAll(loadedItems)
-            : null;
+        let settleLocalStop = null;
         let response = null;
         let stopError = null;
         try {
+            settleLocalStop = config.onPrepareStopAll(loadedItems);
+            containerEl[AGENT_LIST_STOP_ALL_RETRY] = operation.correlationId;
             response = await api.stopHost({
                 reason: config.stopAllReason || 'Stopped from the agents banner',
+                correlation_id: operation.correlationId,
             });
+            const evidence = validateHostStopEnvelope(
+                response,
+                operation.correlationId,
+            );
+            if (evidence) delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
             if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
-                renderStopAllOutcomes(response);
+                renderStopAllOutcomes(response, operation.correlationId);
             }
             if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation
                 && typeof config.onStopAllOutcomes === 'function') {
@@ -776,7 +802,15 @@ export function mountAgentListPane(containerEl, config = {}) {
             }
         } finally {
             if (typeof settleLocalStop === 'function') {
-                settleLocalStop(response, stopError);
+                try {
+                    settleLocalStop(response, stopError, operation.correlationId);
+                } catch (error) {
+                    if (!destroyed
+                        && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                        stopAllResults.hidden = false;
+                        stopAllResults.textContent = `Local Stop settlement failed: ${error && error.message ? error.message : 'unknown error'}`;
+                    }
+                }
             }
             stopAllPending = false;
             if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {

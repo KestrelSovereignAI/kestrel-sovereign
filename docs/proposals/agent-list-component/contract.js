@@ -220,6 +220,7 @@
  *   onToggle?: (collapsed: boolean) => void,
  *   onNew?: () => (void | Promise<void>),
  *   newLabel?: string,
+ *   onPrepareStopAll: (items: AgentListItem[]) => ((response: Object|null, error: Error|null, correlationId: string) => void),
  * }} AgentListPaneConfig
  */
 

@@ -15,6 +15,7 @@ import {
     mountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
+import { validateHostStopEnvelope } from './stop_evidence.js';
 import {
     installScrollFollow,
     getFollowState,
@@ -1540,6 +1541,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     // belonged to the conversation the user just left. The chip DOM
     // goes with the innerHTML reset below; null the field too.
     pane.queuedMessage = null;
+    pane.queuedHostStopGeneration = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
     // #2909: a cleared pane is a fresh conversation — follow its tail,
@@ -2716,6 +2718,7 @@ function fenceLocalAgentStop(agentName) {
     const pane = deps().state.chatPanes.get(agentName);
     if (pane) {
         pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
         clearQueuedChip(pane);
     }
 
@@ -2762,6 +2765,7 @@ export function prepareHostStop(items = []) {
     // before the host request is allowed to yield.
     for (const pane of currentState.chatPanes.values()) {
         pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
         clearQueuedChip(pane);
     }
     for (const name of localNames) fenceLocalAgentStop(name);
@@ -2785,27 +2789,13 @@ export function prepareHostStop(items = []) {
         }
     }
 
-    return (response) => {
-        const outcomes = Array.isArray(response && response.stop_outcomes)
-            ? response.stop_outcomes
-            : [];
-        const correlationId = response && response.correlation_id;
-        const validEnvelope = response
-            && typeof correlationId === 'string'
-            && correlationId.length > 0
-            && Number.isSafeInteger(response.target_count)
-            && response.target_count === outcomes.length
-            && Number.isSafeInteger(response.confirmed_count)
-            && Number.isSafeInteger(response.unconfirmed_count)
-            && response.confirmed_count + response.unconfirmed_count === outcomes.length;
+    return (response, _error, expectedCorrelationId = null) => {
+        const evidence = validateHostStopEnvelope(response, expectedCorrelationId);
+        const outcomes = evidence ? evidence.outcomes : [];
+        const correlationId = evidence ? evidence.correlationId : null;
         const confirmedNames = new Set();
         for (const outcome of outcomes) {
-            if (!validEnvelope
-                || !outcome
-                || !['stopped', 'already_complete'].includes(outcome.disposition)
-                || typeof outcome.receipt_id !== 'string'
-                || outcome.receipt_id.length === 0
-                || outcome.correlation_id !== correlationId) {
+            if (!['stopped', 'already_complete'].includes(outcome.disposition)) {
                 continue;
             }
             for (const address of [outcome.agent_id, outcome.resolved_target]) {
@@ -2871,6 +2861,7 @@ function renderQueuedChip(pane, agentName, text) {
     // running. (The big Stop button cancels both; see stopAgent.)
     cancel.addEventListener('click', () => {
         pane.queuedMessage = null;
+        pane.queuedHostStopGeneration = null;
         clearQueuedChip(pane);
     });
     chip.appendChild(label);
@@ -2934,7 +2925,11 @@ function toggleComposerMode() {
  * the explicit agent, an agent switch between queueing and dispatch
  * would misroute the message.
  */
-export async function sendMessage(overrideText, overrideAgent) {
+export async function sendMessage(
+    overrideText,
+    overrideAgent,
+    expectedHostStopGeneration = undefined,
+) {
     const fromComposer = overrideText === undefined;
     const text = (fromComposer ? messageInput.value : overrideText).trim();
 
@@ -2945,11 +2940,13 @@ export async function sendMessage(overrideText, overrideAgent) {
     const dispatchAgent = overrideAgent !== undefined
         ? overrideAgent
         : deps().api.getHostAgent();
-    const dispatchHostStopGeneration = hostStopGeneration();
+    const dispatchHostStopGeneration = expectedHostStopGeneration === undefined
+        ? hostStopGeneration()
+        : expectedHostStopGeneration;
     const hostStopInvalidatedDispatch = () => (
         hostStopGeneration() !== dispatchHostStopGeneration
     );
-    if (!text) return;
+    if (!text || hostStopInvalidatedDispatch()) return;
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
 
@@ -2977,6 +2974,7 @@ export async function sendMessage(overrideText, overrideAgent) {
             // it — single-slot queue (multi-message queue is a
             // deferred follow-up). Do NOT interrupt the in-flight turn.
             pane.queuedMessage = text;
+            pane.queuedHostStopGeneration = dispatchHostStopGeneration;
             // #1662: stash this turn's staged attachments with the queued
             // message so they ride the eventual re-dispatch; clear the tray now.
             if (fromComposer) pane.queuedAttachments = takeStagedAttachments(pane);
@@ -3057,7 +3055,11 @@ export async function sendMessage(overrideText, overrideAgent) {
         : (pane.queuedAttachments || []);
     pane.queuedAttachments = [];
 
-    await addMessage('user', text, pane.element, turnAttachments);
+    const userMessage = await addMessage('user', text, pane.element, turnAttachments);
+    if (hostStopInvalidatedDispatch()) {
+        if (userMessage && typeof userMessage.remove === 'function') userMessage.remove();
+        return;
+    }
     // Only clear the composer when the text CAME from it. A #1257
     // queued re-dispatch passes overrideText and must not wipe
     // whatever the user has since typed for the (possibly different)
@@ -3596,15 +3598,23 @@ export async function sendMessage(overrideText, overrideAgent) {
         // queued against the ACTIVE turn.
         if (ownsStream() && pane.queuedMessage != null) {
             const queued = pane.queuedMessage;
+            const queuedHostStopGeneration = pane.queuedHostStopGeneration
+                ?? dispatchHostStopGeneration;
             pane.queuedMessage = null;
+            pane.queuedHostStopGeneration = null;
             clearQueuedChip(pane);
             if (!wasAborted && isPaneFresh()) {
                 queueMicrotask(() => {
                     // Re-check generation at fire time — a conversation
                     // switch could land between this finally and the
                     // microtask draining.
-                    if (pane.generation !== dispatchGeneration) return;
-                    sendMessage(queued, dispatchAgent);
+                    if (pane.generation !== dispatchGeneration
+                        || hostStopGeneration() !== queuedHostStopGeneration) return;
+                    sendMessage(
+                        queued,
+                        dispatchAgent,
+                        queuedHostStopGeneration,
+                    );
                 });
             }
         }
