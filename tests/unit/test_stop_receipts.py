@@ -272,6 +272,80 @@ async def test_receipt_survives_sqlite_connection_restart(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(
+    tmp_path,
+):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    path = tmp_path / "cascade-stop-restart.db"
+    first_db = await AsyncDatabase.sqlite(str(path))
+    first_store = StopReceiptStore(first_db)
+    await first_store.ensure_schema()
+    request = StopRequest(
+        scope=StopScope.AGENT,
+        actor_id="did:test:operator",
+        target="root",
+        correlation_id="durable-cascade-stop",
+    )
+
+    def target(address: str, disposition: StopDisposition):
+        async def cancel(_request):
+            return disposition
+
+        return CooperativeStopTarget(address, f"did:test:{address}", cancel)
+
+    resolve = AsyncMock(return_value=["child", "grandchild", "unloaded"])
+    first_authority = CancellationAuthority(
+        lambda: (
+            target("root", StopDisposition.STOPPED),
+            target("child", StopDisposition.ALREADY_COMPLETE),
+            target("grandchild", StopDisposition.REFUSED),
+        ),
+        cleanup_registry=StopCleanupRegistry(),
+        receipt_store=first_store,
+        descendant_resolver=resolve,
+    )
+    written = await first_authority.stop(request)
+    assert [outcome.resolved_target for outcome in written] == [
+        "root",
+        "child",
+        "grandchild",
+        "unloaded",
+    ]
+    rows = await first_db.fetchall(
+        "SELECT ordinal FROM stop_receipt_outcomes "
+        "WHERE receipt_id = ? ORDER BY ordinal",
+        (written[0].receipt_id,),
+    )
+    assert rows == [(0,), (1,), (2,), (3,)]
+    resolve.assert_awaited_once_with("did:test:root")
+    await first_db.close()
+
+    second_db = await AsyncDatabase.sqlite(str(path))
+    try:
+        second_store = StopReceiptStore(second_db)
+        await second_store.ensure_schema()
+        inventory = MagicMock(
+            side_effect=AssertionError("durable replay read live inventory")
+        )
+        descendants = AsyncMock(
+            side_effect=AssertionError("durable replay rebuilt lineage")
+        )
+        replay = await CancellationAuthority(
+            inventory,
+            cleanup_registry=StopCleanupRegistry(),
+            receipt_store=second_store,
+            descendant_resolver=descendants,
+        ).stop(request)
+
+        assert replay == written
+        inventory.assert_not_called()
+        descendants.assert_not_awaited()
+    finally:
+        await second_db.close()
+
+
+@pytest.mark.asyncio
 async def test_exact_replay_preserves_original_durable_outcome(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
