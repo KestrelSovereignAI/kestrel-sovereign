@@ -1518,6 +1518,16 @@ class SignalDispatcher:
                     self._durable_initialized = True
                     self._schedule_runtime_owner_heartbeat()
 
+    def has_durable_consumer(self, consumer_id: str) -> bool:
+        """Whether durable delivery is configured for this consumer.
+
+        A registration is a lifecycle fact, not a transient one: an agent that
+        never registered a durable cognition consumer will never admit durable
+        work, no matter how long a caller retries.
+        """
+
+        return consumer_id in self._started_durable_cognition_consumers
+
     async def register_durable_consumer(
         self, registration: DurableConsumerRegistration
     ) -> None:
