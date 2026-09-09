@@ -5,11 +5,15 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskOutcome,
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import _hook_is_enforcing
 from kestrel_sdk.llm import ToolCallStarted
@@ -41,6 +45,13 @@ from kestrel_sovereign.telemetry import (
     start_span,
     end_span,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredToolBatchCancellation:
+    """Carry Stop across the streaming turn's history checkpoint."""
+
+    outcome: OwnedTaskOutcome[Any]
 
 
 def resolve_turn_invocation_context(
@@ -737,6 +748,24 @@ STRICT_AUDIT_CONTINUATION_TIMEOUT_BLOCK = (
     "content was released. Please try again."
 )
 
+# A Stop that lands inside an already-running tool batch cannot erase the fact
+# that the external action completed. Strict audit still forbids persisting the
+# model/tool bytes, so record a fixed host-authored checkpoint instead. It is
+# safe to replay into the next turn and explicitly prevents the model from
+# treating the cancelled, otherwise-empty assistant row as permission to repeat
+# a send/payment/write automatically.
+STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT = (
+    "A tool batch completed before this request was stopped. Its details were "
+    "withheld by response-audit policy. Do not repeat the completed action "
+    "automatically."
+)
+_STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA = {
+    "tool_batch_checkpoint": {
+        "status": "completed",
+        "details_withheld": True,
+    }
+}
+
 
 def _strict_audit_release(final_text: str) -> list:
     """Post-verdict release for a strict (enforcing) buffered turn (#2674).
@@ -958,9 +987,11 @@ class StreamingMixin:
         whole unaudited metadata envelope on persist — parts, pre_tool_reasoning,
         tool_events and tool_results — on ALLOW as much as on DENY, and suppresses
         the out-of-band ``revising`` SSE event while sanitizing the STOP hook's
-        tool_calls/tool_results (#2674). So the live stream, the persisted row,
-        the reloaded turn and every hook side channel all carry the reviewed prose
-        ONLY — nothing the audit did not see. That trades real-time token delivery
+        tool_calls/tool_results (#2674). The one non-model exception is a fixed,
+        host-authored completion checkpoint when Stop interrupts an already-running
+        side-effecting batch; it contains no tool bytes and prevents automatic
+        repetition. Otherwise the live stream, persisted row, reload and hook side
+        channels carry reviewed prose ONLY. That trades real-time token delivery
         (and live tool/part cards, which no longer survive a buffered turn) for
         the integrity gate. With audit disabled, or in advisory/warn mode,
         streaming stays fully incremental and this method's behavior is unchanged.
@@ -1744,6 +1775,38 @@ class StreamingMixin:
             # stripped, so the orchestrator sets ``timed_out`` here instead and we
             # substitute a deterministic safe block below.
             strict_timeout_state: Dict[str, Any] = {}
+            deferred_tool_batch_cancellation: Optional[
+                _DeferredToolBatchCancellation
+            ] = None
+
+            def tool_batch_completed() -> bool:
+                # ``tool_results`` is populated only after each dispatch returns;
+                # the deferred marker covers the narrower cancellation race where
+                # the owned batch completed but its result channel is unexpectedly
+                # empty. Either is evidence that persistence is now load-bearing.
+                return bool(
+                    deferred_tool_batch_cancellation is not None or tool_results
+                )
+
+            async def persist_strict_cancelled_tool_turn() -> None:
+                checkpointed_batch = tool_batch_completed()
+                await self._persist_assistant_turn_safely(
+                    (
+                        STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT
+                        if checkpointed_batch
+                        else ""
+                    ),
+                    metadata=(
+                        _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA
+                        if checkpointed_batch
+                        else None
+                    ),
+                    session_id=session_id,
+                    request_id=request_id,
+                    response=tool_response,
+                    require_success=checkpointed_batch,
+                )
+
             async for chunk in self._handle_orchestrator_response_streaming(
                 response=tool_response,
                 feature_tools=feature_tools,
@@ -1769,6 +1832,11 @@ class StreamingMixin:
                 # speech for dispatched subagents.
                 continuation_user_content=prompt + lazy_hint,
             ):
+                if isinstance(chunk, _DeferredToolBatchCancellation):
+                    deferred_tool_batch_cancellation = chunk
+                    # Resume once so the inner async generator reaches its return
+                    # after the marker instead of leaving cleanup to finalization.
+                    continue
                 if isinstance(chunk, ThinkingDelta):
                     if not buffer_audit:
                         yield _build_thinking_sentinel(chunk)
@@ -1786,11 +1854,12 @@ class StreamingMixin:
             # #2674 finding 2: a strict (buffered) POST-TOOL continuation stopped
             # before its reviewed release withheld every byte and never audited
             # the partial synthesis. Discard the whole withheld buffer (prose,
-            # parts, tool_events, tool_results) and persist an EMPTY cancelled row
-            # — matching the strict cancel-before-dispatch path — instead of
-            # persisting the unfinished synthesis (which would resurface on reload
-            # and replay into the next turn's context). Nothing is released, so the
-            # endpoint surfaces its standard stop notice exactly once. Return
+            # parts, tool_events, tool_results). Ordinarily persist an EMPTY
+            # cancelled row, matching strict cancel-before-dispatch. If Stop
+            # interrupted an already-running batch, persist the fixed host-authored
+            # completion checkpoint instead: it reveals no tool bytes but prevents
+            # the next turn from repeating an external effect. Nothing is released,
+            # so the endpoint surfaces its standard stop notice exactly once. Return
             # before the audit fire / STOP hook / memory pipeline, none of which
             # should run over discarded content. Advisory turns already streamed
             # their partial, so this is gated on ``buffer_audit``. Inlined (not a
@@ -1800,10 +1869,12 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_tool_turn()
+                if deferred_tool_batch_cancellation is not None:
+                    raise_owned_outcome(
+                        deferred_tool_batch_cancellation.outcome,
+                        operation="side-effecting orchestrator tool batch",
+                    )
                 return
             # #2674 finding 2: a strict (buffered) continuation that TIMED OUT
             # withheld every byte and yielded no reviewable text. Discard the
@@ -1919,10 +1990,7 @@ class StreamingMixin:
             if buffer_audit and request_id and self.is_request_cancelled(
                 request_id
             ):
-                await self._persist_assistant_turn_safely(
-                    "", metadata=None, session_id=session_id,
-                    request_id=request_id, response=tool_response,
-                )
+                await persist_strict_cancelled_tool_turn()
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)
@@ -2004,7 +2072,13 @@ class StreamingMixin:
                 session_id=session_id,
                 request_id=request_id,
                 response=tool_response,
+                require_success=tool_batch_completed(),
             )
+            if deferred_tool_batch_cancellation is not None:
+                raise_owned_outcome(
+                    deferred_tool_batch_cancellation.outcome,
+                    operation="side-effecting orchestrator tool batch",
+                )
             # #2674: strict-audit release. Nothing visible was streamed live this
             # turn; now that the POST_RESPONSE verdict exists, release ONLY the
             # reviewed text (block message on DENY, reviewed prose on
@@ -2459,6 +2533,7 @@ class StreamingMixin:
         response: Optional[LLMResponse] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        require_success: bool = False,
     ) -> None:
         """Persist the assistant turn under cancellation-safe handling.
 
@@ -2473,9 +2548,11 @@ class StreamingMixin:
         An explicitly owned task keeps persistence alive and is joined even
         when the outer generator is cancelled. The exception handler logs and
         emits a metric so production can detect this happening at all.
-        We never re-raise — the request is already over from the
-        client's perspective; raising here would only mask the original
-        cancellation.
+        Ordinary post-response writes remain best-effort because the response
+        may already be visible to the client. ``require_success`` is reserved
+        for a completed side-effecting tool batch: losing that checkpoint can
+        make a retry repeat the external action, so its storage failure is
+        propagated after telemetry instead of being mistaken for a clean Stop.
 
         When ``request_id`` is supplied and the request has been
         cancelled by the user (stop button), stamp ``cancelled: True``
@@ -2547,6 +2624,8 @@ class StreamingMixin:
                 raise outcome.cancellation from outcome.error
             raise outcome.cancellation
         if isinstance(outcome.error, asyncio.CancelledError):
+            raise outcome.error
+        if require_success and outcome.error is not None:
             raise outcome.error
 
     async def _fire_post_response_hook(
