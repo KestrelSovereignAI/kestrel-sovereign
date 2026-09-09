@@ -5079,9 +5079,14 @@ def _enforce_host_csrf(request: Request):
     # cookie-authenticated request cannot bypass host-feature CSRF simply by
     # spelling the same route through an agent prefix (#2382 review).
     path = request.scope.get("path", request.url.path)
-    match = _AGENT_PATH_RE.match(path)
-    if match:
-        path = "/" + match.group(2)
+    # Resolve through the SAME function the routing middleware uses, not a
+    # second regex. #2382 normalized only the literal /api/agents/{name}
+    # spelling; the lossless /api/agent-routes/{encoded} alias reaches exactly
+    # the same host-feature routes, so a private regex here silently stopped
+    # covering half of them the moment that alias was added.
+    routed = _routed_agent_path(path)
+    if routed is not None:
+        path = "/" + routed[1]
     if not is_host_feature_path(request.app, path):
         return None
     try:

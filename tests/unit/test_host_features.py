@@ -264,6 +264,43 @@ def test_agent_prefixed_host_path_still_requires_csrf():
     assert response.headers["X-Correlation-ID"]
 
 
+def test_encoded_agent_route_alias_still_requires_csrf():
+    """The lossless /api/agent-routes/{encoded} alias is the same door.
+
+    The per-agent prefix has two public spellings and MultiAgentAgentRoutingMiddleware
+    resolves both through ``_routed_agent_path`` before the route matches. The CSRF
+    gate ran its own copy of the literal regex, so the encoded spelling reached
+    host-feature routes with the boundary skipped entirely.
+    """
+    import base64
+
+    from kestrel_sovereign import server
+
+    app = FastAPI()
+    hf.mount_host_feature_routers(app, [_UIHostFeature()])
+    encoded = base64.urlsafe_b64encode(b"Kite").decode().rstrip("=")
+    path = f"/api/agent-routes/{encoded}/api/demo-host/do"
+    # Precondition: this really is the same route the literal alias reaches.
+    assert server._routed_agent_path(path) == ("Kite", "api/demo-host/do")
+
+    request = SimpleNamespace(
+        method="POST",
+        app=app,
+        url=SimpleNamespace(path=path),
+        scope={"path": path},
+        cookies={},
+        headers={},
+    )
+
+    response = server._enforce_host_csrf(request)
+
+    assert response is not None, (
+        "the encoded agent alias bypassed the host CSRF boundary"
+    )
+    assert response.status_code == 403
+    assert b'"code":"csrf_failed"' in response.body
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (AC #3)
 # ---------------------------------------------------------------------------
