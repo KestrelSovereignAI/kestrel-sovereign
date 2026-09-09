@@ -453,7 +453,24 @@ def cmd_shell(args) -> int:
 
     # Fall back to in-process agent when no server is running (or when
     # an extension is requested — see comment above).
-    return asyncio.run(_run_shell(agent_dir, args))
+    from kestrel_sovereign.host_features.storage import (
+        resolve_host_database_launch_context,
+    )
+
+    # Resolve fleet custody from the same pre-agent launch environment used by
+    # ProcessManager. Applying the selected agent root first would partition an
+    # offline shell away from a Hold set through the normal host.
+    hold_launch_context = resolve_host_database_launch_context(
+        env=spawned_agent_env(project_dir),
+        base_dir=project_dir,
+    )
+    return asyncio.run(
+        _run_shell(
+            agent_dir,
+            args,
+            host_database_launch_context=hold_launch_context,
+        )
+    )
 
 
 def _run_http_ask(
@@ -550,7 +567,12 @@ def cmd_ask(args) -> int:
     )
 
 
-async def _run_shell(agent_dir: Path, args) -> int:
+async def _run_shell(
+    agent_dir: Path,
+    args,
+    *,
+    host_database_launch_context=None,
+) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.security.encryption import DecryptionError
@@ -589,9 +611,15 @@ async def _run_shell(agent_dir: Path, args) -> int:
         initialize_with_bound_hold_context,
     )
 
+    hold_binding_kwargs = {}
+    if host_database_launch_context is not None:
+        hold_binding_kwargs["host_database_launch_context"] = (
+            host_database_launch_context
+        )
     hold_context = await initialize_with_bound_hold_context(
         agent,
         agent_data_root=agent_dir,
+        **hold_binding_kwargs,
     )
 
     # Load extension if requested

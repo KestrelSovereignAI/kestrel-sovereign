@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -584,6 +585,72 @@ class TestStartAgent:
             str((project_dir / config.data_dir).resolve())
             for config in configs.values()
         ]
+
+    def test_offline_roster_shell_matches_process_launcher_hold_custody(
+        self,
+        pm,
+        project_dir,
+    ):
+        """Mutation tripwire: both launchers must use the pre-agent resolver."""
+
+        import kestrel_sovereign.cli as cli_module
+
+        fleet_root = project_dir / "fleet-data"
+        launch_env = {"KESTREL_DB_PATH": str(fleet_root)}
+        config = LocalAgentConfig(data_dir="agent_data/claw", port=8801)
+        roster = MultiAgentConfig(agents={"claw": config})
+        captured_process_env = {}
+        captured_shell_context = None
+
+        def capture_spawn(_cmd, env, *_args, **_kwargs):
+            captured_process_env.update(env)
+            return 12345
+
+        async def capture_shell(
+            _agent_dir,
+            _args,
+            *,
+            host_database_launch_context,
+        ):
+            nonlocal captured_shell_context
+            captured_shell_context = host_database_launch_context
+            return 0
+
+        with (
+            patch.object(pm, "_load_env", return_value=dict(launch_env)),
+            patch.object(pm, "_spawn", side_effect=capture_spawn),
+        ):
+            pm.start_agent("claw", config, roster=roster)
+
+        with (
+            patch.object(cli_module, "_get_project_dir", return_value=project_dir),
+            patch.object(cli_module, "load_project_env"),
+            patch.object(cli_module.MultiAgentConfig, "load", return_value=roster),
+            patch.object(
+                cli_module,
+                "_detect_running_agent_server",
+                return_value=None,
+            ),
+            patch.object(
+                cli_module,
+                "spawned_agent_env",
+                return_value=dict(launch_env),
+            ),
+            patch.object(cli_module, "_run_shell", side_effect=capture_shell),
+        ):
+            result = cli_module.cmd_shell(
+                SimpleNamespace(name="claw", app=None)
+            )
+
+        assert result == 0
+        assert captured_shell_context is not None
+        assert str(captured_shell_context.database_path) == (
+            captured_process_env[HOST_DB_PATH_ENV]
+        )
+        assert captured_shell_context.explicit_override is False
+        assert captured_process_env[DERIVED_HOST_DB_PATH_ENV] == (
+            captured_process_env[HOST_DB_PATH_ENV]
+        )
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,

@@ -22,7 +22,10 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.host_features.storage import HostDatabaseLaunchContext
 
 from kestrel_sovereign.lifecycle_checks import (
     is_isolated_nonproduction_kite_environment,
@@ -307,6 +310,7 @@ async def build_host_context(
     *,
     config: Any = None,
     db_path: Optional[str] = None,
+    host_database_launch_context: Optional[HostDatabaseLaunchContext] = None,
 ) -> SovereignHostContext:
     """Build the host context: open a host backend + fleet session factory.
 
@@ -407,10 +411,17 @@ async def build_host_context(
         # Surviving custody evidence is authoritative even when the selected
         # SQLite file is absent or old.  Resolve and validate it before
         # preparation can create, harden, migrate, or initialize host storage.
-        preflight_path, _uses_default = host_database_path(db_path)
+        preflight_path = (
+            host_database_launch_context.database_path
+            if host_database_launch_context is not None
+            else host_database_path(db_path)[0]
+        )
         validate_hold_backend_custody(preflight_path, hold_backend)
 
-        resolved = prepare_host_database(db_path)
+        resolved = prepare_host_database(
+            db_path,
+            launch_context=host_database_launch_context,
+        )
         db = await AsyncDatabase.sqlite(str(resolved))
         validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)

@@ -20,6 +20,7 @@ from kestrel_sovereign.host_features.storage import (
     HostStorageError,
     host_database_path,
     prepare_host_database,
+    resolve_host_database_launch_context,
     validate_host_database_migration_readiness,
 )
 
@@ -553,6 +554,39 @@ def test_launcher_derived_host_path_keeps_implicit_migration_semantics(
     with sqlite3.connect(destination) as connection:
         assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
             "pre-launcher-upgrade",
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_shared_launch_context_keeps_implicit_migration_semantics(
+    tmp_path,
+    monkeypatch,
+):
+    """A typed pre-agent selection must not become an explicit override."""
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    fleet_root = tmp_path / "mounted-data"
+    destination = fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="typed-launch-upgrade")
+    previous.chmod(0o644)
+    launch_context = resolve_host_database_launch_context(
+        env={
+            "KESTREL_HOME": str(home),
+            "KESTREL_DB_PATH": str(fleet_root),
+        },
+        base_dir=tmp_path,
+    )
+
+    # Ambient agent selection is deliberately different. The resolved launch
+    # context is the authority for this open and carries its migration class.
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "agent_data" / "alice"))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    assert prepare_host_database(launch_context=launch_context) == destination
+    assert not previous.exists()
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
+            "typed-launch-upgrade",
         )
 
 

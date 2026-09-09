@@ -8,8 +8,9 @@ import os
 import shutil
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping, MutableMapping, Optional
 
 from kestrel_sovereign.paths import host_data_dir, project_dir
 from kestrel_sovereign.private_storage import (
@@ -39,6 +40,17 @@ SQLITE_AUXILIARY_SUFFIXES = ("-wal", "-shm", "-journal")
 HostStorageError = PrivateStorageError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class HostDatabaseLaunchContext:
+    """One resolved host-store selection shared by every launch surface."""
+
+    database_path: Path
+    uses_default: bool
+    explicit_override: bool
+    previous_default: Path
+    legacy_database_path: Path
 
 
 def _runtime_path(value: str, env: Mapping[str, str], base_dir: Path) -> Path:
@@ -101,6 +113,60 @@ def host_database_path(
             False,
         )
     return _default_host_database_path(runtime_env, runtime_base), True
+
+
+def resolve_host_database_launch_context(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    base_dir: Optional[Path] = None,
+) -> HostDatabaseLaunchContext:
+    """Resolve host custody before a launcher applies an agent-root override.
+
+    A launcher-derived ``KESTREL_HOST_DB_PATH`` is an exact path pin, not an
+    operator override. Recording that distinction here keeps migration policy
+    identical for an in-process shell and a spawned server.
+    """
+
+    runtime_env = os.environ if env is None else env
+    runtime_base = absolute_without_following_leaf(base_dir or Path.cwd())
+    database_path, uses_default = host_database_path(
+        env=runtime_env,
+        base_dir=runtime_base,
+    )
+    configured_host_path = runtime_env.get(HOST_DB_PATH_ENV)
+    derived_host_path = runtime_env.get(DERIVED_HOST_DB_PATH_ENV)
+    explicit_override = bool(
+        configured_host_path and derived_host_path != configured_host_path
+    )
+    configured_project_root = runtime_env.get("KESTREL_HOME")
+    launch_project_root = (
+        _runtime_path(configured_project_root, runtime_env, runtime_base)
+        if configured_project_root
+        else runtime_base
+    )
+    return HostDatabaseLaunchContext(
+        database_path=database_path,
+        uses_default=uses_default,
+        explicit_override=explicit_override,
+        previous_default=_default_host_database_path(runtime_env, runtime_base),
+        legacy_database_path=launch_project_root / LEGACY_HOST_DB_FILENAME,
+    )
+
+
+def pin_host_database_launch_context(
+    env: MutableMapping[str, str],
+    *,
+    base_dir: Optional[Path] = None,
+) -> HostDatabaseLaunchContext:
+    """Pin one host path into a child environment without reclassifying it."""
+
+    context = resolve_host_database_launch_context(env=env, base_dir=base_dir)
+    env[HOST_DB_PATH_ENV] = str(context.database_path)
+    if context.explicit_override:
+        env.pop(DERIVED_HOST_DB_PATH_ENV, None)
+    else:
+        env[DERIVED_HOST_DB_PATH_ENV] = str(context.database_path)
+    return context
 
 
 def legacy_host_database_path() -> Path:
@@ -486,25 +552,39 @@ def _migrate_prior_database(
         )
 
 
-def prepare_host_database(db_path: Optional[str] = None) -> Path:
+def prepare_host_database(
+    db_path: Optional[str] = None,
+    *,
+    launch_context: Optional[HostDatabaseLaunchContext] = None,
+) -> Path:
     """Resolve, migrate, and securely pre-create the host-feature database.
 
     Pre-creating the main file as ``0600`` is the secure-at-creation boundary
     for SQLite on POSIX. The standard Unix VFS creates WAL/journal/SHM files
     with the main database's exact mode, independent of the process umask.
     """
-    destination, uses_default = host_database_path(db_path)
-    configured_host_path = os.environ.get(HOST_DB_PATH_ENV)
-    derived_host_path = os.environ.get(DERIVED_HOST_DB_PATH_ENV)
-    launcher_derived_override = bool(
-        not db_path
-        and configured_host_path
-        and derived_host_path == configured_host_path
-    )
-    explicit_override = bool(
-        db_path or (configured_host_path and not launcher_derived_override)
-    )
-    previous_default = host_data_dir() / HOST_FEATURE_DB_FILENAME
+    if db_path is not None and launch_context is not None:
+        raise ValueError("db_path and launch_context are mutually exclusive")
+    if launch_context is None:
+        destination, uses_default = host_database_path(db_path)
+        configured_host_path = os.environ.get(HOST_DB_PATH_ENV)
+        derived_host_path = os.environ.get(DERIVED_HOST_DB_PATH_ENV)
+        launcher_derived_override = bool(
+            not db_path
+            and configured_host_path
+            and derived_host_path == configured_host_path
+        )
+        explicit_override = bool(
+            db_path or (configured_host_path and not launcher_derived_override)
+        )
+        previous_default = host_data_dir() / HOST_FEATURE_DB_FILENAME
+        legacy_database = legacy_host_database_path()
+    else:
+        destination = launch_context.database_path
+        uses_default = launch_context.uses_default
+        explicit_override = launch_context.explicit_override
+        previous_default = launch_context.previous_default
+        legacy_database = launch_context.legacy_database_path
     follows_agent_data_root = not explicit_override and destination != previous_default
     parent = destination.parent
     if uses_default:
@@ -524,7 +604,7 @@ def prepare_host_database(db_path: Optional[str] = None) -> Path:
                     previous_default,
                 )
             )
-        sources.append(("legacy host database", legacy_host_database_path()))
+        sources.append(("legacy host database", legacy_database))
         _migrate_prior_database(destination, tuple(sources))
 
     _harden_existing_family(destination, label="host database")
@@ -539,10 +619,13 @@ __all__ = [
     "HOST_DB_PATH_ENV",
     "HOST_FEATURE_DB_FILENAME",
     "LEGACY_HOST_DB_FILENAME",
+    "HostDatabaseLaunchContext",
     "HostStorageError",
     "host_database_path",
     "legacy_host_database_path",
+    "pin_host_database_launch_context",
     "prepare_host_database",
+    "resolve_host_database_launch_context",
     "sqlite_family",
     "validate_host_database_parent_readiness",
     "validate_host_database_migration_readiness",

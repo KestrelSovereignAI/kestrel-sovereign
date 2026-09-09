@@ -174,12 +174,12 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
     )
 
     assert result is context
-    assert observed == {
-        "config": {"mode": "test"},
-        "db_path": str(
-            selected_root.resolve() / "host-data" / "host-features.db"
-        ),
-    }
+    assert observed["config"] == {"mode": "test"}
+    launch_context = observed["host_database_launch_context"]
+    assert launch_context.database_path == (
+        selected_root.resolve() / "host-data" / "host-features.db"
+    )
+    assert launch_context.explicit_override is False
     assert agent._hold_store is context.hold_store
 
 
