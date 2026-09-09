@@ -388,23 +388,35 @@ def bind_async_invocation(
                         )
 
                         async def run_isolated_operation() -> _T:
-                            if transition_delegation is None:
-                                return await function(*bound.args, **bound.kwargs)
-                            bind_transition_delegation = getattr(
-                                type(lifecycle_owner),
-                                "_bind_committed_feature_transition_delegation",
-                                None,
+                            # A streamed command has already linearized Hold in
+                            # the generator owner. Transfer that exact snapshot
+                            # only to this explicitly created execution task;
+                            # arbitrary child tasks still perform a fresh read.
+                            from kestrel_sovereign.hold.enforcement import (
+                                _adopt_turn_admission_snapshot,
                             )
-                            if not callable(bind_transition_delegation):
-                                raise TypeError(
-                                    "committed feature-transition authority "
-                                    "cannot be delegated"
-                                )
-                            with bind_transition_delegation(
+
+                            with _adopt_turn_admission_snapshot(
                                 lifecycle_owner,
-                                transition_delegation,
+                                from_task=caller_task,
                             ):
-                                return await function(*bound.args, **bound.kwargs)
+                                if transition_delegation is None:
+                                    return await function(*bound.args, **bound.kwargs)
+                                bind_transition_delegation = getattr(
+                                    type(lifecycle_owner),
+                                    "_bind_committed_feature_transition_delegation",
+                                    None,
+                                )
+                                if not callable(bind_transition_delegation):
+                                    raise TypeError(
+                                        "committed feature-transition authority "
+                                        "cannot be delegated"
+                                    )
+                                with bind_transition_delegation(
+                                    lifecycle_owner,
+                                    transition_delegation,
+                                ):
+                                    return await function(*bound.args, **bound.kwargs)
 
                         isolated_operation = asyncio.create_task(
                             run_isolated_operation(),

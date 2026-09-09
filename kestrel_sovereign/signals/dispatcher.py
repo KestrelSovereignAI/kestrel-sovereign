@@ -115,6 +115,7 @@ from kestrel_sdk.signals import (
 from kestrel_sovereign.agent.invocation import register_request_delivery
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.security.encryption import (
     DecryptionError,
     MasterKeyNotConfiguredError,
@@ -4132,6 +4133,15 @@ class SignalDispatcher:
                 artifact=stopped.artifact,
                 action_result=stopped.action_result,
                 error=stopped.error,
+            )
+        except HoldTurnRefusal as exc:
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=exc.wire_json(),
+                registration=registration,
+                audit=audit,
             )
         except Exception as e:
             # Codex round-3 P2: if process_input raises, the audit

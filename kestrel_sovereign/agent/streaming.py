@@ -1014,6 +1014,16 @@ class StreamingMixin:
             invocation_provenance: Endpoint-owned authenticated actor and
                 transport metadata bound task-locally for governed tools.
         """
+        from kestrel_sovereign.hold import require_turn_start_allowed
+        from kestrel_sovereign.hold.enforcement import (
+            _reuse_turn_admission_snapshot,
+        )
+
+        # Match ``process_input`` at the universal turn-start seam. Raising a
+        # typed refusal before the first yield lets each source preserve its
+        # transport semantics without rendering agent-authored rejection text.
+        hold_admission = await require_turn_start_allowed(self)
+
         # Match process_input's retryable pre-initialization behavior. Without
         # storage there is no durable genesis receipt to inspect yet.
         if getattr(self, "storage", None) is None:
@@ -1092,14 +1102,15 @@ class StreamingMixin:
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
                 try:
-                    result = await self.process_input(
-                        user_input,
-                        model_override,
-                        session_id=session_id,
-                        caller=caller,
-                        invocation_context=invocation_context,
-                        invocation_id=current_invocation_id(),
-                    )
+                    with _reuse_turn_admission_snapshot(self, hold_admission):
+                        result = await self.process_input(
+                            user_input,
+                            model_override,
+                            session_id=session_id,
+                            caller=caller,
+                            invocation_context=invocation_context,
+                            invocation_id=current_invocation_id(),
+                        )
                 except InvocationCancelledError:
                     # The command delegate owns an isolated child so Stop does
                     # not cancel a persistent transport task. Its typed unwind

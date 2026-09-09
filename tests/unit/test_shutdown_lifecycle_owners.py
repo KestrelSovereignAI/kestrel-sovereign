@@ -369,16 +369,18 @@ async def test_server_shutdown_drains_host_agent_and_phoenix_after_failures(
 
     cancelled, failure = await server._shutdown_server_resources(app)
 
+    # Stop tails drain while their agents and the host-owned Hold context are
+    # still live. Agents drain next; only then may host features close Hold.
     assert phases == [
-        "host",
         "stop-cleanup",
         "agents",
+        "host",
         "stop-receipts",
         "phoenix",
     ]
     assert cancelled is False
     assert isinstance(failure, RuntimeError)
-    assert str(failure) == "host failure"
+    assert str(failure) == "agent failure"
 
 
 @pytest.mark.asyncio
@@ -724,6 +726,9 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
         def reconcile_spawn_authority_restart_roster(self, config):
             return config
 
+        def bind_hold_store(self, store) -> None:
+            assert store is not None
+
         def set_agent_registration_hook(self, _hook) -> None:
             return None
 
@@ -802,6 +807,9 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
 
         def set_created_agent_registration_removal_hook(self, _hook) -> None:
             return None
+
+        def bind_hold_store(self, store) -> None:
+            assert store is not None
 
         def set_agent_registration_hook(self, _hook) -> None:
             return None

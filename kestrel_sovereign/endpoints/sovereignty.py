@@ -30,6 +30,7 @@ from kestrel_sovereign.features.sovereignty.artifacts import (
     owned_artifacts,
     owned_content_hashes,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +385,8 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
         raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception as e:

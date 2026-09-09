@@ -386,6 +386,10 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             assert backend is shared_backend
             events.append("backend-bind")
 
+        def bind_hold_store(self, store) -> None:
+            assert store is hold_store
+            events.append("hold-bind")
+
         async def load_from_config(
             self,
             config,
@@ -580,6 +584,7 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
         "stop-receipts",
         "reconcile",
         "context-build",
+        "hold-bind",
         "backend-start",
         "backend-bind",
         "preflight",

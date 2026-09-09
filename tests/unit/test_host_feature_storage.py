@@ -15,11 +15,16 @@ import pytest
 from kestrel_sovereign.host_features.context import build_host_context
 from kestrel_sovereign.host_features.storage import (
     DERIVED_HOST_DB_PATH_ENV,
+    HOST_DB_LEGACY_PATH_ENV,
     HOST_DB_PATH_ENV,
+    HOST_DB_PREVIOUS_DEFAULT_ENV,
+    HOST_DB_USES_DEFAULT_ENV,
     HOST_FEATURE_DB_FILENAME,
     HostStorageError,
     host_database_path,
+    pin_host_database_launch_context,
     prepare_host_database,
+    resolve_host_database_launch_context,
     validate_host_database_migration_readiness,
 )
 
@@ -247,6 +252,44 @@ async def test_default_migrates_and_hardens_stopped_legacy_database(
         assert _mode(destination.parent) == 0o700
         assert _mode(destination) == 0o600
         assert await ctx.db.fetchval("SELECT value FROM legacy_probe") == "history"
+    finally:
+        await _close_context(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+async def test_server_launch_from_nested_cwd_migrates_project_root_legacy_database(
+    tmp_path,
+    monkeypatch,
+):
+    """Launch CWD resolves relative inputs, not the project-root legacy store."""
+    import kestrel_sovereign.host_features.storage as storage_module
+
+    project_root = tmp_path / "project"
+    nested_cwd = project_root / "nested"
+    nested_cwd.mkdir(parents=True)
+    legacy = project_root / "kestrel_host.db"
+    _create_legacy_sqlite(legacy, value="project-root-history")
+    legacy.chmod(0o644)
+    operator_home = tmp_path / "operator-home"
+    monkeypatch.chdir(nested_cwd)
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.delenv("KESTREL_HOME", raising=False)
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+    monkeypatch.setattr(storage_module, "project_dir", lambda: project_root)
+
+    ctx = await build_host_context()
+    destination = (
+        operator_home / ".kestrel" / "host-data" / HOST_FEATURE_DB_FILENAME
+    )
+    try:
+        assert ctx.db is not None
+        assert not legacy.exists()
+        assert destination.exists()
+        assert await ctx.db.fetchval("SELECT value FROM legacy_probe") == (
+            "project-root-history"
+        )
     finally:
         await _close_context(ctx)
 
@@ -554,6 +597,109 @@ def test_launcher_derived_host_path_keeps_implicit_migration_semantics(
         assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
             "pre-launcher-upgrade",
         )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+def test_shared_launch_context_keeps_implicit_migration_semantics(
+    tmp_path,
+    monkeypatch,
+):
+    """A typed pre-agent selection must not become an explicit override."""
+
+    home = tmp_path / "kestrel-home"
+    previous = home / "host-data" / HOST_FEATURE_DB_FILENAME
+    fleet_root = tmp_path / "mounted-data"
+    destination = fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
+    _create_legacy_sqlite(previous, value="typed-launch-upgrade")
+    previous.chmod(0o644)
+    launch_context = resolve_host_database_launch_context(
+        env={
+            "KESTREL_HOME": str(home),
+            "KESTREL_DB_PATH": str(fleet_root),
+        },
+        base_dir=tmp_path,
+    )
+
+    # Ambient agent selection is deliberately different. The resolved launch
+    # context is the authority for this open and carries its migration class.
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path / "agent_data" / "alice"))
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    assert prepare_host_database(launch_context=launch_context) == destination
+    assert not previous.exists()
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT value FROM legacy_probe").fetchone() == (
+            "typed-launch-upgrade",
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX custody contract")
+def test_pinned_default_launch_keeps_default_path_custody(tmp_path):
+    """A child hardens the launcher's default instead of treating it as custom."""
+
+    operator_home = tmp_path / "operator-home"
+    host_parent = operator_home / ".kestrel" / "host-data"
+    host_parent.mkdir(parents=True)
+    host_parent.chmod(0o755)
+    launch_env = {"HOME": str(operator_home)}
+
+    parent_context = pin_host_database_launch_context(
+        launch_env,
+        base_dir=tmp_path,
+        project_root=tmp_path,
+    )
+    launch_env["KESTREL_DB_PATH"] = str(tmp_path / "agent_data" / "claw")
+    child_context = resolve_host_database_launch_context(
+        env=launch_env,
+        base_dir=tmp_path,
+    )
+
+    assert parent_context.uses_default is True
+    assert launch_env[HOST_DB_USES_DEFAULT_ENV] == "1"
+    assert launch_env[HOST_DB_PREVIOUS_DEFAULT_ENV] == str(
+        parent_context.previous_default
+    )
+    assert launch_env[HOST_DB_LEGACY_PATH_ENV] == str(
+        parent_context.legacy_database_path
+    )
+    assert child_context == parent_context
+    assert prepare_host_database(launch_context=child_context) == (
+        operator_home / ".kestrel" / "host-data" / HOST_FEATURE_DB_FILENAME
+    )
+    assert _mode(host_parent) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_build_context_uses_one_typed_backend_snapshot(tmp_path, monkeypatch):
+    """Offline/direct opens never mix a launch path with ambient backend config."""
+
+    launch_root = tmp_path / "launch-root"
+    launch_context = resolve_host_database_launch_context(
+        env={
+            "HOME": str(tmp_path / "launch-home"),
+            "KESTREL_DB_PATH": str(launch_root),
+            "KESTREL_DB_BACKEND": "sqlite",
+            "KESTREL_HOLD_BACKEND": "sqlite",
+            "KESTREL_DATABASE_URL": "postgresql://launch-primary/kestrel",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://launch-evidence/kestrel"
+            ),
+        },
+        base_dir=tmp_path,
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "postgres")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("KESTREL_HOLD_EVIDENCE_DATABASE_URL", raising=False)
+
+    ctx = await build_host_context(
+        host_database_launch_context=launch_context,
+    )
+    try:
+        assert ctx.db is not None
+        assert ctx.backend_error == ""
+        assert ctx.db.backend.db_path == str(launch_context.database_path)
+    finally:
+        await _close_context(ctx)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")

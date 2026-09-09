@@ -809,9 +809,11 @@ class AgentManager:
             ]
         ] = None,
         shared_postgres_backend: object | None = None,
+        hold_store: object | None = None,
     ):
         self._validate_shared_postgres_backend(shared_postgres_backend)
         self._agents: dict[str, KestrelAgent] = {}
+        self._hold_store = hold_store
         self._agent_names: dict[str, str] = {}  # agent_id -> name (reverse lookup)
         self._parent_children: dict[str, list[str]] = {}  # parent_did -> [child_name]
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
@@ -1131,6 +1133,19 @@ class AgentManager:
                 "shared PostgreSQL backend must be bound before agent initialization"
             )
         self._shared_postgres_backend = backend
+
+    def bind_hold_store(self, store: object) -> None:
+        """Bind durable Hold admission before any hosted agent initializes."""
+
+        if store is None:
+            raise TypeError("hold_store must be a concrete store")
+        if self._hold_store is not None:
+            if self._hold_store is store:
+                return
+            raise RuntimeError("Hold store is already bound")
+        if self._agents or self._agent_operations or self._initializing_agents:
+            raise RuntimeError("Hold store must be bound before agent initialization")
+        self._hold_store = store
 
     def _load_startup_config(self, config_path: Path) -> MultiAgentConfig:
         """Reload a roster using the same runtime context as initial startup."""
@@ -2695,6 +2710,10 @@ class AgentManager:
                     ),
                 )
 
+            # Ready hooks may invoke cognition during initialize(), while the
+            # candidate is still private. Bind the load-bearing Hold store
+            # before that lifecycle begins rather than at routing publication.
+            agent._hold_store = self._hold_store
             self._initializing_agents[name] = agent
             if admission is not None and admission.candidate_staged_event is not None:
                 admission.candidate_staged_event.set()
@@ -5459,6 +5478,8 @@ class AgentManager:
         arm_restored_ttl: bool = True,
     ) -> None:
         """Publish one fully initialized agent to the co-hosted fleet."""
+        if self._hold_store is not None:
+            agent._hold_store = self._hold_store
         agent_id = _loaded_agent_did(agent)
         if not isinstance(agent_id, str) or not agent_id:
             raise RuntimeError(

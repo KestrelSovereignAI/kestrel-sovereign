@@ -39,6 +39,7 @@ from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
@@ -3389,6 +3390,8 @@ async def chat_completions(request: Request, http_response: Response):
         raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent
         # when no agent is bound — multi-agent mode requires the

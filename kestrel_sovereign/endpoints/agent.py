@@ -51,6 +51,7 @@ from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
@@ -664,6 +665,8 @@ async def invoke_agent(request: Request, http_response: Response):
         }
     except InvocationSelfFencedError as error:
         raise self_fenced_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception:
@@ -1010,6 +1013,8 @@ async def stream_agent_response(request: Request):
                 # has yielded. Its typed unwind is acknowledged Stop even if
                 # nested cleanup already consumed the cancellation marker.
                 yield stop_notice
+            except HoldTurnRefusal as exc:
+                yield exc.wire_json() + "\n"
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation

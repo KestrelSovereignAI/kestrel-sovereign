@@ -54,6 +54,7 @@ from kestrel_sovereign._async_ownership import OwnedAsyncIterator
 from kestrel_sovereign.endpoints.closing_streaming_response import (
     ClosingStreamingResponse,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 
 from .protocol import (
     BridgeCapabilitiesResponse,
@@ -233,6 +234,8 @@ def get_router() -> APIRouter:
                 raise self_fenced_invocation_http_error(request_id) from error
             except InvocationCancelledError as error:
                 raise stopped_invocation_http_error(request_id) from error
+            except HoldTurnRefusal as exc:
+                raise exc.as_http_exception() from exc
             except Exception:
                 # Exception text and tracebacks can contain bridge
                 # message/context content. Keep both client and logs bounded.
@@ -485,6 +488,8 @@ def get_router() -> APIRouter:
                 # nested lifecycle may consume its marker before the exception
                 # crosses the owned iterator, so preserve the typed outcome.
                 yield stopped_event()
+            except HoldTurnRefusal as exc:
+                yield f"event: refusal\ndata: {exc.wire_json()}\n\n"
             except Exception as e:
                 # The SSE client gets only the stable safe payload built by
                 # the same shared boundary /api/agent/stream uses.  Logging

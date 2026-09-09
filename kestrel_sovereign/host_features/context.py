@@ -22,7 +22,10 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.host_features.storage import HostDatabaseLaunchContext
 
 from kestrel_sovereign.lifecycle_checks import (
     is_isolated_nonproduction_kite_environment,
@@ -307,6 +310,7 @@ async def build_host_context(
     *,
     config: Any = None,
     db_path: Optional[str] = None,
+    host_database_launch_context: Optional[HostDatabaseLaunchContext] = None,
 ) -> SovereignHostContext:
     """Build the host context: open a host backend + fleet session factory.
 
@@ -342,20 +346,32 @@ async def build_host_context(
             validate_hold_backend_custody,
         )
         from kestrel_sovereign.host_features.storage import (
-            host_database_path,
             prepare_host_database,
+            resolve_host_database_launch_context,
             validate_sqlite_family_private,
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.sqla.session import make_session_factory
 
+        if db_path is not None and host_database_launch_context is not None:
+            raise ValueError(
+                "db_path and host_database_launch_context are mutually exclusive"
+            )
+        launch_context = host_database_launch_context
+        if launch_context is None:
+            launch_context = resolve_host_database_launch_context(
+                env=os.environ,
+                db_path=db_path,
+            )
+        launch_env = launch_context.backend_env()
+
         # Configuration validation is a read-only preflight. In particular it
         # must precede ``prepare_host_database``: that function may securely
         # create the SQLite file or migrate a legacy store, and a rejected Hold
         # configuration has no authority to mutate either one.
-        backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite").lower()
-        dsn = os.environ.get("KESTREL_DATABASE_URL")
-        configured_hold_backend = os.environ.get("KESTREL_HOLD_BACKEND")
+        backend = launch_env.get("KESTREL_DB_BACKEND", "sqlite").lower()
+        dsn = launch_env.get("KESTREL_DATABASE_URL")
+        configured_hold_backend = launch_env.get("KESTREL_HOLD_BACKEND")
         evidence_dsn = None
         external_pair_id = None
         if configured_hold_backend is None:
@@ -371,7 +387,7 @@ async def build_host_context(
             if (
                 hold_backend == "sqlite"
                 and backend == "postgres"
-                and not is_isolated_nonproduction_kite_environment(os.environ)
+                and not is_isolated_nonproduction_kite_environment(launch_env)
             ):
                 raise RuntimeError(
                     "PostgreSQL runtimes may select SQLite Hold only inside "
@@ -383,7 +399,7 @@ async def build_host_context(
                 raise RuntimeError(
                     "KESTREL_DATABASE_URL is required for PostgreSQL Hold state"
                 )
-            evidence_dsn = os.environ.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
+            evidence_dsn = launch_env.get("KESTREL_HOLD_EVIDENCE_DATABASE_URL")
             if not evidence_dsn:
                 raise RuntimeError(
                     "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required for "
@@ -395,9 +411,9 @@ async def build_host_context(
                     "independent rollback domain"
                 )
             external_pair_id = configured_postgres_hold_pair_id(
-                os.environ,
+                launch_env,
                 required=(
-                    os.environ.get("KESTREL_DEPLOYMENT_PERSISTENCE", "")
+                    launch_env.get("KESTREL_DEPLOYMENT_PERSISTENCE", "")
                     .strip()
                     .lower()
                     == "durable_sovereign"
@@ -407,10 +423,10 @@ async def build_host_context(
         # Surviving custody evidence is authoritative even when the selected
         # SQLite file is absent or old.  Resolve and validate it before
         # preparation can create, harden, migrate, or initialize host storage.
-        preflight_path, _uses_default = host_database_path(db_path)
+        preflight_path = launch_context.database_path
         validate_hold_backend_custody(preflight_path, hold_backend)
 
-        resolved = prepare_host_database(db_path)
+        resolved = prepare_host_database(launch_context=launch_context)
         db = await AsyncDatabase.sqlite(str(resolved))
         validate_sqlite_family_private(resolved)
         inner = make_session_factory(db)
