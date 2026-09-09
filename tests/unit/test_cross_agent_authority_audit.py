@@ -9047,12 +9047,12 @@ def _source_text_may_expose_provenance(source: str) -> bool:
 
 
 def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
-    """Recognize caller-supplied attribution without tainting verified identity.
+    """Recognize attribution that has not been authorized for the target.
 
-    A signed-envelope verdict or trusted ``CallerContext`` may expose a field
-    named ``sender`` as an authenticated principal.  The identically named
-    value inside an A2A ``metadata`` mapping is only a caller claim, so it is
-    provenance when code tries to use it as an authority decision.
+    Signature verification authenticates a principal but does not grant that
+    principal relation authority.  Both a raw metadata claim and an
+    authenticated-yet-unauthorized verdict field therefore remain provenance
+    when code tries to use them as an authority decision.
     """
 
     descendants = tuple(ast.walk(node))
@@ -9064,6 +9064,10 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
         getattr(child, "_authority_verified_attribution", False)
         for child in descendants
     )
+    has_authenticated = any(
+        getattr(child, "_authority_authenticated_attribution", False)
+        for child in descendants
+    )
     has_witness = any(
         getattr(child, "_authority_identity_witness", False)
         for child in descendants
@@ -9071,7 +9075,7 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
     if (
         isinstance(node, ast.BoolOp)
         and isinstance(node.op, ast.And)
-        and has_verified
+        and (has_verified or has_authenticated)
         and has_witness
         and not has_explicit_unverified
     ):
@@ -9081,6 +9085,18 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
         and _call_name(node).casefold() == "_a2a_sender_witness_unchanged"
         and has_witness
         and not has_explicit_unverified
+    ):
+        return False
+    if (
+        has_authenticated
+        and has_witness
+        and not has_explicit_unverified
+        and any(
+            isinstance(child, ast.Call)
+            and _call_name(child).casefold()
+            == "_a2a_sender_witness_unchanged"
+            for child in descendants
+        )
     ):
         return False
 
@@ -9101,9 +9117,14 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
             return False
         if getattr(current, "_authority_unverified_attribution", False):
             return True
-        # A field resolved from a trusted verdict or identity witness shields
-        # the receiver marker beneath it. Walk recursively rather than through
-        # ``ast.walk`` so descendants of this proven value are not re-tainted.
+        # Authentication is tracked separately below when it directly selects
+        # a protected control. Shield the verification-result receiver here so
+        # ordinary authorization plumbing is not reclassified as a raw claim.
+        if getattr(current, "_authority_authenticated_attribution", False):
+            return False
+        # A value returned by a target authorization seam shields the receiver
+        # marker beneath it. Walk recursively rather than through ``ast.walk``
+        # so descendants of this authorized value are not re-tainted.
         if getattr(current, "_authority_verified_attribution", False):
             return False
         if getattr(current, "_authority_identity_witness", False):
@@ -9145,6 +9166,7 @@ _ATTRIBUTION_UNTRUSTED_MAPPING = ("identity", "untrusted-mapping")
 _ATTRIBUTION_UNTRUSTED_CLAIM = ("identity", "untrusted-claim")
 _ATTRIBUTION_VERIFIED_MAPPING = ("identity", "verified-mapping")
 _ATTRIBUTION_VERIFIED_VALUE = ("identity", "verified-value")
+_ATTRIBUTION_AUTHENTICATED_VALUE = ("identity", "authenticated-value")
 _ATTRIBUTION_VERIFICATION_RESULT = ("identity", "verification-result")
 _ATTRIBUTION_ENVELOPE_VERIFIER = ("identity", "envelope-verifier")
 _ATTRIBUTION_IDENTITY_WITNESS = ("identity", "identity-witness")
@@ -9321,6 +9343,7 @@ def _unverified_attribution_aliases(
             "_authority_attribution_validator",
             "_authority_static_string",
             "_authority_unverified_attribution",
+            "_authority_authenticated_attribution",
             "_authority_identity_witness",
             "_authority_verification_result",
             "_authority_verified_attribution",
@@ -9385,6 +9408,7 @@ def _unverified_attribution_aliases(
     untrusted = {
         _ATTRIBUTION_UNTRUSTED_MAPPING,
         _ATTRIBUTION_UNTRUSTED_CLAIM,
+        _ATTRIBUTION_AUTHENTICATED_VALUE,
     }
     verified = {
         _ATTRIBUTION_VERIFIED_MAPPING,
@@ -9408,7 +9432,7 @@ def _unverified_attribution_aliases(
         if isinstance(value, ast.Subscript):
             receiver = value.value
             if flow.resolve(receiver) == _ATTRIBUTION_IDENTITY_WITNESS:
-                return _ATTRIBUTION_VERIFIED_VALUE
+                return _ATTRIBUTION_AUTHENTICATED_VALUE
             field = resolved_key(value.slice)
             if field is None:
                 return None
@@ -9422,7 +9446,7 @@ def _unverified_attribution_aliases(
             return _ATTRIBUTION_UNTRUSTED_MAPPING
         receiver_binding = flow.resolve(receiver)
         if receiver_binding == _ATTRIBUTION_IDENTITY_WITNESS:
-            return _ATTRIBUTION_VERIFIED_VALUE
+            return _ATTRIBUTION_AUTHENTICATED_VALUE
         if receiver_binding == _ATTRIBUTION_VERIFICATION_RESULT:
             if field in {
                 "nonce",
@@ -9430,7 +9454,9 @@ def _unverified_attribution_aliases(
                 "verification_document_fingerprint",
                 "verified",
             }:
-                return _ATTRIBUTION_VERIFIED_VALUE
+                # Signature verification authenticates an identity. It does
+                # not authorize that identity to control the selected target.
+                return _ATTRIBUTION_AUTHENTICATED_VALUE
             return _ATTRIBUTION_UNTRUSTED_CLAIM
         if field in UNVERIFIED_ATTRIBUTION_METADATA_KEYS:
             if receiver_binding in untrusted:
@@ -9481,7 +9507,7 @@ def _unverified_attribution_aliases(
                     for argument in value.args
                 )
             ):
-                return _ATTRIBUTION_VERIFIED_VALUE
+                return _ATTRIBUTION_AUTHENTICATED_VALUE
             parameter_flow = (parameter_return_flows or {}).get(
                 _call_name(value).casefold()
             )
@@ -9500,6 +9526,8 @@ def _unverified_attribution_aliases(
                     ):
                         return _ATTRIBUTION_UNTRUSTED_CLAIM
                     return _ATTRIBUTION_UNTRUSTED_MAPPING
+                if _ATTRIBUTION_AUTHENTICATED_VALUE in returned:
+                    return _ATTRIBUTION_AUTHENTICATED_VALUE
                 if returned and all(binding in verified for binding in returned):
                     return _ATTRIBUTION_VERIFIED_VALUE
             if isinstance(value.func, ast.Attribute):
@@ -9535,9 +9563,17 @@ def _unverified_attribution_aliases(
                 return _ATTRIBUTION_UNTRUSTED_CLAIM
             if (
                 _is_provenance_transform_call(value)
-                and any(binding in verified for binding in supplied)
+                and any(
+                    binding in verified
+                    or binding == _ATTRIBUTION_AUTHENTICATED_VALUE
+                    for binding in supplied
+                )
             ):
-                return _ATTRIBUTION_VERIFIED_VALUE
+                return (
+                    _ATTRIBUTION_AUTHENTICATED_VALUE
+                    if _ATTRIBUTION_AUTHENTICATED_VALUE in supplied
+                    else _ATTRIBUTION_VERIFIED_VALUE
+                )
         if isinstance(value, ast.Dict):
             identity_entries = [
                 flow.resolve(item)
@@ -9567,6 +9603,8 @@ def _unverified_attribution_aliases(
             nested = [flow.resolve(child) for child in ast.iter_child_nodes(value)]
             if _ATTRIBUTION_UNTRUSTED_CLAIM in nested:
                 return _ATTRIBUTION_UNTRUSTED_CLAIM
+            if _ATTRIBUTION_AUTHENTICATED_VALUE in nested:
+                return _ATTRIBUTION_AUTHENTICATED_VALUE
             if (
                 isinstance(value, ast.BoolOp)
                 and isinstance(value.op, ast.And)
@@ -9596,6 +9634,10 @@ def _unverified_attribution_aliases(
         # every helper that consumes metadata.
         if _ATTRIBUTION_UNTRUSTED_MAPPING in bindings:
             return _ATTRIBUTION_UNTRUSTED_MAPPING
+        # Authentication cannot be promoted to target authorization merely by
+        # merging it with a stronger value on another control-flow path.
+        if _ATTRIBUTION_AUTHENTICATED_VALUE in bindings:
+            return _ATTRIBUTION_AUTHENTICATED_VALUE
         if bindings and all(binding == bindings[0] for binding in bindings[1:]):
             return bindings[0]
         # Mixed or partially-bound validators are not proof of identity.
@@ -9604,6 +9646,8 @@ def _unverified_attribution_aliases(
     def annotate(value: ast.AST, binding: _StaticBinding) -> None:
         if binding == _ATTRIBUTION_UNTRUSTED_CLAIM:
             setattr(value, "_authority_unverified_attribution", True)
+        elif binding == _ATTRIBUTION_AUTHENTICATED_VALUE:
+            setattr(value, "_authority_authenticated_attribution", True)
         elif binding == _ATTRIBUTION_VERIFIED_VALUE:
             setattr(value, "_authority_verified_attribution", True)
         elif binding == _ATTRIBUTION_VERIFICATION_RESULT:
@@ -14098,6 +14142,81 @@ def _try_flow_uses_provenance_as_control(
     )
 
 
+_A2A_IDENTITY_PLUMBING_CALLS = frozenset(
+    {
+        "_a2a_inbound_current_scope_is_valid",
+        "_a2a_inbound_requires_verified_sender",
+        "_a2a_inbound_scope_snapshot",
+        "_a2a_inbound_scope_unchanged",
+        "_a2a_sender_witness_unchanged",
+        "_authorize_verified_a2a_sender",
+        "a2a_hosted_policy_for",
+        "a2a_sender_identity_witness",
+        "authorize_a2a_legacy_unsigned_sender",
+        "authorize_legacy",
+    }
+)
+
+
+def _authenticated_identity_selects_protected_control(
+    roots: ast.AST | list[ast.AST],
+    control_aliases: set[str],
+    state_object_aliases: set[str],
+) -> bool:
+    """Whether authenticated identity directly selects a governed effect.
+
+    Authentication and identity-stability plumbing may choose how target
+    authorization is established. It may not itself choose an unrelated
+    lifecycle or state mutation: key ownership is not relation authority.
+    """
+
+    class ProtectedControlVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_Call(self, call: ast.Call) -> None:  # noqa: N802
+            if _call_name(call).casefold() in _A2A_IDENTITY_PLUMBING_CALLS:
+                return
+            if _is_cross_agent_control_call(
+                call, control_aliases, state_object_aliases
+            ) or _is_cross_agent_state_mutation_call(
+                call, state_object_aliases
+            ):
+                self.found = True
+                return
+            self.generic_visit(call)
+
+        def generic_visit(self, current: ast.AST) -> None:
+            if self.found:
+                return
+            if _is_cross_agent_state_mutation_node(
+                current, state_object_aliases
+            ):
+                self.found = True
+                return
+            super().generic_visit(current)
+
+        def visit_FunctionDef(self, _node: ast.FunctionDef) -> None:  # noqa: N802
+            return
+
+        def visit_AsyncFunctionDef(  # noqa: N802
+            self, _node: ast.AsyncFunctionDef
+        ) -> None:
+            return
+
+        def visit_ClassDef(self, _node: ast.ClassDef) -> None:  # noqa: N802
+            return
+
+        def visit_Lambda(self, _node: ast.Lambda) -> None:  # noqa: N802
+            return
+
+    visitor = ProtectedControlVisitor()
+    for root in roots if isinstance(roots, list) else [roots]:
+        visitor.visit(root)
+        if visitor.found:
+            return True
+    return False
+
+
 def _is_fail_closed_envelope_acceptance_guard(
     node: ast.AST,
     function: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -14117,18 +14236,20 @@ def _is_fail_closed_envelope_acceptance_guard(
     ):
         return False
 
-    def contains_protected_control(statements: list[ast.stmt]) -> bool:
+    def contains_protected_control(
+        statements: list[ast.stmt],
+        *,
+        allowed_calls: frozenset[str] = frozenset(),
+    ) -> bool:
         """Find executed controls without treating callable wiring as one."""
 
         class ProtectedControlVisitor(ast.NodeVisitor):
             found = False
 
             def visit_Call(self, call: ast.Call) -> None:  # noqa: N802
-                if _call_name(call).casefold() in {
-                    "_a2a_inbound_requires_verified_sender",
-                    "_a2a_inbound_scope_snapshot",
-                    "_a2a_inbound_scope_unchanged",
-                }:
+                if _call_name(call).casefold() in (
+                    _A2A_IDENTITY_PLUMBING_CALLS | allowed_calls
+                ):
                     return
                 if _is_cross_agent_control_call(
                     call, control_aliases, state_object_aliases
@@ -14184,39 +14305,270 @@ def _is_fail_closed_envelope_acceptance_guard(
         return False
     verdict_receiver = ast.unparse(accepted_field.value).casefold()
 
-    def authorization_partition(statement: ast.stmt) -> bool:
+    def lexical_nodes(root: ast.AST) -> tuple[ast.AST, ...]:
+        """Walk one statement while excluding deferred nested scopes."""
+
+        nodes: list[ast.AST] = []
+
+        class ScopeVisitor(ast.NodeVisitor):
+            def generic_visit(self, current: ast.AST) -> None:
+                nodes.append(current)
+                super().generic_visit(current)
+
+            def visit_FunctionDef(  # noqa: N802
+                self, _node: ast.FunctionDef
+            ) -> None:
+                return
+
+            def visit_AsyncFunctionDef(  # noqa: N802
+                self, _node: ast.AsyncFunctionDef
+            ) -> None:
+                return
+
+            def visit_ClassDef(self, _node: ast.ClassDef) -> None:  # noqa: N802
+                return
+
+            def visit_Lambda(self, _node: ast.Lambda) -> None:  # noqa: N802
+                return
+
+        visitor = ScopeVisitor()
+        visitor.visit(root)
+        return tuple(nodes)
+
+    def authorization_result_names(
+        statement: ast.AST,
+        accepted_call_names: frozenset[str],
+    ) -> set[str]:
+        names: set[str] = set()
+        for candidate in lexical_nodes(statement):
+            targets: list[ast.AST] = []
+            value: ast.AST | None = None
+            if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    list(candidate.targets)
+                    if isinstance(candidate, ast.Assign)
+                    else [candidate.target]
+                )
+                value = candidate.value
+            elif isinstance(candidate, ast.NamedExpr):
+                targets = [candidate.target]
+                value = candidate.value
+            if value is None:
+                continue
+            calls = [child for child in ast.walk(value) if isinstance(child, ast.Call)]
+            if not any(
+                _call_name(call).casefold() in accepted_call_names
+                or getattr(call, "_authority_verified_attribution", False)
+                for call in calls
+            ):
+                continue
+            names.update(
+                name.casefold()
+                for target in targets
+                for name in _binding_target_names(target)
+            )
+        return names
+
+    def rejects_authorization_result(test: ast.AST, name: str) -> bool:
+        """Whether truth of ``test`` proves ``name`` is unauthorized."""
+
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return name in _identifier_tokens(test.operand)
+        if isinstance(test, ast.Compare):
+            values = [test.left, *test.comparators]
+            return name in {
+                token
+                for value in values
+                for token in _identifier_tokens(value)
+            } and any(
+                isinstance(value, ast.Constant)
+                and value.value in {None, False, ""}
+                for value in values
+            )
+        if isinstance(test, ast.BoolOp):
+            checks = [
+                rejects_authorization_result(value, name)
+                for value in test.values
+            ]
+            # For OR, one disjunct that is necessarily true for an empty/false
+            # result makes the whole rejection true. For AND, every conjunct
+            # must reject it; otherwise another flag could bypass the guard.
+            return any(checks) if isinstance(test.op, ast.Or) else all(checks)
+        return False
+
+    def branch_has_fail_closed_authorization(
+        statements: list[ast.stmt],
+        accepted_call_names: frozenset[str],
+    ) -> bool:
+        """Prove an authorizer result is checked before branch continuation."""
+
+        result_names = {
+            name
+            for statement in statements
+            for name in authorization_result_names(
+                statement, accepted_call_names
+            )
+        }
+        for name in result_names:
+            assignment_lines = [
+                getattr(candidate, "lineno", 0)
+                for statement in statements
+                for candidate in lexical_nodes(statement)
+                if isinstance(
+                    candidate, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+                )
+                and name
+                in {
+                    bound.casefold()
+                    for target in (
+                        list(candidate.targets)
+                        if isinstance(candidate, ast.Assign)
+                        else [candidate.target]
+                    )
+                    for bound in _binding_target_names(target)
+                }
+                and authorization_result_names(candidate, accepted_call_names)
+            ]
+            for statement in lexical_nodes(
+                ast.Module(body=statements, type_ignores=[])
+            ):
+                if (
+                    isinstance(statement, ast.If)
+                    and rejects_authorization_result(statement.test, name)
+                    and _block_guaranteed_function_exit(statement.body)
+                    and assignment_lines
+                    and max(assignment_lines) < statement.lineno
+                ):
+                    return True
+        return False
+
+    def branch_all_continuing_paths_authorized(
+        statements: list[ast.stmt],
+        accepted_call_names: frozenset[str],
+    ) -> bool:
+        """Conservatively prove every path past ``statements`` authorized."""
+
+        def assignment_kind(
+            assignment: ast.Assign | ast.AnnAssign | ast.NamedExpr,
+            name: str,
+        ) -> str | None:
+            targets = (
+                list(assignment.targets)
+                if isinstance(assignment, ast.Assign)
+                else [assignment.target]
+            )
+            if name not in {
+                bound.casefold()
+                for target in targets
+                for bound in _binding_target_names(target)
+            }:
+                return None
+            value = assignment.value
+            if isinstance(value, ast.Constant) and value.value in {None, False, ""}:
+                return "invalid"
+            calls = [child for child in ast.walk(value) if isinstance(child, ast.Call)]
+            if any(
+                _call_name(call).casefold() in accepted_call_names
+                or getattr(call, "_authority_verified_attribution", False)
+                for call in calls
+            ):
+                return "authorizer"
+            return "unknown"
+
+        result_names = {
+            name
+            for statement in statements
+            for name in authorization_result_names(
+                statement, accepted_call_names
+            )
+        }
+        for guard_index, guard in enumerate(statements):
+            if not (
+                isinstance(guard, ast.If)
+                and _block_guaranteed_function_exit(guard.body)
+            ):
+                continue
+            for name in result_names:
+                if not rejects_authorization_result(guard.test, name):
+                    continue
+                kinds = [
+                    kind
+                    for statement in statements[:guard_index]
+                    for candidate in lexical_nodes(statement)
+                    if isinstance(
+                        candidate, (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+                    )
+                    if (kind := assignment_kind(candidate, name)) is not None
+                ]
+                if "authorizer" in kinds and set(kinds) <= {
+                    "authorizer",
+                    "invalid",
+                }:
+                    return True
+
+        # A branch tree is complete only when each continuing arm authorizes;
+        # an omitted ``else`` is a real unauthenticated continuation path.
+        for statement in statements:
+            if not isinstance(statement, ast.If) or not statement.orelse:
+                continue
+            body_safe = _block_guaranteed_function_exit(
+                statement.body
+            ) or branch_all_continuing_paths_authorized(
+                statement.body, accepted_call_names
+            )
+            orelse_safe = _block_guaranteed_function_exit(
+                statement.orelse
+            ) or branch_all_continuing_paths_authorized(
+                statement.orelse, accepted_call_names
+            )
+            if body_safe and orelse_safe:
+                return True
+        return _block_guaranteed_function_exit(statements)
+
+    def authorization_partition_strength(statement: ast.stmt) -> str | None:
         if not isinstance(statement, ast.If):
-            return False
+            return None
         if not (
             isinstance(statement.test, ast.Attribute)
             and statement.test.attr.casefold() == "verified"
             and ast.unparse(statement.test.value).casefold()
             == verdict_receiver
             and getattr(
-                statement.test, "_authority_verified_attribution", False
+                statement.test, "_authority_authenticated_attribution", False
             )
         ):
-            return False
-        # The verified arm is authenticated by the condition. The alternate
-        # arm may establish the narrow legacy identity or exit, but must not
-        # execute a protected control before doing either.
-        return (
-            any(
-                isinstance(child, ast.Call)
-                and _call_name(child).casefold()
-                in {
-                    "authorize_a2a_legacy_unsigned_sender",
-                    "authorize_legacy",
-                }
-                for alternative in statement.orelse
-                for child in ast.walk(alternative)
+            return None
+        # Authentication is not relation authority. Each branch must invoke a
+        # target authorizer and fail closed on its result before continuation.
+        verified_call_names = frozenset({"_authorize_verified_a2a_sender"})
+        legacy_call_names = frozenset(
+            {
+                "authorize_a2a_legacy_unsigned_sender",
+                "authorize_legacy",
+            }
+        )
+        if not (
+            branch_has_fail_closed_authorization(
+                statement.body,
+                verified_call_names,
             )
-            and any(
-                isinstance(child, ast.Raise)
-                for alternative in statement.orelse
-                for child in ast.walk(alternative)
+            and branch_has_fail_closed_authorization(
+                statement.orelse,
+                legacy_call_names,
             )
+            and not contains_protected_control(statement.body)
             and not contains_protected_control(statement.orelse)
+        ):
+            return None
+        return (
+            "strong"
+            if branch_all_continuing_paths_authorized(
+                statement.body, verified_call_names
+            )
+            and branch_all_continuing_paths_authorized(
+                statement.orelse, legacy_call_names
+            )
+            else "a2a-only"
         )
 
     def containing_block(
@@ -14236,17 +14588,29 @@ def _is_fail_closed_envelope_acceptance_guard(
         return False
     statements, guard_index = location
     suffix = statements[guard_index + 1 :]
-    partition_index = next(
+    partition = next(
         (
-            index
+            (index, strength)
             for index, statement in enumerate(suffix)
-            if authorization_partition(statement)
+            if (
+                strength := authorization_partition_strength(statement)
+            ) is not None
         ),
         None,
     )
-    if partition_index is None:
+    if partition is None:
         return False
-    return not contains_protected_control(suffix[:partition_index])
+    partition_index, partition_strength = partition
+    return (
+        not contains_protected_control(suffix[:partition_index])
+        and (
+            partition_strength == "strong"
+            or not contains_protected_control(
+                suffix[partition_index + 1 :],
+                allowed_calls=frozenset({"commit", "create_task"}),
+            )
+        )
+    )
 
 
 def _guard_clause_provenance_lines(
@@ -17759,7 +18123,7 @@ def _authority_provenance_lines(
                 )
                 validates_attribution = _is_attribution_validation_call(
                     node, local_attribution_authorizers
-                )
+                ) or _call_name(node).casefold() in _A2A_IDENTITY_PLUMBING_CALLS
                 arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
                 if (
                     is_permission_call
@@ -18071,6 +18435,10 @@ def _authority_provenance_lines(
                 provenance_aliases,
                 decision_provenance_helpers,
             ) or bool(tokens.intersection(attribution_aliases))
+            has_authenticated_attribution = any(
+                getattr(child, "_authority_authenticated_attribution", False)
+                for child in ast.walk(node.test)
+            )
             has_permission = any(_is_permission_name(token) for token in tokens)
             guarded_nodes: list[ast.AST] = [node.test]
             if isinstance(node, (ast.If, ast.While)):
@@ -18106,7 +18474,13 @@ def _authority_provenance_lines(
                 decision_provenance_helpers,
                 state_object_aliases,
             )
-            if (
+            authenticated_identity_selects_control = (
+                has_authenticated_attribution
+                and _authenticated_identity_selects_protected_control(
+                    guarded_nodes, control_aliases, state_object_aliases
+                )
+            )
+            if authenticated_identity_selects_control or (
                 has_provenance
                 and not only_suppresses_cycle
                 and not only_selects_attribution_validation
@@ -20524,16 +20898,20 @@ def test_verified_sender_principals_require_verified_verdict_fields() -> None:
         "        target.shutdown()\n"
     )
 
-    assert _authority_provenance_lines(verified) == set()
+    assert _authority_provenance_lines(verified) == {7}
     assert _authority_provenance_lines(verification_flag) == {2}
     assert _authority_provenance_lines(accepted_only) == {7}
-    assert _authority_provenance_lines(verified_only) == set()
+    assert _authority_provenance_lines(verified_only) == {7}
 
 
 def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
     authorization = (
         "    if verdict.verified:\n"
-        "        pass\n"
+        "        verified_sender = await _authorize_verified_a2a_sender(\n"
+        "            manager, verdict.sender\n"
+        "        )\n"
+        "        if not verified_sender:\n"
+        "            raise PermissionError\n"
         "    else:\n"
         "        authorize_legacy = getattr(\n"
         "            manager,\n"
@@ -20566,10 +20944,70 @@ def test_envelope_acceptance_requires_dominating_sender_authorization() -> None:
         "        raise PermissionError\n"
         + authorization
     )
+    unauthenticated_verified_arm = ast.parse(
+        prefix
+        + "    if verdict.verified:\n"
+        "        pass\n"
+        "    else:\n"
+        "        authorize_legacy = getattr(\n"
+        "            manager,\n"
+        "            'authorize_a2a_legacy_unsigned_sender',\n"
+        "        )\n"
+        "        authorized = await authorize_legacy(task)\n"
+        "        if not authorized:\n"
+        "            raise PermissionError\n"
+        "    target.shutdown()\n"
+    )
+    unrelated_legacy_source = (
+        prefix
+        + "    if verdict.verified:\n"
+        "        verified_sender = await _authorize_verified_a2a_sender(\n"
+        "            manager, verdict.sender\n"
+        "        )\n"
+        "        if not verified_sender:\n"
+        "            raise PermissionError\n"
+        "    else:\n"
+        "        authorize_legacy = getattr(\n"
+        "            manager,\n"
+        "            'authorize_a2a_legacy_unsigned_sender',\n"
+        "        )\n"
+        "        authorized = await authorize_legacy(task)\n"
+        "        if debug:\n"
+        "            raise PermissionError\n"
+    )
+    unrelated_legacy_raise = ast.parse(
+        unrelated_legacy_source + "    target.shutdown()\n"
+    )
+    unrelated_legacy_a2a_commit = ast.parse(
+        unrelated_legacy_source + "    await manager.create_task()\n"
+    )
+    conditional_legacy_authorizer = ast.parse(
+        prefix
+        + "    if verdict.verified:\n"
+        "        verified_sender = await _authorize_verified_a2a_sender(\n"
+        "            manager, verdict.sender\n"
+        "        )\n"
+        "        if not verified_sender:\n"
+        "            raise PermissionError\n"
+        "    else:\n"
+        "        authorize_legacy = getattr(\n"
+        "            manager,\n"
+        "            'authorize_a2a_legacy_unsigned_sender',\n"
+        "        )\n"
+        "        if debug:\n"
+        "            authorized = await authorize_legacy(task)\n"
+        "        else:\n"
+        "            raise PermissionError\n"
+        "    target.shutdown()\n"
+    )
 
     assert _authority_provenance_lines(safe) == set()
     assert _authority_provenance_lines(unsafe) == {7}
     assert _authority_provenance_lines(unsafe_rejection) == {7}
+    assert _authority_provenance_lines(unauthenticated_verified_arm) == {7}
+    assert _authority_provenance_lines(unrelated_legacy_raise) == {7}
+    assert _authority_provenance_lines(unrelated_legacy_a2a_commit) == {7}
+    assert _authority_provenance_lines(conditional_legacy_authorizer) == {7}
 
 
 def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
@@ -20620,7 +21058,7 @@ def test_unverified_sender_alias_remains_provenance_until_validation() -> None:
 
     assert _authority_provenance_lines(guarded) == {3}
     assert _authority_provenance_lines(validation) == set()
-    assert _authority_provenance_lines(inline_validation) == set()
+    assert _authority_provenance_lines(inline_validation) == {7}
     assert _authority_provenance_lines(manager_witness) == {4}
     assert _authority_provenance_lines(fake_validation) == {3, 5, 7}
 
