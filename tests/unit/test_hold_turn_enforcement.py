@@ -152,8 +152,12 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
     """A positional/shell root cannot inherit Hold from a stale ambient root."""
     import kestrel_sovereign.hold.enforcement as enforcement
     import kestrel_sovereign.host_features.context as context_module
+    import kestrel_sovereign.paths as paths_module
 
-    selected_root = tmp_path / "selected-agent"
+    project_root = tmp_path / "project"
+    nested_cwd = project_root / "nested"
+    nested_cwd.mkdir(parents=True)
+    selected_root = project_root / "selected-agent"
     stale_root = tmp_path / "stale-agent"
     context = SimpleNamespace(hold_store=object())
     observed: dict[str, object] = {}
@@ -164,6 +168,9 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
 
     monkeypatch.setenv("KESTREL_DB_PATH", str(stale_root))
     monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+    monkeypatch.delenv("KESTREL_HOME", raising=False)
+    monkeypatch.chdir(nested_cwd)
+    monkeypatch.setattr(paths_module, "project_dir", lambda: project_root)
     monkeypatch.setattr(context_module, "build_host_context", build_context)
     agent = SimpleNamespace()
 
@@ -180,6 +187,9 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
         selected_root.resolve() / "host-data" / "host-features.db"
     )
     assert launch_context.explicit_override is False
+    assert launch_context.legacy_database_path == (
+        project_root / "kestrel_host.db"
+    )
     assert agent._hold_store is context.hold_store
 
 
@@ -400,6 +410,61 @@ async def test_streamed_command_reuses_its_first_hold_admission_snapshot() -> No
     chunks = [chunk async for chunk in agent.process_input_streaming("!status")]
 
     assert chunks == ["command complete"]
+    assert store.calls == ["did:test:held"]
+
+
+@pytest.mark.asyncio
+async def test_streamed_command_transfers_admission_to_decorated_execution_task() -> None:
+    """The production invocation owner adopts the stream's one Hold snapshot."""
+
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+
+    admitted = EffectiveHoldState(host=None, agent=None)
+    later_hold = _latch(
+        HoldScope.AGENT,
+        "hold:after-decorated-admission",
+        target="did:test:held",
+    )
+
+    class _ChangingStore(_Store):
+        async def get_effective(self, agent_id: str) -> EffectiveHoldState:
+            effective = await super().get_effective(agent_id)
+            self.effective = EffectiveHoldState(host=None, agent=later_hold)
+            return effective
+
+    class _ProductionShapeAgent(RequestLifecycleMixin, StreamingMixin):
+        did = "did:test:held"
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def process_input(
+            self,
+            _user_input,
+            _model_override=None,
+            *,
+            session_id=None,
+            caller=None,
+            invocation_context=None,
+            invocation_id=None,
+        ):
+            assert asyncio.current_task() is not outer_task
+            await require_turn_start_allowed(self)
+            return "decorated command complete"
+
+    store = _ChangingStore(admitted)
+    agent = _ProductionShapeAgent()
+    agent._hold_store = store
+    agent.storage = object()
+    agent._safe_mode = False
+    agent._constitution_audit_pending = False
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._maybe_audit = AsyncMock()
+    outer_task = asyncio.current_task()
+
+    chunks = [chunk async for chunk in agent.process_input_streaming("!status")]
+
+    assert chunks == ["decorated command complete"]
     assert store.calls == ["did:test:held"]
 
 

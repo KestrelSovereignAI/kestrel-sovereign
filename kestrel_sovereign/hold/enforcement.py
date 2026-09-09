@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 # first, then the non-streaming command implementation. Both seams remain
 # independently load-bearing, but the same turn must linearize at one latch
 # snapshot. A copied ContextVar is not sufficient authority: only the exact
-# task that captured the snapshot may reuse it.
+# task that captured the snapshot, or the explicitly adopted decorated
+# execution task, may reuse it.
 _turn_admission_snapshot: ContextVar[
     tuple[Any, asyncio.Task[Any], EffectiveHoldState | None] | None
 ] = ContextVar("kestrel_hold_turn_admission_snapshot", default=None)
@@ -47,6 +48,32 @@ def _reuse_turn_admission_snapshot(
         yield
     finally:
         _turn_admission_snapshot.reset(token)
+
+
+@contextmanager
+def _adopt_turn_admission_snapshot(
+    agent: Any,
+    *,
+    from_task: asyncio.Task[Any] | None,
+):
+    """Transfer a reused admission only to the decorated execution owner."""
+
+    current_task = asyncio.current_task()
+    inherited = _turn_admission_snapshot.get()
+    token = None
+    if (
+        current_task is not None
+        and from_task is not None
+        and inherited is not None
+        and inherited[0] is agent
+        and inherited[1] is from_task
+    ):
+        token = _turn_admission_snapshot.set((agent, current_task, inherited[2]))
+    try:
+        yield
+    finally:
+        if token is not None:
+            _turn_admission_snapshot.reset(token)
 
 
 class HoldEnforcementUnavailableError(HoldStateError):
@@ -163,8 +190,11 @@ async def build_bound_host_context(
         # while retaining an explicit KESTREL_HOST_DB_PATH as operator authority.
         launch_env = dict(os.environ)
         launch_env["KESTREL_DB_PATH"] = str(agent_data_root)
+        from kestrel_sovereign.paths import project_dir
+
         host_database_launch_context = resolve_host_database_launch_context(
             env=launch_env,
+            base_dir=project_dir(),
         )
     context_kwargs: dict[str, Any] = {"config": config}
     if host_database_launch_context is not None:

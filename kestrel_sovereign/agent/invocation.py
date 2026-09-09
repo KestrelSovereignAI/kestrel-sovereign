@@ -322,8 +322,24 @@ def bind_async_invocation(
                         )
                         if callable(delegate_lock_ownership):
                             delegate_lock_ownership(operation_context)
+
+                        async def run_isolated_operation() -> _T:
+                            # A streamed command has already linearized Hold in
+                            # the generator owner. Transfer that exact snapshot
+                            # only to this explicitly created execution task;
+                            # arbitrary child tasks still perform a fresh read.
+                            from kestrel_sovereign.hold.enforcement import (
+                                _adopt_turn_admission_snapshot,
+                            )
+
+                            with _adopt_turn_admission_snapshot(
+                                lifecycle_owner,
+                                from_task=caller_task,
+                            ):
+                                return await function(*bound.args, **bound.kwargs)
+
                         isolated_operation = asyncio.create_task(
-                            function(*bound.args, **bound.kwargs),
+                            run_isolated_operation(),
                             name=(
                                 "invocation-turn:"
                                 f"{invocation_log_correlation(invocation_id)}"

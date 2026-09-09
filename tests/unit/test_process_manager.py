@@ -41,8 +41,12 @@ from kestrel_sovereign.config import (
 )
 from kestrel_sovereign.host_features.storage import (
     DERIVED_HOST_DB_PATH_ENV,
+    HOST_DB_LEGACY_PATH_ENV,
     HOST_DB_PATH_ENV,
+    HOST_DB_PREVIOUS_DEFAULT_ENV,
+    HOST_DB_USES_DEFAULT_ENV,
     HOST_FEATURE_DB_FILENAME,
+    resolve_host_database_launch_context,
 )
 
 
@@ -596,7 +600,17 @@ class TestStartAgent:
         import kestrel_sovereign.cli as cli_module
 
         fleet_root = project_dir / "fleet-data"
-        launch_env = {"KESTREL_DB_PATH": str(fleet_root)}
+        launch_env = {
+            "KESTREL_DB_PATH": str(fleet_root),
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary/kestrel",
+            "KESTREL_HOLD_BACKEND": "postgres",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence/kestrel"
+            ),
+            "KESTREL_HOLD_PAIR_ID": "4a5581d4-69d2-4dad-b6cf-66a1fdf2a31c",
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+        }
         config = LocalAgentConfig(data_dir="agent_data/claw", port=8801)
         roster = MultiAgentConfig(agents={"claw": config})
         captured_process_env = {}
@@ -648,8 +662,31 @@ class TestStartAgent:
             captured_process_env[HOST_DB_PATH_ENV]
         )
         assert captured_shell_context.explicit_override is False
+        child_context = resolve_host_database_launch_context(
+            env=captured_process_env,
+            base_dir=project_dir,
+        )
+        assert child_context == captured_shell_context
+        assert captured_shell_context.backend_env() == {
+            name: launch_env[name]
+            for name in (
+                "KESTREL_DB_BACKEND",
+                "KESTREL_DATABASE_URL",
+                "KESTREL_HOLD_BACKEND",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+                "KESTREL_HOLD_PAIR_ID",
+                "KESTREL_DEPLOYMENT_PERSISTENCE",
+            )
+        }
         assert captured_process_env[DERIVED_HOST_DB_PATH_ENV] == (
             captured_process_env[HOST_DB_PATH_ENV]
+        )
+        assert captured_process_env[HOST_DB_USES_DEFAULT_ENV] == "0"
+        assert captured_process_env[HOST_DB_PREVIOUS_DEFAULT_ENV] == str(
+            captured_shell_context.previous_default
+        )
+        assert captured_process_env[HOST_DB_LEGACY_PATH_ENV] == str(
+            captured_shell_context.legacy_database_path
         )
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(

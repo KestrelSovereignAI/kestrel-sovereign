@@ -30,10 +30,25 @@ from kestrel_sovereign.security.path_identity import (
 
 HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
 DERIVED_HOST_DB_PATH_ENV = "KESTREL_DERIVED_HOST_DB_PATH"
+HOST_DB_USES_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_USES_DEFAULT"
+HOST_DB_PREVIOUS_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_PREVIOUS_DEFAULT"
+HOST_DB_LEGACY_PATH_ENV = "KESTREL_HOST_DB_LAUNCH_LEGACY_PATH"
 AGENT_DB_PATH_ENV = "KESTREL_DB_PATH"
 HOST_FEATURE_DB_FILENAME = "host-features.db"
 LEGACY_HOST_DB_FILENAME = "kestrel_host.db"
 SQLITE_AUXILIARY_SUFFIXES = ("-wal", "-shm", "-journal")
+
+_HOST_BACKEND_ENV_NAMES = (
+    "KESTREL_DB_BACKEND",
+    "KESTREL_DATABASE_URL",
+    "KESTREL_HOLD_BACKEND",
+    "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+    "KESTREL_HOLD_PAIR_ID",
+    "KESTREL_DEPLOYMENT_PERSISTENCE",
+    "KESTREL_KITE_RELEASE_EVIDENCE",
+    "KESTREL_DEMO_SERVER",
+    "KESTREL_ENV",
+)
 
 # Public host-domain name while retaining the shared primitive's exception
 # identity, so callers catch failures from every custody operation uniformly.
@@ -51,6 +66,12 @@ class HostDatabaseLaunchContext:
     explicit_override: bool
     previous_default: Path
     legacy_database_path: Path
+    backend_environment: tuple[tuple[str, str], ...]
+
+    def backend_env(self) -> dict[str, str]:
+        """Return the immutable launch-time backend selection as a mapping."""
+
+        return dict(self.backend_environment)
 
 
 def _runtime_path(value: str, env: Mapping[str, str], base_dir: Path) -> Path:
@@ -119,6 +140,7 @@ def resolve_host_database_launch_context(
     *,
     env: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
+    db_path: Optional[str] = None,
 ) -> HostDatabaseLaunchContext:
     """Resolve host custody before a launcher applies an agent-root override.
 
@@ -130,13 +152,19 @@ def resolve_host_database_launch_context(
     runtime_env = os.environ if env is None else env
     runtime_base = absolute_without_following_leaf(base_dir or Path.cwd())
     database_path, uses_default = host_database_path(
+        db_path,
         env=runtime_env,
         base_dir=runtime_base,
     )
     configured_host_path = runtime_env.get(HOST_DB_PATH_ENV)
     derived_host_path = runtime_env.get(DERIVED_HOST_DB_PATH_ENV)
+    launcher_pin = bool(
+        not db_path
+        and configured_host_path
+        and derived_host_path == configured_host_path
+    )
     explicit_override = bool(
-        configured_host_path and derived_host_path != configured_host_path
+        db_path or (configured_host_path and not launcher_pin)
     )
     configured_project_root = runtime_env.get("KESTREL_HOME")
     launch_project_root = (
@@ -144,12 +172,41 @@ def resolve_host_database_launch_context(
         if configured_project_root
         else runtime_base
     )
+    previous_default = _default_host_database_path(runtime_env, runtime_base)
+    legacy_database_path = launch_project_root / LEGACY_HOST_DB_FILENAME
+    if launcher_pin:
+        pinned_uses_default = runtime_env.get(HOST_DB_USES_DEFAULT_ENV)
+        if pinned_uses_default is not None:
+            if pinned_uses_default not in {"0", "1"}:
+                raise HostStorageError(
+                    f"{HOST_DB_USES_DEFAULT_ENV} must be '0' or '1'"
+                )
+            uses_default = pinned_uses_default == "1"
+        pinned_previous_default = runtime_env.get(HOST_DB_PREVIOUS_DEFAULT_ENV)
+        if pinned_previous_default:
+            previous_default = _runtime_path(
+                pinned_previous_default,
+                runtime_env,
+                runtime_base,
+            )
+        pinned_legacy_path = runtime_env.get(HOST_DB_LEGACY_PATH_ENV)
+        if pinned_legacy_path:
+            legacy_database_path = _runtime_path(
+                pinned_legacy_path,
+                runtime_env,
+                runtime_base,
+            )
     return HostDatabaseLaunchContext(
         database_path=database_path,
         uses_default=uses_default,
         explicit_override=explicit_override,
-        previous_default=_default_host_database_path(runtime_env, runtime_base),
-        legacy_database_path=launch_project_root / LEGACY_HOST_DB_FILENAME,
+        previous_default=previous_default,
+        legacy_database_path=legacy_database_path,
+        backend_environment=tuple(
+            (name, runtime_env[name])
+            for name in _HOST_BACKEND_ENV_NAMES
+            if name in runtime_env
+        ),
     )
 
 
@@ -164,8 +221,14 @@ def pin_host_database_launch_context(
     env[HOST_DB_PATH_ENV] = str(context.database_path)
     if context.explicit_override:
         env.pop(DERIVED_HOST_DB_PATH_ENV, None)
+        env.pop(HOST_DB_USES_DEFAULT_ENV, None)
+        env.pop(HOST_DB_PREVIOUS_DEFAULT_ENV, None)
+        env.pop(HOST_DB_LEGACY_PATH_ENV, None)
     else:
         env[DERIVED_HOST_DB_PATH_ENV] = str(context.database_path)
+        env[HOST_DB_USES_DEFAULT_ENV] = "1" if context.uses_default else "0"
+        env[HOST_DB_PREVIOUS_DEFAULT_ENV] = str(context.previous_default)
+        env[HOST_DB_LEGACY_PATH_ENV] = str(context.legacy_database_path)
     return context
 
 
@@ -616,7 +679,10 @@ def prepare_host_database(
 __all__ = [
     "AGENT_DB_PATH_ENV",
     "DERIVED_HOST_DB_PATH_ENV",
+    "HOST_DB_LEGACY_PATH_ENV",
     "HOST_DB_PATH_ENV",
+    "HOST_DB_PREVIOUS_DEFAULT_ENV",
+    "HOST_DB_USES_DEFAULT_ENV",
     "HOST_FEATURE_DB_FILENAME",
     "LEGACY_HOST_DB_FILENAME",
     "HostDatabaseLaunchContext",
