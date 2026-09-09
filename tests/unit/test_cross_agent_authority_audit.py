@@ -9045,15 +9045,15 @@ def _is_unverified_attribution_metadata_lookup(node: ast.AST) -> bool:
     provenance when code tries to use it as an authority decision.
     """
 
-    if getattr(node, "_authority_verified_attribution", False):
-        return False
     if getattr(node, "_authority_unverified_attribution", False):
         return True
+    if getattr(node, "_authority_verified_attribution", False):
+        return False
     for child in ast.walk(node):
-        if getattr(child, "_authority_verified_attribution", False):
-            continue
         if getattr(child, "_authority_unverified_attribution", False):
             return True
+        if getattr(child, "_authority_verified_attribution", False):
+            continue
         receiver: ast.AST | None = None
         key: str | None = None
         if isinstance(child, ast.Subscript):
@@ -9215,6 +9215,20 @@ def _unverified_attribution_aliases(
     projection_helpers: set[str] | None = None,
 ) -> set[str]:
     """Track untrusted and verified identity in the shared binding lattice."""
+
+    # Parsed repository modules are cached and may be visited first as an
+    # imported helper, then as their own audit target. Identity annotations are
+    # analysis results, not permanent AST facts; discard the prior pass before
+    # replaying this function so collection order cannot change the verdict.
+    for node in _walk_lexical_scope(function):
+        for attribute in (
+            "_authority_attribution_validator",
+            "_authority_static_string",
+            "_authority_unverified_attribution",
+            "_authority_verified_attribution",
+        ):
+            if hasattr(node, attribute):
+                delattr(node, attribute)
 
     static_strings = {
         name: ("static-string", value)
@@ -20242,6 +20256,49 @@ def test_cached_a2a_sender_claim_guard_reaches_the_ci_gate(
     )
 
     assert _cached_authority_provenance_lines(source_path) == frozenset({2})
+
+
+def test_attribution_analysis_discards_annotations_from_prior_passes() -> None:
+    unverified_tree = ast.parse(
+        "def dispatch(task, target):\n"
+        "    claimed = task.metadata.get('sender')\n"
+        "    if claimed:\n"
+        "        target.shutdown()\n"
+    )
+    unverified_guard = next(
+        node for node in ast.walk(unverified_tree) if isinstance(node, ast.If)
+    )
+
+    assert _authority_provenance_lines(unverified_tree) == {
+        unverified_guard.lineno
+    }
+    setattr(unverified_guard.test, "_authority_verified_attribution", True)
+    assert _authority_provenance_lines(unverified_tree) == {
+        unverified_guard.lineno
+    }
+
+    verified_tree = ast.parse(
+        "def dispatch(task, target, manager):\n"
+        "    claimed = task.metadata['sender']\n"
+        "    witness = manager.a2a_sender_identity_witness(claimed)\n"
+        "    if witness:\n"
+        "        target.shutdown()\n"
+    )
+    verified_guard = next(
+        node for node in ast.walk(verified_tree) if isinstance(node, ast.If)
+    )
+
+    assert _authority_provenance_lines(verified_tree) == set()
+    setattr(verified_guard.test, "_authority_unverified_attribution", True)
+    assert _authority_provenance_lines(verified_tree) == set()
+
+
+def test_unverified_attribution_dominates_conflicting_annotation() -> None:
+    value = ast.parse("claimed_sender", mode="eval").body
+    setattr(value, "_authority_verified_attribution", True)
+    setattr(value, "_authority_unverified_attribution", True)
+
+    assert _is_unverified_attribution_metadata_lookup(value)
 
 
 def test_provenance_scanner_resolves_module_level_metadata_keys(
