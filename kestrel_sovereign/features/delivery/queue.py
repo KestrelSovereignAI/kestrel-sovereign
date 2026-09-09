@@ -119,7 +119,9 @@ def _persisted_content_hashes(recipient: str, content_json: str) -> tuple[str, s
     )
 
 
-def _validate_json_value(value: Any, *, path: str) -> None:
+def _validate_json_value(
+    value: Any, *, path: str, _active: Optional[set[int]] = None
+) -> None:
     """Reject lossy Python-to-JSON coercions and name the invalid value path."""
     if value is None or isinstance(value, (str, bool, int)):
         return
@@ -127,17 +129,27 @@ def _validate_json_value(value: Any, *, path: str) -> None:
         if math.isfinite(value):
             return
         raise ValueError(f"idempotent delivery {path} must be a finite JSON number")
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_json_value(item, path=f"{path}[{index}]")
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(
-                    f"idempotent delivery {path} has non-string JSON key {key!r}"
-                )
-            _validate_json_value(item, path=f"{path}.{key}")
+    if isinstance(value, (list, dict)):
+        active = _active if _active is not None else set()
+        identity = id(value)
+        if identity in active:
+            raise ValueError(f"idempotent delivery {path} contains a JSON cycle")
+        active.add(identity)
+        try:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    _validate_json_value(
+                        item, path=f"{path}[{index}]", _active=active
+                    )
+            else:
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        raise ValueError(
+                            f"idempotent delivery {path} has non-string JSON key {key!r}"
+                        )
+                    _validate_json_value(item, path=f"{path}.{key}", _active=active)
+        finally:
+            active.remove(identity)
         return
     raise ValueError(
         f"idempotent delivery {path} contains non-JSON value "
@@ -857,17 +869,16 @@ class DeliveryQueue:
                             """
                             UPDATE delivery_idempotency
                             SET entry_id = ?, created_at = ?, compensating = 0,
-                                previous_entry_id = NULL,
+                                previous_entry_id = ?,
                                 legacy_content_hash = ?
-                            WHERE agent_id = ? AND idempotency_key_digest = ?
-                                  AND entry_id = ?
+                            WHERE agent_id = ? AND entry_id = ?
                             """,
                             (
                                 deduplicated,
                                 now_iso,
+                                canonical_id,
                                 adopted_row[0],
                                 self._agent_id,
-                                key_digest,
                                 canonical_id,
                             ),
                         )
@@ -893,15 +904,13 @@ class DeliveryQueue:
                             UPDATE delivery_idempotency
                             SET entry_id = ?, created_at = ?, compensating = 0,
                                 previous_entry_id = ?
-                            WHERE agent_id = ? AND idempotency_key_digest = ?
-                              AND entry_id = ?
+                            WHERE agent_id = ? AND entry_id = ?
                             """,
                             (
                                 anchored_replacement,
                                 now_iso,
                                 canonical_id,
                                 self._agent_id,
-                                key_digest,
                                 canonical_id,
                             ),
                         )
@@ -965,6 +974,22 @@ class DeliveryQueue:
                             now_iso,
                         ),
                     )
+                    if canonical_id != candidate_id:
+                        await self._db.execute(
+                            """
+                            UPDATE delivery_idempotency
+                            SET entry_id = ?, created_at = ?, compensating = 0,
+                                previous_entry_id = ?
+                            WHERE agent_id = ? AND entry_id = ?
+                            """,
+                            (
+                                candidate_id,
+                                now_iso,
+                                canonical_id,
+                                self._agent_id,
+                                canonical_id,
+                            ),
+                        )
                     # Keep previous_entry_id as a durable compensation anchor.
                     # If the INSERT above completed but cancellation was
                     # reported ambiguously, a joined SQLite caller may catch
@@ -1217,10 +1242,10 @@ class DeliveryQueue:
                     """
                     UPDATE delivery_idempotency
                     SET entry_id = ?, created_at = ?, compensating = 0,
-                        previous_entry_id = NULL
+                        previous_entry_id = COALESCE(previous_entry_id, ?)
                     WHERE agent_id = ? AND entry_id = ?
                     """,
-                    (new_id, now_iso, self._agent_id, dl_row[1]),
+                    (new_id, now_iso, dl_row[1], self._agent_id, dl_row[1]),
                 )
                 # This is intentionally the final awaited mutation. If an
                 # earlier step fails, the dead letter retains retry_entry_id
@@ -1528,6 +1553,14 @@ class DeliveryQueue:
                       SELECT 1 FROM delivery_queue
                       WHERE delivery_queue.agent_id = delivery_idempotency.agent_id
                         AND delivery_queue.id = delivery_idempotency.entry_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM delivery_idempotency replacement_claim
+                      JOIN delivery_queue
+                        ON delivery_queue.agent_id = replacement_claim.agent_id
+                       AND delivery_queue.id = replacement_claim.entry_id
+                      WHERE replacement_claim.agent_id = delivery_idempotency.agent_id
+                        AND replacement_claim.previous_entry_id = delivery_idempotency.entry_id
                   )
                   AND NOT EXISTS (
                       SELECT 1 FROM delivery_dead_letter
@@ -1881,8 +1914,11 @@ class DeliveryQueue:
         )
         if self._db.backend_type == "sqlite":
             await self._db.execute(
+                "DROP TRIGGER IF EXISTS trg_delivery_idempotency_compensate"
+            )
+            await self._db.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS trg_delivery_idempotency_compensate
+                CREATE TRIGGER IF NOT EXISTS trg_delivery_idempotency_compensate_v2
                 AFTER UPDATE OF compensating ON delivery_idempotency
                 WHEN NEW.compensating = 1
                 BEGIN
@@ -1893,9 +1929,7 @@ class DeliveryQueue:
                         previous_entry_id = NULL,
                         compensating = 0
                     WHERE agent_id = NEW.agent_id
-                      AND idempotency_key_digest = NEW.idempotency_key_digest
                       AND entry_id = NEW.entry_id
-                      AND compensating = 1
                       AND previous_entry_id IS NOT NULL;
                     DELETE FROM delivery_idempotency
                     WHERE agent_id = NEW.agent_id

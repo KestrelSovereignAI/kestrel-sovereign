@@ -575,10 +575,10 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 5 indexes + the one-time v2 trigger cleanup + the scoped
-        # SQLite atomic-compensation trigger. The v2 index is not rebuilt on an
-        # already-v3 schema.
-        assert queue._db.execute.call_count == 14
+        # 3 tables + 5 indexes + the one-time v2 trigger cleanup + replacement
+        # of the scoped SQLite atomic-compensation trigger. The v2 index is not
+        # rebuilt on an already-v3 schema.
+        assert queue._db.execute.call_count == 15
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1477,6 +1477,152 @@ class TestQueueIdempotency:
         ) == (1,)
 
     @pytest.mark.asyncio
+    async def test_shared_stale_claims_adopt_recent_plain_delivery(self, real_queue):
+        queue, _ = real_queue
+        request = ("email", "shared-plain@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="shared-plain-one"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-plain-two"
+        ) == original_id
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        replacement = await queue.enqueue(*request)
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-plain-one"
+        ) == replacement
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, replacement),
+        )
+
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-plain-two"
+        ) == replacement
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_idempotency
+            WHERE agent_id = ? AND entry_id = ? AND previous_entry_id = ?
+            """,
+            (queue._agent_id, replacement, original_id),
+        ) == (2,)
+
+    @pytest.mark.asyncio
+    async def test_shared_stale_replacement_dead_letter_is_terminal(self, real_queue):
+        queue, _ = real_queue
+        request = ("email", "shared-terminal@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="shared-terminal-one"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-terminal-two"
+        ) == original_id
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        replacement = await queue.enqueue(
+            *request, idempotency_key="shared-terminal-one"
+        )
+        await queue.move_to_dead_letter(replacement, "provider rejected")
+
+        with pytest.raises(DeliveryIdempotencyTerminal, match="dead-letter"):
+            await queue.enqueue(*request, idempotency_key="shared-terminal-two")
+
+    @pytest.mark.asyncio
+    async def test_shared_stale_replacement_retry_preserves_aliases(self, real_queue):
+        queue, _ = real_queue
+        request = ("email", "shared-retry@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="shared-retry-one"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-retry-two"
+        ) == original_id
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        replacement = await queue.enqueue(
+            *request, idempotency_key="shared-retry-one"
+        )
+        await queue.move_to_dead_letter(replacement, "provider rejected")
+        retried = await queue.retry(replacement)
+        assert retried["success"] is True
+        retried_id = retried["entry_id"]
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_queue SET created_at = ? WHERE id = ?",
+            (old, retried_id),
+        )
+
+        assert await queue.enqueue(
+            *request, idempotency_key="shared-retry-two"
+        ) == retried_id
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_idempotency
+            WHERE agent_id = ? AND entry_id = ? AND previous_entry_id = ?
+            """,
+            (queue._agent_id, retried_id, original_id),
+        ) == (2,)
+
+    @pytest.mark.asyncio
+    async def test_purge_retains_claim_represented_by_live_anchor(self, real_queue):
+        queue, _ = real_queue
+        request = ("email", "anchored-purge@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="anchored-purge-one"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="anchored-purge-two"
+        ) == original_id
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        replacement = await queue.enqueue(
+            *request, idempotency_key="anchored-purge-one"
+        )
+        claims = await queue._db.fetchall(
+            """
+            SELECT idempotency_key_digest FROM delivery_idempotency
+            WHERE agent_id = ? ORDER BY idempotency_key_digest
+            """,
+            (queue._agent_id,),
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency
+            SET entry_id = ?, previous_entry_id = NULL, created_at = ?
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (original_id, old, queue._agent_id, claims[0][0]),
+        )
+
+        await queue.purge_delivered(older_than_hours=24)
+
+        assert await queue._db.fetchone(
+            """
+            SELECT entry_id FROM delivery_idempotency
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (queue._agent_id, claims[0][0]),
+        ) == (original_id,)
+        assert await queue._db.fetchone(
+            "SELECT id FROM delivery_queue WHERE agent_id = ? AND id = ?",
+            (queue._agent_id, replacement),
+        ) == (replacement,)
+
+    @pytest.mark.asyncio
     async def test_stale_repair_preserves_durable_legacy_hash(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
@@ -2245,6 +2391,15 @@ class TestQueueIdempotency:
                 "person@example.com",
                 {1: "coerces-to-string"},
                 idempotency_key="strict-json-keys",
+            )
+        cyclic: dict[str, object] = {}
+        cyclic["self"] = cyclic
+        with pytest.raises(ValueError, match="content.self.*JSON cycle"):
+            await queue.enqueue(
+                "email",
+                "person@example.com",
+                cyclic,
+                idempotency_key="strict-json-cycle",
             )
 
     @pytest.mark.asyncio
