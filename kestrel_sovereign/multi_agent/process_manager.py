@@ -1016,7 +1016,11 @@ class ProcessManager:
             pin_host_database_launch_context,
         )
 
-        pin_host_database_launch_context(env, base_dir=self.project_dir)
+        pin_host_database_launch_context(
+            env,
+            base_dir=self.project_dir,
+            project_root=self.project_dir,
+        )
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

@@ -256,6 +256,44 @@ async def test_default_migrates_and_hardens_stopped_legacy_database(
         await _close_context(ctx)
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
+async def test_server_launch_from_nested_cwd_migrates_project_root_legacy_database(
+    tmp_path,
+    monkeypatch,
+):
+    """Launch CWD resolves relative inputs, not the project-root legacy store."""
+    import kestrel_sovereign.host_features.storage as storage_module
+
+    project_root = tmp_path / "project"
+    nested_cwd = project_root / "nested"
+    nested_cwd.mkdir(parents=True)
+    legacy = project_root / "kestrel_host.db"
+    _create_legacy_sqlite(legacy, value="project-root-history")
+    legacy.chmod(0o644)
+    operator_home = tmp_path / "operator-home"
+    monkeypatch.chdir(nested_cwd)
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.delenv("KESTREL_HOME", raising=False)
+    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+    monkeypatch.setattr(storage_module, "project_dir", lambda: project_root)
+
+    ctx = await build_host_context()
+    destination = (
+        operator_home / ".kestrel" / "host-data" / HOST_FEATURE_DB_FILENAME
+    )
+    try:
+        assert ctx.db is not None
+        assert not legacy.exists()
+        assert destination.exists()
+        assert await ctx.db.fetchval("SELECT value FROM legacy_probe") == (
+            "project-root-history"
+        )
+    finally:
+        await _close_context(ctx)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX migration contract")
 def test_cross_filesystem_migration_uses_private_staging(tmp_path, monkeypatch):
     home = tmp_path / "kestrel-home"
@@ -607,6 +645,7 @@ def test_pinned_default_launch_keeps_default_path_custody(tmp_path):
     parent_context = pin_host_database_launch_context(
         launch_env,
         base_dir=tmp_path,
+        project_root=tmp_path,
     )
     launch_env["KESTREL_DB_PATH"] = str(tmp_path / "agent_data" / "claw")
     child_context = resolve_host_database_launch_context(

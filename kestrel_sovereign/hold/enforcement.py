@@ -194,7 +194,7 @@ async def build_bound_host_context(
 
         host_database_launch_context = resolve_host_database_launch_context(
             env=launch_env,
-            base_dir=project_dir(),
+            project_root=project_dir(),
         )
     context_kwargs: dict[str, Any] = {"config": config}
     if host_database_launch_context is not None:

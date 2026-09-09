@@ -140,13 +140,16 @@ def resolve_host_database_launch_context(
     *,
     env: Optional[Mapping[str, str]] = None,
     base_dir: Optional[Path] = None,
+    project_root: Optional[Path] = None,
     db_path: Optional[str] = None,
 ) -> HostDatabaseLaunchContext:
     """Resolve host custody before a launcher applies an agent-root override.
 
     A launcher-derived ``KESTREL_HOST_DB_PATH`` is an exact path pin, not an
     operator override. Recording that distinction here keeps migration policy
-    identical for an in-process shell and a spawned server.
+    identical for an in-process shell and a spawned server. ``base_dir`` is the
+    launch CWD used to resolve relative runtime inputs; ``project_root`` is the
+    independent home of the historical project-root database.
     """
 
     runtime_env = os.environ if env is None else env
@@ -170,7 +173,7 @@ def resolve_host_database_launch_context(
     launch_project_root = (
         _runtime_path(configured_project_root, runtime_env, runtime_base)
         if configured_project_root
-        else runtime_base
+        else absolute_without_following_leaf(project_root or project_dir())
     )
     previous_default = _default_host_database_path(runtime_env, runtime_base)
     legacy_database_path = launch_project_root / LEGACY_HOST_DB_FILENAME
@@ -214,10 +217,15 @@ def pin_host_database_launch_context(
     env: MutableMapping[str, str],
     *,
     base_dir: Optional[Path] = None,
+    project_root: Optional[Path] = None,
 ) -> HostDatabaseLaunchContext:
     """Pin one host path into a child environment without reclassifying it."""
 
-    context = resolve_host_database_launch_context(env=env, base_dir=base_dir)
+    context = resolve_host_database_launch_context(
+        env=env,
+        base_dir=base_dir,
+        project_root=project_root,
+    )
     env[HOST_DB_PATH_ENV] = str(context.database_path)
     if context.explicit_override:
         env.pop(DERIVED_HOST_DB_PATH_ENV, None)

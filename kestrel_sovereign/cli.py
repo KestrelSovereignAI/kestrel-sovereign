@@ -463,6 +463,7 @@ def cmd_shell(args) -> int:
     hold_launch_context = resolve_host_database_launch_context(
         env=spawned_agent_env(project_dir),
         base_dir=project_dir,
+        project_root=project_dir,
     )
     return asyncio.run(
         _run_shell(

@@ -157,7 +157,7 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
     project_root = tmp_path / "project"
     nested_cwd = project_root / "nested"
     nested_cwd.mkdir(parents=True)
-    selected_root = project_root / "selected-agent"
+    selected_root = "selected-agent"
     stale_root = tmp_path / "stale-agent"
     context = SimpleNamespace(hold_store=object())
     observed: dict[str, object] = {}
@@ -184,7 +184,7 @@ async def test_bound_hold_context_uses_selected_agent_data_root(
     assert observed["config"] == {"mode": "test"}
     launch_context = observed["host_database_launch_context"]
     assert launch_context.database_path == (
-        selected_root.resolve() / "host-data" / "host-features.db"
+        nested_cwd / selected_root / "host-data" / "host-features.db"
     )
     assert launch_context.explicit_override is False
     assert launch_context.legacy_database_path == (
