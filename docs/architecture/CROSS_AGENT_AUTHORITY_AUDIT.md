@@ -92,13 +92,13 @@ narrow, revocable, signed delegation.
 | List/read child work | `list_children`, `get_child_result`; `GET /api/spawn/children` | The caller's children | Spawn mandate or self-owned feature state | Results are held by the calling feature instance. Child enumeration consumes process-local maps rebuilt from verified receipts, but does not re-verify the durable receipt at the read boundary. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
 | Delegate work to child | `delegate_task` | A direct child | Spawn mandate | The live boundary checks `manager.get_children()` / `_parent_children`, which are populated from verified issuance or restart receipts, but does not re-verify the durable receipt immediately before delegation. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
 | Terminate/offboard child | `terminate_child` | A direct child/descendant runtime tree | Spawn mandate | The live boundary checks the same receipt-derived process-local projection without a fresh durable-receipt verification. That verification must compose with lifecycle/custody/refund gates; `ALWAYS_ASK` is consent, not proof. Defect: [#3142](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3142). |
-| Run host lifecycle CLI from agent shell | `ComputerUseFeature.shell` with the local backend, then `kestrel terminate` (and related lifecycle verbs) | A named peer, subtree, host, fleet, or shared checkout | Spawn mandate or sovereign/delegated according to the exact target; bounded peer Stop must use its typed rail | Amendment IX host-shell capability and ASK/AUTO consent authorize host execution, not agent relationships. The backend strips authority-bearing environment variables, but `cmd_terminate` still treats local process access as operator authority and cannot distinguish this agent-invoked re-entry. Defect: [#3233](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3233). |
+| Run host-mutating CLI from agent shell | `ComputerUseFeature.shell` with the local backend, then any mutating `kestrel` path inventoried below | A named peer, agent data/identity/configuration, shared interpreter/model/container runtime, external deployment, host, fleet, or shared checkout | Spawn mandate or sovereign/delegated according to the exact target; bounded peer Stop must use its typed rail | Amendment IX host-shell capability and ASK/AUTO consent authorize host execution, not agent relationships. Stripping authority-bearing environment variables does not make local process access sovereign: lifecycle, feature-package, configuration, storage, container, model-server, and deployment commands can all re-enter operator-only mutations. Defect: [#3233](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3233); the complete nested mutation inventory below defines its scope. |
 | Cooperative Stop | Stop authority service and future peer signal rail; current `POST /api/agent/stop` is local only | Turn, agent, subtree, host, or fleet | Universal policy for Stop; spawn mandate/sovereign for Hold | Typed Stop work is tracked by [#3139](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3139) and [#3141](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3141). Peer Stop must inherit signal cycle detection and load-bearing rate limits; repeated Stop must not become Hold through the back door. |
 | File/execute coordinator whole-host restart or update | `request_restart`, `restart_coordinator` | Every co-hosted agent and possibly their code checkout | Sovereign/delegated | Enforced by [#3148](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3148): filing requires endpoint-bound sovereign authority or an exact, expiring, sovereign-signed delegation for the subject agent and operation/update bounds. The durable request is host-sealed; revocation, issuance, consumption, immutable bounds, and key rotation are rechecked at coordinator scan and immediately before update/restart use. Unsigned legacy rows fail closed. The separate agent-shell-to-CLI escape is tracked by #3233. |
 | Read/cancel/ack restart request | `list_restart_requests`, `list_restart_status_events`, `cancel_restart_request`, `acknowledge_restart_escalation`; restart status endpoint | A durable restart request/event | Self for requester reads/cancel; sovereign for authority acknowledgement; explicitly public host-coordination fields may be universal read-only | Enforced by [#3146](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3146): list/event reads bind the requesting agent and cancel includes `requested_by_agent` in the durable predicate. #3148 additionally requires live sovereign-key authority before acknowledgement can reissue authority for a requester-owned row. |
 | Scheduler watcher wake | `github_pr_watch`/`ecosystem_discovery_watch` arguments executed through schedules | Owning agent only | Self | Enforced by [#3147](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3147): the runtime binds the scheduler owner's DID and ignores legacy caller-provided `notify` as a routing or causation identity. |
 | Host agent create/withdraw/offboard | `POST /api/agents`, `DELETE /api/agents/{agent_name}`, `!create-agent` | Host registry, peer runtime, hosted namespace, trusted identity directory | Sovereign/delegated | Enforced by [#3149](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3149): every host lifecycle/provisioning door requires a live sovereign caller context at the handler boundary; ordinary OAuth/JWT authentication is insufficient. |
-| Core operator CLI | Every command in the canonical `kestrel` dispatch table, including `ask`, `create`, `start`, `terminate`, `restart`, and `update` | A named agent, the local fleet/host, agent data, or external infrastructure according to the command | Intended outside agent hierarchy; local sovereign/operator process authority | Direct CLI process access is intended as an operator boundary, not agent causation or peer authority. The complete dispatch table is classified below rather than filtered by names. Agent-invoked local host shell can currently re-enter the unguarded `create`, `start`, `terminate`, `restart`, and `update` lifecycle handlers, however, so those paths are recorded as D-3233 rather than inheriting operator authority. Remote API calls still pass the destination host's authentication checks. |
+| Core operator CLI | Every command in the canonical `kestrel` dispatch table and every nested parser/hand-dispatched mutation listed below | A named agent, the local fleet/host, agent data, shared runtime, or external infrastructure according to the command | Intended outside agent hierarchy; local sovereign/operator process authority | Direct CLI process access is intended as an operator boundary, not agent causation or peer authority. Agent-invoked local host shell can re-enter every unguarded host-mutating family—not just the five lifecycle verbs—so the nested D-3233 inventory explicitly includes feature package/runtime, model server, container, configuration, identity, storage, and deployment mutations. Read-only nested commands remain operator observations; remote API calls still pass the destination host's authentication checks. |
 | Talon coding/repository orchestration | External `kestrel-feature-talon`/`kestrel-talon` process | Repository work, issues, PRs | Outside agent hierarchy | Talon is an operator-enabled external feature/process. Its coordinator state, reviewer state, and worktree lineage are not Kestrel agent authority or causation relations. |
 
 `OrchestrationStore` is currently a backend library with no core agent-facing
@@ -477,42 +477,124 @@ own operator policy.
 
 | Surface ID | Classification |
 |---|---|
-| `kestrel_sovereign/cli.py::kestrel agent` | Local operator control of Docker-isolated agent lifecycle/chat; outside agent hierarchy. |
+| `kestrel_sovereign/cli.py::kestrel agent` | D-3233 for Docker `create`, `retire`, generic `run`, and shared-image `build`; `chat` is operator invocation. |
 | `kestrel_sovereign/cli.py::kestrel ask` | Local operator invocation of a named running agent; the remote host still authenticates the request. |
-| `kestrel_sovereign/cli.py::kestrel auth` | Local operator provider-authentication setup; no cross-agent grant. |
-| `kestrel_sovereign/cli.py::kestrel config` | Local operator host configuration read/mutation; outside agent hierarchy. |
-| `kestrel_sovereign/cli.py::kestrel constitution` | Local operator constitutional verification/maintenance; no peer authority. |
+| `kestrel_sovereign/cli.py::kestrel auth` | D-3233 for host provider-credential mutation through `login`; no cross-agent grant is inferred. |
+| `kestrel_sovereign/cli.py::kestrel config` | D-3233 when it mutates agent/host configuration; a read-only invocation is operator observation. |
+| `kestrel_sovereign/cli.py::kestrel constitution` | `reanchor` requires its sovereign-signed artifact when writing; `anchor-overlay` is D-3233 because it establishes authority-bearing Amendment IX overlay trust. |
 | `kestrel_sovereign/cli.py::kestrel create` | D-3233 — intended local sovereign/operator provisioning of a new agent identity and registration, but the same handler is reachable from agent-invoked local host shell without relation authority. |
-| `kestrel_sovereign/cli.py::kestrel demo` | Local operator demo-agent lifecycle; outside production agent hierarchy. |
-| `kestrel_sovereign/cli.py::kestrel deploy` | Local operator control of external deployment infrastructure. |
-| `kestrel_sovereign/cli.py::kestrel docker` | Local operator control of Docker images/runtimes. |
+| `kestrel_sovereign/cli.py::kestrel demo` | D-3233 for the local demo-agent `run` lifecycle path. |
+| `kestrel_sovereign/cli.py::kestrel deploy` | D-3233 for profile deployment/teardown, secret sync, and image build/push; status/list/logs/health are operator observations. |
+| `kestrel_sovereign/cli.py::kestrel docker` | D-3233 for shared Docker image build and remote build/run paths. |
 | `kestrel_sovereign/cli.py::kestrel doctor` | Local operator host/fleet diagnostic read. |
-| `kestrel_sovereign/cli.py::kestrel embeddings` | Local operator audit/reindex of selected agent storage. |
-| `kestrel_sovereign/cli.py::kestrel feature` | Local operator feature package/runtime management; not agent hierarchy. |
+| `kestrel_sovereign/cli.py::kestrel embeddings` | D-3233 for selected-agent `reindex`; `audit` is operator observation. |
+| `kestrel_sovereign/cli.py::kestrel feature` | D-3233 for install/upgrade/sync, enable/disable, scaffold, and `inventory --write`; list/status/info/skills and inventory without `--write` are observations. |
 | `kestrel_sovereign/cli.py::kestrel health` | Deprecated local operator diagnostic alias for `doctor`. |
 | `kestrel_sovereign/cli.py::kestrel help` | Local operator CLI help/catalog read; no agent target. |
-| `kestrel_sovereign/cli.py::kestrel identity` | Local operator identity-export custody maintenance. |
-| `kestrel_sovereign/cli.py::kestrel ipfs` | Local operator control of external storage infrastructure. |
+| `kestrel_sovereign/cli.py::kestrel identity` | D-3233 for identity-export custody permission mutation (`harden-exports`). |
+| `kestrel_sovereign/cli.py::kestrel ipfs` | D-3233 for shared image/deployment mutation and agent pin publication. |
 | `kestrel_sovereign/cli.py::kestrel list` | Local operator read of the configured agent fleet. |
 | `kestrel_sovereign/cli.py::kestrel logs` | Local operator read of a named agent or host log. |
-| `kestrel_sovereign/cli.py::kestrel migrate-config` | Local operator host configuration migration. |
-| `kestrel_sovereign/cli.py::kestrel migrate-encryption` | Local operator mutation of selected agent storage. |
-| `kestrel_sovereign/cli.py::kestrel migrate-llm-config` | Local operator host model-configuration migration. |
-| `kestrel_sovereign/cli.py::kestrel release` | Local operator release-evidence/repository operation; no agent grant. |
+| `kestrel_sovereign/cli.py::kestrel migrate-config` | D-3233 for host model-configuration migration. |
+| `kestrel_sovereign/cli.py::kestrel migrate-encryption` | D-3233 for selected-agent storage mutation; dry-run is observation. |
+| `kestrel_sovereign/cli.py::kestrel migrate-llm-config` | D-3233 for host model-configuration migration. |
+| `kestrel_sovereign/cli.py::kestrel release` | D-3233 for signing-key use/artifact mutation through `sign`; `verify` is operator observation. |
 | `kestrel_sovereign/cli.py::kestrel restart` | D-3233 — intended local operator restart of a named agent or host/fleet, but it first invokes the same unguarded termination handler reachable from agent-invoked local host shell. |
-| `kestrel_sovereign/cli.py::kestrel runpod` | Local operator control of external RunPod infrastructure. |
-| `kestrel_sovereign/cli.py::kestrel serve` | Local operator control of the shared local model server. |
-| `kestrel_sovereign/cli.py::kestrel setup` | Local operator host/agent bootstrap and recovery. |
+| `kestrel_sovereign/cli.py::kestrel runpod` | D-3233 for external deploy/stop/kill mutations; status is operator observation. |
+| `kestrel_sovereign/cli.py::kestrel serve` | D-3233 for shared local-model `up`, `down`, and `switch`; list/status are observations. |
+| `kestrel_sovereign/cli.py::kestrel setup` | D-3233 for host/agent bootstrap and recovery mutation; `--check` is observation. |
 | `kestrel_sovereign/cli.py::kestrel shell` | Local operator interactive invocation of a named agent. |
 | `kestrel_sovereign/cli.py::kestrel skills` | Local operator read/install of feature skills. |
 | `kestrel_sovereign/cli.py::kestrel start` | D-3233 — intended local operator start of a named agent or host/fleet, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel status` | Local operator host/fleet process-status read. |
-| `kestrel_sovereign/cli.py::kestrel storage` | Local operator storage diagnostics or migrations, optionally fleet-wide. |
+| `kestrel_sovereign/cli.py::kestrel storage` | D-3233 for `stamp-sessions` agent/fleet database mutation; `health` is operator observation. |
 | `kestrel_sovereign/cli.py::kestrel terminate` | D-3233 — intended local operator termination of a named agent or host/fleet, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel tool-dispatches` | Local operator read of a selected agent's tool-dispatch log. |
 | `kestrel_sovereign/cli.py::kestrel tool-log` | Alias for the local operator tool-dispatch log read. |
 | `kestrel_sovereign/cli.py::kestrel update` | D-3233 — intended local operator source/install/feature reconciliation followed by named-agent or fleet restart, but the same handler is reachable from agent-invoked local host shell without relation authority. |
 | `kestrel_sovereign/cli.py::kestrel verify-install` | Local operator installation integrity check. |
+
+## Machine-checked core CLI leaf inventory
+
+This second CLI inventory walks the live argparse tree beneath every source-proven
+core dispatch entry. It prevents a nested verb from inheriting a broad
+"operator command" label invisibly. `D-3233` means agent-invoked local shell can
+re-enter the mutation without carrying the target-specific relation or sovereign
+authority that the equivalent governed surface requires. Read-only leaves remain
+listed because their presence is what makes the nested inventory complete.
+`deploy` is hand-dispatched from positional values rather than argparse
+subparsers: its row therefore names the mutating and observation spellings
+explicitly.
+
+| Surface ID | Classification |
+|---|---|
+| `kestrel_sovereign/cli.py::kestrel agent docker build` | D-3233 — build/replace the shared agent image. |
+| `kestrel_sovereign/cli.py::kestrel agent docker chat` | Operator invocation of one Docker-isolated agent; no relation is inferred. |
+| `kestrel_sovereign/cli.py::kestrel agent docker create` | D-3233 — provision identity/data in an agent volume. |
+| `kestrel_sovereign/cli.py::kestrel agent docker retire` | D-3233 — retire the agent represented by a supplied data volume. |
+| `kestrel_sovereign/cli.py::kestrel agent docker run` | D-3233 — arbitrary command mutation inside a supplied agent volume. |
+| `kestrel_sovereign/cli.py::kestrel ask` | Operator message invocation; the remote host still authenticates the request. |
+| `kestrel_sovereign/cli.py::kestrel auth login` | D-3233 — mutate host provider credentials. |
+| `kestrel_sovereign/cli.py::kestrel config` | D-3233 when mutation flags are present; otherwise an operator configuration read. |
+| `kestrel_sovereign/cli.py::kestrel constitution anchor-overlay` | D-3233 — establish authority-bearing Amendment IX overlay trust for a named agent. |
+| `kestrel_sovereign/cli.py::kestrel constitution reanchor` | Sovereign-signed artifact required for mutation; non-forcing drift inspection is read-only. |
+| `kestrel_sovereign/cli.py::kestrel create` | D-3233 — provision a hosted identity and registration. |
+| `kestrel_sovereign/cli.py::kestrel demo run` | D-3233 — run a local demo-agent lifecycle. |
+| `kestrel_sovereign/cli.py::kestrel deploy` | D-3233 for `<profile>`, `teardown`, `secrets sync`, and `build`; `status`, `list`, `logs`, and `health` are observations. |
+| `kestrel_sovereign/cli.py::kestrel docker build` | D-3233 — build/replace a shared local image. |
+| `kestrel_sovereign/cli.py::kestrel docker remote build` | D-3233 — mutate remote Docker build state. |
+| `kestrel_sovereign/cli.py::kestrel docker remote run` | D-3233 — launch a remote Docker runtime. |
+| `kestrel_sovereign/cli.py::kestrel doctor` | Operator host/fleet diagnostic read. |
+| `kestrel_sovereign/cli.py::kestrel embeddings audit` | Operator read of selected-agent embedding state. |
+| `kestrel_sovereign/cli.py::kestrel embeddings reindex` | D-3233 when applied — mutate selected-agent embedding storage; dry-run is observation. |
+| `kestrel_sovereign/cli.py::kestrel feature disable` | D-3233 — mutate host feature configuration. |
+| `kestrel_sovereign/cli.py::kestrel feature enable` | D-3233 — mutate host feature configuration. |
+| `kestrel_sovereign/cli.py::kestrel feature info` | Operator feature metadata read. |
+| `kestrel_sovereign/cli.py::kestrel feature install` | D-3233 — mutate the shared interpreter. |
+| `kestrel_sovereign/cli.py::kestrel feature inventory` | D-3233 with `--write`; otherwise operator inventory read. |
+| `kestrel_sovereign/cli.py::kestrel feature list` | Operator feature catalog read. |
+| `kestrel_sovereign/cli.py::kestrel feature scaffold` | D-3233 — write a new feature project into the shared checkout. |
+| `kestrel_sovereign/cli.py::kestrel feature skills` | Operator feature-skill metadata read. |
+| `kestrel_sovereign/cli.py::kestrel feature status` | Operator host/agent feature-state read. |
+| `kestrel_sovereign/cli.py::kestrel feature sync` | D-3233 — mutate the shared interpreter/source checkouts or host manifest; dry-run is observation. |
+| `kestrel_sovereign/cli.py::kestrel feature upgrade` | D-3233 — mutate the shared interpreter/source checkouts; dry-run is observation. |
+| `kestrel_sovereign/cli.py::kestrel health` | Deprecated operator diagnostic read. |
+| `kestrel_sovereign/cli.py::kestrel help` | CLI help/catalog read. |
+| `kestrel_sovereign/cli.py::kestrel identity harden-exports` | D-3233 — mutate identity-export custody permissions. |
+| `kestrel_sovereign/cli.py::kestrel ipfs build` | D-3233 — build/replace shared IPFS image state. |
+| `kestrel_sovereign/cli.py::kestrel ipfs deploy` | D-3233 — mutate shared IPFS deployment state. |
+| `kestrel_sovereign/cli.py::kestrel ipfs pin` | D-3233 — publish agent pins to shared/external storage. |
+| `kestrel_sovereign/cli.py::kestrel list` | Operator configured-fleet read. |
+| `kestrel_sovereign/cli.py::kestrel logs` | Operator named-agent/host log read. |
+| `kestrel_sovereign/cli.py::kestrel migrate-config` | D-3233 — mutate host model configuration. |
+| `kestrel_sovereign/cli.py::kestrel migrate-encryption` | D-3233 when applied — mutate selected-agent storage; dry-run is observation. |
+| `kestrel_sovereign/cli.py::kestrel migrate-llm-config` | D-3233 — mutate host model configuration. |
+| `kestrel_sovereign/cli.py::kestrel release sign` | D-3233 — use release signing custody and write an evidence artifact. |
+| `kestrel_sovereign/cli.py::kestrel release verify` | Operator release-evidence verification read. |
+| `kestrel_sovereign/cli.py::kestrel restart` | D-3233 — terminate/start a named agent or the host/fleet. |
+| `kestrel_sovereign/cli.py::kestrel runpod deploy` | D-3233 — mutate external training infrastructure. |
+| `kestrel_sovereign/cli.py::kestrel runpod kill` | D-3233 — force-delete external training infrastructure. |
+| `kestrel_sovereign/cli.py::kestrel runpod status` | Operator external-infrastructure read. |
+| `kestrel_sovereign/cli.py::kestrel runpod stop` | D-3233 — stop external training infrastructure. |
+| `kestrel_sovereign/cli.py::kestrel serve down` | D-3233 — stop the shared local-model runtime. |
+| `kestrel_sovereign/cli.py::kestrel serve list` | Operator shared-model catalog read. |
+| `kestrel_sovereign/cli.py::kestrel serve status` | Operator shared-model runtime read. |
+| `kestrel_sovereign/cli.py::kestrel serve switch` | D-3233 — replace the shared local-model runtime. |
+| `kestrel_sovereign/cli.py::kestrel serve up` | D-3233 — start the shared local-model runtime. |
+| `kestrel_sovereign/cli.py::kestrel setup` | D-3233 unless `--check` — mutate host/agent bootstrap or recovery state. |
+| `kestrel_sovereign/cli.py::kestrel shell` | Operator interactive invocation of one named agent. |
+| `kestrel_sovereign/cli.py::kestrel skills search` | Operator skill-catalog read. |
+| `kestrel_sovereign/cli.py::kestrel start` | D-3233 — start a named agent or the host/fleet. |
+| `kestrel_sovereign/cli.py::kestrel status` | Operator host/fleet process-status read. |
+| `kestrel_sovereign/cli.py::kestrel storage health` | Operator storage diagnostic read. |
+| `kestrel_sovereign/cli.py::kestrel storage stamp-sessions` | D-3233 — mutate selected-agent or fleet conversation storage. |
+| `kestrel_sovereign/cli.py::kestrel terminate` | D-3233 — terminate a named agent or the host/fleet. |
+| `kestrel_sovereign/cli.py::kestrel tool-dispatches failure-rate` | Operator selected-agent dispatch-log read. |
+| `kestrel_sovereign/cli.py::kestrel tool-dispatches recent-failures` | Operator selected-agent dispatch-log read. |
+| `kestrel_sovereign/cli.py::kestrel tool-log failure-rate` | Alias for the same operator dispatch-log read. |
+| `kestrel_sovereign/cli.py::kestrel tool-log recent-failures` | Alias for the same operator dispatch-log read. |
+| `kestrel_sovereign/cli.py::kestrel update` | D-3233 — mutate checkout/interpreter/features, then restart a named agent or fleet unless disabled. |
+| `kestrel_sovereign/cli.py::kestrel verify-install` | Operator integrity verification in isolated temporary environments. |
 
 ## Machine-checked HTTP inventory
 

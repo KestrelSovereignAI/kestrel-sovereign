@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import argparse
 import re
 import shlex
 from collections.abc import Callable
@@ -4148,6 +4149,61 @@ def _discovered_core_cli_surfaces() -> frozenset[str]:
     })
 
 
+@lru_cache(maxsize=None)
+def _discovered_core_cli_leaf_surfaces() -> frozenset[str]:
+    """Return every concrete leaf in the live core argparse tree.
+
+    Top-level dispatch completeness cannot see a new nested feature, Docker,
+    model-server, or storage verb. Walk the constructed parser, but restrict
+    roots to the source-proven core dispatch set so installed entry-point CLI
+    extensions do not make this core contract host-dependent.
+    """
+
+    from kestrel_sovereign.cli import build_parser
+
+    def subparser_choices(
+        parser: argparse.ArgumentParser,
+    ) -> dict[str, argparse.ArgumentParser]:
+        actions = [
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        ]
+        if not actions:
+            return {}
+        if len(actions) != 1:
+            raise AssertionError("CLI parser scope has multiple subparser actions")
+        return actions[0].choices
+
+    parser = build_parser()
+    roots = subparser_choices(parser)
+    core_roots = {
+        surface.rsplit(" ", 1)[-1]
+        for surface in _discovered_core_cli_surfaces()
+    }
+    missing = core_roots - roots.keys()
+    if missing:
+        raise AssertionError(
+            "Core dispatch lacks live parser roots: " + ", ".join(sorted(missing))
+        )
+
+    leaves: set[str] = set()
+
+    def walk(path: tuple[str, ...], current: argparse.ArgumentParser) -> None:
+        children = subparser_choices(current)
+        if not children:
+            leaves.add(
+                "kestrel_sovereign/cli.py::kestrel " + " ".join(path)
+            )
+            return
+        for name, child in children.items():
+            walk((*path, name), child)
+
+    for root in sorted(core_roots):
+        walk((root,), roots[root])
+    return frozenset(leaves)
+
+
 def _dynamic_router_publication_surfaces(
     tree: ast.Module,
     relative: str,
@@ -6394,6 +6450,12 @@ def test_every_core_cli_command_is_classified() -> None:
     )
 
 
+def test_every_core_cli_leaf_command_is_classified() -> None:
+    assert _discovered_core_cli_leaf_surfaces() == _documented_cli_surfaces(
+        "## Machine-checked core CLI leaf inventory"
+    )
+
+
 def test_core_cli_agent_and_fleet_controls_are_discovered() -> None:
     discovered = _discovered_core_cli_surfaces()
     for command in ("ask", "create", "terminate", "restart", "update"):
@@ -7807,10 +7869,18 @@ def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None
     action_row = next(
         line
         for line in audit.splitlines()
-        if line.startswith("| Run host lifecycle CLI from agent shell |")
+        if line.startswith("| Run host-mutating CLI from agent shell |")
     )
     assert "[#3233]" in action_row
     assert "Defect:" in action_row
+
+    nested_start = audit.index("## Machine-checked core CLI leaf inventory")
+    nested_end = audit.index("\n## ", nested_start + 3)
+    nested_inventory = audit[nested_start:nested_end]
+    for prefix in _KESTREL_CLI_HOST_MUTATION_PREFIXES:
+        assert f"::kestrel {' '.join(prefix)}`" in nested_inventory, prefix
+    for command in ("create", "restart", "start", "terminate", "update"):
+        assert f"::kestrel {command}`" in nested_inventory, command
 
     for surface in (
         "features/computer_use/feature.py::shell`",
@@ -7819,9 +7889,38 @@ def test_agent_invoked_host_shell_lifecycle_escape_is_recorded_as_3233() -> None
         "cli.py::kestrel terminate`",
         "cli.py::kestrel restart`",
         "cli.py::kestrel update`",
+        "cli.py::kestrel agent`",
+        "cli.py::kestrel deploy`",
+        "cli.py::kestrel feature`",
+        "cli.py::kestrel serve`",
     ):
         tool_row = next(line for line in audit.splitlines() if surface in line)
         assert "D-3233" in tool_row
+
+    for command in (
+        "kestrel agent docker retire /data/Bob",
+        "kestrel deploy production",
+        "kestrel deploy teardown production",
+        "kestrel deploy secrets sync",
+        "kestrel embeddings reindex --yes",
+        "kestrel feature install talon",
+        "kestrel feature upgrade",
+        "kestrel feature sync",
+        "kestrel feature disable peers",
+        "kestrel serve switch model-a",
+        "kestrel storage stamp-sessions --db agent.db",
+    ):
+        assert _is_kestrel_lifecycle_command(ast.Constant(command)), command
+
+    for command in (
+        "kestrel deploy health production",
+        "kestrel deploy list",
+        "kestrel embeddings audit",
+        "kestrel feature status",
+        "kestrel serve status",
+        "kestrel storage health",
+    ):
+        assert not _is_kestrel_lifecycle_command(ast.Constant(command)), command
 
 
 def test_multi_agent_deployment_control_records_3223_enforcement() -> None:
@@ -8329,6 +8428,58 @@ _KESTREL_CLI_LIFECYCLE_ACTIONS = _CROSS_AGENT_LIFECYCLE_ACTIONS | {
     "create",
     "update",
 }
+
+# Core CLI paths that mutate a managed agent, the shared host runtime, or the
+# host's authority-bearing configuration when re-entered through agent shell.
+# A tuple is a command prefix: arguments after it select the target/options.
+# Keep this list aligned with the nested D-3233 inventory in the audit.
+_KESTREL_CLI_HOST_MUTATION_PREFIXES = frozenset(
+    {
+        ("agent", "docker", "build"),
+        ("agent", "docker", "create"),
+        ("agent", "docker", "retire"),
+        ("agent", "docker", "run"),
+        ("auth", "login"),
+        ("config",),
+        ("constitution", "anchor-overlay"),
+        ("demo", "run"),
+        ("docker", "build"),
+        ("docker", "remote", "build"),
+        ("docker", "remote", "run"),
+        ("embeddings", "reindex"),
+        ("feature", "disable"),
+        ("feature", "enable"),
+        ("feature", "install"),
+        ("feature", "inventory"),
+        ("feature", "scaffold"),
+        ("feature", "sync"),
+        ("feature", "upgrade"),
+        ("identity", "harden-exports"),
+        ("ipfs", "build"),
+        ("ipfs", "deploy"),
+        ("ipfs", "pin"),
+        ("migrate-config",),
+        ("migrate-encryption",),
+        ("migrate-llm-config",),
+        ("release", "sign"),
+        ("runpod", "deploy"),
+        ("runpod", "kill"),
+        ("runpod", "stop"),
+        ("serve", "down"),
+        ("serve", "switch"),
+        ("serve", "up"),
+        ("setup",),
+        ("storage", "stamp-sessions"),
+    }
+)
+_KESTREL_CLI_DEPLOY_READ_PATHS = frozenset(
+    {
+        ("deploy", "health"),
+        ("deploy", "list"),
+        ("deploy", "logs"),
+        ("deploy", "status"),
+    }
+)
 
 
 _CROSS_AGENT_TARGETED_CONTROL_ACTIONS = frozenset(
@@ -9682,6 +9833,32 @@ def _unverified_attribution_aliases(
                 return _ATTRIBUTION_IDENTITY_WITNESS
             if callable_binding == _ATTRIBUTION_VALIDATOR:
                 return _ATTRIBUTION_VERIFIED_VALUE
+            if isinstance(value.func, ast.Call) and value.args:
+                selector_factory = _call_name(value.func).casefold()
+                selector_keys: list[ast.AST] = []
+                if selector_factory == "itemgetter":
+                    selector_keys = list(value.func.args)
+                elif (
+                    selector_factory == "methodcaller"
+                    and value.func.args
+                    and resolved_key(value.func.args[0]) == "get"
+                ):
+                    selector_keys = list(value.func.args[1:2])
+                if selector_keys:
+                    receiver_binding = flow.resolve(value.args[0])
+                    resolved_selectors = [
+                        resolved_key(selector) for selector in selector_keys
+                    ]
+                    selects_identity = any(
+                        selector is None
+                        or selector.casefold()
+                        in UNVERIFIED_ATTRIBUTION_METADATA_KEYS
+                        for selector in resolved_selectors
+                    )
+                    if selects_identity and receiver_binding in untrusted:
+                        return _ATTRIBUTION_UNTRUSTED_CLAIM
+                    if selects_identity and receiver_binding in verified:
+                        return _ATTRIBUTION_VERIFIED_VALUE
             if (
                 _call_name(value).casefold()
                 == "_a2a_sender_witness_unchanged"
@@ -11035,7 +11212,7 @@ def _shell_adapter_invokes_kestrel_lifecycle(call: ast.Call) -> bool:
 
 
 def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
-    """Whether an expression statically denotes a Kestrel lifecycle command."""
+    """Whether an expression denotes Kestrel host/agent mutation re-entry."""
 
     if getattr(command, "_authority_shell_lifecycle", False):
         return True
@@ -11049,7 +11226,7 @@ def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
         return basename.casefold()
 
     def denotes_lifecycle(words: list[str]) -> bool:
-        """Unwrap supported launchers and match one canonical CLI operation."""
+        """Unwrap supported launchers and match a mutating core CLI path."""
 
         if not words:
             return False
@@ -11072,11 +11249,24 @@ def _is_kestrel_lifecycle_command(command: ast.AST) -> bool:
                 return False
             executable = "kestrel"
             operation_index = 3
-        return (
-            executable == "kestrel"
-            and len(normalized) > operation_index
-            and executable_name(normalized[operation_index])
-            in _KESTREL_CLI_LIFECYCLE_ACTIONS
+        if executable != "kestrel" or len(normalized) <= operation_index:
+            return False
+        command_path = tuple(
+            executable_name(word) for word in normalized[operation_index:]
+        )
+        if command_path[0] in _KESTREL_CLI_LIFECYCLE_ACTIONS:
+            return True
+        if command_path[0] == "deploy":
+            # Deploy uses a positional profile rather than argparse
+            # subparsers. Known observation verbs are read-only; every other
+            # target deploys, tears down, writes secrets, or builds/pushes.
+            return not any(
+                command_path[: len(read_path)] == read_path
+                for read_path in _KESTREL_CLI_DEPLOY_READ_PATHS
+            )
+        return any(
+            command_path[: len(prefix)] == prefix
+            for prefix in _KESTREL_CLI_HOST_MUTATION_PREFIXES
         )
 
     def literal_tokens(node: ast.AST) -> list[str]:
@@ -20564,6 +20754,42 @@ def test_provenance_scanner_follows_callable_control_factories() -> None:
     assert _authority_provenance_lines(wrapped_callback) == {3}
     assert _authority_provenance_lines(keyword_wrapped_callback) == {3}
     assert _authority_provenance_lines(decorator_wrapped_callback) == {3}
+
+
+def test_provenance_scanner_propagates_static_metadata_selectors() -> None:
+    itemgetter = ast.parse(
+        "import operator\n\n"
+        "def govern(task, target):\n"
+        "    claim = operator.itemgetter('sender')(task.metadata)\n"
+        "    if claim:\n"
+        "        target.shutdown()\n"
+    )
+    multiple_keys = ast.parse(
+        "from operator import itemgetter\n\n"
+        "def govern(task, target):\n"
+        "    selected = itemgetter('kind', 'sender')(task.metadata)\n"
+        "    if selected:\n"
+        "        target.shutdown()\n"
+    )
+    mapping_getter = ast.parse(
+        "from operator import methodcaller\n\n"
+        "def govern(task, target):\n"
+        "    claim = methodcaller('get', 'sender')(task.metadata)\n"
+        "    if claim:\n"
+        "        target.shutdown()\n"
+    )
+    benign = ast.parse(
+        "import operator\n\n"
+        "def inspect(task, target):\n"
+        "    kind = operator.itemgetter('kind')(task.metadata)\n"
+        "    if kind:\n"
+        "        target.shutdown()\n"
+    )
+
+    assert _authority_provenance_lines(itemgetter) == {5}
+    assert _authority_provenance_lines(multiple_keys) == {5}
+    assert _authority_provenance_lines(mapping_getter) == {5}
+    assert _authority_provenance_lines(benign) == set()
 
 
 def test_provenance_scanner_follows_reflective_lifecycle_dispatch() -> None:
