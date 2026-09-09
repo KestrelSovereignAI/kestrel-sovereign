@@ -16,6 +16,20 @@ from .models import ComputeScript, ExecutionRecord, ScriptState, SecurityFinding
 logger = logging.getLogger(__name__)
 
 
+def _row_get(row, key, default=0):
+    """Read ``key`` from an aiosqlite Row, tolerating a row without it.
+
+    Rows selected before the additive migration ran — or by a query written
+    against the older column set — simply do not carry it, and ``KeyError``
+    at read time would turn a missing flag into a crash instead of a
+    default.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
 class ScriptStore:
     """
     SQLite-backed storage for compute scripts.
@@ -96,9 +110,28 @@ class ScriptStore:
                     resource_usage TEXT,
                     dry_run INTEGER DEFAULT 0,
                     workdir TEXT,
+                    stdout_truncated INTEGER DEFAULT 0,
+                    stderr_truncated INTEGER DEFAULT 0,
                     FOREIGN KEY (script_id) REFERENCES compute_scripts(id)
                 )
             """)
+
+            # ``CREATE TABLE IF NOT EXISTS`` is the whole schema story here,
+            # so a database made before a column existed never gains it and
+            # every read of that column raises. Additive columns are applied
+            # explicitly, guarded by what the table actually has — a record
+            # that reported itself whole because its truncation column was
+            # missing would be the same lie the flag was added to stop.
+            cursor = await db.execute("PRAGMA table_info(compute_executions)")
+            present = {row[1] for row in await cursor.fetchall()}
+            for column, ddl in (
+                ("stdout_truncated", "INTEGER DEFAULT 0"),
+                ("stderr_truncated", "INTEGER DEFAULT 0"),
+            ):
+                if column not in present:
+                    await db.execute(
+                        f"ALTER TABLE compute_executions ADD COLUMN {column} {ddl}"
+                    )
             
             # Indexes for efficient queries
             await db.execute("""
@@ -337,8 +370,9 @@ class ScriptStore:
                 INSERT INTO compute_executions (
                     id, script_id, started_at, completed_at,
                     exit_code, stdout, stderr, executor,
-                    container_id, resource_usage, dry_run, workdir
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    container_id, resource_usage, dry_run, workdir,
+                    stdout_truncated, stderr_truncated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.id,
                 record.script_id,
@@ -352,6 +386,8 @@ class ScriptStore:
                 json.dumps(record.resource_usage),
                 1 if record.dry_run else 0,
                 record.workdir,
+                int(record.stdout_truncated),
+                int(record.stderr_truncated),
             ))
             await db.commit()
         
@@ -369,7 +405,8 @@ class ScriptStore:
                 UPDATE compute_executions SET
                     completed_at = ?, exit_code = ?,
                     stdout = ?, stderr = ?,
-                    container_id = ?, resource_usage = ?
+                    container_id = ?, resource_usage = ?,
+                    stdout_truncated = ?, stderr_truncated = ?
                 WHERE id = ?
             """, (
                 record.completed_at.isoformat() if record.completed_at else None,
@@ -378,6 +415,8 @@ class ScriptStore:
                 record.stderr,
                 record.container_id,
                 json.dumps(record.resource_usage),
+                int(record.stdout_truncated),
+                int(record.stderr_truncated),
                 record.id,
             ))
             await db.commit()
@@ -494,4 +533,6 @@ class ScriptStore:
             resource_usage=json.loads(row["resource_usage"] or "{}"),
             dry_run=bool(row["dry_run"]),
             workdir=row["workdir"],
+            stdout_truncated=bool(_row_get(row, "stdout_truncated")),
+            stderr_truncated=bool(_row_get(row, "stderr_truncated")),
         )

@@ -102,6 +102,46 @@ def is_flat_toolresult_envelope(value: Any) -> bool:
     return False
 
 
+def orchestrator_result_cap() -> int:
+    """The orchestrator's per-tool-result cap (``MAX_TOOL_RESULT_CHARS``).
+
+    Read from the orchestrator constant rather than hardcoded so the two can
+    never drift back into conflict (F086): a serialized result larger than
+    this cap is silently replaced downstream with a head+tail preview, and a
+    feature that does not size against it can have its most important bytes
+    fall in the discarded middle.
+    """
+    try:
+        from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
+    except Exception:  # pragma: no cover - defensive import fallback
+        MAX_TOOL_RESULT_CHARS = 8000
+    return max(1000, int(MAX_TOOL_RESULT_CHARS))
+
+
+def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
+    """Length of a result exactly as the orchestrator measures it.
+
+    The cap is applied to ``len(json.dumps(...))`` of what the orchestrator
+    receives, so callers size against that same shape rather than a raw
+    character count — JSON escaping of quotes, backslashes and non-ASCII can
+    expand a body several-fold past its ``len()``.
+
+    What it receives is not the bare ToolResult: ``DynamicTool.execute``
+    wraps it, adding ``tool`` and ``success`` on top of ``to_dict()``.
+    Measuring the unwrapped form is short by those keys, which is invisible
+    until a result lands in the gap — measured, 7,967 unwrapped against an
+    8,000 cap became 8,001 wrapped, and the orchestrator discarded output
+    from a result that called itself complete. ``tool_name`` is the caller's
+    own name; leaving it empty still counts the keys.
+    """
+    import json as _json
+
+    payload = _serialize_tool_result(result)
+    if isinstance(payload, dict):
+        payload = {**payload, "tool": tool_name, "success": True}
+    return len(_json.dumps(payload))
+
+
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 

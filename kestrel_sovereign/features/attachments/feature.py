@@ -39,29 +39,12 @@ logger = logging.getLogger(__name__)
 _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
-def _orchestrator_result_cap() -> int:
-    """The orchestrator's per-tool-result cap (``MAX_TOOL_RESULT_CHARS``).
-
-    Read from the orchestrator constant rather than hardcoded so the two can
-    never drift back into conflict (F086): a serialized result larger than
-    this cap is silently replaced downstream with an unreadable preview.
-    """
-    try:
-        from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
-    except Exception:  # pragma: no cover - defensive import fallback
-        MAX_TOOL_RESULT_CHARS = 8000
-    return max(1000, int(MAX_TOOL_RESULT_CHARS))
-
-
-def _serialized_len(result: ToolResult) -> int:
-    """Length of the result exactly as the orchestrator measures it.
-
-    The live cap is applied to ``len(json.dumps(_serialize_tool_result(result)))``
-    (orchestrator_engine.py), so we size chunks against that same shape rather
-    than against the raw character count — JSON escaping of quotes, backslashes,
-    and non-ASCII/emoji can expand a body several-fold past its ``len()``.
-    """
-    return len(json.dumps(_serialize_tool_result(result)))
+# Both now live beside the serializer they measure, so a second feature
+# needing the same bound reuses it instead of writing a third copy.
+from kestrel_sovereign.features.base import (  # noqa: E402
+    orchestrator_result_cap as _orchestrator_result_cap,
+    serialized_result_len as _serialized_len,
+)
 
 
 class AttachmentsFeature(Feature):

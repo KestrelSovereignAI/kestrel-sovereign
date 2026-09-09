@@ -255,6 +255,21 @@ class ExecutionRecord:
     exit_code: Optional[int] = None
     stdout: str = ""
     stderr: str = ""
+    # Whether the executor's output cap discarded anything, per stream.
+    # Previously the only signal was a marker appended to ``stdout``/
+    # ``stderr`` themselves, which a consumer had to parse back out of
+    # caller-controlled text — so a command whose own output happened to end
+    # that way was read as truncated. A boolean cannot be spoofed by what the
+    # command prints. Two of them, because the streams are capped
+    # independently and reporting a clipped stdout as a clipped stderr is a
+    # different claim from the true one.
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+    @property
+    def output_truncated(self) -> bool:
+        """Whether either stream was clipped."""
+        return self.stdout_truncated or self.stderr_truncated
     
     # Sandbox info
     executor: Literal["uv", "docker", "local"] = "uv"
@@ -277,6 +292,11 @@ class ExecutionRecord:
             "exit_code": self.exit_code,
             "stdout": self.stdout,
             "stderr": self.stderr,
+            # Round-tripped: a clipped record reconstructed from storage that
+            # reported itself whole would defeat the point of moving the fact
+            # off the text in the first place.
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
             "executor": self.executor,
             "container_id": self.container_id,
             "resource_usage": self.resource_usage,
@@ -295,6 +315,8 @@ class ExecutionRecord:
             exit_code=data.get("exit_code"),
             stdout=data.get("stdout", ""),
             stderr=data.get("stderr", ""),
+            stdout_truncated=bool(data.get("stdout_truncated", False)),
+            stderr_truncated=bool(data.get("stderr_truncated", False)),
             executor=data.get("executor", "uv"),
             container_id=data.get("container_id"),
             resource_usage=data.get("resource_usage", {}),
