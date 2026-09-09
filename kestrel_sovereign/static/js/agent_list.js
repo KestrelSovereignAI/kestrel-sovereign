@@ -103,14 +103,14 @@ export function createDefaultAgentAdapter(api = API) {
 // Default card renderer — the CONSOLE ROW (matches today's `.agent-item`)
 // ============================================================================
 
-// Build the default console-row body: the per-agent thinking pulse, the
-// name/description block, and the stop control — the exact affordance set the
-// standalone console shipped in identity.js. Returns a DocumentFragment so the
+// Build the default console-row body: the per-agent thinking pulse and the
+// name/description block. Returns a DocumentFragment so the
 // children become DIRECT children of the `.agent-item` flex row (a wrapping
 // div would break the row layout), letting the component prepend the
-// component-owned status dot and append the actions anchor around it. The
-// status dot is component-owned (§3.2), so this renderer does NOT draw it.
-function makeConsoleRenderer({ onStop }) {
+// component-owned status dot and append its shared controls around it. The
+// status dot and Stop affordance are component-owned, so this renderer does
+// not draw either one.
+function makeConsoleRenderer() {
     return (item) => {
         const doc = typeof document !== 'undefined' ? document : null;
         const frag = doc.createDocumentFragment();
@@ -135,83 +135,90 @@ function makeConsoleRenderer({ onStop }) {
         info.appendChild(desc);
         frag.appendChild(info);
 
-        // Per-agent stop control. Rendered always but only VISIBLE while the
-        // row carries `.agent-thinking` (CSS gate); a click aborts that exact
-        // agent's stream via the host `onStop` hook. stopPropagation so it does
-        // not also fire the row's selection handler.
-        const stopBtn = doc.createElement('button');
-        stopBtn.className = 'agent-stop-btn';
-        // Label with the live display name; but stop ROUTES by item.name (the
-        // manager routing key) so the abort reaches the right agent (#2672 P2).
-        stopBtn.title = `Stop ${name}`;
-        stopBtn.setAttribute('aria-label', `Stop ${name}`);
-        stopBtn.innerHTML = '&times;';
-        const outcomeEl = doc.createElement('span');
-        outcomeEl.className = 'agent-stop-outcome';
-        outcomeEl.setAttribute('role', 'status');
-        outcomeEl.setAttribute('aria-live', 'polite');
-        outcomeEl.hidden = true;
-        const routedTarget = item.name;
-        stopBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            if (stopBtn.disabled || typeof onStop !== 'function') return;
-            stopBtn.disabled = true;
-            outcomeEl.hidden = false;
-            outcomeEl.dataset.disposition = 'requested';
-            outcomeEl.textContent = 'Stopping…';
-            try {
-                const result = await onStop(routedTarget);
-                const outcomes = Array.isArray(result?.outcomes)
-                    ? result.outcomes
-                    : (
-                        Array.isArray(result?.stop_outcomes)
-                            ? result.stop_outcomes
-                            : (
-                                Array.isArray(result?.response?.stop_outcomes)
-                                    ? result.response.stop_outcomes
-                                    : []
-                            )
-                    );
-                const targetIds = [
-                    routedTarget,
-                    item.id,
-                    item.raw && item.raw.did,
-                    item.raw && item.raw.id,
-                ].filter((value) => typeof value === 'string' && value);
-                const outcome = outcomes.find((candidate) => (
-                    candidate
-                    && targetIds.includes(candidate.resolved_target || candidate.agent_id)
-                )) || outcomes[0] || null;
-                const disposition = outcome && typeof outcome.disposition === 'string'
-                    ? outcome.disposition
-                    : (result === true ? 'stopped' : 'unreachable');
-                const labels = {
-                    stopped: 'Stopped',
-                    already_complete: 'Already complete',
-                    refused: 'Stop refused',
-                    unreachable: 'Stop unreachable',
-                    indeterminate: 'Stop indeterminate',
-                };
-                outcomeEl.dataset.disposition = disposition;
-                outcomeEl.textContent = labels[disposition] || `Stop: ${disposition}`;
-                outcomeEl.title = outcome && typeof outcome.detail === 'string'
-                    ? outcome.detail
-                    : outcomeEl.textContent;
-            } catch (error) {
-                outcomeEl.dataset.disposition = 'unreachable';
-                outcomeEl.textContent = 'Stop unreachable';
-                outcomeEl.title = error && error.message
-                    ? error.message
-                    : 'Cooperative Stop request failed';
-            } finally {
-                stopBtn.disabled = false;
-            }
-        });
-        frag.appendChild(stopBtn);
-        frag.appendChild(outcomeEl);
-
         return frag;
     };
+}
+
+// Stop is behavior, not card presentation. Keep the control on the component-
+// owned seam so a host's custom portrait renderer cannot replace cancellation
+// when it replaces the console body. Default rows receive these nodes directly;
+// custom cards receive them in the actions anchor that the host positions.
+function makeStopControls(doc, item, onStop) {
+    const frag = doc.createDocumentFragment();
+    const displayName = item.displayName || item.name || 'Unnamed Agent';
+    const stopBtn = doc.createElement('button');
+    stopBtn.className = 'agent-stop-btn';
+    stopBtn.title = `Stop ${displayName}`;
+    stopBtn.setAttribute('aria-label', `Stop ${displayName}`);
+    stopBtn.innerHTML = '&times;';
+
+    const outcomeEl = doc.createElement('span');
+    outcomeEl.className = 'agent-stop-outcome';
+    outcomeEl.setAttribute('role', 'status');
+    outcomeEl.setAttribute('aria-live', 'polite');
+    outcomeEl.hidden = true;
+
+    // Capture the immutable routing key at render time. Display-name changes
+    // and selection changes during an awaited Stop may never retarget retries.
+    const routedTarget = item.name;
+    stopBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (stopBtn.disabled || typeof onStop !== 'function') return;
+        stopBtn.disabled = true;
+        outcomeEl.hidden = false;
+        outcomeEl.dataset.disposition = 'requested';
+        outcomeEl.textContent = 'Stopping…';
+        try {
+            const result = await onStop(routedTarget);
+            const outcomes = Array.isArray(result?.outcomes)
+                ? result.outcomes
+                : (
+                    Array.isArray(result?.stop_outcomes)
+                        ? result.stop_outcomes
+                        : (
+                            Array.isArray(result?.response?.stop_outcomes)
+                                ? result.response.stop_outcomes
+                                : []
+                        )
+                );
+            const targetIds = [
+                routedTarget,
+                item.id,
+                item.raw && item.raw.did,
+                item.raw && item.raw.id,
+            ].filter((value) => typeof value === 'string' && value);
+            const outcome = outcomes.find((candidate) => (
+                candidate
+                && targetIds.includes(candidate.resolved_target || candidate.agent_id)
+            )) || outcomes[0] || null;
+            const disposition = outcome && typeof outcome.disposition === 'string'
+                ? outcome.disposition
+                : (result === true ? 'stopped' : 'unreachable');
+            const labels = {
+                stopped: 'Stopped',
+                already_complete: 'Already complete',
+                refused: 'Stop refused',
+                unreachable: 'Stop unreachable',
+                indeterminate: 'Stop indeterminate',
+            };
+            outcomeEl.dataset.disposition = disposition;
+            outcomeEl.textContent = labels[disposition] || `Stop: ${disposition}`;
+            outcomeEl.title = outcome && typeof outcome.detail === 'string'
+                ? outcome.detail
+                : outcomeEl.textContent;
+        } catch (error) {
+            outcomeEl.dataset.disposition = 'unreachable';
+            outcomeEl.textContent = 'Stop unreachable';
+            outcomeEl.title = error && error.message
+                ? error.message
+                : 'Cooperative Stop request failed';
+        } finally {
+            stopBtn.disabled = false;
+        }
+    });
+    frag.appendChild(stopBtn);
+    frag.appendChild(outcomeEl);
+    return frag;
 }
 
 // ============================================================================
@@ -247,7 +254,7 @@ export function mountAgentList(containerEl, config = {}) {
     const onSelect = typeof config.onSelect === 'function'
         ? config.onSelect
         : (adapter && typeof adapter.onSelect === 'function' ? adapter.onSelect : null);
-    const renderCard = hostRenderCard || makeConsoleRenderer({ onStop });
+    const renderCard = hostRenderCard || makeConsoleRenderer();
 
     let items = [];
     let activeName = config.selectedName || null;
@@ -299,6 +306,8 @@ export function mountAgentList(containerEl, config = {}) {
         const actionsAnchor = doc.createElement('div');
         actionsAnchor.dataset.slot = 'agent-card-actions';
         actionsAnchor.className = 'agent-card-actions';
+        const stopControls = makeStopControls(doc, item, onStop);
+        if (!usingDefaultRenderer) actionsAnchor.appendChild(stopControls);
 
         // Component-owned status dot — a config flag (`showStatusDot`, default
         // true = console behavior); a host renderCard may omit it entirely.
@@ -335,6 +344,7 @@ export function mountAgentList(containerEl, config = {}) {
         // portrait), in which case the component leaves it where the host put it.
         if (statusDot) shell.appendChild(statusDot);
         if (body) shell.appendChild(body);
+        if (usingDefaultRenderer) shell.appendChild(stopControls);
         if (!actionsAnchor.parentNode) shell.appendChild(actionsAnchor);
 
         // NOTE: the `agent-card-actions` slot is rendered by `renderList` AFTER

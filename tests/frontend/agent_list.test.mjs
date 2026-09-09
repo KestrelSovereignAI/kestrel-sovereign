@@ -140,6 +140,59 @@ test('renderCard override replaces the body and receives ctx (actionsAnchor + es
     handle.destroy();
 });
 
+test('custom companion renderer retains the shared busy-only Stop affordance', async () => {
+    const calls = [];
+    const { el, handle } = mountInto({
+        adapter: fakeAdapter([{
+            name: 'frinz-route',
+            displayName: 'Frinz Companion',
+            id: 'did:agent:frinz',
+            status: 'online',
+        }]),
+        isThinking: () => true,
+        onStop: async (target) => {
+            calls.push(target);
+            return {
+                outcomes: [{
+                    resolved_target: 'did:agent:frinz',
+                    disposition: 'refused',
+                    detail: 'durable receipt unavailable',
+                }],
+            };
+        },
+        renderCard: (_item, ctx) => {
+            const portrait = document.createElement('div');
+            portrait.className = 'portrait-card';
+            portrait.appendChild(ctx.actionsAnchor);
+            return portrait;
+        },
+    });
+    await tick();
+
+    const shell = el.querySelector('.agent-card');
+    const button = el.querySelector('.agent-stop-btn');
+    const status = el.querySelector('.agent-stop-outcome');
+    assert.ok(shell.classList.contains('agent-thinking'));
+    assert.ok(button, 'custom card keeps the component-owned Stop control');
+    assert.equal(button.closest('.agent-card-actions'), el.querySelector('.agent-card-actions'));
+    button.click();
+    await tick();
+    assert.deepEqual(calls, ['frinz-route']);
+    assert.equal(status.dataset.disposition, 'refused');
+    assert.equal(status.textContent, 'Stop refused');
+
+    const css = readFileSync(
+        resolve(here, '../../kestrel_sovereign/static/index.css'),
+        'utf8',
+    );
+    assert.match(
+        css,
+        /\.agent-card\.agent-thinking \.agent-stop-btn/,
+        'busy-only visibility applies to custom companion cards',
+    );
+    handle.destroy();
+});
+
 test('selection fires setHostAgent ONLY in multi-agent mode', async () => {
     const calls = [];
     const api = { setHostAgent: (n) => calls.push(n) };

@@ -369,12 +369,12 @@ nav {
     color: white;
     border-color: var(--error, #dc2626);
 }
-.agent-item.agent-thinking .agent-stop-btn {
+.agent-card.agent-thinking .agent-stop-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
 }
-.agent-item.selected .agent-stop-btn {
+.agent-card.selected .agent-stop-btn {
     border-color: rgba(255, 255, 255, 0.4);
     color: rgba(255, 255, 255, 0.85);
 }
