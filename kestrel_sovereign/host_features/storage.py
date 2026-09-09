@@ -33,7 +33,6 @@ DERIVED_HOST_DB_PATH_ENV = "KESTREL_DERIVED_HOST_DB_PATH"
 HOST_DB_USES_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_USES_DEFAULT"
 HOST_DB_PREVIOUS_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_PREVIOUS_DEFAULT"
 HOST_DB_LEGACY_PATH_ENV = "KESTREL_HOST_DB_LAUNCH_LEGACY_PATH"
-AGENT_DB_PATH_ENV = "KESTREL_DB_PATH"
 HOST_FEATURE_DB_FILENAME = "host-features.db"
 LEGACY_HOST_DB_FILENAME = "kestrel_host.db"
 SQLITE_AUXILIARY_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -125,14 +124,6 @@ def host_database_path(
     explicit = db_path or runtime_env.get(HOST_DB_PATH_ENV)
     if explicit:
         return _runtime_path(explicit, runtime_env, runtime_base), False
-    agent_data_root = runtime_env.get(AGENT_DB_PATH_ENV)
-    if agent_data_root:
-        return (
-            _runtime_path(agent_data_root, runtime_env, runtime_base)
-            / "host-data"
-            / HOST_FEATURE_DB_FILENAME,
-            False,
-        )
     return _default_host_database_path(runtime_env, runtime_base), True
 
 
@@ -685,7 +676,6 @@ def prepare_host_database(
 
 
 __all__ = [
-    "AGENT_DB_PATH_ENV",
     "DERIVED_HOST_DB_PATH_ENV",
     "HOST_DB_LEGACY_PATH_ENV",
     "HOST_DB_PATH_ENV",
