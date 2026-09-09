@@ -1184,12 +1184,41 @@ async def stop_agent_request(request: Request):
                     "Stop correlation_id must be a non-empty valid Unicode string."
                 ),
             )
+        reason = data.get("reason")
+        if reason is not None and (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 1024
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_stop_reason",
+                message=(
+                    "Stop reason must be non-empty text no longer than 1024 characters."
+                ),
+            )
+        expected_agent_id = data.get("expected_agent_id")
+        if expected_agent_id is not None and (
+            not isinstance(expected_agent_id, str)
+            or not expected_agent_id.strip()
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_expected_agent_id",
+                message="expected_agent_id must be a concrete agent identity.",
+            )
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():
             # Compatibility for pre-inception/test agents. This is an address,
             # not a grant; HTTP caller authorization remains at the route.
             agent_id = "local-agent"
+        if expected_agent_id is not None and expected_agent_id != agent_id:
+            raise ApiHTTPException(
+                status_code=409,
+                code="agent_identity_changed",
+                message="The routed agent identity changed before Stop dispatch.",
+            )
         caller = getattr(request.state, "caller", None)
         actor_id = getattr(caller, "identity", None)
         if not isinstance(actor_id, str) or not actor_id.strip():
@@ -1357,6 +1386,7 @@ async def stop_agent_request(request: Request):
             ),
             target_is_turn_id=turn_id is not None,
             turn_id=canonical_turn_id,
+            reason=reason,
             trace_id=target_trace_id,
             span_id=target_span_id,
             **(

@@ -1230,6 +1230,58 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     ]
 
 
+def test_agent_stop_persists_cli_reason_in_durable_request() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _MemoryReceiptStore()
+    app = FastAPI()
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:reason"
+    agent._active_request_ids = set()
+    agent._current_request_id = None
+    agent.active_turn_request_ids = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"correlation_id": "cli:reason", "reason": "andon cord"},
+    )
+
+    assert response.status_code == 200
+    request, receipt = store.records["cli:reason"]
+    assert request.reason == "andon cord"
+    assert receipt.reason == "andon cord"
+
+
+def test_agent_stop_expected_identity_precondition_blocks_replacement() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _MemoryReceiptStore()
+    app = FastAPI()
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+    replacement = MagicMock()
+    replacement.agent_id = "did:test:replacement"
+    replacement.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = replacement
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={
+            "correlation_id": "cli:stale-route",
+            "expected_agent_id": "did:test:original",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "routed agent identity changed" in response.json()["detail"]
+    replacement.cancel_current_request.assert_not_called()
+    assert store.records == {}
+
+
 def test_live_agent_stop_rechecks_turns_after_receipt_preflight() -> None:
     """A turn admitted during receipt I/O belongs to the same agent Stop."""
     from kestrel_sovereign.endpoints.agent import router

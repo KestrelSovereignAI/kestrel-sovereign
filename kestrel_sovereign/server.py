@@ -3790,6 +3790,24 @@ register_api_error_handlers(app)
 
 
 _AGENT_PATH_RE_ASGI = re.compile(r"^/api/agents/([^/]+)/(.+)$")
+_ENCODED_AGENT_PATH_RE_ASGI = re.compile(r"^/api/agent-routes/([^/]+)/(.+)$")
+
+
+def _routed_agent_path(path: str) -> tuple[str, str] | None:
+    """Resolve legacy literal or lossless encoded host-agent paths."""
+
+    match = _AGENT_PATH_RE_ASGI.match(path)
+    if match:
+        return match.group(1), match.group(2)
+    match = _ENCODED_AGENT_PATH_RE_ASGI.match(path)
+    if not match:
+        return None
+    from kestrel_sovereign.multi_agent.route_name import decode_agent_route_name
+
+    try:
+        return decode_agent_route_name(match.group(1)), match.group(2)
+    except ValueError:
+        return None
 
 
 def _agent_not_found_response(
@@ -3827,11 +3845,11 @@ class MultiAgentAgentRoutingMiddleware:
             return await self.app(scope, receive, send)
 
         path = scope.get("path", "")
-        match = _AGENT_PATH_RE_ASGI.match(path)
-        if not match:
+        routed = _routed_agent_path(path)
+        if routed is None:
             return await self.app(scope, receive, send)
 
-        agent_name = match.group(1)
+        agent_name, remaining_path = routed
         agent = agent_manager.get_agent(agent_name)
         if agent is None:
             if scope["type"] == "http":
@@ -3848,7 +3866,7 @@ class MultiAgentAgentRoutingMiddleware:
         # Mutate scope so downstream routes match the prefix-stripped path
         # and the handler can find the agent on `request.state` /
         # `websocket.state`. Starlette wires scope["state"] → both.
-        scope["path"] = "/" + match.group(2)
+        scope["path"] = "/" + remaining_path
         scope["raw_path"] = scope["path"].encode("utf-8")
         scope.setdefault("state", {})["agent"] = agent
 
@@ -4066,10 +4084,10 @@ async def agent_routing_middleware(request: Request, call_next):
         return await call_next(request)
 
     path = request.url.path
-    match = _AGENT_PATH_RE.match(path)
-    if match:
-        agent_name = match.group(1)
-        remaining_path = "/" + match.group(2)
+    routed = _routed_agent_path(path)
+    if routed is not None:
+        agent_name, remaining = routed
+        remaining_path = "/" + remaining
 
         agent = agent_manager.get_agent(agent_name)
         if agent is None:

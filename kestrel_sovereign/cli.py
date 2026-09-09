@@ -7,6 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
+    kestrel stop <name>            # cooperatively stop one agent's work
+    kestrel stop --all             # cooperatively stop all in-flight work
     kestrel terminate              # terminate everything (agents first, then host)
     kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -1936,6 +1938,7 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _run_uv_pip_install_editable,
     _GitFailedError,
 )
+from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402
 
 
 # Feature commands live in cli_features.py (#1678); re-export the public
@@ -2003,9 +2006,13 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
-    # kestrel start|stop|restart|update|status|logs
+    # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
+
+    # Cooperative Stop is intentionally outside process lifecycle.
+    from kestrel_sovereign.cli_stop import add_stop_subparser
+    add_stop_subparser(subparsers)
 
     # kestrel list
     subparsers.add_parser("list", help="List all agents in multi_agent")
@@ -2448,6 +2455,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
+        "stop": cmd_stop,
         "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,
