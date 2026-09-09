@@ -1429,7 +1429,7 @@ async def test_a_capture_that_could_not_be_written_is_not_complete(
 
     bundle = capture.allocate(tmp_path / "captures")
 
-    async def exploding_pump(reader, fh):
+    async def exploding_pump(reader, fh, state=None):
         await reader.read(10)
         raise OSError("No space left on device")
 
@@ -2094,12 +2094,12 @@ async def test_one_stream_failing_does_not_indict_the_other(
     bundle = capture.allocate(tmp_path / "captures")
     real_pump = local_mod._pump
 
-    async def selective_pump(reader, fh):
+    async def selective_pump(reader, fh, state=None):
         # Fail only the stream whose handle is the stdout capture.
         if getattr(fh, "_is_stdout", False):
             await reader.read(10)
             raise OSError("No space left on device")
-        await real_pump(reader, fh)
+        await real_pump(reader, fh, state)
 
     real_open = local_mod._open_capture
 
@@ -2206,11 +2206,11 @@ async def test_a_failing_stderr_pump_indicts_only_stderr(
         err_fh._is_stderr = True
         return out_fh, err_fh
 
-    async def selective_pump(reader, fh):
+    async def selective_pump(reader, fh, state=None):
         if getattr(fh, "_is_stderr", False):
             await reader.read(10)
             raise OSError("No space left on device")
-        await real_pump(reader, fh)
+        await real_pump(reader, fh, state)
 
     monkeypatch.setattr(local_mod, "_open_capture", tagging_open)
     monkeypatch.setattr(local_mod, "_pump", selective_pump)
@@ -2301,7 +2301,7 @@ async def test_a_failed_pump_ends_the_run_immediately(tmp_path: Path, monkeypatc
 
     bundle = capture.allocate(tmp_path / "captures")
 
-    async def failing_pump(reader, fh):
+    async def failing_pump(reader, fh, state=None):
         await reader.read(10)
         raise OSError("No space left on device")
 
@@ -2483,3 +2483,158 @@ async def test_the_fallback_fits_at_every_cap_that_triggers_it(
         f"the path only became affordable at cap={smallest_cap_with_path} "
         f"for a {path_len}-char path — it is being carried more than once"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 9
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_bigger_cap_is_actually_used_for_uncaptured_output(
+    workspace: Path, queue, monkeypatch
+):
+    """Review round 9. The budget started at the fixed 4,000-character
+    preview and the loop can only shrink, so a larger configured cap was
+    never spent: a 4,001-character stdout under a 10,000-character cap lost
+    one character and was reported incomplete. There is no artifact behind an
+    uncaptured run, so that clip is real loss claimed for no reason."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 20000,
+    )
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(stdout="p" * 4001, stderr=""))
+
+    env = await f.shell(command="echo hi")
+
+    assert env.data["complete"] is True
+    assert env.data["truncated_stdout"] is False
+    assert len(env.data["stdout"]) == 4001
+    assert env.status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_a_slow_final_write_is_flushed_not_discarded(
+    tmp_path: Path, monkeypatch
+):
+    """Review round 9, and a regression from moving writes off the loop. A
+    pump pending at the drain deadline may simply be landing bytes it already
+    read — on a slow filesystem the final write outlasts the grace — and
+    cancelling it threw those bytes away while reporting
+    ``writers_remaining=True`` with a clean truncation flag: loss wearing the
+    wrong label AND a clean one."""
+    import kestrel_sovereign.features.computer_use.backends.local as local_mod
+
+    bundle = capture.allocate(tmp_path / "captures")
+    real_open = local_mod._open_capture
+    monkeypatch.setattr(local_mod, "_DRAIN_GRACE", 0.05)
+
+    def slow_open(cap):
+        out_fh, err_fh = real_open(cap)
+        real_write = out_fh.write
+
+        def slow_write(b):
+            import time as _t
+
+            _t.sleep(0.6)
+            return real_write(b)
+
+        out_fh.write = slow_write
+        return out_fh, err_fh
+
+    monkeypatch.setattr(local_mod, "_open_capture", slow_open)
+
+    result = await LocalSandboxBackend(GRANTS).exec(
+        ["python3", "-c", "print('payload-that-must-survive')"],
+        cwd=None,
+        env=None,
+        timeout=30,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert "payload-that-must-survive" in bundle.stdout_path.read_text()
+    assert result.writers_remaining is False
+    assert result.truncated_stdout is False
+
+
+@pytest.mark.asyncio
+async def test_a_docker_capture_says_so_when_the_bytes_were_replaced():
+    """Review round 9. The executor decodes with ``errors='replace'`` before
+    this backend sees anything, so non-UTF-8 output has already become
+    U+FFFD and a capture written from those strings is not what the command
+    emitted. The bytes are gone by then; what can still be honest is the
+    claim about them."""
+    from kestrel_sovereign.features.computer_use.backends.docker import (
+        DockerSandboxBackend,
+    )
+    import tempfile
+
+    backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None):
+            class _Rec:
+                exit_code = 0
+                stdout = "before�after"
+                stderr = ""
+                stdout_truncated = False
+                stderr_truncated = False
+
+            return _Rec()
+
+    backend._executor = _Executor()
+    bundle = capture.allocate(Path(tempfile.mkdtemp()) / "captures")
+
+    result = await backend.exec(
+        ["echo", "hi"],
+        cwd=None,
+        env=None,
+        timeout=5,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is True
+    assert result.truncated_stderr is False
+
+
+@pytest.mark.asyncio
+async def test_clean_docker_output_is_not_called_lossy():
+    """Control: the marker must be the replacement character, not every
+    capture."""
+    from kestrel_sovereign.features.computer_use.backends.docker import (
+        DockerSandboxBackend,
+    )
+    import tempfile
+
+    backend = DockerSandboxBackend.__new__(DockerSandboxBackend)
+
+    class _Executor:
+        async def execute_command(self, command, working_dir=None):
+            class _Rec:
+                exit_code = 0
+                stdout = "ordinary output"
+                stderr = ""
+                stdout_truncated = False
+                stderr_truncated = False
+
+            return _Rec()
+
+    backend._executor = _Executor()
+    bundle = capture.allocate(Path(tempfile.mkdtemp()) / "captures")
+
+    result = await backend.exec(
+        ["echo", "hi"],
+        cwd=None,
+        env=None,
+        timeout=5,
+        capture=CaptureTarget(
+            stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+        ),
+    )
+
+    assert result.truncated_stdout is False

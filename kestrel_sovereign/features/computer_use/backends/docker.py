@@ -196,6 +196,20 @@ class DockerSandboxBackend(SandboxBackend):
             bool(getattr(record, "stderr_truncated", False)),
         )
 
+        # The executor decodes with ``errors="replace"`` before this sees
+        # anything, so non-UTF-8 output has already become U+FFFD and a
+        # capture written from these strings is not what the command emitted.
+        # The bytes are gone by here; what can still be honest is the claim
+        # about them, so a lossy transcription is reported as incomplete
+        # rather than filed as the output. Over-claiming loss degrades a
+        # clean run to PARTIAL, which is the safe direction — a caveated
+        # artifact is recoverable, a silently wrong one is not.
+        if capture is not None:
+            if "\ufffd" in stdout:
+                out_trunc = True
+            if "\ufffd" in stderr:
+                err_trunc = True
+
         stdout_path = stderr_path = None
         if capture is not None:
             # ``write_stream``, not ``host_write``: a capture is owner-only,

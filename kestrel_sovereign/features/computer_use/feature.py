@@ -1548,7 +1548,18 @@ class ComputerUseFeature(Feature):
                 # tool's name is part of what has to fit.
                 return serialized_result_len(res, tool_name="shell")
 
+            # Uncaptured output starts from its own length, not from the
+            # preview default. The loop can only shrink, so a fixed start
+            # clipped output that the configured cap would have carried
+            # whole: with a 10,000-char cap a 4,001-char stdout lost one
+            # character and was reported incomplete. There is no artifact
+            # behind an uncaptured run, so that clip is real loss, claimed
+            # for no reason.
             chars = capture.PREVIEW_CHARS
+            if not bundle:
+                chars = max(
+                    chars, len(result.stdout or ""), len(result.stderr or "")
+                )
             envelope, run_incomplete = await _build(chars)
             # Shrink until it actually fits. Measuring beats reserving: what
             # overflows is the serialized form, and only the serialized form

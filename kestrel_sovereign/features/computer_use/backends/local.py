@@ -53,6 +53,11 @@ _DRAIN_GRACE = 0.5
 _EXIT_POLL_SECONDS = 0.02
 _REAP_GRACE = 5.0
 
+# Extra time for a pump that has the bytes and is only landing them. Waiting
+# on a pipe and writing to a slow disk both leave a task pending; only the
+# first means someone else can still write.
+_FLUSH_GRACE = 5.0
+
 
 class LocalSandboxBackend(SandboxBackend):
     """Host-process backend.
@@ -210,9 +215,17 @@ class LocalSandboxBackend(SandboxBackend):
                     except Exception:  # noqa: BLE001
                         stdout_bytes, stderr_bytes = b"", b""
             else:
+                # A pump reports whether it is waiting on the pipe or
+                # flushing bytes it already read. Pending means "still
+                # writing" as often as it means "someone still holds the
+                # pipe", and cancelling a flush throws away bytes that were
+                # read successfully — measured on a slow filesystem, a
+                # one-second final write left an empty file behind a
+                # ``writers_remaining`` flag and a clean truncation flag.
+                states: list[dict] = [{"flushing": False}, {"flushing": False}]
                 pumps = [
-                    asyncio.create_task(_pump(proc.stdout, out_fh)),
-                    asyncio.create_task(_pump(proc.stderr, err_fh)),
+                    asyncio.create_task(_pump(proc.stdout, out_fh, states[0])),
+                    asyncio.create_task(_pump(proc.stderr, err_fh, states[1])),
                 ]
                 # NOT ``proc.wait()``. asyncio finishes a subprocess only
                 # once the process has exited AND every pipe transport has
@@ -238,6 +251,18 @@ class LocalSandboxBackend(SandboxBackend):
                     done, pending = await asyncio.wait(
                         pumps, timeout=_DRAIN_GRACE
                     )
+                    # Anything still flushing gets the rest of the budget:
+                    # it has the bytes and only needs to land them, which is
+                    # a different condition from waiting on a pipe nobody
+                    # has closed.
+                    if any(
+                        states[i]["flushing"]
+                        for i, t in enumerate(pumps)
+                        if t in pending
+                    ):
+                        done, pending = await asyncio.wait(
+                            pumps, timeout=_FLUSH_GRACE
+                        )
                 except asyncio.CancelledError:
                     # Every post-spawn await, not just the first. The drain
                     # is its own wait and can be cancelled in its own right —
@@ -255,7 +280,18 @@ class LocalSandboxBackend(SandboxBackend):
                     for task in pumps:
                         task.cancel()
                     raise
-                writers_remaining = bool(pending)
+                # A pump cancelled mid-write loses whatever that write held,
+                # so it is lost output rather than a writer still holding the
+                # pipe. The two are reported differently because they mean
+                # different things to a reader of the manifest.
+                cancelled_mid_write: list[int] = [
+                    i for i, t in enumerate(pumps)
+                    if t in pending and states[i]["flushing"]
+                ]
+                writers_remaining = bool(
+                    [t for i, t in enumerate(pumps)
+                     if t in pending and not states[i]["flushing"]]
+                )
                 for task in pending:
                     task.cancel()
                 # A pump that raised — a full disk, a vanished directory —
@@ -290,8 +326,16 @@ class LocalSandboxBackend(SandboxBackend):
             # A failed pump is lost output, which is what ``truncated_*``
             # already means and already folds into completeness — a second
             # field for the same fact would be a second thing to forget.
-            out_lost = out_error is not None or "out" in close_errors
-            err_lost = err_error is not None or "err" in close_errors
+            out_lost = (
+                out_error is not None
+                or "out" in close_errors
+                or 0 in cancelled_mid_write
+            )
+            err_lost = (
+                err_error is not None
+                or "err" in close_errors
+                or 1 in cancelled_mid_write
+            )
             failures = [
                 str(e)
                 for e in (
@@ -361,7 +405,7 @@ async def _await_exit(proc, timeout: float, pumps: list | None = None) -> bool:
     return True
 
 
-async def _pump(reader, fh) -> None:
+async def _pump(reader, fh, state: dict | None = None) -> None:
     """Copy ``reader`` to ``fh`` until EOF, a chunk at a time.
 
     The loop ends only when every holder of the write end has closed it, so
@@ -378,7 +422,13 @@ async def _pump(reader, fh) -> None:
         # filesystem would otherwise block every other task in this process,
         # including the poll that enforces this command's own timeout — the
         # bound exceeded by the work it exists to bound.
-        await asyncio.to_thread(fh.write, chunk)
+        if state is not None:
+            state["flushing"] = True
+        try:
+            await asyncio.to_thread(fh.write, chunk)
+        finally:
+            if state is not None:
+                state["flushing"] = False
 
 
 
