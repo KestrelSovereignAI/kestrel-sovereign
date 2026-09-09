@@ -1541,6 +1541,12 @@ class ComputerUseFeature(Feature):
                     run_incomplete,
                 )
 
+            # Captured before any minimisation: ``_minimal_envelope``
+            # deliberately drops the truncation flags, and auditing the
+            # stripped envelope recorded ``truncated: false`` beside
+            # ``complete: false`` — the same contradiction fixed in the audit
+            # once already, reintroduced by a later shrink step.
+            clipped_for_audit = False
             cap = orchestrator_result_cap()
 
             def _size(res: ToolResult) -> int:
@@ -1567,11 +1573,19 @@ class ComputerUseFeature(Feature):
             # reserve constant here any more. A starting budget that the loop
             # is guaranteed to correct cannot be tuned wrong, and a constant
             # implying otherwise is a number to maintain and to believe.
-            for _ in range(_FIT_ATTEMPTS):
-                if _size(envelope) <= cap:
-                    break
+            # Halve until it fits or the preview reaches its floor. A fixed
+            # attempt count was fine while the budget started at 4,000, and
+            # wrong once it starts at the stream's own length: an uncaptured
+            # megabyte still measured ~31,000 characters after five halvings,
+            # so the loop gave up and the facts-only fallback threw away a
+            # 2-3 KB preview that would have fit.
+            while chars > _MIN_PREVIEW_CHARS and _size(envelope) > cap:
                 chars = max(_MIN_PREVIEW_CHARS, chars // 2)
                 envelope, run_incomplete = await _build(chars)
+            clipped_for_audit = bool(
+                (envelope.data or {}).get("truncated_stdout")
+                or (envelope.data or {}).get("truncated_stderr")
+            )
             if _size(envelope) > cap:
                 # Still too big with no preview left: a very small configured
                 # cap (KESTREL_MAX_TOOL_RESULT_CHARS is settable, and 1000 is
@@ -1613,10 +1627,7 @@ class ComputerUseFeature(Feature):
                     # stream trimmed to fit is truncation too, and auditing
                     # the backend flag alone recorded ``truncated: false``
                     # beside ``complete: false`` with nothing saying why.
-                    "truncated": bool(
-                        (envelope.data or {}).get("truncated_stdout")
-                        or (envelope.data or {}).get("truncated_stderr")
-                    ),
+                    "truncated": clipped_for_audit,
                     "writers_remaining": result.writers_remaining,
                     "complete": not run_incomplete,
                     "manifest_path": manifest_path,

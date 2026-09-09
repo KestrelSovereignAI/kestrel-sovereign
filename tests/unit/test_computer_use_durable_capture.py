@@ -2815,3 +2815,143 @@ async def test_the_windows_kill_is_bounded_and_off_the_loop(monkeypatch):
     elapsed = _t.monotonic() - began
 
     assert elapsed < 5, f"a wedged taskkill held the caller for {elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# Review round 11
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_abandoning_a_pump_does_not_leak_the_pipe(tmp_path: Path):
+    """Review round 11. Cancelling the pump task does not close the pipe —
+    the descendant holds the other end, so the server kept two descriptors
+    for as long as that process lived, which for a daemon is indefinitely.
+    A few such captures exhaust the process's limit."""
+    import os as _os
+
+    def open_fds():
+        try:
+            return len(_os.listdir(f"/dev/fd/{_os.getpid()}"))
+        except OSError:
+            import resource
+
+            return len(_os.listdir("/dev/fd"))
+
+    script = tmp_path / "daemon.py"
+    script.write_text(
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid(); time.sleep(20); os._exit(0)\n"
+        "print('parent done', flush=True)\n"
+    )
+    backend = LocalSandboxBackend(GRANTS)
+
+    before = open_fds()
+    for i in range(4):
+        bundle = capture.allocate(tmp_path / f"captures{i}")
+        result = await backend.exec(
+            ["python3", str(script)],
+            cwd=None,
+            env=None,
+            timeout=30,
+            capture=CaptureTarget(
+                stdout_path=bundle.stdout_path, stderr_path=bundle.stderr_path
+            ),
+        )
+        assert result.writers_remaining is True
+    after = open_fds()
+
+    # Four abandoned captures held eight descriptors before this was closed.
+    assert after - before < 4, f"leaked {after - before} descriptors over 4 runs"
+
+
+@pytest.mark.asyncio
+async def test_a_permission_error_on_spawn_is_a_failure_not_a_result(
+    workspace: Path, queue
+):
+    """Review round 11, and a regression from round 10. A broad ``OSError``
+    catch turned a permission denial into rc=127 — which ``shell`` reports
+    PARTIAL and the wrapper publishes as ``success: true`` — for a command
+    that never ran."""
+    not_executable = workspace / "not_executable.sh"
+    not_executable.write_text("#!/bin/sh\necho hi\n")
+    not_executable.chmod(0o644)
+
+    f = await _feature(
+        workspace, queue, auto_approved_binaries=[str(not_executable)]
+    )
+
+    env = await f.shell(command=str(not_executable))
+
+    assert env.status is ToolResultStatus.ERROR, env.status
+    assert env.data is None or env.data.get("returncode") != 127
+
+
+@pytest.mark.asyncio
+async def test_a_missing_binary_is_still_an_rc_127_result(workspace: Path, queue):
+    """Control: 'not found' keeps its result shape, which is what the
+    diagnostic-preserving path is built on."""
+    f = await _feature(
+        workspace, queue, auto_approved_binaries=["definitely-not-a-real-binary-xyz"]
+    )
+
+    env = await f.shell(command="definitely-not-a-real-binary-xyz")
+
+    assert env.data["returncode"] == 127
+
+
+@pytest.mark.asyncio
+async def test_a_huge_uncaptured_result_keeps_a_preview(workspace: Path, queue):
+    """Review round 11. The budget now starts at the stream's own length, so
+    a fixed five halvings left an uncaptured megabyte at ~31,000 characters —
+    still far over the cap — and the code jumped to facts-only, discarding a
+    2-3 KB preview that would have fit."""
+    from kestrel_sovereign.features.base import (
+        orchestrator_result_cap,
+        serialized_result_len,
+    )
+
+    f = await _feature(workspace, queue)
+    f._backend = _StubBackend(_run(stdout="p" * 900_000, stderr=""))
+
+    env = await f.shell(command="echo hi")
+
+    assert serialized_result_len(env, tool_name="shell") <= orchestrator_result_cap()
+    assert len(env.data.get("stdout") or "") > 500, "threw the preview away"
+    assert env.data["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_audit_keeps_the_truncation_flag_through_minimisation(
+    tmp_path: Path, queue, monkeypatch
+):
+    """Review round 11. ``_minimal_envelope`` deliberately drops the
+    truncation flags, and the audit read them off the minimised envelope — so
+    it recorded ``truncated: false`` beside ``complete: false``. That is the
+    same contradiction fixed in the audit once already, reintroduced by a
+    later shrink step."""
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.computer_use.feature.orchestrator_result_cap",
+        lambda: 400,
+    )
+    deep = tmp_path
+    for _ in range(8):
+        deep = deep / ("d" * 30)
+    deep.mkdir(parents=True)
+    (deep / "secret").mkdir()
+
+    f = ComputerUseFeature(FakeAgent(queue=queue))
+    f._cfg = _config(deep)
+    await f.initialize()
+    f._backend = _StubBackend(_run(stdout="p" * 200_000, stderr=""))
+
+    await f.shell(command="echo hi")
+
+    rows = [
+        json.loads(line)
+        for line in (deep / "audit.jsonl").read_text().splitlines()
+    ]
+    row = [r for r in rows if r["tool"] == "shell"][-1]
+    assert row["args"]["complete"] is False
+    assert row["args"]["truncated"] is True

@@ -185,9 +185,15 @@ class LocalSandboxBackend(SandboxBackend):
                     stderr=asyncio.subprocess.PIPE,
                     **new_process_group_kwargs(),
                 )
-            except (FileNotFoundError, OSError) as exc:
+            except FileNotFoundError as exc:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 message = str(exc)
+                # ONLY FileNotFoundError. A broad OSError here turned a
+                # permission denial, a bad executable format or descriptor
+                # exhaustion into rc=127 — which ``shell`` reports PARTIAL
+                # and the wrapper publishes as success, for a command that
+                # never ran. Everything else propagates, as it did before
+                # this branch existed.
                 spawn_failed = True
                 if capture is not None and err_fh is not None:
                     # The diagnostic is the only useful thing this run
@@ -300,6 +306,21 @@ class LocalSandboxBackend(SandboxBackend):
                     )
                     for task in pending:
                         task.cancel()
+                    if pending:
+                        # Cancelling the task does not close the pipe. The
+                        # descendant still holds the other end, so without
+                        # this the server keeps two descriptors for as long
+                        # as that process lives — which for a daemon is
+                        # indefinitely, and a few such captures exhaust the
+                        # process's limit.
+                        for stream in (proc.stdout, proc.stderr):
+                            transport = getattr(stream, "_transport", None)
+                            if transport is None:
+                                continue
+                            try:
+                                transport.close()
+                            except Exception:  # noqa: BLE001 - cleanup
+                                pass
                     # A pump that raised — a full disk, a vanished directory —
                     # finishes and lands in ``done`` like any other. Not asking
                     # for its exception meant a capture missing everything after
