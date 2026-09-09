@@ -746,12 +746,18 @@ export function mountAgentListPane(containerEl, config = {}) {
     const onStopAllClick = async () => {
         if (!stopAllOptIn || !listLoaded || stopAllPending
             || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
-        const operation = {
-            correlationId: containerEl[AGENT_LIST_STOP_ALL_RETRY]
-                || newStopAllCorrelationId(),
-        };
         const count = stopAllStatus.inFlightCount;
-        const retryPending = containerEl[AGENT_LIST_STOP_ALL_RETRY] === operation.correlationId;
+        const retryCorrelationId = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string'
+            ? containerEl[AGENT_LIST_STOP_ALL_RETRY]
+            : null;
+        const recoverBeforeFresh = retryCorrelationId !== null && count > 0;
+        const operation = {
+            correlationId: retryCorrelationId && !recoverBeforeFresh
+                ? retryCorrelationId
+                : newStopAllCorrelationId(),
+            recoveryCorrelationId: recoverBeforeFresh ? retryCorrelationId : null,
+        };
+        const retryPending = retryCorrelationId !== null;
         const noun = count === 1 ? 'agent' : 'agents';
         const confirmation = retryPending && count === 0
             ? 'Recover the durable result of the prior Stop All request?'
@@ -771,6 +777,19 @@ export function mountAgentListPane(containerEl, config = {}) {
         try {
             settleLocalStop = config.onPrepareStopAll(loadedItems);
             containerEl[AGENT_LIST_STOP_ALL_RETRY] = operation.correlationId;
+            if (operation.recoveryCorrelationId) {
+                // A prior response may have been lost. Its immutable operation
+                // must be recovered without settling the fence for work that
+                // appeared afterwards; a fresh operation below addresses that
+                // current work. Recovery failure cannot safely substitute its
+                // stale identity for the new Stop attempt.
+                try {
+                    await api.stopHost({
+                        reason: config.stopAllReason || 'Stopped from the agents banner',
+                        correlation_id: operation.recoveryCorrelationId,
+                    });
+                } catch (_) { /* the fresh operation remains authoritative */ }
+            }
             response = await api.stopHost({
                 reason: config.stopAllReason || 'Stopped from the agents banner',
                 correlation_id: operation.correlationId,

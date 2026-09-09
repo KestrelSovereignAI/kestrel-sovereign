@@ -252,6 +252,27 @@ test('an old host Stop receipt cannot clear a newer turn for the same agent', ()
     apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
 });
 
+test('host Stop receipt remains valid when the same-turn retry token resets', () => {
+    const agent = 'host-stop-same-turn-retry';
+    const agentId = 'did:agent:host-stop-same-turn-retry';
+    const priorRequestLookup = apiModule.default.getCurrentStreamRequestId;
+    apiModule.default.getCurrentStreamRequestId = () => 'same-request';
+    state.waitingAgents.add(agent);
+    state.unconfirmedStopCorrelationIds = new Map([[agent, 'first-operation']]);
+
+    const settleHostStop = prepareHostStop([{ name: agent, id: agentId }]);
+
+    // A receipt-bearing per-agent stop_not_confirmed response starts a fresh
+    // retry identity while retaining the exact request fence.
+    state.unconfirmedStopCorrelationIds.delete(agent);
+    settleHostStop(hostStopEnvelope(agentId));
+
+    assert.equal(state.unconfirmedStopAgents.has(agent), false);
+    assert.equal(state.waitingAgents.has(agent), false);
+    state.unconfirmedStopRequestIds.delete(agent);
+    apiModule.default.getCurrentStreamRequestId = priorRequestLookup;
+});
+
 test('host Stop keeps local work fenced when receipt or envelope evidence is malformed', () => {
     const agent = 'host-stop-malformed';
     const agentId = 'did:agent:host-stop-malformed';

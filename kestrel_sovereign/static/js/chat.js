@@ -2762,7 +2762,6 @@ export function prepareHostStop(items = []) {
     ]);
     const stopGeneration = currentState.hostStopGeneration;
     const fencedRequestIds = new Map();
-    const fencedCorrelationIds = new Map();
 
     // A queue belongs to the work being stopped even if its stream has already
     // left waitingAgents during the same event-loop turn. Clear all pane queues
@@ -2774,7 +2773,6 @@ export function prepareHostStop(items = []) {
     }
     for (const name of localNames) {
         fencedRequestIds.set(name, fenceLocalAgentStop(name));
-        fencedCorrelationIds.set(name, unconfirmedStopCorrelationIds().get(name) ?? null);
     }
 
     const addressToName = new Map();
@@ -2821,8 +2819,7 @@ export function prepareHostStop(items = []) {
             // target; a second Host Stop can likewise supersede this one.
             const stillOwnsFence = hostStopGeneration() === stopGeneration
                 && unconfirmedStopAgents().has(name)
-                && (retainedRequestIds.get(name) ?? null) === fencedRequestIds.get(name)
-                && (retainedCorrelationIds.get(name) ?? null) === fencedCorrelationIds.get(name);
+                && (retainedRequestIds.get(name) ?? null) === fencedRequestIds.get(name);
             if (confirmedNames.has(name) && stillOwnsFence) {
                 unconfirmedStopAgents().delete(name);
                 retainedRequestIds.delete(name);

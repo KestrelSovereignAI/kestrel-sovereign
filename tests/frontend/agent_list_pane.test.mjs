@@ -672,7 +672,54 @@ test('an ambiguous Host Stop retry reuses the browser-owned correlation id', asy
     handle.destroy();
 });
 
-test('an ambiguous gateway response retains the browser-owned correlation id', async () => {
+test('new work after an ambiguous Host Stop gets a fresh operation after recovery', async () => {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const operationIds = [];
+    let stopCalls = 0;
+    let fenceCalls = 0;
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([
+            { name: 'Emma', id: 'did:agent:emma', status: 'online' },
+        ]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async (payload) => {
+                operationIds.push(payload.correlation_id);
+                stopCalls += 1;
+                if (stopCalls === 1) throw new Error('response lost');
+                return hostStopEnvelope(payload.correlation_id, [
+                    { agent: 'did:agent:emma', disposition: 'stopped' },
+                ]);
+            },
+        },
+        onPrepareStopAll: () => {
+            fenceCalls += 1;
+            return () => {};
+        },
+        confirmStopAll: () => true,
+        stopAllStatusIntervalMs: 999999,
+    });
+    await tick();
+    await tick();
+
+    const button = el.querySelector('.agent-stop-all-btn');
+    button.click();
+    await tick();
+    await tick();
+    button.click();
+    await tick();
+    await tick();
+    await tick();
+
+    handle.destroy();
+    assert.equal(operationIds.length, 3);
+    assert.equal(operationIds[1], operationIds[0], 'the ambiguous operation is recovered');
+    assert.notEqual(operationIds[2], operationIds[0], 'current work receives a fresh operation');
+    assert.equal(fenceCalls, 2, 'recovery does not create a second browser fence');
+});
+
+test('an ambiguous gateway response is recovered before a fresh current-work Stop', async () => {
     const el = document.createElement('div');
     document.body.appendChild(el);
     const operationIds = [];
@@ -710,9 +757,11 @@ test('an ambiguous gateway response retains the browser-owned correlation id', a
     await tick();
 
     handle.destroy();
-    assert.equal(operationIds.length, 2);
+    assert.equal(operationIds.length, 3);
     assert.equal(operationIds[1], operationIds[0],
-        'an upstream gateway failure is transport-ambiguous, not terminal evidence');
+        'an upstream gateway failure is transport-ambiguous and recovered');
+    assert.notEqual(operationIds[2], operationIds[0],
+        'the live fleet is stopped under a fresh identity');
 });
 
 test('a terminal unreceipted response gets a fresh operation identity', async () => {
