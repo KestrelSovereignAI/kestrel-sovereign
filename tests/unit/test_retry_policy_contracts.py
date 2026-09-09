@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from kestrel_sovereign.llm.retry import (
+    AdvisedWaitExceedsRetryBudget,
     is_plan_limit_error,
     is_retryable_error,
     retry_after_seconds,
@@ -200,7 +201,11 @@ async def test_with_retry_propagates_non_retryable_exception_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_with_retry_caps_advised_delay_at_max():
+async def test_with_retry_declines_advice_beyond_its_budget_instead_of_capping():
+    """An advised wait the loop cannot fit is declined at once (#3127): no
+    capped sleeps that cannot succeed, the throttle kept as the cause. With
+    two throttle attempts the loop could still wait one 120 s cap; 9999 s of
+    advice does not fit."""
     error = _FakeRateLimit("429", status_code=429, headers={"retry-after": "9999"})
 
     async def throttled():
@@ -212,12 +217,13 @@ async def test_with_retry_caps_advised_delay_at_max():
         slept.append(d)
 
     with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
-        with pytest.raises(_FakeRateLimit) as raised:
+        with pytest.raises(AdvisedWaitExceedsRetryBudget) as raised:
             # A throttle is bounded by throttle_max_retries, not max_retries.
             await with_retry(throttled, throttle_max_retries=2)
 
-    assert raised.value is error
-    assert slept and all(d <= 120.0 for d in slept)
+    assert raised.value.__cause__ is error
+    assert raised.value.budget_seconds == 120.0
+    assert slept == []
 
 
 class _FakeServerError(Exception):
@@ -387,12 +393,12 @@ def test_plan_limit_retry_budget_fits_inside_the_turn_watchdog():
     """Behavioural guard on the constants themselves: worst-case sleep must
     stay a small fraction of the watchdog, or a window that clears late is
     killed as `timeout after 180s` instead of returning its answer."""
-    from kestrel_sovereign.llm.retry import (
-        PLAN_LIMIT_MAX_RETRIES,
-        PLAN_LIMIT_MAX_DELAY,
-    )
     from kestrel_sovereign.agent.orchestrator_engine import (
         ORCHESTRATOR_TURN_TIMEOUT_SECS,
+    )
+    from kestrel_sovereign.llm.retry import (
+        PLAN_LIMIT_MAX_DELAY,
+        PLAN_LIMIT_MAX_RETRIES,
     )
 
     worst_case = sum(
