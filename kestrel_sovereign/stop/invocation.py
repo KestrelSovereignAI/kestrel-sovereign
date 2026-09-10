@@ -41,6 +41,11 @@ _PUBLIC_TURN_ID_DOMAIN = b"kestrel:distributed-stop-public-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
 _DEFAULT_WAIT_SECONDS = 4.0
 _DEFAULT_OWNER_LEASE_SECONDS = 2.0
+# Teardown must be bounded. close() runs in the server's shutdown phases, and
+# the completion retry loop only consults ``_closing`` on its EXCEPTION path --
+# a settle that hangs rather than raises never reaches that check, so an
+# unbounded join here is a wedge no signal can break.
+_DEFAULT_CLOSE_DRAIN_SECONDS = 10.0
 logger = logging.getLogger(__name__)
 
 
@@ -1284,13 +1289,44 @@ class DistributedInvocationRegistry:
             except asyncio.CancelledError:
                 pass
             self._relay_task = None
-        while self._registration_tasks:
-            await asyncio.gather(
-                *tuple(self._registration_tasks), return_exceptions=True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DEFAULT_CLOSE_DRAIN_SECONDS
+        for label, tasks in (
+            ("registration", self._registration_tasks),
+            ("completion", self._cleanup_tasks),
+        ):
+            # `while tasks:` alone never terminates if a task schedules more
+            # work; bound it. Outcomes stay owned either way -- registration
+            # tasks are gathered with return_exceptions and completion tasks
+            # carry `_consume_cleanup` as a done-callback -- so an abandoned
+            # tail cannot surface as a never-retrieved exception.
+            while tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "Distributed Stop close timed out after %.1fs with %d "
+                        "%s task(s) still running; releasing teardown",
+                        _DEFAULT_CLOSE_DRAIN_SECONDS,
+                        len(tasks),
+                        label,
+                    )
+                    break
+                pending = tuple(tasks)
+                done, _ = await asyncio.wait(pending, timeout=remaining)
+                if not done:
+                    continue
+        try:
+            await asyncio.wait_for(
+                self._store.abandon_owner(self._owner_id),
+                timeout=max(1.0, deadline - loop.time()),
             )
-        while self._cleanup_tasks:
-            await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
-        await self._store.abandon_owner(self._owner_id)
+        except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001
+            # Owner abandonment is recoverable: the lease expires and another
+            # replica reclaims. Never hold teardown open for it.
+            logger.warning(
+                "Distributed Stop owner abandonment did not complete (%s)",
+                type(error).__name__,
+            )
         self._active.clear()
         self._by_local_generation.clear()
         self._cleanup_keys.clear()

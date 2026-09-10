@@ -1145,7 +1145,6 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # replica+db teardown is heavy on a 2-core runner
 async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
     """A committed deletion cannot falsely fence unrelated active work."""
 
@@ -1581,6 +1580,49 @@ async def test_acknowledged_receipt_fences_direct_non_http_invocation(tmp_path):
         agent._cleanup_cancelled_request("durably-stopped-turn")
     finally:
         await replica_a.close()
+        await replica_b.close()
+        await first_db.close()
+        await second_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_close_is_bounded_when_a_completion_never_settles(tmp_path):
+    """Teardown cannot wait forever on a settle that hangs.
+
+    ``close()`` joined ``_cleanup_tasks`` with a bare ``while tasks:`` loop.
+    The completion retry only consults ``_closing`` on its EXCEPTION path, so
+    a ``settle`` that hangs rather than raises never reaches that check and the
+    join never terminates — in the server's shutdown phases, which are
+    deliberately resistant to cancellation. Surfaced by CI on a 2-core runner,
+    where it burned the whole per-test ceiling twice.
+    """
+    first_db, second_db, store, replica_a, replica_b = await _shared_registries(
+        tmp_path
+    )
+    agent = _ReplicaAgent("did:test:close-bounded")
+    replica_a.attach(agent)
+    original_settle = store.settle
+    settle_entered = asyncio.Event()
+
+    async def never_settles(generation_id, owner_id, disposition):
+        settle_entered.set()
+        await asyncio.Event().wait()      # hangs, never raises
+
+    store.settle = never_settles
+    try:
+        assert await replica_a.register(agent, "wedged-turn", 1)
+        replica_a.complete_soon(agent, "wedged-turn", 1)
+        await asyncio.wait_for(settle_entered.wait(), timeout=30)
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await replica_a.close()
+        elapsed = loop.time() - started
+
+        assert elapsed < 45, f"close() was not bounded ({elapsed:.1f}s)"
+    finally:
+        store.settle = original_settle
         await replica_b.close()
         await first_db.close()
         await second_db.close()
