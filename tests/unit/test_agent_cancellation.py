@@ -3706,3 +3706,47 @@ class TestStreamEndpointErrorContract:
         # The constant label + recovery guidance still reach the user.
         assert "Your selected model route failed" in response.text
         assert "No fallback response was generated" in response.text
+
+
+@pytest.mark.asyncio
+async def test_stop_boundary_batch_task_keeps_the_turns_lock_ownership():
+    """The batch runs in a child task; the turn's holds must follow it.
+
+    ``_execute_tool_batch_at_stop_boundary`` moves the SAME logical turn into a
+    fresh task so Stop can race it. Ordinary child tasks deliberately do not
+    inherit a non-reentrant lock, so without an explicit delegation the turn's
+    CONVERSATION hold is invisible inside every tool: ``is_owned_by_current_task``
+    goes False, an in-turn isolated tool waits on a config-transition gate the
+    turn itself is holding the lock against, and ``privacy_transition()``
+    re-acquires a lock its own turn owns. The invocation boundary and the
+    dispatcher both delegate at their task boundaries.
+    """
+    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+    from kestrel_sovereign.signals import OrderedLockManager
+    from kestrel_sovereign.signals.lock_manager import ResourceLock
+
+    locks = OrderedLockManager()
+    owned_inside_batch: list[bool] = []
+
+    class Owner:
+        _execute_tool_batch_at_stop_boundary = (
+            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
+        )
+
+        def _get_lock_manager(self):
+            return locks
+
+        async def _execute_tool_batch(self):
+            owned_inside_batch.append(
+                locks.is_owned_by_current_task(ResourceLock.CONVERSATION)
+            )
+
+    owner = Owner()
+    async with locks.acquire({ResourceLock.CONVERSATION}):
+        # Precondition: the turn really does hold it in the parent task.
+        assert locks.is_owned_by_current_task(ResourceLock.CONVERSATION) is True
+        await owner._execute_tool_batch_at_stop_boundary()
+
+    assert owned_inside_batch == [True], (
+        "the tool batch task lost the turn's CONVERSATION ownership"
+    )
