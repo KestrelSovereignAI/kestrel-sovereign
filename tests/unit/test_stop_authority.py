@@ -1,6 +1,7 @@
 """Typed Stop requests and the one cancellation authority (#3139)."""
 
 import asyncio
+import contextlib
 import gc
 import inspect
 import time
@@ -565,6 +566,36 @@ async def test_cleanup_registry_drain_owns_tails_through_caller_cancellation() -
     with pytest.raises(asyncio.CancelledError):
         await drain
     assert registry._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_registry_drain_is_bounded_by_a_wedged_tail() -> None:
+    """A stuck tail must not hold teardown open forever.
+
+    drain() runs in a shutdown phase that deliberately resists cancellation,
+    so an unbounded join there is a wedge no signal can break: one stuck
+    target would hold the host open and block the agents phase behind it.
+    The tail is abandoned, not cancelled -- retain() already owns its outcome.
+    """
+    registry = StopCleanupRegistry()
+
+    async def never_finishes() -> StopOutcome:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    wedged = asyncio.create_task(never_finishes())
+    registry.retain(wedged)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await registry.drain(timeout_seconds=0.2)
+    elapsed = loop.time() - started
+
+    assert elapsed < 5.0, f"drain did not honour its budget ({elapsed:.1f}s)"
+    assert not wedged.done(), "the tail is abandoned, not cancelled"
+    wedged.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await wedged
 
 
 @pytest.mark.asyncio
