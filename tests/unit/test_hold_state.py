@@ -5879,3 +5879,55 @@ def test_backend_switch_probe_sees_hold_state_still_in_a_hot_wal(tmp_path):
 
     # And it still sees it once the WAL is folded back in.
     assert _sqlite_database_has_hold_schema(database) is True
+
+
+def test_backend_switch_probe_never_creates_sidecars_in_the_audited_directory(
+    tmp_path,
+):
+    """Neither read-only flag is right alone.
+
+    ``immutable=1`` cannot see a hot WAL, so it reports a held agent as absent.
+    ``mode=ro`` can — but it REBUILDS a missing ``-shm`` inside the directory
+    this probe is auditing, which is documented as creating no diagnostic
+    state and has to work on read-only media. An incomplete sidecar pair is
+    refused rather than repaired, exactly as the sibling probe in
+    ``validate_sqlite_hold_readiness`` refuses it.
+    """
+    import shutil
+
+    from kestrel_sovereign.hold.state import (
+        HoldCorruptStateError,
+        _sqlite_database_has_hold_schema,
+    )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    origin = source / "host-features.db"
+    connection = sqlite3.connect(origin)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute("CREATE TABLE hold_latches (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO hold_latches VALUES ('agent-held')")
+        connection.commit()
+
+        # A restore of only the <db>* family: the -wal survives, the -shm does not.
+        restored_dir = tmp_path / "restored"
+        restored_dir.mkdir()
+        restored = restored_dir / "host-features.db"
+        shutil.copy2(origin, restored)
+        shutil.copy2(f"{origin}-wal", f"{restored}-wal")
+    finally:
+        connection.close()
+
+    before = sorted(entry.name for entry in restored_dir.iterdir())
+    assert f"{restored.name}-shm" not in before, "test needs a missing -shm"
+
+    with pytest.raises(HoldCorruptStateError, match="incomplete live WAL sidecar"):
+        _sqlite_database_has_hold_schema(restored)
+
+    after = sorted(entry.name for entry in restored_dir.iterdir())
+    assert after == before, (
+        f"the audit probe wrote into the directory it audits: "
+        f"{sorted(set(after) - set(before))}"
+    )
