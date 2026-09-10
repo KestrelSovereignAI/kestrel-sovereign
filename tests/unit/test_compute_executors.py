@@ -1937,7 +1937,15 @@ async def test_docker_rejects_working_directory_that_contains_snapshot(
 
     monkeypatch.setattr(docker_executor_module.shutil, "copytree", reject_copy)
 
-    record = await executor.execute(_script(), working_dir=str(tmp_path))
+    # 60s, not the _script() default of 1s: this test's subject is the
+    # snapshot REJECTION, and reaching it walks a real directory. My
+    # TimeoutError fix (it subclasses OSError, so the snapshot deadline
+    # used to be reported as tampering) means the deadline now surfaces
+    # honestly -- which exposed that 1s is not enough on a 2-core runner
+    # to reach the check at all.
+    record = await executor.execute(
+        _script(timeout_seconds=60), working_dir=str(tmp_path)
+    )
 
     assert record.exit_code == -1
     assert "would contain its own destination" in record.stderr
@@ -1968,7 +1976,15 @@ async def test_docker_rejects_special_source_entry_before_copying(
 
     monkeypatch.setattr(docker_executor_module.shutil, "copytree", reject_copy)
 
-    record = await executor.execute(_script(), working_dir=str(source))
+    # 60s, not the _script() default of 1s: this test's subject is the
+    # snapshot REJECTION, and reaching it walks a real directory. My
+    # TimeoutError fix (it subclasses OSError, so the snapshot deadline
+    # used to be reported as tampering) means the deadline now surfaces
+    # honestly -- which exposed that 1s is not enough on a 2-core runner
+    # to reach the check at all.
+    record = await executor.execute(
+        _script(timeout_seconds=60), working_dir=str(source)
+    )
 
     assert record.exit_code == -1
     assert "host service socket or other special file" in record.stderr
