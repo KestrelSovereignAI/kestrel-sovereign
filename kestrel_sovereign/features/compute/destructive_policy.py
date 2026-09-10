@@ -17,6 +17,7 @@ import shlex
 from typing import Optional
 
 from kestrel_sovereign.host_features.storage import host_database_path
+from kestrel_sovereign.paths import project_dir
 from kestrel_sovereign.security.path_identity import (
     is_multiply_linked_regular_file,
     paths_overlap_by_filesystem_identity,
@@ -95,7 +96,15 @@ class DestructiveOperationPolicy:
         # host-owned even when it is lexically inside this agent's writable
         # root, so reserve the complete directory (DB, SQLite sidecars, Hold
         # history, and custody marker) at the canonical destructive boundary.
-        host_db_path, _uses_default = host_database_path()
+        # Resolve against the project root, not Path.cwd(). This is a
+        # DESTRUCTIVE boundary: a relative KESTREL_HOST_DB_PATH resolved
+        # against whichever directory happened to construct the policy points
+        # the guard at a directory that may not exist, while the real
+        # host-data stays deletable. Verified: the same relative value yields
+        # two different boundaries from two different working directories.
+        host_db_path, _uses_default = host_database_path(
+            base_dir=project_dir(),
+        )
         self.host_control_data_path = _resolve_path(host_db_path.parent)
         self.agent_data_audit_log = self.trash_dir / "agent_data_access_audit.jsonl"
 

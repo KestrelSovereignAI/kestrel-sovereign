@@ -11,6 +11,7 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -2382,9 +2383,32 @@ class OrchestratorEngineMixin:
             with bind_transition_lock_reentry(transition_reentry_token):
                 return await self._execute_tool_batch(*args, **kwargs)
 
+        # This moves the SAME logical turn into a cancellable task, which is
+        # exactly the case delegate_current_task_ownership documents: ordinary
+        # child tasks deliberately do not inherit a non-reentrant lock, so
+        # without this the batch runs with the turn's CONVERSATION hold
+        # invisible. is_owned_by_current_task and _caller_belongs_to_live_turn
+        # both go False inside every tool, which turns an in-turn isolated tool
+        # into a wait on a config-transition gate the turn itself is holding
+        # the lock against, and makes privacy_transition() re-acquire a lock
+        # its own turn owns. The invocation boundary and the dispatcher both
+        # delegate at their task boundaries; this one has to as well. Tokens
+        # are per-acquisition, so the delegation stops authorizing the moment
+        # this turn releases.
+        batch_context = contextvars.copy_context()
+        lock_manager = None
+        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
+        if callable(get_lock_manager):
+            lock_manager = get_lock_manager(self)
+        delegate_lock_ownership = getattr(
+            lock_manager, "delegate_current_task_ownership", None
+        )
+        if callable(delegate_lock_ownership):
+            delegate_lock_ownership(batch_context)
         owner = asyncio.create_task(
             run_owned_batch(),
             name="orchestrator-tool-batch",
+            context=batch_context,
         )
         tool_results = kwargs.get("tool_results")
         result_count = len(tool_results) if isinstance(tool_results, list) else None
