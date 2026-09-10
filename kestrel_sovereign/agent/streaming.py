@@ -2008,6 +2008,18 @@ class StreamingMixin:
                 request_id
             ):
                 await persist_strict_cancelled_tool_turn()
+                # A Stop that registers DURING the post-response hook reaches
+                # this gate with a batch cancellation the first gate could not
+                # yet see. Returning here without re-raising it swallows the
+                # owner's CancelledError: the request is cleaned up as
+                # COMPLETED rather than STOPPED, and the durable delivery is
+                # ACKed as an ordinary success. The gates on either side of
+                # this one both re-raise; this one has to as well.
+                if deferred_tool_batch_cancellation is not None:
+                    raise_owned_outcome(
+                        deferred_tool_batch_cancellation.outcome,
+                        operation="side-effecting orchestrator tool batch",
+                    )
                 return
             # #2674: read the EXPLICIT audit verdict, not string equality.
             audit_denied = getattr(tool_final_text, "denied", False)

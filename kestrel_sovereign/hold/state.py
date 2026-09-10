@@ -4551,10 +4551,24 @@ def _sqlite_database_has_hold_schema(database: Path) -> bool:
         return False
     names = tuple(sorted(_HOLD_SCHEMA_TABLES))
     placeholders = ", ".join("?" for _ in names)
+    # immutable=1 tells SQLite to assume there is no WAL or journal, so a
+    # committed Hold latch still living in a hot -wal reads as ABSENT. This
+    # guard decides whether it is safe to switch off SQLite, so answering
+    # "no Hold state" about a held agent fails OPEN and abandons the latch.
+    # The sibling probe in validate_sqlite_hold_readiness already makes this
+    # distinction; make the same one here. An unresolved rollback journal
+    # cannot be read safely either way, so refuse rather than guess.
+    wal_present = path_exists(Path(f"{database}-wal"))
+    if path_exists(Path(f"{database}-journal")):
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            "database is free of Hold state: unresolved rollback journal"
+        )
+    flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
     try:
         with closing(
             sqlite3.connect(
-                f"{database.as_uri()}?mode=ro&immutable=1",
+                f"{database.as_uri()}?{flags}",
                 uri=True,
             )
         ) as connection:

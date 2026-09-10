@@ -5841,3 +5841,41 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
             await store._current_history_anchor_payload()
         )
     await store.ensure_schema()
+
+
+def test_backend_switch_probe_sees_hold_state_still_in_a_hot_wal(tmp_path):
+    """``immutable=1`` alone makes an active Hold latch read as absent.
+
+    ``_sqlite_database_has_hold_schema`` is the last guard before a switch off
+    SQLite: it answers "is there Hold state here that would be abandoned?".
+    ``immutable=1`` tells SQLite to assume no WAL exists, so a latch that is
+    committed but not yet checkpointed is invisible and the guard fails OPEN —
+    it clears the switch while an agent is held.
+
+    The sibling probe in ``validate_sqlite_hold_readiness`` already selects its
+    flags from WAL presence; this asserts the two agree.
+    """
+    from kestrel_sovereign.hold.state import _sqlite_database_has_hold_schema
+
+    database = tmp_path / "host-features.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE hold_latches (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO hold_latches VALUES ('agent-held')")
+        connection.commit()
+
+        # Precondition: the row is committed but lives only in the sidecar.
+        assert (tmp_path / "host-features.db-wal").exists(), (
+            "test needs a hot WAL to mean anything"
+        )
+        assert _sqlite_database_has_hold_schema(database) is True, (
+            "a held agent in a hot WAL must not read as 'no Hold state'"
+        )
+
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+
+    # And it still sees it once the WAL is folded back in.
+    assert _sqlite_database_has_hold_schema(database) is True
