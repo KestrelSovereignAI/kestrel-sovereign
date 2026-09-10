@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-09
-**Scope:** 2427 tracked files (1658 `.py`, 346 `.md`, 423 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-09-10
+**Scope:** 2432 tracked files (1663 `.py`, 346 `.md`, 423 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -203,7 +203,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent_config.py** — Agent Configuration Management.
   - `class AgentConfig`; `def find_agent_dir(hint)`; `def list_agents(base_dir)`
 - **kestrel_sovereign/api_errors.py** — Canonical HTTP API error envelopes and FastAPI exception handlers.
-  - `class ApiHTTPException`; `def api_error_response()`; `async def api_http_exception_handler(request, exc)`; `async def api_validation_exception_handler(request, exc)`; `async def api_unhandled_exception_handler(request, exc)`; `def register_api_error_handlers(app)`
+  - `class ApiHTTPException`; `def rate_limited_until(declined)`; `def api_error_response()`; `async def api_http_exception_handler(request, exc)`; `async def api_validation_exception_handler(request, exc)`; `async def api_unhandled_exception_handler(request, exc)`; `def register_api_error_handlers(app)`
 - **kestrel_sovereign/audit_time.py** — Canonical audit timestamp handling.
   - `def utc_now_iso()`; `def normalize_audit_timestamp(value)`
 - **kestrel_sovereign/auth.py** — Caller context for threading authentication identity into agent operations.
@@ -378,7 +378,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/audit_anchor/hasher.py** — Deterministic hashing of audit log entries.
   - `class AuditHasher`
 - **kestrel_sovereign/features/base.py** — —
-  - `class SubagentContextBudgetExceeded`; `def is_flat_toolresult_envelope(value)`; `class TaskHandler`; `class Feature`
+  - `class SubagentContextBudgetExceeded`; `def is_flat_toolresult_envelope(value)`; `def orchestrator_result_cap()`; `def serialized_result_len(result)`; `class TaskHandler`; `class Feature`
 - **kestrel_sovereign/features/bootstrap/__init__.py** — Bootstrap feature for agent wake-up, discovery commands, and file convention.
 - **kestrel_sovereign/features/bootstrap/feature.py** — Bootstrap Feature - Commands for agent wake-up and discovery management.
   - `class RenameOutcome`; `async def rename_agent_core(agent, new_name)`; `class BootstrapFeature`
@@ -446,11 +446,13 @@ Repo entry points and standard project files.
   - `class AuditRecord`; `class AuditLog`
 - **kestrel_sovereign/features/computer_use/backends/__init__.py** — Sandbox backends for the computer-use feature.
 - **kestrel_sovereign/features/computer_use/backends/base.py** — Abstract sandbox backend.
-  - `class CapabilityBlocked`; `class DirEntry`; `class CompletedRun`; `class SandboxBackend`; `async def host_read(path, max_bytes)`; `async def host_write(path, data)`; `async def host_list(path)`; `def os_scandir(path)`
+  - `class CapabilityBlocked`; `class DirEntry`; `class CaptureTarget`; `class CompletedRun`; `class SandboxBackend`; `async def host_read(path, max_bytes)`; `async def host_write(path, data)`; `async def host_list(path)`; `…`
 - **kestrel_sovereign/features/computer_use/backends/docker.py** — Docker sandbox backend.
   - `class DockerSandboxBackend`
 - **kestrel_sovereign/features/computer_use/backends/local.py** — Local sandbox backend — direct host execution.
   - `class LocalSandboxBackend`
+- **kestrel_sovereign/features/computer_use/capture.py** — Durable artifacts for shell runs whose output must outlive the result.
+  - `class CaptureBundle`; `def allocate(capture_dir)`; `async def git_head(cwd)`; `def build_manifest()`; `def open_stream(path)`; `async def write_stream(path, data)`; `async def write_manifest(bundle, body)`; `async def preview(path)`; `…`
 - **kestrel_sovereign/features/computer_use/feature.py** — ComputerUseFeature: bounded host access wrapped in three gates + policy.
   - `def shell_syntax_refusal(command, argv)`; `class ComputerUseFeature`
 - **kestrel_sovereign/features/computer_use/path_safety.py** — Path-safety guards for the computer-use feature.
@@ -934,7 +936,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/remote_backend.py** — Readiness-gated private inference routing for :class:`LLMService`.
   - `class RemoteRouteSnapshot`; `class RemoteBackendMixin`
 - **kestrel_sovereign/llm/retry.py** — Retry Utilities for LLM Adapters
-  - `def retry_after_seconds(error)`; `def is_plan_limit_error(error)`; `def is_retryable_error(error)`; `async def with_retry(func)`; `async def retry_with_backoff(func)`
+  - `class AdvisedWaitExceedsRetryBudget`; `def advised_wait_exceeding_budget(error)`; `def common_declined_wait(errors)`; `def retry_after_seconds(error)`; `def is_plan_limit_error(error)`; `def is_retryable_error(error)`; `async def with_retry(func)`; `async def retry_with_backoff(func)`
 - **kestrel_sovereign/llm/route_credentials.py** — Single source of truth for which env vars satisfy an LLM route.
   - `def accepted_credential_envs(route_id, route)`
 - **kestrel_sovereign/llm/service.py** — LLM Service - Unified LLM provider management with remote GPU support.
@@ -2783,6 +2785,8 @@ Repo entry points and standard project files.
   - `async def test_writes_one_record(tmp_path)`; `async def test_records_in_order(tmp_path)`; `async def test_concurrent_writes_serialized(tmp_path)`; `async def test_creates_parent_dir(tmp_path)`; `async def test_forwards_to_feedback_hook(tmp_path)`; `async def test_record_includes_outcome_and_error(tmp_path)`
 - **tests/unit/test_computer_use_docker_backend.py** — What the Docker sandbox backend hands to the compute executor (#3187).
   - `async def test_exec_hands_the_vector_to_the_argv_mode_unchanged()`; `async def test_exec_passes_the_timeout_environment_and_cwd_through()`; `async def test_exec_reports_a_missing_exit_code_as_a_failure()`; `async def test_exec_refuses_an_empty_vector()`; `def test_the_backend_still_requires_the_sandboxed_grant()`
+- **tests/unit/test_computer_use_durable_capture.py** — A long review must leave an artifact, and a clipped one must not read as a verdict (#3243).
+  - `class FakeApprovalQueue`; `class FakeSecurityFeature`; `class FakeAgent`; `def workspace(tmp_path)`; `def queue()`; `async def test_a_capture_survives_output_far_larger_than_the_inline_cap(tmp_path)`; `async def test_without_a_capture_the_same_output_is_clipped_and_says_so(tmp_path)`; `async def test_the_capture_path_is_allocated_by_the_runtime(workspace, queue)`; `…`
 - **tests/unit/test_computer_use_feature.py** — Tests for ComputerUseFeature gate ordering and lifecycle (#838).
   - `class FakeApprovalQueue`; `class FakeSecurityFeature`; `class FakeAgent`; `def workspace(tmp_path)`; `async def test_disabled_feature_returns_error(tmp_path)`; `async def test_privacy_gate_blocks_when_flag_off(workspace)`; `async def test_constitution_gate_blocks_without_grant(workspace)`; `async def test_deny_path_hard_rejects_before_approval(workspace)`; `…`
 - **tests/unit/test_computer_use_policy.py** — Tests for the path & binary policy resolvers (#835).
@@ -3483,6 +3487,8 @@ Repo entry points and standard project files.
   - `def test_document_chunk_embedding_maps_to_embedding_vec()`; `def test_build_document_chunk_spec_validates_dim()`; `async def test_migration_skips_when_column_present_pg()`; `async def test_migration_skips_when_table_missing_pg()`; `async def test_migration_defers_when_no_embedded_rows_pg()`; `async def test_migration_backfills_existing_rows_pg()`; `async def test_migration_sqlite_adds_column_and_copies_bytes()`; `async def test_migration_skips_unknown_dialect()`; `…`
 - **tests/unit/test_rasa_shim_endpoint_contracts.py** — Contract tests for the Rasa webhook shim.
   - `def test_rasa_webhook_does_not_force_hardcoded_model_override()`; `def test_rasa_webhook_reports_cooperative_stop_as_conflict()`; `def test_prefixed_rasa_alias_invokes_only_the_routed_agent()`; `def test_prefixed_rasa_alias_beats_the_host_default_agent()`; `def test_unprefixed_rasa_webhook_on_a_multi_agent_host_without_a_default_refuses()`; `def test_prefixed_rasa_alias_still_requires_the_webhook_token()`; `def test_prefixed_rasa_alias_is_a_per_agent_opt_in_that_fails_closed()`; `def test_rasa_rate_limit_bucket_is_per_routed_agent()`; `…`
+- **tests/unit/test_rate_limited_until_surface.py** — A declined advised wait reaches the caller as a rate limit with a reset time (#3127).
+  - `def test_rate_limited_until_is_a_429_with_retry_after_rounded_up()`; `def test_retry_after_is_at_least_one_second()`; `def test_the_stream_message_names_the_reset_time_and_nothing_from_the_provider()`; `def test_the_agent_stream_block_and_bridge_event_carry_the_same_message()`; `def test_an_unrelated_failure_still_gets_the_generic_constant()`; `def test_invoke_answers_429_with_retry_after_when_the_route_declined_to_wait()`; `def test_invoke_still_answers_500_for_any_other_failure()`; `def test_the_invoke_endpoint_logs_the_decline_at_its_own_logger()`; `…`
 - **tests/unit/test_raw_user_strip_in_consumers.py** — Regression: raw-user content consumers (personality calibration, wellness depth metrics) must strip the sent-form wrappers from user-role rows before measuring/exporting.
   - `async def test_personality_calibration_strips_sent_form_from_user_input()`; `async def test_wellness_depth_metric_strips_user_sent_form_for_length()`; `async def test_wellness_depth_metric_does_not_strip_assistant_content()`
 - **tests/unit/test_read_attachment.py** — Lazy attachment reading (#1662 PR C) — read_attachment tool + context hint.
@@ -3519,6 +3525,10 @@ Repo entry points and standard project files.
   - `def test_resolve_uses_privacy_override_when_present()`; `def test_resolve_falls_back_to_global_when_no_override()`; `def test_resolve_falls_back_to_compiled_default()`; `def test_resolve_returns_none_for_zero_or_negative_retention()`; `def test_resolve_ignores_garbage_values()`; `def test_resolve_privacy_mode_match_is_case_insensitive()`; `def test_resolve_with_no_privacy_mode_uses_global_default()`; `def test_agent_privacy_mode_handles_enum_and_string()`; `…`
 - **tests/unit/test_retirement_service.py** — —
   - `async def test_retirement_archives_under_agent_data_dir(tmp_path, monkeypatch)`; `async def test_retirement_prefers_kestrel_db_path_env(tmp_path, monkeypatch)`
+- **tests/unit/test_retry_advised_wait_budget.py** — A server-advised cool-down is honoured, or declined at once (#3127).
+  - `async def test_advice_above_the_cap_but_within_budget_is_one_whole_wait()`; `async def test_advice_under_the_cap_is_still_honoured_exactly()`; `async def test_a_guessed_delay_is_still_clamped_to_the_cap()`; `async def test_advice_beyond_the_remaining_budget_raises_immediately_without_sleeping()`; `async def test_the_attempt_that_raises_did_not_sleep_first()`; `async def test_the_budget_is_what_the_loop_could_still_wait_not_the_whole_budget()`; `async def test_a_non_throttle_transient_with_advice_is_clamped_not_declined()`; `def test_the_declined_error_classifies_as_the_throttle_it_stands_for()`; `…`
+- **tests/unit/test_retry_budget_round2.py** — The advised-wait contract after review round 1 of #3127.
+  - `async def test_advice_that_fits_each_attempts_price_cannot_sum_past_the_budget()`; `async def test_a_constant_advice_is_declined_once_the_budget_is_spent()`; `async def test_a_guessed_delay_after_a_large_advised_wait_is_clamped_to_what_is_left()`; `async def test_advice_equal_to_the_remaining_budget_is_taken_whole()`; `async def test_the_budget_follows_the_error_type_per_attempt()`; `def test_a_non_finite_retry_after_is_no_advice(value)`; `def test_a_boolean_retry_after_attribute_is_ignored()`; `async def test_a_non_finite_header_falls_back_to_backoff_instead_of_raising(value)`; `…`
 - **tests/unit/test_retry_policy_contracts.py** — Contract tests for the retry policy.
   - `def test_non_retryable_classifications(msg)`; `def test_retryable_classifications(msg)`; `def test_unknown_defaults_non_retryable(msg)`; `def test_non_retryable_wins_over_retryable_pattern()`; `def test_status_code_word_boundary()`; `def test_structured_429_retryable_even_without_429_in_text()`; `def test_structured_401_non_retryable_even_with_retry_wording()`; `def test_retry_after_header_seconds()`; `…`
 - **tests/unit/test_root_page_ui_config.py** — GET / seeds ``window.KESTREL_UI_CONFIG`` per serving topology (#2048).
