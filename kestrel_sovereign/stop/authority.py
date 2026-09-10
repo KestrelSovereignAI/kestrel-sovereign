@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -30,6 +31,15 @@ DescendantResolver = Callable[
 ]
 UnloadedAgentStop = Callable[[str], Awaitable[StopDisposition]]
 DEFAULT_STOP_TARGET_TIMEOUT_SECONDS = 5.0
+
+# A retained cleanup tail is best-effort: the caller ALREADY received its typed
+# timeout, and this task exists only to finish target cleanup afterwards. The
+# shutdown phase that drains them is deliberately resistant to cancellation, so
+# an unbounded join there is a teardown wedge no signal can break -- one stuck
+# target would hold the host open and block the agents phase behind it.
+DEFAULT_STOP_CLEANUP_DRAIN_TIMEOUT_SECONDS = 10.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,12 +153,50 @@ class StopCleanupRegistry:
 
         task.add_done_callback(consume)
 
-    async def drain(self) -> None:
-        """Join every retained cleanup tail before application teardown."""
+    async def drain(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_STOP_CLEANUP_DRAIN_TIMEOUT_SECONDS,
+    ) -> None:
+        """Join every retained cleanup tail, bounded, before teardown."""
 
         pending_cancellation: asyncio.CancelledError | None = None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
         while self._tasks:
             task = next(iter(self._tasks))
+            remaining = deadline - loop.time()
+            if remaining > 0 and not task.done():
+                # The bound has to be owned the same way the join is: drain
+                # deliberately SURVIVES cancellation of its caller (teardown
+                # must not be interruptible), so waiting on a bare
+                # asyncio.wait here would hand that back. Wait on an owned
+                # waiter instead -- it settles when the tail finishes or the
+                # budget expires, whichever comes first, and caller
+                # cancellation is still absorbed and re-raised at the end.
+                async def _bounded_wait(
+                    tail: asyncio.Task[StopOutcome] = task,
+                    budget: float = remaining,
+                ) -> None:
+                    await asyncio.wait({tail}, timeout=budget)
+
+                waiter = asyncio.create_task(
+                    _bounded_wait(), name="stop-cleanup-drain-bound"
+                )
+                waited = await await_owned_task(waiter, pending_cancellation)
+                if pending_cancellation is None:
+                    pending_cancellation = waited.cancellation
+            if not task.done():
+                # Abandon, do not cancel: `retain` installed a done-callback
+                # that consumes each outcome, so an abandoned tail stays owned
+                # and cannot surface as a never-retrieved exception.
+                logger.warning(
+                    "Stop cleanup drain timed out after %.1fs with %d tail(s) "
+                    "still running; releasing teardown",
+                    timeout_seconds,
+                    len(self._tasks),
+                )
+                break
             outcome = await await_owned_task(task, pending_cancellation)
             if pending_cancellation is None:
                 pending_cancellation = outcome.cancellation
