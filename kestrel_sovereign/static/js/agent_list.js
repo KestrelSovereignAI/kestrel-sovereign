@@ -640,7 +640,11 @@ export function mountAgentListPane(containerEl, config = {}) {
 
     // --- Mount the shared list surface into the body -----------------------
     let loadedItems = [];
-    let listLoaded = false;
+    // Set once and never cleared. A failed list fetch must not permanently
+    // retire the fleet Stop control: its authority comes from the host status
+    // endpoint, not from the agent list, so once the pane has loaded at all,
+    // polling stays eligible and a later successful status read re-enables it.
+    let listEverLoaded = false;
     let stopAllPending = false;
     let refreshStopAllState = async () => false;
     let invalidateStopAllState = () => {};
@@ -654,14 +658,13 @@ export function mountAgentListPane(containerEl, config = {}) {
         onSelect: config.onSelect,
         onLoaded: (items, meta) => {
             loadedItems = Array.isArray(items) ? items : [];
-            listLoaded = true;
+            listEverLoaded = true;
             if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
                 void refreshStopAllState();
             }
             if (typeof config.onLoaded === 'function') config.onLoaded(items, meta);
         },
         onError: (error) => {
-            listLoaded = false;
             invalidateStopAllState();
             if (typeof config.onError === 'function') config.onError(error);
         },
@@ -689,7 +692,12 @@ export function mountAgentListPane(containerEl, config = {}) {
         stopAllBtn.type = 'button';
         stopAllBtn.className = 'agent-stop-all-btn';
         stopAllBtn.textContent = 'Stop all';
-        header.insertBefore(stopAllBtn, collapseBtn);
+        // collapseBtn came from header.querySelector, a DESCENDANT query, so
+        // an adopted header may nest its chevron in a wrapper. insertBefore on
+        // `header` then throws NotFoundError and aborts the whole mount --
+        // before the "+ New" wiring, the collapse/resize listeners, and the
+        // pane owner handle. Insert relative to the button's own parent.
+        (collapseBtn.parentNode || header).insertBefore(stopAllBtn, collapseBtn);
     }
     if (stopAllBtn) {
         stopAllBtn.hidden = !stopAllOptIn;
@@ -716,7 +724,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         const retryPending = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string';
         stopAllBtn.disabled = stopAllPending
             || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
-            || !listLoaded || !loaded || !canStop
+            || !listEverLoaded || !loaded || !canStop
             || (inFlightCount === 0 && !retryPending);
         stopAllBtn.dataset.inFlightCount = String(inFlightCount);
         if (!loaded) {
@@ -736,7 +744,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         renderStopAllState();
     };
     refreshStopAllState = async () => {
-        if (!stopAllOptIn || !listLoaded) return false;
+        if (!stopAllOptIn || !listEverLoaded) return false;
         if (stopAllStatusPromise) return stopAllStatusPromise;
         const request = (async () => {
             const seq = ++stopAllStatusSeq;
@@ -822,7 +830,7 @@ export function mountAgentListPane(containerEl, config = {}) {
                 : false
         ));
     const onStopAllClick = async () => {
-        if (!stopAllOptIn || !listLoaded || stopAllPending
+        if (!stopAllOptIn || !listEverLoaded || stopAllPending
             || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
         const count = stopAllStatus.inFlightCount;
         const retryCorrelationId = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string'
@@ -932,7 +940,7 @@ export function mountAgentListPane(containerEl, config = {}) {
     const clearIntervalFn = doc.defaultView && doc.defaultView.clearInterval;
     const statusInterval = stopAllOptIn && typeof setIntervalFn === 'function'
         ? setIntervalFn.call(doc.defaultView, () => {
-            if (listLoaded && !stopAllPending
+            if (listEverLoaded && !stopAllPending
                 && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
                 void refreshStopAllState();
             }
