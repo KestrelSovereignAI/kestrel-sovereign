@@ -578,24 +578,13 @@ class TestStartAgent:
             for name, config in configs.items():
                 pm.start_agent(name, config)
 
-        # The property is that every child shares ONE host database, not that
-        # it sits at any particular path. Host custody no longer derives from
-        # the per-agent KESTREL_DB_PATH at all (that fallback put host-owned
-        # Hold state inside an agent's writable root), so assert the invariant
-        # rather than the path the removed fallback used to produce.
-        host_paths = {env[HOST_DB_PATH_ENV] for env in captured}
-        assert len(host_paths) == 1, "children must not partition fleet Hold state"
-        assert {env[DERIVED_HOST_DB_PATH_ENV] for env in captured} == host_paths
-        shared_host = Path(next(iter(host_paths)))
-        # And the stronger guarantee the removal buys: it is inside no agent.
-        for config in configs.values():
-            agent_root = (project_dir / config.data_dir).resolve()
-            assert agent_root not in shared_host.parents, (
-                f"host Hold custody {shared_host} sits inside agent root {agent_root}"
-            )
-        assert fleet_root not in shared_host.parents, (
-            "host custody must not follow the per-agent KESTREL_DB_PATH"
+        expected_host = str(
+            fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
         )
+        assert {env[HOST_DB_PATH_ENV] for env in captured} == {expected_host}
+        assert {
+            env[DERIVED_HOST_DB_PATH_ENV] for env in captured
+        } == {expected_host}
         assert [env["KESTREL_DB_PATH"] for env in captured] == [
             str((project_dir / config.data_dir).resolve())
             for config in configs.values()
@@ -692,14 +681,7 @@ class TestStartAgent:
         assert captured_process_env[DERIVED_HOST_DB_PATH_ENV] == (
             captured_process_env[HOST_DB_PATH_ENV]
         )
-        # This test is a mutation tripwire on the two launchers AGREEING, so
-        # assert the flag matches the shell's answer rather than pinning a
-        # literal. "derived but not the implicit default" was only reachable
-        # through the removed per-agent KESTREL_DB_PATH fallback; with no
-        # explicit KESTREL_HOST_DB_PATH the default is now the honest answer.
-        assert captured_process_env[HOST_DB_USES_DEFAULT_ENV] == (
-            "1" if captured_shell_context.uses_default else "0"
-        )
+        assert captured_process_env[HOST_DB_USES_DEFAULT_ENV] == "0"
         assert captured_process_env[HOST_DB_PREVIOUS_DEFAULT_ENV] == str(
             captured_shell_context.previous_default
         )

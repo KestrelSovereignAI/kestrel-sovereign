@@ -66,7 +66,10 @@ def test_every_default_branch_behind_the_override_also_lands_in_the_root(
     assert host_runtime_isolation_root in paths.project_dir().parents
 
     monkeypatch.delenv(HOST_DB_PATH_ENV)
-    monkeypatch.delenv("KESTREL_DB_PATH")
+    # raising=False: this test must not depend on the developer's gitignored
+    # .env happening to set KESTREL_DB_PATH. It passed only while one did;
+    # removing that line turned a host-isolation guard into a KeyError.
+    monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
     paths.reset_cache()
     fallback, uses_default = host_database_path()
 
