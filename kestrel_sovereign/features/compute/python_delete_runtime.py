@@ -430,7 +430,13 @@ def install_safe_delete_runtime(
             | _os.O_APPEND
             | _os.O_CREAT
             | _os.O_TRUNC
-            | getattr(_os, "O_TMPFILE", 0)
+            # O_TMPFILE is DEFINED as __O_TMPFILE|O_DIRECTORY on Linux, so
+            # masking with it whole matches a plain read-only directory open
+            # (O_RDONLY|O_DIRECTORY) and routes a READ through the write
+            # guard -- and, with dir_fd set, fails every anchored relative
+            # open outright. Keep only its write-intent bit; a real O_TMPFILE
+            # caller also passes O_WRONLY/O_RDWR, which this mask covers.
+            | (getattr(_os, "O_TMPFILE", 0) & ~getattr(_os, "O_DIRECTORY", 0))
         )
         if isinstance(flags, int) and flags & mutation_flags:
             try:

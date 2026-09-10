@@ -415,6 +415,8 @@ class DockerExecutor(BaseExecutor):
                 ):
                     raise changed(display_path)
                 destination_file.chmod(stat.S_IMODE(before.st_mode))
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
             except OSError as exc:
                 raise changed(display_path) from exc
             finally:
@@ -438,6 +440,8 @@ class DockerExecutor(BaseExecutor):
                             dir_fd=source_fd,
                             follow_symlinks=False,
                         )
+                    except TimeoutError:
+                        raise  # the snapshot deadline, not a tamper signal
                     except OSError as exc:
                         raise changed(display_path) from exc
                     destination_entry = destination_directory / name
@@ -466,6 +470,8 @@ class DockerExecutor(BaseExecutor):
                             if not same_object(before, after):
                                 raise changed(display_path)
                             destination_entry.chmod(stat.S_IMODE(before.st_mode))
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
                         except OSError as exc:
                             raise changed(display_path) from exc
                         finally:
@@ -479,6 +485,8 @@ class DockerExecutor(BaseExecutor):
                                 dir_fd=source_fd,
                                 follow_symlinks=False,
                             )
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
                         except OSError as exc:
                             raise changed(display_path) from exc
                         if not same_object(before, after):
@@ -604,6 +612,8 @@ class DockerExecutor(BaseExecutor):
         finally:
             try:
                 result_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
             except OSError as exc:
                 logger.warning(
                     "Could not remove Docker snapshot worker result %s: %s",
