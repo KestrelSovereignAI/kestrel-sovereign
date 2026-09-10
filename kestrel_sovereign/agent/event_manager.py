@@ -299,7 +299,7 @@ class EventManagerMixin:
         # Keep that contract for those agents instead of spinning at the 5s
         # cap forever.
         has_durable = getattr(self.dispatcher, "has_durable_consumer", None)
-        if callable(has_durable) and not has_durable(consumer_id):
+        if callable(has_durable) and not await has_durable(consumer_id):
             signal = signal_factory()
             handle = await self.dispatcher.enqueue_signal(signal)
             outcome = await await_terminal_delivery(

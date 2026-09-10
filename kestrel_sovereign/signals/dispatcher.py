@@ -1518,15 +1518,27 @@ class SignalDispatcher:
                     self._durable_initialized = True
                     self._schedule_runtime_owner_heartbeat()
 
-    def has_durable_consumer(self, consumer_id: str) -> bool:
-        """Whether durable delivery is configured for this consumer.
+    async def has_durable_consumer(self, consumer_id: str) -> bool:
+        """Whether durable delivery is REGISTERED for this consumer.
 
         A registration is a lifecycle fact, not a transient one: an agent that
         never registered a durable cognition consumer will never admit durable
         work, no matter how long a caller retries.
+
+        Read the registration, never ``_started_durable_cognition_consumers``.
+        That set tracks whether a DRAINER is running: it is empty in the boot
+        window between ``register_durable_consumer`` and
+        ``start_durable_cognition_consumer``, is discarded by
+        ``deactivate_consumer``, and is cleared wholesale at shutdown. Gating
+        on it would silently drop A2A wakes back to a non-durable, non-retried
+        ``enqueue_signal`` during exactly the windows #3163 exists to close.
         """
 
-        return consumer_id in self._started_durable_cognition_consumers
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.has_active_consumer(
+                self._agent.did, consumer_id
+            )
 
     async def register_durable_consumer(
         self, registration: DurableConsumerRegistration

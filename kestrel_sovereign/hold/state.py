@@ -4559,11 +4559,24 @@ def _sqlite_database_has_hold_schema(database: Path) -> bool:
     # distinction; make the same one here. An unresolved rollback journal
     # cannot be read safely either way, so refuse rather than guess.
     wal_present = path_exists(Path(f"{database}-wal"))
+    shm_present = path_exists(Path(f"{database}-shm"))
     if path_exists(Path(f"{database}-journal")):
         raise HoldCorruptStateError(
             "Hold backend selection cannot prove the existing SQLite control "
             "database is free of Hold state: unresolved rollback journal"
         )
+    if wal_present != shm_present:
+        # REFUSE rather than repair. mode=ro would rebuild the missing -shm
+        # inside the very directory this probe is auditing, and this is
+        # documented as a read-only probe that creates no diagnostic state;
+        # it also has to work on read-only media. The sibling in
+        # validate_sqlite_hold_readiness refuses the same mismatch.
+        raise HoldCorruptStateError(
+            "Hold backend selection cannot prove the existing SQLite control "
+            "database is free of Hold state: incomplete live WAL sidecar pair"
+        )
+    # With an intact pair the -shm already exists, so mode=ro adds nothing and
+    # is the only flag that can see committed rows still living in the WAL.
     flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
     try:
         with closing(

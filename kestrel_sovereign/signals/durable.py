@@ -5409,6 +5409,16 @@ class DurableSignalStore(UnifiedStoreBase):
             f"{self._backend.backend_type!r}"
         )
 
+    async def has_active_consumer(self, agent_id: str, consumer_id: str) -> bool:
+        """Whether an ACTIVE durable consumer is registered for this id.
+
+        This is the durable registration itself -- the same fact every claim
+        path gates on -- not whether a drainer happens to be running.
+        """
+
+        consumer = await self._get_consumer(agent_id, consumer_id)
+        return consumer is not None and bool(consumer[4])
+
     async def _get_consumer(
         self, agent_id: str, consumer_id: str
     ) -> Optional[tuple[Any, ...]]:
