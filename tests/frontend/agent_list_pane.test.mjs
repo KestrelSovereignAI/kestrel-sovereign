@@ -1064,3 +1064,80 @@ test('Stop All fences local queues synchronously before awaiting the host reques
     assert.deepEqual(beforeSettlement, ['fence', 'post']);
     assert.deepEqual(afterSettlement, ['fence', 'post', 'settle']);
 });
+
+test('a failed agent-list fetch does not permanently retire fleet Stop', async () => {
+    // The control's authority is the HOST status endpoint, not the agent list.
+    // A transient /api/agents failure used to latch listLoaded=false, which
+    // gated the render, the poller and the click handler alike -- so the button
+    // stayed disabled for the rest of the page session. Deterministic: drive
+    // the recovery with an explicit refresh rather than waiting on a timer.
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let listCalls = 0;
+    const adapter = {
+        mode: 'multi_agent',
+        listAgents: async () => {
+            listCalls += 1;
+            if (listCalls === 2) throw new Error('transient network failure');
+            return [{ name: 'Emma', id: 'did:agent:emma' }];
+        },
+    };
+    const handle = mountAgentListPane(el, {
+        adapter,
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async () => ({}),
+        },
+        onPrepareStopAll: browserStopFence,
+        stopAllStatusIntervalMs: 999999,
+    });
+    try {
+        await tick();
+        await tick();
+        const button = el.querySelector('.agent-stop-all-btn');
+        assert.equal(button.disabled, false, 'precondition: enabled after first load');
+
+        await handle.refresh();          // call 2: the failing fetch
+        await tick();
+
+        await handle.refresh();          // call 3: the network recovers
+        await tick();
+        await tick();
+
+        assert.equal(button.disabled, false,
+            'a transient list failure must not disable fleet Stop for the session');
+    } finally {
+        handle.destroy();
+    }
+});
+
+test('an adopted header whose collapse button is nested still mounts', async () => {
+    // collapseBtn is found with a DESCENDANT query, so it need not be a direct
+    // child. insertBefore on the header then threw NotFoundError and aborted
+    // the mount before the owner handle was ever attached.
+    const el = document.createElement('div');
+    el.innerHTML = `
+        <div class="agent-pane">
+          <div class="pane-header">
+            <div class="header-tools"><button class="collapse-btn">v</button></div>
+          </div>
+          <div class="pane-body"></div>
+        </div>`;
+    document.body.appendChild(el);
+
+    const handle = mountAgentListPane(el, {
+        adapter: fakeAdapter([{ name: 'Emma', id: 'did:agent:emma' }]),
+        api: {
+            getHostStopStatus: async () => ({ can_stop: true, in_flight_count: 1 }),
+            stopHost: async () => ({}),
+        },
+        onPrepareStopAll: browserStopFence,
+    });
+    await tick();
+
+    assert.ok(handle, 'mount must not abort on a nested collapse button');
+    assert.ok(el.querySelector('.agent-stop-all-btn'),
+        'the Stop All control is still placed');
+    assert.equal(typeof handle.destroy, 'function');
+    handle.destroy();
+});
