@@ -77,6 +77,33 @@ async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent():
 
 
 @pytest.mark.asyncio
+async def test_encoded_route_preserves_slash_and_unicode_agent_name():
+    agent_name = "Emma bird/\N{SNOWMAN}"
+    fake_agent = MagicMock(name=agent_name)
+    mw, inner, manager = _make_middleware({agent_name: fake_agent})
+    from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
+
+    segment = encode_agent_route_name(agent_name)
+    scope = {
+        "type": "http",
+        "path": f"/api/agent-routes/{segment}/api/agent/info",
+        "raw_path": f"/api/agent-routes/{segment}/api/agent/info".encode(),
+    }
+
+    async def _recv():
+        return {}
+
+    async def _send(_msg):
+        pass
+
+    await mw(scope, _recv, _send)
+
+    manager.get_agent.assert_called_once_with(agent_name)
+    assert inner[0]["scope"]["path"] == "/api/agent/info"
+    assert inner[0]["scope"]["state"]["agent"] is fake_agent
+
+
+@pytest.mark.asyncio
 async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent():
     """The bug this middleware fixes: WebSocket scope used to bypass agent
     resolution entirely because @app.middleware('http') doesn't fire on it.

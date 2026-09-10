@@ -14,6 +14,7 @@ Covers each pipeline step:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import os
 import tempfile
@@ -38,6 +39,12 @@ from kestrel_sdk.signals import (
     Visibility,
 )
 
+from kestrel_sovereign.hold import (
+    EffectiveHoldState,
+    HoldScope,
+    HoldState,
+    HoldTurnRefusal,
+)
 from kestrel_sovereign.signals import (
     DurableAdmissionDisposition,
     OrderedLockManager,
@@ -258,6 +265,51 @@ async def test_monitored_cognition_revalidates_before_execution_handoff(
 
 
 @pytest.mark.asyncio
+async def test_monitored_cognition_transfers_resource_lock_generation(
+    dispatcher_components,
+    tmp_path,
+):
+    """The monitor task boundary preserves lock-aware nested turn ownership."""
+
+    c = dispatcher_components
+    template = tmp_path / "monitored-memory-lock.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(
+        _cognition_reg(
+            template,
+            name="monitored_memory_lock",
+            resources=frozenset({ResourceLock.MEMORY}),
+        )
+    )
+
+    async def monitor(_signal):
+        await asyncio.Event().wait()
+
+    c.agent.monitor_cognition_signal_execution = monitor
+    nested_ownership: list[bool] = []
+
+    async def lock_aware_process_input(_prompt):
+        operation_context = contextvars.copy_context()
+        c.locks.delegate_current_task_ownership(operation_context)
+
+        async def nested_turn():
+            owned = c.locks.is_owned_by_current_task(ResourceLock.MEMORY)
+            nested_ownership.append(owned)
+            return owned
+
+        return await asyncio.create_task(nested_turn(), context=operation_context)
+
+    c.agent.process_input = lock_aware_process_input
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("monitored_memory_lock", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.OK
+    assert nested_ownership == [True]
+
+
+@pytest.mark.asyncio
 async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path):
     """UNTRUSTED + COGNITION → sanitizer runs and replaces payload."""
     c = dispatcher_components
@@ -280,6 +332,40 @@ async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp
     )
     assert result.status == Status.OK
     assert "scrubbed" in c.agent.process_input_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_held_cognition_is_terminal_typed_refusal(
+    dispatcher_components,
+    tmp_path,
+):
+    c = dispatcher_components
+    template = tmp_path / "held.md"
+    template.write_text("wake")
+    c.registry.register(_cognition_reg(template, name="held_signal"))
+    latch = HoldState(
+        scope=HoldScope.AGENT,
+        target_id=c.agent.did,
+        reason="operator hold",
+        actor_id="did:sovereign:operator",
+        set_at="2026-08-28T12:00:00+00:00",
+        hold_receipt_id="hold:signal",
+        revision=3,
+    )
+    refusal = HoldTurnRefusal(
+        agent_id=c.agent.did,
+        effective_state=EffectiveHoldState(host=None, agent=latch),
+    )
+    c.agent.process_input = AsyncMock(side_effect=refusal)
+
+    result = await c.dispatcher.dispatch_signal(
+        _signal("held_signal", mode=SignalMode.COGNITION)
+    )
+
+    assert result.status is Status.DROPPED_VALIDATION
+    assert result.error == refusal.wire_json()
+    assert '"code":"agent_held"' in result.error
+    assert '"hold_receipt_id":"hold:signal"' in result.error
 
 
 @pytest.mark.asyncio

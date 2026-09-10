@@ -656,6 +656,352 @@ class TestDestructivePolicy:
         assert entries[-1]["decision"] == "allowed"
         assert entries[-1]["reason"] == "own_agent_data"
 
+    def test_hold_custody_is_reserved_below_single_agent_data_root(
+        self, temp_trash_dir, tmp_path, monkeypatch
+    ):
+        """An agent cannot erase the host Hold store nested in its own root."""
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        host_db = host_data / "host-features.db"
+        host_db.write_text("sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        for target in (host_db, host_data, current):
+            with pytest.raises(AgentDataProtectionError, match="host Hold custody"):
+                policy.assert_agent_data_deletion_allowed(target)
+            assert policy.is_deletable_path(str(target)) is False
+
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "from pathlib import Path\n"
+                f"Path({str(host_db)!r}).write_text('gone')\n"
+            )
+        )
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert host_db.read_text() == "sovereign state"
+
+    @pytest.mark.parametrize("api", ["builtins", "pathlib", "io"])
+    @pytest.mark.parametrize("mode", ["w", "a", "x", "r+b"])
+    def test_python_wrapper_blocks_every_write_capable_open_mode_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        api,
+        mode,
+    ):
+        """Truncation is not the only ``open`` mode that can corrupt Hold."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / ("new.db" if "x" in mode else "host-features.db")
+        if "x" not in mode:
+            target.write_bytes(b"sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        opener = (
+            f"open({str(target)!r}, {mode!r})"
+            if api == "builtins"
+            else (
+                f"Path({str(target)!r}).open({mode!r})"
+                if api == "pathlib"
+                else f"io.open({str(target)!r}, {mode!r})"
+            )
+        )
+        import_line = (
+            "from pathlib import Path\n"
+            if api == "pathlib"
+            else ("import io\n" if api == "io" else "")
+        )
+        script_path = tmp_path / f"{api}-{mode.replace('+', 'plus')}.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"{import_line}with {opener}:\n"
+                "    pass\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        if "x" in mode:
+            assert not target.exists()
+        else:
+            assert target.read_bytes() == b"sovereign state"
+
+    def test_python_wrapper_blocks_case_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Generated guards honor the target volume's case identity."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "HOST-DATA" / "host-features.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        rewritten = policy.rewrite_python_script(
+            f"open({str(alias)!r}, 'w').write('gone')\n"
+        )
+        # Make the volume result deterministic on Linux CI while retaining the
+        # same runtime wiring used by native APFS/Windows detection.
+        rewritten = rewritten.replace(
+            "del _kestrel_runtime_namespace\n",
+            "_kestrel_runtime_namespace['_filesystem_is_case_insensitive'] = "
+            "lambda _path: True\n"
+            "del _kestrel_runtime_namespace\n",
+            1,
+        )
+        script_path = tmp_path / "case-alias.py"
+        script_path.write_text(rewritten)
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert target.read_bytes() == b"sovereign state"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    def test_python_wrapper_blocks_existing_hard_link_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """An outside pathname cannot make the same protected inode writable."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "outside-alias.db"
+        os.link(target, alias)
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "hard-link-alias.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"open({str(alias)!r}, 'w').write('gone')\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "ambiguous Hold custody" in result.stderr
+        assert target.read_bytes() == b"sovereign state"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    @pytest.mark.parametrize("api", ["os", "pathlib"])
+    def test_python_wrapper_blocks_hard_link_creation_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        api,
+    ):
+        """A compute process cannot first manufacture an outside alias."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = tmp_path / f"{api}-alias.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        operation = (
+            f"os.link({str(target)!r}, {str(alias)!r})"
+            if api == "os"
+            else f"Path({str(alias)!r}).hardlink_to({str(target)!r})"
+        )
+        import_line = "import os\n" if api == "os" else "from pathlib import Path\n"
+        script_path = tmp_path / f"hard-link-{api}.py"
+        script_path.write_text(
+            policy.rewrite_python_script(f"{import_line}{operation}\n")
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        assert not alias.exists()
+        assert target.read_bytes() == b"sovereign state"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX hard-link contract")
+    def test_shell_rewrite_blocks_existing_hard_link_alias_with_ambiguous_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Static shell admission applies the same existing-alias rule."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        target.write_bytes(b"sovereign state")
+        alias = current / "shell-alias.db"
+        os.link(target, alias)
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        assert policy.is_deletable_path(str(alias)) is False
+        with pytest.raises(AgentDataProtectionError, match="ambiguous Hold custody"):
+            policy.rewrite_bash_script(f"printf gone > {alias}")
+
+        assert target.read_bytes() == b"sovereign state"
+
+    def test_parent_policy_blocks_uncreated_case_alias_to_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Rewrite-time admission uses the same filesystem identity rule."""
+
+        from kestrel_sovereign.security import path_identity
+
+        current = tmp_path / "agent_data"
+        current.mkdir()
+        host_data = current / "host-data"
+        alias = current / "HOST-DATA" / "future.db"
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        monkeypatch.setattr(
+            path_identity,
+            "_filesystem_is_case_insensitive",
+            lambda _path: True,
+        )
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        assert policy.host_control_data_path == host_data
+        assert policy.touches_host_hold_custody(alias)
+        with pytest.raises(AgentDataProtectionError, match="host Hold custody"):
+            policy.assert_agent_data_deletion_allowed(alias)
+
+    @pytest.mark.parametrize(
+        ("flags", "target_exists"),
+        [
+            ("os.O_WRONLY", True),
+            ("os.O_RDWR", True),
+            ("os.O_WRONLY | os.O_APPEND", True),
+            ("os.O_WRONLY | os.O_TRUNC", True),
+            ("os.O_RDONLY | os.O_CREAT", False),
+        ],
+    )
+    def test_python_wrapper_blocks_mutating_os_open_for_hold_custody(
+        self,
+        temp_trash_dir,
+        tmp_path,
+        monkeypatch,
+        flags,
+        target_exists,
+    ):
+        """Low-level descriptor opens cannot bypass the Host/Hold boundary."""
+
+        current = tmp_path / "agent_data"
+        host_data = current / "host-data"
+        host_data.mkdir(parents=True)
+        target = host_data / "host-features.db"
+        if target_exists:
+            target.write_bytes(b"sovereign state")
+        monkeypatch.setenv("KESTREL_DB_PATH", str(current))
+        monkeypatch.delenv("KESTREL_HOST_DB_PATH", raising=False)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "os-open.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"descriptor = os.open({str(target)!r}, {flags})\n"
+                "os.close(descriptor)\n"
+            )
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "host Hold custody" in result.stderr
+        if target_exists:
+            assert target.read_bytes() == b"sovereign state"
+        else:
+            assert not target.exists()
+
     def test_rewrite_bash_blocks_mv_of_other_agent_data(self, temp_trash_dir, tmp_path):
         """Test shell mv cannot relocate another agent's data directory."""
         current = tmp_path / "agent_data" / "emma"
@@ -836,7 +1182,7 @@ print("Done")
         assert other_db.read_text() == "memory"
         audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
         entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
-        assert entries[-1]["action"] == "open_truncate"
+        assert entries[-1]["action"] == "open_write"
         assert entries[-1]["decision"] == "blocked"
 
     def test_python_wrapper_blocks_rename_other_agent_data(
@@ -1007,6 +1353,29 @@ class TestTrashManager:
         assert deleted == 0
         assert old_subdir.exists()
         assert (agent_dir / "kestrel_prime.db").exists()
+
+    def test_empty_refuses_host_hold_custody_inside_trash_root(
+        self,
+        temp_trash_dir,
+        monkeypatch,
+    ):
+        """Trash retention cannot purge an overlapping host-control root."""
+
+        old_timestamp = (datetime.now() - timedelta(days=40)).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        old_subdir = temp_trash_dir / old_timestamp
+        old_subdir.mkdir(parents=True)
+        host_db = old_subdir / "host-features.db"
+        host_db.write_text("durable Hold control")
+        monkeypatch.setenv("KESTREL_HOST_DB_PATH", str(host_db))
+        manager = TrashManager(temp_trash_dir)
+
+        deleted = manager.empty(older_than_days=30)
+
+        assert deleted == 0
+        assert old_subdir.exists()
+        assert host_db.exists()
     
     def test_get_stats(self, temp_trash_dir):
         """Test getting trash statistics."""

@@ -90,6 +90,8 @@ async def test_spawned_by_restart_descendant_authority_round_trip_sqlite(
 
         host_witness = SpawnAuthorityRegistry(tmp_path).get(child_did)
         assert host_witness is not None
+        assert host_witness.mandate.authority_committed is True
+        assert host_witness.mandate.to_dict() == child._persisted_spawn_mandate.to_dict()
         assert host_witness.proposal_created_at == proposal_created_at
         assert host_witness.mandate.created_at != proposal_created_at
 
@@ -109,6 +111,7 @@ async def test_spawned_by_restart_descendant_authority_round_trip_sqlite(
         restarted_child = _agent(
             child_did,
             _persisted_spawn_mandate=restored,
+            storage=durable_projection,
         )
         restarted = AgentManager(base_data_dir=tmp_path)
         restarted._register_agent("Parent", restarted_parent)
@@ -133,7 +136,10 @@ async def test_spawned_by_restart_descendant_authority_round_trip_sqlite(
         restarted._register_agent("Child", restarted_child)
         assert restarted.get_children(parent_did) == ["Child"]
         assert await restarted.terminate_child(parent_did, "Child") is True
-        assert restarted.get_children(parent_did) == []
+        assert restarted.get_agent("Child") is None
+        # This is a retained stop, not destructive offboarding: the durable
+        # relation remains so the same child can rehydrate on the next boot.
+        assert restarted.get_children(parent_did) == ["Child"]
     finally:
         await database.close()
 

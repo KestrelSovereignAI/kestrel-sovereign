@@ -744,6 +744,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/privacy-mode/confirm`
   - `GET /api/agent/reflection/status`
   - `POST /api/agent/stop`
+  - `GET /api/agent/stop/capabilities`
   - `POST /api/agent/stream`
   - `GET /api/agent/tasks`
   - `POST /api/agent/tasks/send`
@@ -802,6 +803,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - [`kestrel_sovereign/endpoints/github.py`](kestrel_sovereign/endpoints/github.py)
   - `GET /api/github/repos`
   - `GET /api/github/{path:path}`
+- [`kestrel_sovereign/endpoints/host_stop.py`](kestrel_sovereign/endpoints/host_stop.py)
+  - `POST /api/host/stop`
+  - `GET /api/host/stop/status`
 - [`kestrel_sovereign/endpoints/memories.py`](kestrel_sovereign/endpoints/memories.py)
   - `GET /api/identity-chain`
   - `GET /api/memories`

@@ -8,14 +8,50 @@ from .authority import (
     CooperativeStopTarget,
     StopCleanupRegistry,
 )
-from .types import StopDisposition, StopOutcome, StopRequest, StopScope
+from .fleet import execute_fleet_stop, fleet_in_flight_count
+from .invocation import (
+    DistributedInvocationRegistry,
+    DistributedInvocationStore,
+    DistributedStopTicket,
+)
+from .receipt import (
+    StopOperationClaim,
+    StopReceipt,
+    StopReceiptConflict,
+    StopReceiptCorruptError,
+    StopReceiptError,
+    StopReceiptStore,
+    UnavailableStopReceiptStore,
+)
+from .types import (
+    AuthoritativeStopDescendant,
+    MAX_STOP_CORRELATION_ID_BYTES,
+    StopDisposition,
+    StopOutcome,
+    StopRequest,
+    StopScope,
+)
 
 __all__ = [
+    "MAX_STOP_CORRELATION_ID_BYTES",
+    "AuthoritativeStopDescendant",
     "CancellationAuthority",
     "CooperativeStopTarget",
-    "StopDisposition",
+    "DistributedInvocationRegistry",
+    "DistributedInvocationStore",
+    "DistributedStopTicket",
     "StopCleanupRegistry",
+    "StopDisposition",
+    "StopOperationClaim",
     "StopOutcome",
+    "StopReceipt",
+    "StopReceiptConflict",
+    "StopReceiptCorruptError",
+    "StopReceiptError",
+    "StopReceiptStore",
     "StopRequest",
     "StopScope",
+    "UnavailableStopReceiptStore",
+    "execute_fleet_stop",
+    "fleet_in_flight_count",
 ]

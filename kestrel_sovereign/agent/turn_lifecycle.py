@@ -30,10 +30,18 @@ from uuid import uuid4
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
 from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
     current_invocation_id,
+    invocation_log_correlation,
     validate_invocation_id,
 )
 from kestrel_sovereign.signals import OrderedLockManager
+from kestrel_sovereign.telemetry import (
+    KESTREL_TURN_ID,
+    current_turn_id as telemetry_current_turn_id,
+    span_trace_identity,
+    turn_span_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +63,6 @@ logger = logging.getLogger(__name__)
 _CURRENT_CHAIN: contextvars.ContextVar[list[CausationFrame]] = (
     contextvars.ContextVar("kestrel_signals_current_chain", default=[])
 )
-_CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = (
-    contextvars.ContextVar("kestrel_agent_current_turn_id", default=None)
-)
-
-
 @dataclass(frozen=True)
 class _TurnSessionBinding:
     """A turn/session pair explicitly carried across a task boundary."""
@@ -126,7 +129,7 @@ def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
             return propagated
         return _TurnSessionBinding(agent, None, None)
 
-    turn_id = _CURRENT_TURN_ID.get()
+    turn_id = telemetry_current_turn_id()
     if turn_id and turn_id == live_turn_id:
         resolve = getattr(agent, "get_turn_bound_session_id", None)
         if not callable(resolve):
@@ -201,9 +204,15 @@ class TurnLifecycleMixin:
         chain = _CURRENT_CHAIN.get()
         return chain if chain else None
 
+    def get_current_turn_id(self) -> Optional[str]:
+        """Return the canonical cooperative-Stop address of this task's turn."""
+
+        return telemetry_current_turn_id()
+
     def _get_current_turn_id(self) -> Optional[str]:
-        """Return the current agent turn id for per-turn observability."""
-        return _CURRENT_TURN_ID.get()
+        """Compatibility alias for callers predating the public accessor."""
+
+        return self.get_current_turn_id()
 
     def _turn_request_index(self) -> dict[str, tuple[str, int | None]]:
         """Return the live turn-to-request index, creating it for test doubles."""
@@ -274,6 +283,63 @@ class TurnLifecycleMixin:
             for turn_id, binding in self.active_turn_request_bindings().items()
         }
 
+    def _turn_trace_index(self) -> dict[str, tuple[str, str]]:
+        """Return live turn-to-span correlations, creating it for test doubles."""
+
+        index = getattr(self, "_turn_trace_identities", None)
+        if index is None:
+            index = {}
+            self._turn_trace_identities = index
+        if not isinstance(index, dict):
+            raise TypeError("turn trace identity index has an invalid type")
+        return index
+
+    def bind_current_turn_trace_identity(
+        self,
+        trace_id: str,
+        span_id: str,
+    ) -> bool:
+        """Correlate the live canonical turn with one observable turn span.
+
+        The mapping is evidence only. Cancellation still resolves exclusively
+        through the lifecycle-owned turn-to-request index.
+        """
+
+        turn_id = self.get_current_turn_id()
+        if turn_id is None or turn_id != getattr(self, "_live_turn_id", None):
+            return False
+        for field_name, value, length in (
+            ("trace_id", trace_id, 32),
+            ("span_id", span_id, 16),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != length
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{field_name} must be a lowercase W3C hex identity")
+        self._turn_trace_index()[turn_id] = (trace_id, span_id)
+        return True
+
+    def bind_current_turn_span(self, span: object) -> bool:
+        """Bind a concrete OTel span to the live turn when it is valid."""
+
+        turn_id = self.get_current_turn_id()
+        if turn_id is None or turn_id != getattr(self, "_live_turn_id", None):
+            return False
+        set_attribute = getattr(span, "set_attribute", None)
+        if callable(set_attribute):
+            set_attribute(KESTREL_TURN_ID, turn_id)
+        trace_id, span_id = span_trace_identity(span)
+        if trace_id is None or span_id is None:
+            return False
+        return self.bind_current_turn_trace_identity(trace_id, span_id)
+
+    def active_turn_trace_identities(self) -> dict[str, tuple[str, str]]:
+        """Snapshot optional observability correlations for live turns."""
+
+        return dict(self._turn_trace_index())
+
     def _unregister_turn_request_id(
         self,
         turn_id: str,
@@ -333,7 +399,7 @@ class TurnLifecycleMixin:
                 return _normalize_session_id(propagated.session_id)
             return None
 
-        turn_id = _CURRENT_TURN_ID.get()
+        turn_id = telemetry_current_turn_id()
         if turn_id and turn_id == live_turn_id:
             return _normalize_session_id(
                 getattr(self, "_active_session_id", None)
@@ -488,6 +554,47 @@ class TurnLifecycleMixin:
         finally:
             _COMMITTED_FEATURE_TRANSITION_AGENT.reset(token)
 
+    def _capture_committed_feature_transition_delegation(
+        self,
+    ) -> _FeatureTransitionAncestry | None:
+        """Capture authority that an isolated invocation child may re-own."""
+
+        ancestry = _FEATURE_TRANSITION_ANCESTRY.get()
+        if (
+            ancestry is None
+            or ancestry.agent is not self
+            or not ancestry.active
+            or ancestry.owner_task is not asyncio.current_task()
+            or _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self
+        ):
+            return None
+        return ancestry
+
+    @contextmanager
+    def _bind_committed_feature_transition_delegation(
+        self,
+        ancestry: _FeatureTransitionAncestry,
+    ) -> Iterator[None]:
+        """Re-own captured committed-transition authority in one child task."""
+
+        if (
+            not isinstance(ancestry, _FeatureTransitionAncestry)
+            or ancestry.agent is not self
+            or not ancestry.active
+            or _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self
+        ):
+            raise RuntimeError("committed feature-transition authority expired")
+        delegated = _FeatureTransitionAncestry(
+            agent=self,
+            owner_task=asyncio.current_task(),
+        )
+        token = _FEATURE_TRANSITION_ANCESTRY.set(delegated)
+        try:
+            yield
+        finally:
+            delegated.active = False
+            _FEATURE_TRANSITION_ANCESTRY.reset(token)
+
     def _caller_belongs_to_live_turn(self) -> bool:
         """Whether this task is executing as part of this agent's live turn.
 
@@ -554,7 +661,10 @@ class TurnLifecycleMixin:
         region that can otherwise silently hold an agent hostage for minutes.
         """
         await self._await_host_context_publication()
-        turn_id = f"turn_{uuid4().hex[:12]}"
+        # This identifier is now a durable public Stop address, not a log-only
+        # convenience token.  Keep the full UUID entropy so fleet-scale turns
+        # cannot collide onto the same cancellation target.
+        turn_id = f"turn_{uuid4().hex}"
         mgr = self._get_lock_manager()
         label = f"{getattr(self, 'agent_name', None) or 'agent'} {turn_id}"
         started = time.monotonic()
@@ -586,7 +696,7 @@ class TurnLifecycleMixin:
                 )
         if (
             holder is not None
-            and holder.owner_task is current_task
+            and mgr.is_owned_by_current_task(ResourceLock.CONVERSATION)
             and current_task is not getattr(self, "_live_turn_task", None)
         ):
             if _COMMITTED_FEATURE_TRANSITION_AGENT.get() is not self:
@@ -594,10 +704,11 @@ class TurnLifecycleMixin:
                     "cognition cannot start before the feature transition "
                     "generation is fully committed"
                 )
-            # The committed ready phase still owns CONVERSATION in this task.
-            # Reuse that exact boundary; an arbitrary mid-transition hook is
-            # rejected above, and a genuine live turn is excluded so recursive
-            # process_input cannot replace the outer turn's authority.
+            # The committed ready phase still owns CONVERSATION in this task,
+            # or has explicitly delegated that exact hold to the isolated
+            # invocation child. Reuse that boundary; an arbitrary mid-transition
+            # hook is rejected above, and a genuine live turn is excluded so
+            # recursive process_input cannot replace the outer turn's authority.
             async with self._active_turn_scope(turn_id, label, started):
                 yield turn_id
             return
@@ -616,7 +727,8 @@ class TurnLifecycleMixin:
         """Publish one live turn inside an already-owned conversation bound."""
 
         logger.info("turn_lifecycle: %s begin", label)
-        token = _CURRENT_TURN_ID.set(turn_id)
+        turn_scope = turn_span_scope(turn_id)
+        turn_scope.__enter__()
         # Agent-scoped mirror of "which turn is LIVE" — i.e. which one holds
         # the CONVERSATION lock and therefore owns `_active_session_id`.
         self._live_turn_id = turn_id
@@ -642,6 +754,22 @@ class TurnLifecycleMixin:
                     request_generation,
                 )
                 request_binding_registered = True
+                await_turn_admission = getattr(
+                    self,
+                    "await_durable_turn_admission",
+                    None,
+                )
+                if callable(await_turn_admission):
+                    durable_binding_admitted = await await_turn_admission(
+                        turn_id,
+                        request_id,
+                        request_generation,
+                    )
+                    if not durable_binding_admitted:
+                        raise InvocationCancelledError(
+                            "turn was stopped before durable admission "
+                            f"({invocation_log_correlation(turn_id)})"
+                        )
             yield
         finally:
             try:
@@ -653,7 +781,8 @@ class TurnLifecycleMixin:
                     )
             finally:
                 _BOUND_TURN_SESSION.reset(bound_token)
-                _CURRENT_TURN_ID.reset(token)
+                self._turn_trace_index().pop(turn_id, None)
+                turn_scope.__exit__(None, None, None)
                 self._live_turn_id = None
                 self._live_turn_task = None
                 # An out-of-turn caller must never reuse a stale chat session.

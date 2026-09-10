@@ -15,11 +15,16 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from kestrel_sdk.signals import CausationFrame, ResourceLock
 
-from kestrel_sovereign.agent.invocation import invocation_scope
+from kestrel_sovereign.agent.invocation import (
+    InvocationCancelledError,
+    bind_async_invocation,
+    invocation_scope,
+)
 from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
 from kestrel_sovereign.agent.turn_lifecycle import (
     TurnLifecycleMixin,
@@ -62,6 +67,13 @@ class _RequestTurnAgent(RequestLifecycleMixin, TurnLifecycleMixin):
         self._active_request_counts = {}
         self._active_request_started_at = {}
         self._cancelled_requests = set()
+
+
+class _IsolatedRequestTurnAgent(_RequestTurnAgent):
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def process_input(self, invocation_id=None):
+        async with self._turn_lifecycle():
+            return "ok"
 
 
 class _HostContextStubAgent(_StubAgent):
@@ -346,6 +358,18 @@ async def test_conversation_lock_is_held_inside_turn():
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
     async with agent._turn_lifecycle():
         assert agent._lock_manager.is_held(ResourceLock.CONVERSATION)
+
+
+@pytest.mark.asyncio
+async def test_public_turn_address_keeps_full_uuid_entropy():
+    """Durable Stop addresses must not truncate UUID collision resistance."""
+
+    agent = _StubAgent()
+    async with agent._turn_lifecycle() as turn_id:
+        prefix, value = turn_id.split("_", 1)
+        assert prefix == "turn"
+        assert len(value) == 32
+        assert set(value) <= set("0123456789abcdef")
     assert not agent._lock_manager.is_held(ResourceLock.CONVERSATION)
 
 
@@ -401,6 +425,78 @@ async def test_turn_index_carries_the_exact_request_generation():
             }
 
     assert agent.active_turn_request_bindings() == {}
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_retains_durable_binding_until_request_settlement():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=True),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+
+    with invocation_scope("durable-turn-request"):
+        generation = agent.register_active_request("durable-turn-request")
+        async with agent._turn_lifecycle() as turn_id:
+            registry.bind_public_turn.assert_awaited_once_with(
+                agent,
+                turn_id,
+                "durable-turn-request",
+                generation,
+            )
+
+    registry.bind_public_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_refuses_cognition_when_public_binding_is_fenced():
+    agent = _RequestTurnAgent()
+    registry = SimpleNamespace(
+        bind_public_turn=AsyncMock(return_value=False),
+        complete_soon=MagicMock(),
+    )
+    agent._distributed_invocation_registry = registry
+    entered = False
+
+    with invocation_scope("fenced-turn-request"):
+        generation = agent.register_active_request("fenced-turn-request")
+        with pytest.raises(InvocationCancelledError):
+            async with agent._turn_lifecycle():
+                entered = True
+
+    assert entered is False
+    assert ("fenced-turn-request", generation) in (
+        agent._cancelled_request_generations
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_invocation_preserves_committed_transition_authority():
+    agent = _IsolatedRequestTurnAgent()
+
+    async with agent.feature_config_transition():
+        with agent.committed_feature_transition_cognition():
+            assert await agent.process_input() == "ok"
+
+
+@pytest.mark.asyncio
+async def test_live_turn_trace_identity_is_optional_evidence_and_cleans_up():
+    agent = _RequestTurnAgent()
+    trace_id = "0123456789abcdef0123456789abcdef"
+    span_id = "0123456789abcdef"
+
+    with invocation_scope("observable-request"):
+        agent.register_active_request("observable-request")
+        async with agent._turn_lifecycle() as turn_id:
+            assert agent.get_current_turn_id() == turn_id
+            assert agent.bind_current_turn_trace_identity(trace_id, span_id)
+            assert agent.active_turn_trace_identities() == {
+                turn_id: (trace_id, span_id)
+            }
+
+    assert agent.active_turn_trace_identities() == {}
+    assert agent.get_current_turn_id() is None
 
 
 @pytest.mark.asyncio

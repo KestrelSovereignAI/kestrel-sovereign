@@ -382,6 +382,9 @@ async def test_orchestrator_response_accepts_tool_results_out_param():
         })
 
     agent._execute_tool_batch = _capture_batch
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+    )
     agent._build_all_tools = MagicMock(return_value=[])
     agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _t, **_kw: msgs)
     # Reflection / repair / finalize phases all no-op for this test.

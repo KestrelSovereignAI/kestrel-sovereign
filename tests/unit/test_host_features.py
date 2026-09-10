@@ -7,8 +7,10 @@ endpoints, the host-scoped UI surface, and that per-agent behavior is untouched.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -23,9 +25,9 @@ from kestrel_sovereign.host_features.context import (
     FleetSessionFactory,
     SovereignHostContext,
     build_host_context,
+    close_host_context_resources,
 )
 from kestrel_sovereign.security import csrf
-
 
 # ---------------------------------------------------------------------------
 # A minimal host feature used across the tests.
@@ -262,6 +264,43 @@ def test_agent_prefixed_host_path_still_requires_csrf():
     assert response.headers["X-Correlation-ID"]
 
 
+def test_encoded_agent_route_alias_still_requires_csrf():
+    """The lossless /api/agent-routes/{encoded} alias is the same door.
+
+    The per-agent prefix has two public spellings and MultiAgentAgentRoutingMiddleware
+    resolves both through ``_routed_agent_path`` before the route matches. The CSRF
+    gate ran its own copy of the literal regex, so the encoded spelling reached
+    host-feature routes with the boundary skipped entirely.
+    """
+    import base64
+
+    from kestrel_sovereign import server
+
+    app = FastAPI()
+    hf.mount_host_feature_routers(app, [_UIHostFeature()])
+    encoded = base64.urlsafe_b64encode(b"Kite").decode().rstrip("=")
+    path = f"/api/agent-routes/{encoded}/api/demo-host/do"
+    # Precondition: this really is the same route the literal alias reaches.
+    assert server._routed_agent_path(path) == ("Kite", "api/demo-host/do")
+
+    request = SimpleNamespace(
+        method="POST",
+        app=app,
+        url=SimpleNamespace(path=path),
+        scope={"path": path},
+        cookies={},
+        headers={},
+    )
+
+    response = server._enforce_host_csrf(request)
+
+    assert response is not None, (
+        "the encoded agent alias bypassed the host CSRF boundary"
+    )
+    assert response.status_code == 403
+    assert b'"code":"csrf_failed"' in response.body
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle (AC #3)
 # ---------------------------------------------------------------------------
@@ -305,7 +344,8 @@ async def test_server_lifespan_wires_and_closes_host_features(
     """
     from kestrel_sovereign import server
     from kestrel_sovereign.a2a import did_registry
-    from kestrel_sovereign.multi_agent import agent_manager, config as ma_config
+    from kestrel_sovereign.multi_agent import agent_manager
+    from kestrel_sovereign.multi_agent import config as ma_config
     from kestrel_sovereign.security import demo_isolation
 
     events: list[str] = []
@@ -327,14 +367,24 @@ async def test_server_lifespan_wires_and_closes_host_features(
     class FakeManager:
         init_failures = []
         readiness_sweep_calls = 0
+        persistence_hook = None
 
         def set_host_context_publication_gate(self, gate) -> None:
             self.host_context_publication_gate = gate
+
+        def bind_hold_store(self, store) -> None:
+            assert store is ctx.hold_store
 
         def reconcile_spawn_authority_restart_roster(self, config):
             return config
 
         def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        def set_created_agent_persistence_hook(self, hook) -> None:
+            self.persistence_hook = hook
+
+        def set_created_agent_registration_removal_hook(self, _hook) -> None:
             return None
 
         async def load_from_config(
@@ -387,6 +437,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
         db=Closeable("db-close"),
         config={},
         session_factory=Closeable("session-close"),
+        hold_store=object(),
     )
     ctx.feature_contribution_runtime = host_runtime
 
@@ -460,15 +511,15 @@ async def test_server_lifespan_wires_and_closes_host_features(
                 pass
 
         assert events == [
-            "agents-load",
             "context-build",
+            "agents-load",
             "host-start",
             "host-context-validate",
             "host-stop",
+            "agents-stop",
+            "host-unmount",
             "session-close",
             "db-close",
-            "host-unmount",
-            "agents-stop",
         ]
         assert not fake_manager.host_context_publication_gate.is_set()
         assert fake_manager.readiness_sweep_calls == 0
@@ -478,10 +529,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert fake_config.host.port == 9090
         assert test_app.state.host_features == [feature]
         assert test_app.state.host_context is ctx
+        assert callable(fake_manager.persistence_hook)
         assert fake_manager.host_context_publication_gate.is_set()
         assert events == [
-            "agents-load",
             "context-build",
+            "agents-load",
             "host-start",
             "host-context-validate",
             "host-router-mount",
@@ -493,12 +545,144 @@ async def test_server_lifespan_wires_and_closes_host_features(
         assert fake_manager.readiness_sweep_calls == 1
 
     assert events[-5:] == [
+        "agents-stop",
         "host-stop",
         "host-unmount",
         "session-close",
         "db-close",
-        "agents-stop",
     ]
+
+
+@pytest.mark.asyncio
+async def test_server_retains_control_context_after_optional_mount_failure(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A failed host contribution cannot leak its separate Hold pool."""
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager
+    from kestrel_sovereign.multi_agent import config as ma_config
+    from kestrel_sovereign.security import demo_isolation
+
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={"Kite": object()},
+    )
+    fake_agent = SimpleNamespace(is_test_instance=True)
+
+    class FakeManager:
+        init_failures = []
+
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        async def load_from_config(
+            self,
+            _config,
+            *,
+            restart_roster_reconciled,
+        ):
+            assert restart_roster_reconciled is True
+            return 1
+
+        def list_agents(self):
+            return ["Kite"]
+
+        def get_agent(self, _name):
+            return fake_agent
+
+        async def shutdown_all(self):
+            return None
+
+    feature = _UIHostFeature()
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    candidate = SovereignHostContext(
+        db=host_db,
+        hold_db=hold_db,
+        session_factory=session_factory,
+        hold_store=object(),
+    )
+
+    async def build_context(*, config):
+        assert config["host_port"] == 8888
+        return candidate
+
+    async def start_features(features, context):
+        assert features == [feature]
+        assert context is candidate
+        return [feature]
+
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_kwargs: FakeManager())
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
+    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda _agents: True)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_kwargs: [feature])
+    monkeypatch.setattr(hf, "build_host_context", build_context)
+    monkeypatch.setattr(hf, "start_host_features", start_features)
+    monkeypatch.setattr(hf, "stop_host_features", AsyncMock())
+    monkeypatch.setattr(
+        hf,
+        "mount_host_feature_routers",
+        lambda _app, _features: (_ for _ in ()).throw(
+            RuntimeError("router mount failed")
+        ),
+    )
+    monkeypatch.setattr(hf, "mount_host_feature_ui", lambda _app, _features: None)
+    monkeypatch.setattr(hf, "unmount_host_features", lambda _app: None)
+
+    test_app = FastAPI()
+    async with server.lifespan(test_app):
+        assert test_app.state.host_context is candidate
+        session_factory.close.assert_not_awaited()
+        hold_db.close.assert_not_awaited()
+        host_db.close.assert_not_awaited()
+
+    session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_control_context_fails_closed_before_publication_without_hold(
+    monkeypatch,
+):
+    from kestrel_sovereign import server
+    from kestrel_sovereign.host_features import context as context_module
+
+    degraded = SovereignHostContext(
+        backend_error="Hold schema is corrupt",
+        hold_store=None,
+    )
+    close_resources = AsyncMock()
+    monkeypatch.setattr(hf, "build_host_context", AsyncMock(return_value=degraded))
+    monkeypatch.setattr(
+        context_module,
+        "close_host_context_resources",
+        close_resources,
+    )
+    test_app = FastAPI()
+
+    with pytest.raises(RuntimeError, match="before work admission"):
+        await server._build_host_control_context(test_app, None)
+
+    assert getattr(test_app.state, "host_context", None) is None
+    close_resources.assert_awaited_once_with(degraded)
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +710,326 @@ async def test_build_host_context_provides_fleet_session_factory(tmp_path: Path)
             await ctx.db.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    (
+        (
+            {"KESTREL_HOLD_BACKEND": "bogus"},
+            "KESTREL_HOLD_BACKEND must be 'postgres' or 'sqlite'",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://primary.example/hold",
+                "KESTREL_HOLD_BACKEND": "postgres",
+            },
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL is required",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://shared.example/hold",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                    "postgresql://shared.example/hold"
+                ),
+                "KESTREL_HOLD_BACKEND": "postgres",
+            },
+            "must identify an independent rollback domain",
+        ),
+        (
+            {
+                "KESTREL_DB_BACKEND": "postgres",
+                "KESTREL_DATABASE_URL": "postgresql://primary.example/hold",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                    "postgresql://evidence.example/hold"
+                ),
+                "KESTREL_HOLD_BACKEND": "postgres",
+                "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+            },
+            "KESTREL_HOLD_PAIR_ID is required",
+        ),
+    ),
+)
+async def test_invalid_hold_configuration_precedes_host_database_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, str],
+    error: str,
+):
+    """Rejected Hold settings cannot create, migrate, or open host storage."""
+
+    from kestrel_sovereign.host_features import storage as host_storage
+
+    for name in (
+        "KESTREL_DB_BACKEND",
+        "KESTREL_DATABASE_URL",
+        "KESTREL_HOLD_BACKEND",
+        "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+        "KESTREL_HOLD_PAIR_ID",
+        "KESTREL_DEPLOYMENT_PERSISTENCE",
+        "KESTREL_ENV",
+        "KESTREL_KITE_RELEASE_EVIDENCE",
+        "KESTREL_DEMO_SERVER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+
+    preparation_calls: list[str | None] = []
+    real_prepare = host_storage.prepare_host_database
+
+    def record_prepare(db_path: str | None = None):
+        preparation_calls.append(db_path)
+        return real_prepare(db_path)
+
+    monkeypatch.setattr(host_storage, "prepare_host_database", record_prepare)
+    database = tmp_path / "host.db"
+
+    ctx = await build_host_context(db_path=str(database))
+
+    assert ctx.hold_store is None
+    assert error in ctx.backend_error
+    assert preparation_calls == []
+    assert not database.exists()
+    assert tuple(tmp_path.iterdir()) == ()
+
+
+@pytest.mark.asyncio
+async def test_surviving_backend_custody_precedes_sqlite_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A rejected switch cannot create a missing host SQLite database."""
+
+    from uuid import uuid4
+
+    from kestrel_sovereign.hold.state import claim_hold_backend_custody
+    from kestrel_sovereign.host_features import storage as host_storage
+
+    database = tmp_path / "host.db"
+    claim_hold_backend_custody(
+        database,
+        "postgres",
+        postgres_pair_id=uuid4(),
+        postgres_primary_cluster_identity="primary-cluster",
+        postgres_evidence_cluster_identity="evidence-cluster",
+    )
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.delenv("KESTREL_DATABASE_URL", raising=False)
+
+    preparation_calls: list[str | None] = []
+    real_prepare = host_storage.prepare_host_database
+
+    def record_prepare(db_path: str | None = None):
+        preparation_calls.append(db_path)
+        return real_prepare(db_path)
+
+    monkeypatch.setattr(host_storage, "prepare_host_database", record_prepare)
+
+    ctx = await build_host_context(db_path=str(database))
+
+    assert ctx.hold_store is None
+    assert "backend switch" in ctx.backend_error
+    assert preparation_calls == []
+    assert not database.exists()
+
+
+@pytest.mark.asyncio
+async def test_postgres_kite_context_can_select_isolated_sqlite_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A one-cluster test lane may keep Hold in its owned local database."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://isolated.example/kite",
+    )
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.backend_error == ""
+        assert ctx.hold_store is not None
+        assert ctx.hold_db is ctx.db
+        assert ctx.hold_evidence_db is None
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    (
+        ("KESTREL_ENV", "production"),
+        ("KESTREL_ENV", "prod"),
+        ("KESTREL_DEPLOYMENT_PERSISTENCE", "durable_sovereign"),
+    ),
+)
+async def test_production_rejects_stale_kite_sqlite_hold_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    value: str,
+):
+    """A stale test flag cannot move production Hold onto ephemeral SQLite."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://production/kestrel")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.setenv("KESTREL_DEMO_SERVER", "1")
+    monkeypatch.setenv(setting, value)
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "isolated non-production Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+async def test_kite_flag_without_demo_mode_cannot_select_sqlite_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The broad Kite seam alone is not authority to change Hold custody."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv("KESTREL_DATABASE_URL", "postgresql://production/kestrel")
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_KITE_RELEASE_EVIDENCE", "1")
+    monkeypatch.delenv("KESTREL_DEMO_SERVER", raising=False)
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "isolated non-production Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+async def test_postgres_runtime_cannot_downgrade_hold_to_local_sqlite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The Kite exception cannot become a production control-plane escape."""
+
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL",
+        "postgresql://production.example/kestrel",
+    )
+    monkeypatch.setenv("KESTREL_HOLD_BACKEND", "sqlite")
+
+    ctx = await build_host_context(db_path=str(tmp_path / "host.db"))
+    try:
+        assert ctx.hold_store is None
+        assert "only inside isolated Kite" in ctx.backend_error
+    finally:
+        await close_host_context_resources(ctx)
+
+
+@pytest.mark.asyncio
+async def test_host_context_refuses_silent_rebootstrap_after_sqlite_custody_loss(
+    tmp_path: Path,
+):
+    """Losing the database family cannot silently erase a durable host Hold."""
+
+    custody = tmp_path / "custody"
+    custody.mkdir(mode=0o700)
+    database = custody / "host.db"
+    first = await build_host_context(db_path=str(database))
+    try:
+        assert first.hold_store is not None, first.backend_error
+        mutation = await first.hold_store.set_hold(
+            scope="host",
+            actor_id="did:sovereign:operator",
+            reason="must survive custody loss",
+            operation_id="host-hold-before-custody-loss",
+        )
+        assert mutation.current is not None
+    finally:
+        await close_host_context_resources(first)
+
+    # Model replacement of the complete SQLite family and all evidence that
+    # used to be named beside it.  The independent installation marker is the
+    # only durable fact that may distinguish this from a genuine first boot.
+    for artifact in custody.glob("host.db*"):
+        artifact.unlink()
+
+    reopened = await build_host_context(db_path=str(database))
+    try:
+        assert reopened.hold_store is None
+        assert "custody marker" in reopened.backend_error
+    finally:
+        await close_host_context_resources(reopened)
+
+
 def test_host_context_satisfies_sdk_protocol():
     from kestrel_sdk.features.host_base import HostContext
 
     ctx = SovereignHostContext(db=object(), backplane=object(), config={})
     assert isinstance(ctx, HostContext)
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_closes_separate_hold_backend_once():
+    from kestrel_sovereign import server
+
+    host_db = SimpleNamespace(close=AsyncMock())
+    hold_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    app = FastAPI()
+    app.state.host_features = []
+    app.state.host_context = SovereignHostContext(
+        db=host_db,
+        session_factory=session_factory,
+        hold_db=hold_db,
+    )
+
+    await server._shutdown_host_features(app)
+
+    session_factory.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_closes_later_databases_after_close_cancellation():
+    """One owner preserving cancellation cannot strand the remaining owners."""
+
+    from kestrel_sovereign import server
+
+    evidence_db = SimpleNamespace(
+        close=AsyncMock(side_effect=asyncio.CancelledError())
+    )
+    hold_db = SimpleNamespace(close=AsyncMock())
+    host_db = SimpleNamespace(close=AsyncMock())
+    session_factory = SimpleNamespace(close=AsyncMock())
+    app = FastAPI()
+    app.state.host_features = []
+    app.state.host_context = SovereignHostContext(
+        db=host_db,
+        session_factory=session_factory,
+        hold_db=hold_db,
+        hold_evidence_db=evidence_db,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await server._shutdown_host_features(app)
+
+    session_factory.close.assert_awaited_once()
+    evidence_db.close.assert_awaited_once()
+    hold_db.close.assert_awaited_once()
+    host_db.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

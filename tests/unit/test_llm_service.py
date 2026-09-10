@@ -1982,6 +1982,32 @@ class TestInvocationBoundary:
         assert persisted.kwargs["provider"] == "openai:api"
 
     @pytest.mark.asyncio
+    async def test_normal_assistant_persist_settles_completed_effect_checkpoint(self):
+        """A fully persisted response prevents a later Stop from duplicating it."""
+
+        from kestrel_sovereign.agent.invocation import (
+            current_invocation_effect_checkpoint,
+            invocation_scope,
+            mark_current_invocation_effect_completed,
+        )
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        agent = object.__new__(KestrelAgent)
+        agent.llm_service = SimpleNamespace()
+        agent.privacy_agent = SimpleNamespace(add_conversation=AsyncMock())
+
+        with invocation_scope("normal-effect-persist"):
+            mark_current_invocation_effect_completed("normal-session")
+            state = current_invocation_effect_checkpoint()
+            await agent._persist_assistant_conversation(
+                "effect completed",
+                session_id="normal-session",
+            )
+
+            assert state is not None
+            assert state.checkpointed is True
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("broken_sink", ["usage_db", "store", "meter"])
     async def test_ordinary_sink_failure_does_not_suppress_siblings(
         self, llm_service, broken_sink, caplog

@@ -27,6 +27,22 @@ import API from './api.js';
 import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import { storeGet, storeSet } from './ui_state.mjs';
+import { validateHostStopEnvelope } from './stop_evidence.js';
+
+// One pane owns one set of component listeners. A host may remount into
+// adopted chrome without first retaining/destroying the old handle; carrying
+// ownership on the container lets the new mount retire the old listeners
+// before adopting the same buttons (#3155).
+const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
+const AGENT_LIST_STOP_ALL_OPERATION = Symbol.for('kestrel.agentListPane.stopAllOperation');
+const AGENT_LIST_STOP_ALL_RETRY = Symbol.for('kestrel.agentListPane.stopAllRetry');
+
+function newStopAllCorrelationId() {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+        return `ui-host-stop:${globalThis.crypto.randomUUID()}`;
+    }
+    return `ui-host-stop:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
 
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
@@ -103,14 +119,14 @@ export function createDefaultAgentAdapter(api = API) {
 // Default card renderer — the CONSOLE ROW (matches today's `.agent-item`)
 // ============================================================================
 
-// Build the default console-row body: the per-agent thinking pulse, the
-// name/description block, and the stop control — the exact affordance set the
-// standalone console shipped in identity.js. Returns a DocumentFragment so the
+// Build the default console-row body: the per-agent thinking pulse and the
+// name/description block. Returns a DocumentFragment so the
 // children become DIRECT children of the `.agent-item` flex row (a wrapping
 // div would break the row layout), letting the component prepend the
-// component-owned status dot and append the actions anchor around it. The
-// status dot is component-owned (§3.2), so this renderer does NOT draw it.
-function makeConsoleRenderer({ onStop }) {
+// component-owned status dot and append its shared controls around it. The
+// status dot and Stop affordance are component-owned, so this renderer does
+// not draw either one.
+function makeConsoleRenderer() {
     return (item) => {
         const doc = typeof document !== 'undefined' ? document : null;
         const frag = doc.createDocumentFragment();
@@ -135,25 +151,90 @@ function makeConsoleRenderer({ onStop }) {
         info.appendChild(desc);
         frag.appendChild(info);
 
-        // Per-agent stop control. Rendered always but only VISIBLE while the
-        // row carries `.agent-thinking` (CSS gate); a click aborts that exact
-        // agent's stream via the host `onStop` hook. stopPropagation so it does
-        // not also fire the row's selection handler.
-        const stopBtn = doc.createElement('button');
-        stopBtn.className = 'agent-stop-btn';
-        // Label with the live display name; but stop ROUTES by item.name (the
-        // manager routing key) so the abort reaches the right agent (#2672 P2).
-        stopBtn.title = `Stop ${name}`;
-        stopBtn.setAttribute('aria-label', `Stop ${name}`);
-        stopBtn.innerHTML = '&times;';
-        stopBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (typeof onStop === 'function') onStop(item.name);
-        });
-        frag.appendChild(stopBtn);
-
         return frag;
     };
+}
+
+// Stop is behavior, not card presentation. Keep the control on the component-
+// owned seam so a host's custom portrait renderer cannot replace cancellation
+// when it replaces the console body. Default rows receive these nodes directly;
+// custom cards receive them in the actions anchor that the host positions.
+function makeStopControls(doc, item, onStop) {
+    const frag = doc.createDocumentFragment();
+    const displayName = item.displayName || item.name || 'Unnamed Agent';
+    const stopBtn = doc.createElement('button');
+    stopBtn.className = 'agent-stop-btn';
+    stopBtn.title = `Stop ${displayName}`;
+    stopBtn.setAttribute('aria-label', `Stop ${displayName}`);
+    stopBtn.innerHTML = '&times;';
+
+    const outcomeEl = doc.createElement('span');
+    outcomeEl.className = 'agent-stop-outcome';
+    outcomeEl.setAttribute('role', 'status');
+    outcomeEl.setAttribute('aria-live', 'polite');
+    outcomeEl.hidden = true;
+
+    // Capture the immutable routing key at render time. Display-name changes
+    // and selection changes during an awaited Stop may never retarget retries.
+    const routedTarget = item.name;
+    stopBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (stopBtn.disabled || typeof onStop !== 'function') return;
+        stopBtn.disabled = true;
+        outcomeEl.hidden = false;
+        outcomeEl.dataset.disposition = 'requested';
+        outcomeEl.textContent = 'Stopping…';
+        try {
+            const result = await onStop(routedTarget);
+            const outcomes = Array.isArray(result?.outcomes)
+                ? result.outcomes
+                : (
+                    Array.isArray(result?.stop_outcomes)
+                        ? result.stop_outcomes
+                        : (
+                            Array.isArray(result?.response?.stop_outcomes)
+                                ? result.response.stop_outcomes
+                                : []
+                        )
+                );
+            const targetIds = [
+                routedTarget,
+                item.id,
+                item.raw && item.raw.did,
+                item.raw && item.raw.id,
+            ].filter((value) => typeof value === 'string' && value);
+            const outcome = outcomes.find((candidate) => (
+                candidate
+                && targetIds.includes(candidate.resolved_target || candidate.agent_id)
+            )) || outcomes[0] || null;
+            const disposition = outcome && typeof outcome.disposition === 'string'
+                ? outcome.disposition
+                : (result === true ? 'stopped' : 'unreachable');
+            const labels = {
+                stopped: 'Stopped',
+                already_complete: 'Already complete',
+                refused: 'Stop refused',
+                unreachable: 'Stop unreachable',
+                indeterminate: 'Stop indeterminate',
+            };
+            outcomeEl.dataset.disposition = disposition;
+            outcomeEl.textContent = labels[disposition] || `Stop: ${disposition}`;
+            outcomeEl.title = outcome && typeof outcome.detail === 'string'
+                ? outcome.detail
+                : outcomeEl.textContent;
+        } catch (error) {
+            outcomeEl.dataset.disposition = 'unreachable';
+            outcomeEl.textContent = 'Stop unreachable';
+            outcomeEl.title = error && error.message
+                ? error.message
+                : 'Cooperative Stop request failed';
+        } finally {
+            stopBtn.disabled = false;
+        }
+    });
+    frag.appendChild(stopBtn);
+    frag.appendChild(outcomeEl);
+    return frag;
 }
 
 // ============================================================================
@@ -189,7 +270,7 @@ export function mountAgentList(containerEl, config = {}) {
     const onSelect = typeof config.onSelect === 'function'
         ? config.onSelect
         : (adapter && typeof adapter.onSelect === 'function' ? adapter.onSelect : null);
-    const renderCard = hostRenderCard || makeConsoleRenderer({ onStop });
+    const renderCard = hostRenderCard || makeConsoleRenderer();
 
     let items = [];
     let activeName = config.selectedName || null;
@@ -223,9 +304,9 @@ export function mountAgentList(containerEl, config = {}) {
         const shell = doc.createElement('div');
         const classes = [];
         // The default renderer IS the console row, so tag the shell `.agent-item`
-        // so identity.js/chat.js selectors (refreshAgentThinkingDot's
-        // `.agent-item[data-agent-name]`, the CSS state rules) keep matching. A
-        // host renderer gets a clean `.agent-card` shell without the row layout.
+        // for its row layout. Every renderer retains `.agent-card`, which is the
+        // shared live-state selector used by refreshAgentThinkingDot. A host
+        // renderer therefore gets a clean shell without console-row layout.
         if (usingDefaultRenderer) classes.push('agent-item');
         classes.push('agent-card');
         if (selected) classes.push('selected');
@@ -241,6 +322,8 @@ export function mountAgentList(containerEl, config = {}) {
         const actionsAnchor = doc.createElement('div');
         actionsAnchor.dataset.slot = 'agent-card-actions';
         actionsAnchor.className = 'agent-card-actions';
+        const stopControls = makeStopControls(doc, item, onStop);
+        if (!usingDefaultRenderer) actionsAnchor.appendChild(stopControls);
 
         // Component-owned status dot — a config flag (`showStatusDot`, default
         // true = console behavior); a host renderCard may omit it entirely.
@@ -277,6 +360,7 @@ export function mountAgentList(containerEl, config = {}) {
         // portrait), in which case the component leaves it where the host put it.
         if (statusDot) shell.appendChild(statusDot);
         if (body) shell.appendChild(body);
+        if (usingDefaultRenderer) shell.appendChild(stopControls);
         if (!actionsAnchor.parentNode) shell.appendChild(actionsAnchor);
 
         // NOTE: the `agent-card-actions` slot is rendered by `renderList` AFTER
@@ -444,6 +528,11 @@ export function mountAgentList(containerEl, config = {}) {
  *     emptyText, errorText — forwarded verbatim to `mountAgentList`.
  *   - onNew()          — the "+ New" header action (Add-a-Companion / new agent).
  *                        The New button is only built/adopted when this is a fn.
+ *   - onPrepareStopAll(items) — REQUIRED to enable Stop All: synchronous
+ *                        browser-work fence returning an optional settlement
+ *                        callback invoked with (response, error, correlationId).
+ *   - confirmStopAll(message) — host confirmation override (defaults to confirm).
+ *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence.
  *   - newLabel         — accessible label / tooltip for the New button.
  *   - collapsed        — initial collapsed state (overridden by persistence).
  *   - storageKey       — persistence namespace (default 'kestrel:agents-pane').
@@ -462,7 +551,13 @@ export function mountAgentListPane(containerEl, config = {}) {
         || (typeof document !== 'undefined' ? document : null);
     if (!doc) throw new Error('mountAgentListPane requires a document');
 
+    const priorOwner = containerEl[AGENT_LIST_PANE_OWNER];
+    if (priorOwner && typeof priorOwner.destroy === 'function') {
+        priorOwner.destroy();
+    }
+
     const storageKey = config.storageKey || 'kestrel:agents-pane';
+    const api = config.api || API;
     const KEY_WIDTH = `${storageKey}:width`;
     const KEY_COLLAPSED = `${storageKey}:collapsed`;
     const minWidth = Number.isFinite(config.minWidth) ? config.minWidth : 200;
@@ -544,6 +639,15 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     // --- Mount the shared list surface into the body -----------------------
+    let loadedItems = [];
+    // Set once and never cleared. A failed list fetch must not permanently
+    // retire the fleet Stop control: its authority comes from the host status
+    // endpoint, not from the agent list, so once the pane has loaded at all,
+    // polling stays eligible and a later successful status read re-enables it.
+    let listEverLoaded = false;
+    let stopAllPending = false;
+    let refreshStopAllState = async () => false;
+    let invalidateStopAllState = () => {};
     const listHandle = mountAgentList(body, {
         api: config.api,
         adapter: config.adapter,
@@ -552,8 +656,18 @@ export function mountAgentListPane(containerEl, config = {}) {
         isThinking: config.isThinking,
         onStop: config.onStop,
         onSelect: config.onSelect,
-        onLoaded: config.onLoaded,
-        onError: config.onError,
+        onLoaded: (items, meta) => {
+            loadedItems = Array.isArray(items) ? items : [];
+            listEverLoaded = true;
+            if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
+                void refreshStopAllState();
+            }
+            if (typeof config.onLoaded === 'function') config.onLoaded(items, meta);
+        },
+        onError: (error) => {
+            invalidateStopAllState();
+            if (typeof config.onError === 'function') config.onError(error);
+        },
         autoLoad: config.autoLoad,
         autoSelectFirst: config.autoSelectFirst,
         selectedName: config.selectedName,
@@ -561,6 +675,279 @@ export function mountAgentListPane(containerEl, config = {}) {
         emptyText: config.emptyText,
         errorText: config.errorText,
     });
+
+    // --- Fleet cooperative Stop (andon cord) -------------------------------
+    // This control belongs to the shared pane, not identity.js, so every host
+    // that adopts or embeds mountAgentListPane receives the same behavior. The
+    // server owns target resolution and fan-out; this component submits one
+    // host request and renders every typed result without collapsing partial
+    // refusal/unreachability into success.
+    const stopAllOptIn = typeof config.onPrepareStopAll === 'function'
+        && api && typeof api.getHostStopStatus === 'function'
+        && typeof api.stopHost === 'function';
+    let stopAllBtn = header.querySelector('.agent-stop-all-btn');
+    const builtStopAllBtn = stopAllOptIn && !stopAllBtn;
+    if (stopAllOptIn && !stopAllBtn) {
+        stopAllBtn = doc.createElement('button');
+        stopAllBtn.type = 'button';
+        stopAllBtn.className = 'agent-stop-all-btn';
+        stopAllBtn.textContent = 'Stop all';
+        // collapseBtn came from header.querySelector, a DESCENDANT query, so
+        // an adopted header may nest its chevron in a wrapper. insertBefore on
+        // `header` then throws NotFoundError and aborts the whole mount --
+        // before the "+ New" wiring, the collapse/resize listeners, and the
+        // pane owner handle. Insert relative to the button's own parent.
+        (collapseBtn.parentNode || header).insertBefore(stopAllBtn, collapseBtn);
+    }
+    if (stopAllBtn) {
+        stopAllBtn.hidden = !stopAllOptIn;
+        stopAllBtn.disabled = !stopAllOptIn;
+        stopAllBtn.title = 'Cooperatively stop all in-flight agent work';
+        stopAllBtn.setAttribute('aria-label', 'Stop all in-flight agents');
+    }
+
+    const stopAllResults = stopAllOptIn ? doc.createElement('div') : null;
+    if (stopAllResults) {
+        stopAllResults.className = 'agent-stop-all-results';
+        stopAllResults.setAttribute('role', 'status');
+        stopAllResults.setAttribute('aria-live', 'polite');
+        stopAllResults.hidden = true;
+        body.insertBefore(stopAllResults, listHandle.element);
+    }
+
+    let stopAllStatusSeq = 0;
+    let stopAllStatusPromise = null;
+    let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
+    function renderStopAllState() {
+        if (!stopAllOptIn || !stopAllBtn) return;
+        const { loaded, canStop, inFlightCount } = stopAllStatus;
+        const retryPending = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string';
+        stopAllBtn.disabled = stopAllPending
+            || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
+            || !listEverLoaded || !loaded || !canStop
+            || (inFlightCount === 0 && !retryPending);
+        stopAllBtn.dataset.inFlightCount = String(inFlightCount);
+        if (!loaded) {
+            stopAllBtn.title = 'Checking cooperative Stop availability';
+        } else if (!canStop) {
+            stopAllBtn.title = 'Sovereign host authority is required to Stop all agents';
+        } else if (retryPending && inFlightCount === 0) {
+            stopAllBtn.title = 'Recover the durable result of the prior Stop All request';
+        } else if (inFlightCount > 0) {
+            stopAllBtn.title = `Cooperatively stop ${inFlightCount} in-flight agent${inFlightCount === 1 ? '' : 's'}`;
+        } else {
+            stopAllBtn.title = 'No agent work is currently in flight';
+        }
+    }
+    invalidateStopAllState = () => {
+        stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
+        renderStopAllState();
+    };
+    refreshStopAllState = async () => {
+        if (!stopAllOptIn || !listEverLoaded) return false;
+        if (stopAllStatusPromise) return stopAllStatusPromise;
+        const request = (async () => {
+            const seq = ++stopAllStatusSeq;
+            try {
+                const status = await api.getHostStopStatus();
+                if (seq !== stopAllStatusSeq) return false;
+                const rawCount = status && status.in_flight_count;
+                const validCount = Number.isSafeInteger(rawCount) && rawCount >= 0;
+                stopAllStatus = {
+                    loaded: true,
+                    canStop: status && status.can_stop === true,
+                    inFlightCount: validCount ? rawCount : 0,
+                };
+            } catch (_) {
+                if (seq !== stopAllStatusSeq) return false;
+                // Status is an authority and inventory gate. A failed read must not
+                // fall back to browser-local cards or expose a knowingly doomed
+                // control to an unauthorized caller.
+                stopAllStatus = { loaded: true, canStop: false, inFlightCount: 0 };
+            }
+            renderStopAllState();
+            return stopAllStatus.canStop;
+        })();
+        stopAllStatusPromise = request;
+        try {
+            return await request;
+        } finally {
+            if (stopAllStatusPromise === request) stopAllStatusPromise = null;
+        }
+    };
+
+    function displayTarget(outcome) {
+        const ids = [outcome && outcome.agent_id, outcome && outcome.resolved_target]
+            .filter((value) => typeof value === 'string' && value);
+        const item = loadedItems.find((candidate) => {
+            if (!candidate) return false;
+            const candidateIds = [
+                candidate.id,
+                candidate.name,
+                candidate.raw && candidate.raw.did,
+                candidate.raw && candidate.raw.id,
+            ];
+            return candidateIds.some((value) => ids.includes(value));
+        });
+        return (item && (item.displayName || item.name)) || ids[0] || 'Unknown target';
+    }
+
+    function renderStopAllOutcomes(response, expectedCorrelationId) {
+        const evidence = validateHostStopEnvelope(response, expectedCorrelationId);
+        stopAllResults.hidden = false;
+        stopAllResults.textContent = '';
+        if (!evidence) {
+            stopAllResults.textContent = 'Cooperative Stop evidence was malformed or incomplete; outcome is indeterminate.';
+            return;
+        }
+
+        const counts = new Map();
+        const list = doc.createElement('ul');
+        for (const outcome of evidence.outcomes) {
+            const disposition = outcome.disposition;
+            counts.set(disposition, (counts.get(disposition) || 0) + 1);
+            const row = doc.createElement('li');
+            row.dataset.disposition = disposition;
+            row.textContent = `${displayTarget(outcome)}: ${disposition}`;
+            if (outcome && typeof outcome.detail === 'string' && outcome.detail) {
+                row.textContent += ` — ${outcome.detail}`;
+            }
+            list.appendChild(row);
+        }
+        const summary = doc.createElement('p');
+        summary.textContent = `Stop All results: ${Array.from(counts.entries())
+            .map(([name, count]) => `${count} ${name}`)
+            .join(', ')}.`;
+        stopAllResults.appendChild(summary);
+        stopAllResults.appendChild(list);
+    }
+
+    const confirmStopAll = typeof config.confirmStopAll === 'function'
+        ? config.confirmStopAll
+        : ((message) => (
+            typeof window !== 'undefined' && typeof window.confirm === 'function'
+                ? window.confirm(message)
+                : false
+        ));
+    const onStopAllClick = async () => {
+        if (!stopAllOptIn || !listEverLoaded || stopAllPending
+            || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
+        const count = stopAllStatus.inFlightCount;
+        const retryCorrelationId = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string'
+            ? containerEl[AGENT_LIST_STOP_ALL_RETRY]
+            : null;
+        const recoverBeforeFresh = retryCorrelationId !== null && count > 0;
+        const operation = {
+            correlationId: retryCorrelationId && !recoverBeforeFresh
+                ? retryCorrelationId
+                : newStopAllCorrelationId(),
+            recoveryCorrelationId: recoverBeforeFresh ? retryCorrelationId : null,
+        };
+        const retryPending = retryCorrelationId !== null;
+        const noun = count === 1 ? 'agent' : 'agents';
+        const confirmation = retryPending && count === 0
+            ? 'Recover the durable result of the prior Stop All request?'
+            : `Stop all ${count} in-flight ${noun}?`;
+        if (!confirmStopAll(confirmation)) return;
+
+        containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
+        stopAllPending = true;
+        renderStopAllState();
+        // Browser-owned queues and streams must be fenced synchronously before
+        // even the fresh status read can yield. The callback may return a
+        // settlement hook that reconciles locally-addressed streams with the
+        // typed host outcomes.
+        let settleLocalStop = null;
+        let response = null;
+        let stopError = null;
+        try {
+            settleLocalStop = config.onPrepareStopAll(loadedItems);
+            containerEl[AGENT_LIST_STOP_ALL_RETRY] = operation.correlationId;
+            if (operation.recoveryCorrelationId) {
+                // A prior response may have been lost. Its immutable operation
+                // must be recovered without settling the fence for work that
+                // appeared afterwards; a fresh operation below addresses that
+                // current work. Recovery failure cannot safely substitute its
+                // stale identity for the new Stop attempt.
+                try {
+                    const recovery = api.stopHost({
+                        reason: config.stopAllReason || 'Stopped from the agents banner',
+                        correlation_id: operation.recoveryCorrelationId,
+                    });
+                    if (recovery && typeof recovery.catch === 'function') {
+                        void recovery.catch(() => {});
+                    }
+                } catch (_) { /* the fresh operation remains authoritative */ }
+            }
+            response = await api.stopHost({
+                reason: config.stopAllReason || 'Stopped from the agents banner',
+                correlation_id: operation.correlationId,
+            });
+            // A response, even malformed or unreceipted, is terminal for this
+            // attempt. Only a transport-ambiguous failure replays one durable
+            // correlation; a terminal refusal/conflict gets a fresh operation.
+            delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                renderStopAllOutcomes(response, operation.correlationId);
+            }
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation
+                && typeof config.onStopAllOutcomes === 'function') {
+                config.onStopAllOutcomes(response);
+            }
+        } catch (error) {
+            stopError = error;
+            if (Number.isSafeInteger(error && error.status)
+                && error.status >= 400 && error.status < 500) {
+                delete containerEl[AGENT_LIST_STOP_ALL_RETRY];
+            }
+            if (!destroyed && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                stopAllResults.hidden = false;
+                stopAllResults.textContent = `Stop All failed: ${error && error.message ? error.message : 'request failed'}`;
+            }
+        } finally {
+            if (typeof settleLocalStop === 'function') {
+                try {
+                    settleLocalStop(response, stopError, operation.correlationId);
+                } catch (error) {
+                    if (!destroyed
+                        && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                        stopAllResults.hidden = false;
+                        stopAllResults.textContent = `Local Stop settlement failed: ${error && error.message ? error.message : 'unknown error'}`;
+                    }
+                }
+            }
+            stopAllPending = false;
+            if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+                delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+            }
+            const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
+            if (!destroyed && currentOwner === handle) {
+                await refreshStopAllState();
+            } else if (currentOwner && typeof currentOwner.refreshStopAllState === 'function') {
+                void currentOwner.refreshStopAllState();
+            }
+        }
+    };
+    if (stopAllOptIn) stopAllBtn.addEventListener('click', onStopAllClick);
+
+    // Host work can originate in another tab, through the API, or from a
+    // signal. Poll the authoritative read-only status instead of treating this
+    // document's `.agent-thinking` classes as fleet truth.
+    const statusIntervalMs = Number.isFinite(config.stopAllStatusIntervalMs)
+        ? Math.max(250, config.stopAllStatusIntervalMs)
+        : 2000;
+    const setIntervalFn = doc.defaultView && doc.defaultView.setInterval;
+    const clearIntervalFn = doc.defaultView && doc.defaultView.clearInterval;
+    const statusInterval = stopAllOptIn && typeof setIntervalFn === 'function'
+        ? setIntervalFn.call(doc.defaultView, () => {
+            if (listEverLoaded && !stopAllPending
+                && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
+                void refreshStopAllState();
+            }
+        }, statusIntervalMs)
+        : null;
+    renderStopAllState();
+    void refreshStopAllState();
 
     // --- "+ New" header action (adopt existing, else build) ----------------
     // Component-owned so embed hosts — which never run the console's
@@ -665,8 +1052,20 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
     resizeHandle.addEventListener('mousedown', onResizeDown);
 
+    let destroyed = false;
+    let handle = null;
     function destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        if (paneEl[AGENT_LIST_PANE_OWNER] === handle) {
+            delete paneEl[AGENT_LIST_PANE_OWNER];
+        }
         collapseBtn.removeEventListener('click', onCollapseClick);
+        if (stopAllBtn) stopAllBtn.removeEventListener('click', onStopAllClick);
+        stopAllStatusSeq++;
+        if (statusInterval !== null && typeof clearIntervalFn === 'function') {
+            clearIntervalFn.call(doc.defaultView, statusInterval);
+        }
         if (newBtn && onNewClick) newBtn.removeEventListener('click', onNewClick);
         resizeHandle.removeEventListener('mousedown', onResizeDown);
         doc.removeEventListener('mousemove', onMouseMove);
@@ -675,13 +1074,15 @@ export function mountAgentListPane(containerEl, config = {}) {
         // Remove only chrome this mount built; adopted chrome is left in place.
         if (builtHeader && header.parentNode) header.parentNode.removeChild(header);
         if (builtNewBtn && newBtn) newBtn.remove();
+        if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
+        if (stopAllResults && stopAllResults.parentNode) stopAllResults.remove();
         // The built resize handle too (codex P2): a leaked absolutely-positioned
         // .resize-handle overlays the container edge and gets ADOPTED by the
         // next mount into the same container, doubling listeners over time.
         if (builtResizeHandle && resizeHandle) resizeHandle.remove();
     }
 
-    return {
+    handle = {
         element: paneEl,
         list: listHandle,
         refresh: (...a) => listHandle.refresh(...a),
@@ -691,7 +1092,10 @@ export function mountAgentListPane(containerEl, config = {}) {
         open,
         close,
         toggle,
+        refreshStopAllState,
         get collapsed() { return isCollapsed(); },
         destroy,
     };
+    paneEl[AGENT_LIST_PANE_OWNER] = handle;
+    return handle;
 }

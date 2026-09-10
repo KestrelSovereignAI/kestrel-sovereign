@@ -43,6 +43,9 @@ def _base_agent():
         return_value={"role": "assistant", "content": "", "tool_calls": []}
     )
     agent._execute_tool_batch = AsyncMock()
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+    )
     agent._build_all_tools = MagicMock(return_value=[])
     agent._visible_features_by_tool_name = MagicMock(return_value={})
     agent._visible_known_tool_names = MagicMock(return_value=set())

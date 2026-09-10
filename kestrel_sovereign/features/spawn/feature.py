@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -682,6 +683,7 @@ class SpawnFeature(Feature):
             manager = AgentManager(
                 base_data_dir=base_dir,
                 startup_roster_enabled=False,
+                hold_store=vars(self.agent).get("_hold_store"),
             )
             standalone_manager_created = True
             self._standalone_manager_owned = True
@@ -1006,8 +1008,44 @@ class SpawnFeature(Feature):
             return ToolResult.failed(error="No AgentManager available")
 
         parent_did = self.agent.agent_id
-        child_names = manager.get_children(parent_did)
+        child_names = await manager.get_authoritative_children(parent_did)
+        persistent_cleanup_children = getattr(
+            type(manager),
+            "persistent_spawn_cleanup_children",
+            None,
+        )
+        if callable(persistent_cleanup_children):
+            known = {name.casefold() for name in child_names}
+            for retained_name, _retained_did in persistent_cleanup_children(
+                manager,
+                parent_did=parent_did,
+            ):
+                if retained_name.casefold() not in known:
+                    child_names.append(retained_name)
+                    known.add(retained_name.casefold())
+        registry_cleanup_children = getattr(
+            type(manager),
+            "registry_spawn_cleanup_children",
+            None,
+        )
+        if callable(registry_cleanup_children):
+            known = {name.casefold() for name in child_names}
+            for retained_name, _retained_did in registry_cleanup_children(
+                manager,
+                parent_did=parent_did,
+            ):
+                if retained_name.casefold() not in known:
+                    child_names.append(retained_name)
+                    known.add(retained_name.casefold())
         lifecycle = self._get_lifecycle(manager)
+        if lifecycle is not None:
+            known = {name.casefold() for name in child_names}
+            for retained_name in lifecycle.get_cleanup_retained_children(
+                parent_did=parent_did
+            ):
+                if retained_name.casefold() not in known:
+                    child_names.append(retained_name)
+                    known.add(retained_name.casefold())
 
         children = []
         for child_name in child_names:
@@ -1072,17 +1110,44 @@ class SpawnFeature(Feature):
         if manager is None:
             return ToolResult.failed(error="No AgentManager available")
 
+        # Preserve the cheap absent-child response without retaining this
+        # pre-verification object as the execution binding.
+        if manager.get_agent(child_name) is None:
+            return ToolResult.failed(
+                error=f"Child agent '{child_name}' not found or not running"
+            )
+
+        # Verify this is actually our child and carry the exact signed child DID
+        # across the awaited durable-receipt read. A name alone is not an
+        # execution binding: removal can complete and another parent can publish
+        # a same-name replacement before the post-verification lookup.
+        parent_did = self.agent.agent_id
+        relations = await manager.get_authoritative_spawn_relations()
+        verified_child_dids = [
+            child_did
+            for child_did, relation in relations.items()
+            if relation == (parent_did, child_name)
+        ]
+        if len(verified_child_dids) != 1:
+            return ToolResult.failed(
+                error=f"Agent '{child_name}' is not a child of this agent"
+            )
+        verified_child_did = verified_child_dids[0]
+
+        # Bind routing only after receipt verification, then reject rather than
+        # crossing the authority boundary if the name now selects a different
+        # identity generation.
         child_agent = manager.get_agent(child_name)
         if child_agent is None:
             return ToolResult.failed(
                 error=f"Child agent '{child_name}' not found or not running"
             )
-
-        # Verify this is actually our child
-        parent_did = self.agent.agent_id
-        if child_name not in manager.get_children(parent_did):
+        if getattr(child_agent, "agent_id", None) != verified_child_did:
             return ToolResult.failed(
-                error=f"Agent '{child_name}' is not a child of this agent"
+                error=(
+                    f"Child agent '{child_name}' generation changed while "
+                    "delegation authority was being verified"
+                )
             )
 
         # Run the task asynchronously via the child agent's chat method.
@@ -1103,6 +1168,13 @@ class SpawnFeature(Feature):
                     self._child_results[child_name] = {
                         "success": True,
                         "result": result,
+                        "completed_at": time.time(),
+                    }
+            except HoldTurnRefusal as exc:
+                if self._child_tasks.get(child_name) is owner:
+                    self._child_results[child_name] = {
+                        "success": False,
+                        "refusal": exc.wire_payload(),
                         "completed_at": time.time(),
                     }
             except Exception as e:
@@ -1243,9 +1315,57 @@ class SpawnFeature(Feature):
         if type(offboard_runtime) is not bool:
             return ToolResult.failed(error="offboard_runtime must be a bool")
 
-        # Verify this is our child
         parent_did = self.agent.agent_id
-        if child_name not in manager.get_children(parent_did):
+        authoritative_children = await manager.get_authoritative_children(parent_did)
+        lifecycle = self._get_lifecycle(manager)
+        cleanup_retained_did = (
+            lifecycle.cleanup_retained_child_did(
+                parent_did=parent_did,
+                child_name=child_name,
+            )
+            if lifecycle is not None
+            else None
+        )
+        persistent_cleanup = getattr(
+            type(manager),
+            "persistent_spawn_cleanup_child_did",
+            None,
+        )
+        persistent_cleanup_did = (
+            persistent_cleanup(
+                manager,
+                parent_did=parent_did,
+                child_name=child_name,
+            )
+            if callable(persistent_cleanup)
+            else None
+        )
+        registry_cleanup = getattr(
+            type(manager),
+            "registry_spawn_cleanup_children",
+            None,
+        )
+        registry_cleanup_did = (
+            next(
+                (
+                    retained_did
+                    for retained_name, retained_did in registry_cleanup(
+                        manager,
+                        parent_did=parent_did,
+                    )
+                    if retained_name.casefold() == child_name.casefold()
+                ),
+                None,
+            )
+            if offboard_runtime and callable(registry_cleanup)
+            else None
+        )
+        if (
+            child_name not in authoritative_children
+            and cleanup_retained_did is None
+            and persistent_cleanup_did is None
+            and registry_cleanup_did is None
+        ):
             return ToolResult.failed(
                 error=f"Agent '{child_name}' is not a child of this agent"
             )
@@ -1267,9 +1387,12 @@ class SpawnFeature(Feature):
             public_exception_type_name,
         )
 
-        lifecycle = self._get_lifecycle(manager)
+        result = None
+        lifecycle_owns_child = (
+            lifecycle is not None and lifecycle.is_tracked(child_name)
+        )
         try:
-            if lifecycle is not None:
+            if lifecycle_owns_child:
                 if offboard_runtime:
                     result = await lifecycle.terminate(
                         child_name=child_name,
@@ -1315,7 +1438,7 @@ class SpawnFeature(Feature):
             return partial
         if removed:
             if (
-                lifecycle is not None
+                lifecycle_owns_child
                 and getattr(result, "finalized_from_absence", False) is True
             ):
                 return _absence_finalization_partial_result(

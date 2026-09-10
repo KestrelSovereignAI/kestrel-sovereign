@@ -1,10 +1,12 @@
 """Typed Stop requests and the one cancellation authority (#3139)."""
 
 import asyncio
+import contextlib
 import gc
 import inspect
 import time
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -15,20 +17,65 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
     StopCleanupRegistry,
     StopDisposition,
     StopOutcome,
     StopRequest,
+    StopReceipt,
+    StopReceiptConflict,
     StopScope,
 )
+
+
+class _MemoryReceiptStore:
+    def __init__(self):
+        self.records = {}
+
+    async def load(self, request):
+        record = self.records.get(request.correlation_id)
+        if record is None:
+            return None
+        prior_request, receipt = record
+        if prior_request != request:
+            raise StopReceiptConflict("conflicting replay")
+        return receipt
+
+    async def persist(self, request, outcomes):
+        replay = await self.load(request)
+        if replay is not None:
+            return replay
+        receipt_id = f"receipt-{request.correlation_id}"
+        receipted = tuple(
+            replace(outcome, receipt_id=receipt_id) for outcome in outcomes
+        )
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="test-fingerprint",
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-08-28T00:00:00+00:00",
+            turn_id=(request.target if request.scope is StopScope.TURN else None),
+            span_id=None,
+            trace_id=None,
+            outcomes=receipted,
+        )
+        self.records[request.correlation_id] = (request, receipt)
+        return receipt
 
 
 def _authority(target_inventory, **kwargs) -> CancellationAuthority:
     return CancellationAuthority(
         target_inventory,
         cleanup_registry=StopCleanupRegistry(),
+        receipt_store=kwargs.pop("receipt_store", _MemoryReceiptStore()),
         **kwargs,
     )
 
@@ -100,6 +147,26 @@ def test_addressed_scopes_require_a_target(scope: StopScope) -> None:
         StopRequest(scope=scope, actor_id="did:test:operator")
 
 
+def test_stop_request_rejects_non_utf8_correlation_identity() -> None:
+    with pytest.raises(ValueError, match="valid Unicode"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="\ud800",
+        )
+
+
+def test_stop_request_bounds_correlation_identity_by_encoded_bytes() -> None:
+    with pytest.raises(ValueError, match="256 UTF-8 bytes"):
+        StopRequest(
+            scope=StopScope.AGENT,
+            actor_id="did:test:operator",
+            target="did:test:target",
+            correlation_id="é" * 129,
+        )
+
+
 def test_host_scope_rejects_a_target() -> None:
     with pytest.raises(ValueError, match="cannot carry a target"):
         StopRequest(
@@ -149,6 +216,170 @@ async def test_host_fanout_preserves_partial_per_target_outcomes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_stop_cascades_in_authoritative_descendant_order() -> None:
+    calls: list[str] = []
+
+    def target(name: str, did: str, disposition: StopDisposition):
+        async def cancel(_request: StopRequest) -> StopDisposition:
+            calls.append(name)
+            return disposition
+
+        return CooperativeStopTarget(name, did, cancel)
+
+    resolve = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant("child", "did:test:child"),
+            AuthoritativeStopDescendant("missing", "did:test:missing"),
+            AuthoritativeStopDescendant("grandchild", "did:test:grandchild"),
+        ]
+    )
+    authority = _authority(
+        lambda: [
+            target("peer", "did:test:peer", StopDisposition.STOPPED),
+            target(
+                "grandchild",
+                "did:test:grandchild",
+                StopDisposition.REFUSED,
+            ),
+            target("root", "did:test:root", StopDisposition.STOPPED),
+            target(
+                "child",
+                "did:test:child",
+                StopDisposition.ALREADY_COMPLETE,
+            ),
+        ],
+        descendant_resolver=resolve,
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.AGENT,
+            "did:test:operator",
+            target="root",
+            correlation_id="cascade-stop",
+        )
+    )
+
+    resolve.assert_awaited_once_with("did:test:root")
+    assert [outcome.resolved_target for outcome in outcomes] == [
+        "root",
+        "did:test:child",
+        "did:test:missing",
+        "did:test:grandchild",
+    ]
+    assert [outcome.disposition for outcome in outcomes] == [
+        StopDisposition.STOPPED,
+        StopDisposition.ALREADY_COMPLETE,
+        StopDisposition.UNREACHABLE,
+        StopDisposition.REFUSED,
+    ]
+    assert {outcome.receipt_id for outcome in outcomes} == {
+        "receipt-cascade-stop"
+    }
+    assert set(calls) == {"root", "child", "grandchild"}
+    assert "peer" not in calls
+
+
+@pytest.mark.asyncio
+async def test_descendant_resolution_fails_closed_before_any_stop() -> None:
+    cancel = AsyncMock(return_value=StopDisposition.STOPPED)
+    resolve = AsyncMock(side_effect=RuntimeError("tampered signed graph"))
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget("root", "did:test:root", cancel),
+        ],
+        descendant_resolver=resolve,
+    )
+
+    with pytest.raises(RuntimeError, match="tampered signed graph"):
+        await authority.stop(
+            StopRequest(StopScope.AGENT, "did:test:operator", target="root")
+        )
+
+    cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "descendants",
+    [
+        [
+            AuthoritativeStopDescendant("child", "did:test:child"),
+            AuthoritativeStopDescendant("child", "did:test:other"),
+        ],
+        [AuthoritativeStopDescendant("root", "did:test:child")],
+        [AuthoritativeStopDescendant("child", "did:test:root")],
+    ],
+)
+async def test_repeated_or_cyclic_descendant_plan_fails_before_stop(
+    descendants,
+) -> None:
+    cancel = AsyncMock(return_value=StopDisposition.STOPPED)
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget("root", "did:test:root", cancel),
+            CooperativeStopTarget("child", "did:test:child", cancel),
+        ],
+        descendant_resolver=AsyncMock(return_value=descendants),
+    )
+
+    with pytest.raises(ValueError, match="repeated|cycle|duplicate"):
+        await authority.stop(
+            StopRequest(StopScope.AGENT, "did:test:operator", target="root")
+        )
+
+    cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_child_stop_never_walks_up_or_sideways() -> None:
+    cancel_root = AsyncMock(return_value=StopDisposition.STOPPED)
+    cancel_child = AsyncMock(return_value=StopDisposition.STOPPED)
+    cancel_peer = AsyncMock(return_value=StopDisposition.STOPPED)
+    resolve = AsyncMock(return_value=[])
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget("root", "did:test:root", cancel_root),
+            CooperativeStopTarget("child", "did:test:child", cancel_child),
+            CooperativeStopTarget("peer", "did:test:peer", cancel_peer),
+        ],
+        descendant_resolver=resolve,
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(StopScope.AGENT, "did:test:operator", target="child")
+    )
+
+    resolve.assert_awaited_once_with("did:test:child")
+    assert [outcome.resolved_target for outcome in outcomes] == ["child"]
+    cancel_child.assert_awaited_once()
+    cancel_root.assert_not_awaited()
+    cancel_peer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_cascading_agent_stop_never_reads_descendant_authority() -> None:
+    cancel = AsyncMock(return_value=StopDisposition.STOPPED)
+    resolve = AsyncMock()
+    authority = _authority(
+        lambda: [CooperativeStopTarget("root", "did:test:root", cancel)],
+        descendant_resolver=resolve,
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.AGENT,
+            "did:test:operator",
+            target="root",
+            cascade=False,
+        )
+    )
+
+    assert outcomes[0].disposition is StopDisposition.STOPPED
+    resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_host_fanout_converts_target_failure_and_continues() -> None:
     calls: list[str] = []
 
@@ -177,6 +408,46 @@ async def test_host_fanout_converts_target_failure_and_continues() -> None:
         StopDisposition.STOPPED,
     ]
     assert "private remote detail" not in outcomes[0].detail
+
+
+@pytest.mark.asyncio
+async def test_target_base_exception_group_isolated_and_receipted() -> None:
+    calls: list[str] = []
+
+    async def grouped_failure(_request: StopRequest) -> StopDisposition:
+        calls.append("broken")
+        raise BaseExceptionGroup(
+            "target cleanup",
+            [asyncio.CancelledError(), RuntimeError("private failure")],
+        )
+
+    async def stopped(_request: StopRequest) -> StopDisposition:
+        calls.append("healthy")
+        return StopDisposition.STOPPED
+
+    authority = _authority(
+        lambda: [
+            CooperativeStopTarget("broken", "did:test:broken", grouped_failure),
+            CooperativeStopTarget("healthy", "did:test:healthy", stopped),
+        ]
+    )
+
+    outcomes = await authority.stop(
+        StopRequest(
+            StopScope.HOST,
+            "did:test:operator",
+            correlation_id="grouped-target-failure",
+        )
+    )
+
+    assert set(calls) == {"broken", "healthy"}
+    assert [outcome.disposition for outcome in outcomes] == [
+        StopDisposition.UNREACHABLE,
+        StopDisposition.STOPPED,
+    ]
+    assert {outcome.receipt_id for outcome in outcomes} == {
+        "receipt-grouped-target-failure"
+    }
 
 
 @pytest.mark.asyncio
@@ -242,6 +513,7 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
             )
         ],
         cleanup_registry=cleanup_registry,
+        receipt_store=_MemoryReceiptStore(),
         target_timeout_seconds=0.01,
     )
 
@@ -268,14 +540,113 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
 
 
 @pytest.mark.asyncio
-async def test_empty_host_inventory_returns_no_agent_outcomes() -> None:
+async def test_cleanup_registry_drain_owns_tails_through_caller_cancellation() -> None:
+    release = asyncio.Event()
+
+    async def cleanup_tail() -> StopOutcome:
+        await release.wait()
+        return StopOutcome(
+            scope=StopScope.HOST,
+            requested_target=None,
+            resolved_target="tail",
+            agent_id="did:test:tail",
+            disposition=StopDisposition.STOPPED,
+            correlation_id="shutdown-tail",
+        )
+
+    registry = StopCleanupRegistry()
+    registry.retain(asyncio.create_task(cleanup_tail()))
+    drain = asyncio.create_task(registry.drain())
+    await asyncio.sleep(0)
+    drain.cancel()
+    await asyncio.sleep(0)
+    assert not drain.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drain
+    assert registry._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_registry_drain_is_bounded_by_a_wedged_tail() -> None:
+    """A stuck tail must not hold teardown open forever.
+
+    drain() runs in a shutdown phase that deliberately resists cancellation,
+    so an unbounded join there is a wedge no signal can break: one stuck
+    target would hold the host open and block the agents phase behind it.
+    The tail is abandoned, not cancelled -- retain() already owns its outcome.
+    """
+    registry = StopCleanupRegistry()
+
+    async def never_finishes() -> StopOutcome:
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    wedged = asyncio.create_task(never_finishes())
+    registry.retain(wedged)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await registry.drain(timeout_seconds=0.2)
+    elapsed = loop.time() - started
+
+    assert elapsed < 5.0, f"drain did not honour its budget ({elapsed:.1f}s)"
+    assert not wedged.done(), "the tail is abandoned, not cancelled"
+    wedged.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await wedged
+
+
+@pytest.mark.asyncio
+async def test_empty_host_inventory_returns_authority_level_failure() -> None:
     authority = _authority(list)
 
     outcomes = await authority.stop(
         StopRequest(StopScope.HOST, "did:test:operator")
     )
 
-    assert outcomes == ()
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.UNREACHABLE
+    assert outcomes[0].receipt_id is not None
+    assert outcomes[0].detail == "No cooperative Stop targets were discovered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["load", "claim"])
+async def test_empty_host_receipt_preflight_returns_authority_refusal(
+    failure_stage: str,
+) -> None:
+    class FailingReceiptStore:
+        async def load(self, _request):
+            if failure_stage == "load":
+                raise RuntimeError("receipt backend unavailable")
+            return None
+
+        async def claim(self, _request):
+            if failure_stage == "claim":
+                raise RuntimeError("receipt backend unavailable")
+            raise AssertionError("claim must not run after load failure")
+
+        async def persist(self, *_args, **_kwargs):
+            raise AssertionError("preflight refusal must not be persisted")
+
+    authority = _authority(list, receipt_store=FailingReceiptStore())
+
+    outcomes = await authority.stop(
+        StopRequest(StopScope.HOST, "did:test:operator")
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resolved_target == StopScope.HOST.value
+    assert outcomes[0].agent_id == StopScope.HOST.value
+    assert outcomes[0].disposition is StopDisposition.REFUSED
+    assert outcomes[0].receipt_id is None
+    assert outcomes[0].detail == (
+        "Stop receipt storage is unavailable; cancellation not attempted"
+    )
 
 
 @pytest.mark.asyncio
@@ -671,9 +1042,16 @@ def test_turn_and_tool_call_addresses_require_owning_agent() -> None:
 
 
 def test_stop_authority_has_no_process_lifecycle_dependency() -> None:
+    from kestrel_sovereign.endpoints.agent import stop_agent_request
+
     source = inspect.getsource(inspect.getmodule(CancellationAuthority))
+    endpoint_source = inspect.getsource(stop_agent_request)
     assert "ProcessManager" not in source
     assert "terminate_all" not in source
+    assert "ProcessManager" not in endpoint_source
+    assert "terminate_child" not in endpoint_source
+    assert "terminate_all" not in endpoint_source
+    assert "kill(" not in endpoint_source
 
 
 def test_control_panel_uses_termination_wording_for_process_action() -> None:
@@ -693,6 +1071,7 @@ def test_live_stop_endpoint_routes_request_through_typed_authority() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -774,6 +1153,7 @@ def test_stop_endpoint_resolves_public_turn_to_whitespace_request_id() -> None:
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -854,6 +1234,7 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -880,6 +1261,367 @@ def test_live_agent_stop_cancels_every_snapshotted_turn() -> None:
     ]
 
 
+def test_agent_stop_persists_cli_reason_in_durable_request() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _MemoryReceiptStore()
+    app = FastAPI()
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:reason"
+    agent._active_request_ids = set()
+    agent._current_request_id = None
+    agent.active_turn_request_ids = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=False)
+    app.state.agent = agent
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"correlation_id": "cli:reason", "reason": "andon cord"},
+    )
+
+    assert response.status_code == 200
+    request, receipt = store.records["cli:reason"]
+    assert request.reason == "andon cord"
+    assert receipt.reason == "andon cord"
+
+
+def test_agent_stop_expected_identity_precondition_blocks_replacement() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    store = _MemoryReceiptStore()
+    app = FastAPI()
+    app.state.stop_receipt_store = store
+    app.include_router(router)
+    replacement = MagicMock()
+    replacement.agent_id = "did:test:replacement"
+    replacement.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = replacement
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={
+            "correlation_id": "cli:stale-route",
+            "expected_agent_id": "did:test:original",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "routed agent identity changed" in response.json()["detail"]
+    replacement.cancel_current_request.assert_not_called()
+    assert store.records == {}
+
+
+def test_live_agent_stop_rechecks_turns_after_receipt_preflight() -> None:
+    """A turn admitted during receipt I/O belongs to the same agent Stop."""
+    from kestrel_sovereign.endpoints.agent import router
+
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"turn-a"}
+    agent._current_request_id = "turn-a"
+    agent.cancel_current_request = MagicMock(return_value=True)
+    agent.wait_for_request_completion = AsyncMock(return_value=None)
+
+    class AdmittingReceiptStore(_MemoryReceiptStore):
+        async def load(self, request):
+            agent._active_request_ids.add("turn-b")
+            return await super().load(request)
+
+    app = FastAPI()
+    app.state.stop_receipt_store = AdmittingReceiptStore()
+    app.include_router(router)
+    app.state.agent = agent
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert agent.cancel_current_request.call_args_list == [
+        call(request_id="turn-a"),
+        call(request_id="turn-b"),
+    ]
+    assert agent.wait_for_request_completion.await_args_list == [
+        call("turn-a"),
+        call("turn-b"),
+    ]
+
+
+def test_live_agent_stop_cascades_only_through_signed_descendant_query() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    def live_agent(agent_id: str, turn_id: str):
+        return SimpleNamespace(
+            agent_id=agent_id,
+            _active_request_ids={turn_id},
+            _current_request_id=turn_id,
+            cancel_current_request=MagicMock(return_value=True),
+            wait_for_request_completion=AsyncMock(return_value=None),
+        )
+
+    root = live_agent("did:test:root", "root-turn")
+    child = live_agent("did:test:child", "child-turn")
+    peer = live_agent("did:test:peer", "peer-turn")
+    peer.active_turn_request_bindings = MagicMock(
+        side_effect=AssertionError("unrelated peer inventory was consulted")
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "Root": root,
+        "Child": child,
+        "Peer": peer,
+    }
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant("Child", "did:test:child")
+        ]
+    )
+    # Neither this mutable projection nor display metadata grants Stop.
+    manager._parent_children = {"did:test:root": ["Peer"]}
+    peer.kestrel = SimpleNamespace(orchestrator="did:test:root")
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert [
+        outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
+    ] == ["did:test:root", "did:test:child"]
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
+        "did:test:root"
+    )
+    root.cancel_current_request.assert_called_once_with(request_id="root-turn")
+    child.cancel_current_request.assert_called_once_with(request_id="child-turn")
+    peer.cancel_current_request.assert_not_called()
+    peer.active_turn_request_bindings.assert_not_called()
+
+
+def test_live_cascade_binds_signed_did_not_colliding_routing_name() -> None:
+    """An unloaded child's name cannot select an unrelated peer DID."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    def live_agent(agent_id: str, turn_id: str):
+        return SimpleNamespace(
+            agent_id=agent_id,
+            _active_request_ids={turn_id},
+            _current_request_id=turn_id,
+            cancel_current_request=MagicMock(return_value=True),
+            wait_for_request_completion=AsyncMock(return_value=None),
+        )
+
+    root = live_agent("did:test:root", "root-turn")
+    peer = live_agent("did:test:peer", "peer-turn")
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Root": root, "Peer": peer}
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant(
+                "did:test:peer",
+                "did:test:signed-unloaded-child",
+            )
+        ]
+    )
+
+    class DistributedStop:
+        def __init__(self) -> None:
+            self.requested: list[str] = []
+
+        async def request_agent(self, candidate_id: str):
+            self.requested.append(candidate_id)
+            return candidate_id
+
+        async def wait_for_stop(self, _ticket):
+            return StopDisposition.STOPPED
+
+    distributed = DistributedStop()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.distributed_invocation_registry = distributed
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert [
+        outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
+    ] == ["did:test:root", "did:test:signed-unloaded-child"]
+    assert distributed.requested == [
+        "did:test:root",
+        "did:test:signed-unloaded-child",
+    ]
+    peer.cancel_current_request.assert_not_called()
+
+
+def test_live_child_stop_does_not_walk_to_parent_or_peer() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    def live_agent(agent_id: str, turn_id: str):
+        return SimpleNamespace(
+            agent_id=agent_id,
+            _active_request_ids={turn_id},
+            _current_request_id=turn_id,
+            cancel_current_request=MagicMock(return_value=True),
+            wait_for_request_completion=AsyncMock(return_value=None),
+        )
+
+    parent = live_agent("did:test:parent", "parent-turn")
+    child = live_agent("did:test:child", "child-turn")
+    peer = live_agent("did:test:peer", "peer-turn")
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "Parent": parent,
+        "Child": child,
+        "Peer": peer,
+    }
+    manager.get_authoritative_stop_descendants = AsyncMock(return_value=[])
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = child
+    app.state.agent_manager = manager
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
+        "did:test:child"
+    )
+    child.cancel_current_request.assert_called_once_with(request_id="child-turn")
+    parent.cancel_current_request.assert_not_called()
+    peer.cancel_current_request.assert_not_called()
+
+
+def test_live_agent_stop_uses_agent_attached_manager_after_load() -> None:
+    """Standalone roots retain descendant Stop after manager restoration."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    root = SimpleNamespace(
+        agent_id="did:test:standalone-root",
+        _active_request_ids=set(),
+        _current_request_id=None,
+        cancel_current_request=MagicMock(return_value=False),
+        wait_for_request_completion=AsyncMock(return_value=None),
+    )
+    child = SimpleNamespace(
+        agent_id="did:test:standalone-child",
+        _active_request_ids={"child-turn"},
+        _current_request_id="child-turn",
+        cancel_current_request=MagicMock(return_value=True),
+        wait_for_request_completion=AsyncMock(return_value=None),
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Root": root, "Child": child}
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[
+            AuthoritativeStopDescendant(
+                "Child",
+                "did:test:standalone-child",
+            )
+        ]
+    )
+    class RestoringReceiptStore(_MemoryReceiptStore):
+        async def load(self, request):
+            root._agent_manager = manager
+            return await super().load(request)
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.stop_receipt_store = RestoringReceiptStore()
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert [
+        outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
+    ] == ["did:test:standalone-root", "did:test:standalone-child"]
+    manager.get_authoritative_stop_descendants.assert_awaited_once_with(
+        "did:test:standalone-root"
+    )
+    child.cancel_current_request.assert_called_once_with(request_id="child-turn")
+
+
+def test_live_agent_stop_rejects_tampered_descendant_graph_before_effects() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    root = SimpleNamespace(
+        agent_id="did:test:root",
+        _active_request_ids={"root-turn"},
+        _current_request_id="root-turn",
+        cancel_current_request=MagicMock(return_value=True),
+        wait_for_request_completion=AsyncMock(return_value=None),
+    )
+    child = SimpleNamespace(
+        agent_id="did:test:child",
+        _active_request_ids={"child-turn"},
+        _current_request_id="child-turn",
+        cancel_current_request=MagicMock(return_value=True),
+        wait_for_request_completion=AsyncMock(return_value=None),
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Root": root, "Child": child}
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        side_effect=RuntimeError("tampered signed spawn receipt")
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/agent/stop"
+    )
+
+    assert response.status_code == 500
+    root.cancel_current_request.assert_not_called()
+    child.cancel_current_request.assert_not_called()
+
+
+def test_live_agent_stop_has_no_legacy_manager_fallback() -> None:
+    from kestrel_sovereign.endpoints.agent import router
+
+    root = SimpleNamespace(
+        agent_id="did:test:root",
+        _active_request_ids={"root-turn"},
+        _current_request_id="root-turn",
+        cancel_current_request=MagicMock(return_value=True),
+        wait_for_request_completion=AsyncMock(return_value=None),
+    )
+    manager = SimpleNamespace(list_agents=lambda: {"Root": root})
+    app = FastAPI()
+    app.include_router(router)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/agent/stop"
+    )
+
+    assert response.status_code == 500
+    root.cancel_current_request.assert_not_called()
+
+
+def test_live_descendant_stop_has_no_projection_or_display_authority() -> None:
+    from kestrel_sovereign.endpoints.agent import stop_agent_request
+
+    source = inspect.getsource(stop_agent_request)
+
+    assert "get_authoritative_stop_descendants" in source
+    assert "_parent_children" not in source
+    assert "orchestrator" not in source
+    assert "causation" not in source
+
+
 def test_stop_before_registration_fences_the_late_request_generation() -> None:
     """An empty Stop snapshot must still prevent its in-transit turn starting."""
 
@@ -899,6 +1641,7 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
 
     agent = LiveAgent()
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -918,6 +1661,67 @@ def test_stop_before_registration_fences_the_late_request_generation() -> None:
     assert agent.is_request_cancelled("in-transit-turn") is True
     assert ("in-transit-turn", generation) in agent._cancelled_request_generations
     assert "in-transit-turn" in agent._pending_request_cancellations
+
+
+def test_stop_endpoint_declares_and_enforces_an_admission_rate_limit(
+    isolated_process_rate_limiter,
+) -> None:
+    """Fresh caller-controlled receipt IDs must not bypass HTTP admission."""
+
+    from slowapi.errors import RateLimitExceeded
+    from starlette.requests import Request
+
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import stop_agent_request
+    from kestrel_sovereign.rate_limit import limiter
+
+    endpoint_key = (
+        f"{stop_agent_request.__module__}.{stop_agent_request.__name__}"
+    )
+
+    assert endpoint_key in limiter._route_limits
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/agent/stop",
+            "headers": [],
+            "query_string": b"",
+            "scheme": "https",
+            "server": ("kestrel.test", 443),
+            "client": ("10.0.0.1", 1234),
+        }
+    )
+    request.state.caller = CallerContext.authenticated("one@example.test")
+    unwrapped_endpoint = stop_agent_request.__wrapped__
+    for _ in range(120):
+        limiter._check_request_limit(request, unwrapped_endpoint, False)
+    with pytest.raises(RateLimitExceeded):
+        limiter._check_request_limit(request, unwrapped_endpoint, False)
+
+
+def test_stop_admission_bucket_is_principal_scoped_and_opaque() -> None:
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.endpoints.agent import _stop_rate_limit_key
+
+    def request_for(identity: str, host: str):
+        return SimpleNamespace(
+            state=SimpleNamespace(
+                caller=CallerContext.authenticated(identity)
+            ),
+            client=SimpleNamespace(host=host),
+        )
+
+    first = _stop_rate_limit_key(request_for("one@example.test", "10.0.0.1"))
+    same_principal = _stop_rate_limit_key(
+        request_for("one@example.test", "10.0.0.2")
+    )
+    second = _stop_rate_limit_key(request_for("two@example.test", "10.0.0.1"))
+
+    assert first == same_principal
+    assert first != second
+    assert "one@example.test" not in first
 
 
 def test_expired_pre_registration_stop_does_not_poison_a_future_reuse() -> None:
@@ -960,6 +1764,7 @@ def test_live_stop_endpoint_accepts_turn_id_and_resolves_inside_authority() -> N
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1009,6 +1814,7 @@ def test_turn_stop_cannot_cancel_a_reused_request_generation() -> None:
     app = FastAPI()
     app.include_router(router)
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1045,6 +1851,7 @@ def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
         return_value=RequestCompletionDisposition.COMPLETED
     )
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1054,6 +1861,34 @@ def test_live_stop_request_id_collision_does_not_resolve_as_turn_id() -> None:
     assert response.status_code == 200
     agent.cancel_current_request.assert_called_once_with(request_id="collision")
     agent.wait_for_request_completion.assert_awaited_once_with("collision")
+
+
+def test_unknown_public_turn_cannot_cancel_same_named_private_request() -> None:
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    register_api_error_handlers(app)
+    app.include_router(router)
+    agent = MagicMock()
+    agent.agent_id = "did:test:live-agent"
+    agent._active_request_ids = {"collision"}
+    agent._current_request_id = "collision"
+    agent.active_turn_request_ids = MagicMock(return_value={})
+    agent.cancel_current_request = MagicMock(return_value=True)
+    app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
+
+    response = TestClient(app).post(
+        "/api/agent/stop",
+        json={"turn_id": "collision"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["details"][0]["disposition"] == (
+        "unreachable"
+    )
+    agent.cancel_current_request.assert_not_called()
 
 
 def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
@@ -1068,6 +1903,7 @@ def test_unknown_turn_does_not_fall_back_to_agent_wide_stop() -> None:
     agent.active_turn_request_ids = MagicMock(return_value={})
     agent.cancel_current_request = MagicMock(return_value=True)
     app.state.agent = agent
+    app.state.stop_receipt_store = _MemoryReceiptStore()
 
     response = TestClient(app).post(
         "/api/agent/stop",
@@ -1140,7 +1976,6 @@ def test_stop_endpoint_rejects_empty_query_request_id() -> None:
 async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     """The endpoint must not confuse a cancel marker with completed execution."""
     from kestrel_sovereign.agent.request_lifecycle import (
-        RequestCompletionDisposition,
         RequestLifecycleMixin,
     )
     from kestrel_sovereign.endpoints.agent import router
@@ -1167,6 +2002,7 @@ async def test_live_stop_reports_stopped_only_after_request_cleanup() -> None:
     agent = LiveAgent()
     agent.register_active_request("turn-live")
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -1248,6 +2084,7 @@ async def test_live_stop_stale_prune_is_unreachable_not_stopped() -> None:
     agent.register_active_request("long-turn")
     agent._active_request_started_at["long-turn"] -= 1000
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
 
@@ -1297,6 +2134,7 @@ def test_agent_wide_stop_includes_pruned_unconfirmed_turns() -> None:
     assert agent.prune_stale_active_requests(900) == ["pruned-turn"]
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     app.state.agent = agent
     response = TestClient(app).post("/api/agent/stop")
@@ -1342,6 +2180,7 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
     from kestrel_sovereign.endpoints.agent import router
 
     app = FastAPI()
+    app.state.stop_receipt_store = _MemoryReceiptStore()
     app.include_router(router)
     agent = MagicMock()
     agent.agent_id = "did:test:live-agent"
@@ -1356,3 +2195,26 @@ def test_live_stop_endpoint_reports_unreachable_as_http_failure() -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Cooperative Stop could not be confirmed."
+
+
+def test_turn_stop_capability_endpoint_is_explicit_and_versioned() -> None:
+    """External inspectors can fail closed against older agent-wide doors."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    response = TestClient(app).get("/api/agent/stop/capabilities")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "protocol": "kestrel.cooperative_stop",
+        "version": 1,
+        "scopes": ["agent", "turn"],
+        "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
+        "typed_outcomes": True,
+        "durable_receipts": True,
+    }

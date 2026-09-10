@@ -7,6 +7,8 @@ It subsumes main.py's interactive chat into `kestrel shell <name>`.
 Commands:
     kestrel start                  # start all agents in-process (default)
     kestrel start <name>           # start just one agent (standalone process)
+    kestrel stop <name>            # cooperatively stop one agent's work
+    kestrel stop --all             # cooperatively stop all in-flight work
     kestrel terminate              # terminate everything (agents first, then host)
     kestrel terminate <name>       # terminate one agent process
     kestrel status                 # table: host + all agents with ports, PIDs, status
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from kestrel_sovereign import __version__
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.paths import load_project_env, spawned_agent_env
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
@@ -452,7 +455,25 @@ def cmd_shell(args) -> int:
 
     # Fall back to in-process agent when no server is running (or when
     # an extension is requested — see comment above).
-    return asyncio.run(_run_shell(agent_dir, args))
+    from kestrel_sovereign.host_features.storage import (
+        resolve_host_database_launch_context,
+    )
+
+    # Resolve fleet custody from the same pre-agent launch environment used by
+    # ProcessManager. Applying the selected agent root first would partition an
+    # offline shell away from a Hold set through the normal host.
+    hold_launch_context = resolve_host_database_launch_context(
+        env=spawned_agent_env(project_dir),
+        base_dir=project_dir,
+        project_root=project_dir,
+    )
+    return asyncio.run(
+        _run_shell(
+            agent_dir,
+            args,
+            host_database_launch_context=hold_launch_context,
+        )
+    )
 
 
 def _run_http_ask(
@@ -549,7 +570,12 @@ def cmd_ask(args) -> int:
     )
 
 
-async def _run_shell(agent_dir: Path, args) -> int:
+async def _run_shell(
+    agent_dir: Path,
+    args,
+    *,
+    host_database_launch_context=None,
+) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
     from kestrel_sovereign.security.encryption import DecryptionError
@@ -583,7 +609,21 @@ async def _run_shell(agent_dir: Path, args) -> int:
         storage_path=str(db_path),
         llm_service=llm_service,
     )
-    await agent.initialize()
+    from kestrel_sovereign.hold import (
+        close_bound_host_context,
+        initialize_with_bound_hold_context,
+    )
+
+    hold_binding_kwargs = {}
+    if host_database_launch_context is not None:
+        hold_binding_kwargs["host_database_launch_context"] = (
+            host_database_launch_context
+        )
+    hold_context = await initialize_with_bound_hold_context(
+        agent,
+        agent_data_root=agent_dir,
+        **hold_binding_kwargs,
+    )
 
     # Load extension if requested
     if hasattr(args, 'app') and args.app:
@@ -610,6 +650,8 @@ async def _run_shell(agent_dir: Path, args) -> int:
                 response = await agent.process_input(user_input)
                 decryption_error_count = 0
                 print(f"\nKestrel: {response}")
+            except HoldTurnRefusal as exc:
+                print(f"\n{exc.wire_json()}")
             except DecryptionError:
                 decryption_error_count += 1
                 print(f"\n\U0001f510 DECRYPTION ERROR: Cannot read encrypted data.")
@@ -655,6 +697,7 @@ async def _run_shell(agent_dir: Path, args) -> int:
         except Exception:
             print("Agent deactivated (with errors).")
         cancelled = await await_agent_shutdown_completion(agent) or cancelled
+        await close_bound_host_context(hold_context)
         if cancelled:
             raise asyncio.CancelledError()
 
@@ -1895,6 +1938,7 @@ from kestrel_sovereign.cli_lifecycle import (  # noqa: E402
     _run_uv_pip_install_editable,
     _GitFailedError,
 )
+from kestrel_sovereign.cli_stop import cmd_stop  # noqa: E402
 
 
 # Feature commands live in cli_features.py (#1678); re-export the public
@@ -1962,9 +2006,13 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_serve import add_serve_subparser
     add_serve_subparser(subparsers)
 
-    # kestrel start|stop|restart|update|status|logs
+    # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
+
+    # Cooperative Stop is intentionally outside process lifecycle.
+    from kestrel_sovereign.cli_stop import add_stop_subparser
+    add_stop_subparser(subparsers)
 
     # kestrel list
     subparsers.add_parser("list", help="List all agents in multi_agent")
@@ -2407,6 +2455,7 @@ def main() -> int:
 
     commands = {
         "start": cmd_start,
+        "stop": cmd_stop,
         "terminate": cmd_terminate,
         "restart": cmd_restart,
         "update": cmd_update,

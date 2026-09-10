@@ -16,6 +16,7 @@ from typing import Generic, TypeVar, cast
 
 _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
+_ITERATOR_INTERRUPTED = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,18 +44,31 @@ class OwnedAsyncIterator(Generic[_T]):
         iterator_factory: Callable[[], AsyncIterator[_T]],
         *,
         operation: str,
+        cleanup_requested: Callable[[], bool] | None = None,
     ) -> None:
         self._iterator_factory = iterator_factory
         self._operation = operation
+        self._cleanup_requested = cleanup_requested
         self._items: asyncio.Queue[tuple[object, _T | None]] = asyncio.Queue()
         self._continue = asyncio.Event()
         self._stop = asyncio.Event()
         self._item_outstanding = False
+        self._waiting_for_continue = False
+        self._interrupt_after_continue = False
         self._closed = False
+        self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
+        self._cancellation_watch_started = False
         self._owner = asyncio.create_task(
             self._run(),
             name=f"owned_async_iterator:{operation}",
+        )
+        self._cancellation_owner = asyncio.create_task(
+            self._watch_owner_cancellation(),
+            name=f"owned_async_iterator_cancel:{operation}",
+        )
+        self._cancellation_owner.add_done_callback(
+            self._interrupt_if_watch_never_started
         )
 
     def __aiter__(self) -> "OwnedAsyncIterator[_T]":
@@ -72,6 +86,18 @@ class OwnedAsyncIterator(Generic[_T]):
             return error
 
     @property
+    def owner_task(self) -> asyncio.Task[None]:
+        """Return the task whose cancellation interrupts a blocked producer."""
+
+        return self._cancellation_owner
+
+    @property
+    def interrupted_by_cleanup(self) -> bool:
+        """Whether requested cancellation interrupted source iteration."""
+
+        return self._interrupted_by_cleanup
+
+    @property
     def cleanup_error(self) -> BaseException | None:
         """Return an error raised while cancellation/closure unwound the source."""
 
@@ -83,8 +109,18 @@ class OwnedAsyncIterator(Generic[_T]):
         if self._item_outstanding:
             self._item_outstanding = False
             self._continue.set()
+            if self._interrupt_after_continue:
+                self._interrupt_after_continue = False
+                asyncio.get_running_loop().call_soon(
+                    self._cancel_owner_if_running
+                )
 
         marker, item = await self._items.get()
+        if marker is _ITERATOR_INTERRUPTED:
+            # Do not join here. The consumer may first publish its bounded Stop
+            # acknowledgement; its ``finally`` then calls ``aclose`` and owns
+            # the source cleanup through terminalization.
+            raise StopAsyncIteration
         if marker is _ITERATOR_TERMINAL:
             self._closed = True
             outcome = await await_owned_task(self._owner)
@@ -93,6 +129,64 @@ class OwnedAsyncIterator(Generic[_T]):
 
         self._item_outstanding = True
         return cast(_T, item)
+
+    async def _watch_owner_cancellation(self) -> None:
+        """Translate lifecycle cancellation without racing a delivered item."""
+
+        self._cancellation_watch_started = True
+        completion = asyncio.Event()
+
+        def mark_complete(_task: asyncio.Task[None]) -> None:
+            completion.set()
+
+        self._owner.add_done_callback(mark_complete)
+        try:
+            await completion.wait()
+        except asyncio.CancelledError:
+            if self._owner.done():
+                return
+            if self._item_outstanding:
+                # Let the consumer resume the source once. A source already at
+                # EOF can publish its real cleanup result; a provider that
+                # blocks in the next ``anext`` is interrupted one loop turn later.
+                self._interrupt_after_continue = True
+            elif self._waiting_for_continue:
+                # The consumer already released the handshake in this event-loop
+                # turn. Let the owner publish a synchronous EOF/failure first,
+                # then interrupt only if it actually blocks in the next source step.
+                asyncio.get_running_loop().call_soon(
+                    self._cancel_owner_if_running
+                )
+            else:
+                self._owner.cancel()
+            raise
+        finally:
+            self._owner.remove_done_callback(mark_complete)
+
+    def _interrupt_if_watch_never_started(
+        self,
+        watcher: asyncio.Task[None],
+    ) -> None:
+        """Close the pre-first-turn cancellation gap of the watcher task.
+
+        ``Task.cancel()`` can terminally cancel a newly-created task without
+        running one byte of its coroutine.  In that case the watcher's
+        ``except CancelledError`` cannot translate cancellation to the source
+        owner, so do that one missing handoff from a synchronous done callback.
+        Once the watcher has started, its handshake-aware body remains the
+        sole owner of cancellation ordering.
+        """
+
+        if (
+            watcher.cancelled()
+            and not self._cancellation_watch_started
+            and not self._owner.done()
+        ):
+            self._owner.cancel()
+
+    def _cancel_owner_if_running(self) -> None:
+        if not self._owner.done():
+            self._owner.cancel()
 
     async def _run(self) -> None:
         iterator: AsyncIterator[_T] | None = None
@@ -103,7 +197,11 @@ class OwnedAsyncIterator(Generic[_T]):
                     if self._stop.is_set():
                         break
                     await self._items.put((self, item))
-                    await self._continue.wait()
+                    self._waiting_for_continue = True
+                    try:
+                        await self._continue.wait()
+                    finally:
+                        self._waiting_for_continue = False
                     self._continue.clear()
                     if self._stop.is_set():
                         break
@@ -112,12 +210,34 @@ class OwnedAsyncIterator(Generic[_T]):
                 # ``anext`` belongs to generator unwinding, not ordinary
                 # source execution. Preserve that distinction for lifecycle
                 # acknowledgement at the transport boundary.
-                cleanup_requested = self._stop.is_set()
-                if cleanup_requested and not isinstance(
+                close_requested = self._stop.is_set()
+                cancellation_requested = close_requested
+                if (
+                    not cancellation_requested
+                    and self._cleanup_requested is not None
+                ):
+                    try:
+                        cancellation_requested = self._cleanup_requested() is True
+                    except Exception:
+                        # An observability predicate must not replace the
+                        # iterator's actual terminal failure.
+                        cancellation_requested = False
+                # A Stop marker can race a source's independent terminal
+                # failure after its final item. Only an initiated close owns a
+                # non-cancellation unwind as cleanup debt; the marker extends
+                # ownership solely to cancellation that interrupted the source.
+                if close_requested and not isinstance(
                     error,
                     asyncio.CancelledError,
                 ):
                     self._cleanup_error = error
+                if cancellation_requested and isinstance(
+                    error,
+                    asyncio.CancelledError,
+                ):
+                    self._interrupted_by_cleanup = True
+                    self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
+                    return
                 raise
         finally:
             try:
@@ -141,7 +261,7 @@ class OwnedAsyncIterator(Generic[_T]):
         self._stop.set()
         self._continue.set()
         owner_cancelled_by_close = False
-        if not self._owner.done():
+        if not self._owner.done() and not self._interrupted_by_cleanup:
             owner_cancelled_by_close = self._owner.cancel()
         outcome = await await_owned_task(self._owner)
         if (

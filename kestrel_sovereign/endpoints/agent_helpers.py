@@ -139,6 +139,67 @@ def request_invocation_provenance(
     )
 
 
+async def prime_durable_stop_fence(
+    request: Request,
+    agent: object,
+    invocation_id: str,
+) -> bool:
+    """Reinstall a durable exact-turn Stop before lifecycle registration.
+
+    The in-memory reservation closes the live race between Stop and request
+    registration. This lookup closes the longer restart/delivery-delay window:
+    an acknowledged durable Stop remains authoritative even after that short
+    reservation ages out. Stores without this optional query are retained for
+    compatibility in tests and embedded deployments that do not expose Stop.
+    """
+
+    store = getattr(request.app.state, "stop_receipt_store", None)
+    lookup = getattr(store, "has_acknowledged_turn_stop", None)
+    if not callable(lookup):
+        startup_error = getattr(
+            request.app.state, "stop_receipt_store_error", ""
+        )
+        if isinstance(startup_error, str) and startup_error:
+            raise ApiHTTPException(
+                status_code=503,
+                code="stop_evidence_unavailable",
+                message=(
+                    "Durable Stop evidence could not be checked before execution."
+                ),
+            )
+        return False
+    agent_id = getattr(agent, "agent_id", None)
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        agent_id = "local-agent"
+    try:
+        stopped = await lookup(agent_id, invocation_id)
+    except Exception as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message=(
+                "Durable Stop evidence could not be checked before execution."
+            ),
+        ) from error
+    if not isinstance(stopped, bool):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_evidence_unavailable",
+            message="Durable Stop evidence returned an invalid result.",
+        )
+    if not stopped:
+        return False
+    reserve = getattr(type(agent), "reserve_request_cancellation", None)
+    if not callable(reserve):
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_fence_unavailable",
+            message="The stopped request cannot be fenced safely.",
+        )
+    reserve(agent, invocation_id)
+    return True
+
+
 def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
     """Translate cooperative turn cancellation at a synchronous HTTP door."""
 
@@ -148,6 +209,43 @@ def stopped_invocation_http_error(invocation_id: str) -> ApiHTTPException:
         message="Request stopped during execution.",
         headers={"X-Request-ID": invocation_id_response_header(invocation_id)},
     )
+
+
+def invocation_was_self_fenced(agent: object, invocation_id: str) -> bool:
+    """Whether infrastructure, rather than peer/operator Stop, ended a turn."""
+
+    accessor = getattr(agent, "is_request_self_fenced", None)
+    return bool(
+        callable(accessor)
+        and accessor(invocation_id) is True
+    )
+
+
+def self_fenced_invocation_http_error(
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Expose owner lease loss as retryable infrastructure unavailability."""
+
+    return ApiHTTPException(
+        status_code=503,
+        code="invocation_owner_lease_lost",
+        message="Invocation ownership was lost; retry the request.",
+        headers={
+            "Retry-After": "1",
+            "X-Request-ID": invocation_id_response_header(invocation_id),
+        },
+    )
+
+
+def cancelled_invocation_http_error(
+    agent: object,
+    invocation_id: str,
+) -> ApiHTTPException:
+    """Translate a cancellation marker without forging Stop provenance."""
+
+    if invocation_was_self_fenced(agent, invocation_id):
+        return self_fenced_invocation_http_error(invocation_id)
+    return stopped_invocation_http_error(invocation_id)
 
 
 def get_agent(request: Request):

@@ -19,12 +19,19 @@ from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,
     SSE_PING_INTERVAL_SECONDS,
 )
-from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.rate_limit import (
+    durable_stop_rate_limit_key,
+    limiter,
+    stop_admission_rate_limit,
+)
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    invocation_was_self_fenced,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     validate_request_invocation_id,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException, rate_limited_until
@@ -32,28 +39,42 @@ from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskAlreadyExistsError
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
-    invocation_log_correlation,
+    InvocationSelfFencedError,
     invocation_id_response_header,
+    invocation_log_correlation,
     new_stream_delivery_id,
+    register_request_delivery,
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
+    bind_request_operation_if_supported,
 )
 from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+from kestrel_sovereign.endpoints.closing_streaming_response import (
+    ClosingStreamingResponse,
+)
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.storage.privacy_wrapper import (
     PRIVACY_TRANSITION_RETRY_MESSAGE,
     PrivacyViolationError,
 )
 from kestrel_sovereign.stop import (
+    AuthoritativeStopDescendant,
     CancellationAuthority,
     CooperativeStopTarget,
+    MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
     StopRequest,
     StopScope,
+    UnavailableStopReceiptStore,
 )
-
+from kestrel_sovereign.stop.runtime_target import (
+    build_runtime_stop_target,
+    resolve_runtime_stop_identity,
+)
+from kestrel_sovereign.telemetry import current_trace_identity
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
@@ -73,6 +94,40 @@ LEGACY_CONTEXT_MODEL = "legacy/unknown"
 _KITE_EVIDENCE_CONTRACT = "kite-http-evidence-v1"
 _KITE_EVIDENCE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
 _KITE_EVIDENCE_VALUE_RE = re.compile(r"^kite-evidence-[A-Za-z0-9_-]{20,128}$")
+
+# Compatibility name retained for callers and tests that inspect the endpoint's
+# admission key directly; the shared helper now also gates host-scope Stop.
+_stop_rate_limit_key = durable_stop_rate_limit_key
+
+
+class _CloseAwareStreamBody:
+    """Run setup cleanup even when a response body is never first-pulled."""
+
+    def __init__(self, iterator, cleanup) -> None:
+        self._iterator = iterator
+        self._cleanup = cleanup
+        self._started = False
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        self._started = True
+        return await self._iterator.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if not self._started:
+            self._cleanup()
+            return
+        close = getattr(self._iterator, "aclose", None)
+        if callable(close):
+            await close()
 
 
 def _kite_release_evidence_allowed(agent: Any) -> bool:
@@ -373,6 +428,8 @@ async def invoke_agent(request: Request, http_response: Response):
       - 'model' parameter to override the default model
       - 'session_id' to load context from a specific conversation session
     """
+    cleanup_agent = None
+    cleanup_request_id = None
     try:
         data = await _parse_json_body(request)
         user_input = data.get("input")
@@ -405,25 +462,40 @@ async def invoke_agent(request: Request, http_response: Response):
             request,
             source_locator="POST:/api/agent/invoke",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
+            register_request_delivery(agent, request_id, nested=False)
+            await_admission = getattr(
+                type(agent), "await_durable_request_admission", None
+            )
+            try:
+                if callable(await_admission):
+                    await await_admission(agent, request_id)
+            except BaseException:
+                agent._cleanup_cancelled_request(request_id)
+                raise
         else:
             agent._current_request_id = request_id
+        # From this point onward every return, validation failure, ordinary
+        # exception, and task cancellation must retire the registration.  In
+        # particular, session resolution below is an await before process_input
+        # begins and therefore cannot rely on process_input's local finally.
+        cleanup_agent = agent
+        cleanup_request_id = request_id
 
         request_cancelled = getattr(agent, "is_request_cancelled", None)
         if callable(request_cancelled) and request_cancelled(request_id) is True:
-            try:
-                http_response.headers["X-Request-ID"] = (
-                    invocation_id_response_header(request_id)
-                )
-                return {
-                    "response": "Request stopped before execution.",
-                    "session_id": session_id,
-                    "model": None,
-                    "provider": None,
-                }
-            finally:
-                agent._cleanup_cancelled_request(request_id)
+            if invocation_was_self_fenced(agent, request_id):
+                raise self_fenced_invocation_http_error(request_id)
+            http_response.headers["X-Request-ID"] = invocation_id_response_header(
+                request_id
+            )
+            return {
+                "response": "Request stopped before execution.",
+                "session_id": session_id,
+                "model": None,
+                "provider": None,
+            }
 
         if isinstance(kite_evidence_request, dict):
             if user_input not in (None, ""):
@@ -432,70 +504,71 @@ async def invoke_agent(request: Request, http_response: Response):
             owner_cancellation_baseline = (
                 owner_task.cancelling() if owner_task is not None else 0
             )
-            try:
-                evidence_task = asyncio.create_task(
-                    _kite_runtime_observation(
-                        agent,
-                        request_id=request_id,
-                        provenance=request_invocation_provenance(
-                            request,
-                            source_locator=(
-                                "POST:/api/agent/invoke#kite-release-evidence"
-                            ),
+            evidence_task = asyncio.create_task(
+                _kite_runtime_observation(
+                    agent,
+                    request_id=request_id,
+                    provenance=request_invocation_provenance(
+                        request,
+                        source_locator=(
+                            "POST:/api/agent/invoke#kite-release-evidence"
                         ),
-                        request=kite_evidence_request,
                     ),
-                    name=(
-                        "kite-evidence:"
-                        f"{invocation_log_correlation(request_id)}"
-                    ),
-                )
-                bind_operation = getattr(
-                    type(agent), "bind_request_operation", None
-                )
-                if callable(bind_operation):
-                    bind_operation(agent, request_id, evidence_task)
-                try:
-                    operation, observation = await evidence_task
-                except asyncio.CancelledError:
-                    if (
-                        owner_task is not None
-                        and owner_task.cancelling()
-                        > owner_cancellation_baseline
-                    ):
-                        raise
-                    if not (
-                        callable(request_cancelled)
-                        and request_cancelled(request_id) is True
-                    ):
-                        raise
-                    http_response.headers["X-Request-ID"] = (
-                        invocation_id_response_header(request_id)
-                    )
-                    return {
-                        "response": "Request stopped during execution.",
-                        "session_id": session_id,
-                        "model": None,
-                        "provider": None,
-                    }
-                # Stop can linearize after the evidence task has produced its
-                # observation but before this owner publishes signed success.
-                # Re-read the exact generation with no following await.
+                    request=kite_evidence_request,
+                ),
+                name=(
+                    "kite-evidence:"
+                    f"{invocation_log_correlation(request_id)}"
+                ),
+            )
+            bind_operation = getattr(
+                type(agent), "bind_request_operation", None
+            )
+            if callable(bind_operation):
+                bind_operation(agent, request_id, evidence_task)
+            try:
+                operation, observation = await evidence_task
+            except asyncio.CancelledError:
                 if (
+                    owner_task is not None
+                    and owner_task.cancelling()
+                    > owner_cancellation_baseline
+                ):
+                    raise
+                if not (
                     callable(request_cancelled)
                     and request_cancelled(request_id) is True
                 ):
-                    http_response.headers["X-Request-ID"] = (
-                        invocation_id_response_header(request_id)
-                    )
-                    return {
-                        "response": "Request stopped during execution.",
-                        "session_id": session_id,
-                        "model": None,
-                        "provider": None,
-                    }
-            finally:
-                agent._cleanup_cancelled_request(request_id)
+                    raise
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": session_id,
+                    "model": None,
+                    "provider": None,
+                }
+            # Stop can linearize after the evidence task has produced its
+            # observation but before this owner publishes signed success.
+            # Re-read the exact generation with no following await.
+            if (
+                callable(request_cancelled)
+                and request_cancelled(request_id) is True
+            ):
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
+                http_response.headers["X-Request-ID"] = (
+                    invocation_id_response_header(request_id)
+                )
+                return {
+                    "response": "Request stopped during execution.",
+                    "session_id": session_id,
+                    "model": None,
+                    "provider": None,
+                }
             nonce = kite_evidence_request.get("nonce")
             assert isinstance(nonce, str)
             signed = {
@@ -534,6 +607,8 @@ async def invoke_agent(request: Request, http_response: Response):
                 invocation_provenance=invocation_provenance,
             )
             if callable(request_cancelled) and request_cancelled(request_id) is True:
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -545,6 +620,8 @@ async def invoke_agent(request: Request, http_response: Response):
                 }
         except (asyncio.CancelledError, InvocationCancelledError):
             if callable(request_cancelled) and request_cancelled(request_id) is True:
+                if invocation_was_self_fenced(agent, request_id):
+                    raise self_fenced_invocation_http_error(request_id)
                 http_response.headers["X-Request-ID"] = (
                     invocation_id_response_header(request_id)
                 )
@@ -555,8 +632,6 @@ async def invoke_agent(request: Request, http_response: Response):
                     "provider": None,
                 }
             raise
-        finally:
-            agent._cleanup_cancelled_request(request_id)
         # Extract model/provider identity for frontend footer rendering (#1373)
         identity = agent._conversation_response_identity(use_last_identity=True)
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
@@ -566,6 +641,10 @@ async def invoke_agent(request: Request, http_response: Response):
             "model": identity.get("model"),
             "provider": identity.get("provider"),
         }
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         raise
     except Exception as exc:
@@ -589,6 +668,9 @@ async def invoke_agent(request: Request, http_response: Response):
             code="invoke_failed",
             message="An internal error occurred.",
         )
+    finally:
+        if cleanup_agent is not None and cleanup_request_id is not None:
+            cleanup_agent._cleanup_cancelled_request(cleanup_request_id)
 
 
 # Chat attachments (#1662). Images can be sent to the model as vision input
@@ -725,9 +807,14 @@ async def stream_agent_response(request: Request):
     stream_delivery_id = None
     request_lifecycle_registered = False
     stream_tap_registered = False
+    setup_cleanup_complete = False
 
     def cleanup_unstarted_stream() -> None:
         """Undo setup if constructing the response fails before generation."""
+        nonlocal setup_cleanup_complete
+        if setup_cleanup_complete:
+            return
+        setup_cleanup_complete = True
         if stream_tap_registered and stream_tap is not None and stream_delivery_id is not None:
             stream_tap.unregister(stream_delivery_id)
         if request_lifecycle_registered and agent is not None and request_id is not None:
@@ -768,8 +855,15 @@ async def stream_agent_response(request: Request):
             request,
             source_locator="POST:/api/agent/stream",
         )
+        await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
-            agent.register_active_request(request_id)
+            register_request_delivery(agent, request_id, nested=False)
+            request_lifecycle_registered = True
+            await_admission = getattr(
+                type(agent), "await_durable_request_admission", None
+            )
+            if callable(await_admission):
+                await await_admission(agent, request_id)
         else:
             agent._current_request_id = request_id
         request_lifecycle_registered = True
@@ -796,6 +890,7 @@ async def stream_agent_response(request: Request):
             effective_session_id = session_id  # fall back; never block the stream
 
         async def generate():
+            nonlocal setup_cleanup_complete
             # Shared stop notice for the in-loop cancel check AND the post-loop
             # fallback (#2674). A strict (fail-closed) response audit that is
             # stopped before dispatch WITHHOLDS every chunk and returns cleanly,
@@ -805,6 +900,10 @@ async def stream_agent_response(request: Request):
             stop_notice = (
                 "\n\n---\n⏹️ **Request stopped**\n\n"
                 "Type `!continue` to resume from where I left off, or start a new message."
+            )
+            self_fenced_notice = (
+                "\n\n---\n⚠️ **Request interrupted**\n\n"
+                "Invocation ownership was lost; retry the request."
             )
             stop_notice_emitted = False
             # #2674 P2: track whether the turn ever surfaced a user-visible
@@ -818,7 +917,11 @@ async def stream_agent_response(request: Request):
             agent_stream = None
             try:
                 if agent.is_request_cancelled(request_id) is True:
-                    yield stop_notice
+                    yield (
+                        self_fenced_notice
+                        if invocation_was_self_fenced(agent, request_id)
+                        else stop_notice
+                    )
                     stop_notice_emitted = True
                     return
                 from kestrel_sovereign.agent.streaming import strip_revise_sentinels
@@ -834,11 +937,23 @@ async def stream_agent_response(request: Request):
                         attachments=attachments,
                     ),
                     operation="agent stream cleanup",
+                    cleanup_requested=lambda: agent.is_request_cancelled(
+                        request_id
+                    ),
+                )
+                bind_request_operation_if_supported(
+                    agent,
+                    request_id,
+                    agent_stream.owner_task,
                 )
                 async for chunk in agent_stream:
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
-                        yield stop_notice
+                        yield (
+                            self_fenced_notice
+                            if invocation_was_self_fenced(agent, request_id)
+                            else stop_notice
+                        )
                         stop_notice_emitted = True
                         break
                     # Wave 5E: strip the in-band revise sentinel before
@@ -865,11 +980,30 @@ async def stream_agent_response(request: Request):
                 # double-emit either.
                 if (
                     not stop_notice_emitted
-                    and not response_chunk_yielded
+                    and (
+                        not response_chunk_yielded
+                        or (
+                            agent_stream is not None
+                            and agent_stream.interrupted_by_cleanup
+                        )
+                    )
                     and agent.is_request_cancelled(request_id)
                 ):
-                    yield stop_notice
+                    yield (
+                        self_fenced_notice
+                        if invocation_was_self_fenced(agent, request_id)
+                        else stop_notice
+                    )
                     stop_notice_emitted = True
+            except InvocationSelfFencedError:
+                yield self_fenced_notice
+            except InvocationCancelledError:
+                # A durable public-turn fence can win before the nested stream
+                # has yielded. Its typed unwind is acknowledged Stop even if
+                # nested cleanup already consumed the cancellation marker.
+                yield stop_notice
+            except HoldTurnRefusal as exc:
+                yield exc.wire_json() + "\n"
             except Exception as e:
                 # A request id and exception text can be client-controlled or
                 # contain withheld content.  Keep only a one-way correlation
@@ -878,25 +1012,21 @@ async def stream_agent_response(request: Request):
                 from kestrel_sovereign.agent.invocation import (
                     invocation_log_correlation,
                 )
-                logger.error(
-                    "Streaming request failed (correlation=%s)",
-                    invocation_log_correlation(request_id),
-                )
-                # #2674 findings 3 & 4: emit the user-visible error through the
-                # ONE shared safe boundary used by /api/bridge/stream too, so the
-                # two transports cannot drift. It NEVER reflects ``str(e)``,
-                # ``underlying``, or ``provider`` — an adapter that raises after
-                # yielding partial prose can carry withheld response content or an
-                # injected marker, and ``LLMStreamingError.provider`` is an
-                # unvalidated free string (finding 4: it leaked
-                # ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT). A route failure
-                # still gets the no-blind-fallback / recovery guidance via a
-                # CONSTANT "your selected model route" label; the failing route
-                # and full error remain unavailable to this transport.
-                from kestrel_sovereign.llm.streaming_errors import (
-                    agent_stream_error_block,
-                )
-                yield agent_stream_error_block(e)
+                if invocation_was_self_fenced(agent, request_id):
+                    yield self_fenced_notice
+                else:
+                    logger.error(
+                        "Streaming request failed (correlation=%s)",
+                        invocation_log_correlation(request_id),
+                    )
+                    # #2674 findings 3 & 4: emit the user-visible error through
+                    # the ONE shared safe boundary used by /api/bridge/stream
+                    # too, so the two transports cannot drift. It NEVER reflects
+                    # ``str(e)``, ``underlying``, or ``provider``.
+                    from kestrel_sovereign.llm.streaming_errors import (
+                        agent_stream_error_block,
+                    )
+                    yield agent_stream_error_block(e)
             finally:
                 agent_stream_cleanup_failed = False
                 try:
@@ -933,6 +1063,7 @@ async def stream_agent_response(request: Request):
                             )
                         else:
                             agent._cleanup_cancelled_request(request_id)
+                        setup_cleanup_complete = True
 
         headers = {
             "Cache-Control": "no-cache",
@@ -942,11 +1073,17 @@ async def stream_agent_response(request: Request):
         }
         if effective_session_id:
             headers["X-Session-Id"] = effective_session_id
-        return StreamingResponse(
-            generate(),
+        return ClosingStreamingResponse(
+            _CloseAwareStreamBody(generate(), cleanup_unstarted_stream),
             media_type="text/plain",
             headers=headers,
         )
+    except InvocationSelfFencedError as error:
+        cleanup_unstarted_stream()
+        raise self_fenced_invocation_http_error(request_id) from error
+    except asyncio.CancelledError:
+        cleanup_unstarted_stream()
+        raise
     except HTTPException:
         cleanup_unstarted_stream()
         raise
@@ -960,7 +1097,24 @@ async def stream_agent_response(request: Request):
         )
 
 
+@router.get("/stop/capabilities")
+async def get_stop_capabilities():
+    """Advertise the exact cooperative Stop wire contract this host accepts."""
+
+    return {
+        "protocol": "kestrel.cooperative_stop",
+        "version": 1,
+        "scopes": ["agent", "turn"],
+        "turn_address": "turn_id",
+        "accepted_turn_addresses": ["turn_id", "request_id"],
+        "invocation_address_header": "X-Request-ID",
+        "typed_outcomes": True,
+        "durable_receipts": True,
+    }
+
+
 @router.post("/stop")
+@stop_admission_rate_limit
 async def stop_agent_request(request: Request):
     """
     Stop the current agent request/streaming.
@@ -1016,169 +1170,193 @@ async def stop_agent_request(request: Request):
             request_id = resolve_request_invocation_id(request, {})
         else:
             request_id = None
+        correlation_id = data.get("correlation_id")
+        if correlation_id is None:
+            correlation_id = request.query_params.get("correlation_id")
+        if correlation_id is None:
+            correlation_id = request.headers.get("X-Stop-Correlation-ID")
+        invalid_correlation_id = correlation_id is not None and (
+            not isinstance(correlation_id, str) or not correlation_id.strip()
+        )
+        if isinstance(correlation_id, str):
+            try:
+                encoded_correlation_id = correlation_id.encode("utf-8")
+            except UnicodeEncodeError:
+                invalid_correlation_id = True
+            else:
+                invalid_correlation_id = invalid_correlation_id or (
+                    len(encoded_correlation_id)
+                    > MAX_STOP_CORRELATION_ID_BYTES
+                )
+        if invalid_correlation_id:
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_stop_correlation_id",
+                message=(
+                    "Stop correlation_id must be a non-empty valid Unicode string."
+                ),
+            )
+        reason = data.get("reason")
+        if reason is not None and (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason) > 1024
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_stop_reason",
+                message=(
+                    "Stop reason must be non-empty text no longer than 1024 characters."
+                ),
+            )
+        expected_agent_id = data.get("expected_agent_id")
+        if expected_agent_id is not None and (
+            not isinstance(expected_agent_id, str)
+            or not expected_agent_id.strip()
+        ):
+            raise ApiHTTPException(
+                status_code=400,
+                code="invalid_expected_agent_id",
+                message="expected_agent_id must be a concrete agent identity.",
+            )
         agent = get_agent(request)
         agent_id = getattr(agent, "agent_id", None)
         if not isinstance(agent_id, str) or not agent_id.strip():
             # Compatibility for pre-inception/test agents. This is an address,
             # not a grant; HTTP caller authorization remains at the route.
             agent_id = "local-agent"
+        if expected_agent_id is not None and expected_agent_id != agent_id:
+            raise ApiHTTPException(
+                status_code=409,
+                code="agent_identity_changed",
+                message="The routed agent identity changed before Stop dispatch.",
+            )
         caller = getattr(request.state, "caller", None)
         actor_id = getattr(caller, "identity", None)
         if not isinstance(actor_id, str) or not actor_id.strip():
             actor_id = f"local-operator:{agent_id}"
 
-        active_request_ids = set(
-            getattr(agent, "_active_request_ids", set()) or set()
+        canonical_turn_id, target_trace_id, target_span_id = (
+            resolve_runtime_stop_identity(
+                agent,
+                explicit_request_id=request_id,
+                explicit_turn_id=turn_id,
+            )
         )
-        abandoned_turns = getattr(agent, "_abandoned_request_generations", None)
-        if isinstance(abandoned_turns, dict):
-            active_request_ids.update(abandoned_turns)
-        current_turn = getattr(agent, "_current_request_id", None)
-        if isinstance(current_turn, str) and current_turn:
-            active_request_ids.add(current_turn)
-        if request_id is not None:
-            active_request_ids.add(request_id)
-        instance_binding_accessor = vars(agent).get(
-            "active_turn_request_bindings"
-        )
-        if callable(instance_binding_accessor):
-            has_binding_accessor = True
-            raw_turn_bindings = instance_binding_accessor()
-        else:
-            class_binding_accessor = getattr(
-                type(agent),
-                "active_turn_request_bindings",
+
+        descendant_manager: list[object | None] = [None]
+        descendant_query: list[object | None] = [None]
+
+        def target_inventory() -> tuple[CooperativeStopTarget, ...]:
+            """Snapshot live candidates only after durable receipt preflight."""
+
+            distributed_registry = getattr(
+                request.app.state,
+                "distributed_invocation_registry",
                 None,
             )
-            has_binding_accessor = callable(class_binding_accessor)
-            raw_turn_bindings = (
-                class_binding_accessor(agent) if has_binding_accessor else None
-            )
-        if has_binding_accessor:
-            if not isinstance(raw_turn_bindings, dict):
-                raise TypeError("agent turn binding inventory has an invalid type")
-            turn_request_ids = {}
-            turn_request_generations = {}
-            for indexed_turn_id, binding in raw_turn_bindings.items():
-                if (
-                    not isinstance(indexed_turn_id, str)
-                    or not isinstance(binding, tuple)
-                    or len(binding) != 2
-                    or not isinstance(binding[0], str)
-                ):
-                    raise TypeError("agent turn binding inventory is malformed")
-                try:
-                    validate_invocation_id(indexed_turn_id)
-                    validate_invocation_id(binding[0])
-                except ValueError as error:
-                    raise TypeError(
-                        "agent turn binding inventory is malformed"
-                    ) from error
-                turn_request_ids[indexed_turn_id] = binding[0]
-                if binding[1] is not None:
-                    if (
-                        not isinstance(binding[1], int)
-                        or isinstance(binding[1], bool)
-                        or binding[1] <= 0
-                    ):
-                        raise TypeError("agent turn generation is malformed")
-                    turn_request_generations[indexed_turn_id] = binding[1]
-        else:
-            turn_index_accessor = vars(agent).get("active_turn_request_ids")
-            if not callable(turn_index_accessor):
-                turn_index_accessor = getattr(
-                    type(agent),
-                    "active_turn_request_ids",
-                    None,
+            if request_id is not None or turn_id is not None:
+                descendant_manager[0] = None
+                descendant_query[0] = None
+                return (
+                    build_runtime_stop_target(
+                        agent,
+                        agent_id=agent_id,
+                        explicit_request_id=request_id,
+                        explicit_turn_id=turn_id,
+                        distributed_registry=distributed_registry,
+                    ),
                 )
-                if callable(turn_index_accessor):
-                    turn_request_ids = turn_index_accessor(agent)
-                else:
-                    turn_request_ids = {}
-            else:
-                turn_request_ids = turn_index_accessor()
-            turn_request_generations = {}
-        if not isinstance(turn_request_ids, dict):
-            raise TypeError("agent turn request inventory has an invalid type")
-        turn_addresses = active_request_ids.union(turn_request_ids)
 
-        async def cancel_request(stop_request: StopRequest) -> StopDisposition:
-            cancelled_request_ids: list[Optional[str]] = []
-            if stop_request.scope is StopScope.TURN:
-                cancel_kwargs = {"request_id": stop_request.target}
-                if stop_request.request_generation is not None:
-                    cancel_kwargs["generation"] = stop_request.request_generation
-                canceled = agent.cancel_current_request(**cancel_kwargs)
-                if canceled:
-                    cancelled_request_ids.append(stop_request.target)
-                else:
-                    # The matching invoke/stream may have been dispatched by
-                    # the client but not yet reached lifecycle registration.
-                    # Fence that exact ID briefly; registration consumes the
-                    # tombstone before cognition can begin.  Unknown IDs keep
-                    # the historical ALREADY_COMPLETE result.
-                    reserve = getattr(
-                        type(agent),
-                        "reserve_request_cancellation",
-                        None,
-                    )
-                    if (
-                        stop_request.request_generation is None
-                        and callable(reserve)
-                    ):
-                        reserve(agent, stop_request.target)
-            else:
-                canceled = False
-                for active_request_id in sorted(active_request_ids):
-                    request_cancelled = agent.cancel_current_request(
-                        request_id=active_request_id
-                    )
-                    if request_cancelled:
-                        cancelled_request_ids.append(active_request_id)
-                    canceled = request_cancelled or canceled
-                if not active_request_ids:
-                    canceled = agent.cancel_current_request(request_id=None)
-                    if canceled:
-                        cancelled_request_ids.append(None)
-            if canceled:
-                wait_for_completion = getattr(
-                    agent,
-                    "wait_for_request_completion",
-                    None,
-                )
-                if not callable(wait_for_completion):
-                    raise RuntimeError(
-                        "agent cannot confirm request lifecycle completion"
-                    )
-                # Every cancellation marker is installed before the first
-                # await, so agent-wide Stop reaches all snapshotted turns at
-                # once. STOPPED is returned only after each one has run its
-                # endpoint cleanup; CancellationAuthority bounds this wait.
-                abandoned = False
-                for cancelled_request_id in cancelled_request_ids:
-                    wait_kwargs = {}
-                    if (
-                        stop_request.scope is StopScope.TURN
-                        and stop_request.request_generation is not None
-                    ):
-                        wait_kwargs["generation"] = (
-                            stop_request.request_generation
-                        )
-                    completion_disposition = await wait_for_completion(
-                        cancelled_request_id,
-                        **wait_kwargs,
-                    )
-                    abandoned = abandoned or (
-                        completion_disposition
-                        is RequestCompletionDisposition.ABANDONED
-                    )
-                if abandoned:
-                    return StopDisposition.UNREACHABLE
-            return (
-                StopDisposition.STOPPED
-                if canceled
-                else StopDisposition.ALREADY_COMPLETE
+            manager = getattr(request.app.state, "agent_manager", None)
+            if manager is None:
+                manager = vars(agent).get("_agent_manager")
+            descendant_manager[0] = manager
+            descendant_query[0] = getattr(
+                manager,
+                "get_authoritative_stop_descendants",
+                None,
             )
+            list_managed_agents = getattr(manager, "list_agents", None)
+            managed_agents: dict[str, object] = {}
+            if callable(list_managed_agents):
+                listed_agents = list_managed_agents()
+                if not isinstance(listed_agents, dict):
+                    raise TypeError("agent manager returned an invalid inventory")
+                managed_agents = listed_agents
+
+            candidates_by_id: dict[str, object] = {agent_id: agent}
+            managed_names: dict[str, str] = {}
+            for name, candidate in sorted(
+                managed_agents.items(),
+                key=lambda item: (str(item[0]).casefold(), str(item[0])),
+            ):
+                if not isinstance(name, str) or not name.strip():
+                    raise TypeError("agent manager returned an invalid agent name")
+                candidate_id = getattr(candidate, "agent_id", None)
+                if not isinstance(candidate_id, str) or not candidate_id.strip():
+                    continue
+                canonical_name = name.casefold()
+                prior_address = managed_names.setdefault(
+                    canonical_name,
+                    candidate_id,
+                )
+                if prior_address != candidate_id:
+                    raise TypeError("agent manager returned an ambiguous agent name")
+                candidates_by_id.setdefault(candidate_id, candidate)
+
+            return tuple(
+                build_runtime_stop_target(
+                    candidate,
+                    agent_id=candidate_id,
+                    distributed_registry=distributed_registry,
+                    resolve_turn_addresses=False,
+                )
+                for candidate_id, candidate in candidates_by_id.items()
+            )
+
+        async def resolve_descendants(
+            root_agent_id: str,
+        ) -> tuple[AuthoritativeStopDescendant, ...]:
+            authoritative_descendants = descendant_query[0]
+            if descendant_manager[0] is None:
+                return ()
+            if not callable(authoritative_descendants):
+                raise TypeError(
+                    "agent manager lacks authoritative descendant query"
+                )
+            descendants = await authoritative_descendants(root_agent_id)
+            if isinstance(descendants, (str, bytes)):
+                raise TypeError(
+                    "authoritative descendant query returned a scalar"
+                )
+            resolved: list[AuthoritativeStopDescendant] = []
+            for descendant in descendants:
+                if not isinstance(descendant, AuthoritativeStopDescendant):
+                    raise TypeError(
+                        "authoritative descendant query returned an untyped identity"
+                    )
+                resolved.append(descendant)
+            return tuple(resolved)
+
+        async def stop_unloaded_descendant(
+            descendant_agent_id: str,
+        ) -> StopDisposition:
+            distributed_registry = getattr(
+                request.app.state,
+                "distributed_invocation_registry",
+                None,
+            )
+            if distributed_registry is None:
+                return StopDisposition.UNREACHABLE
+            request_agent = getattr(distributed_registry, "request_agent", None)
+            wait_for_stop = getattr(distributed_registry, "wait_for_stop", None)
+            if not callable(request_agent) or not callable(wait_for_stop):
+                raise TypeError(
+                    "distributed Stop registry lacks agent cancellation operations"
+                )
+            ticket = await request_agent(descendant_agent_id)
+            return await wait_for_stop(ticket)
 
         cleanup_registry = getattr(
             request.app.state,
@@ -1192,17 +1370,14 @@ async def stop_agent_request(request: Request):
             raise TypeError("app Stop cleanup registry has an invalid type")
 
         authority = CancellationAuthority(
-            lambda: (
-                CooperativeStopTarget(
-                    target_id=agent_id,
-                    agent_id=agent_id,
-                    cancel=cancel_request,
-                    turn_ids=frozenset(turn_addresses),
-                    turn_request_ids=turn_request_ids,
-                    turn_request_generations=turn_request_generations,
-                ),
-            ),
+            target_inventory,
             cleanup_registry=cleanup_registry,
+            receipt_store=(
+                getattr(request.app.state, "stop_receipt_store", None)
+                or UnavailableStopReceiptStore()
+            ),
+            descendant_resolver=resolve_descendants,
+            unloaded_agent_stop=stop_unloaded_descendant,
         )
         stop_request = StopRequest(
             scope=(
@@ -1222,6 +1397,15 @@ async def stop_agent_request(request: Request):
                 else None
             ),
             target_is_turn_id=turn_id is not None,
+            turn_id=canonical_turn_id,
+            reason=reason,
+            trace_id=target_trace_id,
+            span_id=target_span_id,
+            **(
+                {"correlation_id": correlation_id}
+                if correlation_id is not None
+                else {}
+            ),
         )
         outcomes = await authority.stop(stop_request)
         failed_outcomes = tuple(
@@ -1244,7 +1428,7 @@ async def stop_agent_request(request: Request):
             "success": True,
             "cancelled": cancelled,
             "request_id": request_id,
-            "turn_id": turn_id,
+            "turn_id": canonical_turn_id,
             "message": "Request cancelled" if cancelled else "No active request to cancel",
             "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
         }

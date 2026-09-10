@@ -12,6 +12,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +49,20 @@ DEFAULT_IMAGES = {
 # reusing it here would re-attach a shell to a path that has none.
 DEFAULT_COMMAND_IMAGE = "alpine:3.19"
 _DOCKER_CONTROL_REAP_TIMEOUT_SECONDS = 1.0
+_DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+_DEFAULT_MAX_SNAPSHOT_ENTRIES = 100_000
+_SNAPSHOT_COPY_CHUNK_BYTES = 1024 * 1024
+_SNAPSHOT_WORKER_MODULE = (
+    "kestrel_sovereign.features.compute.executors.docker_snapshot_worker"
+)
+_SNAPSHOT_DIRFD_SUPPORTED = (
+    bool(getattr(os, "O_DIRECTORY", 0))
+    and bool(getattr(os, "O_NOFOLLOW", 0))
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.readlink in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
 
 _CONTAINER_TRASH_DIR = "/kestrel-trash"
 
@@ -85,6 +100,8 @@ class DockerExecutor(BaseExecutor):
         # one positionally.
         command_image: Optional[str] = None,
         legacy_staging_age_seconds: Optional[int] = None,
+        max_snapshot_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
+        max_snapshot_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
     ):
         """
         Initialize the Docker executor.
@@ -97,6 +114,8 @@ class DockerExecutor(BaseExecutor):
             default_cpu_quota: CPU quota (microseconds per 100ms)
             default_pids_limit: Maximum number of processes
             max_output_bytes: Maximum stdout/stderr size
+            max_snapshot_bytes: Maximum regular-file bytes copied from a cwd
+            max_snapshot_entries: Maximum entries copied from a cwd
         """
         super().__init__(max_output_bytes=max_output_bytes)
         self._docker_path = docker_path
@@ -106,6 +125,10 @@ class DockerExecutor(BaseExecutor):
         self._memory_limit = default_memory_limit
         self._cpu_quota = default_cpu_quota
         self._pids_limit = default_pids_limit
+        if max_snapshot_bytes <= 0 or max_snapshot_entries <= 0:
+            raise ValueError("Docker snapshot limits must be positive")
+        self._max_snapshot_bytes = max_snapshot_bytes
+        self._max_snapshot_entries = max_snapshot_entries
         self._policy = DestructiveOperationPolicy(
             current_agent_data_path=current_agent_data_path
         )
@@ -171,9 +194,12 @@ class DockerExecutor(BaseExecutor):
 
         Args:
             script: The ComputeScript to execute
-            working_dir: Optional working directory (mounted read-only)
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
             network: Whether to allow network access (default: False)
-            mounts: Additional mounts [{"src": "/host/path", "dst": "/container/path", "ro": True}]
+            mounts: Reserved compatibility parameter. Additional host mounts
+                are refused because even a read-only bind can expose a Unix
+                service socket.
 
         Returns:
             ExecutionRecord with execution results
@@ -187,6 +213,9 @@ class DockerExecutor(BaseExecutor):
             raise ExecutionError(
                 f"No Docker image configured for language: {script.language}"
             )
+
+        self._validate_additional_mounts(mounts)
+        self._validated_trash_root()
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
@@ -214,6 +243,384 @@ class DockerExecutor(BaseExecutor):
             cleanup=cleanup,
         )
 
+    def _validate_additional_mounts(
+        self,
+        mounts: Optional[List[Dict[str, str]]],
+    ) -> None:
+        """Reject caller-selected host mounts at the sandbox boundary.
+
+        Read-only bind mounts prevent regular-file writes but do not prevent
+        ``connect(2)`` to a Unix socket.  A Docker/Podman socket, PostgreSQL
+        socket, or a directory in which one can appear would let compute cross
+        Hold custody through a host service.  A recursive scan is raceable, so
+        no arbitrary additional host mount is safe.  The executor-owned script,
+        workspace, and per-run trash binds are assembled internally instead.
+        """
+
+        if mounts:
+            raise ExecutionEnvironmentError(
+                "Refusing additional Docker mounts because read-only bind "
+                "mounts still expose host service sockets and cannot prove "
+                "separation from host Hold custody"
+            )
+
+    def _validated_trash_root(self) -> Path:
+        """Resolve the internal writable bind and keep it outside custody."""
+
+        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        if self._policy.touches_host_hold_custody(host_trash_dir):
+            raise ExecutionEnvironmentError(
+                "Docker trash staging overlaps host Hold custody; configure "
+                "KESTREL_TRASH_DIR outside the host control-data directory"
+            )
+        return host_trash_dir
+
+    @staticmethod
+    def _snapshot_working_directory(
+        source: str,
+        destination: Path,
+        *,
+        max_bytes: int = _DEFAULT_MAX_SNAPSHOT_BYTES,
+        max_entries: int = _DEFAULT_MAX_SNAPSHOT_ENTRIES,
+        deadline: float | None = None,
+    ) -> str:
+        """Copy a host cwd into executor custody without importing live sockets.
+
+        A read-only bind of the caller's directory would still expose Unix
+        sockets, including one created after a recursive preflight.  Copying
+        into the already-private execution directory gives the container a
+        stable regular-file snapshot. Every descent and file open is relative
+        to an already-validated directory descriptor, so a concurrent rename
+        cannot redirect traversal into an ambient host path. Bytes, entries,
+        and elapsed time are bounded while copying; symlinks are preserved
+        without following them.
+        """
+
+        if max_bytes <= 0 or max_entries <= 0:
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot limits must be positive"
+            )
+        if not _SNAPSHOT_DIRFD_SUPPORTED:
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshots require anchored POSIX "
+                "directory-descriptor traversal"
+            )
+
+        try:
+            source_path = Path(source).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ExecutionEnvironmentError(
+                f"Cannot snapshot Docker working directory {source}: {exc}"
+            ) from exc
+        try:
+            source_stat = source_path.lstat()
+        except OSError as exc:
+            raise ExecutionEnvironmentError(
+                f"Cannot inspect Docker working directory {source_path}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(source_stat.st_mode):
+            raise ExecutionEnvironmentError(
+                f"Docker working directory is not a directory: {source_path}"
+            )
+        destination_path = destination.expanduser().resolve(strict=False)
+        if destination_path == source_path or destination_path.is_relative_to(
+            source_path
+        ):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot would contain its own "
+                f"destination: {source_path}"
+            )
+
+        entries_copied = 0
+        bytes_copied = 0
+
+        def check_limits(*, add_entry: bool = False, add_bytes: int = 0) -> None:
+            nonlocal entries_copied, bytes_copied
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Docker working directory snapshot timed out")
+            if add_entry:
+                entries_copied += 1
+                if entries_copied > max_entries:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_entries}-entry limit"
+                    )
+            if add_bytes:
+                bytes_copied += add_bytes
+                if bytes_copied > max_bytes:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_bytes}-byte limit"
+                    )
+
+        def changed(path: Path) -> ExecutionEnvironmentError:
+            return ExecutionEnvironmentError(
+                f"Docker working directory entry changed during snapshot: {path}"
+            )
+
+        open_directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        open_file_flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+
+        def same_object(before: os.stat_result, after: os.stat_result) -> bool:
+            return (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) == (
+                after.st_dev,
+                after.st_ino,
+                stat.S_IFMT(after.st_mode),
+            )
+
+        def copy_regular_file(
+            parent_fd: int,
+            name: str,
+            before: os.stat_result,
+            destination_file: Path,
+            display_path: Path,
+        ) -> None:
+            descriptor = -1
+            try:
+                descriptor = os.open(name, open_file_flags, dir_fd=parent_fd)
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory contains a host service socket "
+                        f"or other special file: {display_path}"
+                    )
+                if not same_object(before, opened):
+                    raise changed(display_path)
+                if opened.st_size > max_bytes - bytes_copied:
+                    raise ExecutionEnvironmentError(
+                        "Docker working directory snapshot exceeds the "
+                        f"{max_bytes}-byte limit"
+                    )
+                with os.fdopen(descriptor, "rb") as source_stream:
+                    descriptor = -1
+                    with destination_file.open("xb") as destination_stream:
+                        while chunk := source_stream.read(_SNAPSHOT_COPY_CHUNK_BYTES):
+                            check_limits(add_bytes=len(chunk))
+                            destination_stream.write(chunk)
+                after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    not same_object(before, after)
+                    or after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                ):
+                    raise changed(display_path)
+                destination_file.chmod(stat.S_IMODE(before.st_mode))
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
+            except OSError as exc:
+                raise changed(display_path) from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+        def copy_directory(
+            source_fd: int,
+            destination_directory: Path,
+            display_directory: Path,
+        ) -> None:
+            check_limits()
+            with os.scandir(source_fd) as iterator:
+                for entry in iterator:
+                    name = entry.name
+                    check_limits(add_entry=True)
+                    display_path = display_directory / name
+                    try:
+                        before = os.stat(
+                            name,
+                            dir_fd=source_fd,
+                            follow_symlinks=False,
+                        )
+                    except TimeoutError:
+                        raise  # the snapshot deadline, not a tamper signal
+                    except OSError as exc:
+                        raise changed(display_path) from exc
+                    destination_entry = destination_directory / name
+                    if stat.S_ISREG(before.st_mode):
+                        copy_regular_file(
+                            source_fd,
+                            name,
+                            before,
+                            destination_entry,
+                            display_path,
+                        )
+                    elif stat.S_ISDIR(before.st_mode):
+                        child_fd = -1
+                        try:
+                            child_fd = os.open(
+                                name,
+                                open_directory_flags,
+                                dir_fd=source_fd,
+                            )
+                            opened = os.fstat(child_fd)
+                            if not same_object(before, opened):
+                                raise changed(display_path)
+                            destination_entry.mkdir()
+                            copy_directory(child_fd, destination_entry, display_path)
+                            after = os.fstat(child_fd)
+                            if not same_object(before, after):
+                                raise changed(display_path)
+                            destination_entry.chmod(stat.S_IMODE(before.st_mode))
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
+                        except OSError as exc:
+                            raise changed(display_path) from exc
+                        finally:
+                            if child_fd >= 0:
+                                os.close(child_fd)
+                    elif stat.S_ISLNK(before.st_mode):
+                        try:
+                            link_target = os.readlink(name, dir_fd=source_fd)
+                            after = os.stat(
+                                name,
+                                dir_fd=source_fd,
+                                follow_symlinks=False,
+                            )
+                        except TimeoutError:
+                            raise  # the snapshot deadline, not a tamper signal
+                        except OSError as exc:
+                            raise changed(display_path) from exc
+                        if not same_object(before, after):
+                            raise changed(display_path)
+                        destination_entry.symlink_to(
+                            link_target,
+                            target_is_directory=False,
+                        )
+                    else:
+                        raise ExecutionEnvironmentError(
+                            "Docker working directory contains a host service "
+                            f"socket or other special file: {display_path}"
+                        )
+
+        source_fd = -1
+        try:
+            check_limits()
+            source_fd = os.open(source_path, open_directory_flags)
+            opened_source = os.fstat(source_fd)
+            if not same_object(source_stat, opened_source):
+                raise changed(source_path)
+            destination_path.mkdir(parents=True)
+            copy_directory(source_fd, destination_path, source_path)
+            destination_path.chmod(stat.S_IMODE(source_stat.st_mode))
+        except TimeoutError:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise
+        except ExecutionEnvironmentError:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise
+        except OSError as exc:
+            shutil.rmtree(destination_path, ignore_errors=True)
+            raise ExecutionEnvironmentError(
+                "Docker working directory contains a host service socket, "
+                f"special file, or unreadable entry: {source_path}: {exc}"
+            ) from exc
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
+        return str(destination_path)
+
+    async def _bounded_working_directory_snapshot(
+        self,
+        source: str,
+        destination: Path,
+        *,
+        deadline: float,
+        subject_id: str,
+        timeout_seconds: float,
+    ) -> str:
+        """Copy a cwd in a killable child under the execution's deadline.
+
+        A thread cannot be stopped while a FUSE/NFS filesystem call is stuck in
+        the kernel, and a lingering ``asyncio.to_thread`` worker consumes the
+        shared executor and can delay loop shutdown.  The one-purpose child is
+        instead terminated and reaped through the same bounded process
+        lifecycle as script execution.
+        """
+
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise ExecutionTimeoutError(subject_id, timeout_seconds)
+        worker_deadline = time.monotonic() + remaining
+        result_path = destination.parent / ".docker-snapshot-result.json"
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-m",
+            _SNAPSHOT_WORKER_MODULE,
+            source,
+            str(destination),
+            str(self._max_snapshot_bytes),
+            str(self._max_snapshot_entries),
+            repr(worker_deadline),
+            str(result_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+        try:
+            try:
+                _stdout, stderr = await self._capture_process_output(
+                    process,
+                    timeout_seconds=remaining,
+                    terminate=lambda: self._kill_process_group(process),
+                )
+            except TimeoutError:
+                raise ExecutionTimeoutError(subject_id, timeout_seconds) from None
+
+            try:
+                payload = result_path.read_bytes()
+                if len(payload) > 64 * 1024:
+                    raise ValueError
+                response = json.loads(payload)
+            except (OSError, ValueError, json.JSONDecodeError):
+                diagnostic = stderr.content.decode("utf-8", errors="replace").strip()
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker failed without a "
+                    f"valid response{detail}"
+                ) from None
+            kind = response["kind"]
+            message = response["message"]
+            if not isinstance(kind, str) or not isinstance(message, str):
+                raise TypeError
+            if process.returncode == 0 and kind == "success" and destination.is_dir():
+                return str(destination)
+            if kind == "timeout":
+                raise ExecutionTimeoutError(subject_id, timeout_seconds)
+            if kind == "environment":
+                raise ExecutionEnvironmentError(message)
+            if kind == "success":
+                raise ExecutionEnvironmentError(
+                    "Docker working directory snapshot worker returned an "
+                    "invalid success response"
+                )
+            raise ExecutionEnvironmentError(message)
+        except (KeyError, TypeError):
+            raise ExecutionEnvironmentError(
+                "Docker working directory snapshot worker returned an invalid response"
+            ) from None
+        finally:
+            try:
+                result_path.unlink(missing_ok=True)
+            except TimeoutError:
+                raise  # the snapshot deadline, not a tamper signal
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove Docker snapshot worker result %s: %s",
+                    result_path,
+                    exc,
+                )
+
     async def _execute_script(
         self,
         script: ComputeScript,
@@ -226,7 +633,22 @@ class DockerExecutor(BaseExecutor):
         network: bool,
         mounts: Optional[List[Dict[str, str]]],
     ) -> _ExecutionResult:
-        host_trash_dir = self._policy.trash_dir.expanduser().resolve(strict=False)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + script.timeout_seconds
+        isolated_working_dir = (
+            await self._bounded_working_directory_snapshot(
+                working_dir,
+                Path(context.workdir) / "workspace",
+                deadline=deadline,
+                subject_id=script.id,
+                timeout_seconds=script.timeout_seconds,
+            )
+            if working_dir
+            else None
+        )
+        # Repeat at the final pre-bind boundary so a path alias changed after
+        # admission cannot make the earlier validation stale.
+        host_trash_dir = self._validated_trash_root()
         host_trash_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Mount a PER-EXECUTION staging directory, never the shared trash
         # root: a read/write bind of the root would let any container script
@@ -251,7 +673,7 @@ class DockerExecutor(BaseExecutor):
             staging_dir.mkdir(mode=0o700)
             return await self._run_staged_script(
                 script,
-                working_dir,
+                isolated_working_dir,
                 context,
                 docker_path=docker_path,
                 image=image,
@@ -259,6 +681,7 @@ class DockerExecutor(BaseExecutor):
                 network=network,
                 mounts=mounts,
                 staging_dir=staging_dir,
+                deadline=deadline,
             )
         finally:
             self._promote_staged_trash(staging_dir, host_trash_dir)
@@ -275,6 +698,7 @@ class DockerExecutor(BaseExecutor):
         network: bool,
         mounts: Optional[List[Dict[str, str]]],
         staging_dir: Path,
+        deadline: float,
     ) -> _ExecutionResult:
         """Rewrite, stage and run the script against an existing staging dir."""
         # Container mounts (/scripts, /workspace) are read-only, so no
@@ -335,7 +759,10 @@ class DockerExecutor(BaseExecutor):
         try:
             stdout, stderr = await self._capture_process_output(
                 process,
-                timeout_seconds=script.timeout_seconds,
+                timeout_seconds=max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
                 terminate=lambda: self._kill_container(
                     docker_path,
                     container_name,
@@ -429,12 +856,6 @@ class DockerExecutor(BaseExecutor):
             dst = mount.get("dst")
             read_only = mount.get("ro", True)
             if src and dst:
-                if dst == _CONTAINER_TRASH_DIR or dst.startswith(
-                    f"{_CONTAINER_TRASH_DIR}/"
-                ):
-                    raise ExecutionError(
-                        f"Mount destination is reserved: {_CONTAINER_TRASH_DIR}"
-                    )
                 ro_flag = ":ro" if read_only else ""
                 cmd.extend(["-v", f"{src}:{dst}{ro_flag}"])
 
@@ -485,7 +906,8 @@ class DockerExecutor(BaseExecutor):
 
         Args:
             command: The :class:`ComputeCommand` to execute
-            working_dir: Optional working directory (mounted read-only)
+            working_dir: Optional host directory copied into a private,
+                read-only container snapshot.
 
         Returns:
             ExecutionRecord with execution results
@@ -496,11 +918,25 @@ class DockerExecutor(BaseExecutor):
 
         async def run(context: _ExecutionContext) -> _ExecutionResult:
             container_name = self._container_name(context.execution_id)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + command.timeout_seconds
+            isolated_working_dir = (
+                await self._bounded_working_directory_snapshot(
+                    working_dir,
+                    Path(context.workdir) / "workspace",
+                    deadline=deadline,
+                    subject_id=command.id,
+                    timeout_seconds=command.timeout_seconds,
+                )
+                if working_dir
+                else None
+            )
             return await self._execute_argv(
                 command,
-                working_dir,
+                isolated_working_dir,
                 docker_path=docker_path,
                 container_name=container_name,
+                deadline=deadline,
             )
 
         async def cleanup(context: _ExecutionContext) -> None:
@@ -523,6 +959,7 @@ class DockerExecutor(BaseExecutor):
         *,
         docker_path: str,
         container_name: str,
+        deadline: float,
     ) -> _ExecutionResult:
         cmd, log_safe_cmd = self._container_invocation(
             docker_path=docker_path,
@@ -564,7 +1001,10 @@ class DockerExecutor(BaseExecutor):
         try:
             stdout, stderr = await self._capture_process_output(
                 process,
-                timeout_seconds=command.timeout_seconds,
+                timeout_seconds=max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                ),
                 terminate=lambda: self._kill_container(
                     docker_path,
                     container_name,

@@ -94,15 +94,17 @@ recolored. Theme vars cannot express "portrait on top, name below, actions row
 under it" vs "dot + name + description in a row".
 
 - **Default (`renderCard` omitted):** the CONSOLE ROW style — status dot, name,
-  description, stop button — matching today's `.agent-item` markup in
-  identity.js.
+  and description — matching today's `.agent-item` markup in identity.js.
 - **Frinz:** a portrait-card renderer — large portrait, name below, actions area
   under the portrait.
 
 The component owns the card's OUTER shell, selection wiring, the status dot, and
-the `agent-card-actions` slot anchor (passed to the renderer as
+the typed busy-only Stop control, plus the `agent-card-actions` slot anchor
+(passed to the renderer as
 `ctx.actionsAnchor`); `renderCard` fills the body and positions the actions
-anchor. **The shared list layout budgets for an actions row by default** — the
+anchor. The Stop control is placed in that anchor for custom cards, so replacing
+the body never replaces cancellation behavior. **The shared list layout budgets
+for an actions row by default** — the
 ticket calls out that current Frinz cards are too tight for buttons under
 portraits, and that the layout "must budget for an actions row by default". That
 is a component responsibility (base CSS reserves vertical room for the actions

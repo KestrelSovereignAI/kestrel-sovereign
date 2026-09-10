@@ -247,7 +247,14 @@ def _start_uvicorn(
     uvicorn = _venv_exec(venv_dir, "uvicorn")
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(venv_dir)
+    env.pop("KESTREL_DATABASE_URL", None)
+    env.pop("KESTREL_HOLD_EVIDENCE_DATABASE_URL", None)
+    env.pop("KESTREL_HOLD_BACKEND", None)
+    env["KESTREL_DB_BACKEND"] = "sqlite"
     env["KESTREL_DB_PATH"] = str(agent_dir)
+    env["KESTREL_HOST_DB_PATH"] = str(
+        agent_dir / "host-data" / "host-features.db"
+    )
     cmd = [
         str(uvicorn), "kestrel_sovereign.server:app",
         "--host", "127.0.0.1",
