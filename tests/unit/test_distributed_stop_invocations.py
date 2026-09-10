@@ -1145,6 +1145,7 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # replica+db teardown is heavy on a 2-core runner
 async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
     """A committed deletion cannot falsely fence unrelated active work."""
 
@@ -1171,7 +1172,9 @@ async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
         ]
 
         replica_a.complete_soon(agent, "completing-turn", 1)
-        await deletion_committed.wait()
+        # Bounded so a real failure to commit is reported as itself rather
+        # than as the whole test hitting the global pytest ceiling.
+        await asyncio.wait_for(deletion_committed.wait(), timeout=30)
         await asyncio.sleep(0.05)
 
         assert replica_a._lease_lost is False

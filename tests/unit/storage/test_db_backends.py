@@ -1965,7 +1965,13 @@ class TestAsyncDatabase:
 
                 # The factory timeout is observable, but only after the
                 # primary backend close was attempted and its worker exited.
+                # Join rather than assert on the instant: the worker's exit is
+                # a real thread teardown, and on a loaded 2-core runner it had
+                # simply not been scheduled yet by the time this line ran. The
+                # deadline under test is the FACTORY's, asserted above; this is
+                # only an observation bound, so it is generous.
                 assert not db.backend.is_connected
+                primary_worker.join(timeout=30.0)
                 assert not primary_worker.is_alive()
                 assert factory_worker.is_alive()
                 assert workers == [factory_worker]
