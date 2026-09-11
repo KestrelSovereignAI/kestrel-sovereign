@@ -21,7 +21,7 @@ import tempfile
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from kestrel_sdk.signals import (
@@ -47,6 +47,7 @@ from kestrel_sovereign.hold import (
 )
 from kestrel_sovereign.signals import (
     DurableAdmissionDisposition,
+    DurableConsumerRegistration,
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
@@ -188,9 +189,251 @@ def _signal(
     )
 
 
+def _held_state(agent_id: str) -> EffectiveHoldState:
+    return EffectiveHoldState(
+        host=None,
+        agent=HoldState(
+            scope=HoldScope.AGENT,
+            target_id=agent_id,
+            reason="maintenance",
+            actor_id="did:sovereign:operator",
+            set_at="2026-08-28T12:00:00+00:00",
+            hold_receipt_id="hold:signal-test",
+            revision=1,
+        ),
+    )
+
+
+class _HoldSnapshots:
+    def __init__(self, *snapshots: EffectiveHoldState) -> None:
+        self.snapshots = list(snapshots)
+
+    async def get_effective(self, _agent_id: str) -> EffectiveHoldState:
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_held_periodic_signal_is_audited_as_benign_skip(
+    dispatcher_components,
+    monkeypatch,
+):
+    """Periodic work is consumed as a skip, never accumulated for replay."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("cron.test", handler=handler))
+    snapshots = _HoldSnapshots(_held_state(c.agent.did))
+    c.agent._hold_store = snapshots
+    metric = Mock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        metric,
+    )
+
+    held_results = [
+        await c.dispatcher.dispatch_signal(_signal("cron.test"))
+        for _ in range(3)
+    ]
+    snapshots.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
+    resumed = await c.dispatcher.dispatch_signal(_signal("cron.test"))
+    if c.agent.background_tasks:
+        await asyncio.gather(*c.agent.background_tasks)
+
+    assert all(
+        result.status is Status.DROPPED_QUIET_HOURS
+        and result.error == "hold_skipped"
+        for result in held_results
+    )
+    assert resumed.status is Status.OK
+    handler.assert_awaited_once()
+    rows = await c.backend.fetch_all(
+        "SELECT status, error FROM signal_log WHERE id IN (?, ?, ?)",
+        tuple(result.signal_id for result in held_results),
+    )
+    assert rows == [
+        (Status.DROPPED_QUIET_HOURS.value, "hold_skipped")
+    ] * 3
+    assert metric.call_count == 3
+    metric.assert_called_with(disposition="skipped", source="cron.test")
+
+
+@pytest.mark.asyncio
+async def test_hold_committed_while_waiting_for_signal_lock_skips_handler(
+    dispatcher_components,
+):
+    """The last under-lock snapshot closes the Hold/handler start race."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("cron.race", handler=handler))
+    c.agent._hold_store = _HoldSnapshots(
+        EffectiveHoldState(host=None, agent=None),
+        _held_state(c.agent.did),
+    )
+
+    result = await c.dispatcher.dispatch_signal(_signal("cron.race"))
+
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_held_a2a_wake_is_drained_automatically_after_release(
+    dispatcher_components,
+):
+    """A one-shot A2A callback needs no peer re-emission after Release."""
+
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        DURABLE_COGNITION_CONSUMER_ID,
+        build_a2a_task_submitted_registration,
+        build_signal_for_submitted_task,
+    )
+
+    task = SimpleNamespace(
+        id="task-held-a2a",
+        sessionId="session-held-a2a",
+        metadata={},
+        history=[],
+    )
+
+    c = dispatcher_components
+    c.registry.register(build_a2a_task_submitted_registration())
+    await c.dispatcher.register_durable_consumer(
+        DurableConsumerRegistration(
+            consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+            source="a2a.task_submitted",
+            agent_id=c.agent.did,
+            max_attempts=0,
+        )
+    )
+    await c.dispatcher.start_durable_cognition_consumer(
+        DURABLE_COGNITION_CONSUMER_ID
+    )
+    snapshots = _HoldSnapshots(_held_state(c.agent.did))
+    c.agent._hold_store = snapshots
+
+    handle = await c.dispatcher.enqueue_durable_cognition(
+        build_signal_for_submitted_task(task, target_agent=c.agent.did),
+        source_event_id=task.id,
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+    )
+    admission = await handle.wait_for_durable_admission()
+    held = await handle.wait()
+    snapshots.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
+
+    for _ in range(150):
+        [delivery] = await c.dispatcher.list_durable_deliveries(
+            consumer_id=DURABLE_COGNITION_CONSUMER_ID
+        )
+        if delivery.status == "acknowledged":
+            break
+        await asyncio.sleep(0.01)
+
+    assert admission.disposition is DurableAdmissionDisposition.HELD
+    assert held.status is Status.COALESCED
+    assert held.error == "hold_deferred"
+    assert delivery.status == "acknowledged"
+    assert len(c.agent.process_input_calls) == 1
+    await c.dispatcher.shutdown_durable_delivery()
+
+
+@pytest.mark.asyncio
+async def test_public_nested_signal_does_not_inherit_durable_disposition(
+    dispatcher_components,
+):
+    """Each public dispatch owns its source contract despite ContextVar copy."""
+
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    c.registry.register(_action_reg("nested.while.held", handler=handler))
+    c.agent._hold_store = _HoldSnapshots(_held_state(c.agent.did))
+    token = c.dispatcher._durable_cognition_route.set(True)
+    try:
+        result = await c.dispatcher.dispatch_signal(
+            _signal("nested.while.held")
+        )
+    finally:
+        c.dispatcher._durable_cognition_route.reset(token)
+
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_hold_skip_does_not_consume_coalescing_key(
+    dispatcher_components,
+):
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    base = _action_reg("coalesce_held", handler=handler)
+    c.registry.register(
+        SourceRegistration(
+            name=base.name,
+            schema=base.schema,
+            default_mode=base.default_mode,
+            allowed_modes=base.allowed_modes,
+            handler=base.handler,
+            log_redaction=base.log_redaction,
+            coalescing_window=timedelta(seconds=10),
+        )
+    )
+    c.agent._hold_store = _HoldSnapshots(
+        EffectiveHoldState(host=None, agent=None),
+        _held_state(c.agent.did),
+        EffectiveHoldState(host=None, agent=None),
+    )
+
+    skipped = await c.dispatcher.dispatch_signal(
+        _signal("coalesce_held", dedupe_key="resumable")
+    )
+    resumed = await c.dispatcher.dispatch_signal(
+        _signal("coalesce_held", dedupe_key="resumable")
+    )
+
+    assert skipped.error == "hold_skipped"
+    assert resumed.status is Status.OK
+    handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_late_hold_skip_does_not_consume_rate_budget(
+    dispatcher_components,
+):
+    c = dispatcher_components
+    handler = AsyncMock(return_value={"ran": True})
+    base = _action_reg("rate_held", handler=handler)
+    c.registry.register(
+        SourceRegistration(
+            name=base.name,
+            schema=base.schema,
+            default_mode=base.default_mode,
+            allowed_modes=base.allowed_modes,
+            handler=base.handler,
+            log_redaction=base.log_redaction,
+            rate_limit=RateLimit(per_minute=1, per_hour=1, burst=1),
+        )
+    )
+    c.agent._hold_store = _HoldSnapshots(
+        EffectiveHoldState(host=None, agent=None),
+        _held_state(c.agent.did),
+        EffectiveHoldState(host=None, agent=None),
+    )
+
+    skipped = await c.dispatcher.dispatch_signal(_signal("rate_held"))
+    resumed = await c.dispatcher.dispatch_signal(_signal("rate_held"))
+
+    assert skipped.error == "hold_skipped"
+    assert resumed.status is Status.OK
+    handler.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -335,9 +578,10 @@ async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp
 
 
 @pytest.mark.asyncio
-async def test_held_cognition_is_terminal_typed_refusal(
+async def test_turn_gate_hold_refusal_preserves_signal_skip_disposition(
     dispatcher_components,
     tmp_path,
+    monkeypatch,
 ):
     c = dispatcher_components
     template = tmp_path / "held.md"
@@ -357,15 +601,19 @@ async def test_held_cognition_is_terminal_typed_refusal(
         effective_state=EffectiveHoldState(host=None, agent=latch),
     )
     c.agent.process_input = AsyncMock(side_effect=refusal)
+    metric = Mock()
+    monkeypatch.setattr(
+        "kestrel_sovereign.hold.metrics.record_held_work_disposition",
+        metric,
+    )
 
     result = await c.dispatcher.dispatch_signal(
         _signal("held_signal", mode=SignalMode.COGNITION)
     )
 
-    assert result.status is Status.DROPPED_VALIDATION
-    assert result.error == refusal.wire_json()
-    assert '"code":"agent_held"' in result.error
-    assert '"hold_receipt_id":"hold:signal"' in result.error
+    assert result.status is Status.DROPPED_QUIET_HOURS
+    assert result.error == "hold_skipped"
+    metric.assert_called_once_with(disposition="skipped", source="held_signal")
 
 
 @pytest.mark.asyncio

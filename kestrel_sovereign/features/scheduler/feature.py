@@ -849,7 +849,7 @@ class SchedulerFeature(Feature):
                 "SchedulerFeature: no dispatcher on agent, "
                 "executing %r directly", task_name,
             )
-            return await self._lookup_and_run_tool(task_name, args)
+            return await self._lookup_and_run_tool_under_hold(task_name, args)
 
         # Look up the task's mode from the classification table. If a
         # task fires that isn't in CRON_TASKS, it has no source
@@ -863,7 +863,7 @@ class SchedulerFeature(Feature):
                 "SchedulerFeature: %r has no source registration, "
                 "executing directly", task_name,
             )
-            return await self._lookup_and_run_tool(task_name, args)
+            return await self._lookup_and_run_tool_under_hold(task_name, args)
 
         signal = Signal(
             source=cron_source_name(task_name),
@@ -875,6 +875,29 @@ class SchedulerFeature(Feature):
         )
         result = await dispatcher.dispatch_signal(signal)
         return self._translate_signal_result(result, task_name)
+
+    async def _lookup_and_run_tool_under_hold(
+        self, task_name: str, args: dict
+    ) -> Any:
+        """Apply periodic-work Hold semantics to an unregistered tool unit."""
+
+        from kestrel_sovereign.hold import (
+            HeldWorkDisposition,
+            get_effective_hold_state,
+        )
+        from kestrel_sovereign.hold.metrics import record_held_work_disposition
+        from kestrel_sovereign.signals.sources.scheduler import cron_source_name
+
+        effective = await get_effective_hold_state(self.agent)
+        if effective is not None and effective.held:
+            record_held_work_disposition(
+                disposition=HeldWorkDisposition.SKIPPED.value,
+                source=cron_source_name(task_name),
+            )
+            # Match the registered-signal translation so SchedulerRunner
+            # records a benign no-execution receipt, not a failed retry unit.
+            return "skipped: dropped_quiet_hours (hold_skipped)"
+        return await self._lookup_and_run_tool(task_name, args)
 
     @staticmethod
     def _translate_signal_result(result, task_name: str) -> Any:

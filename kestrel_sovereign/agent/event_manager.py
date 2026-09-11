@@ -7,7 +7,8 @@ listener management, and background task notification queuing.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ EVENT_REJECTED = "rejected"
 # load for long LLM/tool turns.
 A2A_CANCELLATION_POLL_INITIAL_SECONDS = 0.1
 A2A_CANCELLATION_POLL_MAX_SECONDS = 2.0
+A2A_WAKE_RETRY_INITIAL_SECONDS = 0.1
+A2A_WAKE_RETRY_MAX_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -262,6 +265,167 @@ class EventManagerMixin:
         if listener in self._event_listeners:
             self._event_listeners.remove(listener)
 
+    async def _deliver_a2a_wake_until_durable(
+        self,
+        *,
+        signal_factory,
+        task_id: str,
+        consumer_id: str,
+        label: str,
+        cancellation_aware: bool,
+    ) -> None:
+        """Retry the task->signal outbox handoff until it is durable.
+
+        The task row committed before this coroutine was scheduled. A transient
+        dispatcher/storage failure therefore cannot be treated as completion:
+        retry in-process, while boot reconciliation covers process loss.
+        """
+
+        from kestrel_sovereign.signals import DurableAdmissionDisposition
+        from kestrel_sovereign.signals.delivery import (
+            ACCEPTED_STATUSES,
+            await_terminal_delivery,
+        )
+
+        delay = A2A_WAKE_RETRY_INITIAL_SECONDS
+        pending = vars(self).setdefault("_a2a_submitted_signal_handles", {})
+        # A retry loop must terminate on a condition retrying cannot change.
+        # Durable admission needs a registered durable cognition consumer;
+        # an agent that never registered one (the ordinary non-durable
+        # configuration) can never admit this wake, and NOT_ADMITTED there is
+        # permanent, not transient. Before #3163 this path was a plain
+        # enqueue_signal wake -- "nothing durable advances on delivery here,
+        # the task row is already persisted, this signal is only the wake."
+        # Keep that contract for those agents instead of spinning at the 5s
+        # cap forever.
+        has_durable = getattr(self.dispatcher, "has_durable_consumer", None)
+        if callable(has_durable) and not await has_durable(consumer_id):
+            signal = signal_factory()
+            handle = await self.dispatcher.enqueue_signal(signal)
+            outcome = await await_terminal_delivery(
+                handle,
+                label=label,
+                delivered_statuses=ACCEPTED_STATUSES,
+            )
+            if not outcome.delivered:
+                logging.warning(
+                    "%s: non-durable wake was not delivered (%s)",
+                    label,
+                    outcome.describe(),
+                )
+            return
+        while True:
+            if cancellation_aware:
+                try:
+                    snapshot = await self.task_manager.get_task_cancellation_snapshot(
+                        task_id,
+                        recipient_agent_id=self.did,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logging.warning(
+                        "%s: task-state read failed; retrying durable wake: %s",
+                        label,
+                        exc,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
+                    continue
+                if snapshot is None or snapshot.state not in {"submitted", "working"}:
+                    return
+            try:
+                # Dispatch mutates normalization and causation state in-place.
+                # A persistence retry must therefore start from a fresh source
+                # envelope rather than appending a second frame to the failed
+                # attempt's object.
+                signal = signal_factory()
+                handle = await self.dispatcher.enqueue_durable_cognition(
+                    signal,
+                    source_event_id=task_id,
+                    consumer_id=consumer_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    "%s: durable enqueue failed; retrying: %s",
+                    label,
+                    exc,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
+                continue
+
+            if cancellation_aware:
+                pending[task_id] = handle
+            retry = False
+            try:
+                if cancellation_aware:
+                    try:
+                        snapshot = (
+                            await self.task_manager.get_task_cancellation_snapshot(
+                                task_id,
+                                recipient_agent_id=self.did,
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # The dispatcher's execution-time validation reads the
+                        # same authoritative row. Keep the durable handoff live
+                        # and observable rather than abandoning it here.
+                        logging.warning(
+                            "%s: post-enqueue task-state read failed: %s",
+                            label,
+                            exc,
+                            exc_info=True,
+                        )
+                    else:
+                        if snapshot is None or snapshot.state not in {
+                            "submitted",
+                            "working",
+                        }:
+                            dispatch_task = getattr(handle, "task", None)
+                            if dispatch_task is not None and not dispatch_task.done():
+                                dispatch_task.cancel()
+
+                admission_waiter = getattr(handle, "wait_for_durable_admission", None)
+                admission = (
+                    await admission_waiter()
+                    if callable(admission_waiter)
+                    else None
+                )
+                outcome = await await_terminal_delivery(
+                    handle,
+                    label=label,
+                    delivered_statuses=ACCEPTED_STATUSES,
+                )
+                if not outcome.delivered:
+                    logging.warning(
+                        "%s: signal was accepted but never delivered (%s)",
+                        label,
+                        outcome.describe(),
+                    )
+                retry = (
+                    admission is not None
+                    and admission.disposition
+                    is DurableAdmissionDisposition.NOT_ADMITTED
+                )
+            finally:
+                if cancellation_aware and pending.get(task_id) is handle:
+                    pending.pop(task_id, None)
+                if cancellation_aware:
+                    self_declines = vars(self).get("_a2a_self_declining_task_ids")
+                    if isinstance(self_declines, set):
+                        self_declines.discard(task_id)
+            if not retry:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
+
     def _on_background_task_complete(self, task) -> None:
         """
         Callback invoked when a background task completes.
@@ -323,32 +487,31 @@ class EventManagerMixin:
             return
 
         try:
-            from kestrel_sovereign.signals.delivery import (
-                harvest_detached_delivery,
-            )
             from kestrel_sovereign.signals.sources.a2a import (
+                DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_completed_task,
             )
 
-            signal = build_signal_for_completed_task(
-                task=task, target_agent=self.did
-            )
-
-            # enqueue_signal is async and returns a SignalHandle at
+            # enqueue_durable_cognition is async and returns a SignalHandle at
             # *acceptance*; the terminal result only arrives via
             # handle.wait(). We're in a sync callback (TaskManager
-            # ._notify_status_update calls us synchronously), and nothing
-            # durable advances on delivery here \u2014 the task row is already
-            # persisted, this signal is only the wake. So this is
-            # intentional detached dispatch (#2532): the agent's tracker
-            # owns the task so shutdown drains it, and the terminal result
-            # is harvested so a wake that silently failed shows up in the
-            # log instead of vanishing.
-            harvest_detached_delivery(
-                self._track_background_task,
-                lambda: dispatcher.enqueue_signal(signal),
-                label=f"a2a.task_complete[{task_id}]",
-                task_name=f"a2a_complete:{task_id[:8]}",
+            # ._notify_status_update calls us synchronously). The task row is
+            # already terminal, so this signal is only its wake; the selected
+            # durable consumer preserves that wake across Hold and restart.
+            # The agent's tracker owns the initial enqueue and harvests its
+            # terminal result for observability (#2532).
+            self._track_background_task(
+                self._deliver_a2a_wake_until_durable(
+                    signal_factory=lambda: build_signal_for_completed_task(
+                        task=task,
+                        target_agent=self.did,
+                    ),
+                    task_id=str(task_id),
+                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                    label=f"a2a.task_complete[{task_id}]",
+                    cancellation_aware=False,
+                ),
+                name=f"a2a_complete:{task_id[:8]}",
             )
         except Exception as e:
             # Never let a dispatcher failure break the SSE notification
@@ -391,11 +554,8 @@ class EventManagerMixin:
 
         task_id = getattr(task, "id", "<unknown>")
         try:
-            from kestrel_sovereign.signals.delivery import (
-                ACCEPTED_STATUSES,
-                await_terminal_delivery,
-            )
             from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+                DURABLE_COGNITION_CONSUMER_ID,
                 build_signal_for_submitted_task,
             )
 
@@ -407,68 +567,18 @@ class EventManagerMixin:
             metadata = getattr(task, "metadata", None) or {}
             sender = str(metadata.get("sender", "") or "") if isinstance(metadata, dict) else ""
 
-            signal = build_signal_for_submitted_task(
-                task=task,
-                target_agent=getattr(self, "did", ""),
-                sender=sender,
-            )
-
-            label = f"a2a.task_submitted[{task_id}]"
-            pending = vars(self).setdefault(
-                "_a2a_submitted_signal_handles",
-                {},
-            )
-
-            async def enqueue_and_gate() -> None:
-                try:
-                    handle = await dispatcher.enqueue_signal(signal)
-                except Exception as exc:
-                    logging.warning(
-                        "%s: enqueue_signal raised: %s",
-                        label,
-                        exc,
-                        exc_info=True,
-                    )
-                    return
-                pending[str(task_id)] = handle
-                try:
-                    # Close the race where cancellation commits before the
-                    # handle becomes visible to ``_on_task_cancelled``.  Once
-                    # stored, any later cancellation synchronously cancels the
-                    # exact dispatch task; this post-registration read covers
-                    # every earlier cancellation.
-                    snapshot = (
-                        await self.task_manager.get_task_cancellation_snapshot(
-                            str(task_id),
-                            recipient_agent_id=self.did,
-                        )
-                    )
-                    if snapshot is not None and snapshot.state == "canceled":
-                        dispatch_task = getattr(handle, "task", None)
-                        if dispatch_task is not None and not dispatch_task.done():
-                            dispatch_task.cancel()
-                    outcome = await await_terminal_delivery(
-                        handle,
-                        label=label,
-                        delivered_statuses=ACCEPTED_STATUSES,
-                    )
-                    if not outcome.delivered:
-                        logging.warning(
-                            "%s: signal was accepted but never delivered (%s)",
-                            label,
-                            outcome.describe(),
-                        )
-                finally:
-                    if pending.get(str(task_id)) is handle:
-                        pending.pop(str(task_id), None)
-                    self_declines = vars(self).get(
-                        "_a2a_self_declining_task_ids",
-                    )
-                    if isinstance(self_declines, set):
-                        self_declines.discard(str(task_id))
-
             self._track_background_task(
-                enqueue_and_gate(),
+                self._deliver_a2a_wake_until_durable(
+                    signal_factory=lambda: build_signal_for_submitted_task(
+                        task=task,
+                        target_agent=getattr(self, "did", ""),
+                        sender=sender,
+                    ),
+                    task_id=str(task_id),
+                    consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                    label=f"a2a.task_submitted[{task_id}]",
+                    cancellation_aware=True,
+                ),
                 name=f"a2a_submitted:{str(task_id)[:8]}",
             )
         except Exception as e:
@@ -479,6 +589,136 @@ class EventManagerMixin:
                 "Failed to enqueue a2a.task_submitted signal for %s: %s",
                 task_id, e, exc_info=True,
             )
+
+    async def rehydrate_durable_cognition_signal(
+        self,
+        event,
+        *,
+        dispatch_signal,
+    ):
+        """Rebuild a privacy-elided A2A wake from its authoritative task row."""
+
+        source = getattr(event, "source", None)
+        if source not in {"a2a.task_submitted", "a2a.task_complete"}:
+            return None
+        # WORKING recovery deliberately uses a revision-specific source event
+        # identity so it cannot deduplicate against the original SUBMITTED
+        # wake. The canonical task id remains in the durable dedupe field,
+        # which privacy projection retains without storing authored content.
+        task_id = (
+            getattr(event, "dedupe_key", None)
+            if source == "a2a.task_submitted"
+            else getattr(event, "source_event_id", None)
+        )
+        if not isinstance(task_id, str) or not task_id:
+            task_id = getattr(event, "source_event_id", None)
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        if getattr(event, "target_agent", None) != getattr(self, "did", None):
+            return None
+        task = await self.task_manager.get_task_for_recipient(task_id, self.did)
+        if task is None:
+            return None
+
+        if source == "a2a.task_submitted":
+            from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+                build_signal_for_submitted_task,
+            )
+
+            metadata = getattr(task, "metadata", None) or {}
+            sender = (
+                str(metadata.get("sender", "") or "")
+                if isinstance(metadata, dict)
+                else ""
+            )
+            recovered = build_signal_for_submitted_task(
+                task,
+                target_agent=self.did,
+                sender=sender,
+            )
+        else:
+            from kestrel_sovereign.signals.sources.a2a import (
+                build_signal_for_completed_task,
+            )
+
+            recovered = build_signal_for_completed_task(
+                task,
+                target_agent=self.did,
+            )
+        return replace(
+            recovered,
+            id=dispatch_signal.id,
+            arrived_at=dispatch_signal.arrived_at,
+        )
+
+    async def reconcile_a2a_cognition_wakes(self) -> None:
+        """Recreate any A2A wake lost after its authoritative task commit.
+
+        Task callbacks cannot be atomic with the asynchronous signal ledger.
+        Boot therefore treats TaskStore as the outbox authority and idempotently
+        replays candidates before durable drainers are allowed to consume
+        privacy-elided marker rows.
+        """
+
+        from kestrel_sovereign.a2a.types import TaskState
+        from kestrel_sovereign.signals import DurableAdmissionDisposition
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
+            build_signal_for_completed_task,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+            build_signal_for_submitted_task,
+        )
+
+        tasks = await self.task_manager.list_cognition_wake_candidates(
+            recipient_agent_id=self.did,
+            terminal_updated_since=datetime.now(timezone.utc) - timedelta(days=14),
+        )
+        for candidate in tasks:
+            task = candidate.task
+            state = task.status.state
+            if state in {TaskState.SUBMITTED, TaskState.WORKING}:
+                metadata = getattr(task, "metadata", None) or {}
+                sender = (
+                    str(metadata.get("sender", "") or "")
+                    if isinstance(metadata, dict)
+                    else ""
+                )
+                signal = build_signal_for_submitted_task(
+                    task,
+                    target_agent=self.did,
+                    sender=sender,
+                )
+                consumer_id = SUBMITTED_CONSUMER
+                # SUBMITTED owns the callback's original source identity.
+                # WORKING is a later durable lifecycle revision: if the
+                # original wake already ACKed before a process died, reusing
+                # the task ID would deduplicate against that completed wake.
+                source_event_id = (
+                    str(task.id)
+                    if state is TaskState.SUBMITTED
+                    else f"{task.id}:working:{candidate.lifecycle_revision}"
+                )
+            else:
+                signal = build_signal_for_completed_task(
+                    task,
+                    target_agent=self.did,
+                )
+                consumer_id = COMPLETE_CONSUMER
+                source_event_id = str(task.id)
+
+            handle = await self.dispatcher.enqueue_durable_cognition(
+                signal,
+                source_event_id=source_event_id,
+                consumer_id=consumer_id,
+            )
+            receipt = await handle.wait_for_durable_admission()
+            if receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
+                raise RuntimeError(
+                    "A2A cognition outbox reconciliation could not durably "
+                    f"admit task {task.id}"
+                )
 
     async def validate_cognition_signal_execution(self, signal) -> str | None:
         """Fail closed when durable state withdraws an inbound A2A wake.
@@ -504,7 +744,7 @@ class EventManagerMixin:
         if snapshot is None:
             return f"A2A task {task_id!r} no longer exists"
         durable_state = snapshot.state
-        if durable_state != "submitted":
+        if durable_state not in {"submitted", "working"}:
             return (
                 f"A2A task {task_id!r} is already {durable_state!r}; "
                 "its submission wake is no longer executable"
