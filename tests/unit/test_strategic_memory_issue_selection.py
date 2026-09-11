@@ -273,3 +273,120 @@ async def test_the_dispatched_title_is_the_issues_own(monkeypatch):
 
     assert picked["issue_title"] == "What GitHub says"
     assert "A note" in picked["context"]
+
+
+# ---------------------------------------------------------------------------
+# #3280 review round 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_issue_in_its_production_shape_is_not_open(monkeypatch):
+    """[P2] github_api_get does not raise on a 404, a 410, a rate limit or a
+    network error: it returns None. The first "unreadable" test raised, which
+    only exercised _fetch_issue's except branch -- so a mutant turning an
+    unreadable read into a phantom OPEN issue, the exact defect this ticket is
+    about, passed all of it."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/3": None})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#3", "title": "x"}],
+    }
+
+    assert await issue_selection.pick_top_issue(data) is None
+
+
+@pytest.mark.asyncio
+async def test_a_blocker_that_names_its_repo_in_a_field_is_not_ambiguous(monkeypatch):
+    """[P3] The repo FIELD is how 31 of the live host's 33 qualifying blockers
+    name their repository -- a bare number plus repo: owner/name -- and that
+    leg of the contract had no test. With fourteen scan repos a bare number
+    would otherwise be skipped as ambiguous."""
+    _stub_github(monkeypatch, {"/repos/org/repo3/issues/51": _open(51, "named")})
+    data = {
+        "morning_signal_config": {"scan_repos": FOURTEEN},
+        "blockers": [{"severity": "high", "issue": "51", "repo": "org/repo3", "title": "x"}],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked is not None
+    assert (picked["repo"], picked["issue_number"]) == ("org/repo3", 51)
+
+
+@pytest.mark.asyncio
+async def test_a_target_named_by_many_rows_is_read_once(monkeypatch):
+    """[P3] The walk is one GitHub read per distinct (repo, number). On the live
+    host 12 of 33 qualifying rows named the same pull request -- a guaranteed
+    miss, read twelve times every run -- and the ledger only grows."""
+    calls = []
+    pr = {**_open(3112), "pull_request": {"url": "..."}}
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/3112": pr,
+        "/repos/o/r/issues/7": _open(7, "live"),
+    }, calls)
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": (
+            [{"severity": "high", "issue": "3112", "repo": "o/r", "title": f"pr {i}"} for i in range(12)]
+            + [{"severity": "high", "issue": "o/r#7", "title": "live"}]
+        ),
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked["issue_number"] == 7
+    assert calls.count("/repos/o/r/issues/3112") == 1, calls
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
+    """[P3] None means either "nothing is actionable" or "GitHub could not
+    confirm anything". The caller can tell them apart only if selection says
+    how many blockers it checked and how many were unreadable."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": None, "/repos/o/r/issues/2": None})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "high", "issue": "o/r#1", "title": "a"},
+            {"severity": "critical", "issue": "o/r#2", "title": "b"},
+        ],
+    }
+    diagnostics: dict = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert diagnostics == {"blockers_checked": 2, "blockers_unreadable": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
+    """The control: a blocker GitHub answered for, closed, is a real answer --
+    it must not be counted with the unreadable ones, or an all-closed ledger
+    would be reported as an outage."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _closed(1)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#1", "title": "a"}],
+    }
+    diagnostics: dict = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert diagnostics == {"blockers_checked": 1, "blockers_unreadable": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [None, "", "unknown", "OPEN"])
+async def test_only_an_explicitly_open_issue_is_dispatched(monkeypatch, state):
+    """The suite pinned only that a CLOSED issue is refused. ``state != "closed"``
+    would pass all of that while dispatching an issue whose state GitHub did
+    not state -- the permissive reading, for the one action that writes code."""
+    issue = {"number": 5, "title": "t", "labels": []}
+    if state is not None:
+        issue["state"] = state
+    _stub_github(monkeypatch, {"/repos/o/r/issues/5": issue})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#5", "title": "x"}],
+    }
+
+    assert await issue_selection.pick_top_issue(data) is None

@@ -56,8 +56,21 @@ def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
         return repo, None
 
 
-async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return the highest-priority issue represented by strategic memory."""
+async def pick_top_issue(
+    data: Dict[str, Any], diagnostics: Optional[Dict[str, int]] = None
+) -> Optional[Dict[str, Any]]:
+    """Return the highest-priority issue represented by strategic memory.
+
+    ``None`` has two meanings a caller must be able to tell apart: nothing is
+    actionable, or GitHub could not confirm anything. Pass ``diagnostics`` to
+    have ``blockers_checked`` and ``blockers_unreadable`` filled in -- when
+    every blocker checked was unreadable, "no actionable issue" would be a
+    claim about a ledger nobody actually looked at.
+    """
+    if diagnostics is None:
+        diagnostics = {}
+    diagnostics.setdefault("blockers_checked", 0)
+    diagnostics.setdefault("blockers_unreadable", 0)
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -66,6 +79,12 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     config = data.get("morning_signal_config", {})
     repos = config.get("scan_repos", [])
 
+    # One GitHub read per DISTINCT (repo, number), not per row: the ledger only
+    # grows, and on the live host 12 of the 33 qualifying rows named the same
+    # pull request -- a guaranteed miss, read twelve times every run. That is
+    # the bound on this walk: one read per distinct target named by a
+    # high/critical blocker.
+    checked: set = set()
     for blocker in data.get("blockers", []):
         if blocker.get("severity") not in ("critical", "high") or not blocker.get("issue"):
             continue
@@ -98,7 +117,13 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # issues closed for weeks, and the dispatch path picked one of them --
         # a ticket closed on 2026-07-28, under a title that was not the
         # issue's own -- every morning. Talon would have written code for it.
+        if (repo, issue_number) in checked:
+            continue
+        checked.add((repo, issue_number))
         issue = await _fetch_issue(repo, issue_number, token)
+        diagnostics["blockers_checked"] += 1
+        if issue is None:
+            diagnostics["blockers_unreadable"] += 1
         if not _is_open_issue(issue):
             continue
         return {
