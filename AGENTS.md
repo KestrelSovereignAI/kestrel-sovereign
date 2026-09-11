@@ -16,6 +16,8 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 
 ## Code Indexes
 
+**Reach for these before searching the tree.** For "where does X live" or "what is in this area", read the index first — it is cheaper and more complete than a blind grep across 2400 files. Direct search is still right for call sites, string literals, and anything an index does not carry.
+
 - [docs/audit/REPO_MAP.md](docs/audit/REPO_MAP.md) — generated per-file index of this repo (every tracked file with a one-line purpose and its public Python symbols; regenerated nightly).
 - [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) — index of all sibling repositories (feature packages, providers, standalone tools), each with its own `AGENTS.md`.
 
