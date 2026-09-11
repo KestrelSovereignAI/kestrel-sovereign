@@ -109,7 +109,8 @@ class TaskStore(UnifiedStoreBase):
                 cancel_previous_status TEXT,
                 cancel_operation_id TEXT,
                 terminal_operation_id TEXT,
-                lifecycle_revision BIGINT NOT NULL DEFAULT 0
+                lifecycle_revision BIGINT NOT NULL DEFAULT 0,
+                lifecycle_updated_at {ts_type}
             )
         """)
 
@@ -169,6 +170,7 @@ class TaskStore(UnifiedStoreBase):
             SET status = 'failed',
                 message = ?,
                 lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
                 updated_at = {self.now_sql()}
             WHERE status IN ('submitted', 'working', 'input-required')
               AND (creator_agent_id IS NULL OR recipient_agent_id IS NULL)
@@ -189,7 +191,7 @@ class TaskStore(UnifiedStoreBase):
         row = await self._backend.fetch_one("""
             SELECT
                 (
-                    SELECT COUNT(*) = 8
+                    SELECT COUNT(*) = 9
                     FROM information_schema.columns
                     WHERE table_schema = current_schema()
                       AND table_name = 'a2a_tasks'
@@ -201,7 +203,8 @@ class TaskStore(UnifiedStoreBase):
                           'cancel_previous_status',
                           'cancel_operation_id',
                           'terminal_operation_id',
-                          'lifecycle_revision'
+                          'lifecycle_revision',
+                          'lifecycle_updated_at'
                       )
                 )
                 AND EXISTS (
@@ -224,7 +227,7 @@ class TaskStore(UnifiedStoreBase):
                           'a2a_tasks_enforce_authority_fence_v4'
                       AND pg_get_function_identity_arguments(procedure.oid) = ''
                       AND position(
-                          'lifecycle_revision'
+                          'lifecycle_updated_at'
                           IN pg_get_functiondef(procedure.oid)
                       ) > 0
                 )
@@ -267,6 +270,16 @@ class TaskStore(UnifiedStoreBase):
             "a2a_tasks",
             "lifecycle_revision",
             "BIGINT NOT NULL DEFAULT 0",
+        )
+        # When the current revision began. ``updated_at`` cannot stand in:
+        # appending an artifact moves it without a new revision, which would
+        # keep an old wake identity inside the reconciliation window long
+        # after retention forgot it. Rows written before this column existed
+        # stay NULL and are read through ``updated_at``.
+        await self.add_column_if_missing(
+            "a2a_tasks",
+            "lifecycle_updated_at",
+            self.timestamp_type(),
         )
 
         # Cancellation is terminal at the storage boundary, including for
@@ -329,6 +342,10 @@ class TaskStore(UnifiedStoreBase):
                     IF TG_OP = 'UPDATE'
                        AND NEW.status IS DISTINCT FROM OLD.status THEN
                         NEW.lifecycle_revision := OLD.lifecycle_revision + 1;
+                        NEW.lifecycle_updated_at := now();
+                    END IF;
+                    IF TG_OP = 'INSERT' AND NEW.lifecycle_updated_at IS NULL THEN
+                        NEW.lifecycle_updated_at := now();
                     END IF;
                     RETURN NEW;
                 END;
@@ -536,6 +553,7 @@ class TaskStore(UnifiedStoreBase):
                 metadata = ?,
                 terminal_operation_id = ?,
                 lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
@@ -590,8 +608,10 @@ class TaskStore(UnifiedStoreBase):
                 f"""
                 INSERT INTO a2a_tasks
                 (id, session_id, user_id, task_type, status, message, artifacts,
-                 history, metadata, updated_at, creator_agent_id, recipient_agent_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()}, ?, ?)
+                 history, metadata, updated_at, lifecycle_updated_at,
+                 creator_agent_id, recipient_agent_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {self.now_sql()},
+                        {self.now_sql()}, ?, ?)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 (
@@ -803,6 +823,7 @@ class TaskStore(UnifiedStoreBase):
             UPDATE a2a_tasks
             SET status = ?, message = ?,
                 lifecycle_revision = lifecycle_revision + 1,
+                lifecycle_updated_at = {self.now_sql()},
                 updated_at = {self.now_sql()}
             WHERE id = ?
               AND recipient_agent_id = ?
@@ -968,6 +989,7 @@ class TaskStore(UnifiedStoreBase):
                     cancel_reason = ?,
                     cancel_operation_id = ?,
                     lifecycle_revision = lifecycle_revision + 1,
+                    lifecycle_updated_at = {self.now_sql()},
                     updated_at = {self.now_sql()}
                 WHERE {live_authority_predicate}
                 """,
@@ -1115,41 +1137,50 @@ class TaskStore(UnifiedStoreBase):
         self,
         *,
         recipient_agent_id: str,
-        terminal_updated_since: datetime,
+        live_changed_since: datetime,
+        terminal_changed_since: datetime,
     ) -> list[TaskCognitionWakeCandidate]:
         """List authoritative rows whose one-shot cognition wake may be absent.
 
-        Live SUBMITTED/WORKING work is never aged out. Terminal rows are
-        bounded to the signal source's retention horizon so an expired signal
-        is not recreated forever from the longer-lived task ledger.
+        Every row is bounded by when its current lifecycle revision began,
+        against the retention horizon of the source that owns its wake: live
+        SUBMITTED/WORKING rows by the submission source's, terminal rows by
+        the completion source's. A row past its horizon has outlived the
+        durable row that deduplicates its wake, so listing it would recreate
+        that wake once per retention period.
         """
 
         if not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip():
             raise ValueError("Task wake reconciliation requires a concrete recipient")
-        terminal_cutoff = self.to_timestamp_param(terminal_updated_since)
-        terminal_predicate = "updated_at >= ?"
+        changed_at = "COALESCE(lifecycle_updated_at, updated_at)"
         if self.is_sqlite:
             # Task writes use SQLite's ``datetime('now')`` (space separator),
             # while Python's canonical ISO form contains ``T`` and an offset.
             # TEXT comparison orders those representations incorrectly around
             # the retention boundary; SQLite's datetime parser normalizes both.
-            terminal_predicate = "datetime(updated_at) >= datetime(?)"
+            changed_predicate = f"datetime({changed_at}) >= datetime(?)"
+        else:
+            changed_predicate = f"{changed_at} >= ?"
         rows = await self._backend.fetch_all(
             f"""
             SELECT * FROM a2a_tasks
             WHERE recipient_agent_id = ?
               AND (
-                    status IN ('submitted', 'working')
+                    (
+                        status IN ('submitted', 'working')
+                        AND {changed_predicate}
+                    )
                     OR (
                         status IN ('completed', 'failed', 'canceled')
-                        AND {terminal_predicate}
+                        AND {changed_predicate}
                     )
                   )
             ORDER BY created_at ASC
             """,
             (
                 recipient_agent_id,
-                terminal_cutoff,
+                self.to_timestamp_param(live_changed_since),
+                self.to_timestamp_param(terminal_changed_since),
             ),
         )
         candidates: list[TaskCognitionWakeCandidate] = []

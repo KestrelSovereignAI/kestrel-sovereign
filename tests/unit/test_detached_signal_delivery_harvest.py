@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -34,6 +36,13 @@ from kestrel_sovereign.signals import DurableAdmissionDisposition
 from kestrel_sovereign.signals.dispatcher import (
     DurableAdmissionResult,
     SignalDispatchHandle,
+)
+from kestrel_sovereign.signals.registry import SourceRegistry
+from kestrel_sovereign.signals.sources.a2a import (
+    build_a2a_task_complete_registration,
+)
+from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+    build_a2a_task_submitted_registration,
 )
 
 
@@ -60,7 +69,13 @@ class _Agent(EventManagerMixin):
     def __init__(self):
         self.did = "did:test:agent"
         self._pending_task_notifications = []
+        self.signal_registry = SourceRegistry()
+        self.signal_registry.register(build_a2a_task_submitted_registration())
+        self.signal_registry.register(build_a2a_task_complete_registration())
         self.dispatcher = MagicMock()
+        # These callbacks exercise the durable path, which a real dispatcher
+        # takes only once the consumer is registered.
+        self.dispatcher.has_durable_consumer = AsyncMock(return_value=True)
         self.task_manager = MagicMock()
         self.task_manager.get_task = AsyncMock(
             side_effect=lambda task_id: _task(task_id, state=TaskState.SUBMITTED)
@@ -130,7 +145,9 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
         )
     )
 
+    before = datetime.now(timezone.utc)
     await agent.reconcile_a2a_cognition_wakes()
+    after = datetime.now(timezone.utc)
 
     calls = agent.dispatcher.enqueue_durable_cognition.await_args_list
     assert [call.kwargs["source_event_id"] for call in calls] == [
@@ -143,28 +160,131 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
         "core.a2a-task-submitted-cognition-v1",
         "core.a2a-task-complete-cognition-v1",
     ]
+    # Each window is the owning source's registered retention, not a copy.
+    window = agent.task_manager.list_cognition_wake_candidates.await_args.kwargs
+    for key, registration in (
+        ("live_changed_since", build_a2a_task_submitted_registration()),
+        ("terminal_changed_since", build_a2a_task_complete_registration()),
+    ):
+        retention = timedelta(days=registration.retention_days)
+        assert before - retention <= window[key] <= after - retention
+
+
+@pytest.mark.asyncio
+async def test_boot_reconciliation_follows_a_changed_source_retention():
+    """The window moves with the registration, so it cannot drift from it."""
+
+    agent = _Agent()
+    agent.signal_registry = SourceRegistry()
+    agent.signal_registry.register(
+        replace(build_a2a_task_submitted_registration(), retention_days=3)
+    )
+    agent.signal_registry.register(
+        replace(build_a2a_task_complete_registration(), retention_days=40)
+    )
+    agent.task_manager.list_cognition_wake_candidates = AsyncMock(return_value=[])
+
+    before = datetime.now(timezone.utc)
+    await agent.reconcile_a2a_cognition_wakes()
+
+    window = agent.task_manager.list_cognition_wake_candidates.await_args.kwargs
+    assert before - timedelta(days=3, seconds=5) <= window["live_changed_since"]
+    assert window["live_changed_since"] <= before - timedelta(days=3) + timedelta(
+        seconds=5
+    )
+    assert before - timedelta(days=40, seconds=5) <= window[
+        "terminal_changed_since"
+    ] <= before - timedelta(days=40) + timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_boot_reconciliation_refuses_without_a_registered_a2a_source():
+    agent = _Agent()
+    agent.signal_registry = SourceRegistry()
+    agent.signal_registry.register(build_a2a_task_complete_registration())
+    agent.task_manager.list_cognition_wake_candidates = AsyncMock(return_value=[])
+
+    with pytest.raises(RuntimeError, match="a2a.task_submitted"):
+        await agent.reconcile_a2a_cognition_wakes()
+    agent.task_manager.list_cognition_wake_candidates.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
+    """One unadmitted wake refuses boot, but only after every candidate ran."""
+
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
             SimpleNamespace(
                 task=_task("missing-outbox", state=TaskState.SUBMITTED),
                 lifecycle_revision=0,
-            )
+            ),
+            SimpleNamespace(
+                task=_task("behind-it", state=TaskState.COMPLETED),
+                lifecycle_revision=4,
+            ),
         ]
     )
-    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
-        return_value=_durable_signal_handle(
+    dispositions = iter(
+        (
             DurableAdmissionDisposition.NOT_ADMITTED,
+            DurableAdmissionDisposition.COMMITTED,
+        )
+    )
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
+        side_effect=lambda *args, **kwargs: _durable_signal_handle(
+            next(dispositions),
             status=Status.FAILED,
         )
     )
 
-    with pytest.raises(RuntimeError, match="could not durably admit"):
+    with pytest.raises(RuntimeError, match="could not durably admit.*missing-outbox"):
         await agent.reconcile_a2a_cognition_wakes()
+    assert [
+        call.kwargs["source_event_id"]
+        for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
+    ] == ["missing-outbox", "behind-it"]
+
+
+@pytest.mark.asyncio
+async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog):
+    """A wake whose delivery already failed is not lost and cannot wedge boot."""
+
+    agent = _Agent()
+    agent.task_manager.list_cognition_wake_candidates = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                task=_task("exhausted", state=TaskState.SUBMITTED),
+                lifecycle_revision=0,
+            ),
+            SimpleNamespace(
+                task=_task("behind-it", state=TaskState.COMPLETED),
+                lifecycle_revision=4,
+            ),
+        ]
+    )
+    dispositions = iter(
+        (
+            DurableAdmissionDisposition.DELIVERY_FAILED,
+            DurableAdmissionDisposition.COMMITTED,
+        )
+    )
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
+        side_effect=lambda *args, **kwargs: _durable_signal_handle(
+            next(dispositions),
+            status=Status.FAILED,
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await agent.reconcile_a2a_cognition_wakes()
+
+    assert [
+        call.kwargs["source_event_id"]
+        for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
+    ] == ["exhausted", "behind-it"]
+    assert "exhausted already failed terminally" in caplog.text
 
 
 @pytest.mark.asyncio

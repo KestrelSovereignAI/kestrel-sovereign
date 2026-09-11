@@ -1255,13 +1255,15 @@ class TaskManager:
         self,
         *,
         recipient_agent_id: str,
-        terminal_updated_since: datetime,
+        live_changed_since: datetime,
+        terminal_changed_since: datetime,
     ) -> list[TaskCognitionWakeCandidate]:
         """Return task rows that can reconstruct a missing one-shot wake."""
 
         return await self.task_store.list_cognition_wake_candidates(
             recipient_agent_id=recipient_agent_id,
-            terminal_updated_since=terminal_updated_since,
+            live_changed_since=live_changed_since,
+            terminal_changed_since=terminal_changed_since,
         )
 
     async def cancel_task(

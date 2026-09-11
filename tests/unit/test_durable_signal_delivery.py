@@ -2539,6 +2539,74 @@ async def test_cursor_owned_admission_resolves_before_a_hung_cognition_turn(tmp_
 
 
 @pytest.mark.asyncio
+async def test_readmitting_a_terminally_failed_delivery_reports_delivery_failed(
+    tmp_path,
+):
+    """Re-admission cannot revive a failed delivery, and says so (#3163).
+
+    Reported as NOT_ADMITTED, it sent every producer that retries until
+    admitted into a loop no retry could end: the A2A wake retried at its cap
+    forever and boot reconciliation refused every restart.
+    """
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "readmit-failed.db", "did:agent:one"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    agent.process_input = AsyncMock(side_effect=RuntimeError("model route down"))
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        first = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "exhausted"),
+            source_event_id="telegram:update:exhausted",
+            consumer_id=consumer.consumer_id,
+        )
+        assert (
+            await first.wait_for_durable_admission()
+        ).disposition is DurableAdmissionDisposition.COMMITTED
+        await first.wait()
+        [exhausted] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert exhausted.status == FAILED
+        assert exhausted.attempts == 1
+
+        dispatcher._rate.reset()
+        dispatcher._coalescing.reset()
+        again = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "exhausted"),
+            source_event_id="telegram:update:exhausted",
+            consumer_id=consumer.consumer_id,
+        )
+        receipt = await again.wait_for_durable_admission()
+        result = await again.wait()
+
+        assert receipt.disposition is DurableAdmissionDisposition.DELIVERY_FAILED
+        # Still not an ACK: an external cursor stays where it was.
+        assert receipt.acknowledged is False
+        assert result.status is Status.FAILED
+        assert "already failed terminally" in (result.error or "")
+        agent.process_input.assert_awaited_once()
+        [unchanged] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert unchanged.status == FAILED
+        assert unchanged.attempts == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("privacy_preset", ("ephemeral", "isolated", "deidentified"))
 async def test_privacy_elided_first_cognition_delivery_is_claimed_and_acked(
     tmp_path, privacy_preset
@@ -2760,9 +2828,15 @@ async def test_terminal_channel_noop_redelivery_remains_provider_ackable_after_l
             source_event_id="telegram:update:ordinary-terminal-failure",
             consumer_id=consumer.consumer_id,
         )
+        ordinary_receipt = await ordinary_redelivery.wait_for_durable_admission()
+        # Not ACKable, so the provider cursor stays put -- but named for what
+        # it is, so a producer that retries NOT_ADMITTED does not retry this
+        # forever (#3163).
+        assert ordinary_receipt.acknowledged is False
         assert (
-            await ordinary_redelivery.wait_for_durable_admission()
-        ).disposition is DurableAdmissionDisposition.NOT_ADMITTED
+            ordinary_receipt.disposition
+            is DurableAdmissionDisposition.DELIVERY_FAILED
+        )
         assert (await ordinary_redelivery.wait()).status is Status.FAILED
 
         # A deduplicated source event with its selected row absent has no

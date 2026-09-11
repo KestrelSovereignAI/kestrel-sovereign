@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -3075,19 +3076,109 @@ async def test_postgres_fence_versions_legacy_writer_status_transitions(db_backe
 
         revisions = []
         for state in ("working", "input-required", "working"):
+            # Back-date the stamp so the trigger's restamp is observable
+            # within one transaction-clock tick.
+            await db_backend.execute(
+                "UPDATE a2a_tasks SET lifecycle_updated_at = "
+                "NOW() - INTERVAL '30 days' WHERE id = ?",
+                (task_id,),
+            )
             # This deliberately models a pre-upgrade writer: it changes only
-            # status and has no knowledge of lifecycle_revision.
+            # status and has no knowledge of lifecycle_revision or
+            # lifecycle_updated_at.
             await db_backend.execute(
                 "UPDATE a2a_tasks SET status = ? WHERE id = ?",
                 (state, task_id),
             )
             row = await db_backend.fetch_one(
-                "SELECT lifecycle_revision FROM a2a_tasks WHERE id = ?",
+                "SELECT lifecycle_revision, "
+                "lifecycle_updated_at > NOW() - INTERVAL '1 day' "
+                "FROM a2a_tasks WHERE id = ?",
                 (task_id,),
             )
-            revisions.append(row[0])
+            revisions.append((row[0], row[1]))
 
-        assert revisions == [1, 2, 3]
+        assert revisions == [(1, True), (2, True), (3, True)]
+
+        # A legacy insert that names neither column is stamped at the
+        # database boundary, so its first wake is inside the window too.
+        legacy_id = f"{task_id}-insert"
+        await db_backend.execute(
+            "INSERT INTO a2a_tasks (id, task_type, status, creator_agent_id, "
+            "recipient_agent_id) VALUES (?, 'generic', 'submitted', ?, ?)",
+            (legacy_id, "did:test:creator", "did:test:recipient"),
+        )
+        stamped = await db_backend.fetch_one(
+            "SELECT lifecycle_updated_at IS NOT NULL FROM a2a_tasks WHERE id = ?",
+            (legacy_id,),
+        )
+        assert stamped[0] is True
+    finally:
+        await db_backend.execute(
+            "DELETE FROM a2a_tasks WHERE id IN (?, ?)",
+            (task_id, f"{task_id}-insert"),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_wake_window_follows_the_revision_not_an_artifact_on_both_backends(
+    db_backend,
+):
+    """The candidate query bounds live work by its revision's start (#3163)."""
+
+    store = TaskStore(db_backend)
+    await store.initialize()
+    recipient = f"did:test:window-{uuid4().hex}"
+    task_id = f"window-{uuid4().hex}"
+    month_ago = (
+        "NOW() - INTERVAL '30 days'"
+        if db_backend.backend_type == "postgres"
+        else "datetime('now', '-30 days')"
+    )
+    try:
+        await store.create(
+            Task(id=task_id, status=TaskStatus(state=TaskState.WORKING)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id=recipient,
+        )
+        await db_backend.execute(
+            f"UPDATE a2a_tasks SET lifecycle_updated_at = {month_ago}, "
+            f"updated_at = {month_ago} WHERE id = ?",
+            (task_id,),
+        )
+        await store.add_artifact(
+            task_id,
+            Artifact(name="progress.txt", parts=[TextPart(text="still going")]),
+            recipient_agent_id=recipient,
+        )
+        horizon = datetime.now(timezone.utc) - timedelta(days=14)
+
+        async def listed():
+            return [
+                candidate.task.id
+                for candidate in await store.list_cognition_wake_candidates(
+                    recipient_agent_id=recipient,
+                    live_changed_since=horizon,
+                    terminal_changed_since=horizon,
+                )
+            ]
+
+        assert await listed() == []
+        await store.update_status(
+            task_id,
+            TaskStatus(state=TaskState.INPUT_REQUIRED),
+            recipient_agent_id=recipient,
+            expected_state=TaskState.WORKING,
+        )
+        assert await listed() == []  # INPUT_REQUIRED owns no wake
+        await store.update_status(
+            task_id,
+            TaskStatus(state=TaskState.WORKING),
+            recipient_agent_id=recipient,
+            expected_state=TaskState.INPUT_REQUIRED,
+        )
+        assert await listed() == [task_id]
     finally:
         await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
 
@@ -3172,6 +3263,11 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     assert "A2A task requires durable authority" in scripts
     assert "live A2A task requires durable authority" in scripts
     assert "NEW.lifecycle_revision := OLD.lifecycle_revision + 1" in scripts
+    assert "NEW.lifecycle_updated_at := now();" in scripts
+    assert (
+        "IF TG_OP = 'INSERT' AND NEW.lifecycle_updated_at IS NULL THEN"
+        in scripts
+    )
     assert "CREATE TRIGGER a2a_tasks_authority_fence_v4" in scripts
     assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v4()" in scripts
     statements = "\n".join(
@@ -3181,6 +3277,9 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     assert (
         "ADD COLUMN IF NOT EXISTS lifecycle_revision BIGINT NOT NULL DEFAULT 0"
         in statements
+    )
+    assert (
+        "ADD COLUMN IF NOT EXISTS lifecycle_updated_at TIMESTAMPTZ" in statements
     )
 
 
@@ -3232,7 +3331,10 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
     assert "terminal_operation_id" in schema_probes[0]
     assert "lifecycle_revision" in schema_probes[0]
     assert "pg_get_functiondef" in schema_probes[0]
-    assert "COUNT(*) = 8" in schema_probes[0]
+    # A fence installed before lifecycle_updated_at existed is not ready: it
+    # would leave legacy writers' transitions unstamped.
+    assert "'lifecycle_updated_at'\n" in schema_probes[0]
+    assert "COUNT(*) = 9" in schema_probes[0]
 
 
 @pytest.mark.asyncio

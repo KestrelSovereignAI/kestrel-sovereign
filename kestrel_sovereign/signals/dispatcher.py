@@ -217,6 +217,11 @@ class DurableAdmissionDisposition(str, Enum):
     DUPLICATE = "duplicate"
     TERMINAL = "terminal"
     HELD = "held"
+    # The exact delivery already exists and its consumer gave up on it
+    # (attempts exhausted, or the consumer was deactivated). Not acknowledged,
+    # so an external cursor still stays put; but re-admitting the same source
+    # event cannot change it, so it must not read as a retryable NOT_ADMITTED.
+    DELIVERY_FAILED = "delivery_failed"
     NOT_ADMITTED = "not_admitted"
 
 
@@ -3882,6 +3887,27 @@ class SignalDispatcher:
                     Status.COALESCED,
                     error=(
                         "Duplicate source event ID is already leased by its "
+                        f"durable consumer {consumer_id}"
+                    ),
+                    registration=registration,
+                )
+            if existing is not None and existing.status == FAILED:
+                # Terminal and not re-armable by admission. Reporting it as
+                # NOT_ADMITTED would send every producer that retries until
+                # admitted into a loop no retry can end (#3163).
+                if durable_admission is not None and not durable_admission.done():
+                    durable_admission.set_result(
+                        DurableAdmissionResult(
+                            DurableAdmissionDisposition.DELIVERY_FAILED,
+                            signal.id,
+                        )
+                    )
+                return self._fail(
+                    signal,
+                    start,
+                    Status.FAILED,
+                    error=(
+                        "Duplicate source event ID already failed terminally in "
                         f"durable consumer {consumer_id}"
                     ),
                     registration=registration,

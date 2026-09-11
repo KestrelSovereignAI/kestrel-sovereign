@@ -403,7 +403,17 @@ class EventManagerMixin:
                     label=label,
                     delivered_statuses=ACCEPTED_STATUSES,
                 )
-                if not outcome.delivered:
+                if (
+                    admission is not None
+                    and admission.disposition
+                    is DurableAdmissionDisposition.DELIVERY_FAILED
+                ):
+                    logging.warning(
+                        "%s: this task's durable wake already failed "
+                        "terminally; not re-admitting it",
+                        label,
+                    )
+                elif not outcome.delivered:
                     logging.warning(
                         "%s: signal was accepted but never delivered (%s)",
                         label,
@@ -658,23 +668,45 @@ class EventManagerMixin:
         Boot therefore treats TaskStore as the outbox authority and idempotently
         replays candidates before durable drainers are allowed to consume
         privacy-elided marker rows.
+
+        Deduplication is the durable event row, which retention deletes. A
+        wake is admitted no earlier than the lifecycle change that minted it,
+        so its row outlives that change by at least the source's retention.
+        Each candidate is therefore bounded by its own source's retention,
+        measured from the lifecycle change -- live and terminal alike. Past
+        that, a missing row is not evidence of a lost wake, and replaying it
+        would recreate the wake once every retention period.
         """
 
         from kestrel_sovereign.a2a.types import TaskState
         from kestrel_sovereign.signals import DurableAdmissionDisposition
         from kestrel_sovereign.signals.sources.a2a import (
             DURABLE_COGNITION_CONSUMER_ID as COMPLETE_CONSUMER,
+            SOURCE_NAME as COMPLETE_SOURCE,
             build_signal_for_completed_task,
         )
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+            SOURCE_NAME as SUBMITTED_SOURCE,
             build_signal_for_submitted_task,
         )
 
+        now = datetime.now(timezone.utc)
+        horizons = {}
+        for source in (SUBMITTED_SOURCE, COMPLETE_SOURCE):
+            registration = self.signal_registry.get(source)
+            if registration is None:
+                raise RuntimeError(
+                    f"A2A cognition outbox reconciliation needs the {source!r} "
+                    "registration to bound its replay window"
+                )
+            horizons[source] = now - timedelta(days=registration.retention_days)
         tasks = await self.task_manager.list_cognition_wake_candidates(
             recipient_agent_id=self.did,
-            terminal_updated_since=datetime.now(timezone.utc) - timedelta(days=14),
+            live_changed_since=horizons[SUBMITTED_SOURCE],
+            terminal_changed_since=horizons[COMPLETE_SOURCE],
         )
+        unadmitted: list[str] = []
         for candidate in tasks:
             task = candidate.task
             state = task.status.state
@@ -714,11 +746,23 @@ class EventManagerMixin:
                 consumer_id=consumer_id,
             )
             receipt = await handle.wait_for_durable_admission()
-            if receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
-                raise RuntimeError(
-                    "A2A cognition outbox reconciliation could not durably "
-                    f"admit task {task.id}"
+            if receipt.disposition is DurableAdmissionDisposition.DELIVERY_FAILED:
+                # The wake was admitted and then failed terminally. It is not
+                # lost, and raising here would refuse every future boot.
+                logging.warning(
+                    "A2A cognition wake for task %s already failed terminally; "
+                    "leaving it failed",
+                    task.id,
                 )
+            elif receipt.disposition is DurableAdmissionDisposition.NOT_ADMITTED:
+                unadmitted.append(str(task.id))
+        if unadmitted:
+            # Fail closed before the drainers start, but only after every
+            # candidate had its chance: one bad row must not strand the rest.
+            raise RuntimeError(
+                "A2A cognition outbox reconciliation could not durably admit "
+                f"task(s) {', '.join(unadmitted)}"
+            )
 
     async def validate_cognition_signal_execution(self, signal) -> str | None:
         """Fail closed when durable state withdraws an inbound A2A wake.

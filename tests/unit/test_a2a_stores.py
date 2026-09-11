@@ -346,11 +346,11 @@ class TestTaskStore:
         assert pending[0].status.state == TaskState.SUBMITTED
 
     @pytest.mark.asyncio
-    async def test_cognition_wake_candidates_keep_live_and_bound_terminal_rows(
+    async def test_cognition_wake_candidates_bound_each_group_by_its_own_horizon(
         self,
         db_path,
     ):
-        """Outbox repair is unbounded for live work but not expired history."""
+        """Live and terminal rows are each bounded by their source's window."""
 
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -368,20 +368,25 @@ class TestTaskStore:
                 recipient_agent_id=recipient,
             )
 
-        after_every_terminal = await store.list_cognition_wake_candidates(
-            recipient_agent_id="did:test:recipient",
-            terminal_updated_since=datetime.now(timezone.utc) + timedelta(days=1),
-        )
-        including_recent_terminal = await store.list_cognition_wake_candidates(
-            recipient_agent_id="did:test:recipient",
-            terminal_updated_since=datetime.now(timezone.utc) - timedelta(days=1),
-        )
+        future = datetime.now(timezone.utc) + timedelta(days=1)
+        past = datetime.now(timezone.utc) - timedelta(days=1)
 
-        assert {candidate.task.id for candidate in after_every_terminal} == {
+        async def candidate_ids(*, live, terminal):
+            return {
+                candidate.task.id
+                for candidate in await store.list_cognition_wake_candidates(
+                    recipient_agent_id="did:test:recipient",
+                    live_changed_since=live,
+                    terminal_changed_since=terminal,
+                )
+            }
+
+        assert await candidate_ids(live=past, terminal=future) == {
             "live-submitted",
             "live-working",
         }
-        assert {candidate.task.id for candidate in including_recent_terminal} == {
+        assert await candidate_ids(live=future, terminal=past) == {"terminal"}
+        assert await candidate_ids(live=past, terminal=past) == {
             "live-submitted",
             "live-working",
             "terminal",
@@ -389,7 +394,9 @@ class TestTaskStore:
 
         # SQLite task transitions use ``datetime('now')`` and therefore store
         # a space-separated timestamp. The ISO ``T`` in a Python cutoff must
-        # not turn lexical formatting into the retention decision.
+        # not turn lexical formatting into the retention decision. This row
+        # also names no lifecycle_updated_at, as a writer that predates the
+        # column would not, so it is read through updated_at.
         await backend.execute(
             "INSERT INTO a2a_tasks "
             "(id, task_type, status, updated_at, creator_agent_id, "
@@ -405,7 +412,8 @@ class TestTaskStore:
         )
         near_boundary = await store.list_cognition_wake_candidates(
             recipient_agent_id="did:test:recipient",
-            terminal_updated_since=datetime(
+            live_changed_since=future,
+            terminal_changed_since=datetime(
                 2026, 8, 26, 18, 0, 0, tzinfo=timezone.utc
             ),
         )
@@ -426,7 +434,8 @@ class TestTaskStore:
             candidate
             for candidate in await store.list_cognition_wake_candidates(
                 recipient_agent_id="did:test:recipient",
-                terminal_updated_since=datetime.now(timezone.utc),
+                live_changed_since=past,
+                terminal_changed_since=datetime.now(timezone.utc),
             )
             if candidate.task.id == "live-submitted"
         ]
@@ -446,12 +455,89 @@ class TestTaskStore:
             candidate
             for candidate in await store.list_cognition_wake_candidates(
                 recipient_agent_id="did:test:recipient",
-                terminal_updated_since=datetime.now(timezone.utc),
+                live_changed_since=past,
+                terminal_changed_since=datetime.now(timezone.utc),
             )
             if candidate.task.id == "live-submitted"
         ]
         assert first_working.lifecycle_revision == 1
         assert second_working.lifecycle_revision == 3
+
+    @pytest.mark.asyncio
+    async def test_artifact_append_keeps_no_stale_wake_inside_the_window(
+        self,
+        db_path,
+    ):
+        """An artifact moves updated_at but not the wake identity (#3163).
+
+        Bounding live work by updated_at would keep a month-old WORKING
+        revision listed after retention deleted the row that deduplicates its
+        wake, recreating that wake every retention period.
+        """
+
+        backend = SQLiteBackend(db_path)
+        await backend.connect()
+        store = track_store(TaskStore(backend))
+        await store.initialize()
+        await store.save(
+            Task(id="long-running", status=TaskStatus(state=TaskState.WORKING)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        stamped = await backend.fetch_one(
+            "SELECT lifecycle_updated_at IS NOT NULL FROM a2a_tasks WHERE id = ?",
+            ("long-running",),
+        )
+        assert stamped[0] == 1
+        await backend.execute(
+            "UPDATE a2a_tasks SET lifecycle_updated_at = "
+            "datetime('now', '-30 days'), updated_at = "
+            "datetime('now', '-30 days') WHERE id = ?",
+            ("long-running",),
+        )
+        await store.add_artifact(
+            "long-running",
+            Artifact(name="progress.txt", parts=[TextPart(text="still going")]),
+            recipient_agent_id="did:test:recipient",
+        )
+        row = await backend.fetch_one(
+            "SELECT lifecycle_revision, "
+            "datetime(updated_at) > datetime('now', '-1 day'), "
+            "datetime(lifecycle_updated_at) < datetime('now', '-1 day') "
+            "FROM a2a_tasks WHERE id = ?",
+            ("long-running",),
+        )
+        assert tuple(row) == (0, 1, 1)
+        horizon = datetime.now(timezone.utc) - timedelta(days=14)
+
+        async def listed():
+            return [
+                candidate
+                for candidate in await store.list_cognition_wake_candidates(
+                    recipient_agent_id="did:test:recipient",
+                    live_changed_since=horizon,
+                    terminal_changed_since=horizon,
+                )
+                if candidate.task.id == "long-running"
+            ]
+
+        assert await listed() == []
+
+        # A new revision is a new wake identity, and it is inside the window.
+        await store.update_status(
+            "long-running",
+            TaskStatus(state=TaskState.INPUT_REQUIRED),
+            recipient_agent_id="did:test:recipient",
+            expected_state=TaskState.WORKING,
+        )
+        await store.update_status(
+            "long-running",
+            TaskStatus(state=TaskState.WORKING),
+            recipient_agent_id="did:test:recipient",
+            expected_state=TaskState.INPUT_REQUIRED,
+        )
+        [candidate] = await listed()
+        assert candidate.lifecycle_revision == 2
 
     @pytest.mark.asyncio
     async def test_list_tasks_by_session(self, db_path):
