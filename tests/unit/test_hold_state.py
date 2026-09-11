@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import sqlite3
@@ -25,9 +26,11 @@ from kestrel_sovereign.hold import (
     HoldStore,
 )
 from kestrel_sovereign.hold.state import (
+    _HOLD_SCHEMA_TABLES,
     _POSTGRES_EVIDENCE_LOCK,
     _WITNESS_BACKFILL,
     HoldCorruptStateError,
+    HoldDatabaseSnapshot,
     PostgresHoldCustodySnapshot,
     _latch_from_row,
     _postgres_custody_locks,
@@ -37,11 +40,13 @@ from kestrel_sovereign.hold.state import (
     _terminal_authority_ids,
     hold_history_anchor_path,
     hold_initialization_witness_path,
+    hold_sqlite_custody_marker_path,
     initialize_postgres_hold_databases,
     postgres_hold_custody_binding_payload,
     preflight_postgres_hold_custody,
     validate_hold_readiness_snapshot,
     validate_postgres_hold_custody,
+    validate_postgres_hold_readiness_snapshot,
     validate_sqlite_hold_readiness,
 )
 from kestrel_sovereign.host_features.context import (
@@ -5931,3 +5936,338 @@ def test_backend_switch_probe_never_creates_sidecars_in_the_audited_directory(
         f"the audit probe wrote into the directory it audits: "
         f"{sorted(set(after) - set(before))}"
     )
+
+
+# An unused schema left without initialization evidence (#3287).
+#
+# Recorded verbatim from the production host database that refused every boot
+# on 2026-09-11. Pre-release Hold code created these tables and the witness
+# migration marker in the real host database, and predated the external
+# witness, anchor, and custody marker, so it wrote none of them. The named
+# unique indexes current code creates are absent too.
+_PRERELEASE_HOLD_SCHEMA = (
+    "CREATE TABLE hold_latches (scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+    "active INTEGER NOT NULL DEFAULT 0, hold_receipt_id TEXT NOT NULL DEFAULT '', "
+    "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', "
+    "set_at TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, "
+    "PRIMARY KEY (scope, target_id), CHECK (scope IN ('host', 'agent')), "
+    "CHECK (scope <> 'host' OR target_id = 'host'), CHECK (active IN (0, 1)), "
+    "CHECK (revision >= 0))",
+    "CREATE TABLE hold_receipts (receipt_id TEXT NOT NULL PRIMARY KEY, "
+    "operation_id TEXT NOT NULL UNIQUE, action TEXT NOT NULL, "
+    "disposition TEXT NOT NULL, scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+    "reason TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL, "
+    "occurred_at TEXT NOT NULL, expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+    "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+    "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+    "CHECK (action IN ('hold', 'release')), "
+    "CHECK (disposition IN ('applied', 'already_in_state', 'refused_stale')), "
+    "CHECK (scope IN ('host', 'agent')), "
+    "CHECK (scope <> 'host' OR target_id = 'host'))",
+    "CREATE INDEX idx_hold_receipts_target "
+    "ON hold_receipts(scope, target_id, occurred_at, receipt_id)",
+    "CREATE TABLE hold_receipt_witnesses (scope TEXT NOT NULL, "
+    "target_id TEXT NOT NULL, receipt_count INTEGER NOT NULL DEFAULT 0, "
+    "PRIMARY KEY (scope, target_id), CHECK (scope IN ('host', 'agent')), "
+    "CHECK (scope <> 'host' OR target_id = 'host'), CHECK (receipt_count >= 0))",
+    "CREATE TABLE hold_receipt_content_witnesses (receipt_id TEXT NOT NULL "
+    "PRIMARY KEY, scope TEXT NOT NULL, target_id TEXT NOT NULL, "
+    "receipt_digest TEXT NOT NULL, CHECK (scope IN ('host', 'agent')), "
+    "CHECK (scope <> 'host' OR target_id = 'host'))",
+    "CREATE INDEX idx_hold_receipt_content_witnesses_target "
+    "ON hold_receipt_content_witnesses(scope, target_id)",
+    "CREATE TABLE hold_operation_witnesses (operation_id TEXT NOT NULL "
+    "PRIMARY KEY, receipt_id TEXT NOT NULL UNIQUE)",
+    "CREATE TABLE hold_schema_migrations (name TEXT NOT NULL PRIMARY KEY)",
+)
+
+# One row that makes each table evidence Hold may have been in force.
+_ONE_RECORDED_ROW = {
+    "hold_latches": (
+        "INSERT INTO hold_latches (scope, target_id) VALUES ('host', 'host')"
+    ),
+    "hold_receipts": (
+        "INSERT INTO hold_receipts (receipt_id, operation_id, action, "
+        "disposition, scope, target_id, actor_id, occurred_at) VALUES "
+        "('receipt-1', 'operation-1', 'hold', 'applied', 'host', 'host', "
+        "'did:sovereign:operator', '2026-09-01T00:00:00+00:00')"
+    ),
+    "hold_receipt_witnesses": (
+        "INSERT INTO hold_receipt_witnesses (scope, target_id, receipt_count) "
+        "VALUES ('host', 'host', 1)"
+    ),
+    "hold_receipt_content_witnesses": (
+        "INSERT INTO hold_receipt_content_witnesses (receipt_id, scope, "
+        "target_id, receipt_digest) VALUES ('receipt-1', 'host', 'host', "
+        "'" + "0" * 64 + "')"
+    ),
+    "hold_operation_witnesses": (
+        "INSERT INTO hold_operation_witnesses (operation_id, receipt_id) "
+        "VALUES ('operation-1', 'receipt-1')"
+    ),
+}
+
+
+async def _leave_prerelease_hold_schema(database: Path, *extra: str) -> None:
+    """Write what the pre-release code left: tables and a marker, no evidence."""
+
+    database.parent.mkdir(mode=0o700, exist_ok=True)
+    db = await AsyncDatabase.sqlite(str(database))
+    try:
+        for statement in _PRERELEASE_HOLD_SCHEMA:
+            await db.execute(statement)
+        await db.execute(
+            "INSERT INTO hold_schema_migrations (name) VALUES (?)",
+            (_WITNESS_BACKFILL,),
+        )
+        for statement in extra:
+            await db.execute(statement)
+    finally:
+        await db.close()
+    # Production host databases are private; readiness refuses anything else.
+    for member in database.parent.glob(f"{database.name}*"):
+        member.chmod(0o600)
+
+
+def _hold_state_warnings(caplog) -> list[str]:
+    """Every WARNING the Hold state module logged, whatever it says.
+
+    Asserting on the adoption message's own wording would let a revert that
+    restores the old wording along with the old position pass.
+    """
+
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.hold.state"
+        and record.levelno >= logging.WARNING
+    ]
+
+
+def _hold_index_names(database: Path) -> set[str]:
+    # mode=ro alone would create the -shm of a stopped database, which the
+    # readiness check under test then reads as a live host.
+    live = Path(f"{database}-wal").exists()
+    flags = "mode=ro" if live else "mode=ro&immutable=1"
+    with contextlib.closing(
+        sqlite3.connect(f"{database.as_uri()}?{flags}", uri=True)
+    ) as connection:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name LIKE 'hold_%'"
+            )
+        }
+
+
+@pytest.mark.asyncio
+async def test_host_boot_adopts_unused_schema_left_without_evidence(
+    tmp_path,
+    caplog,
+):
+    """The state that wedged production is a first bootstrap, not lost custody.
+
+    No latch, receipt, or witness was ever recorded and no custody marker
+    proves an earlier initialization, so there is no Hold to protect. Boot
+    completes the bootstrap, the doctor predicts that, and the adopted store
+    then behaves like any other.
+    """
+
+    database = tmp_path / "host-data" / "host-features.db"
+    await _leave_prerelease_hold_schema(database)
+    assert "idx_hold_latches_scope_target_unique" not in _hold_index_names(database)
+
+    assert validate_sqlite_hold_readiness(database) == ()
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is not None, context.backend_error
+        assert await context.hold_store.read_boot_state() == ()
+        assert "completed them as a first bootstrap" in caplog.text
+        assert hold_initialization_witness_path(database).exists()
+        assert hold_history_anchor_path(database).exists()
+        assert hold_sqlite_custody_marker_path(database).exists()
+        assert "idx_hold_latches_scope_target_unique" in _hold_index_names(
+            database
+        )
+        mutation = await context.hold_store.set_hold(
+            scope="agent",
+            target_id="did:agent:after-adoption",
+            actor_id="did:sovereign:operator",
+            reason="adopted store records Hold",
+            operation_id="hold-after-adoption",
+        )
+    finally:
+        await close_host_context_resources(context)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        reopened = await build_host_context(db_path=str(database))
+    try:
+        assert reopened.hold_store is not None, reopened.backend_error
+        assert await reopened.hold_store.read_boot_state() == (mutation.current,)
+        assert _hold_state_warnings(caplog) == []
+    finally:
+        await close_host_context_resources(reopened)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("table", sorted(_ONE_RECORDED_ROW))
+async def test_schema_without_evidence_that_recorded_a_row_is_refused(
+    tmp_path,
+    caplog,
+    table,
+):
+    """Any recorded row may be Hold history, so boot and doctor both refuse."""
+
+    database = tmp_path / "host-data" / "host-features.db"
+    await _leave_prerelease_hold_schema(database, _ONE_RECORDED_ROW[table])
+    reason = rf"witness is missing for an initialized schema\..*{table} holds 1 row"
+
+    with pytest.raises(HoldCorruptStateError, match=reason):
+        validate_sqlite_hold_readiness(database)
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is None
+        assert f"{table} holds 1 row" in context.backend_error
+        assert _hold_state_warnings(caplog) == []
+    finally:
+        await close_host_context_resources(context)
+    assert not hold_initialization_witness_path(database).exists()
+
+
+@pytest.mark.asyncio
+async def test_empty_schema_is_refused_when_custody_proves_initialization(
+    tmp_path,
+    caplog,
+):
+    """Empty tables beside a custody marker are erased evidence, not a first boot."""
+
+    database = tmp_path / "host-data" / "host-features.db"
+    database.parent.mkdir(mode=0o700)
+    first = await build_host_context(db_path=str(database))
+    assert first.hold_store is not None, first.backend_error
+    await close_host_context_resources(first)
+    hold_initialization_witness_path(database).unlink()
+    hold_history_anchor_path(database).unlink()
+    assert hold_sqlite_custody_marker_path(database).exists()
+    reason = "custody marker proves an earlier initialization"
+
+    with pytest.raises(HoldCorruptStateError, match=reason):
+        validate_sqlite_hold_readiness(database)
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is None
+        assert reason in context.backend_error
+        assert _hold_state_warnings(caplog) == []
+    finally:
+        await close_host_context_resources(context)
+
+
+@pytest.mark.asyncio
+async def test_empty_schema_with_an_unknown_migration_is_refused(
+    tmp_path,
+    caplog,
+):
+    """A migration this code does not know came from a release it cannot judge."""
+
+    database = tmp_path / "host-data" / "host-features.db"
+    await _leave_prerelease_hold_schema(
+        database,
+        "INSERT INTO hold_schema_migrations (name) VALUES ('hold_state_v9')",
+    )
+    reason = "unknown migration 'hold_state_v9'"
+
+    with pytest.raises(HoldCorruptStateError, match=reason):
+        validate_sqlite_hold_readiness(database)
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is None
+        assert reason in context.backend_error
+        assert _hold_state_warnings(caplog) == []
+    finally:
+        await close_host_context_resources(context)
+
+
+@pytest.mark.asyncio
+async def test_refusal_after_adoption_does_not_claim_a_completed_bootstrap(
+    tmp_path,
+    caplog,
+):
+    """A boot that adopts and then refuses must not log that it completed one.
+
+    The staged history candidate is refused after the adoption decision is
+    taken, and an operator greps that WARNING to tell a cleared wedge from a
+    host that is still down.
+    """
+
+    database = tmp_path / "host-data" / "host-features.db"
+    await _leave_prerelease_hold_schema(database)
+    candidate = Path(f"{hold_history_anchor_path(database)}.pending")
+    candidate.write_bytes(b"kestrel-hold-history-v1\n0\n" + b"0" * 64 + b"\n")
+    candidate.chmod(0o600)
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is None
+        assert "publication exists without initialized schema" in (
+            context.backend_error
+        )
+        assert _hold_state_warnings(caplog) == []
+    finally:
+        await close_host_context_resources(context)
+    assert not hold_initialization_witness_path(database).exists()
+
+
+@pytest.mark.asyncio
+async def test_unused_schema_without_its_migration_table_is_adopted(tmp_path):
+    """A partial unused schema records nothing either, so boot completes it."""
+
+    database = tmp_path / "host-data" / "host-features.db"
+    database.parent.mkdir(mode=0o700, exist_ok=True)
+    db = await AsyncDatabase.sqlite(str(database))
+    try:
+        for statement in _PRERELEASE_HOLD_SCHEMA:
+            if "hold_schema_migrations" not in statement:
+                await db.execute(statement)
+    finally:
+        await db.close()
+    for member in database.parent.glob(f"{database.name}*"):
+        member.chmod(0o600)
+
+    assert validate_sqlite_hold_readiness(database) == ()
+
+    context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is not None, context.backend_error
+        assert await context.hold_store.read_boot_state() == ()
+        assert hold_initialization_witness_path(database).exists()
+    finally:
+        await close_host_context_resources(context)
+
+
+def test_backend_without_custody_marker_still_refuses_unused_schema():
+    """PostgreSQL Hold keeps no marker that proves it was never initialized."""
+
+    snapshot = HoldDatabaseSnapshot(
+        existing_tables=frozenset(_HOLD_SCHEMA_TABLES),
+        migration_rows=((_WITNESS_BACKFILL,),),
+    )
+
+    with pytest.raises(
+        HoldCorruptStateError,
+        match="keeps no independent evidence that Hold was never initialized",
+    ):
+        validate_postgres_hold_readiness_snapshot(
+            snapshot=snapshot,
+            evidence_rows=[],
+        )

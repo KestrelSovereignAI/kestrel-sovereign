@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import logging
 import os
 import sqlite3
 import stat
@@ -43,6 +44,8 @@ from kestrel_sovereign.private_storage import (
     path_exists,
 )
 from kestrel_sovereign.storage.database_clock import database_now_sql
+
+logger = logging.getLogger(__name__)
 
 HOST_HOLD_TARGET = "host"
 _SCHEMA_LOCK = "hold_state_v1"
@@ -1199,6 +1202,52 @@ def _validate_sqlite_custody_evidence(
     return marked
 
 
+_UNUSED_SCHEMA_UNASSESSED = (
+    "this backend keeps no independent evidence that Hold was never initialized"
+)
+
+
+def _unused_schema_refusal(
+    *,
+    row_counts: Mapping[str, int],
+    migration_names: tuple[object, ...],
+    custody_marked: bool,
+) -> str | None:
+    """Say why uninitialized Hold tables are not an unused first bootstrap.
+
+    Boot already treats a database with no Hold tables and no external
+    evidence as a first bootstrap. Tables that exist but never recorded
+    anything carry the same facts: no latch, receipt, or witness row, only the
+    marker a schema transaction writes, and no SQLite custody marker proving
+    an earlier initialization. Adopting them grants nothing that dropping
+    those empty tables would not, so returning ``None`` is safe. Any recorded
+    row, the custody marker, or a migration this code does not know means Hold
+    may have been in force, and the absent witness must be restored instead.
+
+    Pre-release Hold code that predated the external witness left exactly
+    this state in a production host database and refused its next boot
+    (#3287).
+    """
+
+    if custody_marked:
+        return "the SQLite custody marker proves an earlier initialization"
+    occupied = [
+        f"{table} holds {count} row{'' if count == 1 else 's'}"
+        for table, count in sorted(row_counts.items())
+        if table != "hold_schema_migrations" and count
+    ]
+    if occupied:
+        return ", ".join(occupied)
+    unknown = sorted(
+        repr(name) for name in migration_names if name != _WITNESS_BACKFILL
+    )
+    if unknown:
+        return "hold_schema_migrations records unknown migration " + ", ".join(
+            unknown
+        )
+    return None
+
+
 def _terminal_authority_ids(
     authorities: Mapping[str, HoldReceipt],
     consumers: Mapping[str, HoldReceipt],
@@ -1890,8 +1939,14 @@ def validate_hold_readiness_snapshot(
     history_anchor: bytes | None,
     history_candidate: bytes | None,
     bootstrap_intent: bytes | None,
+    sqlite_custody_marked: bool | None = None,
 ) -> tuple[HoldState, ...]:
-    """Predict the exact bootstrap/read gate without mutating durable state."""
+    """Predict the exact bootstrap/read gate without mutating durable state.
+
+    ``sqlite_custody_marked`` says whether the SQLite custody marker exists;
+    ``None`` means the backend keeps no such marker, as boot's own PostgreSQL
+    store does not, so an unused schema is refused exactly as boot refuses it.
+    """
 
     existing = set(snapshot.existing_tables)
     if any(not isinstance(table, str) for table in existing):
@@ -1948,11 +2003,25 @@ def validate_hold_readiness_snapshot(
                 "Hold bootstrap intent has invalid durable evidence"
             ) from exc
 
+    unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED
+    if sqlite_custody_marked is not None:
+        unused_schema_refusal = _unused_schema_refusal(
+            row_counts={
+                table: len(rows)
+                for table, rows in rows_by_table.items()
+                if table in existing
+            },
+            migration_names=tuple(
+                row[0] if len(row) == 1 else row for row in snapshot.migration_rows
+            ),
+            custody_marked=sqlite_custody_marked,
+        )
     HoldStore._validate_schema_evidence(
         initialized=initialized,
         anchored=anchored,
         existing=existing,
         bootstrap_pending=bootstrap_history is not None,
+        unused_schema_refusal=unused_schema_refusal,
     )
     receipt_rows = snapshot.receipt_rows
     current = HoldStore._history_anchor_payload_from_rows(receipt_rows)
@@ -3261,6 +3330,24 @@ class HoldStore:
             )
         return {str(row[0]) for row in rows}
 
+    async def _schema_row_counts(self, existing: set[str]) -> dict[str, int]:
+        """Count rows in each existing Hold table without reading its columns."""
+
+        counts: dict[str, int] = {}
+        for table in sorted(existing & _HOLD_SCHEMA_TABLES):
+            row = await self._db.fetchone(f"SELECT COUNT(*) FROM {table}")
+            counts[table] = int(row[0])
+        return counts
+
+    async def _schema_migration_names(
+        self,
+        existing: set[str],
+    ) -> tuple[object, ...]:
+        if "hold_schema_migrations" not in existing:
+            return ()
+        rows = await self._db.fetchall("SELECT name FROM hold_schema_migrations")
+        return tuple(row[0] for row in rows)
+
     async def _read_database_snapshot(self) -> HoldDatabaseSnapshot:
         """Read every Hold projection and witness from one stable database."""
 
@@ -3328,7 +3415,14 @@ class HoldStore:
         anchored: bytes | None,
         existing: set[str],
         bootstrap_pending: bool = False,
-    ) -> None:
+        unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED,
+    ) -> bool:
+        """Refuse evidence boot cannot trust; return whether it adopts tables.
+
+        ``unused_schema_refusal`` is :func:`_unused_schema_refusal` for this
+        database, or the default when the caller cannot assess it.
+        """
+
         legacy_tables = {"hold_latches", "hold_receipts"}
         if initialized and anchored is None:
             raise HoldCorruptStateError("Hold history anchor is missing")
@@ -3338,9 +3432,17 @@ class HoldStore:
                     "Hold history anchor exists without its initialization witness"
                 )
             if existing - legacy_tables:
+                if unused_schema_refusal is None:
+                    return True
                 raise HoldCorruptStateError(
-                    "Hold initialization witness is missing for an initialized schema"
+                    "Hold initialization witness is missing for an initialized "
+                    "schema. Boot will not adopt it as an unused first "
+                    f"bootstrap because {unused_schema_refusal}. Restore the "
+                    "Hold witness and history anchor saved with this database, "
+                    "or boot the Kestrel release that wrote it; dropping Hold "
+                    "tables that hold rows would erase Hold history"
                 )
+        return False
 
     async def _ensure_external_schema_protocol(self) -> None:
         """Run or recover bootstrap under the external protocol lock."""
@@ -3349,11 +3451,22 @@ class HoldStore:
         anchored = await self._read_history_anchor()
         existing = await self._existing_schema_tables()
         bootstrap_history = await self._read_external_bootstrap_intent()
-        self._validate_schema_evidence(
+        custody_marker = None
+        unused_schema_refusal: str | None = _UNUSED_SCHEMA_UNASSESSED
+        if self._custody_marker_path is not None:
+            custody_marker = self._read_sqlite_custody_marker()
+            if not initialized and bootstrap_history is None:
+                unused_schema_refusal = _unused_schema_refusal(
+                    row_counts=await self._schema_row_counts(existing),
+                    migration_names=await self._schema_migration_names(existing),
+                    custody_marked=custody_marker is not None,
+                )
+        adopting_unused_schema = self._validate_schema_evidence(
             initialized=initialized,
             anchored=anchored,
             existing=existing,
             bootstrap_pending=bootstrap_history is not None,
+            unused_schema_refusal=unused_schema_refusal,
         )
         current_bootstrap_history = await self._bootstrap_history_anchor(existing)
         if (
@@ -3371,9 +3484,7 @@ class HoldStore:
             raise HoldCorruptStateError(
                 "Hold bootstrap intent conflicts with the stable history anchor"
             )
-        custody_marker = None
         if self._custody_marker_path is not None:
-            custody_marker = self._read_sqlite_custody_marker()
             _validate_sqlite_custody_evidence(
                 marker_payload=custody_marker,
                 expected_payload=None,
@@ -3418,6 +3529,18 @@ class HoldStore:
         # evidence, then retire the recovery authority last.
         await self._write_history_anchor()
         await self._write_initialization_witness()
+        if adopting_unused_schema:
+            # After the witness, not before the refusals that follow adoption:
+            # a boot that still refuses (a staged history candidate, a schema
+            # transaction that cannot resolve a conflict key) must not leave a
+            # line saying it completed a bootstrap it never completed.
+            logger.warning(
+                "Hold tables in %s had no initialization evidence and had "
+                "never recorded a latch, receipt, or witness, and no custody "
+                "marker proved an earlier initialization; completed them as a "
+                "first bootstrap",
+                self._custody_control_path,
+            )
         self._write_sqlite_custody_marker(current_bootstrap_history)
         await self._remove_external_bootstrap_intent()
 
@@ -5316,6 +5439,7 @@ def validate_sqlite_hold_readiness(
                 history_anchor=evidence_after[1],
                 history_candidate=evidence_after[2],
                 bootstrap_intent=evidence_after[3],
+                sqlite_custody_marked=evidence_after[4] is not None,
             )
 
     _validate_sqlite_creation_parent(
@@ -5417,6 +5541,7 @@ def validate_sqlite_hold_readiness(
             history_anchor=evidence_after[1],
             history_candidate=evidence_after[2],
             bootstrap_intent=evidence_after[3],
+            sqlite_custody_marked=evidence_after[4] is not None,
         )
         _validate_sqlite_custody_readiness(
             database=database,
