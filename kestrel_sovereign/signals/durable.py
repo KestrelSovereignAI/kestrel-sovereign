@@ -967,6 +967,12 @@ class DurableDelivery:
 
         return self.event.source_sequence
 
+    @property
+    def is_terminal(self) -> bool:
+        """Whether no claim, retry, or lease recovery can run this again."""
+
+        return self.status in _TERMINAL_STATUSES
+
 
 def _json_dump(value: Any) -> str:
     return json.dumps(value, default=_json_default, ensure_ascii=False, sort_keys=True)
@@ -4877,6 +4883,36 @@ class DurableSignalStore(UnifiedStoreBase):
                 "d.agent_id = ? AND d.consumer_id = ? AND d.event_id = ?"
             ),
             (agent_id, consumer_id, event_id),
+        )
+        return self._row_to_delivery(row) if row is not None else None
+
+    async def get_delivery_for_source_event(
+        self,
+        *,
+        agent_id: str,
+        consumer_id: str,
+        source: str,
+        source_event_id: str,
+    ) -> Optional[DurableDelivery]:
+        """Read one consumer delivery by the producer's own event identity.
+
+        The same key admission deduplicates on, so it finds exactly the row a
+        re-admission of that source event would reuse.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("source", source)
+        row = await self._backend.fetch_one(
+            self._delivery_select_sql(
+                "d.agent_id = ? AND d.consumer_id = ? AND e.agent_id = ? "
+                "AND e.source = ? AND e.source_event_id = ?"
+            ),
+            (
+                agent_id,
+                consumer_id,
+                agent_id,
+                source,
+                self._normalize_source_event_id(source_event_id),
+            ),
         )
         return self._row_to_delivery(row) if row is not None else None
 

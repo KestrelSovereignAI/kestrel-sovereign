@@ -1947,6 +1947,19 @@ class SignalDispatcher:
                 event_id=event_id,
             )
 
+    async def get_durable_delivery_for_source_event(
+        self, *, consumer_id: str, source: str, source_event_id: str
+    ) -> Optional[DurableDelivery]:
+        """Read one consumer delivery by its producer's source event ID."""
+        async with self._admit_durable_operation():
+            await self.initialize_durable_delivery()
+            return await self._durable_store.get_delivery_for_source_event(
+                agent_id=self._agent.did,
+                consumer_id=consumer_id,
+                source=source,
+                source_event_id=source_event_id,
+            )
+
     def _delivery_with_transient_handoff(
         self, delivery: DurableDelivery
     ) -> DurableDelivery:

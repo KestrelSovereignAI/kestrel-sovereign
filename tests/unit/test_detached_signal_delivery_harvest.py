@@ -76,6 +76,10 @@ class _Agent(EventManagerMixin):
         # These callbacks exercise the durable path, which a real dispatcher
         # takes only once the consumer is registered.
         self.dispatcher.has_durable_consumer = AsyncMock(return_value=True)
+        # No earlier submission wake exists unless a test says otherwise.
+        self.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
+            return_value=None
+        )
         self.task_manager = MagicMock()
         self.task_manager.get_task = AsyncMock(
             side_effect=lambda task_id: _task(task_id, state=TaskState.SUBMITTED)
@@ -245,6 +249,80 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
     ] == ["missing-outbox", "behind-it"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original,mints",
+    [
+        (None, True),
+        (SimpleNamespace(is_terminal=True), True),
+        (SimpleNamespace(is_terminal=False), False),
+    ],
+    ids=["no-original", "original-finished", "original-still-live"],
+)
+async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
+    original, mints
+):
+    """A live submission wake resumes its own work; a second would duplicate it."""
+
+    agent = _Agent()
+    agent.task_manager.list_cognition_wake_candidates = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                task=_task("mid-turn", state=TaskState.WORKING),
+                lifecycle_revision=1,
+            )
+        ]
+    )
+    agent.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
+        return_value=original
+    )
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
+        side_effect=lambda *args, **kwargs: _durable_signal_handle(
+            DurableAdmissionDisposition.COMMITTED
+        )
+    )
+
+    await agent.reconcile_a2a_cognition_wakes()
+
+    agent.dispatcher.get_durable_delivery_for_source_event.assert_awaited_once_with(
+        consumer_id="core.a2a-task-submitted-cognition-v1",
+        source="a2a.task_submitted",
+        source_event_id="mid-turn",
+    )
+    minted = [
+        call.kwargs["source_event_id"]
+        for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
+    ]
+    assert minted == (["mid-turn:working:1"] if mints else [])
+
+
+@pytest.mark.asyncio
+async def test_a2a_wake_retries_a_failed_durable_consumer_read(monkeypatch, caplog):
+    """The read that picks the path retries like the handoff it gates."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.agent.event_manager.A2A_WAKE_RETRY_INITIAL_SECONDS",
+        0,
+    )
+    agent = _Agent()
+    agent.dispatcher.has_durable_consumer = AsyncMock(
+        side_effect=[RuntimeError("database is locked"), True]
+    )
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
+        side_effect=lambda *args, **kwargs: _durable_signal_handle(
+            DurableAdmissionDisposition.COMMITTED
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        agent._on_task_submitted(_task(state=TaskState.SUBMITTED))
+        await _drain(agent)
+
+    assert agent.dispatcher.has_durable_consumer.await_count == 2
+    agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+    assert "durable-consumer read failed; retrying" in caplog.text
 
 
 @pytest.mark.asyncio

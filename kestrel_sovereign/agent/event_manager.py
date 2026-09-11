@@ -299,7 +299,25 @@ class EventManagerMixin:
         # Keep that contract for those agents instead of spinning at the 5s
         # cap forever.
         has_durable = getattr(self.dispatcher, "has_durable_consumer", None)
-        if callable(has_durable) and not await has_durable(consumer_id):
+        durable = True
+        while callable(has_durable):
+            # This read decides the path, so it retries like the handoff it
+            # gates: a transient error must not drop the wake until reboot.
+            try:
+                durable = await has_durable(consumer_id)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    "%s: durable-consumer read failed; retrying: %s",
+                    label,
+                    exc,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, A2A_WAKE_RETRY_MAX_SECONDS)
+        if not durable:
             signal = signal_factory()
             handle = await self.dispatcher.enqueue_signal(signal)
             outcome = await await_terminal_delivery(
@@ -732,6 +750,19 @@ class EventManagerMixin:
                     if state is TaskState.SUBMITTED
                     else f"{task.id}:working:{candidate.lifecycle_revision}"
                 )
+                if state is TaskState.WORKING:
+                    original = (
+                        await self.dispatcher.get_durable_delivery_for_source_event(
+                            consumer_id=SUBMITTED_CONSUMER,
+                            source=SUBMITTED_SOURCE,
+                            source_event_id=str(task.id),
+                        )
+                    )
+                    if original is not None and not original.is_terminal:
+                        # A crash mid-turn leaves the submission wake live, and
+                        # its own retry resumes this work. A second identity
+                        # would run the same task twice at recovery.
+                        continue
             else:
                 signal = build_signal_for_completed_task(
                     task,

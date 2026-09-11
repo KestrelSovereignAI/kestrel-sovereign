@@ -2607,6 +2607,203 @@ async def test_readmitting_a_terminally_failed_delivery_reports_delivery_failed(
 
 
 @pytest.mark.asyncio
+async def test_delivery_lookup_by_source_event_uses_the_admission_key(tmp_path):
+    """Found by exactly the key admission deduplicates on, and nothing else."""
+
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "source-event-lookup.db", "did:agent:source-event-lookup"
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-worker",
+        source="provider.message",
+        agent_id=agent.did,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.dispatch_signal(
+            _signal(agent_id=agent.did),
+            source_event_id="provider:lookup",
+        )
+
+        async def lookup(**overrides):
+            key = {
+                "consumer_id": consumer.consumer_id,
+                "source": "provider.message",
+                "source_event_id": " provider:lookup ",
+                **overrides,
+            }
+            return await dispatcher.get_durable_delivery_for_source_event(**key)
+
+        found = await lookup()
+        assert found is not None
+        assert found.event.source_event_id == "provider:lookup"
+        assert found.is_terminal is False
+        assert await lookup(source="other.source") is None
+        assert await lookup(consumer_id="other-consumer") is None
+        assert await lookup(source_event_id="provider:other") is None
+
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            executor_id="workflow-executor",
+        )
+        assert claimed is not None
+        assert await dispatcher.ack_durable_delivery(
+            consumer_id=consumer.consumer_id,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token or "",
+        )
+        assert (await lookup()).is_terminal is True
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+class _ReconcilingA2AAgent(_Agent):
+    """A booting agent running the real A2A outbox reconcile over one task."""
+
+    from kestrel_sovereign.agent.event_manager import EventManagerMixin as _Mixin
+
+    reconcile_a2a_cognition_wakes = _Mixin.reconcile_a2a_cognition_wakes
+
+    def __init__(self, did: str, task, lifecycle_revision: int):
+        from kestrel_sovereign.a2a.stores.unified.task_store import (
+            TaskCognitionWakeCandidate,
+        )
+        from kestrel_sovereign.signals.sources.a2a import (
+            build_a2a_task_complete_registration,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+        )
+
+        super().__init__(did)
+        self.task = task
+        self.prompts: list[str] = []
+        self.hang = asyncio.Event()
+        self.hang_turns = False
+        self.signal_registry = SourceRegistry()
+        self.signal_registry.register(build_a2a_task_submitted_registration())
+        self.signal_registry.register(build_a2a_task_complete_registration())
+        self.task_manager = SimpleNamespace(
+            list_cognition_wake_candidates=AsyncMock(
+                return_value=[
+                    TaskCognitionWakeCandidate(
+                        task=task, lifecycle_revision=lifecycle_revision
+                    )
+                ]
+            )
+        )
+
+    async def process_input(self, prompt: str):
+        self.prompts.append(prompt)
+        if self.hang_turns:
+            await self.hang.wait()
+        return "handled"
+
+    async def validate_cognition_signal_execution(self, signal):
+        # EventManagerMixin's rule: a submission wake runs while the task is live.
+        state = self.task.status.state.value
+        return None if state in {"submitted", "working"} else f"task is {state}"
+
+
+async def _reconciling_a2a_dispatcher(path, did: str, task, lifecycle_revision: int):
+    backend = SQLiteBackend(str(path))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    agent = _ReconcilingA2AAgent(did, task, lifecycle_revision)
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=agent.signal_registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    agent.dispatcher = dispatcher
+    await dispatcher.initialize_durable_delivery()
+    return backend, agent, dispatcher
+
+
+@pytest.mark.asyncio
+async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
+    """A turn that set its task WORKING and then died resumes once (#3163).
+
+    The live submission wake retries that work itself. Minting the WORKING
+    identity beside it ran the same peer task twice at recovery.
+    """
+
+    from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+        DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+        build_signal_for_submitted_task,
+    )
+
+    path = tmp_path / "crash-mid-submission.db"
+    did = "did:agent:crash-mid-submission"
+    submitted = Task(
+        id="peer-task", sessionId="s1", status=TaskStatus(state=TaskState.SUBMITTED)
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=SUBMITTED_CONSUMER,
+        source="a2a.task_submitted",
+        agent_id=did,
+        max_attempts=0,
+    )
+    backend_a, agent_a, dispatcher_a = await _reconciling_a2a_dispatcher(
+        path, did, submitted, 0
+    )
+    agent_a.hang_turns = True
+    await dispatcher_a.register_durable_consumer(consumer)
+    handle = await dispatcher_a.enqueue_durable_cognition(
+        build_signal_for_submitted_task(submitted, target_agent=did),
+        source_event_id=submitted.id,
+        consumer_id=SUBMITTED_CONSUMER,
+    )
+    await handle.wait_for_durable_admission()
+    for _ in range(200):
+        if agent_a.prompts:
+            break
+        await asyncio.sleep(0.01)
+    assert agent_a.prompts, "the first turn never started"
+    # The turn moved the task to WORKING, then the process died mid-turn.
+    for task in agent_a.tasks:
+        task.cancel()
+    await asyncio.gather(*agent_a.tasks, return_exceptions=True)
+    await backend_a.close()
+
+    working = submitted.model_copy(
+        update={"status": TaskStatus(state=TaskState.WORKING)}
+    )
+    backend_b, agent_b, dispatcher_b = await _reconciling_a2a_dispatcher(
+        path, did, working, 1
+    )
+    try:
+        await dispatcher_b.register_durable_consumer(consumer)
+        await agent_b.reconcile_a2a_cognition_wakes()
+        await dispatcher_b.start_durable_cognition_consumer(SUBMITTED_CONSUMER)
+        # The dead runtime's owner row goes stale, and the next owner
+        # heartbeat requeues its lease, exactly as it would after two minutes.
+        dispatcher_b._runtime_owner_stale_after = timedelta(0)
+        await dispatcher_b._heartbeat_runtime_owner()
+        for _ in range(300):
+            deliveries = await dispatcher_b.list_durable_deliveries(
+                consumer_id=SUBMITTED_CONSUMER
+            )
+            if deliveries and all(d.status == ACKNOWLEDGED for d in deliveries):
+                break
+            await asyncio.sleep(0.01)
+
+        [recovered] = await dispatcher_b.list_durable_deliveries(
+            consumer_id=SUBMITTED_CONSUMER
+        )
+        assert recovered.event.source_event_id == "peer-task"
+        assert recovered.status == ACKNOWLEDGED
+        assert len(agent_b.prompts) == 1
+    finally:
+        await dispatcher_b.shutdown_durable_delivery()
+        await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("privacy_preset", ("ephemeral", "isolated", "deidentified"))
 async def test_privacy_elided_first_cognition_delivery_is_claimed_and_acked(
     tmp_path, privacy_preset
