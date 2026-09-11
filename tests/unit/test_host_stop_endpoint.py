@@ -106,6 +106,12 @@ def test_host_stop_fans_out_with_one_receipted_outcome_per_agent():
         "did:test:beta",
     ]
     assert all(item["receipt_id"] for item in payload["stop_outcomes"])
+    persisted = app.state.stop_receipt_store.persisted
+    assert persisted
+    # The receipt names the authenticated sovereign, not a fallback label.
+    assert {receipt.actor_id for _request, receipt in persisted} == {
+        "sovereign-key"
+    }
     alpha.cancel_current_request.assert_called_once_with(request_id="turn-alpha")
     beta.cancel_current_request.assert_called_once_with(request_id="turn-beta")
     alpha.terminate.assert_not_called()
