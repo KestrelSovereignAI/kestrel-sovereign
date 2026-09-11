@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
-from kestrel_sovereign.auth import CallerContext
+from kestrel_sovereign.endpoints.agent_helpers import caller_is_sovereign, get_caller
 from kestrel_sovereign.rate_limit import (
     stop_admission_rate_limit,
 )
@@ -60,20 +60,18 @@ class HostStopBody(BaseModel):
 
 
 def _sovereign_actor(request: Request) -> str:
-    caller = getattr(request.state, "caller", None)
-    if not isinstance(caller, CallerContext) or not caller.is_sovereign:
+    if not caller_is_sovereign(request):
         raise ApiHTTPException(
             status_code=403,
             code="sovereign_authority_required",
             message="Host Stop requires sovereign authority.",
         )
-    identity = caller.identity
+    identity = get_caller(request).identity
     return identity if isinstance(identity, str) and identity.strip() else "api_key"
 
 
 def _caller_can_stop_host(request: Request) -> bool:
-    caller = getattr(request.state, "caller", None)
-    return isinstance(caller, CallerContext) and caller.is_sovereign
+    return caller_is_sovereign(request)
 
 
 def _host_agents(request: Request) -> tuple[tuple[str, object], ...]:
