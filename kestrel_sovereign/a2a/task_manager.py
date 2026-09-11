@@ -38,6 +38,7 @@ from kestrel_sovereign.a2a.stores import (
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskCancellationSnapshot,
+    TaskCognitionWakeCandidate,
     TaskMutationAuthorizationError,
     without_reserved_cancellation_receipt,
 )
@@ -1248,6 +1249,19 @@ class TaskManager:
             user_id=user_id,
             status=status,
             limit=limit,
+        )
+
+    async def list_cognition_wake_candidates(
+        self,
+        *,
+        recipient_agent_id: str,
+        terminal_updated_since: datetime,
+    ) -> list[TaskCognitionWakeCandidate]:
+        """Return task rows that can reconstruct a missing one-shot wake."""
+
+        return await self.task_store.list_cognition_wake_candidates(
+            recipient_agent_id=recipient_agent_id,
+            terminal_updated_since=terminal_updated_since,
         )
 
     async def cancel_task(

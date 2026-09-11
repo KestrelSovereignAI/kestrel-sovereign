@@ -783,7 +783,11 @@ async def test_cancellation_suppresses_an_already_queued_submission_wake(tmp_pat
     class Dispatcher:
         handle = None
 
-        async def enqueue_signal(self, _signal):
+        async def enqueue_durable_cognition(
+            self, _signal, *, source_event_id, consumer_id
+        ):
+            assert source_event_id == "queued-wake"
+            assert consumer_id == "core.a2a-task-submitted-cognition-v1"
             self.handle = Handle()
             enqueue_started.set()
             return self.handle
@@ -909,7 +913,11 @@ async def test_post_registration_gate_does_not_cancel_working_dispatch(tmp_path)
     class Dispatcher:
         handle = None
 
-        async def enqueue_signal(self, _signal):
+        async def enqueue_durable_cognition(
+            self, _signal, *, source_event_id, consumer_id
+        ):
+            assert source_event_id == "working-wake"
+            assert consumer_id == "core.a2a-task-submitted-cognition-v1"
             self.handle = Handle()
             return self.handle
 
@@ -3049,6 +3057,43 @@ async def test_database_fence_blocks_legacy_writer_on_available_backends(db_back
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_postgres_fence_versions_legacy_writer_status_transitions(db_backend):
+    """Old workers cannot reuse a cognition-wake identity after upgrade."""
+
+    if db_backend.backend_type != "postgres":
+        pytest.skip("PostgreSQL compatibility trigger only")
+
+    store = TaskStore(db_backend)
+    await store.initialize()
+    task_id = f"legacy-revision-{uuid4().hex}"
+    try:
+        await store.create(
+            Task(id=task_id, status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+
+        revisions = []
+        for state in ("working", "input-required", "working"):
+            # This deliberately models a pre-upgrade writer: it changes only
+            # status and has no knowledge of lifecycle_revision.
+            await db_backend.execute(
+                "UPDATE a2a_tasks SET status = ? WHERE id = ?",
+                (state, task_id),
+            )
+            row = await db_backend.fetch_one(
+                "SELECT lifecycle_revision FROM a2a_tasks WHERE id = ?",
+                (task_id,),
+            )
+            revisions.append(row[0])
+
+        assert revisions == [1, 2, 3]
+    finally:
+        await db_backend.execute("DELETE FROM a2a_tasks WHERE id = ?", (task_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 @pytest.mark.parametrize("with_payload", [False, True])
 async def test_cancel_readback_failure_rolls_back_transition_on_available_backends(
     db_backend,
@@ -3126,12 +3171,17 @@ async def test_postgres_initialization_installs_terminal_lifecycle_trigger():
     assert "IF TG_OP = 'INSERT'" in scripts
     assert "A2A task requires durable authority" in scripts
     assert "live A2A task requires durable authority" in scripts
+    assert "NEW.lifecycle_revision := OLD.lifecycle_revision + 1" in scripts
     assert "CREATE TRIGGER a2a_tasks_authority_fence_v4" in scripts
     assert "EXECUTE FUNCTION a2a_tasks_enforce_authority_fence_v4()" in scripts
     statements = "\n".join(
         call.args[0] for call in backend.execute.await_args_list
     )
     assert "ADD COLUMN IF NOT EXISTS terminal_operation_id TEXT" in statements
+    assert (
+        "ADD COLUMN IF NOT EXISTS lifecycle_revision BIGINT NOT NULL DEFAULT 0"
+        in statements
+    )
 
 
 @pytest.mark.asyncio
@@ -3180,7 +3230,9 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
     assert events.index("transaction-enter") < lock_index < probe_index
     assert probe_index < fence_index < events.index("transaction-exit")
     assert "terminal_operation_id" in schema_probes[0]
-    assert "COUNT(*) = 7" in schema_probes[0]
+    assert "lifecycle_revision" in schema_probes[0]
+    assert "pg_get_functiondef" in schema_probes[0]
+    assert "COUNT(*) = 8" in schema_probes[0]
 
 
 @pytest.mark.asyncio
