@@ -859,6 +859,49 @@ class TestSecurityHook:
         # Nothing left queued — the scheduler loop is not wedged.
         assert approval_queue.pending_requests == []
 
+    @pytest.mark.asyncio
+    async def test_a_feature_lifecycle_call_is_denied_not_queued(
+        self, hook, permission_store, approval_queue
+    ):
+        """#3280. A feature's ready hook runs before the host serves HTTP, so an
+        approval it waits on can never be answered -- the Approvals surface is
+        served by the server that has not started. It must get the scheduler's
+        guarantee: a non-blocking deny with nothing left queued. Under its OWN
+        id, so the audit row says who actually called."""
+        from kestrel_sovereign.features.security.hooks import (
+            FEATURE_LIFECYCLE_SESSION_ID,
+            NON_INTERACTIVE_SESSION_IDS,
+        )
+
+        await permission_store.register_tool(
+            "WorkflowsFeature", "workflow_define", PermissionLevel.ASK
+        )
+        input = HookInput(
+            session_id=FEATURE_LIFECYCLE_SESSION_ID,
+            hook_event_name="PreToolUse",
+            tool_name="workflow_define",
+            feature_name="WorkflowsFeature",
+            tool_input={"spec": {}},
+        )
+
+        output = await asyncio.wait_for(hook.execute(input), timeout=1.0)
+
+        assert FEATURE_LIFECYCLE_SESSION_ID in NON_INTERACTIVE_SESSION_IDS
+        assert FEATURE_LIFECYCLE_SESSION_ID != "scheduler"
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+        assert approval_queue.pending_requests == []
+
+    def test_the_feature_lifecycle_id_is_a_stable_contract(self):
+        """Feature packages hard-code this string: they cannot import it
+        without raising their core floor, and raising it strands them on any
+        host whose core is older. So the value itself is the contract."""
+        from kestrel_sovereign.features.security.hooks import (
+            FEATURE_LIFECYCLE_SESSION_ID,
+        )
+
+        assert FEATURE_LIFECYCLE_SESSION_ID == "feature-lifecycle"
+
     def test_scheduler_session_id_pinned_to_non_interactive_set(self):
         """Drift guard: the SchedulerFeature tags ticks with a session id that
         MUST be in NON_INTERACTIVE_SESSION_IDS, or the #2111 wedge returns. Pins

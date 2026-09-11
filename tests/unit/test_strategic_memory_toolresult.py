@@ -509,3 +509,52 @@ async def test_signal_dispatch_invalid_mode_names_a_reason_code():
     assert result.status is ToolResultStatus.ERROR
     assert result.data["reason_code"] == "INVALID_DISPATCH_MODE"
     assert result.data["dispatched"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_does_not_call_an_unreachable_github_nothing_to_do(mode):
+    """#3280 review. Selection now asks GitHub before dispatching a blocker, so
+    it can fail on a network fault where it never could before. When every
+    blocker it tried came back unreadable, "No actionable issue found" would be
+    a claim about a ledger nobody looked at -- the same lie blocker_reconcile
+    is written to avoid."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def unreachable(view, diagnostics=None):
+        diagnostics.update(blockers_checked=3, blockers_unreadable=3)
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=unreachable,
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["reason_code"] == "BLOCKERS_UNCONFIRMED"
+    assert result.data["dispatched"] is False
+    assert "No actionable issue found" not in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_still_says_nothing_to_do_when_github_answered():
+    """The control: blockers GitHub answered for -- closed, say -- are a real
+    answer, and an empty result then really is nothing to do."""
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+
+    async def all_closed(view, diagnostics=None):
+        diagnostics.update(blockers_checked=3, blockers_unreadable=0)
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=all_closed,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.status is ToolResultStatus.OK
+    assert "No actionable issue found" in result.confirmation
