@@ -75,7 +75,6 @@ from kestrel_sovereign.stop.runtime_target import (
     build_runtime_stop_target,
     resolve_runtime_stop_identity,
 )
-from kestrel_sovereign.telemetry import current_trace_identity
 logger = logging.getLogger(__name__)
 
 # SSE connection tracking: maps (client_ip, agent_id) -> active connection count
