@@ -16,6 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.stop import (
     AuthoritativeStopDescendant,
     CancellationAuthority,
@@ -69,6 +70,15 @@ class _MemoryReceiptStore:
         )
         self.records[request.correlation_id] = (request, receipt)
         return receipt
+
+
+def _bind_caller(app: FastAPI, caller: CallerContext | None) -> None:
+    """Attach ``caller`` to every request, as the auth middleware does."""
+
+    @app.middleware("http")
+    async def bind_caller(request, call_next):
+        request.state.caller = caller
+        return await call_next(request)
 
 
 def _authority(target_inventory, **kwargs) -> CancellationAuthority:
@@ -1381,6 +1391,7 @@ def test_live_agent_stop_cascades_only_through_signed_descendant_query() -> None
     peer.kestrel = SimpleNamespace(orchestrator="did:test:root")
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = root
     app.state.agent_manager = manager
     app.state.stop_receipt_store = _MemoryReceiptStore()
@@ -1398,6 +1409,60 @@ def test_live_agent_stop_cascades_only_through_signed_descendant_query() -> None
     child.cancel_current_request.assert_called_once_with(request_id="child-turn")
     peer.cancel_current_request.assert_not_called()
     peer.active_turn_request_bindings.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "caller",
+    [
+        CallerContext.authenticated("user@example.test"),
+        CallerContext.authenticated("jwt-subject", AuthMethod.JWT),
+        CallerContext.a2a_transport(),
+        None,
+    ],
+    ids=["oauth-session", "jwt", "a2a-transport", "no-caller"],
+)
+def test_live_agent_stop_cascades_only_for_the_sovereign(caller) -> None:
+    """Any caller may stop the routed agent; only the sovereign's Stop
+    follows its signed descendants (#3143)."""
+
+    from kestrel_sovereign.endpoints.agent import router
+
+    def live_agent(agent_id: str, turn_id: str):
+        return SimpleNamespace(
+            agent_id=agent_id,
+            _active_request_ids={turn_id},
+            _current_request_id=turn_id,
+            cancel_current_request=MagicMock(return_value=True),
+            wait_for_request_completion=AsyncMock(return_value=None),
+        )
+
+    root = live_agent("did:test:root", "root-turn")
+    child = live_agent("did:test:child", "child-turn")
+    manager = MagicMock()
+    manager.list_agents.return_value = {"Root": root, "Child": child}
+    manager.get_authoritative_stop_descendants = AsyncMock(
+        return_value=[AuthoritativeStopDescendant("Child", "did:test:child")]
+    )
+    receipts = _MemoryReceiptStore()
+    app = FastAPI()
+    app.include_router(router)
+    _bind_caller(app, caller)
+    app.state.agent = root
+    app.state.agent_manager = manager
+    app.state.stop_receipt_store = receipts
+
+    response = TestClient(app).post("/api/agent/stop")
+
+    assert response.status_code == 200
+    assert [
+        outcome["agent_id"] for outcome in response.json()["stop_outcomes"]
+    ] == ["did:test:root"]
+    root.cancel_current_request.assert_called_once_with(request_id="root-turn")
+    child.cancel_current_request.assert_not_called()
+    manager.get_authoritative_stop_descendants.assert_not_awaited()
+    [(request, receipt)] = receipts.records.values()
+    assert request.cascade is False
+    assert receipt.cascade is False
 
 
 def test_live_cascade_binds_signed_did_not_colliding_routing_name() -> None:
@@ -1441,6 +1506,7 @@ def test_live_cascade_binds_signed_did_not_colliding_routing_name() -> None:
     distributed = DistributedStop()
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = root
     app.state.agent_manager = manager
     app.state.distributed_invocation_registry = distributed
@@ -1483,6 +1549,7 @@ def test_live_child_stop_does_not_walk_to_parent_or_peer() -> None:
     manager.get_authoritative_stop_descendants = AsyncMock(return_value=[])
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = child
     app.state.agent_manager = manager
     app.state.stop_receipt_store = _MemoryReceiptStore()
@@ -1534,6 +1601,7 @@ def test_live_agent_stop_uses_agent_attached_manager_after_load() -> None:
 
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = root
     app.state.stop_receipt_store = RestoringReceiptStore()
 
@@ -1573,6 +1641,7 @@ def test_live_agent_stop_rejects_tampered_descendant_graph_before_effects() -> N
     )
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = root
     app.state.agent_manager = manager
     app.state.stop_receipt_store = _MemoryReceiptStore()
@@ -1599,6 +1668,7 @@ def test_live_agent_stop_has_no_legacy_manager_fallback() -> None:
     manager = SimpleNamespace(list_agents=lambda: {"Root": root})
     app = FastAPI()
     app.include_router(router)
+    _bind_caller(app, CallerContext.sovereign())
     app.state.agent = root
     app.state.agent_manager = manager
     app.state.stop_receipt_store = _MemoryReceiptStore()

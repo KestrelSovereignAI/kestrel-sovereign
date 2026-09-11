@@ -26,6 +26,7 @@ from kestrel_sovereign.rate_limit import (
 )
 from kestrel_sovereign.security.demo_isolation import enforce_destructive_op
 from kestrel_sovereign.endpoints.agent_helpers import (
+    caller_is_sovereign,
     get_agent,
     invocation_was_self_fenced,
     prime_durable_stop_fence,
@@ -1399,6 +1400,13 @@ async def stop_agent_request(request: Request):
             target_is_turn_id=turn_id is not None,
             turn_id=canonical_turn_id,
             reason=reason,
+            # Two questions, answered separately (#3143): any authenticated
+            # caller may stop this agent, but only the sovereign's Stop
+            # follows the agent's signed descendants. A cascade reaches other
+            # agents across the fleet — /api/host/stop's authority class — and
+            # turns one rate-limited admission into N stops, the peer power
+            # the epic confines to the signal rails (#3169).
+            cascade=caller_is_sovereign(request),
             trace_id=target_trace_id,
             span_id=target_span_id,
             **(
