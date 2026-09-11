@@ -58,7 +58,10 @@ def caller_is_sovereign(request: Request) -> bool:
 
     This is a hint for the client, never the gate: a mutation or a
     host-scoped read still declares the dependency, which refuses before
-    the handler body runs.
+    the handler body runs. The one other use is narrowing the reach of an
+    operation every authenticated caller is admitted to — agent Stop
+    cascades through signed descendants only for the sovereign (#3143) —
+    where nothing is refused, so there is no probe to avoid.
     """
     caller = get_caller(request)
     return getattr(caller, "is_sovereign", False) is True
