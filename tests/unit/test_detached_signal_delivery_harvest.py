@@ -386,6 +386,40 @@ async def test_a2a_persistence_retry_rebuilds_a_fresh_signal(monkeypatch):
     assert seen[0] is not seen[1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fire,state",
+    [
+        (lambda a, t: a._on_background_task_complete(t), TaskState.COMPLETED),
+        (lambda a, t: a._on_task_submitted(t), TaskState.SUBMITTED),
+    ],
+    ids=["task_complete", "task_submitted"],
+)
+async def test_a2a_wake_does_not_retry_a_terminally_failed_delivery(
+    monkeypatch, caplog, fire, state
+):
+    """A retry loop ends on a condition retrying cannot change (#3163)."""
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.agent.event_manager.A2A_WAKE_RETRY_INITIAL_SECONDS",
+        0,
+    )
+    agent = _Agent()
+    agent.dispatcher.enqueue_durable_cognition = AsyncMock(
+        side_effect=lambda *a, **k: _durable_signal_handle(
+            DurableAdmissionDisposition.DELIVERY_FAILED,
+            status=Status.FAILED,
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        fire(agent, _task(state=state))
+        await _drain(agent)
+
+    agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
+    assert "already failed terminally" in caplog.text
+
+
 @pytest.mark.parametrize(
     "fire,prefix",
     [
