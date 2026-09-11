@@ -530,6 +530,17 @@ def test_boot_phase_order_is_the_documented_dependency_sequence(tmp_path):
 @pytest.mark.asyncio
 async def test_clean_boot_reaches_ready(tmp_path):
     agent = _make_agent(tmp_path)
+    started_when_reconciled = None
+
+    async def capture_reconciliation_order():
+        nonlocal started_when_reconciled
+        started_when_reconciled = set(
+            agent.dispatcher._started_durable_cognition_consumers
+        )
+
+    agent.reconcile_a2a_cognition_wakes = AsyncMock(
+        side_effect=capture_reconciliation_order
+    )
     try:
         with _boot_mocks():
             await agent.initialize()
@@ -539,6 +550,19 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # The Workflows built-in is registrable without Talon or any other
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_CONSUMER,
+        )
+
+        assert {
+            A2A_COMPLETE_CONSUMER,
+            A2A_SUBMITTED_CONSUMER,
+        } <= agent.dispatcher._started_durable_cognition_consumers
+        agent.reconcile_a2a_cognition_wakes.assert_awaited_once_with()
+        assert started_when_reconciled == set()
     finally:
         await _cleanup(agent)
 

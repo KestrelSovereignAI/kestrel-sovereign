@@ -465,10 +465,14 @@ def bind_async_invocation(
                             # only to this explicitly created execution task;
                             # arbitrary child tasks still perform a fresh read.
                             from kestrel_sovereign.hold.enforcement import (
+                                _adopt_source_disposition_owner,
                                 _adopt_turn_admission_snapshot,
                             )
 
                             with _adopt_turn_admission_snapshot(
+                                lifecycle_owner,
+                                from_task=caller_task,
+                            ), _adopt_source_disposition_owner(
                                 lifecycle_owner,
                                 from_task=caller_task,
                             ):

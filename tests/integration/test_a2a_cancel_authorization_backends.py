@@ -347,6 +347,15 @@ async def test_upgrade_settles_live_rows_without_trustworthy_authority(tmp_path)
             live.status.message.parts[0].text
         )
         assert done.status.state is TaskState.COMPLETED
+        # Settlement mints a revision like any other transition, so it stamps
+        # when that revision began; the untouched terminal row keeps NULL and
+        # is read through updated_at.
+        stamped = dict(
+            await backend.fetch_all(
+                "SELECT id, lifecycle_updated_at IS NOT NULL FROM a2a_tasks"
+            )
+        )
+        assert stamped == {"legacy-live": 1, "legacy-done": 0}
     finally:
         await backend.close()
 
