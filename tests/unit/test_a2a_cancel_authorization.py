@@ -3066,6 +3066,10 @@ async def test_postgres_fence_versions_legacy_writer_status_transitions(db_backe
 
     store = TaskStore(db_backend)
     await store.initialize()
+    # initialize() reinstalls the fence only when its probe finds it stale,
+    # so on a reused database it would test whatever fence ran last. Install
+    # this code's fence so the assertions below are about it.
+    await store._install_canceled_terminal_fence()
     task_id = f"legacy-revision-{uuid4().hex}"
     try:
         await store.create(
@@ -3332,9 +3336,15 @@ async def test_postgres_cancellation_schema_reprobes_under_advisory_lock():
     assert "lifecycle_revision" in schema_probes[0]
     assert "pg_get_functiondef" in schema_probes[0]
     # A fence installed before lifecycle_updated_at existed is not ready: it
-    # would leave legacy writers' transitions unstamped.
-    assert "'lifecycle_updated_at'\n" in schema_probes[0]
-    assert "COUNT(*) = 9" in schema_probes[0]
+    # would leave legacy writers' transitions unstamped, and this probe is the
+    # only thing that makes an upgraded database reinstall it.
+    probe = " ".join(schema_probes[0].split())
+    assert (
+        "position( 'lifecycle_updated_at' IN pg_get_functiondef(procedure.oid) )"
+        in probe
+    )
+    assert "'lifecycle_updated_at' )" in probe
+    assert "COUNT(*) = 9" in probe
 
 
 @pytest.mark.asyncio

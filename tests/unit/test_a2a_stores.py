@@ -464,6 +464,69 @@ class TestTaskStore:
         assert second_working.lifecycle_revision == 3
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "transition",
+        ["lifecycle_save", "terminal_outcome", "cancel"],
+    )
+    async def test_every_lifecycle_revision_restamps_its_change_time(
+        self,
+        db_path,
+        transition,
+    ):
+        """A revision minted weeks after submission is still reconcilable.
+
+        Each write that mints a new wake identity must restamp when that
+        revision began; otherwise the window measures it from the old one.
+        """
+
+        backend = SQLiteBackend(db_path)
+        await backend.connect()
+        store = track_store(TaskStore(backend))
+        await store.initialize()
+        await store.save(
+            Task(id="aged", status=TaskStatus(state=TaskState.SUBMITTED)),
+            creator_agent_id="did:test:creator",
+            recipient_agent_id="did:test:recipient",
+        )
+        await backend.execute(
+            "UPDATE a2a_tasks SET lifecycle_updated_at = "
+            "datetime('now', '-30 days') WHERE id = ?",
+            ("aged",),
+        )
+        if transition == "lifecycle_save":
+            assert await store.save_recipient_lifecycle(
+                Task(id="aged", status=TaskStatus(state=TaskState.WORKING)),
+                recipient_agent_id="did:test:recipient",
+                expected_state=TaskState.SUBMITTED,
+            )
+        elif transition == "terminal_outcome":
+            assert await store.save_recipient_terminal_outcome(
+                Task(id="aged", status=TaskStatus(state=TaskState.COMPLETED)),
+                recipient_agent_id="did:test:recipient",
+                operation_id="op-aged",
+            )
+        else:
+            assert await store.cancel_if_authorized(
+                "aged",
+                actor_agent_id="did:test:creator",
+            ) is not None
+
+        row = await backend.fetch_one(
+            "SELECT lifecycle_revision, "
+            "datetime(lifecycle_updated_at) > datetime('now', '-1 day') "
+            "FROM a2a_tasks WHERE id = ?",
+            ("aged",),
+        )
+        assert tuple(row) == (1, 1)
+        horizon = datetime.now(timezone.utc) - timedelta(days=14)
+        listed = await store.list_cognition_wake_candidates(
+            recipient_agent_id="did:test:recipient",
+            live_changed_since=horizon,
+            terminal_changed_since=horizon,
+        )
+        assert [candidate.task.id for candidate in listed] == ["aged"]
+
+    @pytest.mark.asyncio
     async def test_artifact_append_keeps_no_stale_wake_inside_the_window(
         self,
         db_path,
