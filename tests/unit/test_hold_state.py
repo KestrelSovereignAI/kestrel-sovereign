@@ -6029,6 +6029,21 @@ async def _leave_prerelease_hold_schema(database: Path, *extra: str) -> None:
         member.chmod(0o600)
 
 
+def _hold_state_warnings(caplog) -> list[str]:
+    """Every WARNING the Hold state module logged, whatever it says.
+
+    Asserting on the adoption message's own wording would let a revert that
+    restores the old wording along with the old position pass.
+    """
+
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.hold.state"
+        and record.levelno >= logging.WARNING
+    ]
+
+
 def _hold_index_names(database: Path) -> set[str]:
     # mode=ro alone would create the -shm of a stopped database, which the
     # readiness check under test then reads as a live host.
@@ -6093,7 +6108,7 @@ async def test_host_boot_adopts_unused_schema_left_without_evidence(
     try:
         assert reopened.hold_store is not None, reopened.backend_error
         assert await reopened.hold_store.read_boot_state() == (mutation.current,)
-        assert "completed them as a first bootstrap" not in caplog.text
+        assert _hold_state_warnings(caplog) == []
     finally:
         await close_host_context_resources(reopened)
 
@@ -6119,7 +6134,7 @@ async def test_schema_without_evidence_that_recorded_a_row_is_refused(
     try:
         assert context.hold_store is None
         assert f"{table} holds 1 row" in context.backend_error
-        assert "completed them as a first bootstrap" not in caplog.text
+        assert _hold_state_warnings(caplog) == []
     finally:
         await close_host_context_resources(context)
     assert not hold_initialization_witness_path(database).exists()
@@ -6150,7 +6165,7 @@ async def test_empty_schema_is_refused_when_custody_proves_initialization(
     try:
         assert context.hold_store is None
         assert reason in context.backend_error
-        assert "completed them as a first bootstrap" not in caplog.text
+        assert _hold_state_warnings(caplog) == []
     finally:
         await close_host_context_resources(context)
 
@@ -6177,7 +6192,7 @@ async def test_empty_schema_with_an_unknown_migration_is_refused(
     try:
         assert context.hold_store is None
         assert reason in context.backend_error
-        assert "completed them as a first bootstrap" not in caplog.text
+        assert _hold_state_warnings(caplog) == []
     finally:
         await close_host_context_resources(context)
 
@@ -6207,7 +6222,7 @@ async def test_refusal_after_adoption_does_not_claim_a_completed_bootstrap(
         assert "publication exists without initialized schema" in (
             context.backend_error
         )
-        assert "completed them as a first bootstrap" not in caplog.text
+        assert _hold_state_warnings(caplog) == []
     finally:
         await close_host_context_resources(context)
     assert not hold_initialization_witness_path(database).exists()
