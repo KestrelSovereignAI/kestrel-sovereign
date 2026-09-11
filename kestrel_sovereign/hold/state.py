@@ -3468,14 +3468,6 @@ class HoldStore:
             bootstrap_pending=bootstrap_history is not None,
             unused_schema_refusal=unused_schema_refusal,
         )
-        if adopting_unused_schema:
-            logger.warning(
-                "Hold tables in %s have no initialization evidence but never "
-                "recorded a latch, receipt, or witness, and no custody marker "
-                "proves an earlier initialization; completing them as a first "
-                "bootstrap",
-                self._custody_control_path,
-            )
         current_bootstrap_history = await self._bootstrap_history_anchor(existing)
         if (
             bootstrap_history is not None
@@ -3537,6 +3529,18 @@ class HoldStore:
         # evidence, then retire the recovery authority last.
         await self._write_history_anchor()
         await self._write_initialization_witness()
+        if adopting_unused_schema:
+            # After the witness, not before the refusals that follow adoption:
+            # a boot that still refuses (a staged history candidate, a schema
+            # transaction that cannot resolve a conflict key) must not leave a
+            # line saying it completed a bootstrap it never completed.
+            logger.warning(
+                "Hold tables in %s had no initialization evidence and had "
+                "never recorded a latch, receipt, or witness, and no custody "
+                "marker proved an earlier initialization; completed them as a "
+                "first bootstrap",
+                self._custody_control_path,
+            )
         self._write_sqlite_custody_marker(current_bootstrap_history)
         await self._remove_external_bootstrap_intent()
 

@@ -6070,7 +6070,7 @@ async def test_host_boot_adopts_unused_schema_left_without_evidence(
     try:
         assert context.hold_store is not None, context.backend_error
         assert await context.hold_store.read_boot_state() == ()
-        assert "completing them as a first bootstrap" in caplog.text
+        assert "completed them as a first bootstrap" in caplog.text
         assert hold_initialization_witness_path(database).exists()
         assert hold_history_anchor_path(database).exists()
         assert hold_sqlite_custody_marker_path(database).exists()
@@ -6093,7 +6093,7 @@ async def test_host_boot_adopts_unused_schema_left_without_evidence(
     try:
         assert reopened.hold_store is not None, reopened.backend_error
         assert await reopened.hold_store.read_boot_state() == (mutation.current,)
-        assert "completing them as a first bootstrap" not in caplog.text
+        assert "completed them as a first bootstrap" not in caplog.text
     finally:
         await close_host_context_resources(reopened)
 
@@ -6119,7 +6119,7 @@ async def test_schema_without_evidence_that_recorded_a_row_is_refused(
     try:
         assert context.hold_store is None
         assert f"{table} holds 1 row" in context.backend_error
-        assert "completing them as a first bootstrap" not in caplog.text
+        assert "completed them as a first bootstrap" not in caplog.text
     finally:
         await close_host_context_resources(context)
     assert not hold_initialization_witness_path(database).exists()
@@ -6150,7 +6150,7 @@ async def test_empty_schema_is_refused_when_custody_proves_initialization(
     try:
         assert context.hold_store is None
         assert reason in context.backend_error
-        assert "completing them as a first bootstrap" not in caplog.text
+        assert "completed them as a first bootstrap" not in caplog.text
     finally:
         await close_host_context_resources(context)
 
@@ -6177,7 +6177,65 @@ async def test_empty_schema_with_an_unknown_migration_is_refused(
     try:
         assert context.hold_store is None
         assert reason in context.backend_error
-        assert "completing them as a first bootstrap" not in caplog.text
+        assert "completed them as a first bootstrap" not in caplog.text
+    finally:
+        await close_host_context_resources(context)
+
+
+@pytest.mark.asyncio
+async def test_refusal_after_adoption_does_not_claim_a_completed_bootstrap(
+    tmp_path,
+    caplog,
+):
+    """A boot that adopts and then refuses must not log that it completed one.
+
+    The staged history candidate is refused after the adoption decision is
+    taken, and an operator greps that WARNING to tell a cleared wedge from a
+    host that is still down.
+    """
+
+    database = tmp_path / "host-data" / "host-features.db"
+    await _leave_prerelease_hold_schema(database)
+    candidate = Path(f"{hold_history_anchor_path(database)}.pending")
+    candidate.write_bytes(b"kestrel-hold-history-v1\n0\n" + b"0" * 64 + b"\n")
+    candidate.chmod(0o600)
+
+    with caplog.at_level(logging.WARNING, logger="kestrel_sovereign.hold.state"):
+        context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is None
+        assert "publication exists without initialized schema" in (
+            context.backend_error
+        )
+        assert "completed them as a first bootstrap" not in caplog.text
+    finally:
+        await close_host_context_resources(context)
+    assert not hold_initialization_witness_path(database).exists()
+
+
+@pytest.mark.asyncio
+async def test_unused_schema_without_its_migration_table_is_adopted(tmp_path):
+    """A partial unused schema records nothing either, so boot completes it."""
+
+    database = tmp_path / "host-data" / "host-features.db"
+    database.parent.mkdir(mode=0o700, exist_ok=True)
+    db = await AsyncDatabase.sqlite(str(database))
+    try:
+        for statement in _PRERELEASE_HOLD_SCHEMA:
+            if "hold_schema_migrations" not in statement:
+                await db.execute(statement)
+    finally:
+        await db.close()
+    for member in database.parent.glob(f"{database.name}*"):
+        member.chmod(0o600)
+
+    assert validate_sqlite_hold_readiness(database) == ()
+
+    context = await build_host_context(db_path=str(database))
+    try:
+        assert context.hold_store is not None, context.backend_error
+        assert await context.hold_store.read_boot_state() == ()
+        assert hold_initialization_witness_path(database).exists()
     finally:
         await close_host_context_resources(context)
 
