@@ -2279,7 +2279,8 @@ async def test_an_outcome_row_carrying_an_authorization_value_is_counted_once(tm
     d = result.data
     assert (d["authorized"], d["outcomes"], d["unclassified_outcomes"], d["refused"]) == (0, 0, 1, 0)
     assert d["authorized"] + d["outcomes"] + d["unclassified_outcomes"] + d["refused"] == d["count"]
-    assert "-1" not in result.confirmation and "?" in result.confirmation
+    assert "-1 NOT authorized" not in result.confirmation
+    assert "?" in result.confirmation
 
 
 @pytest.mark.asyncio

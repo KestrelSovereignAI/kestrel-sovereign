@@ -566,43 +566,55 @@ class DeliveryQueue:
         while inserting another row could duplicate an older process's retry.
         The only safe automatic outcome is therefore to fail closed.
         """
+        eligibility = """
+            AND delivery_queue.recipient = ?
+            AND delivery_queue.channel_type = ?
+            AND delivery_queue.created_at >= ?
+            AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.original_id = delivery_queue.id
+            )
+            AND NOT EXISTS (
+                  SELECT 1 FROM delivery_dead_letter
+                  WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
+                    AND delivery_dead_letter.retry_entry_id = delivery_queue.id
+            )
+            AND NOT EXISTS (
+                  SELECT 1 FROM delivery_idempotency
+                  WHERE delivery_idempotency.agent_id = delivery_queue.agent_id
+                    AND delivery_idempotency.entry_id = delivery_queue.id
+            )
+        """
         row = await self._db.fetchone(
-            """
-            SELECT delivery_queue.id
-            FROM delivery_queue
-            WHERE delivery_queue.agent_id = ?
-              AND delivery_queue.recipient = ?
-              AND delivery_queue.channel_type = ?
-              AND delivery_queue.created_at >= ?
-              AND (
-                    delivery_queue.canonical_content_hash = ?
-                    OR delivery_queue.content_hash IN (?, ?)
-              )
-              AND NOT EXISTS (
-                    SELECT 1 FROM delivery_dead_letter
-                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                      AND delivery_dead_letter.original_id = delivery_queue.id
-              )
-              AND NOT EXISTS (
-                    SELECT 1 FROM delivery_dead_letter
-                    WHERE delivery_dead_letter.agent_id = delivery_queue.agent_id
-                      AND delivery_dead_letter.retry_entry_id = delivery_queue.id
-              )
-              AND NOT EXISTS (
-                    SELECT 1 FROM delivery_idempotency
-                    WHERE delivery_idempotency.agent_id = delivery_queue.agent_id
-                      AND delivery_idempotency.entry_id = delivery_queue.id
-              )
+            f"""
+            SELECT id FROM (
+                SELECT delivery_queue.id
+                FROM delivery_queue
+                WHERE delivery_queue.agent_id = ?
+                  AND delivery_queue.canonical_content_hash = ?
+                  {eligibility}
+                UNION ALL
+                SELECT delivery_queue.id
+                FROM delivery_queue
+                WHERE delivery_queue.agent_id = ?
+                  AND delivery_queue.content_hash IN (?, ?)
+                  {eligibility}
+            ) AS compatible_queue_rows
             LIMIT 1
             """,
             (
                 self._agent_id,
+                canonical_content_hash,
                 recipient,
                 channel_type,
                 claim_created_at,
-                canonical_content_hash,
+                self._agent_id,
                 canonical_content_hash,
                 legacy_content_hash,
+                recipient,
+                channel_type,
+                claim_created_at,
             ),
         )
         return row is not None
@@ -1005,13 +1017,16 @@ class DeliveryQueue:
                         )
                         return anchored_replacement
 
-                    if await self._has_unlinked_compatible_queue_row(
-                        recipient=recipient,
-                        canonical_content_hash=canonical_content_hash,
-                        legacy_content_hash=stored_legacy_hash
-                        or legacy_content_hash,
-                        channel_type=channel_type,
-                        claim_created_at=claim_created_at,
+                    if (
+                        canonical_id != candidate_id
+                        and await self._has_unlinked_compatible_queue_row(
+                            recipient=recipient,
+                            canonical_content_hash=canonical_content_hash,
+                            legacy_content_hash=stored_legacy_hash
+                            or legacy_content_hash,
+                            channel_type=channel_type,
+                            claim_created_at=claim_created_at,
+                        )
                     ):
                         raise DeliveryIdempotencyStateError(
                             "stale delivery idempotency record has an unlinked "

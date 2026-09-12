@@ -881,6 +881,25 @@ class TestQueueIdempotency:
         ) == (queue._max_retries,)
 
     @pytest.mark.asyncio
+    async def test_fresh_claim_skips_stale_compatibility_probe(self, real_queue):
+        queue, _ = real_queue
+
+        with patch.object(
+            queue,
+            "_has_unlinked_compatible_queue_row",
+            new_callable=AsyncMock,
+        ) as compatibility_probe:
+            entry_id = await queue.enqueue(
+                "email",
+                "fresh-claim@example.com",
+                {"body": "hello"},
+                idempotency_key="fresh-claim",
+            )
+
+        assert entry_id
+        compatibility_probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_pre_upgrade_stale_claim_without_policy_fails_closed(
         self, real_queue
     ):
@@ -2751,6 +2770,42 @@ class TestQueueIdempotency:
         details = "\n".join(str(column) for row in plan for column in row)
         assert "idx_delivery_dead_letter_original" in details
         assert "idx_delivery_dead_letter_retry" in details
+
+    @pytest.mark.asyncio
+    async def test_stale_compatibility_probe_uses_both_content_indexes(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_fetchone = queue._db.fetchone
+        captured = {}
+
+        async def capture_compatibility_query(sql, params=()):
+            if "AS compatible_queue_rows" in sql:
+                captured["sql"] = sql
+                captured["params"] = params
+            return await original_fetchone(sql, params)
+
+        with patch.object(
+            queue._db, "fetchone", side_effect=capture_compatibility_query
+        ):
+            found = await queue._has_unlinked_compatible_queue_row(
+                recipient="query-plan@example.com",
+                canonical_content_hash="canonical",
+                legacy_content_hash="legacy",
+                channel_type="email",
+                claim_created_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        assert found is False
+        normalized = " ".join(captured["sql"].split())
+        assert " OR " not in normalized
+        assert "UNION ALL" in normalized
+        plan = await queue._db.fetchall(
+            f"EXPLAIN QUERY PLAN {captured['sql']}", captured["params"]
+        )
+        details = "\n".join(str(column) for row in plan for column in row)
+        assert "idx_delivery_queue_canonical_dedup" in details
+        assert "idx_delivery_queue_dedup" in details
 
     @pytest.mark.asyncio
     async def test_dead_letter_lock_probes_each_identity_without_or(
