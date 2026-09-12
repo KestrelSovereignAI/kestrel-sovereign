@@ -401,6 +401,11 @@ class SQLiteBackend(DatabaseBackend):
     @property
     def backend_type(self) -> str:
         return "sqlite"
+
+    @property
+    def nested_transaction_strategy(self) -> str:
+        """SQLite currently joins same-task nested transaction scopes."""
+        return "joined"
     
     @property
     def is_connected(self) -> bool:

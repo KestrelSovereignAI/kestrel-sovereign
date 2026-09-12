@@ -1174,6 +1174,19 @@ class AsyncDatabase:
     def backend_type(self) -> str:
         """Get backend type: 'sqlite' or 'postgres'."""
         return self._backend.backend_type
+
+    @property
+    def nested_transaction_strategy(self) -> str | None:
+        """How this backend isolates a same-task nested transaction.
+
+        ``savepoint`` means an inner failure rolls back independently;
+        ``joined`` means the inner scope shares its caller's transaction and
+        must compensate any partial work before propagating an error.
+        Unknown backends return ``None`` so durability-sensitive callers fail
+        closed instead of guessing from a backend name.
+        """
+        strategy = getattr(self._backend, "nested_transaction_strategy", None)
+        return strategy if strategy in {"savepoint", "joined"} else None
     
     async def _init_schema(self) -> None:
         """Create database tables if they don't exist."""
@@ -3375,6 +3388,27 @@ class AsyncDatabase:
             )
         return bool(row) and not bool(row[0])
 
+    async def _column_has_default(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has a database-side default.
+
+        An absent column returns ``False``. PostgreSQL resolves the same
+        search-path relation as unqualified DDL via ``to_regclass``; SQLite
+        reports the live default through ``pragma_table_info``.
+        """
+        if self.backend_type == "postgres":
+            row = await self._backend.fetch_one(
+                "SELECT atthasdef FROM pg_attribute "
+                "WHERE attrelid = to_regclass(?) AND attname = ? "
+                "AND attnum > 0 AND NOT attisdropped",
+                (table, column),
+            )
+            return bool(row and row[0])
+        row = await self._backend.fetch_one(
+            f"SELECT dflt_value FROM pragma_table_info('{table}') "
+            f"WHERE name='{column}'"
+        )
+        return bool(row and row[0] is not None)
+
     # ─────────────────────────────────────────────────────────────────
     # Query methods - delegate to backend
     # ─────────────────────────────────────────────────────────────────
@@ -3457,6 +3491,26 @@ class AsyncDatabase:
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""
         return await self._backend.table_exists(table_name)
+
+    async def column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check whether a column exists using backend-safe catalog lookup."""
+        return await self._column_exists(table_name, column_name)
+
+    async def column_accepts_null(self, table_name: str, column_name: str) -> bool:
+        """Check whether an existing column accepts NULL.
+
+        Returns ``False`` when the column is absent. Callers that must
+        distinguish an absent column from a NOT NULL column must first call
+        :meth:`column_exists`.
+        """
+        return await self._column_accepts_null(table_name, column_name)
+
+    async def column_has_default(self, table_name: str, column_name: str) -> bool:
+        """Check whether an existing column has a database-side default.
+
+        Returns ``False`` when the column is absent.
+        """
+        return await self._column_has_default(table_name, column_name)
 
     async def table_exists_diagnostic(self, table_name: str) -> bool:
         """Check schema state without waiting on SQLite cleanup."""

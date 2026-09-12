@@ -444,6 +444,11 @@ class PostgresBackend(DatabaseBackend):
         return "postgres"
 
     @property
+    def nested_transaction_strategy(self) -> str:
+        """PostgreSQL isolates same-task nested transactions with savepoints."""
+        return "savepoint"
+
+    @property
     def is_connected(self) -> bool:
         return self._pool is not None
 

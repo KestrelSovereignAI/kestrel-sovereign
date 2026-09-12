@@ -886,6 +886,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/delivery_idempotency.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Delivery Enqueue Idempotency",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/economics/AGENT_ECONOMICS.md",
       "privacy": "public",
       "render": "public",

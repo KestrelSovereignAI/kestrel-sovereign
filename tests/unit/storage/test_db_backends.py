@@ -4,7 +4,7 @@ Tests for database backend abstraction layer.
 import asyncio
 import threading
 from contextlib import suppress
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -117,6 +117,10 @@ class TestSQLiteBackend:
     @pytest.mark.asyncio
     async def test_backend_type(self, backend):
         assert backend.backend_type == "sqlite"
+
+    @pytest.mark.asyncio
+    async def test_nested_transaction_strategy_is_joined(self, backend):
+        assert backend.nested_transaction_strategy == "joined"
     
     @pytest.mark.asyncio
     async def test_is_connected(self, backend):
@@ -1831,6 +1835,51 @@ class TestSQLiteBackend:
 
 class TestAsyncDatabase:
     """Test the AsyncDatabase facade."""
+
+    @pytest.mark.asyncio
+    async def test_column_shape_helpers_delegate_to_backend_safe_probes(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = AsyncDatabase(MagicMock())
+        database._column_accepts_null = AsyncMock(return_value=True)
+        database._column_has_default = AsyncMock(return_value=True)
+
+        assert await database.column_accepts_null("widgets", "note") is True
+        assert await database.column_has_default("widgets", "note") is True
+        database._column_accepts_null.assert_awaited_once_with("widgets", "note")
+        database._column_has_default.assert_awaited_once_with("widgets", "note")
+
+    def test_nested_transaction_strategy_allow_list_and_backend_contracts(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+        unknown_backend = MagicMock()
+        unknown_backend.nested_transaction_strategy = "future-strategy"
+        assert AsyncDatabase(unknown_backend).nested_transaction_strategy is None
+        assert SQLiteBackend(":memory:").nested_transaction_strategy == "joined"
+        assert PostgresBackend(
+            "postgresql://test:test@127.0.0.1/test"
+        ).nested_transaction_strategy == "savepoint"
+
+    @pytest.mark.asyncio
+    async def test_column_shape_helpers_define_missing_column_semantics(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(":memory:")
+        try:
+            await database.execute(
+                "CREATE TABLE widgets (nullable TEXT DEFAULT 'note', "
+                "required TEXT NOT NULL)"
+            )
+
+            assert await database.column_accepts_null("widgets", "nullable")
+            assert not await database.column_accepts_null("widgets", "required")
+            assert not await database.column_accepts_null("widgets", "missing")
+            assert await database.column_has_default("widgets", "nullable")
+            assert not await database.column_has_default("widgets", "required")
+            assert not await database.column_has_default("widgets", "missing")
+        finally:
+            await database.close()
 
     @pytest.mark.asyncio
     async def test_cancelled_cached_sqla_disposal_still_closes_primary_worker(
