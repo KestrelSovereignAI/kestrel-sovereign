@@ -32,7 +32,7 @@ dead-letter retry do not adopt a changed process default or reconstructed hash; 
 pre-upgrade orphan with no recoverable policy fails closed. This minimizes accidental raw-key
 disclosure but does not make a guessable key confidential. The
 `delivery_queue_schema_v3` migration lock serializes creation and upgrades of
-the ledger, its retention index, and SQLite's explicitly marked compensation
+the ledger and SQLite's explicitly marked compensation
 trigger. Queue rows retain the historical `content_hash` representation for
 readers from a rolling deployment and store the semantic JSON identity in
 `canonical_content_hash`. Current readers consult both identities. Every
@@ -63,13 +63,30 @@ trigger. A stale replay claim records its prior queue ID while a replacement is
 being created and retains that recovery anchor after insertion, so an
 ambiguously completed insert can still be compensated and restore the claim
 instead of deleting its fail-closed conflict history. If a stale claim finds an
-unlinked compatible rolling-writer retry outside the short deduplication window,
+unlinked compatible rolling-writer retry with the same recipient, channel, and
+effective retry policy outside the short deduplication window,
 replay fails closed for manual reconciliation: automatically adopting it could
 collapse an independent delivery, while inserting again could duplicate a retry.
 Purge never deletes an idempotency claim solely because its queue row is absent:
 that durable shape can also represent missing retry-policy provenance or an
 unlinked compatible rolling-writer retry. Such claims remain fail closed until
 replay can repair them safely or an operator reconciles them explicitly.
+Manual reconciliation is deliberately a direct database-administration action,
+not an application API. The operator must first inspect the owner-scoped claim
+(`agent_id`, `idempotency_key_digest`, `entry_id`, `previous_entry_id`,
+`payload_digest`, and `effective_max_retries`) together with matching
+`delivery_queue` and `delivery_dead_letter` rows and confirm the external
+provider state. Only then may the exact claim be removed:
+
+```sql
+DELETE FROM delivery_idempotency
+WHERE agent_id = :agent_id
+  AND idempotency_key_digest = :sha256_key_digest;
+```
+
+The digest is the hexadecimal SHA-256 of the raw key, which is never stored.
+Both predicates are mandatory; a digest alone is not tenant-safe. If external
+delivery state is uncertain, retain the claim and keep replay fail closed.
 The move into dead letter
 uses the same recoverable ordering: it writes
 the tombstone before deleting the live row, while queue processing and keyed

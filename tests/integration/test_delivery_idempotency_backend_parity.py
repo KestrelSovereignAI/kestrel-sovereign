@@ -203,7 +203,7 @@ async def test_stale_claim_repair_preserves_effective_retry_policy(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_stale_claim_refuses_dedup_under_different_policy(db_backend):
+async def test_stale_claim_does_not_treat_different_policy_as_compatible(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-stale-policy-dedup:{uuid4().hex}"
     original_queue = DeliveryQueue(database, owner, max_retries=5)
@@ -221,15 +221,19 @@ async def test_stale_claim_refuses_dedup_under_different_policy(db_backend):
         )
         replacement_id = await restarted_queue.enqueue(*request)
 
-        with pytest.raises(DeliveryIdempotencyStateError, match="unlinked"):
-            await restarted_queue.enqueue(
-                *request, idempotency_key="stale-policy-dedup"
-            )
+        repaired_id = await restarted_queue.enqueue(
+            *request, idempotency_key="stale-policy-dedup"
+        )
 
         assert await database.fetchone(
             "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
             (replacement_id, owner),
         ) == (99,)
+        assert repaired_id not in {original_id, replacement_id}
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (repaired_id, owner),
+        ) == (5,)
     finally:
         await database.execute(
             "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)

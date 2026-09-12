@@ -783,6 +783,38 @@ class TestQueueIdempotency:
         assert len(deliveries) == 1
 
     @pytest.mark.asyncio
+    async def test_claim_upsert_locks_conflict_in_one_statement(self, real_queue):
+        queue, _ = real_queue
+        original_execute = queue._db.execute
+        statements = []
+
+        async def capture_execute(sql, params=()):
+            statements.append(" ".join(sql.split()))
+            return await original_execute(sql, params)
+
+        with patch.object(queue._db, "execute", side_effect=capture_execute):
+            await queue.enqueue(
+                "email",
+                "atomic-claim@example.com",
+                {"body": "hello"},
+                idempotency_key="atomic-claim",
+            )
+
+        claim_insert = next(
+            sql
+            for sql in statements
+            if sql.startswith("INSERT INTO delivery_idempotency")
+        )
+        assert (
+            "ON CONFLICT (agent_id, idempotency_key_digest) DO UPDATE "
+            "SET entry_id = delivery_idempotency.entry_id"
+        ) in claim_insert
+        assert not any(
+            sql.startswith("UPDATE delivery_idempotency SET entry_id = entry_id")
+            for sql in statements
+        )
+
+    @pytest.mark.asyncio
     async def test_replay_returns_canonical_id_after_delivery(self, real_queue):
         queue, _ = real_queue
         request = {
@@ -1050,7 +1082,47 @@ class TestQueueIdempotency:
             canonical_content_hash=row[1],
             legacy_content_hash=row[2],
             channel_type=row[3],
+            max_retries=3,
             claim_created_at=row[4],
+        )
+
+    @pytest.mark.asyncio
+    async def test_unlinked_compatibility_requires_matching_retry_policy(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        entry_id = await queue.enqueue(
+            "email",
+            "unlinked-policy@example.com",
+            {"body": "hello"},
+            max_retries=7,
+            idempotency_key="unlinked-policy",
+        )
+        row = await queue._db.fetchone(
+            """
+            SELECT recipient, canonical_content_hash, content_hash,
+                   channel_type, max_retries, created_at
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            (entry_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        )
+
+        query = {
+            "recipient": row[0],
+            "canonical_content_hash": row[1],
+            "legacy_content_hash": row[2],
+            "channel_type": row[3],
+            "claim_created_at": row[5],
+        }
+        assert await queue._has_unlinked_compatible_queue_row(
+            **query, max_retries=row[4]
+        )
+        assert not await queue._has_unlinked_compatible_queue_row(
+            **query, max_retries=row[4] + 1
         )
 
     @pytest.mark.asyncio
@@ -1353,7 +1425,7 @@ class TestQueueIdempotency:
         ) == (entry_id,)
 
     @pytest.mark.asyncio
-    async def test_schema_has_retention_and_scoped_compensation_indexes(
+    async def test_schema_has_only_live_scoped_idempotency_indexes(
         self, real_queue
     ):
         queue, _ = real_queue
@@ -1366,7 +1438,7 @@ class TestQueueIdempotency:
         names = {row[0] for row in indexes}
         assert "idx_delivery_idempotency_entry" in names
         assert "idx_delivery_idempotency_previous" in names
-        assert "idx_delivery_idempotency_retention" in names
+        assert "idx_delivery_idempotency_retention" not in names
 
     @pytest.mark.asyncio
     async def test_v3_schema_does_not_rebuild_replay_index(self, real_queue):
@@ -1663,7 +1735,7 @@ class TestQueueIdempotency:
                 original[2],
                 None,
                 DeliveryStatus.PENDING.value,
-                original[3] + 1,
+                original[3],
                 candidate_time,
                 candidate_time,
             ),
@@ -3013,6 +3085,24 @@ class TestQueueIdempotency:
             )
 
     @pytest.mark.asyncio
+    async def test_keyed_content_accepts_tuple_as_json_array(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "tuple-json@example.com",
+            "content": {"items": ("one", 2)},
+            "idempotency_key": "tuple-json",
+        }
+
+        entry_id = await queue.enqueue(**request)
+        assert await queue.enqueue(
+            "email",
+            request["recipient"],
+            {"items": ["one", 2]},
+            idempotency_key=request["idempotency_key"],
+        ) == entry_id
+
+    @pytest.mark.asyncio
     async def test_keyed_and_plain_enqueues_share_dedup_identity(self, real_queue):
         queue, _ = real_queue
         content = {"subject": "hello", "body": "world"}
@@ -3187,6 +3277,7 @@ class TestQueueIdempotency:
                 canonical_content_hash="canonical",
                 legacy_content_hash="legacy",
                 channel_type="email",
+                max_retries=3,
                 claim_created_at=datetime.now(timezone.utc).isoformat(),
             )
 

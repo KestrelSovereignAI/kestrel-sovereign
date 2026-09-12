@@ -128,14 +128,14 @@ def _validate_json_value(
         if math.isfinite(value):
             return
         raise ValueError(f"idempotent delivery {path} must be a finite JSON number")
-    if isinstance(value, (list, dict)):
+    if isinstance(value, (list, tuple, dict)):
         active = _active if _active is not None else set()
         identity = id(value)
         if identity in active:
             raise ValueError(f"idempotent delivery {path} contains a JSON cycle")
         active.add(identity)
         try:
-            if isinstance(value, list):
+            if isinstance(value, (list, tuple)):
                 for index, item in enumerate(value):
                     _validate_json_value(
                         item, path=f"{path}[{index}]", _active=active
@@ -558,6 +558,7 @@ class DeliveryQueue:
         canonical_content_hash: str,
         legacy_content_hash: str,
         channel_type: str,
+        max_retries: int,
         claim_created_at: str,
     ) -> bool:
         """Detect an unreconciled rolling-writer retry outside dedup time.
@@ -569,6 +570,7 @@ class DeliveryQueue:
         eligibility = """
             AND delivery_queue.recipient = ?
             AND delivery_queue.channel_type = ?
+            AND delivery_queue.max_retries = ?
             AND delivery_queue.created_at >= ?
             AND NOT EXISTS (
                   SELECT 1 FROM delivery_dead_letter
@@ -608,12 +610,14 @@ class DeliveryQueue:
                 canonical_content_hash,
                 recipient,
                 channel_type,
+                max_retries,
                 claim_created_at,
                 self._agent_id,
                 canonical_content_hash,
                 legacy_content_hash,
                 recipient,
                 channel_type,
+                max_retries,
                 claim_created_at,
             ),
         )
@@ -822,7 +826,8 @@ class DeliveryQueue:
                              payload_digest, created_at, effective_max_retries,
                              legacy_content_hash)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (agent_id, idempotency_key_digest) DO NOTHING
+                        ON CONFLICT (agent_id, idempotency_key_digest)
+                        DO UPDATE SET entry_id = delivery_idempotency.entry_id
                         """,
                         (
                             self._agent_id,
@@ -833,16 +838,6 @@ class DeliveryQueue:
                             retries,
                             legacy_content_hash,
                         ),
-                    )
-                    # Lock the canonical ledger row portably. SQLite already
-                    # owns the sole writer slot; PostgreSQL's no-op UPDATE waits
-                    # for and locks a concurrently inserted claim.
-                    await self._db.execute(
-                        """
-                        UPDATE delivery_idempotency SET entry_id = entry_id
-                        WHERE agent_id = ? AND idempotency_key_digest = ?
-                        """,
-                        (self._agent_id, key_digest),
                     )
                     existing = await self._db.fetchone(
                         """
@@ -1036,6 +1031,7 @@ class DeliveryQueue:
                             legacy_content_hash=stored_legacy_hash
                             or legacy_content_hash,
                             channel_type=channel_type,
+                            max_retries=stored_retries,
                             claim_created_at=claim_created_at,
                         )
                     ):
@@ -2007,11 +2003,11 @@ class DeliveryQueue:
             ON delivery_idempotency(agent_id, previous_entry_id)
             """
         )
+        # Older v3 schemas created this index for age-only orphan cleanup.
+        # Claims are now retained fail closed unless their delivered queue row
+        # is selected by purge, so no query uses the index.
         await self._db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_delivery_idempotency_retention
-            ON delivery_idempotency(agent_id, created_at)
-            """
+            "DROP INDEX IF EXISTS idx_delivery_idempotency_retention"
         )
         if self._db.backend_type == "sqlite":
             await self._db.execute(
