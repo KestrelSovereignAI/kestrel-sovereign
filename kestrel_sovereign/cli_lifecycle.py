@@ -1,6 +1,6 @@
 """Kestrel CLI — host/agent lifecycle commands.
 
-``start``, ``stop``, ``restart``, ``update``, ``status``, ``logs``. Extracted
+``start``, ``terminate``, ``restart``, ``update``, ``status``, ``logs``. Extracted
 from ``cli.py`` (#1678) following the ``cli_<group>.py`` convention. Shared,
 test-patched helpers (``_get_project_dir``, ``MultiAgentConfig``, and the
 ``update`` git/uv helpers patched via ``cli.<name>``) are reached through the
@@ -1719,7 +1719,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
     restart_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
     restart_p.add_argument(
         "--force", action="store_true",
-        help="Force-kill existing processes during the stop phase",
+        help="Force-kill existing processes during the termination phase",
     )
     _add_startup_timeout_argument(restart_p)
 

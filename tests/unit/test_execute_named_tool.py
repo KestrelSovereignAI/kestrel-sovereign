@@ -211,6 +211,61 @@ def agent_with_tool(fake_tool):
 
 class TestExecuteNamedToolGovernance:
     @pytest.mark.asyncio
+    async def test_inline_executor_marks_completed_effect_on_owning_turn(self):
+        """The reader-task bridge updates the captured turn durability state."""
+
+        from kestrel_sovereign.agent.invocation import (
+            current_invocation_effect_checkpoint,
+            invocation_scope,
+        )
+
+        agent = _MinimalOrchestrator(
+            features={},
+            hooks_manager=_FakeHooksManager(),
+        )
+        agent.execute_named_tool = AsyncMock(
+            return_value={"success": True, "result": "committed"}
+        )
+
+        with invocation_scope("inline-effect-turn"):
+            state = current_invocation_effect_checkpoint()
+            executor = agent._make_inline_tool_executor("effect-session")
+            await executor("send_message", {"text": "sent once"})
+
+            assert state is not None
+            assert state.completed is True
+            assert state.session_id == "effect-session"
+
+    @pytest.mark.asyncio
+    async def test_inline_executor_exposes_completed_effect_checkpoint(self):
+        """The adapter-facing callable is wired to the durable Stop seam."""
+
+        agent = _MinimalOrchestrator(
+            features={},
+            hooks_manager=_FakeHooksManager(),
+        )
+        agent._persist_completed_tool_stop_checkpoint = AsyncMock()
+
+        executor = agent._make_inline_tool_executor("session-checkpoint")
+        checkpoint = getattr(executor, "persist_completed_effects", None)
+        assert callable(checkpoint)
+
+        executed = [
+            {
+                "id": "call-1",
+                "name": "send_email",
+                "arguments": {},
+                "result": {"success": True},
+            }
+        ]
+        await checkpoint(executed)
+
+        agent._persist_completed_tool_stop_checkpoint.assert_awaited_once_with(
+            session_id="session-checkpoint",
+            request_id=None,
+        )
+
+    @pytest.mark.asyncio
     async def test_runs_tool_and_fires_pre_and_post_hooks(self, agent_with_tool, fake_tool):
         result = await agent_with_tool.execute_named_tool(
             "send_email",

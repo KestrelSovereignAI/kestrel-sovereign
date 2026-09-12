@@ -14,6 +14,8 @@ import uuid
 import logging
 
 from kestrel_sovereign.kestrel_config.defaults import get_ipfs_api_url
+from kestrel_sovereign.api_errors import rate_limited_until
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.llm.model_metadata import ModelCategory
 from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
@@ -22,20 +24,24 @@ from kestrel_sovereign.features.sovereignty.artifacts import owned_artifacts, ow
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
     get_caller,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     caller_is_sovereign,
     require_sovereign_host_lifecycle,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     stopped_invocation_http_error,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
 )
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
     resolve_feature_database,
 )
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.multi_agent.agent_manager import (
     RuntimeOffboardingAdmission,
     RuntimeOffboardingNotPerformedError,
@@ -49,6 +55,20 @@ router = APIRouter(tags=["models"])
 
 # Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+
+
+def _reload_multi_agent_config(request: Request, config_path):
+    """Reload a roster under the same path context accepted at host boot."""
+
+    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+
+    runtime_env = getattr(request.app.state, "multi_agent_runtime_env", None)
+    runtime_base = getattr(request.app.state, "multi_agent_runtime_base", None)
+    return MultiAgentConfig.from_file(
+        config_path,
+        runtime_env=runtime_env,
+        runtime_base=runtime_base,
+    )
 
 
 def _key_storage_privacy_detail() -> str:
@@ -314,9 +334,8 @@ async def create_agent(request: Request, body: CreateAgentRequest):
         or clobber a malformed file mid-repair."""
         cfg_path = getattr(request.app.state, 'multi_agent_config_path', None)
         if cfg_path:
-            from kestrel_sovereign.multi_agent.config import MultiAgentConfig as _MAC
             try:
-                return _MAC.from_file(cfg_path), cfg_path, True
+                return _reload_multi_agent_config(request, cfg_path), cfg_path, True
             except Exception as reload_err:
                 logger.error(
                     f"Could not reload {cfg_path} ({reload_err}); refusing to "
@@ -422,10 +441,8 @@ def _read_persisted_agent_registration_for_offboarding(
                 "again on restart."
             ),
         )
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         logger.error(
             "Could not load multi-agent config before offboarding %r",
@@ -475,10 +492,8 @@ def _remove_persisted_agent_registration_for_offboarding(
     """Remove the previously witnessed registration with a narrow CAS check."""
 
     config_path, persisted_name, expected_config = registration
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
     try:
-        current = MultiAgentConfig.from_file(config_path)
+        current = _reload_multi_agent_config(request, config_path)
     except Exception as exc:
         raise HTTPException(
             status_code=409,
@@ -526,9 +541,7 @@ def _restore_persisted_agent_registration(
     config_path, persisted_name, removed_config = rollback
     if removed_config is None:
         return
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
-
-    current = MultiAgentConfig.from_file(config_path)
+    current = _reload_multi_agent_config(request, config_path)
     if any(name.casefold() == persisted_name.casefold() for name in current.agents):
         raise RuntimeError(
             "agent registration changed concurrently; refusing rollback overwrite"
@@ -3335,6 +3348,7 @@ async def chat_completions(request: Request, http_response: Response):
         # Extract user_passphrase for USER_BYOK agents
         user_passphrase = data.get("user_passphrase")
         request_id = resolve_request_invocation_id(request, data)
+        await prime_durable_stop_fence(request, agent, request_id)
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/v1/chat/completions",
@@ -3374,8 +3388,12 @@ async def chat_completions(request: Request, http_response: Response):
         }
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return resp
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
     except HTTPException:
         # Preserve the original status code (notably 503 from get_agent
         # when no agent is bound — multi-agent mode requires the
@@ -3387,4 +3405,10 @@ async def chat_completions(request: Request, http_response: Response):
         raise
     except Exception as e:
         logger.error(f"Error in chat_completions: {e}", exc_info=True)
+        declined = advised_wait_exceeding_budget(e)
+        if declined is not None:
+            # The route declined a server-advised wait (#3127): tell the
+            # OpenAI-compatible client when, the way it expects (429 with
+            # Retry-After), not a 500 that reads as a server bug.
+            raise rate_limited_until(declined) from e
         raise HTTPException(status_code=500, detail="Internal error in chat completions.")

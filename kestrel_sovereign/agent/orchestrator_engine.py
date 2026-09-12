@@ -11,6 +11,7 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -20,6 +21,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
@@ -41,6 +46,11 @@ from kestrel_sovereign.agent.parts import (
     drain_parts,
     sanitize_part,
 )
+from kestrel_sovereign.agent.invocation import (
+    current_invocation_effect_checkpoint,
+    current_invocation_id,
+    mark_current_invocation_effect_completed,
+)
 from kestrel_sovereign.agent.turn_lifecycle import (
     bind_turn_session,
     capture_turn_session_binding,
@@ -49,8 +59,11 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     bind_transition_lock_reentry,
 )
 from kestrel_sovereign.agent.streaming import (
+    _DeferredToolBatchCancellation,
+    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
     _build_revise_sentinel,
     _build_tool_sentinel,
+    STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
 )
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.security.tool_audit import (
@@ -691,6 +704,8 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.auth import capture_caller_context_binding
 
         turn_caller_binding = capture_caller_context_binding()
+        request_id = current_invocation_id()
+        effect_checkpoint = current_invocation_effect_checkpoint()
 
         async def _exec(name: str, args: dict):
             # Capture the post-hook args so the inline adapter's
@@ -708,9 +723,55 @@ class OrchestratorEngineMixin:
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
                 )
+            # The Codex reader owns this callback on an old task context.  Pass
+            # the turn's captured mutable state explicitly: a ContextVar lookup
+            # here would see the reader's stale pre-turn snapshot.
+            mark_current_invocation_effect_completed(
+                session_id,
+                checkpoint=effect_checkpoint,
+            )
             return capture.get("effective_args", args), result
 
+        async def _persist_completed_effects(executed: list[dict]) -> None:
+            """Checkpoint an inline effect before transport cancellation wins."""
+
+            if not executed:
+                return
+            await self._persist_completed_tool_stop_checkpoint(
+                session_id=session_id,
+                request_id=request_id,
+            )
+
+        # Codex runs the callable on a reader-owned task and therefore owns the
+        # only cancellation boundary that can see both the completed inline
+        # effect log and the pending turn cancellation.  Publish a narrow
+        # callback on the callable itself so the adapter can make that boundary
+        # durable without learning anything about Kestrel's storage layer.
+        _exec.persist_completed_effects = _persist_completed_effects
+
         return _exec
+
+    async def _persist_completed_tool_stop_checkpoint(
+        self,
+        *,
+        session_id: Optional[str],
+        request_id: Optional[str],
+    ) -> None:
+        """Persist fixed anti-repeat evidence for a cancelled completed batch."""
+
+        await self._persist_assistant_turn_safely(
+            STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
+            metadata={
+                "tool_batch_checkpoint": dict(
+                    _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA[
+                        "tool_batch_checkpoint"
+                    ]
+                )
+            },
+            session_id=session_id,
+            request_id=request_id,
+            require_success=True,
+        )
 
     def _capture_transition_reentry_token(self):
         """Capture the owning turn's transition-lock reentry token, or ``None``.
@@ -2296,6 +2357,74 @@ class OrchestratorEngineMixin:
                 # parts once after the gather and attach to the last event.
                 _collect_parts()
 
+    async def _execute_tool_batch_at_stop_boundary(
+        self,
+        *args,
+        defer_cancellation_to_persistence: bool = False,
+        **kwargs,
+    ):
+        """Finish a side-effecting batch before propagating cancellation.
+
+        Cooperative Stop may cancel the top-level invocation task at any
+        await.  A tool batch is not such a boundary: cancelling it halfway can
+        leave an external effect committed while the corresponding tool result
+        is absent from history.  Give the batch its own lifecycle owner, join
+        it through repeated caller cancellation, and only then let Stop unwind
+        the turn.  The next loop checkpoint observes the cancellation flag and
+        prevents another tool or provider round-trip.
+        """
+
+        capture_reentry = getattr(self, "_capture_transition_reentry_token", None)
+        transition_reentry_token = (
+            capture_reentry() if callable(capture_reentry) else None
+        )
+
+        async def run_owned_batch():
+            with bind_transition_lock_reentry(transition_reentry_token):
+                return await self._execute_tool_batch(*args, **kwargs)
+
+        # This moves the SAME logical turn into a cancellable task, which is
+        # exactly the case delegate_current_task_ownership documents: ordinary
+        # child tasks deliberately do not inherit a non-reentrant lock, so
+        # without this the batch runs with the turn's CONVERSATION hold
+        # invisible. is_owned_by_current_task and _caller_belongs_to_live_turn
+        # both go False inside every tool, which turns an in-turn isolated tool
+        # into a wait on a config-transition gate the turn itself is holding
+        # the lock against, and makes privacy_transition() re-acquire a lock
+        # its own turn owns. The invocation boundary and the dispatcher both
+        # delegate at their task boundaries; this one has to as well. Tokens
+        # are per-acquisition, so the delegation stops authorizing the moment
+        # this turn releases.
+        batch_context = contextvars.copy_context()
+        lock_manager = None
+        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
+        if callable(get_lock_manager):
+            lock_manager = get_lock_manager(self)
+        delegate_lock_ownership = getattr(
+            lock_manager, "delegate_current_task_ownership", None
+        )
+        if callable(delegate_lock_ownership):
+            delegate_lock_ownership(batch_context)
+        owner = asyncio.create_task(
+            run_owned_batch(),
+            name="orchestrator-tool-batch",
+            context=batch_context,
+        )
+        tool_results = kwargs.get("tool_results")
+        result_count = len(tool_results) if isinstance(tool_results, list) else None
+        outcome = await await_owned_task(owner)
+        if (
+            result_count is not None
+            and len(tool_results) > result_count
+        ):
+            mark_current_invocation_effect_completed(kwargs.get("session_id"))
+        if defer_cancellation_to_persistence and outcome.cancellation is not None:
+            return _DeferredToolBatchCancellation(outcome)
+        return raise_owned_outcome(
+            outcome,
+            operation="side-effecting orchestrator tool batch",
+        )
+
     # ------------------------------------------------------------------
     # Non-streaming orchestrator response handler
     # ------------------------------------------------------------------
@@ -2383,6 +2512,57 @@ class OrchestratorEngineMixin:
         return 1 + history_len + (1 if has_user_message else 0), history_len
 
     async def _handle_orchestrator_response(
+        self,
+        response: Union[str, LLMResponse],
+        feature_tools: List[Dict[str, Any]],
+        system_prompt: str,
+        force_local_only: bool,
+        effective_model: str,
+        max_iterations: int = None,
+        user_message: str = None,
+        session_id: Optional[str] = None,
+        tool_results: Optional[list] = None,
+        invocation_context=None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        continuation_user_content: Optional[str] = None,
+    ) -> str:
+        """Run the non-streaming loop behind a completed-effect Stop fence."""
+
+        captured_results = tool_results if tool_results is not None else []
+        had_inline_effect = bool(getattr(response, "executed_tool_calls", None))
+        try:
+            return await OrchestratorEngineMixin._handle_orchestrator_response_impl(
+                self,
+                response=response,
+                feature_tools=feature_tools,
+                system_prompt=system_prompt,
+                force_local_only=force_local_only,
+                effective_model=effective_model,
+                max_iterations=max_iterations,
+                user_message=user_message,
+                session_id=session_id,
+                tool_results=captured_results,
+                invocation_context=invocation_context,
+                conversation_history=conversation_history,
+                continuation_user_content=continuation_user_content,
+            )
+        except asyncio.CancelledError as error:
+            state = current_invocation_effect_checkpoint()
+            already_checkpointed = bool(
+                getattr(error, "_kestrel_completed_effect_checkpointed", False)
+                or (state is not None and state.checkpointed)
+            )
+            if (had_inline_effect or captured_results) and not already_checkpointed:
+                await self._persist_completed_tool_stop_checkpoint(
+                    session_id=session_id,
+                    request_id=current_invocation_id(),
+                )
+                if state is not None:
+                    state.checkpointed = True
+                setattr(error, "_kestrel_completed_effect_checkpointed", True)
+            raise
+
+    async def _handle_orchestrator_response_impl(
         self,
         response: Union[str, LLMResponse],
         feature_tools: List[Dict[str, Any]],
@@ -2486,13 +2666,19 @@ class OrchestratorEngineMixin:
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
-            await self._execute_tool_batch(
+            batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_results=tool_results,
                 session_id=session_id,
                 effective_model=effective_model,
+                defer_cancellation_to_persistence=True,
             )
+            if isinstance(batch_result, _DeferredToolBatchCancellation):
+                raise_owned_outcome(
+                    batch_result.outcome,
+                    operation="side-effecting orchestrator tool batch",
+                )
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -2967,13 +3153,22 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
-            await self._execute_tool_batch(
+            batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id, part_emit_buffer=part_emit_buffer,
                 effective_model=effective_model,
+                defer_cancellation_to_persistence=True,
             )
+            if isinstance(batch_result, _DeferredToolBatchCancellation):
+                # The side effect and its result are complete, but Stop cancelled
+                # the invocation owner while this batch was in flight. Hand the
+                # captured cancellation to StreamingMixin without emitting any
+                # more client-visible bytes; it re-raises only after durable
+                # conversation history contains the completed result.
+                yield batch_result
+                return
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:
                 _parts_by_event_index.setdefault(_evt_idx, []).extend(_evt_parts)

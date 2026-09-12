@@ -727,6 +727,7 @@ ROUTED_MODULES = {
     "features/audit_anchor/feature.py",
     "features/consent/feature.py",
     "features/storage_access.py",  # the definition itself
+    "hold/enforcement.py",  # the turn-start Hold latch's own scope
     "features/tasks/feature.py",
     "features/tasks/wait_provider.py",
     "server.py",  # the feature-route mount owner's stable identity (#3240)

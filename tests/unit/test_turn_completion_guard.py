@@ -135,6 +135,9 @@ async def test_no_tool_continuation_gets_one_repair_step():
         ]
     )
     agent._execute_tool_batch = AsyncMock()
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+    )
     agent._build_all_tools = MagicMock(return_value=[])
     agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
@@ -243,6 +246,9 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
         ]
     )
     agent._execute_tool_batch = AsyncMock()
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+    )
     agent._build_all_tools = MagicMock(return_value=[])
     agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 

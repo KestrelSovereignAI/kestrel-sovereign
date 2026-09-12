@@ -9,6 +9,9 @@ from uuid import uuid4
 from kestrel_sovereign.agent.invocation import validate_invocation_id
 
 
+MAX_STOP_CORRELATION_ID_BYTES = 256
+
+
 class StopScope(str, Enum):
     """The addressable work boundary affected by a cooperative Stop.
 
@@ -32,6 +35,24 @@ class StopDisposition(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class AuthoritativeStopDescendant:
+    """One descendant identity proven by the durable signed lineage graph.
+
+    ``routing_name`` is deterministic presentation/routing metadata only.
+    ``agent_id`` is the signed child DID and is the sole cancellation binding.
+    """
+
+    routing_name: str
+    agent_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.routing_name, str) or not self.routing_name.strip():
+            raise ValueError("authoritative descendant requires a routing name")
+        if not isinstance(self.agent_id, str) or not self.agent_id.strip():
+            raise ValueError("authoritative descendant requires a signed agent DID")
+
+
+@dataclass(frozen=True, slots=True)
 class StopRequest:
     """A typed request to cooperatively stop work, never a process."""
 
@@ -44,6 +65,9 @@ class StopRequest:
     correlation_id: str = field(default_factory=lambda: uuid4().hex)
     target_is_turn_id: bool = False
     request_generation: int | None = None
+    turn_id: str | None = None
+    span_id: str | None = None
+    trace_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, StopScope):
@@ -103,6 +127,35 @@ class StopRequest:
             or not self.correlation_id.strip()
         ):
             raise ValueError("correlation_id must be a concrete string")
+        try:
+            encoded_correlation_id = self.correlation_id.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("correlation_id must be valid Unicode text") from error
+        if len(encoded_correlation_id) > MAX_STOP_CORRELATION_ID_BYTES:
+            raise ValueError(
+                "correlation_id must be no longer than 256 UTF-8 bytes"
+            )
+        if self.scope is StopScope.TURN:
+            if self.turn_id is None:
+                object.__setattr__(self, "turn_id", self.target)
+            elif self.target_is_turn_id and self.turn_id != self.target:
+                raise ValueError("public turn Stop identity must match its target")
+        elif self.scope is not StopScope.TURN and self.turn_id is not None:
+            raise ValueError("only turn Stop may carry a turn_id")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str) or not self.turn_id
+        ):
+            raise ValueError("turn_id must be a non-empty string when supplied")
+        for field_name, value in (
+            ("span_id", self.span_id),
+            ("trace_id", self.trace_id),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"{field_name} must be a non-empty string when supplied"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +168,9 @@ class StopRequest:
             "correlation_id": self.correlation_id,
             "target_is_turn_id": self.target_is_turn_id,
             "request_generation": self.request_generation,
+            "turn_id": self.turn_id,
+            "span_id": self.span_id,
+            "trace_id": self.trace_id,
         }
 
     @classmethod
@@ -129,6 +185,9 @@ class StopRequest:
             correlation_id=value["correlation_id"],
             target_is_turn_id=value.get("target_is_turn_id", False),
             request_generation=value.get("request_generation"),
+            turn_id=value.get("turn_id"),
+            span_id=value.get("span_id"),
+            trace_id=value.get("trace_id"),
         )
 
 

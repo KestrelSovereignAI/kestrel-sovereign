@@ -18,8 +18,11 @@ marker. Terra reproduced both leaks:
   ``ROUTE_FIELD_UNBOUNDED_MARKER__WITHHELD_TEXT`` (finding 4).
 
 So the client message here is CONSTANT per error class — it never interpolates
-the exception's message, underlying, or provider. The failing route and full
-error stay operator-log only (a separate trust boundary the callers own).
+the exception's message, underlying, or provider. The one variable it carries
+is the reset time of a declined advised wait (#3127), a timestamp this code
+computed from the provider's ``Retry-After`` number, never provider text. The
+failing route and full error stay operator-log only (a separate trust boundary
+the callers own).
 
 Callers:
     * :func:`safe_streaming_error_message` — the core content-free string.
@@ -35,7 +38,8 @@ import json
 # Each safe message is a ``(header, body)`` pair: the ``header`` is the bold
 # summary the chat error card renders, the ``body`` the plain guidance after it.
 # Both are CONSTANT per error class — no interpolation of ``str(exc)``,
-# ``underlying``, or ``provider`` ever.
+# ``underlying``, or ``provider`` ever; a declined wait's reset time (our own
+# computed timestamp) is the one value that varies.
 
 # Any non-``LLMStreamingError`` exception is arbitrary, untrusted text (a
 # mid-buffer failure under a strict audit could carry the withheld response), so
@@ -74,15 +78,47 @@ def _is_llm_streaming_error(exc: BaseException) -> bool:
     return isinstance(exc, LLMStreamingError)
 
 
+def _declined_wait(exc: BaseException):
+    """The retry loop's declined advised wait in ``exc``'s cause chain, if any
+    (imported lazily for the same reason as :func:`_is_llm_streaming_error`)."""
+    try:
+        from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
+    except Exception:  # pragma: no cover - defensive import guard
+        return None
+    return advised_wait_exceeding_budget(exc)
+
+
+def _rate_limited_message(declined) -> tuple[str, str]:
+    """The route declined to wait for a reset the provider named (#3127).
+
+    The only interpolated value is that reset time: a timestamp this code
+    computed from the provider's number, not caller content, provider prose,
+    or the route's free-string name. The guidance stays constant and mirrors
+    ``_ROUTE_ERROR``. Only a throttle is ever declined.
+    """
+    return (
+        "The model route is rate limited.",
+        (
+            f"The provider asked to wait {declined.reset_phrase()}. No fallback "
+            "response was generated — retry after that time, or pick a different "
+            "model/route from the dropdown."
+        ),
+    )
+
+
 def _classify(exc: BaseException):
     """Map ``exc`` to its ``(header, body)`` safe message pair."""
+    declined = _declined_wait(exc)
+    if declined is not None:
+        return _rate_limited_message(declined)
     return _ROUTE_ERROR if _is_llm_streaming_error(exc) else _GENERIC_ERROR
 
 
 def safe_streaming_error_message(exc: BaseException) -> str:
     """The single content-free, user-safe message for a failed stream.
 
-    CONSTANT per error class — never interpolates ``str(exc)``, ``underlying``,
+    CONSTANT per error class (plus a declined wait's computed reset time) —
+    never interpolates ``str(exc)``, ``underlying``,
     or ``provider``. A selected-route failure returns the recovery guidance; any
     other exception returns the generic message. Full detail is the caller's job
     to log operator-side.

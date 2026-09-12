@@ -333,6 +333,334 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_tool_batch_persists_completed_result_before_unwind():
+    """A completed external effect must cross the history checkpoint on Stop."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _build_mock_agent(cancel_on_call=None)
+    cancelled = False
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+
+    agent.is_request_cancelled = lambda _request_id=None: cancelled
+    persist_assistant_turn = agent._persist_assistant_turn_safely
+    persistence_requirements = []
+
+    async def capture_persistence_requirement(*args, **kwargs):
+        persistence_requirements.append(kwargs.get("require_success", False))
+        return await persist_assistant_turn(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_persistence_requirement
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+    agent._handle_orchestrator_response_streaming = (
+        OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+
+    async def execute_batch(*_args, **kwargs):
+        batch_started.set()
+        await release_batch.wait()
+        kwargs["tool_events"].extend(
+            [
+                {"type": "start", "tool": "send_message"},
+                {"type": "complete", "tool": "send_message", "ms": 1},
+            ]
+        )
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc1",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+        batch_completed.set()
+
+    agent._execute_tool_batch = execute_batch
+
+    async def stream(**_kwargs):
+        yield LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="send_message",
+                    arguments={"text": "sent once"},
+                )
+            ],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+
+    async def consume():
+        return [
+            chunk
+            async for chunk in agent.process_input_streaming(
+                "send it", request_id="req-stop-in-batch"
+            )
+        ]
+
+    turn = asyncio.create_task(consume())
+    await batch_started.wait()
+    cancelled = True
+    turn.cancel()
+    await asyncio.sleep(0)
+    assert batch_completed.is_set() is False
+
+    release_batch.set()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert batch_completed.is_set() is True
+    assistant_calls = [
+        call
+        for call in agent.privacy_agent.add_conversation.await_args_list
+        if call.args and call.args[0] == "assistant"
+    ]
+    assert len(assistant_calls) == 1
+    assert persistence_requirements == [True]
+    assert assistant_calls[0].kwargs["metadata"]["cancelled"] is True
+    assert assistant_calls[0].kwargs["metadata"]["tool_results"] == [
+        {
+            "tool_call_id": "tc1",
+            "name": "send_message",
+            "arguments": {"text": "sent once"},
+            "result": {"success": True},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
+    """The non-streaming orchestrator cannot strand a completed effect."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _make_persist_agent(cancelled_request_id=None)
+    batch_started = asyncio.Event()
+    release_batch = asyncio.Event()
+    batch_completed = asyncio.Event()
+    required = []
+    persist = agent._persist_assistant_turn_safely
+
+    async def capture_required(*args, **kwargs):
+        required.append(kwargs.get("require_success", False))
+        return await persist(*args, **kwargs)
+
+    agent._persist_assistant_turn_safely = capture_required
+    agent._persist_completed_tool_stop_checkpoint = (
+        OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+
+    async def execute_batch(*_args, **kwargs):
+        batch_started.set()
+        await release_batch.wait()
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc-nonstream",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+        batch_completed.set()
+
+    agent._execute_tool_batch = execute_batch
+    response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="tc-nonstream",
+                name="send_message",
+                arguments={"text": "sent once"},
+            )
+        ],
+    )
+
+    turn = asyncio.create_task(
+        OrchestratorEngineMixin._handle_orchestrator_response(
+            agent,
+            response=response,
+            feature_tools=[],
+            system_prompt="system",
+            force_local_only=False,
+            effective_model="test",
+            user_message="send it",
+            session_id="s-nonstream",
+            tool_results=[],
+        )
+    )
+    await batch_started.wait()
+    turn.cancel()
+    release_batch.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert batch_completed.is_set()
+    assert required == [True]
+    assert len(agent._captured) == 1
+    assert agent._captured[0]["metadata"] == {
+        "tool_batch_checkpoint": {
+            "status": "completed",
+            "details_withheld": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
+    """A later provider await remains behind the completed-batch fence."""
+
+    from kestrel_sovereign.agent.orchestrator_engine import (
+        OrchestratorEngineMixin,
+    )
+
+    agent = _make_persist_agent(cancelled_request_id=None)
+    synthesis_started = asyncio.Event()
+    required = []
+    persist = agent._persist_assistant_turn_safely
+
+    async def capture_required(*args, **kwargs):
+        required.append(kwargs.get("require_success", False))
+        return await persist(*args, **kwargs)
+
+    async def execute_batch(*_args, **kwargs):
+        kwargs["tool_results"].append(
+            {
+                "tool_call_id": "tc-late-cancel",
+                "name": "send_message",
+                "arguments": {"text": "sent once"},
+                "result": {"success": True},
+            }
+        )
+
+    async def wait_for_synthesis(**_kwargs):
+        synthesis_started.set()
+        await asyncio.Event().wait()
+
+    agent._persist_assistant_turn_safely = capture_required
+    agent._persist_completed_tool_stop_checkpoint = (
+        OrchestratorEngineMixin._persist_completed_tool_stop_checkpoint.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(
+            agent
+        )
+    )
+    agent._execute_tool_batch = execute_batch
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._known_tool_names = MagicMock(return_value=set())
+    agent._build_all_tools = MagicMock(return_value=[])
+    agent._prune_orchestrator_messages = MagicMock(
+        side_effect=lambda messages, *_args, **_kwargs: messages
+    )
+    agent._make_inline_tool_executor = MagicMock(return_value=None)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        side_effect=wait_for_synthesis
+    )
+    response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="tc-late-cancel",
+                name="send_message",
+                arguments={"text": "sent once"},
+            )
+        ],
+    )
+
+    turn = asyncio.create_task(
+        OrchestratorEngineMixin._handle_orchestrator_response(
+            agent,
+            response=response,
+            feature_tools=[],
+            system_prompt="system",
+            force_local_only=False,
+            effective_model="test",
+            user_message="send it",
+            session_id="s-late-cancel",
+            tool_results=[],
+        )
+    )
+    await synthesis_started.wait()
+    turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert required == [True]
+    assert len(agent._captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_effect_requires_successful_history_persistence():
+    """Codex inline effects cannot complete behind a best-effort history write."""
+
+    from kestrel_sovereign.llm.adapter import LLMResponse
+
+    agent = _build_mock_agent(cancel_on_call=None)
+
+    async def fail_assistant_persistence(role, _content, **_kwargs):
+        if role == "assistant":
+            raise RuntimeError("history unavailable")
+
+    agent.privacy_agent.add_conversation = AsyncMock(
+        side_effect=fail_assistant_persistence
+    )
+    response = LLMResponse(content="", tool_calls=[])
+    response.executed_tool_calls = [
+        {
+            "id": "inline-effect",
+            "name": "send_message",
+            "arguments": {"text": "sent once"},
+            "result": {"success": True},
+        }
+    ]
+
+    async def stream(**_kwargs):
+        yield "sent"
+        yield response
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        async for _chunk in agent.process_input_streaming(
+            "send it",
+            session_id="inline-session",
+            request_id="inline-required-persist",
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_no_cancel_path_unaffected_for_normal_completion():
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking
@@ -431,6 +759,7 @@ async def test_orchestrator_loop_returns_early_when_cancelled_between_iterations
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -524,6 +853,7 @@ async def test_orchestrator_loop_runs_normally_without_request_id():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -627,6 +957,7 @@ async def test_orchestrator_loop_streams_followup_text_in_real_time():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -723,6 +1054,7 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -822,6 +1154,7 @@ async def test_orchestrator_loop_timeout_marker_precedes_separator():
 
         for method_name in (
             "_handle_orchestrator_response_streaming",
+            "_execute_tool_batch_at_stop_boundary",
             "_execute_tool_with_hooks", "_execute_tool_batch",
             "_partition_tool_calls", "_dispatch_tool_call",
             "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -927,6 +1260,7 @@ async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",
@@ -1041,6 +1375,7 @@ async def test_orchestrator_loop_followup_separator_emitted_once_per_turn():
 
     for method_name in (
         "_handle_orchestrator_response_streaming",
+        "_execute_tool_batch_at_stop_boundary",
         "_execute_tool_with_hooks", "_execute_tool_batch",
         "_partition_tool_calls", "_dispatch_tool_call",
         "_dispatch_feature_tool", "_dispatch_direct_tool",

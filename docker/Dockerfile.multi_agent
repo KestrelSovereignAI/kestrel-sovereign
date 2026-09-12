@@ -13,6 +13,7 @@ WORKDIR /app
 # (C extension, pulled in by core deps after voice PR #799). Without them, uv
 # pip install fails silently on the chain and the venv ends up empty.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    bubblewrap \
     curl \
     git \
     gcc \

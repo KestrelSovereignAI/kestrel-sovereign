@@ -16,6 +16,8 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 
 ## Code Indexes
 
+**Reach for these before searching the tree.** For "where does X live" or "what is in this area", read the index first — it is cheaper and more complete than a blind grep across 2400 files. Direct search is still right for call sites, string literals, and anything an index does not carry.
+
 - [docs/audit/REPO_MAP.md](docs/audit/REPO_MAP.md) — generated per-file index of this repo (every tracked file with a one-line purpose and its public Python symbols; regenerated nightly).
 - [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md) — index of all sibling repositories (feature packages, providers, standalone tools), each with its own `AGENTS.md`.
 
@@ -143,17 +145,76 @@ one tool's argv stops being true the moment that tool changes or goes away.
 **The verdict must arrive whole, and that is a separate gate.** `shell`
 tokenizes with `shlex` and hands an argv vector to a backend — no shell
 interprets the string (#3129). So `> review.txt` is not a redirect, it is a
-literal argument, and `... | tail` is not a pipe, it is three extra arguments
-to a command that then prints everything and exits 0. Neither a file hatch nor
-a pager is available to a governed caller; the review has to come back through
-the ToolResult, and each of stdout and stderr is capped at 1 MiB with
-`truncated_stdout: true` set on the result.
+literal argument; `... | tail` is not a pipe, it is three extra arguments to a
+command that then prints everything and exits 0; and `cd <worktree> && ...` is
+refused as shell grammar before anything runs.
 
-**A truncated review is a gate FAILURE, not a verdict** — it is the same shape
-as the dead-reviewer case above: plausible text, no completed judgement. Check
-`truncated_stdout` before reading findings, and if it is set, say the gate was
-not met rather than reporting what arrived. Tracked as #3243, filed by the
-agent this rule kept blocking.
+**#3243 gives `shell` the two constructs that line needed**, performed by the
+runtime rather than by a shell it does not have. Two parameters:
+
+* **`cwd=<worktree>`** — replaces `cd <worktree> &&`. Policy-checked, and
+  relative paths in the command resolve against it.
+* **`capture_output=true`** — replaces `> review.txt`. stdout and stderr are
+  written to runtime-owned files; the result carries `stdout_path`,
+  `stderr_path` and a `manifest_path`, and the inline text becomes a bounded
+  preview showing the head *and the tail*, so a verdict at the end of a long
+  review is visible without opening the file. On the **local** backend the
+  child writes to the file directly and there is no cap on it. On the
+  **docker** backend — which is the DEFAULT — there is: the capture is
+  written from a string the executor already clipped at `max_output_bytes`
+  (1 MiB unless `[features.computer_use.docker].max_output_bytes` says
+  otherwise), so a review past that ceiling still comes back clipped and
+  PARTIAL. Streaming it is #3277. Check `complete`, as below, rather than
+  assuming the file is whole.
+
+The manifest records what ran, where, how it ended, which backend ran it
+(`backend` — the result itself does not carry it), and the git `HEAD` before
+and after. **A verdict is about one tree.** During the 2026-08-31 run the head
+moved three times in eight hours; `git.head_moved` is how you can tell a
+verdict was about a tree that no longer exists, and re-running is the answer
+when it is `true`.
+
+**A truncated or timed-out review is a gate FAILURE, not a verdict** — the same
+shape as the dead-reviewer case above: plausible text, no completed judgement.
+Read **`complete`** on the result. It is the conjunction of every way the run
+could be less than whole — timed out, stdout clipped, stderr clipped, or a
+writer still holding the pipes (`writers_remaining` anything but `false`,
+which is what a review that daemonizes leaves behind) — so checking it cannot
+be satisfied by remembering only one of them, and the same field is on the
+manifest. All four are named here deliberately: a `complete: false` whose
+reason you cannot name is the case this paragraph exists for. Such a run now also comes back PARTIAL rather than
+OK even when the process exited 0 — "the process exited 0" and "the work
+finished" are different claims, and only the second is a verdict.
+
+Until #3243 shipped this paragraph asked you to check `truncated_stdout`, which
+`shell` computed in the backend and **never put in its result**. The rule was
+unfollowable, not merely hard. If a rule here names a field, and the field is
+not in what you get back, that is a defect to file, not an instruction to
+approximate.
+
+**Measured 2026-09-09, running the form once end to end on the LOCAL
+backend.** A 3.2 MB review captured to a file came back `complete: true` with
+the artifact at 3,348,905 bytes — past the 1 MiB ToolResult cap this was filed
+against — and a 4,222-character preview carrying both the opening line and the
+closing `VERDICT:` line, so the verdict was readable without opening the
+file. The
+same command killed at a 2-second timeout came back PARTIAL with
+`complete: false`, rc −9, and an error saying the output must not be read as a
+finished result. A run that committed while it ran recorded
+`git.head_moved: true` with differing before/after SHAs. Every field named in
+this section was present in the result with that spelling.
+
+What that run did NOT cover: it called `shell` directly rather than through
+the tool executor, so the approval queue and the LLM-facing schema are still
+unexercised; and it ran on the local backend, so it says nothing about the
+docker ceiling above. Review round 12 caught that generalisation — one
+backend's measurement written up as an unqualified promise — which is the same
+defect this section warns about two paragraphs down.
+
+Note when you first use this that `capture_output` is advertised to the model
+as a *string* (its annotation is `bool | str`, which no JSON schema type
+fits); `"true"` is accepted and coerced, and anything else is refused by name
+rather than silently read as false.
 
 **Against `main`, not against your last iteration.** Talon's per-run review sees
 only that run's diff, so a PR spanning a failed run plus a resume has never been

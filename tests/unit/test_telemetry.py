@@ -6,6 +6,7 @@ Verifies:
 - optional_span() context manager works as no-op without OTEL
 - setup_tracing() returns False when disabled
 """
+import asyncio
 import os
 import pytest
 from unittest.mock import patch, MagicMock
@@ -17,37 +18,44 @@ class TestIsTracingEnabled:
     def test_disabled_when_otel_not_available(self):
         """Tracing is disabled when OTEL packages are not installed."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', False):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", False):
             assert telemetry.is_tracing_enabled() is False
 
     def test_disabled_when_explicitly_off(self):
         """KESTREL_TRACING_ENABLED=false disables tracing."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', True):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True):
             with patch.dict(os.environ, {"KESTREL_TRACING_ENABLED": "false"}):
                 assert telemetry.is_tracing_enabled() is False
 
     def test_disabled_when_explicitly_zero(self):
         """KESTREL_TRACING_ENABLED=0 disables tracing."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', True):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True):
             with patch.dict(os.environ, {"KESTREL_TRACING_ENABLED": "0"}):
                 assert telemetry.is_tracing_enabled() is False
 
     def test_enabled_when_explicitly_on(self):
         """KESTREL_TRACING_ENABLED=true enables tracing."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', True):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True):
             with patch.dict(os.environ, {"KESTREL_TRACING_ENABLED": "true"}):
                 assert telemetry.is_tracing_enabled() is True
 
     def test_auto_detect_with_endpoint(self):
         """Auto-detect enables tracing when OTLP endpoint is set."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', True):
-            with patch.dict(os.environ, {
-                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
-            }, clear=False):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True):
+            with patch.dict(
+                os.environ,
+                {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"},
+                clear=False,
+            ):
                 # Remove KESTREL_TRACING_ENABLED to trigger auto-detect
                 env = os.environ.copy()
                 env.pop("KESTREL_TRACING_ENABLED", None)
@@ -57,12 +65,109 @@ class TestIsTracingEnabled:
     def test_auto_detect_without_endpoint(self):
         """Auto-detect disables tracing when no OTLP endpoint is set."""
         from kestrel_sovereign import telemetry
-        with patch.object(telemetry, '_OTEL_AVAILABLE', True):
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True):
             env = os.environ.copy()
             env.pop("KESTREL_TRACING_ENABLED", None)
             env.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
             with patch.dict(os.environ, env, clear=True):
                 assert telemetry.is_tracing_enabled() is False
+
+
+class TestCurrentTraceIdentity:
+    def test_returns_fixed_width_w3c_identities(self):
+        from kestrel_sovereign import telemetry
+
+        context = MagicMock(is_valid=True, trace_id=0x1234, span_id=0x5678)
+        current_span = MagicMock()
+        current_span.get_span_context.return_value = context
+        trace_api = MagicMock()
+        trace_api.get_current_span.return_value = current_span
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", True), patch.object(
+            telemetry,
+            "trace",
+            trace_api,
+            create=True,
+        ):
+            trace_id, span_id = telemetry.current_trace_identity()
+
+        assert trace_id == "00000000000000000000000000001234"
+        assert span_id == "0000000000005678"
+
+    def test_returns_none_without_a_valid_context(self):
+        from kestrel_sovereign import telemetry
+
+        with patch.object(telemetry, "_OTEL_AVAILABLE", False):
+            assert telemetry.current_trace_identity() == (None, None)
+
+    def test_reads_identity_from_a_concrete_noncurrent_span(self):
+        from kestrel_sovereign import telemetry
+
+        context = MagicMock(is_valid=True, trace_id=0xABCD, span_id=0x1234)
+        span = MagicMock()
+        span.get_span_context.return_value = context
+
+        assert telemetry.span_trace_identity(span) == (
+            "0000000000000000000000000000abcd",
+            "0000000000001234",
+        )
+
+
+class TestTurnSpanAddress:
+    def test_optional_span_stamps_canonical_turn_over_caller_metadata(self):
+        from kestrel_sovereign import telemetry
+
+        span = MagicMock()
+        span_context = MagicMock()
+        span_context.__enter__.return_value = span
+        tracer = MagicMock()
+        tracer.start_as_current_span.return_value = span_context
+
+        with patch.object(telemetry, "get_tracer", return_value=tracer):
+            with telemetry.turn_span_scope("turn-canonical"):
+                with telemetry.optional_span(
+                    "child",
+                    {telemetry.KESTREL_TURN_ID: "display-only"},
+                ):
+                    pass
+
+        span.set_attribute.assert_any_call(
+            telemetry.KESTREL_TURN_ID,
+            "turn-canonical",
+        )
+
+    def test_start_span_stamps_canonical_turn(self):
+        from kestrel_sovereign import telemetry
+
+        span = MagicMock()
+        tracer = MagicMock()
+        tracer.start_span.return_value = span
+
+        with patch.object(telemetry, "get_tracer", return_value=tracer):
+            with telemetry.turn_span_scope("turn-stream"):
+                assert telemetry.start_span("stream") is span
+
+        span.set_attribute.assert_any_call(
+            telemetry.KESTREL_TURN_ID,
+            "turn-stream",
+        )
+
+    @pytest.mark.asyncio
+    async def test_turn_address_propagates_to_orchestrated_child_tasks(self):
+        from kestrel_sovereign import telemetry
+
+        async def child():
+            await asyncio.sleep(0)
+            return telemetry.current_turn_span_attributes()
+
+        with telemetry.turn_span_scope("turn-orchestrated"):
+            attributes = await asyncio.create_task(child())
+
+        assert attributes == {
+            telemetry.KESTREL_TURN_ID: "turn-orchestrated"
+        }
+        assert telemetry.current_turn_id() is None
 
 
 class TestOptionalSpan:

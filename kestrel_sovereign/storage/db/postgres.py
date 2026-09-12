@@ -27,6 +27,7 @@ import contextvars
 import logging
 from collections.abc import Sequence as SequenceABC
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
@@ -56,6 +57,15 @@ _CONCURRENT_UPDATE_MARKER = "tuple concurrently updated"
 _CONCURRENT_WRITE_RETRIES = 4
 _CONCURRENT_WRITE_BACKOFF_S = 0.02
 _ADVISORY_LOCK_POLL_INTERVAL_S = 0.05
+
+
+@dataclass
+class _OperationalSessionLease:
+    """One pool connection shared only by a context and its owned children."""
+
+    connection: Any
+    lock: asyncio.Lock
+    active: bool = True
 
 
 def is_concurrent_update_error(exc: BaseException) -> bool:
@@ -193,6 +203,9 @@ class PostgresBackend(DatabaseBackend):
         self._txn_conn_var: "contextvars.ContextVar" = contextvars.ContextVar(
             "pg_txn_conn", default=None
         )
+        self._operational_conn_var: "contextvars.ContextVar" = (
+            contextvars.ContextVar("pg_operational_conn", default=None)
+        )
         self._owns_pool = True  # We own pools we create
     
     @classmethod
@@ -303,6 +316,9 @@ class PostgresBackend(DatabaseBackend):
         instance._advisory_backend = advisory_backend
         instance._pool = pool
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+        instance._operational_conn_var = contextvars.ContextVar(
+            "pg_operational_conn", default=None
+        )
         instance._owns_pool = False  # Mark that we don't own the pool
         return instance
 
@@ -395,6 +411,33 @@ class PostgresBackend(DatabaseBackend):
         if owner is asyncio.current_task():
             return conn
         return None
+
+    def _current_operational_lease(self) -> Optional[_OperationalSessionLease]:
+        """Return the live operational lease inherited by this task, if any."""
+
+        operational_var = getattr(self, "_operational_conn_var", None)
+        if operational_var is None:
+            return None
+        lease = operational_var.get()
+        if isinstance(lease, _OperationalSessionLease) and lease.active:
+            return lease
+        return None
+
+    @asynccontextmanager
+    async def _operational_query_connection(self) -> AsyncIterator[Any]:
+        """Serialize one non-transactional query on the inherited lease."""
+
+        lease = self._current_operational_lease()
+        if lease is None:
+            yield None
+            return
+        async with lease.lock:
+            # The owning context can start closing while an inherited child is
+            # waiting. Never use a connection after that context released it.
+            if not lease.active:
+                yield None
+                return
+            yield lease.connection
 
     @property
     def backend_type(self) -> str:
@@ -595,15 +638,18 @@ class PostgresBackend(DatabaseBackend):
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
 
-        # Use this task's transaction connection if one is open (#1726).
-        txn = self._current_txn_conn()
         attempt = 0
         while True:
             try:
+                txn = self._current_txn_conn()
                 if txn is not None:
                     result = await txn.execute(pg_query, *params)
                 else:
-                    result = await pool.execute(pg_query, *params)
+                    async with self._operational_query_connection() as conn:
+                        if conn is None:
+                            result = await pool.execute(pg_query, *params)
+                        else:
+                            result = await conn.execute(pg_query, *params)
 
                 # Parse affected rows from result (e.g., "INSERT 0 1" or "UPDATE 5")
                 if result:
@@ -640,8 +686,12 @@ class PostgresBackend(DatabaseBackend):
             if txn is not None:
                 await txn.executemany(pg_query, params_list)
             else:
-                async with pool.acquire() as conn:
-                    await conn.executemany(pg_query, params_list)
+                async with self._operational_query_connection() as conn:
+                    if conn is not None:
+                        await conn.executemany(pg_query, params_list)
+                    else:
+                        async with pool.acquire() as acquired:
+                            await acquired.executemany(pg_query, params_list)
             return len(params_list)  # asyncpg doesn't return affected count
             
         except Exception as e:
@@ -659,7 +709,11 @@ class PostgresBackend(DatabaseBackend):
             if txn is not None:
                 row = await txn.fetchrow(pg_query, *params)
             else:
-                row = await pool.fetchrow(pg_query, *params)
+                async with self._operational_query_connection() as conn:
+                    if conn is None:
+                        row = await pool.fetchrow(pg_query, *params)
+                    else:
+                        row = await conn.fetchrow(pg_query, *params)
             
             if row is None:
                 return None
@@ -680,7 +734,11 @@ class PostgresBackend(DatabaseBackend):
             if txn is not None:
                 rows = await txn.fetch(pg_query, *params)
             else:
-                rows = await pool.fetch(pg_query, *params)
+                async with self._operational_query_connection() as conn:
+                    if conn is None:
+                        rows = await pool.fetch(pg_query, *params)
+                    else:
+                        rows = await conn.fetch(pg_query, *params)
             
             return [tuple(row.values()) for row in rows]
             
@@ -698,8 +756,10 @@ class PostgresBackend(DatabaseBackend):
             txn = self._current_txn_conn()
             if txn is not None:
                 return await txn.fetchval(pg_query, *params)
-            else:
-                return await pool.fetchval(pg_query, *params)
+            async with self._operational_query_connection() as conn:
+                if conn is None:
+                    return await pool.fetchval(pg_query, *params)
+                return await conn.fetchval(pg_query, *params)
             
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
@@ -714,12 +774,98 @@ class PostgresBackend(DatabaseBackend):
             if txn is not None:
                 await txn.execute(script)
             else:
-                async with pool.acquire() as conn:
-                    await conn.execute(script)
+                async with self._operational_query_connection() as conn:
+                    if conn is not None:
+                        await conn.execute(script)
+                    else:
+                        async with pool.acquire() as acquired:
+                            await acquired.execute(script)
                     
         except Exception as e:
             raise QueryError(f"Script execution failed: {e}") from e
-    
+
+    @staticmethod
+    async def _verify_operational_cluster_identity(
+        conn: Any,
+        expected_cluster_identity: str | None,
+    ) -> None:
+        """Bind a checked cluster identity to the session used for later I/O."""
+
+        if expected_cluster_identity is None:
+            return
+        try:
+            actual_cluster_identity = await conn.fetchval(
+                "SELECT system_identifier::text "
+                "FROM pg_catalog.pg_control_system()"
+            )
+        except Exception as exc:
+            raise QueryError(
+                "PostgreSQL operational session cluster identity could not be "
+                "verified"
+            ) from exc
+        if (
+            not isinstance(actual_cluster_identity, str)
+            or not actual_cluster_identity.strip()
+            or actual_cluster_identity != expected_cluster_identity
+        ):
+            raise QueryError(
+                "PostgreSQL operational session is not on the validated "
+                "PostgreSQL cluster"
+            )
+
+    @asynccontextmanager
+    async def operational_session(
+        self,
+        *,
+        expected_cluster_identity: str | None = None,
+    ) -> AsyncIterator[None]:
+        """Pin autocommit operations to one checked physical connection.
+
+        This is deliberately not a transaction: Hold's external evidence
+        protocol must publish commits incrementally, but a load-balanced DSN
+        must not let its cluster-identity probe and custody reads land on
+        different servers. Ordinary backend methods route through the pinned
+        connection for the owning task for the lifetime of this context.
+        """
+
+        existing = self._current_txn_conn()
+        if existing is not None:
+            await self._verify_operational_cluster_identity(
+                existing,
+                expected_cluster_identity,
+            )
+            yield
+            return
+
+        existing_lease = self._current_operational_lease()
+        if existing_lease is not None:
+            async with existing_lease.lock:
+                if not existing_lease.active:
+                    raise QueryError(
+                        "PostgreSQL operational session is no longer active"
+                    )
+                await self._verify_operational_cluster_identity(
+                    existing_lease.connection,
+                    expected_cluster_identity,
+                )
+            yield
+            return
+
+        pool = self._ensure_connected()
+        async with pool.acquire() as conn:
+            await self._verify_operational_cluster_identity(
+                conn,
+                expected_cluster_identity,
+            )
+            lease = _OperationalSessionLease(conn, asyncio.Lock())
+            token = self._operational_conn_var.set(lease)
+            try:
+                yield
+            finally:
+                async with lease.lock:
+                    lease.active = False
+                self._operational_conn_var.reset(token)
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
         """Transaction context manager.
@@ -739,6 +885,22 @@ class PostgresBackend(DatabaseBackend):
                 yield
             return
 
+        operational = self._current_operational_lease()
+        if operational is not None:
+            async with operational.lock:
+                if operational.active:
+                    token = self._txn_conn_var.set(
+                        (asyncio.current_task(), operational.connection)
+                    )
+                    try:
+                        async with operational.connection.transaction():
+                            yield
+                    except Exception as e:
+                        raise TransactionError(f"Transaction failed: {e}") from e
+                    finally:
+                        self._txn_conn_var.reset(token)
+                    return
+
         async with pool.acquire() as conn:
             token = self._txn_conn_var.set((asyncio.current_task(), conn))
             try:
@@ -751,7 +913,11 @@ class PostgresBackend(DatabaseBackend):
 
     @asynccontextmanager
     async def advisory_locks(
-        self, keys: Sequence[Tuple[int, int]], *, shared: bool = False
+        self,
+        keys: Sequence[Tuple[int, int]],
+        *,
+        shared: bool = False,
+        expected_cluster_identity: Optional[str] = None,
     ) -> AsyncIterator[None]:
         """Hold multiple session advisory locks on one bounded-pool connection.
 
@@ -765,7 +931,12 @@ class PostgresBackend(DatabaseBackend):
 
         Callers must provide keys in their established global order when more
         than one process can acquire an overlapping set.  Each pair uses
-        PostgreSQL's signed two-int advisory-lock form.
+        PostgreSQL's signed two-int advisory-lock form. When
+        ``expected_cluster_identity`` is supplied, the exact session that will
+        own the locks must prove that immutable ``initdb`` identity first.
+        This matters for load-balanced DSNs: the bounded advisory pool is
+        intentionally separate from the operational pool, so merely probing
+        the latter does not prove which cluster serialized the operation.
         """
         normalized_keys = tuple(keys)
         for namespace, key in normalized_keys:
@@ -788,6 +959,20 @@ class PostgresBackend(DatabaseBackend):
         async with advisory_pool.acquire() as conn:
             acquired: list[Tuple[int, int]] = []
             try:
+                if expected_cluster_identity is not None:
+                    actual_cluster_identity = await conn.fetchval(
+                        "SELECT system_identifier::text "
+                        "FROM pg_catalog.pg_control_system()"
+                    )
+                    if (
+                        not isinstance(actual_cluster_identity, str)
+                        or not actual_cluster_identity.strip()
+                        or actual_cluster_identity != expected_cluster_identity
+                    ):
+                        raise QueryError(
+                            "PostgreSQL advisory lock session is not on the "
+                            "validated PostgreSQL cluster"
+                        )
                 for namespace, key in normalized_keys:
                     await conn.execute(
                         f"SELECT {lock_function}($1, $2)", namespace, key

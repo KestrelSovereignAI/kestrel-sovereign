@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator, Mapping, T
 from urllib.parse import quote, unquote_to_bytes
 import uuid
 
+from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.auth import (
     caller_context_binding_scope,
     caller_context_lifetime,
@@ -35,6 +36,20 @@ _HEADER_UNRESERVED = frozenset(
 _current_invocation_id: ContextVar[str | None] = ContextVar(
     "kestrel_current_invocation_id",
     default=None,
+)
+
+
+@dataclass(slots=True)
+class InvocationEffectCheckpoint:
+    """Mutable durability state shared by every task owned by one turn."""
+
+    completed: bool = False
+    checkpointed: bool = False
+    session_id: str | None = None
+
+
+_current_effect_checkpoint: ContextVar[InvocationEffectCheckpoint | None] = (
+    ContextVar("kestrel_current_effect_checkpoint", default=None)
 )
 
 
@@ -66,6 +81,16 @@ class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
 
 
+class InvocationSelfFencedError(Exception):
+    """An invocation stopped because its infrastructure lease became unsafe.
+
+    This deliberately is not an ``InvocationCancelledError``: infrastructure
+    lease loss is not evidence that an operator requested or received an
+    acknowledged Stop. Durable ingress and HTTP boundaries must therefore keep
+    the work retryable instead of consuming it as a terminal no-op.
+    """
+
+
 def validate_invocation_id(value: object) -> str:
     """Return a bounded opaque invocation id or reject an invalid one."""
     if not isinstance(value, str) or not (1 <= len(value) <= MAX_INVOCATION_ID_LENGTH):
@@ -78,6 +103,25 @@ def validate_invocation_id(value: object) -> str:
     except UnicodeEncodeError as error:
         raise ValueError("invocation id must be valid Unicode text") from error
     return value
+
+
+def register_request_delivery(
+    agent: object,
+    request_id: str,
+    *,
+    nested: bool,
+) -> object:
+    """Register an explicit delivery boundary with legacy-agent compatibility."""
+
+    registrar = getattr(agent, "register_active_request")
+    try:
+        parameters = inspect.signature(registrar).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_boundary = any(parameter.name == "nested" for parameter in parameters)
+    if supports_boundary:
+        return registrar(request_id, nested=nested)
+    return registrar(request_id)
 
 
 def invocation_id_response_header(value: object) -> str:
@@ -222,6 +266,35 @@ def current_invocation_id() -> str | None:
     return _current_invocation_id.get()
 
 
+def current_invocation_effect_checkpoint() -> InvocationEffectCheckpoint | None:
+    """Return the turn's shared completed-effect durability state, if bound."""
+
+    return _current_effect_checkpoint.get()
+
+
+def mark_current_invocation_effect_completed(
+    session_id: str | None,
+    *,
+    checkpoint: InvocationEffectCheckpoint | None = None,
+) -> None:
+    """Record that this turn completed an externally visible tool effect."""
+
+    state = checkpoint or _current_effect_checkpoint.get()
+    if state is not None:
+        state.completed = True
+        state.checkpointed = False
+        if state.session_id is None:
+            state.session_id = session_id
+
+
+def mark_current_invocation_effect_checkpointed() -> None:
+    """Record that the turn's completed effects now have durable evidence."""
+
+    state = _current_effect_checkpoint.get()
+    if state is not None and state.completed:
+        state.checkpointed = True
+
+
 def current_invocation_provenance() -> InvocationProvenance | None:
     """Return task-local trusted request provenance, if the entry point bound it."""
     return _current_invocation_provenance.get()
@@ -231,14 +304,19 @@ def current_invocation_provenance() -> InvocationProvenance | None:
 def _exact_invocation_scope(
     invocation_id: str,
     provenance: InvocationProvenance | None,
+    effect_checkpoint: InvocationEffectCheckpoint | None = None,
 ) -> Iterator[str]:
     """Bind an already-resolved identity and an exact provenance value."""
 
     id_token = _current_invocation_id.set(invocation_id)
     provenance_token = _current_invocation_provenance.set(provenance)
+    effect_token = _current_effect_checkpoint.set(
+        effect_checkpoint or InvocationEffectCheckpoint()
+    )
     try:
         yield invocation_id
     finally:
+        _current_effect_checkpoint.reset(effect_token)
         _current_invocation_provenance.reset(provenance_token)
         _current_invocation_id.reset(id_token)
 
@@ -295,6 +373,29 @@ def bind_async_invocation(
                 caller_cancellation_baseline = (
                     caller_task.cancelling() if caller_task is not None else 0
                 )
+
+                async def checkpoint_completed_effects() -> None:
+                    state = _current_effect_checkpoint.get()
+                    if (
+                        state is None
+                        or not state.completed
+                        or state.checkpointed
+                        or lifecycle_owner is None
+                    ):
+                        return
+                    checkpoint = getattr(
+                        lifecycle_owner,
+                        "_persist_completed_tool_stop_checkpoint",
+                        None,
+                    )
+                    if not callable(checkpoint):
+                        return
+                    await checkpoint(
+                        session_id=state.session_id,
+                        request_id=invocation_id,
+                    )
+                    state.checkpointed = True
+
                 if track_request_lifecycle and lifecycle_owner is not None:
                     register = getattr(
                         type(lifecycle_owner),
@@ -302,10 +403,26 @@ def bind_async_invocation(
                         None,
                     )
                     if callable(register):
-                        register(lifecycle_owner, invocation_id)
+                        register_request_delivery(
+                            lifecycle_owner,
+                            invocation_id,
+                            nested=True,
+                        )
                         registered = True
                 try:
                     if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, invocation_id
+                        ):
+                            raise InvocationCancelledError(
+                                "invocation was stopped before durable admission "
+                                f"({invocation_log_correlation(invocation_id)})"
+                            )
                         bind_operation = getattr(
                             type(lifecycle_owner),
                             "bind_request_operation",
@@ -315,6 +432,14 @@ def bind_async_invocation(
                         operation_context = parent_context.copy()
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
+                        if lock_manager is None:
+                            get_lock_manager = getattr(
+                                type(lifecycle_owner),
+                                "_get_lock_manager",
+                                None,
+                            )
+                            if callable(get_lock_manager):
+                                lock_manager = get_lock_manager(lifecycle_owner)
                         delegate_lock_ownership = getattr(
                             lock_manager,
                             "delegate_current_task_ownership",
@@ -322,8 +447,55 @@ def bind_async_invocation(
                         )
                         if callable(delegate_lock_ownership):
                             delegate_lock_ownership(operation_context)
+
+                        capture_transition_delegation = getattr(
+                            type(lifecycle_owner),
+                            "_capture_committed_feature_transition_delegation",
+                            None,
+                        )
+                        transition_delegation = (
+                            capture_transition_delegation(lifecycle_owner)
+                            if callable(capture_transition_delegation)
+                            else None
+                        )
+
+                        async def run_isolated_operation() -> _T:
+                            # A streamed command has already linearized Hold in
+                            # the generator owner. Transfer that exact snapshot
+                            # only to this explicitly created execution task;
+                            # arbitrary child tasks still perform a fresh read.
+                            from kestrel_sovereign.hold.enforcement import (
+                                _adopt_source_disposition_owner,
+                                _adopt_turn_admission_snapshot,
+                            )
+
+                            with _adopt_turn_admission_snapshot(
+                                lifecycle_owner,
+                                from_task=caller_task,
+                            ), _adopt_source_disposition_owner(
+                                lifecycle_owner,
+                                from_task=caller_task,
+                            ):
+                                if transition_delegation is None:
+                                    return await function(*bound.args, **bound.kwargs)
+                                bind_transition_delegation = getattr(
+                                    type(lifecycle_owner),
+                                    "_bind_committed_feature_transition_delegation",
+                                    None,
+                                )
+                                if not callable(bind_transition_delegation):
+                                    raise TypeError(
+                                        "committed feature-transition authority "
+                                        "cannot be delegated"
+                                    )
+                                with bind_transition_delegation(
+                                    lifecycle_owner,
+                                    transition_delegation,
+                                ):
+                                    return await function(*bound.args, **bound.kwargs)
+
                         isolated_operation = asyncio.create_task(
-                            function(*bound.args, **bound.kwargs),
+                            run_isolated_operation(),
                             name=(
                                 "invocation-turn:"
                                 f"{invocation_log_correlation(invocation_id)}"
@@ -353,20 +525,52 @@ def bind_async_invocation(
                             if callable(is_cancelled) and is_cancelled(
                                 lifecycle_owner, invocation_id
                             ):
-                                raise InvocationCancelledError(
+                                is_self_fenced = getattr(
+                                    type(lifecycle_owner),
+                                    "is_request_self_fenced",
+                                    None,
+                                )
+                                cancellation_error = (
+                                    InvocationSelfFencedError
+                                    if callable(is_self_fenced)
+                                    and is_self_fenced(
+                                        lifecycle_owner, invocation_id
+                                    )
+                                    else InvocationCancelledError
+                                )
+                                raise cancellation_error(
                                     "isolated invocation was stopped after "
                                     "operation completion "
                                     f"({invocation_log_correlation(invocation_id)})"
                                 )
                             return result
                         except asyncio.CancelledError as error:
+                            # An adapter/tool batch may have returned normally
+                            # before cancellation lands at a later await in the
+                            # turn.  The mutable checkpoint state is shared with
+                            # every owned child task, so this top-level boundary
+                            # closes that post-effect/pre-response window too.
+                            await checkpoint_completed_effects()
                             if (
                                 caller_task is not None
                                 and caller_task.cancelling()
                                 > caller_cancellation_baseline
                             ):
                                 raise
-                            raise InvocationCancelledError(
+                            is_self_fenced = getattr(
+                                type(lifecycle_owner),
+                                "is_request_self_fenced",
+                                None,
+                            )
+                            cancellation_error = (
+                                InvocationSelfFencedError
+                                if callable(is_self_fenced)
+                                and is_self_fenced(
+                                    lifecycle_owner, invocation_id
+                                )
+                                else InvocationCancelledError
+                            )
+                            raise cancellation_error(
                                 "isolated invocation was cancelled "
                                 f"({invocation_log_correlation(invocation_id)})"
                             ) from error
@@ -390,10 +594,11 @@ def bind_async_invocation(
                                 ):
                                     variable.set(child_value)
                     return await function(*bound.args, **bound.kwargs)
-                except InvocationCancelledError:
-                    # The isolated child cooperatively unwound after Stop. Its
-                    # cancellation is a successful lifecycle completion, not a
-                    # cleanup failure.
+                except (InvocationCancelledError, InvocationSelfFencedError):
+                    # The isolated child cooperatively unwound after Stop or a
+                    # lease self-fence. Its cancellation is a successful
+                    # lifecycle cleanup, not abandonment. Keep the typed errors
+                    # distinct so callers retry only the infrastructure case.
                     raise
                 except BaseException as error:
                     if registered:
@@ -465,6 +670,8 @@ def bind_async_invocation(
 
 def bind_async_generator_invocation(
     parameter: str,
+    *,
+    track_request_lifecycle: bool = False,
 ) -> Callable[[Callable[..., AsyncIterator[_T]]], Callable[..., AsyncIterator[_T]]]:
     """Bind/generate ``parameter`` for an async-generator top-level turn.
 
@@ -502,15 +709,81 @@ def bind_async_generator_invocation(
                 if supplied_provenance is not None
                 else _current_invocation_provenance.get()
             )
+            lifecycle_owner = args[0] if args else None
+            registered = False
+            cleanup_abandoned = False
+            effect_checkpoint = InvocationEffectCheckpoint()
+
+            async def checkpoint_completed_effects() -> None:
+                if (
+                    not effect_checkpoint.completed
+                    or effect_checkpoint.checkpointed
+                    or lifecycle_owner is None
+                ):
+                    return
+                checkpoint = getattr(
+                    lifecycle_owner,
+                    "_persist_completed_tool_stop_checkpoint",
+                    None,
+                )
+                if not callable(checkpoint):
+                    return
+                persistence = asyncio.create_task(
+                    checkpoint(
+                        session_id=effect_checkpoint.session_id,
+                        request_id=effective_id,
+                    ),
+                    name=(
+                        "stream-effect-checkpoint:"
+                        f"{invocation_log_correlation(effective_id)}"
+                    ),
+                )
+                outcome = await await_owned_task(persistence)
+                if outcome.error is not None:
+                    if outcome.cancellation is not None:
+                        outcome.error.add_note(
+                            "caller cancellation remained pending while the "
+                            "required streaming effect checkpoint failed"
+                        )
+                    raise outcome.error
+                effect_checkpoint.checkpointed = True
+                if outcome.cancellation is not None:
+                    raise outcome.cancellation
+
+            if track_request_lifecycle and lifecycle_owner is not None:
+                register = getattr(
+                    type(lifecycle_owner),
+                    "register_active_request",
+                    None,
+                )
+                if callable(register):
+                    register(lifecycle_owner, effective_id)
+                    registered = True
+            iterator = None
             with caller_context_lifetime(
                 bound.arguments.get("caller")
             ) as caller_binding:
-                iterator = function(*bound.args, **bound.kwargs)
                 try:
+                    if registered:
+                        await_admission = getattr(
+                            type(lifecycle_owner),
+                            "await_durable_request_admission",
+                            None,
+                        )
+                        if callable(await_admission) and not await await_admission(
+                            lifecycle_owner, effective_id
+                        ):
+                            raise InvocationCancelledError(
+                                "streaming invocation was stopped before durable "
+                                "admission "
+                                f"({invocation_log_correlation(effective_id)})"
+                            )
+                    iterator = function(*bound.args, **bound.kwargs)
                     while True:
                         with _exact_invocation_scope(
                             effective_id,
                             effective_provenance,
+                            effect_checkpoint,
                         ), caller_context_binding_scope(caller_binding):
                             try:
                                 item = await anext(iterator)
@@ -518,13 +791,40 @@ def bind_async_generator_invocation(
                                 return
                         yield item
                 finally:
-                    close_iterator = getattr(iterator, "aclose", None)
-                    if callable(close_iterator):
+                    try:
                         with _exact_invocation_scope(
                             effective_id,
                             effective_provenance,
+                            effect_checkpoint,
                         ), caller_context_binding_scope(caller_binding):
-                            await close_iterator()
+                            try:
+                                close_iterator = getattr(iterator, "aclose", None)
+                                if callable(close_iterator):
+                                    await close_iterator()
+                            finally:
+                                try:
+                                    await checkpoint_completed_effects()
+                                except BaseException:
+                                    cleanup_abandoned = (
+                                        effect_checkpoint.completed
+                                        and not effect_checkpoint.checkpointed
+                                    )
+                                    raise
+                    finally:
+                        if registered:
+                            if cleanup_abandoned:
+                                from .request_lifecycle import (
+                                    RequestCompletionDisposition,
+                                )
+
+                                lifecycle_owner._cleanup_cancelled_request(
+                                    effective_id,
+                                    disposition=(
+                                        RequestCompletionDisposition.ABANDONED
+                                    ),
+                                )
+                            else:
+                                lifecycle_owner._cleanup_cancelled_request(effective_id)
 
         return wrapped
 

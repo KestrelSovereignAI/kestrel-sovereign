@@ -201,6 +201,7 @@ async def test_oversize_query_uses_complete_fallback_instead_of_partial_ranking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)  # 10k-row corpus: ~4s alone, far longer under `-n auto`
 async def test_large_corpus_backfill_removes_recall_time_full_scan(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", "true")
     db = await AsyncDatabase.sqlite(str(tmp_path / "large-index.db"))
@@ -232,8 +233,15 @@ async def test_large_corpus_backfill_removes_recall_time_full_scan(tmp_path, mon
         assert result["indexed"] == 10_000
         assert result["coverage"] == 1.0
         assert [row["content"] for row in after] == ["rare zirconium axolotl fact"]
+        # THIS is the claim in the test's name: the indexed recall did not
+        # fall back to a full scan. It is exact and load-independent.
         assert store._last_lexical_bridge_stats["fallback_rows_scanned"] == 0
-        assert indexed_recall_seconds < 1.0
+        # A wall clock cannot prove that, and under `-n auto` a sub-second
+        # budget measures the machine, not the index -- this assertion failed
+        # on loaded runs while fallback_rows_scanned was already 0. Keep only a
+        # coarse guard against a catastrophic regression (a 10k-row scan takes
+        # far longer than this even on a busy runner).
+        assert indexed_recall_seconds < 10.0
     finally:
         await db.close()
 

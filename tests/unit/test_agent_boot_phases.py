@@ -373,7 +373,7 @@ def _boot_mocks():
     """
     with patch("kestrel_sovereign.kestrel_agent.AsyncStorage") as MockStorage, patch(
         "kestrel_sovereign.kestrel_agent.discover_features", return_value=[]
-    ), patch("kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"), patch(
+    ) as discover_features, patch("kestrel_sovereign.kestrel_agent.verify_mandatory_feature_set"), patch(
         "kestrel_sovereign.kestrel_agent.MemorySystem"
     ) as MockMemorySystem, patch(
         "kestrel_sovereign.kestrel_agent.TaskManager"
@@ -412,7 +412,10 @@ def _boot_mocks():
         MockTaskManager.return_value = task_manager
 
         yield SimpleNamespace(
-            storage=storage, memory=memory, task_manager=task_manager
+            storage=storage,
+            memory=memory,
+            task_manager=task_manager,
+            discover_features=discover_features,
         )
 
 
@@ -527,6 +530,17 @@ def test_boot_phase_order_is_the_documented_dependency_sequence(tmp_path):
 @pytest.mark.asyncio
 async def test_clean_boot_reaches_ready(tmp_path):
     agent = _make_agent(tmp_path)
+    started_when_reconciled = None
+
+    async def capture_reconciliation_order():
+        nonlocal started_when_reconciled
+        started_when_reconciled = set(
+            agent.dispatcher._started_durable_cognition_consumers
+        )
+
+    agent.reconcile_a2a_cognition_wakes = AsyncMock(
+        side_effect=capture_reconciliation_order
+    )
     try:
         with _boot_mocks():
             await agent.initialize()
@@ -536,6 +550,19 @@ async def test_clean_boot_reaches_ready(tmp_path):
         # The Workflows built-in is registrable without Talon or any other
         # domain feature: core hosts its six provider-neutral source contracts.
         assert all(name in agent.signal_registry for name in SOURCE_NAMES)
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_CONSUMER,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_CONSUMER,
+        )
+
+        assert {
+            A2A_COMPLETE_CONSUMER,
+            A2A_SUBMITTED_CONSUMER,
+        } <= agent.dispatcher._started_durable_cognition_consumers
+        agent.reconcile_a2a_cognition_wakes.assert_awaited_once_with()
+        assert started_when_reconciled == set()
     finally:
         await _cleanup(agent)
 
@@ -551,6 +578,41 @@ async def test_second_initialize_when_ready_is_a_noop(tmp_path):
         # before touching AsyncStorage, so this neither raises nor re-runs.
         await agent.initialize()
         assert agent._boot_state is BootPhaseState.READY
+    finally:
+        await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+async def test_host_authority_preflight_refuses_before_feature_discovery(tmp_path):
+    """A bad configured receipt cannot start even one feature worker."""
+
+    from kestrel_sovereign.spawn.mandate import SpawnMandate
+
+    agent = _make_agent(tmp_path)
+    mandate = SpawnMandate(
+        parent_did="did:test:parent",
+        child_did=agent.did,
+        parent_signature="00",
+    )
+    observed = []
+
+    def refuse_unverified_receipt(candidate):
+        assert candidate is agent
+        observed.append(agent._persisted_spawn_mandate)
+        raise RuntimeError("invalid persisted authority")
+
+    agent._host_authority_preflight = refuse_unverified_receipt
+    try:
+        with _boot_mocks() as mocks, patch(
+            "kestrel_sovereign.spawn.mandate_reload.read_spawn_mandate",
+            new=AsyncMock(return_value=mandate),
+        ):
+            with pytest.raises(RuntimeError, match="invalid persisted authority"):
+                await agent.initialize()
+
+        assert observed == [mandate]
+        mocks.discover_features.assert_not_called()
+        assert agent._boot_state is BootPhaseState.FAILED
     finally:
         await _cleanup(agent)
 

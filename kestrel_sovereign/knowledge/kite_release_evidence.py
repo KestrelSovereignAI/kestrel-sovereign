@@ -15,17 +15,17 @@ diagnostics commands; otherwise the harness fails closed.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from enum import StrEnum
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import socket
 import subprocess
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -35,7 +35,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .capabilities import SemanticRuntimeCapabilities, semantic_capabilities_from_config
 from .registry import get_knowledge_registry
-from .release_evidence_models import DrillBinding, ErasureStage, ReleaseEvidenceError, _canonical_json, _sha256
+from .release_evidence_models import (
+    DrillBinding,
+    ErasureStage,
+    ReleaseEvidenceError,
+    _canonical_json,
+    _sha256,
+)
 from .release_evidence_postgres import DisposablePostgresDatabase
 
 
@@ -243,6 +249,12 @@ class KiteIsolationConfig:
             # never an inherited TEST_POSTGRES_URL/DATABASE_URL value.
             env["KESTREL_DATABASE_URL"] = self.storage.disposable_postgres.dsn
             env["DATABASE_URL"] = self.storage.disposable_postgres.dsn
+            # The disposable authority owns one PostgreSQL cluster, while
+            # production Hold requires its rollback witness on another. Keep
+            # this single-host, fresh-home evidence process on the isolated
+            # SQLite control plane it already owns rather than borrowing an
+            # ambient service or weakening the production independence gate.
+            env["KESTREL_HOLD_BACKEND"] = "sqlite"
         return env
 
 

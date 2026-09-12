@@ -25,15 +25,19 @@ from pydantic import BaseModel
 
 from kestrel_sovereign.endpoints.agent_helpers import (
     get_agent,
+    prime_durable_stop_fence,
     request_invocation_provenance,
     resolve_request_invocation_id,
+    self_fenced_invocation_http_error,
     stopped_invocation_http_error,
 )
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
+    InvocationSelfFencedError,
     invocation_id_response_header,
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
+from kestrel_sovereign.hold import HoldTurnRefusal
 from kestrel_sovereign.rate_limit import limiter
 from slowapi.util import get_remote_address
 
@@ -268,7 +272,13 @@ async def rasa_webhook(
     )
 
     try:
+        await prime_durable_stop_fence(request, agent, request_id)
         async with _agent_semaphore_for(routed_name):
+            # Semaphore admission can wait beyond the short in-memory Stop
+            # reservation TTL. Re-read the durable exact-turn authority at the
+            # execution boundary so an acknowledged queued Stop cannot age out
+            # and then start work.
+            await prime_durable_stop_fence(request, agent, request_id)
             response_text = await agent.process_input(
                 user_input=enriched_input,
                 session_id=f"sms:{sender}",  # namespace prevents collision with UI sessions
@@ -280,8 +290,14 @@ async def rasa_webhook(
         http_response.headers["X-Request-ID"] = invocation_id_response_header(request_id)
         return [RasaWebhookResponse(recipient_id=sender, text=response_text)]
 
+    except InvocationSelfFencedError as error:
+        raise self_fenced_invocation_http_error(request_id) from error
     except InvocationCancelledError as error:
         raise stopped_invocation_http_error(request_id) from error
+    except HoldTurnRefusal as exc:
+        raise exc.as_http_exception() from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"[rasa-shim] Error processing message from {sender}: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail="Kestrel agent failed to process the message.")

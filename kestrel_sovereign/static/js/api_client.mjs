@@ -1379,23 +1379,13 @@ export function createApiClient({
             if (clientRequestId !== null) {
                 state.currentStreamRequestIds.set(dispatchAgent, clientRequestId);
             }
-            try {
-                const result = agent !== undefined
-                    ? await client.requestForAgent('/api/agent/invoke', opts, agent)
-                    : await client.request('/api/agent/invoke', opts);
-                if (result && typeof result === 'object' && result.session_id) {
-                    state.effectiveSessionIds.set(dispatchAgent, result.session_id);
-                }
-                return result;
-            } finally {
-                if (
-                    clientRequestId !== null
-                    && state.currentStreamRequestIds.get(dispatchAgent)
-                        === clientRequestId
-                ) {
-                    state.currentStreamRequestIds.delete(dispatchAgent);
-                }
+            const result = agent !== undefined
+                ? await client.requestForAgent('/api/agent/invoke', opts, agent)
+                : await client.request('/api/agent/invoke', opts);
+            if (result && typeof result === 'object' && result.session_id) {
+                state.effectiveSessionIds.set(dispatchAgent, result.session_id);
             }
+            return result;
         },
         // Two-arg overload: pass `agent` to target a specific agent's
         // /stop endpoint regardless of which agent is currently
@@ -1403,15 +1393,33 @@ export function createApiClient({
         // viewing Agent B would route the stop to B's backend (because
         // request() pins to state.selectedHostAgent), aborting client-
         // side but never telling A's server to halt.
-        stop: (requestId = null, agent) => {
+        stop: (requestId = null, agent, correlationId = null) => {
             const opts = {
                 method: 'POST',
-                body: JSON.stringify(requestId ? { request_id: requestId } : {}),
+                body: JSON.stringify({
+                    ...(requestId ? { request_id: requestId } : {}),
+                    ...(correlationId ? { correlation_id: correlationId } : {}),
+                }),
             };
             return agent !== undefined
                 ? client.requestForAgent('/api/agent/stop', opts, agent)
                 : client.request('/api/agent/stop', opts);
         },
+        // Fleet cooperative Stop is a host control-plane operation. It must
+        // never inherit the currently selected agent prefix and it never calls
+        // the process lifecycle API; the host resolves the live targets and
+        // returns one typed outcome for each of them (#3155).
+        stopHost: (payload = {}) => client.requestHost('/api/host/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
+        // Read-only, caller-scoped inventory for the component-owned Stop All
+        // affordance. The server supplies both authority and the live host
+        // count; browser-local stream state is not a fleet inventory.
+        getHostStopStatus: () => client.requestHost('/api/host/stop/status', {
+            cache: 'no-store',
+        }),
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);
@@ -1430,6 +1438,18 @@ export function createApiClient({
         getCurrentStreamRequestId(agent) {
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.currentStreamRequestIds.get(key) || null;
+        },
+        completeCurrentStreamRequestId(agent, requestId) {
+            const key = agent === undefined ? state.selectedHostAgent : agent;
+            if (
+                requestId !== null
+                && requestId !== undefined
+                && state.currentStreamRequestIds.get(key) === String(requestId)
+            ) {
+                state.currentStreamRequestIds.delete(key);
+                return true;
+            }
+            return false;
         },
         // Effective session_id surfaced by the server's most recent
         // /stream or /invoke for this agent. Returns null until the
@@ -1620,13 +1640,11 @@ export function createApiClient({
                 if (state.streamAbortControllers.get(dispatchAgent) === controller) {
                     state.streamAbortControllers.delete(dispatchAgent);
                 }
-                if (
-                    activeRequestId !== null
-                    && state.currentStreamRequestIds.get(dispatchAgent)
-                        === activeRequestId
-                ) {
-                    state.currentStreamRequestIds.delete(dispatchAgent);
-                }
+                // The fetch/body can settle before the chat owner clears its
+                // busy state. Retain the exact turn address until that same UI
+                // owner finishes; Stop in this window must not widen to agent
+                // scope. ``completeCurrentStreamRequestId`` performs the
+                // owner-checked release.
             }
         },
         getApiKey() {

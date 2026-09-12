@@ -99,6 +99,9 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         "WORKFLOW_RUNNER_UNAVAILABLE",
         "WORKFLOW_RUNNER_FAILED",
         "WORKFLOW_RUN_REJECTED",
+        # Every blocker selection tried to confirm came back unreadable; not
+        # the same claim as "nothing is actionable" (#3280).
+        "BLOCKERS_UNCONFIRMED",
     }
 )
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
@@ -1626,8 +1629,34 @@ class StrategicMemoryFeature(Feature):
                 },
             )
 
-        issue = await pick_top_issue(self._strategy_data_view())
+        selection: Dict[str, int] = {}
+        issue = await pick_top_issue(self._strategy_data_view(), selection)
         workflow_name = self._dispatch_workflow_name()
+        checked = selection.get("blockers_checked", 0)
+        if not issue and checked and selection.get("blockers_unreadable") == checked:
+            # Every blocker it tried to confirm came back unreadable. Before
+            # #3280 a qualified blocker was dispatched without asking GitHub,
+            # so selection could not fail on a network fault; now it asks, and
+            # "nothing is actionable" and "GitHub could not be reached" must
+            # not render the same. This is not the first answer, it is no answer.
+            return ToolResult.partial(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + f"\nCould not confirm any of {checked} blocker issue(s) with "
+                    "GitHub -- every read was unreadable. Nothing was dispatched; "
+                    "this is not the same as having nothing to do."
+                ),
+                error="GitHub could not confirm any blocker issue",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "reason_code": "BLOCKERS_UNCONFIRMED",
+                    "blockers_checked": checked,
+                },
+            )
         if not issue:
             return ToolResult.ok(
                 confirmation=(

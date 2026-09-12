@@ -1426,7 +1426,19 @@ async def test_live_postgres_runtime_create_spawn_execute_remove_and_failure_rol
                 *,
                 properties,
             ):
-                self.edges.append((source_id, target_id, label, properties))
+                # The real store UPSERTS on (source_id, target_id, label):
+                # PostgreSQL uses ON CONFLICT ... DO UPDATE and SQLite uses
+                # INSERT OR REPLACE (async_graph_store). A second write for one
+                # spawn -- the signed receipt, then its authority commit -- is a
+                # replacement, not a second edge. Appending blindly made this
+                # double disagree with its dependency and reported a duplicate
+                # the production graph cannot hold.
+                key = (source_id, target_id, label)
+                for index, existing in enumerate(self.edges):
+                    if existing[:3] == key:
+                        self.edges[index] = (*key, properties)
+                        return
+                self.edges.append((*key, properties))
 
         class HostedTestAgent:
             def __init__(self, *, did, **_kwargs):

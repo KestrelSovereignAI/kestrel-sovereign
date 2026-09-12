@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import AsyncIterator, Dict, Optional
 
+from kestrel_sdk.signals import Status
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -37,6 +38,7 @@ from kestrel_sovereign.security.encryption import (
     get_agent_fernet,
     get_fernet,
 )
+from kestrel_sovereign.signals import DurableAdmissionDisposition
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
@@ -111,6 +113,7 @@ class InboundAdmissionDisposition(str, Enum):
     """What the channel feature proved about one inbound message."""
 
     DURABLY_ADMITTED = "durably_admitted"
+    HELD = "held"
     RETRYABLE = "retryable"
     LEGACY_ROUTED = "legacy_routed"
     REJECTED = "rejected"
@@ -1163,7 +1166,16 @@ class ChannelFeature(Feature):
                                 message.id,
                             )
                         else:
-                            await wait_for_terminal()
+                            terminal_result = await wait_for_terminal()
+                            if (
+                                getattr(terminal_result, "status", None)
+                                is Status.COALESCED
+                                and getattr(terminal_result, "error", None)
+                                == "hold_deferred"
+                            ):
+                                return InboundAdmission(
+                                    InboundAdmissionDisposition.HELD
+                                )
                             event_id = getattr(handle, "signal_id", None)
                             if not isinstance(event_id, str) or not event_id:
                                 logger.error(
@@ -1184,6 +1196,13 @@ class ChannelFeature(Feature):
                             }
                     else:
                         receipt = await wait_for_durable_admission()
+                        if (
+                            getattr(receipt, "disposition", None)
+                            is DurableAdmissionDisposition.HELD
+                        ):
+                            return InboundAdmission(
+                                InboundAdmissionDisposition.HELD
+                            )
                         durable_admission = (
                             getattr(receipt, "acknowledged", False) is True
                         )

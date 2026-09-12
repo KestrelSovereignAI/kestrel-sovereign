@@ -166,6 +166,19 @@ def _load_dotenv_for_demo(repo: Path) -> dict:
     return {k: v for k, v in raw.items() if v is not None}
 
 
+def _pin_demo_database_env(env: dict, demo_db: Path) -> None:
+    """Keep every demo subprocess inside one disposable SQLite custody root."""
+
+    env.pop("KESTREL_DATABASE_URL", None)
+    env.pop("KESTREL_HOLD_EVIDENCE_DATABASE_URL", None)
+    env.pop("KESTREL_HOLD_BACKEND", None)
+    env["KESTREL_DB_BACKEND"] = "sqlite"
+    env["KESTREL_DB_PATH"] = str(demo_db)
+    env["KESTREL_HOST_DB_PATH"] = str(
+        demo_db / "host-data" / "host-features.db"
+    )
+
+
 def _build_demo_env(parent_env: dict, demo_db: Path, repo: Path) -> dict:
     """Build the env for the ``uvicorn`` demo-server subprocess.
 
@@ -191,7 +204,7 @@ def _build_demo_env(parent_env: dict, demo_db: Path, repo: Path) -> dict:
     env.update(_load_dotenv_for_demo(repo))
     env.update(parent_env)
     env.pop("KESTREL_API_KEY", None)
-    env["KESTREL_DB_PATH"] = str(demo_db)
+    _pin_demo_database_env(env, demo_db)
     env["KESTREL_MULTI_AGENT_CONFIG"] = str(
         demo_db / "multi_agent-disabled.toml"
     )
@@ -225,7 +238,7 @@ def _build_playwright_env(parent_env: dict, demo_url: str, repo: Path, demo_db: 
             env[key] = parent_env[key]
     env["KESTREL_URL"] = demo_url
     env["KESTREL_DEMO_SERVER"] = "1"
-    env["KESTREL_DB_PATH"] = str(demo_db)
+    _pin_demo_database_env(env, demo_db)
     return env
 
 

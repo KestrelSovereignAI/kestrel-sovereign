@@ -377,7 +377,15 @@ jobs:
         # TestIndexUsage::test_agent_status_query_uses_index. The only tests
         # that fail are the by-name existence checks in TestJsonPathIndexes.
         # See #2798. The integration tier does exclude benchmarks; below.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short -x --timeout=60
+        # No -x. Under -n auto this suite has a tail of load-sensitive tests
+        # (#3276): repeated runs on ONE unchanged commit fail a different 1-3
+        # each time, all passing serially. With -x the run stopped at whichever
+        # test lost the race, so the reported failure was rarely the real
+        # problem and a genuine regression could hide behind a flake that
+        # tripped first. --maxfail bounds a truly broken tree without hiding
+        # the set. Reading a red run now means reading every failure, which is
+        # what tells you flake from regression.
+        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60
         # 10 was too tight and started killing PASSING runs. The tier was
         # measured at 7:43 on the 2-core runner (#2795) and has since grown —
         # #2465, #2890 and #2902 added ~1.2k lines of tests in one week. The

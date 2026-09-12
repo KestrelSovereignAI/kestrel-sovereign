@@ -31,7 +31,19 @@ logger = logging.getLogger(__name__)
 # than queue-and-wait forever (which would wedge the background loop, #2111).
 # The scheduler tags every tick with session_id="scheduler"
 # (features/scheduler/feature.py); test_scheduler_ask_gate pins that agreement.
-NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler"})
+#
+# A feature's lifecycle hooks (``on_agent_ready`` and friends) are the other
+# such context, and until #3280 had no id of their own. The first feature to
+# call a governed tool from one — defining its own workflow at ready time —
+# queued an approval on any agent whose workflow tools sit at the default ASK,
+# and awaited it with no timeout. That hook runs before the host serves HTTP,
+# so boot never finished, and the Approvals surface that could have answered
+# it is served by the server that never started. The only way out was to
+# borrow the scheduler's id, which would have filed every such call in the
+# audit log as a scheduler tick. This is a public contract: a feature calling
+# ``execute_named_tool`` from a lifecycle hook passes this session id.
+FEATURE_LIFECYCLE_SESSION_ID = "feature-lifecycle"
+NON_INTERACTIVE_SESSION_IDS = frozenset({"scheduler", FEATURE_LIFECYCLE_SESSION_ID})
 
 
 class SecurityHook(Hook):

@@ -1007,6 +1007,20 @@ class ProcessManager:
             A2A_PEER_IDENTITY_DOCUMENTS_SHA256_ENV,
         ):
             env.pop(inherited_registry_key, None)
+        # Host-feature state is fleet-scoped, while the KESTREL_DB_PATH below
+        # is deliberately replaced with this one agent's root. Resolve the
+        # host path first and publish that exact answer to every child; letting
+        # each child derive it after the override partitions Hold latches and
+        # every other host feature by agent.
+        from kestrel_sovereign.host_features.storage import (
+            pin_host_database_launch_context,
+        )
+
+        pin_host_database_launch_context(
+            env,
+            base_dir=self.project_dir,
+            project_root=self.project_dir,
+        )
         env["KESTREL_DB_PATH"] = str(resolved_dir)
         # A parent-process KESTREL_DATA_DIR is not a per-agent setting. Carry
         # the resolved custody root in a dedicated child-only variable so

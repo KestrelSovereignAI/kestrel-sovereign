@@ -98,7 +98,10 @@ from kestrel_sovereign.agent.request_lifecycle import (
     RequestLifecycleMixin,
 )
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
-from kestrel_sovereign.agent.invocation import bind_async_invocation
+from kestrel_sovereign.agent.invocation import (
+    bind_async_invocation,
+    mark_current_invocation_effect_checkpointed,
+)
 from kestrel_sovereign.signals import OrderedLockManager
 from kestrel_sovereign.storage.memory_system import MemorySystem
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
@@ -823,6 +826,12 @@ class KestrelAgent(
                 complete maintenance snapshot for the active capability.
         """
         self.did = did
+        # Production launchers bind the fleet control store before initialize.
+        # Direct construction remains supported for embedding/tests; only an
+        # explicit binding activates the durable turn-start admission seam.
+        self._hold_store = None
+        self._standalone_hold_context = None
+        self._standalone_hold_context_close_task = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         effective_db_backend = db_backend or os.environ.get(
@@ -1578,10 +1587,12 @@ class KestrelAgent(
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
         # A caller may retry the same id while its original delivery is still
-        # running. Keep lifecycle registration ownership per delivery so one
-        # completion cannot unregister the other.
+        # running. The request-level maps are compatibility projections; the
+        # generation index keeps each top-level delivery independently owned
+        # while nested registrations reference-count that exact generation.
         self._active_request_counts: dict[str, int] = {}
         self._active_request_generations: dict[str, int] = {}
+        self._active_request_generation_counts: dict[tuple[str, int], int] = {}
         self._next_request_generation = 0
         self._abandoned_request_generations: dict[str, set[int]] = {}
         self._abandoned_request_dispositions: dict[
@@ -1590,6 +1601,9 @@ class KestrelAgent(
         # Monotonic registration time per active request id so the
         # restart coordinator can age out stale markers (#1558).
         self._active_request_started_at: dict[str, float] = {}
+        self._active_request_generation_started_at: dict[
+            tuple[str, int], float
+        ] = {}
         # Observable turn IDs resolve to the task-local invocation/request IDs
         # that the cooperative Stop loop already understands (#3141).
         self._turn_request_ids: dict[str, str] = {}
@@ -2729,6 +2743,31 @@ class KestrelAgent(
             lambda names=list(core_source_names): self._boot_teardown_signal_sources(names),
         )
 
+        # The A2A callbacks fire once, after their task transition commits.
+        # Core-owned durable cognition consumers preserve those wakes across
+        # Hold and restart; their drainers observe Release and resume the
+        # unclaimed ledger rows without requiring a peer retry.
+        from kestrel_sovereign.signals import DurableConsumerRegistration
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        )
+
+        for consumer_id, source in (
+            (A2A_COMPLETE_COGNITION_CONSUMER_ID, "a2a.task_complete"),
+            (A2A_SUBMITTED_COGNITION_CONSUMER_ID, "a2a.task_submitted"),
+        ):
+            await self.dispatcher.register_durable_consumer(
+                DurableConsumerRegistration(
+                    consumer_id=consumer_id,
+                    source=source,
+                    agent_id=self.did,
+                    max_attempts=0,
+                )
+            )
+
         # Sender-side store for in-flight send_a2a_question
         # correlation rows (#1444). PeersFeature.send_a2a_question
         # inserts here on POST; the subscription supervisor marks
@@ -3837,6 +3876,24 @@ class KestrelAgent(
         )
         verify_llm_providers_initialized(self.llm_service)
         await verify_llm_providers_reachable(self.llm_service)
+
+        # TaskStore is the authoritative outbox for the two one-shot A2A
+        # callbacks. Repair any commit->callback crash gap before starting the
+        # consumers: privacy-elided durable rows need the live task envelope
+        # presented once before a drainer may claim their marker-only replay.
+        await self.reconcile_a2a_cognition_wakes()
+        from kestrel_sovereign.signals.sources.a2a import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
+        )
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        )
+
+        for consumer_id in (
+            A2A_COMPLETE_COGNITION_CONSUMER_ID,
+            A2A_SUBMITTED_COGNITION_CONSUMER_ID,
+        ):
+            await self.dispatcher.start_durable_cognition_consumer(consumer_id)
 
         # All subsystems are now up (memory system, context manager, dispatcher,
         # LLM). On direct-agent boots, notify features now. Server-owned agents
@@ -6197,6 +6254,12 @@ Expected Duration: {expected_duration}
                 transport metadata. This is task-local only; tools cannot
                 provide or override it through their arguments.
         """
+        from kestrel_sovereign.hold import require_turn_start_allowed
+
+        # Universal willingness-to-begin gate. It precedes credentials,
+        # genesis, hooks, context, turn lifecycle, tools, and provider work.
+        await require_turn_start_allowed(self)
+
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
         # USER_BYOK credentials are a non-cognitive readiness input. Refresh
@@ -6331,6 +6394,10 @@ Expected Duration: {expected_duration}
                 KESTREL_SESSION_ID: session_id or None,
                 "agent.input_length": len(user_input),
             }) as _otel_span:
+                # Correlation is optional evidence, never cancellation
+                # authority. The observability feature may replace this with
+                # its dedicated turn-root span later in USER_PROMPT_SUBMIT.
+                self.bind_current_turn_span(_otel_span)
                 # Lifecycle is already entered; call the locked body directly.
                 return await self._process_input_traced_locked(
                     user_input, model_override, session_id, _otel_span, include_memories,
@@ -6534,6 +6601,7 @@ Expected Duration: {expected_duration}
             content,
             **kwargs,
         )
+        mark_current_invocation_effect_checkpointed()
 
     async def _maybe_compact_codex_thread(
         self, session_id: Optional[str],
@@ -7831,6 +7899,32 @@ Expected Duration: {expected_duration}
             skills=skills
         )
 
+    async def _close_standalone_hold_context(
+        self,
+    ) -> tuple[bool, BaseException | None]:
+        """Join closure of a standalone helper's agent-owned Hold context."""
+
+        state = vars(self)
+        context = state.get("_standalone_hold_context")
+        task = state.get("_standalone_hold_context_close_task")
+        if context is None and task is None:
+            return False, None
+        if task is None:
+            from kestrel_sovereign.hold import close_bound_host_context
+
+            task = asyncio.create_task(
+                close_bound_host_context(context),
+                name="agent_shutdown:standalone_hold_context",
+            )
+            self._standalone_hold_context_close_task = task
+        cancelled, failure = await await_lifecycle_task_completion(task)
+        if failure is None:
+            self._standalone_hold_context = None
+        # A failed close remains retryable on a later shutdown call; a terminal
+        # success is idempotent and no longer needs a task reference.
+        self._standalone_hold_context_close_task = None
+        return cancelled, failure
+
     async def shutdown(self):
         """Properly clean up all agent resources including async MCP connections.
 
@@ -8191,6 +8285,20 @@ Expected Duration: {expected_duration}
             # shutdown as complete while its owned dispatcher-to-storage tail
             # is still running.
             tail_degraded = True
+
+        context_cancelled, context_failure = await self._close_standalone_hold_context()
+        shutdown_cancelled = shutdown_cancelled or context_cancelled
+        if context_failure is not None:
+            tail_degraded = True
+            logging.warning(
+                "Standalone Hold context shutdown failed: %s",
+                context_failure,
+                exc_info=(
+                    type(context_failure),
+                    context_failure,
+                    context_failure.__traceback__,
+                ),
+            )
 
         if shutdown_cancelled:
             # Never report success after cancellation: re-raise so the outer

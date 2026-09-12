@@ -32,7 +32,9 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from ..capture import write_stream
 from .base import (
+    CaptureTarget,
     CompletedRun,
     DirEntry,
     SandboxBackend,
@@ -103,11 +105,41 @@ class DockerSandboxBackend(SandboxBackend):
         cwd: Optional[Path],
         env: Optional[dict[str, str]],
         timeout: int,
+        capture: Optional[CaptureTarget] = None,
     ) -> CompletedRun:
+        """Run ``argv`` in a one-shot container.
+
+        Two completeness facts used to be dropped on this path, and both are
+        the shape #3243 is about — a result that reads whole when it is not.
+
+        The executor caps output at ``max_output_bytes`` and used to mark the
+        clip only by appending a marker to the *text*, so ``truncated_stdout``
+        stayed ``False`` here no matter how much was thrown away. Reading it
+        back off the marker fixed the flag and introduced a different lie:
+        the output is caller-controlled, so a command that printed that exact
+        string — echoing a prior executor log, say — was reported truncated
+        when it was whole. ``ExecutionRecord.output_truncated`` now carries
+        the fact, and the marker is only stripped when the record says there
+        was one.
+
+        A timeout raised out of this method entirely, so ``timed_out``
+        was likewise never ``True`` on this backend. It is now caught and
+        reported as the outcome it is.
+
+        A capture on this backend is weaker than on the local one and says
+        so: the container's output has already been through the executor's
+        cap by the time it gets here, so the file is written from what
+        survived, and ``truncated_stdout`` rides along to say whether that
+        was everything.
+        """
         if not argv:
             raise ValueError("empty argv")
 
         from kestrel_sovereign.features.compute.models import ComputeCommand
+        from kestrel_sovereign.features.compute.executors.base import (
+            _OUTPUT_TRUNCATED_SUFFIX,
+            ExecutionTimeoutError,
+        )
 
         command = ComputeCommand(
             id=str(uuid.uuid4()),
@@ -119,15 +151,101 @@ class DockerSandboxBackend(SandboxBackend):
         )
 
         started = time.monotonic()
-        record = await self._executor.execute_command(
-            command,
-            working_dir=str(cwd) if cwd else None,
-        )
+        try:
+            record = await self._executor.execute_command(
+                command,
+                working_dir=str(cwd) if cwd else None,
+            )
+        except ExecutionTimeoutError:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            # A capture was asked for, so the files must exist even though
+            # the executor kept nothing from before the kill. Skipping them
+            # left the feature writing a manifest that named paths which
+            # were not there, and previews reading "[capture unreadable]" —
+            # a missing artifact reported as a broken one.
+            if capture is not None:
+                await write_stream(capture.stdout_path, b"")
+                await write_stream(
+                    capture.stderr_path,
+                    f"command exceeded its {timeout}s timeout; the "
+                    f"container was killed and no output was preserved\n".encode(
+                        "utf-8"
+                    ),
+                )
+            return CompletedRun(
+                argv=list(argv),
+                returncode=-1,
+                stdout="",
+                stderr=f"command exceeded its {timeout}s timeout",
+                duration_ms=duration_ms,
+                timed_out=True,
+                stdout_path=str(capture.stdout_path) if capture else None,
+                stderr_path=str(capture.stderr_path) if capture else None,
+                cwd=str(cwd) if cwd else None,
+            )
         duration_ms = int((time.monotonic() - started) * 1000)
+
+        stdout, out_trunc = _split_truncation_marker(
+            record.stdout,
+            _OUTPUT_TRUNCATED_SUFFIX,
+            bool(getattr(record, "stdout_truncated", False)),
+        )
+        stderr, err_trunc = _split_truncation_marker(
+            record.stderr,
+            _OUTPUT_TRUNCATED_SUFFIX,
+            bool(getattr(record, "stderr_truncated", False)),
+        )
+
+        # The executor decodes with ``errors="replace"`` before this sees
+        # anything, so non-UTF-8 output has already become U+FFFD and a
+        # capture written from these strings is not what the command emitted.
+        # The bytes are gone by here; what can still be honest is the claim
+        # about them, so a lossy transcription is reported as incomplete
+        # rather than filed as the output. Over-claiming loss degrades a
+        # clean run to PARTIAL, which is the safe direction — a caveated
+        # artifact is recoverable, a silently wrong one is not.
+        if capture is not None:
+            if "\ufffd" in stdout:
+                out_trunc = True
+            if "\ufffd" in stderr:
+                err_trunc = True
+
+        stdout_path = stderr_path = None
+        if capture is not None:
+            # ``write_stream``, not ``host_write``: a capture is owner-only,
+            # like the manifest and the audit log beside it.
+            await write_stream(capture.stdout_path, stdout.encode("utf-8"))
+            await write_stream(capture.stderr_path, stderr.encode("utf-8"))
+            stdout_path = str(capture.stdout_path)
+            stderr_path = str(capture.stderr_path)
+
         return CompletedRun(
             argv=list(argv),
             returncode=record.exit_code if record.exit_code is not None else -1,
-            stdout=record.stdout,
-            stderr=record.stderr,
+            stdout=stdout,
+            stderr=stderr,
             duration_ms=duration_ms,
+            truncated_stdout=out_trunc,
+            truncated_stderr=err_trunc,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            cwd=str(cwd) if cwd else None,
         )
+
+
+def _split_truncation_marker(
+    text: str, marker: str, truncated: bool
+) -> tuple[str, bool]:
+    """Drop the executor's cosmetic marker when the record says it clipped.
+
+    ``truncated`` is the authority; the marker is only presentation. The
+    text alone cannot be, because it is whatever the command chose to
+    print — a run that legitimately ends with that string is not a
+    truncated run, and reporting it as one turns a clean pass into a
+    caveated PARTIAL.
+    """
+    if not truncated:
+        return text, False
+    if text.endswith(marker):
+        return text[: -len(marker)], True
+    return text, True

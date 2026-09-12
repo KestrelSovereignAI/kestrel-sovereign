@@ -375,9 +375,11 @@ async def test_shutdown_all_releases_outstanding_holds(tmp_path):
     parent = SimpleNamespace(
         _private_key=generate_secp256k1_keypair()[0], identity=None, agent_id="did:p", features={},
         wallet=FakeWallet(initial_balance=Decimal("100")),
+        shutdown=AsyncMock(),
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child, base_data_dir=tmp_path)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
     await mgr.spawn_agent("Kid", parent, mandate)
@@ -414,8 +416,22 @@ def _mgr_with_mock_child(child, *, base_data_dir=None):
     async def fake_create_agent(name, parent_did=None, features=None, mandate=None):
         # Mimic load_agent registering the child, so the REAL remove_agent (the
         # path that releases budget holds — #2113) finds and stops it.
+        async def durable_edges(node_id):
+            receipt = getattr(child, "_persisted_spawn_mandate", None)
+            if receipt is None:
+                return []
+            return [
+                SimpleNamespace(
+                    label="spawned_by",
+                    source_id=node_id,
+                    target_id=receipt.parent_did,
+                    properties=receipt.to_edge_properties(),
+                )
+            ]
+
         child._raw_storage = SimpleNamespace(
-            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock())
+            graph=SimpleNamespace(add_trusted_cross_agent_edge=AsyncMock()),
+            get_edges_from=durable_edges,
         )
         admission = mgr._agent_operations[mgr._canonical_agent_name(name)]
         assert admission.before_publish is not None
@@ -439,6 +455,39 @@ def _mgr_with_mock_child(child, *, base_data_dir=None):
     return mgr
 
 
+def _use_runtime_projection_as_authority_test_double(manager) -> None:
+    """Keep budget-only fixtures focused on refund/custody behavior."""
+
+    known_child_ids = {}
+
+    async def runtime_relations():
+        relations = {}
+        for parent_did, child_names in manager._parent_children.items():
+            for child_name in child_names:
+                child = manager.get_agent(child_name)
+                child_did = getattr(child, "agent_id", None)
+                if not isinstance(child_did, str) or not child_did:
+                    mandate = manager.get_mandate(child_name)
+                    child_did = getattr(mandate, "child_did", None)
+                if not isinstance(child_did, str) or not child_did:
+                    child_did = known_child_ids.get(child_name)
+                if isinstance(child_did, str) and child_did:
+                    known_child_ids[child_name] = child_did
+                    relations[child_did] = (parent_did, child_name)
+        return relations
+
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        side_effect=runtime_relations
+    )
+
+
+def _register_spawn_parent(manager, parent) -> None:
+    """Publish the exact parent identity required by production spawn."""
+
+    manager._agents["Parent"] = parent
+    manager._agent_names[parent.agent_id] = "Parent"
+
+
 @pytest.mark.asyncio
 async def test_spawn_holds_budget_and_terminate_releases(tmp_path):
     from kestrel_sovereign.spawn.mandate import SpawnMandate
@@ -449,6 +498,8 @@ async def test_spawn_holds_budget_and_terminate_releases(tmp_path):
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child, base_data_dir=tmp_path)
+    _use_runtime_projection_as_authority_test_double(mgr)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
     result = await mgr.spawn_agent("Kid", parent, mandate)
@@ -529,6 +580,7 @@ async def test_spawn_cancellation_after_provider_allocation_refunds_tracked_hold
         return child
 
     manager.create_agent = fake_create_agent
+    _register_spawn_parent(manager, parent)
     mandate = SpawnMandate(
         parent_did=parent.agent_id,
         purpose="allocation cancellation regression",
@@ -622,6 +674,7 @@ async def test_direct_remove_agent_releases_budget(tmp_path):
         return child
 
     mgr.create_agent = fake_create_agent  # real remove_agent (the path under test)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("30"))
     await mgr.spawn_agent("Kid", parent, mandate)
@@ -742,6 +795,7 @@ async def test_budget_allocation_failure_revokes_receipt_before_child_shutdown(
         return child
 
     manager.create_agent = create_and_publish
+    _register_spawn_parent(manager, parent)
     mandate = SpawnMandate(
         parent_did=parent.agent_id,
         purpose="rollback",
@@ -798,6 +852,7 @@ async def test_terminate_child_keeps_retry_tracking_after_refund_failure() -> No
     manager._child_budgets["retry-child"] = entry
     manager._parent_children["did:test:retry-parent"] = ["retry-child"]
     manager._child_mandates["retry-child"] = mandate
+    _use_runtime_projection_as_authority_test_double(manager)
 
     async def fail_refund(name: str) -> bool:
         assert name == "retry-child"
@@ -843,6 +898,7 @@ async def test_terminate_child_prunes_tracking_after_completed_removal_cancellat
     manager._child_budgets["cancelled-child"] = entry
     manager._parent_children["did:test:cancelled-parent"] = ["cancelled-child"]
     manager._child_mandates["cancelled-child"] = mandate
+    _use_runtime_projection_as_authority_test_double(manager)
 
     async def refund_then_report_cancellation(name: str) -> bool:
         assert name == "cancelled-child"
@@ -883,6 +939,7 @@ async def test_terminate_child_cascade_releases_nested_to_root():
     # root spawned child; child spawned gc.
     mgr._parent_children = {"did:root": ["child"], "did:child": ["gc"]}
     mgr._child_budgets = {"child": (child_dw, root), "gc": (gc_dw, child_dw)}
+    _use_runtime_projection_as_authority_test_double(mgr)
 
     await mgr.terminate_child("did:root", "child")
     assert root.get_balance() == Decimal("100")   # gc released into child, then child to root
@@ -941,6 +998,7 @@ async def test_budget_refused_for_persistent_child():
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(
         parent_did="did:p", purpose="x", budget_allocation=Decimal("30"), ttl_seconds=0,
@@ -958,6 +1016,7 @@ async def test_budget_refused_without_funded_parent_wallet():
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("5"))
     with pytest.raises(ValueError, match="funded wallet"):
@@ -974,6 +1033,7 @@ async def test_budget_refused_when_parent_cannot_afford():
     )
     child = SimpleNamespace(agent_id="did:c", wallet=None, wallet_agent=None)
     mgr = _mgr_with_mock_child(child)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x", budget_allocation=Decimal("50"))
     with pytest.raises(ValueError, match="cannot afford"):
@@ -1014,6 +1074,7 @@ async def test_no_budget_leaves_wallet_untouched(tmp_path):
     )
     child = SimpleNamespace(agent_id="did:c", wallet="preexisting", wallet_agent=None)
     mgr = _mgr_with_mock_child(child, base_data_dir=tmp_path)
+    _register_spawn_parent(mgr, parent)
 
     mandate = SpawnMandate(parent_did="did:p", purpose="x")  # budget defaults to 0
     await mgr.spawn_agent("Kid", parent, mandate)

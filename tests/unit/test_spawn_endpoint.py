@@ -9,11 +9,13 @@ caught by codex during the inline (#1149 round 3).
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kestrel_sovereign.endpoints import spawn as spawn_endpoints
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+from kestrel_sovereign.spawn.mandate import SpawnMandate
 
 
 def _make_request(*, agent_manager=None):
@@ -43,7 +45,7 @@ async def test_get_spawn_children_returns_empty_when_no_manager(monkeypatch):
 async def test_get_spawn_children_uses_agent_attached_manager(monkeypatch):
     """Single-agent mode — manager is on agent._agent_manager."""
     manager = MagicMock()
-    manager.get_children.return_value = []
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
     manager._lifecycle = None
     agent = SimpleNamespace(agent_id="parent-did", _agent_manager=manager)
     request = _make_request(agent_manager=None)
@@ -51,9 +53,8 @@ async def test_get_spawn_children_uses_agent_attached_manager(monkeypatch):
 
     result = await spawn_endpoints.get_spawn_children(request)
     assert result["count"] == 0
-    # The agent's manager was consulted (top-level call + delegation chain recursion).
-    manager.get_children.assert_called_with("parent-did")
-    assert manager.get_children.call_count >= 1
+    manager.get_authoritative_spawn_relations.assert_awaited_once_with()
+    manager.get_children.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -64,7 +65,7 @@ async def test_get_spawn_children_falls_back_to_app_state_manager(monkeypatch):
     the app-level manager held children/lifecycle state.
     """
     manager = MagicMock()
-    manager.get_children.return_value = []
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
     manager._lifecycle = None
     # Agent has no manager; app.state does.
     agent = SimpleNamespace(agent_id="parent-did", _agent_manager=None)
@@ -73,9 +74,110 @@ async def test_get_spawn_children_falls_back_to_app_state_manager(monkeypatch):
 
     result = await spawn_endpoints.get_spawn_children(request)
     assert result["count"] == 0
-    # The app-level manager was consulted via fallback (top + delegation chain)
-    manager.get_children.assert_called_with("parent-did")
-    assert manager.get_children.call_count >= 1
+    manager.get_authoritative_spawn_relations.assert_awaited_once_with()
+    manager.get_children.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_spawn_children_surfaces_cleanup_retained_child(monkeypatch):
+    """Expired authority stays absent while operator cleanup stays visible."""
+
+    lifecycle = MagicMock()
+    lifecycle.get_cleanup_retained_children.return_value = ["ExpiredChild"]
+    lifecycle.cleanup_retained_child_did.return_value = "did:child:expired"
+    lifecycle._tracked = {}
+    lifecycle._results = {}
+    manager = MagicMock()
+    manager._lifecycle = lifecycle
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
+    manager.get_agent.return_value = None
+    manager.get_mandate.return_value = None
+    agent = SimpleNamespace(agent_id="did:parent:A", _agent_manager=manager)
+    request = _make_request(agent_manager=None)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+
+    assert [child["name"] for child in result["children"]] == ["ExpiredChild"]
+    assert result["children"][0]["did"] == "did:child:expired"
+    assert result["delegation_chain"]["children"] == []
+    lifecycle.get_cleanup_retained_children.assert_called_once_with(
+        parent_did="did:parent:A"
+    )
+    lifecycle.cleanup_retained_child_did.assert_called_once_with(
+        parent_did="did:parent:A",
+        child_name="ExpiredChild",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_spawn_children_surfaces_stopped_persistent_cleanup_custody(
+    monkeypatch,
+    tmp_path,
+):
+    """Restart/offboarding custody remains visible after runtime shutdown."""
+
+    parent_did = "did:parent:persistent"
+    child_did = "did:child:persistent"
+    child_name = "PersistentChild"
+    manager = AgentManager(base_data_dir=tmp_path)
+    canonical_name = manager._canonical_agent_name(child_name)
+    manager._persistent_spawn_registrations[canonical_name] = (
+        child_name,
+        child_did,
+    )
+    manager._persistent_spawn_parent_dids[canonical_name] = (
+        child_did,
+        parent_did,
+    )
+    manager._persistent_spawn_mandates[canonical_name] = SpawnMandate(
+        parent_did=parent_did,
+        child_did=child_did,
+        ttl_seconds=0,
+        parent_signature="signed",
+        authority_committed=True,
+    )
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
+    agent = SimpleNamespace(agent_id=parent_did, _agent_manager=manager)
+    request = _make_request(agent_manager=None)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+
+    assert result["count"] == 1
+    assert result["children"][0]["name"] == child_name
+    assert result["children"][0]["did"] == child_did
+    assert result["children"][0]["status"] == "stopped"
+    assert result["delegation_chain"]["children"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_spawn_children_surfaces_registry_only_cleanup_custody(
+    monkeypatch,
+    tmp_path,
+):
+    """A committed pre-projection child remains visible for offboarding."""
+
+    parent_did = "did:parent:registry"
+    child_did = "did:child:registry"
+    child_name = "RegistryOnlyChild"
+    manager = AgentManager(base_data_dir=tmp_path)
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        AgentManager,
+        "registry_spawn_cleanup_children",
+        lambda self, *, parent_did: ((child_name, child_did),),
+    )
+    agent = SimpleNamespace(agent_id=parent_did, _agent_manager=manager)
+    request = _make_request(agent_manager=None)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+
+    assert result["count"] == 1
+    assert result["children"][0]["name"] == child_name
+    assert result["children"][0]["did"] == child_did
+    assert result["children"][0]["status"] == "stopped"
 
 
 @pytest.mark.asyncio
@@ -129,7 +231,7 @@ async def test_spawn_history_filtered_by_parent_did(monkeypatch):
     )
     manager = MagicMock()
     manager._lifecycle = lifecycle
-    manager.get_children.return_value = []
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
 
     # Request comes from agent A.
     agent_a = SimpleNamespace(agent_id="did:parent:A", _agent_manager=None)
@@ -175,7 +277,7 @@ async def test_spawn_history_excludes_legacy_records_without_parent_did(monkeypa
     )
     manager = MagicMock()
     manager._lifecycle = lifecycle
-    manager.get_children.return_value = []
+    manager.get_authoritative_spawn_relations = AsyncMock(return_value={})
 
     agent = SimpleNamespace(agent_id="did:parent:A", _agent_manager=None)
     request = _make_request(agent_manager=manager)
@@ -206,3 +308,38 @@ def test_get_agent_manager_helper_prefers_agent_then_app_state():
     # When neither has one, return None
     request_no_state = _make_request(agent_manager=None)
     assert spawn_endpoints._get_agent_manager(agent_no_mgr, request=request_no_state) is None
+
+
+@pytest.mark.asyncio
+async def test_delegation_tree_verifies_one_relation_snapshot():
+    manager = MagicMock()
+    manager.get_authoritative_spawn_relations = AsyncMock(
+        return_value={
+            "did:child:a": ("did:root", "Alpha"),
+            "did:child:b": ("did:root", "Beta"),
+            "did:grandchild": ("did:child:a", "Leaf"),
+        }
+    )
+    manager.get_authoritative_children = AsyncMock(
+        side_effect=AssertionError("tree rendering must not rescan authority")
+    )
+    agents = {
+        "Alpha": SimpleNamespace(agent_id="did:child:a"),
+        "Beta": SimpleNamespace(agent_id="did:child:b"),
+        "Leaf": SimpleNamespace(agent_id="did:grandchild"),
+    }
+    manager.get_agent.side_effect = agents.get
+    manager.get_mandate.return_value = None
+
+    result = await spawn_endpoints._build_delegation_chain(
+        manager,
+        "did:root",
+        "Root",
+    )
+
+    manager.get_authoritative_spawn_relations.assert_awaited_once_with()
+    manager.get_authoritative_children.assert_not_awaited()
+    assert [child["name"] for child in result["children"]] == ["Alpha", "Beta"]
+    assert [child["name"] for child in result["children"][0]["children"]] == [
+        "Leaf"
+    ]

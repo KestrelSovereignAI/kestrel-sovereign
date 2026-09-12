@@ -56,8 +56,21 @@ def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
         return repo, None
 
 
-async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return the highest-priority issue represented by strategic memory."""
+async def pick_top_issue(
+    data: Dict[str, Any], diagnostics: Optional[Dict[str, int]] = None
+) -> Optional[Dict[str, Any]]:
+    """Return the highest-priority issue represented by strategic memory.
+
+    ``None`` has two meanings a caller must be able to tell apart: nothing is
+    actionable, or GitHub could not confirm anything. Pass ``diagnostics`` to
+    have ``blockers_checked`` and ``blockers_unreadable`` filled in -- when
+    every blocker checked was unreadable, "no actionable issue" would be a
+    claim about a ledger nobody actually looked at.
+    """
+    if diagnostics is None:
+        diagnostics = {}
+    diagnostics.setdefault("blockers_checked", 0)
+    diagnostics.setdefault("blockers_unreadable", 0)
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -66,6 +79,12 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     config = data.get("morning_signal_config", {})
     repos = config.get("scan_repos", [])
 
+    # One GitHub read per DISTINCT (repo, number), not per row: the ledger only
+    # grows, and on the live host 12 of the 33 qualifying rows named the same
+    # pull request -- a guaranteed miss, read twelve times every run. That is
+    # the bound on this walk: one read per distinct target named by a
+    # high/critical blocker.
+    checked: set = set()
     for blocker in data.get("blockers", []):
         if blocker.get("severity") not in ("critical", "high") or not blocker.get("issue"):
             continue
@@ -79,20 +98,47 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # are the ones whose target is least ambiguous.
         repo = blocker.get("repo") or ref_repo
         if not repo:
-            if not repos:
+            # A bare number names no project when several are configured.
+            # This used to walk scan_repos and take the FIRST repository that
+            # had any issue with that number -- with fourteen repos, low
+            # numbers collide everywhere. The blocker reconciler and
+            # ``_resolve_blocker_repo`` both refuse this guess ("the guess is
+            # what made reconciliation resolve a blocker against the wrong
+            # project's issue 42"); dispatch, which is irreversible, guessed.
+            # A lone configured repository is not a guess.
+            if len(repos) != 1:
                 continue
-            repo = await _find_issue_repo(str(issue_number), repos, token)
-        if repo:
-            return {
-                "repo": repo,
-                "issue_number": issue_number,
-                "issue_title": blocker.get("title", "Blocker"),
-                "priority": "high",
-                "context": (
-                    f"Blocker (severity: {blocker.get('severity')}): "
-                    f"{blocker.get('notes', '')}"
-                ),
-            }
+            repo = repos[0]
+
+        # Selection is where "this blocker is still live" gets decided, so it
+        # is decided against GitHub, not the ledger. The ledger only grows
+        # unless someone reconciles it, and nothing schedules that: on the
+        # live host 161 blocker rows were all unresolved, several naming
+        # issues closed for weeks, and the dispatch path picked one of them --
+        # a ticket closed on 2026-07-28, under a title that was not the
+        # issue's own -- every morning. Talon would have written code for it.
+        if (repo, issue_number) in checked:
+            continue
+        checked.add((repo, issue_number))
+        issue = await _fetch_issue(repo, issue_number, token)
+        diagnostics["blockers_checked"] += 1
+        if issue is None:
+            diagnostics["blockers_unreadable"] += 1
+        if not _is_open_issue(issue):
+            continue
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            # The issue's own title, which is what Talon will work from. The
+            # ledger row's title is a note someone wrote about it, and on the
+            # live host it described a different problem than the issue did.
+            "issue_title": issue.get("title") or blocker.get("title", "Blocker"),
+            "priority": "high",
+            "context": (
+                f"Blocker (severity: {blocker.get('severity')}): "
+                f"{blocker.get('title', '')}. {blocker.get('notes', '')}"
+            ).strip(),
+        }
 
     # #2813: the retired handoff fetched the full morning-signal projection
     # here but never consumed it, adding network/auth failure modes without
@@ -140,15 +186,30 @@ async def pick_top_issue(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _find_issue_repo(issue_number: str, repos: List[str], token: str) -> Optional[str]:
-    for repo in repos:
-        try:
-            issue = await github_api_get(f"/repos/{repo}/issues/{issue_number}", token)
-            if issue and not issue.get("pull_request"):
-                return repo
-        except Exception:
-            continue
-    return None
+async def _fetch_issue(
+    repo: str, issue_number: int, token: str
+) -> Optional[Dict[str, Any]]:
+    """One issue, or ``None`` when it cannot be read. Never raises."""
+    try:
+        issue = await github_api_get(f"/repos/{repo}/issues/{issue_number}", token)
+    except Exception as exc:  # noqa: BLE001 - selection must not crash dispatch
+        logger.debug("Could not read %s#%s: %s", repo, issue_number, exc)
+        return None
+    return issue if isinstance(issue, dict) else None
+
+
+def _is_open_issue(issue: Optional[Dict[str, Any]]) -> bool:
+    """Dispatchable only when GitHub says it is an open issue.
+
+    Unreadable is not open: a lookup failure must not be read as a live
+    target for work that writes code. And GitHub serves pull requests from
+    the issues endpoint too, which a blocker's number can name.
+    """
+    return (
+        isinstance(issue, dict)
+        and issue.get("state") == "open"
+        and not issue.get("pull_request")
+    )
 
 
 async def _fetch_milestone_issues(

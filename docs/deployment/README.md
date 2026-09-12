@@ -75,11 +75,15 @@ to every hosted agent.
 
 The checked-in `prod` profile nonetheless caps `max_instances` at 1, because the
 contract permitting horizontal scale is not the same thing as a substrate able
-to serve it. Each instance opens up to 10 pooled plus 4 advisory PostgreSQL
-connections, so the cap must be raised together with the database tier (or a
-connection pooler added) rather than on its own — see the comment above
-`[profiles.prod]` in `deploy_config.toml`. A profile that advertises capacity
-its database cannot supply is a declaration nothing has provisioned.
+to serve it. Each instance opens up to 10 pooled plus 4 advisory runtime
+PostgreSQL connections plus Hold's one-connection operational pool and
+separately bounded one-connection advisory pool on the primary database.
+Hold's independent evidence database has the same operational-plus-advisory
+pair. The cap must therefore be raised together with the database tier (or a
+connection
+pooler added) rather than on its own — see the comment above `[profiles.prod]`
+in `deploy_config.toml`. A profile that advertises capacity its database cannot
+supply is a declaration nothing has provisioned.
 
 Do not put SQLite on a Cloud Storage mount. Object storage does not provide the
 filesystem locking/transaction semantics SQLite requires. See Google's
@@ -94,8 +98,20 @@ PostgreSQL database. Keep the output directory and bundle outside the source
 tree. The same `KESTREL_DATA_KEY` must protect the identity at ceremony and at
 runtime.
 
+Before using the runtime URLs, connect to each database as its owner or a
+PostgreSQL administrator and grant the role named by that URL only the probe
+Kestrel uses to prove that the two databases live on different clusters.
+Replace `kestrel_runtime` with that URL's role; repeat this in the other database
+and for its role when the two URLs use different roles.
+
+```sql
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()
+  TO kestrel_runtime;
+```
+
 ```bash
 export KESTREL_DATABASE_URL='postgresql://...'
+export KESTREL_HOLD_EVIDENCE_DATABASE_URL='postgresql://...'
 export KESTREL_DATA_KEY='...'
 export KESTREL_DID_WEB_DOMAIN='agents.kestrelsovereign.com'
 export KESTREL_CEREMONY_DIR="$(mktemp -d)"
@@ -105,6 +121,11 @@ import asyncio
 import os
 
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.hold import HoldStore
+from kestrel_sovereign.hold.state import (
+    commit_postgres_hold_pair_custody,
+    initialize_postgres_hold_databases,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 async def provision():
@@ -120,31 +141,90 @@ async def provision():
     finally:
         await db.close()
 
+    hold_db, evidence_db, pair_id = await initialize_postgres_hold_databases(
+        os.environ["KESTREL_DATABASE_URL"],
+        os.environ["KESTREL_HOLD_EVIDENCE_DATABASE_URL"],
+        control_db_path=os.path.join(
+            os.environ["KESTREL_CEREMONY_DIR"], "host-features.db"
+        ),
+    )
+    try:
+        hold = HoldStore(
+            hold_db,
+            evidence_db=evidence_db,
+            expected_postgres_pair_id=pair_id,
+        )
+        await hold.ensure_schema()
+        commit_postgres_hold_pair_custody(
+            os.path.join(
+                os.environ["KESTREL_CEREMONY_DIR"], "host-features.db"
+            ),
+            pair_id,
+        )
+        print(f"KESTREL_HOLD_PAIR_ID={pair_id}")
+    finally:
+        await hold_db.close()
+        await evidence_db.close()
+
 asyncio.run(provision())
 PY
 
 # Set this to the DID printed above. The bundle command verifies the encrypted
 # private keys against that DID before exporting anything.
 export KESTREL_PROD_EXPECTED_DID='did:web:agents.kestrelsovereign.com:kestrel'
+# Set this to the canonical UUID printed as KESTREL_HOLD_PAIR_ID above.
+export KESTREL_HOLD_PAIR_ID='00000000-0000-0000-0000-000000000000'
 uv run python -m kestrel_sovereign.identity.custody_bundle create \
   --agent-dir "$KESTREL_CEREMONY_DIR" \
   --expected-did "$KESTREL_PROD_EXPECTED_DID" \
   --output "$KESTREL_CEREMONY_DIR/custody.json"
 ```
 
-Upload the database URL, data key, and `custody.json` as separate Secret
+The Hold evidence URL must name a database on a different PostgreSQL
+cluster/Cloud SQL instance in an independent backup/restore domain. Another
+database or schema on the primary cluster is refused because one cluster-level
+restore would roll both back together. Its history head and pending-publication
+journal are deliberately excluded from restores of `KESTREL_DATABASE_URL`, so
+rolling the primary database back cannot silently erase a later Hold. Kestrel
+also binds both databases to their original primary/evidence roles; swapping
+the two URLs fails closed rather than bootstrapping empty state.
+
+Run the `GRANT EXECUTE` above in both databases for both PostgreSQL runtime roles
+before the first boot. PostgreSQL restricts `pg_control_system()` to superusers
+and `pg_monitor` by default, but permits granting this one function directly;
+the narrow function grant is sufficient, so do not grant the broader
+`pg_monitor` role. The function reports cluster-wide control data, including the
+`system_identifier` Kestrel compares. See PostgreSQL's
+[control-data function](https://www.postgresql.org/docs/current/functions-info.html#FUNCTIONS-INFO-CONTROL-DATA)
+and [function privilege](https://www.postgresql.org/docs/current/ddl-priv.html)
+documentation.
+
+Run `uv run kestrel doctor` (or `uv run kestrel setup --check`) from the
+deployment environment before boot. Readiness now connects to both URLs,
+executes the control-data probe with each runtime role, and refuses two URLs
+whose `system_identifier` values place them on the same PostgreSQL cluster.
+
+Upload both database URLs, the data key, and `custody.json` as separate Secret
 Manager secrets. Grant the Cloud Run runtime service account
 `roles/secretmanager.secretAccessor` only on those required secrets. Secret
 Manager access is visible in Cloud Audit Logs; never print the bundle/data key
-or bake either into an image. The three custody references in
+or bake either into an image. Upload the exact `KESTREL_HOLD_PAIR_ID` UUID as
+its own secret as well. Unlike the encrypted credentials it need not be
+confidential, but its immutability is load-bearing: Cloud Run's local pair
+marker disappears at cold start, and the pinned UUID is what prevents two
+fresh databases from being accepted as a new Hold installation. The five
+custody references in
 `deploy_config.toml` must use immutable numeric versions such as `:7`, never
 `:latest`: two instances in one revision must not resolve different keys or
 bundles. Cloud Run environment values have a 32 KiB limit, which the bundle
 export enforces.
 
-After adding a new secret version, update all three numeric references and
+After adding a new secret version, update all five numeric references and
 deploy a new immutable image tag. A revision whose database, data key, bundle,
-or expected DID is missing/mismatched fails startup and never re-incepts.
+pair UUID, or expected DID is missing/mismatched fails startup and never
+re-incepts. Provisioning the pair is part of the ceremony above; a durable
+Cloud Run runtime will not initialize two databases that lack its externally
+committed pair UUID.
 
 ### Continuity and recovery check
 
@@ -360,6 +440,7 @@ creates / updates secret versions per the `[profiles.*.secrets]` map in
 | `kestrel-anthropic-key` | Anthropic API key |
 | `kestrel-api-key` | Internal Kestrel API key |
 | `kestrel-data-key` | Encryption key for agent data |
+| `kestrel-prod-hold-pair-id` | Pinned UUID of the pre-provisioned PostgreSQL Hold pair |
 | `kestrel-session-secret` | Session cookie signing |
 | `kestrel-google-client-id` / `-secret` | Google OAuth |
 | `kestrel-lighthouse-key` | Lighthouse pricing/oversight feed |

@@ -24,6 +24,7 @@ arguments, and a row the query does not describe stays invisible.
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -2279,8 +2280,17 @@ async def test_an_outcome_row_carrying_an_authorization_value_is_counted_once(tm
     d = result.data
     assert (d["authorized"], d["outcomes"], d["unclassified_outcomes"], d["refused"]) == (0, 0, 1, 0)
     assert d["authorized"] + d["outcomes"] + d["unclassified_outcomes"] + d["refused"] == d["count"]
-    assert "-1 NOT authorized" not in result.confirmation
-    assert "?" in result.confirmation
+    # The confirmation embeds ISO timestamps, and "-1" occurs inside every
+    # date from the 10th to the 19th of a month (2026-09-10T...). This
+    # assertion passed on the 9th and failed on the 10th, having nothing to do
+    # with the bucket arithmetic it is guarding. Drop the timestamps, then keep
+    # the original broad check: no negative count anywhere a reader can see.
+    countable = re.sub(
+        r"\d{4}-\d{2}-\d{2}T[\d:.]+(?:[+-]\d{2}:\d{2}|Z)?",
+        "",
+        result.confirmation,
+    )
+    assert "-1" not in countable and "?" in result.confirmation
 
 
 @pytest.mark.asyncio

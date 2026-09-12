@@ -8,8 +8,10 @@ import asyncio
 import hashlib
 import logging
 import re
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Set, Tuple
+import sqlite3
+from contextlib import asynccontextmanager, closing
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from .db import (
     ConnectionError,
@@ -38,6 +40,38 @@ logger = logging.getLogger(__name__)
 
 
 _BACKFILL_LOCK_DOMAIN = b"kestrel:schema-backfill-lock:v1\0"
+
+
+async def _close_failed_database_initialization(db: "AsyncDatabase") -> None:
+    """Finish closing an owned backend even if its caller is cancelled again."""
+
+    cleanup = asyncio.create_task(
+        db.close(), name="failed-database-initialization-cleanup"
+    )
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+        except Exception:  # noqa: BLE001 - inspect and log below
+            # The task is now complete with an error.  Do not let a secondary
+            # close failure replace the schema-initialization failure whose
+            # cleanup brought us here; the final await below records it.
+            continue
+    try:
+        await cleanup
+    except asyncio.CancelledError:
+        cancelled = True
+    except Exception as close_exc:  # noqa: BLE001 - preserve initialization error
+        logger.warning(
+            "Could not close backend after database initialization failed: %s",
+            close_exc,
+        )
+    if cancelled:
+        raise asyncio.CancelledError()
+
 
 #: ``(name, table, columns)`` of the index that makes the #2959 projection worth
 #: having — Phase C lists an agent's sessions newest-activity-first.
@@ -943,6 +977,44 @@ def core_schema_sql(backend_type: str) -> str:
     )
 
 
+def validate_sqlite_core_schema_readiness(db_path: str | Path) -> None:
+    """Prove core host schema DDL can initialize without mutating the store.
+
+    ``CREATE TABLE IF NOT EXISTS`` accepts an existing table without checking
+    its columns; a later mandatory index statement then fails startup. Clone a
+    consistent read-only snapshot into memory and run the same core DDL there,
+    so Doctor detects that incompatibility while leaving live custody bytes
+    untouched. An absent database remains a valid first-boot target.
+    """
+
+    database = Path(db_path).expanduser().resolve(strict=False)
+    if not database.exists():
+        return
+    # Match Hold's diagnostic-open contract.  Opening a lone WAL in read-only
+    # mode can still create the missing shared-memory sidecar.  Reject the
+    # incomplete pair before SQLite is called so Doctor remains non-mutating.
+    wal_present = Path(f"{database}-wal").exists()
+    shm_present = Path(f"{database}-shm").exists()
+    if wal_present != shm_present:
+        raise ValueError(
+            "SQLite core host schema cannot be inspected with an incomplete "
+            "WAL sidecar pair"
+        )
+    flags = "mode=ro" if wal_present else "mode=ro&immutable=1"
+    try:
+        with closing(
+            sqlite3.connect(f"{database.as_uri()}?{flags}", uri=True)
+        ) as source, closing(sqlite3.connect(":memory:")) as snapshot:
+            source.execute("PRAGMA query_only = ON")
+            source.backup(snapshot)
+            snapshot.executescript(core_schema_sql("sqlite"))
+            snapshot.executescript(_SQLITE_JSON_INDEXES)
+    except sqlite3.Error as exc:
+        raise ValueError(
+            f"SQLite core host schema cannot initialize: {exc}"
+        ) from exc
+
+
 class AsyncDatabase:
     """
     Async database manager supporting SQLite and PostgreSQL.
@@ -968,6 +1040,46 @@ class AsyncDatabase:
         # dialect-specific connection retirement have completed.
         self._sovereign_sqla_factory = None
         self._sovereign_sqla_retirement_owner = None
+
+    @classmethod
+    async def from_connected_backend(
+        cls,
+        backend: DatabaseBackend,
+        *,
+        initialization_guard: Any = None,
+        schema_initializer: Optional[
+            Callable[["AsyncDatabase"], Awaitable[None]]
+        ] = None,
+    ) -> "AsyncDatabase":
+        """Take ownership of a connected backend and initialize its schema.
+
+        Callers that must inspect a specific connected pool before any schema
+        mutation use this boundary rather than discarding that pool and opening
+        a second one through :meth:`postgres`. ``initialization_guard`` may be
+        an async context manager that serializes the first schema publication;
+        it is exited before failure cleanup closes the owned backend. A narrow
+        subsystem may supply ``schema_initializer`` when the connected database
+        intentionally carries only that subsystem's schema; the default remains
+        the complete Kestrel core initializer.
+        """
+
+        db = cls(backend)
+        initialize_schema = (
+            db._init_schema
+            if schema_initializer is None
+            else lambda: schema_initializer(db)
+        )
+        try:
+            if initialization_guard is None:
+                await initialize_schema()
+            else:
+                async with initialization_guard:
+                    await initialize_schema()
+        except BaseException:
+            await _close_failed_database_initialization(db)
+            raise
+        db._initialized = True
+        return db
     
     @classmethod
     async def create(cls, config: Optional[Dict[str, Any]] = None) -> "AsyncDatabase":
@@ -982,31 +1094,35 @@ class AsyncDatabase:
             Connected AsyncDatabase instance
         """
         backend = await get_backend(config)
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
-        return db
+        return await cls.from_connected_backend(backend)
     
     @classmethod
     async def sqlite(cls, db_path: str) -> "AsyncDatabase":
         """Create SQLite database at given path."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info(f"SQLite database connected: {db_path}")
         return db
     
     @classmethod
-    async def postgres(cls, dsn: str) -> "AsyncDatabase":
-        """Create PostgreSQL database with given DSN."""
+    async def postgres(
+        cls,
+        dsn: str,
+        *,
+        min_pool_size: int = 2,
+        max_pool_size: int = 10,
+    ) -> "AsyncDatabase":
+        """Create a PostgreSQL database with an explicitly bounded pool."""
         from .db.postgres import PostgresBackend
-        backend = PostgresBackend(dsn=dsn)
+
+        backend = PostgresBackend(
+            dsn=dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+        )
         await backend.connect()
-        db = cls(backend)
-        await db._init_schema()
-        db._initialized = True
+        db = await cls.from_connected_backend(backend)
         logger.info("PostgreSQL database connected")
         return db
 

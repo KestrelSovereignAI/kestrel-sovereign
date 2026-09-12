@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -37,6 +38,15 @@ from kestrel_sovereign.config import (
     SEMANTIC_CAPABILITIES_CONFIGURED_ENV,
     SEMANTIC_CAPABILITIES_CONFIG_ENV,
     SEMANTIC_INFERENCE_CONFIG_ENV,
+)
+from kestrel_sovereign.host_features.storage import (
+    DERIVED_HOST_DB_PATH_ENV,
+    HOST_DB_LEGACY_PATH_ENV,
+    HOST_DB_PATH_ENV,
+    HOST_DB_PREVIOUS_DEFAULT_ENV,
+    HOST_DB_USES_DEFAULT_ENV,
+    HOST_FEATURE_DB_FILENAME,
+    resolve_host_database_launch_context,
 )
 
 
@@ -535,6 +545,149 @@ class TestStartAgent:
         assert env["KESTREL_API_KEY"] == "test-key"
         assert env["KESTREL_A2A_TRANSPORT_ONLY"] == "false"
         assert env["KESTREL_SERVE_UI"] == "true"
+
+    def test_named_agents_share_host_database_resolved_before_agent_override(
+        self,
+        pm,
+        project_dir,
+    ):
+        """Per-agent primary roots cannot partition fleet Hold state."""
+
+        fleet_root = project_dir / "fleet-data"
+        captured = []
+
+        def capture_spawn(_cmd, env, *_args, **_kwargs):
+            captured.append(dict(env))
+            return 12345 + len(captured)
+
+        configs = {
+            "claw": LocalAgentConfig(data_dir="agent_data/claw", port=8801),
+            "testbot": LocalAgentConfig(
+                data_dir="agent_data/testbot",
+                port=8802,
+            ),
+        }
+        with (
+            patch.object(
+                pm,
+                "_load_env",
+                return_value={"KESTREL_DB_PATH": str(fleet_root)},
+            ),
+            patch.object(pm, "_spawn", side_effect=capture_spawn),
+        ):
+            for name, config in configs.items():
+                pm.start_agent(name, config)
+
+        expected_host = str(
+            fleet_root / "host-data" / HOST_FEATURE_DB_FILENAME
+        )
+        assert {env[HOST_DB_PATH_ENV] for env in captured} == {expected_host}
+        assert {
+            env[DERIVED_HOST_DB_PATH_ENV] for env in captured
+        } == {expected_host}
+        assert [env["KESTREL_DB_PATH"] for env in captured] == [
+            str((project_dir / config.data_dir).resolve())
+            for config in configs.values()
+        ]
+
+    def test_offline_roster_shell_matches_process_launcher_hold_custody(
+        self,
+        pm,
+        project_dir,
+    ):
+        """Mutation tripwire: both launchers must use the pre-agent resolver."""
+
+        import kestrel_sovereign.cli as cli_module
+
+        fleet_root = project_dir / "fleet-data"
+        launch_env = {
+            "KESTREL_DB_PATH": str(fleet_root),
+            "KESTREL_DB_BACKEND": "postgres",
+            "KESTREL_DATABASE_URL": "postgresql://primary/kestrel",
+            "KESTREL_HOLD_BACKEND": "postgres",
+            "KESTREL_HOLD_EVIDENCE_DATABASE_URL": (
+                "postgresql://evidence/kestrel"
+            ),
+            "KESTREL_HOLD_PAIR_ID": "4a5581d4-69d2-4dad-b6cf-66a1fdf2a31c",
+            "KESTREL_DEPLOYMENT_PERSISTENCE": "durable_sovereign",
+        }
+        config = LocalAgentConfig(data_dir="agent_data/claw", port=8801)
+        roster = MultiAgentConfig(agents={"claw": config})
+        captured_process_env = {}
+        captured_shell_context = None
+
+        def capture_spawn(_cmd, env, *_args, **_kwargs):
+            captured_process_env.update(env)
+            return 12345
+
+        async def capture_shell(
+            _agent_dir,
+            _args,
+            *,
+            host_database_launch_context,
+        ):
+            nonlocal captured_shell_context
+            captured_shell_context = host_database_launch_context
+            return 0
+
+        with (
+            patch.object(pm, "_load_env", return_value=dict(launch_env)),
+            patch.object(pm, "_spawn", side_effect=capture_spawn),
+        ):
+            pm.start_agent("claw", config, roster=roster)
+
+        with (
+            patch.object(cli_module, "_get_project_dir", return_value=project_dir),
+            patch.object(cli_module, "load_project_env"),
+            patch.object(cli_module.MultiAgentConfig, "load", return_value=roster),
+            patch.object(
+                cli_module,
+                "_detect_running_agent_server",
+                return_value=None,
+            ),
+            patch.object(
+                cli_module,
+                "spawned_agent_env",
+                return_value=dict(launch_env),
+            ),
+            patch.object(cli_module, "_run_shell", side_effect=capture_shell),
+        ):
+            result = cli_module.cmd_shell(
+                SimpleNamespace(name="claw", app=None)
+            )
+
+        assert result == 0
+        assert captured_shell_context is not None
+        assert str(captured_shell_context.database_path) == (
+            captured_process_env[HOST_DB_PATH_ENV]
+        )
+        assert captured_shell_context.explicit_override is False
+        child_context = resolve_host_database_launch_context(
+            env=captured_process_env,
+            base_dir=project_dir,
+        )
+        assert child_context == captured_shell_context
+        assert captured_shell_context.backend_env() == {
+            name: launch_env[name]
+            for name in (
+                "KESTREL_DB_BACKEND",
+                "KESTREL_DATABASE_URL",
+                "KESTREL_HOLD_BACKEND",
+                "KESTREL_HOLD_EVIDENCE_DATABASE_URL",
+                "KESTREL_HOLD_PAIR_ID",
+                "KESTREL_DEPLOYMENT_PERSISTENCE",
+            )
+        }
+        assert captured_process_env[DERIVED_HOST_DB_PATH_ENV] == (
+            captured_process_env[HOST_DB_PATH_ENV]
+        )
+        assert captured_process_env[HOST_DB_USES_DEFAULT_ENV] == "0"
+        assert captured_process_env[HOST_DB_PREVIOUS_DEFAULT_ENV] == str(
+            captured_shell_context.previous_default
+        )
+        assert captured_process_env[HOST_DB_LEGACY_PATH_ENV] == str(
+            captured_shell_context.legacy_database_path
+        )
 
     def test_start_agent_passes_per_agent_semantic_inference_profile(
         self,

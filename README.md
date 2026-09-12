@@ -133,10 +133,11 @@ with `umask 077` so DB sidecars are private at creation. An insecure or
 ambiguous legacy store disables local tracing before the OTLP endpoint is
 auto-wired. See [Phoenix trace custody](docs/architecture/security/PHOENIX_TRACE_CUSTODY.md).
 
-Fleet-wide host-feature state uses the same private host-data root, in
-`host-features.db`, rather than writing `kestrel_host.db` into whichever source
-checkout launched the host. The directory is `0700`; the database and its
-SQLite WAL/SHM/journal family are `0600` from creation. An explicit
+Fleet-wide host-feature state lives in `host-data/host-features.db`, rather than
+writing `kestrel_host.db` into whichever source checkout launched the host. It
+follows the effective `KESTREL_DB_PATH` when that agent-data root is set, and
+otherwise uses the private host-data root. The directory is `0700`; the database
+and its SQLite WAL/SHM/journal family are `0600` from creation. An explicit
 `KESTREL_HOST_DB_PATH` remains supported when its parent is a dedicated `0700`
 directory. This feature-state database is intentionally separate from the
 payment/key vault at `agent_data/host.db`; Kestrel never falls back or copies
@@ -180,12 +181,21 @@ The default uv compute executor requires the Kestrel process itself to run
 inside a Python `venv` or `virtualenv`. This lets it pin an interpreter outside
 Kestrel's runtime while `uv run --isolated --no-project` creates a fresh,
 project-free script environment, so scripts cannot inherit Kestrel's installed
-packages. `uv tool install` and the source checkout's `uv sync` satisfy this
-automatically. For a plain pip installation, create and activate a Python
-virtual environment first. A system or `--user` install can run Kestrel, but
-the uv compute executor deliberately reports unavailable. A Conda environment
-alone is also insufficient because it does not provide the distinct
-`sys.prefix`/`sys.base_prefix` boundary this executor validates.
+packages. On Linux it also requires `bwrap` (bubblewrap). Linux compute receives
+a read-only view of the host filesystem, with only its freshly allocated
+executor workspace reopened for writes, plus a private PID/proc namespace;
+an external hard-link alias therefore cannot bypass Hold custody by using
+another pathname, including from native extensions rather than Python file
+APIs. `uv tool install` and the source checkout's `uv sync` satisfy the
+virtual environment requirement automatically. For a plain pip installation,
+create and activate a Python virtual environment first. A system or `--user`
+install or a Linux host without bubblewrap can run Kestrel, but the uv compute
+executor deliberately reports unavailable. It is also unavailable on macOS:
+Seatbelt path rules cannot make pre-existing external hard-link aliases to a
+protected inode read-only. Use the Docker
+executor there. A Conda environment alone is also insufficient because it does
+not provide the distinct `sys.prefix`/`sys.base_prefix` boundary this executor
+validates.
 
 **Where data lives.** `kestrel` resolves the project directory in this order: `KESTREL_HOME` → walk up from CWD looking for a `multi_agent.toml` / `kestrel.toml` / `.env` marker → `~/.kestrel/` for pip-installed users with no markers anywhere. A pure pip install with no `KESTREL_HOME` and no project in CWD lands on `~/.kestrel/` and creates it on first run. **Never** writes to `site-packages/` — `pip install --upgrade kestrel-sovereign` is safe and won't touch your agent data.
 
@@ -207,8 +217,10 @@ All commands work on Windows, macOS, and Linux. Pass the agent directory as an a
 kestrel doctor                       # Check prerequisites and readiness
 kestrel create MyAgent               # Create a new agent
 kestrel start MyAgent                # Start an agent
+kestrel stop MyAgent                 # Cooperatively stop in-flight work
+kestrel stop --all                   # Cooperatively stop all in-flight work
 kestrel terminate MyAgent            # Terminate an agent process
-kestrel restart MyAgent              # Restart (stop then start)
+kestrel restart MyAgent              # Restart (terminate then start)
 kestrel update [MyAgent]             # Pull + install + feature sync + restart (see below)
 kestrel status                       # Show all running agents
 kestrel list                         # List available agents

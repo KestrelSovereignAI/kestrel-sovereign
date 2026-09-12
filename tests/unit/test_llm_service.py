@@ -25,6 +25,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.error_handling import (
     LLMAllProvidersFailedError,
     LLMProviderError,
+    LLMProviderQuotaError,
 )
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.llm.service import (
@@ -517,6 +518,464 @@ class TestCoreGeneration:
                 system_prompt="Test",
                 user_prompt="Test prompt",
             )
+
+    @pytest.mark.asyncio
+    async def test_get_response_all_providers_fail_carries_the_earliest_decline(
+        self, llm_service, mock_adapter,
+    ):
+        """When every route failed and one declined a server-advised wait, the
+        aggregate is chained to that decline so the caller can be told when a
+        retry could succeed (#3127)."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(
+            side_effect=LLMProviderQuotaError("openai", "Quota exceeded", declined)
+        )
+        with pytest.raises(LLMAllProvidersFailedError) as info:
+            await llm_service.get_response(
+                system_prompt="Test",
+                user_prompt="Test prompt",
+            )
+        assert advised_wait_exceeding_budget(info.value) is declined
+
+    @pytest.mark.asyncio
+    async def test_get_response_aggregate_carries_no_decline_when_another_route_failed_otherwise(
+        self, llm_service, mock_adapter,
+    ):
+        """One route throttled for hours, the other reset by peer: a retry may
+        succeed at once on the second, so the aggregate names no reset time."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=46774, budget_seconds=840,
+            retry_at=datetime(2026, 8, 27, 9, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", declined),
+            LLMProviderError("anthropic", "Connection reset by peer"),
+        ])
+        with pytest.raises(LLMAllProvidersFailedError) as info:
+            await llm_service.get_response(
+                system_prompt="Test",
+                user_prompt="Test prompt",
+            )
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
+    async def test_generate_with_messages_aggregate_carries_the_decline_every_route_shares(
+        self, llm_service, mock_adapter,
+    ):
+        """The invoke path uses generate_with_messages, whose aggregate is raised
+        outside any except block; it must chain the decline explicitly."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(
+            side_effect=LLMProviderQuotaError("openai", "Quota exceeded", declined)
+        )
+        with pytest.raises(Exception) as info:
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+        assert advised_wait_exceeding_budget(info.value) is declined
+
+    @pytest.mark.asyncio
+    async def test_stream_with_messages_aggregate_carries_the_decline_every_route_shares(
+        self, llm_service, mock_adapter,
+    ):
+        """The orchestrator streams; the streaming aggregate is raised outside
+        any except block too and must chain the decline explicitly."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        soon = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=900, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        late = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+        )
+        mock_adapter.get_streaming_response = None  # take the non-streaming fallback
+        # The first route's reset comes first; the LAST route's error is what
+        # ``underlying`` carries, so only the explicit chain names the soonest.
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", soon),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", late),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.stream_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            ):
+                pass
+        assert info.value.underlying is not None
+        assert advised_wait_exceeding_budget(info.value) is soon
+
+    @pytest.mark.asyncio
+    async def test_a_last_route_decline_after_an_unrelated_failure_is_not_a_rate_limit(
+        self, llm_service, mock_adapter,
+    ):
+        """The round-3 P1: the last route declined, the first failed on a reset
+        connection; a retry on the first may succeed at once, so neither the
+        non-streaming nor the streaming aggregate may surface the decline."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(Exception) as info:
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.stream_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            ):
+                pass
+        assert info.value.underlying is not None
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_configured_routes_raise_states_the_common_verdict(
+        self, llm_service, mock_adapter,
+    ):
+        """The round-4 P1: when the preferred routes are exhausted mid-loop,
+        the raise chained the LAST route's error; if that route declined after
+        an earlier unrelated failure, its decline became the call's verdict."""
+        from datetime import UTC, datetime
+        from unittest.mock import Mock
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        # Exhausted only after the second route failed.
+        llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(Exception) as info:
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert info.value.__cause__ is not None
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderError("openai", "Connection reset by peer"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.stream_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            ):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert info.value.underlying is not None
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
+    async def test_every_exhausted_routes_raise_states_the_common_verdict(
+        self, llm_service, mock_adapter,
+    ):
+        """The three remaining raise sites: get_response, generate_stream
+        (behind _get_streaming_response_frozen) and stream_with_tool_detection."""
+        from datetime import UTC, datetime
+        from unittest.mock import Mock
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+
+        def arm():
+            llm_service._configured_routes_exhausted = Mock(side_effect=[False, True])
+            mock_adapter.get_response = AsyncMock(side_effect=[
+                LLMProviderError("openai", "Connection reset by peer"),
+                LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+            ])
+
+        arm()
+        with pytest.raises(Exception) as info:
+            await llm_service.get_response(system_prompt="Test", user_prompt="Test prompt")
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        arm()
+        mock_adapter.get_streaming_response = None
+        with pytest.raises(Exception) as info:
+            async for _chunk in llm_service.generate_stream(system_prompt="Test", user_prompt="Hello"):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+        arm()
+        mock_adapter.get_streaming_response_with_tools = None
+        tools = [{"name": "noop", "description": "a tool", "parameters": {"type": "object"}}]
+        with pytest.raises(Exception) as info:
+            async for _chunk in llm_service.stream_with_tool_detection(
+                messages=[{"role": "user", "content": "Hello"}], tools=tools
+            ):
+                pass
+        assert "refusing to silently swap vendors" in str(info.value)
+        assert advised_wait_exceeding_budget(info.value) is None
+
+    @pytest.mark.asyncio
+    async def test_generate_stream_aggregate_carries_the_common_decline(
+        self, llm_service, mock_adapter,
+    ):
+        """The fifth aggregate site, behind generate_stream."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        soon = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=900, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        late = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+        )
+        mock_adapter.get_streaming_response = None
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", soon),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", late),
+        ])
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.generate_stream(
+                system_prompt="Test", user_prompt="Hello"
+            ):
+                pass
+        assert advised_wait_exceeding_budget(info.value) is soon
+
+    @pytest.mark.asyncio
+    async def test_stream_with_tool_detection_aggregate_carries_the_common_decline(
+        self, llm_service, mock_adapter,
+    ):
+        """The orchestrator's streaming call."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.streaming import LLMStreamingError
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        soon = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=900, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        late = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+        )
+        mock_adapter.get_streaming_response_with_tools = None  # take the tool fallback
+        # The last route's error is what ``underlying`` carries; only the
+        # aggregate's own verdict names the soonest reset.
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            LLMProviderQuotaError("openai", "Quota exceeded", soon),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", late),
+        ])
+        tools = [{"name": "noop", "description": "a tool", "parameters": {"type": "object"}}]
+        with pytest.raises(LLMStreamingError) as info:
+            async for _chunk in llm_service.stream_with_tool_detection(
+                messages=[{"role": "user", "content": "Hello"}], tools=tools
+            ):
+                pass
+        assert advised_wait_exceeding_budget(info.value) is soon
+
+    @pytest.mark.asyncio
+    async def test_get_response_aggregate_ignores_routes_that_were_not_attempted(
+        self, llm_service, mock_adapter,
+    ):
+        """A route that cannot serve the model is skipped, not attempted; it
+        must not veto the decline every attempted route shares."""
+        from datetime import UTC, datetime
+
+        from kestrel_sovereign.llm.retry import (
+            AdvisedWaitExceedsRetryBudget,
+            advised_wait_exceeding_budget,
+        )
+        from kestrel_sovereign.llm.service import ModelNotAvailableForRoute
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime(2026, 8, 26, 21, 0, tzinfo=UTC),
+        )
+        mock_adapter.get_response = AsyncMock(side_effect=[
+            ModelNotAvailableForRoute("openai", "api", "gpt-x"),
+            LLMProviderQuotaError("anthropic", "Quota exceeded", declined),
+        ])
+        with pytest.raises(LLMAllProvidersFailedError) as info:
+            await llm_service.get_response(
+                system_prompt="Test",
+                user_prompt="Test prompt",
+            )
+        assert advised_wait_exceeding_budget(info.value) is declined
+
+    @pytest.mark.asyncio
+    async def test_the_invoke_endpoint_maps_the_aggregate_the_service_really_raises(
+        self, llm_service, mock_adapter,
+    ):
+        """End to end from the service's aggregate to the HTTP surface: the
+        exception object the endpoint sees is the one generate_with_messages
+        raised, not a hand-built shape."""
+        import os
+        from contextlib import asynccontextmanager
+        from datetime import UTC, datetime, timedelta
+        from unittest.mock import MagicMock, patch
+
+        from fastapi.testclient import TestClient
+
+        from kestrel_sovereign.llm.retry import AdvisedWaitExceedsRetryBudget
+
+        class _Throttle(Exception):
+            status_code = 429
+
+        declined = AdvisedWaitExceedsRetryBudget(
+            _Throttle("429"), advised_seconds=6832, budget_seconds=840,
+            retry_at=datetime.now(UTC) + timedelta(seconds=6832),
+        )
+        mock_adapter.get_response = AsyncMock(
+            side_effect=LLMProviderQuotaError("openai", "Quota exceeded", declined)
+        )
+        try:
+            await llm_service.generate_with_messages(
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+        except Exception as raised:  # noqa: BLE001 - the real aggregate
+            aggregate = raised
+        else:
+            raise AssertionError("expected the aggregate")
+
+        from server import app
+
+        @asynccontextmanager
+        async def noop_lifespan(_app):
+            yield
+
+        original = (app.router.lifespan_context, getattr(app.state, "agent", None),
+                    getattr(app.state, "agent_manager", None))
+        agent = MagicMock()
+        agent.agent_id = "did:pkh:eip155:1:0xabc"
+        agent.privacy_mode = MagicMock()
+        agent.privacy_mode.value = "NORMAL"
+        agent.features = {}
+        agent.process_input = AsyncMock(side_effect=aggregate)
+        agent.register_active_request = MagicMock()
+        agent.is_request_cancelled = MagicMock(return_value=False)
+        agent._cleanup_cancelled_request = MagicMock()
+        agent.storage.resolve_session_id = AsyncMock(return_value="sess-1")
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = agent
+        app.state.agent_manager = None
+        try:
+            with patch.dict(os.environ, {"KESTREL_API_KEY": "test-key"}), TestClient(app) as client:
+                response = client.post(
+                    "/api/agent/invoke",
+                    json={"input": "hello"},
+                    headers={"X-API-Key": "test-key"},
+                )
+        finally:
+            app.router.lifespan_context, app.state.agent, app.state.agent_manager = original
+        assert response.status_code == 429
+        assert response.json()["error"]["code"] == "rate_limited"
+        assert int(response.headers["Retry-After"]) in (6831, 6832, 6833)
 
     @pytest.mark.asyncio
     async def test_explicit_route_not_gated_by_catalog(self, llm_service, mock_adapter):
@@ -1521,6 +1980,32 @@ class TestInvocationBoundary:
         assert persisted.args == ("assistant", "visible answer")
         assert persisted.kwargs["model"] == "gpt-5-mini"
         assert persisted.kwargs["provider"] == "openai:api"
+
+    @pytest.mark.asyncio
+    async def test_normal_assistant_persist_settles_completed_effect_checkpoint(self):
+        """A fully persisted response prevents a later Stop from duplicating it."""
+
+        from kestrel_sovereign.agent.invocation import (
+            current_invocation_effect_checkpoint,
+            invocation_scope,
+            mark_current_invocation_effect_completed,
+        )
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        agent = object.__new__(KestrelAgent)
+        agent.llm_service = SimpleNamespace()
+        agent.privacy_agent = SimpleNamespace(add_conversation=AsyncMock())
+
+        with invocation_scope("normal-effect-persist"):
+            mark_current_invocation_effect_completed("normal-session")
+            state = current_invocation_effect_checkpoint()
+            await agent._persist_assistant_conversation(
+                "effect completed",
+                session_id="normal-session",
+            )
+
+            assert state is not None
+            assert state.checkpointed is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("broken_sink", ["usage_db", "store", "meter"])

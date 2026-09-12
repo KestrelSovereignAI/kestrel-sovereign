@@ -16,6 +16,7 @@ import inspect
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+from kestrel_sovereign.llm.retry import common_declined_wait
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
@@ -4617,6 +4618,7 @@ No other text or formatting.
         tools = self._check_model_tool_support(available_providers, tools, model_override)
 
         errors = {}
+        route_errors: list[BaseException] = []  # attempted routes only
         for provider_index, provider in enumerate(available_providers):
             if not explicit_selection and self._skip_paid_fallback(
                 provider, available_providers, provider_index
@@ -4684,6 +4686,7 @@ No other text or formatting.
             except LLMProviderError as e:
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
+                route_errors.append(e)
                 # Record the failed attempt as an event on the one
                 # logical-request span (opened by the public entry method).
                 # #2674 finding 4: thread the per-invocation redaction flag so an
@@ -4711,14 +4714,24 @@ No other text or formatting.
                         "an unconfigured vendor. Error: %s",
                         available_providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
 
-        raise LLMAllProvidersFailedError(errors)
+        # The aggregate states its own verdict: a reset time only when every
+        # ATTEMPTED route declined (skipped routes and models a route cannot
+        # serve were not attempted). Surfaces read the verdict, never the
+        # routes' errors behind it.
+        aggregate = LLMAllProvidersFailedError(errors)
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from aggregate.declined_wait
 
     async def get_response_with_model(
         self,
@@ -4792,16 +4805,16 @@ No other text or formatting.
 
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError, openai.AuthenticationError) as e:
             logger.error(f"Model {model_id} API error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (httpx.HTTPError, ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
             logger.error(f"Model {model_id} network error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except (KeyError, AttributeError, TypeError) as e:
             logger.error(f"Model {model_id} data error: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
         except Exception as e:
             logger.error(f"Model {model_id} failed: {e}", exc_info=True)
-            raise RuntimeError(f"Model {model_id} failed: {e}")
+            raise RuntimeError(f"Model {model_id} failed: {e}") from e
 
     # get_streaming_response is provided by StreamingMixin
 
@@ -5258,6 +5271,7 @@ No other text or formatting.
             force_local_only=force_local_only,
         )
         last_error = None
+        route_errors: list[BaseException] = []
         last_provider_name = None
         for provider_index, provider in enumerate(providers):
             if not explicit_selection and self._skip_paid_fallback(
@@ -5320,6 +5334,7 @@ No other text or formatting.
                 logger.error(f"Provider {provider['name']} failed: {e}")
                 self._maybe_disable_route(provider, e)
                 last_error = e
+                route_errors.append(e)
                 if explicit_selection:
                     raise LLMServiceError(
                         f"Selected route {provider['name']} failed: {e}"
@@ -5338,22 +5353,28 @@ No other text or formatting.
                         "route is an unconfigured vendor. Error: %s",
                         providers[0].get("vendor"), provider["name"], e,
                     )
-                    raise LLMServiceError(
+                    exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
                         f"Underlying error: {e}"
-                    ) from e
+                    )
+                    # This too is an aggregate of every attempted route: its
+                    # verdict is the common decline, not this route's error.
+                    exhausted.declined_wait = common_declined_wait(route_errors)
+                    raise exhausted from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
                     provider["name"], e,
                 )
                 continue
 
-        raise LLMServiceError(
+        aggregate = LLMServiceError(
             f"All providers failed for generate_with_messages "
             f"(last: {last_provider_name}): {last_error}"
         )
+        aggregate.declined_wait = common_declined_wait(route_errors)
+        raise aggregate from last_error
 
     # generate_stream, stream_with_messages, and stream_with_tool_detection
     # are provided by StreamingMixin
