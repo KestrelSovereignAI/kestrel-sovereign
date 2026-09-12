@@ -1341,10 +1341,24 @@ class DeliveryQueue:
                     """
                     UPDATE delivery_idempotency
                     SET entry_id = ?, created_at = ?, compensating = 0,
-                        previous_entry_id = COALESCE(previous_entry_id, ?)
+                        previous_entry_id = COALESCE(previous_entry_id, ?),
+                        effective_max_retries = COALESCE(
+                            effective_max_retries, ?
+                        ),
+                        legacy_content_hash = COALESCE(
+                            legacy_content_hash, ?
+                        )
                     WHERE agent_id = ? AND entry_id = ?
                     """,
-                    (new_id, now_iso, dl_row[1], self._agent_id, dl_row[1]),
+                    (
+                        new_id,
+                        now_iso,
+                        dl_row[1],
+                        retry_policy,
+                        legacy_hash,
+                        self._agent_id,
+                        dl_row[1],
+                    ),
                 )
                 # This is intentionally the final awaited mutation. If an
                 # earlier step fails, the dead letter retains retry_entry_id
@@ -1928,6 +1942,12 @@ class DeliveryQueue:
         )
         await self._db.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_delivery_queue_purge
+            ON delivery_queue(agent_id, status, delivered_at, id)
+            """
+        )
+        await self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS delivery_idempotency (
                 agent_id TEXT NOT NULL,
                 idempotency_key_digest TEXT NOT NULL,
@@ -2072,11 +2092,29 @@ class DeliveryQueue:
                 ADD COLUMN max_retries INTEGER
                 """
             )
-        elif self._db.backend_type == "postgres":
+        if not await self._db.column_exists(
+            "delivery_dead_letter", "retry_entry_id"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter
+                ADD COLUMN retry_entry_id TEXT
+                """
+            )
+        if not await self._db.column_exists(
+            "delivery_dead_letter", "legacy_content_hash"
+        ):
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter
+                ADD COLUMN legacy_content_hash TEXT
+                """
+            )
+        if self._db.backend_type == "postgres":
             # Early v0.53.12 prerelease schemas declared this NOT NULL. A
             # rolling old writer cannot persist the new value, so the durable
             # ledger recovery path requires the compatibility column to remain
-            # nullable on upgraded PostgreSQL databases too.
+            # nullable on every upgraded database.
             if not await self._db.column_accepts_null(
                 "delivery_dead_letter", "max_retries"
             ):
@@ -2099,22 +2137,54 @@ class DeliveryQueue:
                     ALTER COLUMN max_retries DROP DEFAULT
                     """
                 )
-        if not await self._db.column_exists(
-            "delivery_dead_letter", "retry_entry_id"
+        elif not await self._db.column_accepts_null(
+            "delivery_dead_letter", "max_retries"
+        ) or await self._db.column_has_default(
+            "delivery_dead_letter", "max_retries"
         ):
+            # SQLite cannot alter a column constraint or default in place.
+            # Rebuild the unreleased prerelease shape transactionally after
+            # every current column exists; the indexes are recreated below.
             await self._db.execute(
                 """
-                ALTER TABLE delivery_dead_letter
-                ADD COLUMN retry_entry_id TEXT
+                DROP TABLE IF EXISTS delivery_dead_letter__policy_upgrade
                 """
             )
-        if not await self._db.column_exists(
-            "delivery_dead_letter", "legacy_content_hash"
-        ):
             await self._db.execute(
                 """
-                ALTER TABLE delivery_dead_letter
-                ADD COLUMN legacy_content_hash TEXT
+                CREATE TABLE delivery_dead_letter__policy_upgrade (
+                    id TEXT PRIMARY KEY,
+                    original_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    channel_type TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    content_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    max_retries INTEGER,
+                    retry_entry_id TEXT,
+                    legacy_content_hash TEXT
+                )
+                """
+            )
+            await self._db.execute(
+                """
+                INSERT INTO delivery_dead_letter__policy_upgrade
+                    (id, original_id, agent_id, channel_type, recipient,
+                     content_json, error, attempts, created_at, max_retries,
+                     retry_entry_id, legacy_content_hash)
+                SELECT id, original_id, agent_id, channel_type, recipient,
+                       content_json, error, attempts, created_at, max_retries,
+                       retry_entry_id, legacy_content_hash
+                FROM delivery_dead_letter
+                """
+            )
+            await self._db.execute("DROP TABLE delivery_dead_letter")
+            await self._db.execute(
+                """
+                ALTER TABLE delivery_dead_letter__policy_upgrade
+                RENAME TO delivery_dead_letter
                 """
             )
         await self._db.execute(

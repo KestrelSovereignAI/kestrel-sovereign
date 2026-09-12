@@ -828,13 +828,12 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             )
             """
         )
-        if database.backend_type == "postgres":
-            assert not await database.column_accepts_null(
-                "delivery_dead_letter", "max_retries"
-            )
-            assert await database.column_has_default(
-                "delivery_dead_letter", "max_retries"
-            )
+        assert not await database.column_accepts_null(
+            "delivery_dead_letter", "max_retries"
+        )
+        assert await database.column_has_default(
+            "delivery_dead_letter", "max_retries"
+        )
         await database.execute(
             """
             INSERT INTO delivery_queue
@@ -872,26 +871,35 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
                 """
             )
             assert column_shape == ("YES", None)
-            await database.execute(
-                """
-                INSERT INTO delivery_dead_letter
-                    (id, original_id, agent_id, channel_type, recipient,
-                     content_json, error, attempts, created_at)
-                VALUES (?, ?, ?, 'email', ?, '{}', 'old writer', 1, ?)
-                """,
-                (
-                    f"old-writer-{uuid4().hex}",
-                    f"old-original-{uuid4().hex}",
-                    owner,
-                    "old-writer@example.com",
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+        else:
+            table_shape = await database.fetchall(
+                "PRAGMA table_info('delivery_dead_letter')"
             )
-            assert await database.fetchone(
-                "SELECT max_retries FROM delivery_dead_letter "
-                "WHERE agent_id = ?",
-                (owner,),
-            ) == (None,)
+            max_retries_shape = next(
+                row for row in table_shape if row[1] == "max_retries"
+            )
+            assert max_retries_shape[3] == 0
+            assert max_retries_shape[4] is None
+        await database.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at)
+            VALUES (?, ?, ?, 'email', ?, '{}', 'old writer', 1, ?)
+            """,
+            (
+                f"old-writer-{uuid4().hex}",
+                f"old-original-{uuid4().hex}",
+                owner,
+                "old-writer@example.com",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_dead_letter "
+            "WHERE agent_id = ?",
+            (owner,),
+        ) == (None,)
         canonical_row = await database.fetchone(
             "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
             (entry_id,),

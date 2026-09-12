@@ -578,10 +578,10 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 10 indexes + the one-time v2 trigger cleanup + replacement
+        # 3 tables + 11 indexes + the one-time v2 trigger cleanup + replacement
         # of the scoped SQLite atomic-compensation trigger. The v2 index is not
         # rebuilt on an already-v3 schema.
-        assert queue._db.execute.call_count == 16
+        assert queue._db.execute.call_count == 17
 
     @pytest.mark.asyncio
     async def test_schema_bootstrap_uses_shared_migration_lock(self, queue):
@@ -1171,6 +1171,29 @@ class TestQueueIdempotency:
             "SELECT COUNT(*) FROM delivery_idempotency",
         )
         assert row == (0,)
+
+    @pytest.mark.asyncio
+    async def test_delivered_purge_order_uses_covering_index(self, real_queue):
+        queue, _ = real_queue
+
+        plan = await queue._db.fetchall(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT id FROM delivery_queue
+            WHERE agent_id = ? AND status = ? AND delivered_at < ?
+            ORDER BY delivered_at, id
+            LIMIT 500
+            """,
+            (
+                queue._agent_id,
+                DeliveryStatus.DELIVERED.value,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        details = "\n".join(str(row[-1]) for row in plan)
+        assert "idx_delivery_queue_purge" in details
+        assert "USE TEMP B-TREE" not in details
 
     @pytest.mark.asyncio
     async def test_legacy_dead_letter_uses_configured_retry_policy(self, tmp_path):
@@ -2335,6 +2358,44 @@ class TestQueueIdempotency:
             "SELECT max_retries FROM delivery_queue WHERE id = ?",
             (retried["entry_id"],),
         ) == (11,)
+
+    @pytest.mark.asyncio
+    async def test_retry_backfills_pre_upgrade_replay_metadata(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "retry-upgrade@example.com",
+            "content": {"body": "hello"},
+            "max_retries": 11,
+            "idempotency_key": "retry-upgrade",
+        }
+        original_id = await queue.enqueue(**request)
+        original_hash = await queue._db.fetchone(
+            "SELECT content_hash FROM delivery_queue WHERE id = ?",
+            (original_id,),
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency
+            SET effective_max_retries = NULL, legacy_content_hash = NULL
+            WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        )
+
+        retried = await queue.retry(original_id)
+
+        assert retried["success"] is True
+        assert await queue._db.fetchone(
+            """
+            SELECT effective_max_retries, legacy_content_hash,
+                   previous_entry_id
+            FROM delivery_idempotency WHERE agent_id = ?
+            """,
+            (queue._agent_id,),
+        ) == (11, original_hash[0], original_id)
+        assert await queue.enqueue(**request) == retried["entry_id"]
 
     @pytest.mark.asyncio
     async def test_dead_letter_retry_rejects_inconsistent_ledger_policies(
