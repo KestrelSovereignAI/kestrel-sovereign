@@ -1962,6 +1962,105 @@ class TestQueueIdempotency:
         ) == (replacement,)
 
     @pytest.mark.asyncio
+    async def test_purge_retains_policyless_orphan_fail_closed(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "policyless-purge@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "policyless-purge",
+        }
+        original_id = await queue.enqueue(**request)
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency
+            SET effective_max_retries = NULL, created_at = ?
+            WHERE agent_id = ?
+            """,
+            (old, queue._agent_id),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        assert await queue.purge_delivered(older_than_hours=24) == 0
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_idempotency WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+        with pytest.raises(DeliveryIdempotencyStateError, match="retry policy"):
+            await queue.enqueue(**request)
+
+    @pytest.mark.asyncio
+    async def test_purge_retains_unlinked_compatible_fail_closed(self, real_queue):
+        queue, _ = real_queue
+        request = {
+            "channel_type": "email",
+            "recipient": "unlinked-purge@example.com",
+            "content": {"body": "hello"},
+            "idempotency_key": "unlinked-purge",
+        }
+        original_id = await queue.enqueue(**request)
+        row = await queue._db.fetchone(
+            """
+            SELECT content_json, content_hash, canonical_content_hash,
+                   max_retries
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            (original_id, queue._agent_id),
+        )
+        claim_created = (
+            datetime.now(timezone.utc) - timedelta(hours=48)
+        ).isoformat()
+        candidate_created = (
+            datetime.now(timezone.utc) - timedelta(hours=47)
+        ).isoformat()
+        await queue._db.execute(
+            "UPDATE delivery_idempotency SET created_at = ? WHERE agent_id = ?",
+            (claim_created, queue._agent_id),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_queue
+                (id, agent_id, channel_type, recipient, content_json,
+                 content_hash, canonical_content_hash, status, attempts,
+                 max_retries, next_retry_at, created_at)
+            VALUES (?, ?, 'email', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+            """,
+            (
+                "unlinked-purge-candidate",
+                queue._agent_id,
+                request["recipient"],
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                candidate_created,
+                candidate_created,
+            ),
+        )
+
+        with pytest.raises(
+            DeliveryIdempotencyStateError, match="manual reconciliation"
+        ):
+            await queue.enqueue(**request)
+        assert await queue.purge_delivered(older_than_hours=24) == 0
+        with pytest.raises(
+            DeliveryIdempotencyStateError, match="manual reconciliation"
+        ):
+            await queue.enqueue(**request)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE agent_id = ?",
+            (queue._agent_id,),
+        ) == (1,)
+
+    @pytest.mark.asyncio
     async def test_stale_repair_preserves_durable_legacy_hash(self, real_queue):
         queue, _ = real_queue
         original_id = await queue.enqueue(
@@ -3909,6 +4008,40 @@ class TestQueueReclaimInFlight:
 
         assert await real_queue._reclaim_in_flight() == 0
         assert (await self._status_attempts(real_queue, "tombstoned"))[0] == (
+            DeliveryStatus.IN_FLIGHT.value
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_candidate_in_flight_row_is_not_reclaimed(self, real_queue):
+        await self._insert(
+            real_queue, "retry-candidate", DeliveryStatus.IN_FLIGHT.value, 2
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        await real_queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries,
+                 retry_entry_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "retry-candidate-dl",
+                "prior-entry",
+                real_queue._agent_id,
+                "webhook",
+                "https://example.com/hook",
+                '{"text":"hi"}',
+                "interrupted retry",
+                2,
+                now,
+                5,
+                "retry-candidate",
+            ),
+        )
+
+        assert await real_queue._reclaim_in_flight() == 0
+        assert (await self._status_attempts(real_queue, "retry-candidate"))[0] == (
             DeliveryStatus.IN_FLIGHT.value
         )
 

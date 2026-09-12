@@ -1654,38 +1654,14 @@ class DeliveryQueue:
                 )
                 if len(purged_ids) < 500:
                     break
-            # Clean pre-v0.53.12 or independently orphaned claims only after the
-            # same retention period, while preserving dead-letter tombstones.
-            await self._db.execute(
-                """
-                DELETE FROM delivery_idempotency
-                WHERE agent_id = ? AND created_at < ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM delivery_queue
-                      WHERE delivery_queue.agent_id = delivery_idempotency.agent_id
-                        AND delivery_queue.id = delivery_idempotency.entry_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM delivery_idempotency replacement_claim
-                      JOIN delivery_queue
-                        ON delivery_queue.agent_id = replacement_claim.agent_id
-                       AND delivery_queue.id = replacement_claim.entry_id
-                      WHERE replacement_claim.agent_id = delivery_idempotency.agent_id
-                        AND replacement_claim.previous_entry_id = delivery_idempotency.entry_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM delivery_dead_letter
-                      WHERE delivery_dead_letter.agent_id = delivery_idempotency.agent_id
-                        AND delivery_dead_letter.original_id = delivery_idempotency.entry_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM delivery_dead_letter
-                      WHERE delivery_dead_letter.agent_id = delivery_idempotency.agent_id
-                        AND delivery_dead_letter.retry_entry_id = delivery_idempotency.entry_id
-                  )
-                """,
-                (self._agent_id, cutoff),
-            )
+            # Never age out a claim merely because its queue row is absent.
+            # The same durable shape can mean either an abandoned legacy claim
+            # or a claim intentionally held fail-closed for missing retry
+            # policy / an unlinked rolling-writer retry. Without the original
+            # request, purge cannot distinguish those states safely. Successful
+            # claims are removed above with their delivered row; all other
+            # orphans remain available for replay repair or manual
+            # reconciliation instead of permitting a duplicate delivery.
 
         if count > 0:
             logger.info("Purged %d delivered entries older than %dh", count, older_than_hours)

@@ -66,6 +66,10 @@ instead of deleting its fail-closed conflict history. If a stale claim finds an
 unlinked compatible rolling-writer retry outside the short deduplication window,
 replay fails closed for manual reconciliation: automatically adopting it could
 collapse an independent delivery, while inserting again could duplicate a retry.
+Purge never deletes an idempotency claim solely because its queue row is absent:
+that durable shape can also represent missing retry-policy provenance or an
+unlinked compatible rolling-writer retry. Such claims remain fail closed until
+replay can repair them safely or an operator reconciles them explicitly.
 The move into dead letter
 uses the same recoverable ordering: it writes
 the tombstone before deleting the live row, while queue processing and keyed
