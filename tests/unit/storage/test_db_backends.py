@@ -1833,14 +1833,37 @@ class TestAsyncDatabase:
     """Test the AsyncDatabase facade."""
 
     @pytest.mark.asyncio
-    async def test_column_accepts_null_delegates_to_backend_safe_probe(self):
+    async def test_column_shape_helpers_delegate_to_backend_safe_probes(self):
         from kestrel_sovereign.storage.async_database import AsyncDatabase
 
         database = AsyncDatabase(MagicMock())
         database._column_accepts_null = AsyncMock(return_value=True)
+        database._column_has_default = AsyncMock(return_value=True)
 
         assert await database.column_accepts_null("widgets", "note") is True
+        assert await database.column_has_default("widgets", "note") is True
         database._column_accepts_null.assert_awaited_once_with("widgets", "note")
+        database._column_has_default.assert_awaited_once_with("widgets", "note")
+
+    @pytest.mark.asyncio
+    async def test_column_shape_helpers_define_missing_column_semantics(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = await AsyncDatabase.sqlite(":memory:")
+        try:
+            await database.execute(
+                "CREATE TABLE widgets (nullable TEXT DEFAULT 'note', "
+                "required TEXT NOT NULL)"
+            )
+
+            assert await database.column_accepts_null("widgets", "nullable")
+            assert not await database.column_accepts_null("widgets", "required")
+            assert not await database.column_accepts_null("widgets", "missing")
+            assert await database.column_has_default("widgets", "nullable")
+            assert not await database.column_has_default("widgets", "required")
+            assert not await database.column_has_default("widgets", "missing")
+        finally:
+            await database.close()
 
     @pytest.mark.asyncio
     async def test_cancelled_cached_sqla_disposal_still_closes_primary_worker(

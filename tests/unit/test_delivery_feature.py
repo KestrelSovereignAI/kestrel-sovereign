@@ -54,6 +54,7 @@ def _make_mock_db():
     db.nested_transaction_strategy = "joined"
     db.column_exists = AsyncMock(return_value=True)
     db.column_accepts_null = AsyncMock(return_value=True)
+    db.column_has_default = AsyncMock(return_value=False)
 
     @asynccontextmanager
     async def migration_lock(_name):
@@ -576,7 +577,7 @@ class TestQueueTableCreation:
     @pytest.mark.asyncio
     async def test_ensure_tables_creates_tables_and_indexes(self, queue):
         await queue._ensure_tables()
-        # 3 tables + 6 indexes + the one-time v2 trigger cleanup + replacement
+        # 3 tables + 10 indexes + the one-time v2 trigger cleanup + replacement
         # of the scoped SQLite atomic-compensation trigger. The v2 index is not
         # rebuilt on an already-v3 schema.
         assert queue._db.execute.call_count == 16
@@ -625,6 +626,35 @@ class TestQueueTableCreation:
         sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
         assert "ALTER COLUMN max_retries DROP NOT NULL" in sql
         assert "pg_attribute" not in sql
+
+    @pytest.mark.asyncio
+    async def test_postgres_upgrade_skips_redundant_nullability_alter(self, queue):
+        queue._db.backend_type = "postgres"
+        queue._db.nested_transaction_strategy = "savepoint"
+        queue._db.column_accepts_null.return_value = True
+
+        await queue._ensure_tables()
+
+        queue._db.column_accepts_null.assert_awaited_once_with(
+            "delivery_dead_letter", "max_retries"
+        )
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "ALTER COLUMN max_retries DROP NOT NULL" not in sql
+        assert "ALTER COLUMN max_retries DROP DEFAULT" not in sql
+
+    @pytest.mark.asyncio
+    async def test_postgres_upgrade_drops_prerelease_policy_default(self, queue):
+        queue._db.backend_type = "postgres"
+        queue._db.nested_transaction_strategy = "savepoint"
+        queue._db.column_has_default.return_value = True
+
+        await queue._ensure_tables()
+
+        queue._db.column_has_default.assert_awaited_once_with(
+            "delivery_dead_letter", "max_retries"
+        )
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "ALTER COLUMN max_retries DROP DEFAULT" in sql
 
 
 # =========================================================================
@@ -2215,7 +2245,7 @@ class TestQueueIdempotency:
         )
         await queue.move_to_dead_letter(original_id, "provider rejected")
         await queue._db.execute(
-            "UPDATE delivery_dead_letter SET max_retries = NULL WHERE original_id = ?",
+            "UPDATE delivery_dead_letter SET max_retries = 5 WHERE original_id = ?",
             (original_id,),
         )
 

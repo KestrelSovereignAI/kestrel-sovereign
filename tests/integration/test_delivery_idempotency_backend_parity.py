@@ -247,6 +247,52 @@ async def test_dead_letter_retry_preserves_legacy_content_hash(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_dead_letter_retry_prefers_attached_ledger_policy(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-retry-policy:{uuid4().hex}"
+    queue = DeliveryQueue(database, owner, max_retries=2)
+    await queue._ensure_tables()
+
+    try:
+        original_id = await queue.enqueue(
+            "email",
+            "rolling-policy@example.com",
+            {"body": "same"},
+            idempotency_key="rolling-policy",
+        )
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        # Early prerelease schemas supplied DEFAULT 5 when a rolling old
+        # writer omitted this column. The attached replay ledger is the
+        # durable request policy and must win over that ambiguous value.
+        await database.execute(
+            "UPDATE delivery_dead_letter SET max_retries = 5 "
+            "WHERE original_id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+
+        retried = await DeliveryQueue(
+            database, owner, max_retries=99
+        ).retry(original_id)
+
+        assert retried["success"] is True
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (retried["entry_id"], owner),
+        ) == (2,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_dead_letter WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_rolling_retry_metadata_recovers_from_replay_ledger(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-ledger-retry:{uuid4().hex}"
@@ -730,6 +776,22 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
         )
         await database.execute(
             """
+            CREATE TABLE delivery_dead_letter (
+                id TEXT PRIMARY KEY,
+                original_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                max_retries INTEGER NOT NULL DEFAULT 5
+            )
+            """
+        )
+        await database.execute(
+            """
             INSERT INTO delivery_queue
                 (id, agent_id, channel_type, recipient, content_json,
                  content_hash, status, attempts, max_retries,
@@ -754,6 +816,13 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
         assert await database.column_exists(
             "delivery_queue", "canonical_content_hash"
         )
+        if database.backend_type == "postgres":
+            assert await database.column_accepts_null(
+                "delivery_dead_letter", "max_retries"
+            )
+            assert not await database.column_has_default(
+                "delivery_dead_letter", "max_retries"
+            )
         canonical_row = await database.fetchone(
             "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
             (entry_id,),

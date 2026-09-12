@@ -1271,11 +1271,16 @@ class DeliveryQueue:
                         "dead-letter retry has no authoritative compatibility hash"
                     )
                 legacy_hash = dl_row[11] or ledger_legacy_hash or computed_legacy_hash
+                # The replay ledger is authoritative when attached. Early
+                # prerelease schemas gave the tombstone column DEFAULT 5, so
+                # a rolling old writer that omitted it can leave a fabricated
+                # value on both backends. Prefer the request policy captured
+                # by the ledger over that ambiguous tombstone value.
                 retry_policy = (
-                    dl_row[9]
-                    if dl_row[9] is not None
-                    else ledger_policy
+                    ledger_policy
                     if ledger_policy is not None
+                    else dl_row[9]
+                    if dl_row[9] is not None
                     else self._max_retries
                 )
                 await self._db.execute(
@@ -2056,22 +2061,33 @@ class DeliveryQueue:
                 ADD COLUMN max_retries INTEGER
                 """
             )
-        elif (
-            self._db.backend_type == "postgres"
-            and not await self._db.column_accepts_null(
-                "delivery_dead_letter", "max_retries"
-            )
-        ):
+        elif self._db.backend_type == "postgres":
             # Early v0.53.12 prerelease schemas declared this NOT NULL. A
             # rolling old writer cannot persist the new value, so the durable
             # ledger recovery path requires the compatibility column to remain
             # nullable on upgraded PostgreSQL databases too.
-            await self._db.execute(
-                """
-                ALTER TABLE delivery_dead_letter
-                ALTER COLUMN max_retries DROP NOT NULL
-                """
-            )
+            if not await self._db.column_accepts_null(
+                "delivery_dead_letter", "max_retries"
+            ):
+                await self._db.execute(
+                    """
+                    ALTER TABLE delivery_dead_letter
+                    ALTER COLUMN max_retries DROP NOT NULL
+                    """
+                )
+            # DROP NOT NULL does not remove the prerelease DEFAULT 5. Probe it
+            # independently so a database already visited by an earlier
+            # v0.53.12 build still converges and old writers persist unknown
+            # policy as NULL rather than silently widening it to five.
+            if await self._db.column_has_default(
+                "delivery_dead_letter", "max_retries"
+            ):
+                await self._db.execute(
+                    """
+                    ALTER TABLE delivery_dead_letter
+                    ALTER COLUMN max_retries DROP DEFAULT
+                    """
+                )
         if not await self._db.column_exists(
             "delivery_dead_letter", "retry_entry_id"
         ):
