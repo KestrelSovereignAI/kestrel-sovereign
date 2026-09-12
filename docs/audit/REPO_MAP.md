@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-11
-**Scope:** 2454 tracked files (1684 `.py`, 346 `.md`, 424 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-09-12
+**Scope:** 2455 tracked files (1685 `.py`, 346 `.md`, 424 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -135,7 +135,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/stores/unified/session_service.py** — Unified SessionService - Backend-Agnostic Session Management.
   - `class SessionState`; `class SessionService`
 - **kestrel_sovereign/a2a/stores/unified/task_store.py** — Unified TaskStore - Backend-Agnostic Task Persistence.
-  - `class TaskAlreadyExistsError`; `class TaskMutationAuthorizationError`; `class TaskCancellationSnapshot`; `def without_reserved_cancellation_receipt(metadata)`; `class TaskStore`
+  - `class TaskAlreadyExistsError`; `class TaskMutationAuthorizationError`; `class TaskCancellationSnapshot`; `class TaskCognitionWakeCandidate`; `def without_reserved_cancellation_receipt(metadata)`; `class TaskStore`
 - **kestrel_sovereign/a2a/task_manager.py** — TaskManager - Task Lifecycle Management for A2A Protocol.
   - `class TaskHandler`; `class TaskCancellationAuthorizationError`; `class TaskManager`; `async def create_task_manager(db_path, include_memory, include_feedback, host_agent_id)`
 - **kestrel_sovereign/a2a/task_worker.py** — TaskWorker - Background Task Processing for A2A Protocol.
@@ -642,7 +642,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/github_integration.py** — GitHub API integration helpers for Strategic Memory.
   - `class GitHubAuthError`; `def github_signal_prerequisite(data)`; `def get_github_token()`; `async def github_api_get(path, token)`; `async def github_api_post(path, token, body)`; `def short_repo(repo, all_repos)`; `async def fetch_github_signal(data)`
 - **kestrel_sovereign/features/strategic_memory/issue_selection.py** — Select the highest-priority actionable GitHub issue.
-  - `def parse_issue_ref(value)`; `async def pick_top_issue(data)`
+  - `def parse_issue_ref(value)`; `async def pick_top_issue(data, diagnostics)`
 - **kestrel_sovereign/features/strategic_memory/ledger.py** — The strategy ledger: patterns and blockers, canonical but not prompt-injected.
   - `def pattern_row_id(entry)`; `def blocker_row_id(entry)`; `def assign_row_ids(rows, minter)`; `def is_active_pattern(row)`; `def is_active_blocker(row)`; `def active_patterns(rows)`; `def active_blockers(rows)`; `class StrategyLedger`; `…`
 - **kestrel_sovereign/features/strategic_memory/ledger_index.py** — Project the strategy ledger into the knowledge graph as an index.
@@ -737,7 +737,9 @@ Repo entry points and standard project files.
   - `class HeartbeatResponseClassification`; `def classify_heartbeat_response(result_body)`
 - **kestrel_sovereign/hold/__init__.py** — Durable lifecycle Hold state.
 - **kestrel_sovereign/hold/enforcement.py** — Universal turn-start enforcement for durable Hold state.
-  - `class HoldEnforcementUnavailableError`; `class HoldTurnRefusal`; `def require_context_hold_store(context)`; `async def build_bound_host_context(agent)`; `async def close_bound_host_context(context)`; `async def initialize_with_bound_hold_context(agent)`; `async def require_turn_start_allowed(agent)`
+  - `class HoldEnforcementUnavailableError`; `class HeldWorkDisposition`; `class HoldTurnRefusal`; `def require_context_hold_store(context)`; `async def build_bound_host_context(agent)`; `async def close_bound_host_context(context)`; `async def initialize_with_bound_hold_context(agent)`; `async def get_effective_hold_state(agent)`; `…`
+- **kestrel_sovereign/hold/metrics.py** — Bounded metrics for work dispositioned by durable Hold.
+  - `def record_held_work_disposition()`
 - **kestrel_sovereign/hold/state.py** — Typed, durable host and agent Hold latches.
   - `class HoldScope`; `class HoldAction`; `class HoldDisposition`; `class HoldStateError`; `class HoldIdempotencyConflict`; `class HoldCorruptStateError`; `class PostgresHoldCustodySnapshot`; `class HoldDatabaseSnapshot`; `…`
 - **kestrel_sovereign/hooks/__init__.py** — Kestrel Hooks — HooksManager (framework implementation).
@@ -2952,8 +2954,8 @@ Repo entry points and standard project files.
   - `def deploy_config_two_profiles()`; `def deploy_config_with_azure_substitutions()`; `def mock_secret_client()`; `def test_derive_secret_mapping_single_profile(deploy_config_two_profiles)`; `def test_derive_secret_mapping_all_profiles_dedupes(deploy_config_two_profiles)`; `def test_derive_secret_mapping_skips_dollar_substitutions(deploy_config_with_azure_substitutions)`; `def test_derive_secret_mapping_accepts_unusual_secret_names()`; `def test_derive_secret_mapping_skips_non_cloudrun_profiles()`; `…`
 - **tests/unit/test_destroy_legacy_key.py** — Tests for ``scripts/quantum_destroy_legacy_key.py``.
   - `def kestrel_data_key(monkeypatch)`; `def post_ceremony_dir(post_ceremony_material)`; `def test_dry_run_preserves_legacy_key(post_ceremony_dir)`; `def test_confirm_without_env_var_rejects(post_ceremony_dir)`; `def test_confirm_with_env_var_deletes_legacy_only(post_ceremony_dir)`; `def test_rollback_window_blocks_fresh_succession(post_ceremony_dir)`; `def test_missing_hybrid_keys_blocks_destruction(post_ceremony_dir)`; `def test_unrelated_succession_blocks_destruction(post_ceremony_dir, tmp_path)`; `…`
-- **tests/unit/test_detached_signal_delivery_harvest.py** — Detached signal dispatches are owned and harvested (#2532, AC4).
-  - `class TestDetachedDeliveryIsOwnedAndHarvested`; `async def test_supervisor_cancellation_restores_optimistically_retired_state()`; `async def test_supervisor_advances_the_checkpoint_only_on_terminal_ok()`
+- **tests/unit/test_detached_signal_delivery_harvest.py** — A2A cognition dispatches are durably owned and harvested (#2532, AC4).
+  - `async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows()`; `async def test_boot_reconciliation_follows_a_changed_source_retention()`; `async def test_boot_reconciliation_refuses_without_a_registered_a2a_source()`; `async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable()`; `async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(original, mints)`; `async def test_a2a_wake_retries_a_failed_durable_consumer_read(monkeypatch, caplog)`; `async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog)`; `async def test_completion_wake_does_not_clear_submission_self_decline()`; `…`
 - **tests/unit/test_devcontainer_postgres_volume.py** — The devcontainer's PostgreSQL volume must be versioned with its server.
   - `def test_the_cluster_volume_is_versioned_with_the_server_major()`; `def test_the_versioned_volume_is_declared()`; `def test_the_devcontainer_and_ci_agree_on_the_major()`; `def test_no_document_ships_a_destructive_project_wide_command(doc)`; `def test_no_document_derives_a_project_from_the_global_container_name(doc)`; `def test_no_document_removes_a_live_volume_by_its_compose_file_name(doc)`
 - **tests/unit/test_did_web.py** — did:web producer + resolver — Wave 2 sub-PR 3 (#917).
@@ -3139,7 +3141,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_hold_state.py** — —
   - `async def hold_db(tmp_path)`; `async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(monkeypatch)`; `async def test_postgres_operational_session_routes_queries_on_checked_connection()`; `async def test_postgres_operational_session_owned_child_reuses_checked_connection()`; `async def test_postgres_custody_locks_bind_each_session_to_probed_cluster()`; `async def test_postgres_custody_metadata_probe_is_bound_to_current_schema()`; `async def test_postgres_custody_snapshot_pins_one_operational_session()`; `def test_readiness_rejects_duplicate_rows_before_predicting_index_repair(tmp_path)`; `…`
 - **tests/unit/test_hold_turn_enforcement.py** — Turn-start Hold is unconditional, typed, and source-independent (#3162).
-  - `async def test_agent_closes_legacy_owned_hold_context_after_shutdown_work()`; `async def test_get_agent_by_did_uses_atomic_hold_initialization(monkeypatch)`; `async def test_bound_hold_initialization_closes_context_on_failure(monkeypatch)`; `async def test_bound_hold_context_uses_selected_agent_data_root(monkeypatch, tmp_path)`; `async def test_hold_binding_failure_closes_context_before_refusing_startup(monkeypatch)`; `def test_standalone_entrypoints_use_atomic_hold_initialization_wiring()`; `async def test_cli_shell_prints_typed_hold_refusal(monkeypatch, tmp_path, capsys)`; `async def test_process_input_refuses_at_unconditional_hold_seam()`; `…`
+  - `async def test_agent_closes_legacy_owned_hold_context_after_shutdown_work()`; `async def test_get_agent_by_did_uses_atomic_hold_initialization(monkeypatch)`; `async def test_bound_hold_initialization_closes_context_on_failure(monkeypatch)`; `async def test_bound_hold_context_uses_selected_agent_data_root(monkeypatch, tmp_path)`; `async def test_hold_binding_failure_closes_context_before_refusing_startup(monkeypatch)`; `def test_standalone_entrypoints_use_atomic_hold_initialization_wiring()`; `async def test_cli_shell_prints_typed_hold_refusal(monkeypatch, tmp_path, capsys)`; `async def test_process_input_refuses_at_unconditional_hold_seam(monkeypatch)`; `…`
 - **tests/unit/test_hooks.py** — Unit Tests for Kestrel Hooks System.
   - `class AllowAllHook`; `class DenyAllHook`; `class RegexMatcherHook`; `class TimeoutHook`; `class SessionStartHook`; `class FailingHook`; `class AwaitsUserInputHook`; `class TestHookInput`; `…`
 - **tests/unit/test_host_agent_lifecycle_authority.py** — Sovereign authority boundary for host-wide agent lifecycle endpoints.
@@ -3725,7 +3727,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_signals_channel_source.py** — Source registration tests for inbound channel messages.
   - `def test_registration_is_untrusted_cognition_source()`; `def test_sanitizer_caps_content_and_metadata()`; `def test_sanitizer_preserves_invalid_required_fields_for_schema_rejection()`; `def test_build_signal_for_channel_message()`; `def test_build_signal_rejects_outbound_messages()`
 - **tests/unit/test_signals_dispatcher.py** — Unit tests for the SignalDispatcher pipeline.
-  - `def db_path(tmp_path)`; `async def dispatcher_components(db_path)`; `async def test_unknown_source_drops_validation(dispatcher_components)`; `async def test_mode_not_in_allowed_drops_validation(dispatcher_components)`; `async def test_synchronous_cognition_monitor_refusal_drops_validation(dispatcher_components, tmp_path)`; `async def test_monitored_cognition_revalidates_before_execution_handoff(dispatcher_components, tmp_path)`; `async def test_monitored_cognition_transfers_resource_lock_generation(dispatcher_components, tmp_path)`; `async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path)`; `…`
+  - `def db_path(tmp_path)`; `async def dispatcher_components(db_path)`; `async def test_held_periodic_signal_is_audited_as_benign_skip(dispatcher_components, monkeypatch)`; `async def test_hold_committed_while_waiting_for_signal_lock_skips_handler(dispatcher_components)`; `async def test_held_a2a_wake_is_drained_automatically_after_release(dispatcher_components)`; `async def test_public_nested_signal_does_not_inherit_durable_disposition(dispatcher_components)`; `async def test_late_hold_skip_does_not_consume_coalescing_key(dispatcher_components)`; `async def test_late_hold_skip_does_not_consume_rate_budget(dispatcher_components)`; `…`
 - **tests/unit/test_signals_dispatcher_constitution_injection.py** — Dispatcher integration tests for constitutional injection.
   - `def template_path(tmp_path)`; `async def test_legacy_cognition_signals_skip_audit_entirely(tmp_path, template_path)`; `async def test_full_injection_records_hashes_when_no_drift(tmp_path, template_path)`; `async def test_full_injection_drift_returns_dropped_validation(tmp_path, template_path)`; `async def test_full_injection_no_drift_when_only_one_hash_resolvable(tmp_path, template_path)`; `async def test_echo_required_verified_status_succeeds(tmp_path, template_path)`; `async def test_canary_injected_pre_dispatch_matches_verifier_input(tmp_path, template_path)`; `async def test_echo_required_missing_status_fails_dispatch(tmp_path, template_path)`; `…`
 - **tests/unit/test_signals_github_pr_watch_source.py** — Tests for the github.pr_activity signal source and the change-detection core that backs the github_pr_watch cron task (#1618).
@@ -3825,7 +3827,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_strategic_memory_created_at_contract.py** — Strategic-memory projections stamp ``created_at`` under the graph contract (#3255).
   - `def test_contract_created_at(value, expected, new_york_clock)`; `def test_stamp_leaves_the_key_absent_when_nothing_is_known()`; `def test_every_writer_stamps_the_contract_shape()`; `def test_every_writer_leaves_the_key_absent_for_a_dateless_row()`; `async def test_reindex_rewrites_bare_date_and_empty_stamps(tmp_path)`
 - **tests/unit/test_strategic_memory_issue_selection.py** — Tests for provider-neutral strategic-memory issue selection.
-  - `async def test_pick_top_issue_requires_github_token(monkeypatch)`; `async def test_pick_top_issue_requires_scan_repositories(monkeypatch)`; `def test_select_best_candidate_skips_blocked_and_prefers_unassigned_low_comment()`; `async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypatch)`; `class TestReferencePrefixMustLookLikeARepository`
+  - `async def test_pick_top_issue_requires_github_token(monkeypatch)`; `async def test_pick_top_issue_requires_scan_repositories(monkeypatch)`; `def test_select_best_candidate_skips_blocked_and_prefers_unassigned_low_comment()`; `async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypatch)`; `class TestReferencePrefixMustLookLikeARepository`; `async def test_the_live_host_shape_a_closed_issue_is_not_dispatched(monkeypatch)`; `async def test_a_closed_blocker_gives_way_to_the_open_one_behind_it(monkeypatch)`; `async def test_an_ambiguous_number_is_never_guessed_into_a_repository(monkeypatch)`; `…`
 - **tests/unit/test_strategic_memory_toolresult.py** — ToolResult contract tests for StrategicMemoryFeature (#1061 wave 12).
   - `async def test_strategy_view_no_data_returns_error()`; `async def test_strategy_view_unknown_section_returns_error()`; `async def test_strategy_view_vision_falls_back_when_empty()`; `async def test_strategy_view_vision_present()`; `async def test_resolve_blocker_missing_returns_error()`; `async def test_resolve_blocker_present_returns_ok()`; `async def test_backlog_hygiene_prereq_failure_returns_error()`; `async def test_backlog_hygiene_dry_run_returns_partial()`; `…`
 - **tests/unit/test_strategy_ledger.py** — Patterns and blockers move out of the prompt and into an addressable ledger (#2954).
