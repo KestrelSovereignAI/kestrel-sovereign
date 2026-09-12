@@ -1175,22 +1175,24 @@ class TestQueueIdempotency:
     @pytest.mark.asyncio
     async def test_delivered_purge_order_uses_covering_index(self, real_queue):
         queue, _ = real_queue
+        original_fetchall = queue._db.fetchall
+        captured = {}
 
+        async def capture_purge_query(sql, params=()):
+            if "RETURNING id" in sql:
+                captured["sql"] = sql
+                captured["params"] = params
+            return await original_fetchall(sql, params)
+
+        with patch.object(
+            queue._db, "fetchall", side_effect=capture_purge_query
+        ):
+            assert await queue.purge_delivered() == 0
+
+        assert "ORDER BY delivered_at, id" in captured["sql"]
         plan = await queue._db.fetchall(
-            """
-            EXPLAIN QUERY PLAN
-            SELECT id FROM delivery_queue
-            WHERE agent_id = ? AND status = ? AND delivered_at < ?
-            ORDER BY delivered_at, id
-            LIMIT 500
-            """,
-            (
-                queue._agent_id,
-                DeliveryStatus.DELIVERED.value,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+            f"EXPLAIN QUERY PLAN {captured['sql']}", captured["params"]
         )
-
         details = "\n".join(str(row[-1]) for row in plan)
         assert "idx_delivery_queue_purge" in details
         assert "USE TEMP B-TREE" not in details

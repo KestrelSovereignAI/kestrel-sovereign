@@ -792,6 +792,12 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
     owner = f"did:test:delivery-schema-upgrade:{uuid4().hex}"
     content_json = json.dumps({"subject": "hello", "body": "world"})
     entry_id = f"legacy-{uuid4().hex}"
+    preserved_explicit_id = f"preserved-explicit-{uuid4().hex}"
+    preserved_explicit_original = f"preserved-original-{uuid4().hex}"
+    preserved_explicit_created = datetime.now(timezone.utc).isoformat()
+    preserved_default_id = f"preserved-default-{uuid4().hex}"
+    preserved_default_original = f"preserved-original-{uuid4().hex}"
+    preserved_default_created = datetime.now(timezone.utc).isoformat()
     try:
         await database.execute(
             """
@@ -824,7 +830,9 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
                 error TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                max_retries INTEGER NOT NULL DEFAULT 5
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                retry_entry_id TEXT,
+                legacy_content_hash TEXT
             )
             """
         )
@@ -833,6 +841,41 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
         )
         assert await database.column_has_default(
             "delivery_dead_letter", "max_retries"
+        )
+        await database.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries,
+                 retry_entry_id, legacy_content_hash)
+            VALUES (?, ?, ?, 'email', ?, ?, ?, 7, ?, 19, ?, ?)
+            """,
+            (
+                preserved_explicit_id,
+                preserved_explicit_original,
+                owner,
+                "preserved-explicit@example.com",
+                '{"body":"preserved"}',
+                "preserved error",
+                preserved_explicit_created,
+                "preserved-retry-entry",
+                "preserved-legacy-hash",
+            ),
+        )
+        await database.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at)
+            VALUES (?, ?, ?, 'webhook', ?, '{}', NULL, 0, ?)
+            """,
+            (
+                preserved_default_id,
+                preserved_default_original,
+                owner,
+                "preserved-default@example.com",
+                preserved_default_created,
+            ),
         )
         await database.execute(
             """
@@ -880,6 +923,55 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             )
             assert max_retries_shape[3] == 0
             assert max_retries_shape[4] is None
+            rebuilt_indexes = await database.fetchall(
+                "PRAGMA index_list('delivery_dead_letter')"
+            )
+            rebuilt_index_names = {row[1] for row in rebuilt_indexes}
+            assert "idx_delivery_dead_letter_original" in rebuilt_index_names
+            assert "idx_delivery_dead_letter_retry_entry" in rebuilt_index_names
+        assert await database.fetchone(
+            """
+            SELECT id, original_id, agent_id, channel_type, recipient,
+                   content_json, error, attempts, created_at, max_retries,
+                   retry_entry_id, legacy_content_hash
+            FROM delivery_dead_letter WHERE id = ?
+            """,
+            (preserved_explicit_id,),
+        ) == (
+            preserved_explicit_id,
+            preserved_explicit_original,
+            owner,
+            "email",
+            "preserved-explicit@example.com",
+            '{"body":"preserved"}',
+            "preserved error",
+            7,
+            preserved_explicit_created,
+            19,
+            "preserved-retry-entry",
+            "preserved-legacy-hash",
+        )
+        assert await database.fetchone(
+            """
+            SELECT original_id, channel_type, recipient, content_json, error,
+                   attempts, created_at, max_retries, retry_entry_id,
+                   legacy_content_hash
+            FROM delivery_dead_letter WHERE id = ?
+            """,
+            (preserved_default_id,),
+        ) == (
+            preserved_default_original,
+            "webhook",
+            "preserved-default@example.com",
+            "{}",
+            None,
+            0,
+            preserved_default_created,
+            5,
+            None,
+            None,
+        )
+        old_writer_id = f"old-writer-{uuid4().hex}"
         await database.execute(
             """
             INSERT INTO delivery_dead_letter
@@ -888,7 +980,7 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             VALUES (?, ?, ?, 'email', ?, '{}', 'old writer', 1, ?)
             """,
             (
-                f"old-writer-{uuid4().hex}",
+                old_writer_id,
                 f"old-original-{uuid4().hex}",
                 owner,
                 "old-writer@example.com",
@@ -896,9 +988,8 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             ),
         )
         assert await database.fetchone(
-            "SELECT max_retries FROM delivery_dead_letter "
-            "WHERE agent_id = ?",
-            (owner,),
+            "SELECT max_retries FROM delivery_dead_letter WHERE id = ?",
+            (old_writer_id,),
         ) == (None,)
         canonical_row = await database.fetchone(
             "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
