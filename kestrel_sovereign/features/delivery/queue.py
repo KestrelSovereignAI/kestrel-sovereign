@@ -2056,27 +2056,22 @@ class DeliveryQueue:
                 ADD COLUMN max_retries INTEGER
                 """
             )
-        elif self._db.backend_type == "postgres":
+        elif (
+            self._db.backend_type == "postgres"
+            and not await self._db.column_accepts_null(
+                "delivery_dead_letter", "max_retries"
+            )
+        ):
             # Early v0.53.12 prerelease schemas declared this NOT NULL. A
             # rolling old writer cannot persist the new value, so the durable
             # ledger recovery path requires the compatibility column to remain
             # nullable on upgraded PostgreSQL databases too.
-            nullable = await self._db.fetchone(
+            await self._db.execute(
                 """
-                SELECT NOT attnotnull
-                FROM pg_attribute
-                WHERE attrelid = to_regclass(?) AND attname = ?
-                  AND attnum > 0 AND NOT attisdropped
-                """,
-                ("delivery_dead_letter", "max_retries"),
+                ALTER TABLE delivery_dead_letter
+                ALTER COLUMN max_retries DROP NOT NULL
+                """
             )
-            if nullable == (False,):
-                await self._db.execute(
-                    """
-                    ALTER TABLE delivery_dead_letter
-                    ALTER COLUMN max_retries DROP NOT NULL
-                    """
-                )
         if not await self._db.column_exists(
             "delivery_dead_letter", "retry_entry_id"
         ):

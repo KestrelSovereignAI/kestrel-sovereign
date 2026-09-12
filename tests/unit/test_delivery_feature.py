@@ -53,6 +53,7 @@ def _make_mock_db():
     db.backend_type = "sqlite"
     db.nested_transaction_strategy = "joined"
     db.column_exists = AsyncMock(return_value=True)
+    db.column_accepts_null = AsyncMock(return_value=True)
 
     @asynccontextmanager
     async def migration_lock(_name):
@@ -609,6 +610,21 @@ class TestQueueTableCreation:
         await queue._ensure_tables()
         sql_texts = [queue._db.execute.call_args_list[i][0][0] for i in range(queue._db.execute.call_count)]
         assert any("delivery_dead_letter" in sql and "CREATE TABLE" in sql for sql in sql_texts)
+
+    @pytest.mark.asyncio
+    async def test_postgres_upgrade_reuses_shared_nullability_probe(self, queue):
+        queue._db.backend_type = "postgres"
+        queue._db.nested_transaction_strategy = "savepoint"
+        queue._db.column_accepts_null.return_value = False
+
+        await queue._ensure_tables()
+
+        queue._db.column_accepts_null.assert_awaited_once_with(
+            "delivery_dead_letter", "max_retries"
+        )
+        sql = "\n".join(call.args[0] for call in queue._db.execute.call_args_list)
+        assert "ALTER COLUMN max_retries DROP NOT NULL" in sql
+        assert "pg_attribute" not in sql
 
 
 # =========================================================================

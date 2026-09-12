@@ -3475,6 +3475,10 @@ class AsyncDatabase:
         """Check whether a column exists using backend-safe catalog lookup."""
         return await self._column_exists(table_name, column_name)
 
+    async def column_accepts_null(self, table_name: str, column_name: str) -> bool:
+        """Check whether a column accepts NULL using backend-safe lookup."""
+        return await self._column_accepts_null(table_name, column_name)
+
     async def table_exists_diagnostic(self, table_name: str) -> bool:
         """Check schema state without waiting on SQLite cleanup."""
         check = getattr(self._backend, "table_exists_diagnostic", None)

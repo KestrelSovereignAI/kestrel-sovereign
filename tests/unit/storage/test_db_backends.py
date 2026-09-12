@@ -4,7 +4,7 @@ Tests for database backend abstraction layer.
 import asyncio
 import threading
 from contextlib import suppress
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -1831,6 +1831,16 @@ class TestSQLiteBackend:
 
 class TestAsyncDatabase:
     """Test the AsyncDatabase facade."""
+
+    @pytest.mark.asyncio
+    async def test_column_accepts_null_delegates_to_backend_safe_probe(self):
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+        database = AsyncDatabase(MagicMock())
+        database._column_accepts_null = AsyncMock(return_value=True)
+
+        assert await database.column_accepts_null("widgets", "note") is True
+        database._column_accepts_null.assert_awaited_once_with("widgets", "note")
 
     @pytest.mark.asyncio
     async def test_cancelled_cached_sqla_disposal_still_closes_primary_worker(
