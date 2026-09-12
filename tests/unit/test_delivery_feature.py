@@ -1441,6 +1441,54 @@ class TestQueueIdempotency:
         assert "idx_delivery_idempotency_retention" not in names
 
     @pytest.mark.asyncio
+    async def test_existing_v3_schema_drops_obsolete_retention_index(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        await queue._db.execute(
+            """
+            CREATE INDEX idx_delivery_idempotency_retention
+            ON delivery_idempotency(agent_id, created_at)
+            """
+        )
+
+        await queue._ensure_tables()
+
+        assert await queue._db.fetchone(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_delivery_idempotency_retention'
+            """
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_existing_v3_schema_drops_obsolete_compensation_trigger(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        await queue._db.execute(
+            """
+            CREATE TRIGGER trg_delivery_idempotency_compensate
+            AFTER DELETE ON delivery_idempotency
+            BEGIN
+                DELETE FROM delivery_queue
+                WHERE id = OLD.entry_id AND agent_id = OLD.agent_id;
+            END
+            """
+        )
+
+        await queue._ensure_tables()
+
+        assert await queue._db.fetchone(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name = 'trg_delivery_idempotency_compensate'
+            """
+        ) is None
+
+    @pytest.mark.asyncio
     async def test_v3_schema_does_not_rebuild_replay_index(self, real_queue):
         queue, _ = real_queue
         original_execute = queue._db.execute
