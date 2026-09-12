@@ -847,7 +847,8 @@ class DeliveryQueue:
                     existing = await self._db.fetchone(
                         """
                         SELECT entry_id, payload_digest, effective_max_retries,
-                               created_at, legacy_content_hash
+                               created_at, legacy_content_hash,
+                               previous_entry_id
                         FROM delivery_idempotency
                         WHERE agent_id = ? AND idempotency_key_digest = ?
                         """,
@@ -866,6 +867,7 @@ class DeliveryQueue:
                     stored_retries = existing[2]
                     claim_created_at = existing[3]
                     stored_legacy_hash = existing[4]
+                    previous_entry_id = existing[5]
 
                     canonical_id = existing[0]
                     dead_letter = await self._find_dead_letter_for_queue_id(
@@ -887,6 +889,15 @@ class DeliveryQueue:
                     )
                     if queue_row is not None:
                         if stored_retries is None:
+                            if previous_entry_id is not None:
+                                # A replacement anchor proves this claim was
+                                # already stale and followed another claim's
+                                # repair. It therefore has no live pre-upgrade
+                                # row from which its own policy can be learned.
+                                raise DeliveryIdempotencyStateError(
+                                    "stale delivery idempotency record has no "
+                                    "durable retry policy"
+                                )
                             # Upgrade old ledger rows lazily from their live
                             # queue entry. Keeping the column nullable lets old
                             # rolling-deployment writers continue inserting.
@@ -1831,9 +1842,9 @@ class DeliveryQueue:
     async def _ensure_tables(self):
         """Create the delivery tables under one concurrency-safe migration."""
         async with self._db.migration_lock("delivery_queue_schema_v3"):
-            # Every existence check is performed by the IF NOT EXISTS DDL only
-            # after the lock is held. This makes the statements both the probe
-            # and the re-probe and keeps the complete schema change atomic.
+            # Run both idempotent DDL and explicit catalog probes only after
+            # the lock is held, so every decision is a serialized re-probe and
+            # the complete schema change stays atomic.
             await self._ensure_tables_locked()
 
     async def _ensure_tables_locked(self) -> None:

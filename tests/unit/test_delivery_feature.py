@@ -13,6 +13,7 @@ Tests:
 """
 
 import asyncio
+import hashlib
 import json
 import pytest
 import pytest_asyncio
@@ -975,6 +976,82 @@ class TestQueueIdempotency:
                 {"body": "hello"},
                 idempotency_key="unknown-policy",
             )
+
+    @pytest.mark.asyncio
+    async def test_policyless_alias_stays_fail_closed_after_peer_repair(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        request = ("email", "policyless-alias@example.com", {"body": "hello"})
+        original_id = await queue.enqueue(
+            *request, idempotency_key="policyless-alias-a"
+        )
+        assert await queue.enqueue(
+            *request, idempotency_key="policyless-alias-b", max_retries=5
+        ) == original_id
+        missing_policy_digest = hashlib.sha256(
+            b"policyless-alias-a"
+        ).hexdigest()
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET effective_max_retries = NULL
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (queue._agent_id, missing_policy_digest),
+        )
+        await queue._db.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        )
+
+        replacement_id = await queue.enqueue(
+            *request, idempotency_key="policyless-alias-b", max_retries=5
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="retry policy"):
+            await queue.enqueue(
+                *request, idempotency_key="policyless-alias-a"
+            )
+        assert await queue._db.fetchone(
+            """
+            SELECT effective_max_retries, previous_entry_id
+            FROM delivery_idempotency
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (queue._agent_id, missing_policy_digest),
+        ) == (None, original_id)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (replacement_id, queue._agent_id),
+        ) == (1,)
+
+    @pytest.mark.asyncio
+    async def test_linked_queue_row_is_not_unlinked_compatibility_hazard(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        entry_id = await queue.enqueue(
+            "email",
+            "linked-compatible@example.com",
+            {"body": "hello"},
+            idempotency_key="linked-compatible",
+        )
+        row = await queue._db.fetchone(
+            """
+            SELECT recipient, canonical_content_hash, content_hash,
+                   channel_type, created_at
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            (entry_id, queue._agent_id),
+        )
+
+        assert not await queue._has_unlinked_compatible_queue_row(
+            recipient=row[0],
+            canonical_content_hash=row[1],
+            legacy_content_hash=row[2],
+            channel_type=row[3],
+            claim_created_at=row[4],
+        )
 
     @pytest.mark.asyncio
     async def test_pre_upgrade_live_claim_backfills_replay_metadata(self, real_queue):
@@ -2258,6 +2335,115 @@ class TestQueueIdempotency:
             "SELECT max_retries FROM delivery_queue WHERE id = ?",
             (retried["entry_id"],),
         ) == (11,)
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_retry_rejects_inconsistent_ledger_policies(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "ambiguous-policy@example.com",
+            {"body": "hello"},
+            idempotency_key="ambiguous-policy-a",
+        )
+        assert await queue.enqueue(
+            "email",
+            "ambiguous-policy@example.com",
+            {"body": "hello"},
+            idempotency_key="ambiguous-policy-b",
+        ) == original_id
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET effective_max_retries = 17
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (
+                queue._agent_id,
+                hashlib.sha256(b"ambiguous-policy-b").hexdigest(),
+            ),
+        )
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="inconsistent"):
+            await queue.retry(original_id)
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_retry_rejects_ambiguous_ledger_hashes(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email",
+            "ambiguous-hash@example.com",
+            {"body": "hello"},
+            idempotency_key="ambiguous-hash-a",
+        )
+        assert await queue.enqueue(
+            "email",
+            "ambiguous-hash@example.com",
+            {"body": "hello"},
+            idempotency_key="ambiguous-hash-b",
+        ) == original_id
+        await queue.move_to_dead_letter(original_id, "provider rejected")
+        await queue._db.execute(
+            """
+            UPDATE delivery_dead_letter SET legacy_content_hash = NULL
+            WHERE original_id = ? AND agent_id = ?
+            """,
+            (original_id, queue._agent_id),
+        )
+        await queue._db.execute(
+            """
+            UPDATE delivery_idempotency SET legacy_content_hash = ?
+            WHERE agent_id = ? AND idempotency_key_digest = ?
+            """,
+            (
+                "different-legacy-hash",
+                queue._agent_id,
+                hashlib.sha256(b"ambiguous-hash-b").hexdigest(),
+            ),
+        )
+
+        with pytest.raises(
+            DeliveryIdempotencyStateError, match="authoritative compatibility hash"
+        ):
+            await queue.retry(original_id)
+
+    @pytest.mark.asyncio
+    async def test_move_to_dead_letter_does_not_duplicate_existing_tombstone(
+        self, real_queue
+    ):
+        queue, _ = real_queue
+        original_id = await queue.enqueue(
+            "email", "existing-tombstone@example.com", {"body": "hello"}
+        )
+        await queue._db.execute(
+            """
+            INSERT INTO delivery_dead_letter
+                (id, original_id, agent_id, channel_type, recipient,
+                 content_json, error, attempts, created_at, max_retries,
+                 legacy_content_hash)
+            SELECT ?, id, agent_id, channel_type, recipient, content_json,
+                   'prior move', attempts, created_at, max_retries, content_hash
+            FROM delivery_queue WHERE id = ? AND agent_id = ?
+            """,
+            ("existing-tombstone", original_id, queue._agent_id),
+        )
+
+        await queue.move_to_dead_letter(original_id, "resumed move")
+
+        assert await queue._db.fetchone(
+            """
+            SELECT COUNT(*) FROM delivery_dead_letter
+            WHERE original_id = ? AND agent_id = ?
+            """,
+            (original_id, queue._agent_id),
+        ) == (1,)
+        assert await queue._db.fetchone(
+            "SELECT COUNT(*) FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, queue._agent_id),
+        ) == (0,)
 
     @pytest.mark.asyncio
     async def test_dead_letter_retry_preserves_rolling_writer_legacy_hash(

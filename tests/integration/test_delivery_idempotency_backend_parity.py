@@ -203,6 +203,44 @@ async def test_stale_claim_repair_preserves_effective_retry_policy(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_stale_claim_refuses_dedup_under_different_policy(db_backend):
+    database = AsyncDatabase(db_backend)
+    owner = f"did:test:delivery-stale-policy-dedup:{uuid4().hex}"
+    original_queue = DeliveryQueue(database, owner, max_retries=5)
+    restarted_queue = DeliveryQueue(database, owner, max_retries=99)
+    await original_queue._ensure_tables()
+    request = ("email", "stale-policy-dedup@example.com", {"body": "same"})
+
+    try:
+        original_id = await original_queue.enqueue(
+            *request, idempotency_key="stale-policy-dedup"
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (original_id, owner),
+        )
+        replacement_id = await restarted_queue.enqueue(*request)
+
+        with pytest.raises(DeliveryIdempotencyStateError, match="unlinked"):
+            await restarted_queue.enqueue(
+                *request, idempotency_key="stale-policy-dedup"
+            )
+
+        assert await database.fetchone(
+            "SELECT max_retries FROM delivery_queue WHERE id = ? AND agent_id = ?",
+            (replacement_id, owner),
+        ) == (99,)
+    finally:
+        await database.execute(
+            "DELETE FROM delivery_idempotency WHERE agent_id = ?", (owner,)
+        )
+        await database.execute(
+            "DELETE FROM delivery_queue WHERE agent_id = ?", (owner,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_dead_letter_retry_preserves_legacy_content_hash(db_backend):
     database = AsyncDatabase(db_backend)
     owner = f"did:test:delivery-retry-hash:{uuid4().hex}"
@@ -790,6 +828,13 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             )
             """
         )
+        if database.backend_type == "postgres":
+            assert not await database.column_accepts_null(
+                "delivery_dead_letter", "max_retries"
+            )
+            assert await database.column_has_default(
+                "delivery_dead_letter", "max_retries"
+            )
         await database.execute(
             """
             INSERT INTO delivery_queue
@@ -817,12 +862,36 @@ async def test_legacy_delivery_queue_schema_upgrade_converges(
             "delivery_queue", "canonical_content_hash"
         )
         if database.backend_type == "postgres":
-            assert await database.column_accepts_null(
-                "delivery_dead_letter", "max_retries"
+            column_shape = await database.fetchone(
+                """
+                SELECT is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'delivery_dead_letter'
+                  AND column_name = 'max_retries'
+                """
             )
-            assert not await database.column_has_default(
-                "delivery_dead_letter", "max_retries"
+            assert column_shape == ("YES", None)
+            await database.execute(
+                """
+                INSERT INTO delivery_dead_letter
+                    (id, original_id, agent_id, channel_type, recipient,
+                     content_json, error, attempts, created_at)
+                VALUES (?, ?, ?, 'email', ?, '{}', 'old writer', 1, ?)
+                """,
+                (
+                    f"old-writer-{uuid4().hex}",
+                    f"old-original-{uuid4().hex}",
+                    owner,
+                    "old-writer@example.com",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
+            assert await database.fetchone(
+                "SELECT max_retries FROM delivery_dead_letter "
+                "WHERE agent_id = ?",
+                (owner,),
+            ) == (None,)
         canonical_row = await database.fetchone(
             "SELECT canonical_content_hash FROM delivery_queue WHERE id = ?",
             (entry_id,),
