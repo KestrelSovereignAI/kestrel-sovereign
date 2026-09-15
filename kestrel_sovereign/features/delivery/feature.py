@@ -82,6 +82,7 @@ class DeliveryFeature(Feature):
         recipient: str,
         content: Dict[str, Any],
         max_retries: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[str]:
         """Enqueue a message for delivery (programmatic API).
 
@@ -90,14 +91,28 @@ class DeliveryFeature(Feature):
             recipient: Target address or identifier.
             content: Message payload dict.
             max_retries: Override default max retries.
+            idempotency_key: Optional opaque, owner-scoped replay key. Reusing
+                it requires preserving whether ``max_retries`` was omitted or
+                explicitly supplied; a different request raises a conflict.
 
         Returns:
             Queue entry ID, or None if queue is not available.
+
+        Raises:
+            ValueError: The key or keyed JSON content is invalid.
+            DeliveryIdempotencyError: The replay conflicts, is dead-lettered,
+                or cannot be reconciled safely.
         """
         if not self._queue:
             logger.warning("DeliveryFeature: cannot enqueue, queue not available")
             return None
-        return await self._queue.enqueue(channel_type, recipient, content, max_retries)
+        return await self._queue.enqueue(
+            channel_type,
+            recipient,
+            content,
+            max_retries,
+            idempotency_key=idempotency_key,
+        )
 
     # ------------------------------------------------------------------
     # Tools

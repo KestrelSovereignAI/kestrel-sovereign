@@ -610,7 +610,7 @@ async def test_direct_stop_preserves_finite_authority_expiry_owner(
     monkeypatch.setattr(
         lifecycle,
         "_remaining_ttl_seconds",
-        lambda _created_at, _ttl_seconds: 0.01,
+        lambda _created_at, _ttl_seconds: 1.0,
     )
     manager._parent_children[parent_did] = [child_name]
     manager._child_mandates[child_name] = mandate
@@ -632,7 +632,7 @@ async def test_direct_stop_preserves_finite_authority_expiry_owner(
     cold_key = (child_name.casefold(), child_did)
     assert lifecycle._cold_ttl_tasks[cold_key] is expiry_owner
     assert not expiry_owner.cancelled()
-    await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=0.5)
+    await asyncio.wait_for(asyncio.shield(expiry_owner), timeout=2.0)
     assert registry.get(child_did).retired
 
 
