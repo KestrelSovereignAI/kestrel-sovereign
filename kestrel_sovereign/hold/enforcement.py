@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from kestrel_sovereign.host_features.storage import HostDatabaseLaunchContext
 
-from .state import EffectiveHoldState, HoldState, HoldStateError
+from .state import (
+    EffectiveHoldState,
+    HoldState,
+    HoldStateError,
+    hold_latch_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -163,17 +168,9 @@ class HoldTurnRefusal(RuntimeError):
 
     @staticmethod
     def _latch_payload(latch: HoldState | None) -> dict[str, Any] | None:
-        if latch is None:
-            return None
-        return {
-            "scope": latch.scope.value,
-            "target_id": latch.target_id,
-            "reason": latch.reason,
-            "actor_id": latch.actor_id,
-            "set_at": latch.set_at,
-            "hold_receipt_id": latch.hold_receipt_id,
-            "revision": latch.revision,
-        }
+        # One projection, shared with the host Hold door, so a console badge
+        # and a turn refusal can never describe the same latch differently.
+        return hold_latch_payload(latch)
 
     def wire_payload(self) -> dict[str, Any]:
         """Return the stable refusal envelope for non-Python callers."""

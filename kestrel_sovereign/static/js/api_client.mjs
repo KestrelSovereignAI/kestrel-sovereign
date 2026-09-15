@@ -1420,6 +1420,25 @@ export function createApiClient({
         getHostStopStatus: () => client.requestHost('/api/host/stop/status', {
             cache: 'no-store',
         }),
+        // Hold is durable STATE, so its door is separate from Stop's (#3164).
+        // The three calls below never cancel work and never take the selected
+        // agent prefix: the host owns the latch table and names every agent it
+        // can latch, so a card can only ever hold an agent this host hosts.
+        getHostHoldState: () => client.requestHost('/api/host/hold', {
+            cache: 'no-store',
+        }),
+        setHostHold: (payload = {}) => client.requestHost('/api/host/hold', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
+        // The release carries the receipt id of the latch the caller SAW, so a
+        // Resume cannot release a hold somebody else set in the meantime.
+        releaseHostHold: (payload = {}) => client.requestHost('/api/host/hold/release', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
         getModels: (options = {}) => {
             const params = new URLSearchParams();
             if (options.featuredOnly !== undefined) params.append('featured_only', options.featuredOnly);

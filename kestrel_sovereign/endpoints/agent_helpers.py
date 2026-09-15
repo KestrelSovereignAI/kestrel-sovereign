@@ -67,6 +67,28 @@ def caller_is_sovereign(request: Request) -> bool:
     return getattr(caller, "is_sovereign", False) is True
 
 
+def sovereign_actor_id(request: Request) -> str:
+    """Name the sovereign principal a host control-plane receipt is bound to.
+
+    Called as the FIRST statement of a host Stop/Hold handler rather than as
+    a dependency: those handlers resolve a target against the live inventory,
+    so a refusal raised after that lookup would answer 404 for an unknown
+    target and 403 for a known one, making the refusal a probe.
+
+    One copy for both host doors — a durable receipt must not name the actor
+    one way when Stop wrote it and another way when Hold did.
+    """
+
+    if not caller_is_sovereign(request):
+        raise ApiHTTPException(
+            status_code=403,
+            code="sovereign_authority_required",
+            message="Host control-plane authority is required.",
+        )
+    identity = get_caller(request).identity
+    return identity if isinstance(identity, str) and identity.strip() else "api_key"
+
+
 def get_caller(request: Request):
     """Return the CallerContext attached by the auth middleware, or None.
 

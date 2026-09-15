@@ -29,6 +29,8 @@ from .state import (
     HoldState,
     HoldStateError,
     HoldStore,
+    hold_latch_payload,
+    hold_receipt_payload,
 )
 
 __all__ = [
@@ -50,6 +52,8 @@ __all__ = [
     "build_bound_host_context",
     "close_bound_host_context",
     "get_effective_hold_state",
+    "hold_latch_payload",
+    "hold_receipt_payload",
     "initialize_with_bound_hold_context",
     "require_context_hold_store",
     "require_turn_start_allowed",

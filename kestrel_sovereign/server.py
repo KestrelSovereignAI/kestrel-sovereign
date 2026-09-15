@@ -3958,6 +3958,7 @@ from kestrel_sovereign.endpoints import (
     features_router,
     ui_router,
     github_router,
+    hold_router,
     host_stop_router,
 )
 from kestrel_sovereign.endpoints.rasa_shim import router as rasa_shim_router
@@ -3986,6 +3987,7 @@ app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 app.include_router(github_router)
 app.include_router(host_stop_router)
+app.include_router(hold_router)
 
 
 # Regex for multi-agent path routing: /api/agents/{name}/{remaining_path}

@@ -379,6 +379,110 @@ nav {
     color: rgba(255, 255, 255, 0.85);
 }
 
+/* Hold is a LATCH, so unlike `.agent-stop-btn` its card affordances do not
+   depend on the row thinking (#3164). The kebab is always available — Hold's
+   primary case is an idle agent about to heartbeat — and a held card keeps a
+   resting badge plus a Resume control in the Stop slot, so a hold set days ago
+   is still legible with nothing in flight. */
+.agent-card-kebab {
+    background: none;
+    border: none;
+    color: var(--text-muted, #8b949e);
+    cursor: pointer;
+    flex-shrink: 0;
+    line-height: 1;
+    padding: 0.125rem 0.25rem;
+}
+.agent-card-kebab:not(:disabled):hover {
+    color: var(--text-primary);
+}
+.agent-card-kebab:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+}
+
+.agent-hold-badge {
+    align-items: center;
+    background: var(--warning-bg, rgba(210, 153, 34, 0.15));
+    border: 1px solid var(--warning, #d29922);
+    border-radius: 6px;
+    color: var(--warning, #d29922);
+    display: inline-flex;
+    flex-shrink: 0;
+    font-size: 0.65rem;
+    gap: 0.3rem;
+    line-height: 1.2;
+    max-width: 12rem;
+    overflow: hidden;
+    padding: 0.1rem 0.35rem;
+    white-space: nowrap;
+}
+.agent-hold-badge[hidden] {
+    display: none;
+}
+.agent-hold-badge-label {
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.agent-hold-badge-reason,
+.agent-hold-badge-actor,
+.agent-hold-badge-time {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.agent-hold-badge-actor,
+.agent-hold-badge-time {
+    opacity: 0.8;
+}
+
+/* Resume occupies the Stop slot on a held card: a held agent's next gesture is
+   release, not cancellation. Stop stays reachable from the kebab while work is
+   actually in flight. */
+.agent-resume-btn {
+    background: transparent;
+    border: 1px solid var(--warning, #d29922);
+    border-radius: 6px;
+    color: var(--warning, #d29922);
+    cursor: pointer;
+    display: none;
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    line-height: 1;
+    padding: 0.15rem 0.4rem;
+}
+.agent-card.agent-held .agent-resume-btn:not([hidden]) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.agent-card.agent-held .agent-stop-btn {
+    display: none;
+}
+.agent-resume-btn:not(:disabled):hover {
+    background: var(--warning, #d29922);
+    color: var(--bg-primary, #0d1117);
+}
+.agent-resume-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.agent-hold-outcome {
+    color: var(--text-muted, #8b949e);
+    font-size: 0.68rem;
+    line-height: 1.15;
+    max-width: 9rem;
+    text-align: right;
+}
+.agent-hold-outcome[data-disposition="applied"] {
+    color: var(--warning, #d29922);
+}
+.agent-hold-outcome[data-disposition="refused_stale"],
+.agent-hold-outcome[data-disposition="unreachable"],
+.agent-hold-outcome[data-disposition="indeterminate"] {
+    color: var(--error, #dc2626);
+}
+
 /* Fleet cooperative Stop belongs to the shared agents-pane banner. It is
    intentionally styled apart from process shutdown controls: this button asks
    live turns to stop and renders the typed per-target receipt outcomes below. */
