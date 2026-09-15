@@ -355,7 +355,11 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
     diagnostics: dict = {}
 
     assert await issue_selection.pick_top_issue(data, diagnostics) is None
-    assert diagnostics == {"blockers_checked": 2, "blockers_unreadable": 2}
+    assert diagnostics == {
+        "blockers_checked": 2,
+        "blockers_unreadable": 2,
+        "blockers_talon_owned": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -371,7 +375,7 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
     diagnostics: dict = {}
 
     assert await issue_selection.pick_top_issue(data, diagnostics) is None
-    assert diagnostics == {"blockers_checked": 1, "blockers_unreadable": 0}
+    assert diagnostics == {"blockers_checked": 1, "blockers_unreadable": 0, "blockers_talon_owned": 0}
 
 
 @pytest.mark.asyncio
@@ -390,3 +394,90 @@ async def test_only_an_explicitly_open_issue_is_dispatched(monkeypatch, state):
     }
 
     assert await issue_selection.pick_top_issue(data) is None
+
+
+def _labelled(number, *names, title="t"):
+    return {
+        "number": number, "title": title, "state": "open",
+        "labels": [{"name": n} for n in names],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_blocker_talon_owns_gives_way_to_the_next_one(monkeypatch):
+    """#3051 on the live host, 09-12 through 09-15: open, top blocker, and
+    already carrying Talon's answer -- clarification asked, then failed. The
+    dispatcher never looked at the label and re-ran the same claim daily."""
+    _stub_github(monkeypatch, {
+        "/repos/o/r/issues/3051": _labelled(3051, "tech-debt", "agent-clarifying"),
+        "/repos/o/r/issues/3052": _open(3052, "next"),
+    })
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "high", "issue": "o/r#3051", "title": "asked"},
+            {"severity": "high", "issue": "o/r#3052", "title": "free"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 3052
+    assert diagnostics["blockers_talon_owned"] == 1
+    assert diagnostics["blockers_checked"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label",
+    ["agent-analyzing", "agent-clarifying", "agent-claimed", "agent-blocked",
+     "agent-failed", "Agent-Failed"],
+)
+async def test_every_talon_state_label_withholds_dispatch(monkeypatch, label):
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _labelled(1, label)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "critical", "issue": "o/r#1", "title": "t"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert diagnostics["blockers_talon_owned"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["agent-ready", "agent-complete", "tech-debt"])
+async def test_an_instruction_or_a_finished_run_does_not_withhold(monkeypatch, label):
+    """``agent-ready`` tells Talon to skip clarification; it must still dispatch."""
+    _stub_github(monkeypatch, {"/repos/o/r/issues/1": _labelled(1, label)})
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "critical", "issue": "o/r#1", "title": "t"}],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked is not None and picked["issue_number"] == 1
+
+
+def test_backlog_scan_skips_talon_owned_issues_too():
+    issues = [
+        _labelled(1, "agent-failed"),
+        _labelled(2, "agent-claimed"),
+        _open(3),
+    ]
+    assert issue_selection._select_best_candidate(issues)["number"] == 3
+
+
+def test_talon_state_labels_match_talons_vocabulary():
+    """A copy of ``kestreltalon/config.py``'s state labels, pinned here because
+    core cannot import the Talon package. Change both or neither."""
+    assert issue_selection.TALON_STATE_LABELS == frozenset({
+        "agent-analyzing",   # label_analyzing
+        "agent-clarifying",  # label_clarifying
+        "agent-claimed",     # label_in_progress
+        "agent-blocked",     # label_blocked
+        "agent-failed",      # label_failed
+    })
+

@@ -19,6 +19,26 @@ logger = logging.getLogger(__name__)
 #: does not match this is prose, not a repository.
 _REPO_SHAPE = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
+#: Labels Talon puts on an issue while a run owns it or is waiting on a
+#: human: ``kestreltalon/config.py`` ``label_analyzing`` / ``label_clarifying``
+#: / ``label_in_progress`` / ``label_blocked`` / ``label_failed``. Talon's own
+#: failure comment says "remove the label to allow a retry": the label is the
+#: retry protocol, and re-dispatching over it re-runs the same claim every
+#: morning (#3294 -- #3051 four days running). ``agent-ready`` and
+#: ``agent-complete`` are deliberately absent: the first is an instruction to
+#: Talon, the second is a finished run. Core cannot import kestreltalon
+#: (features are entry points, never imports), so this is a copy of that
+#: vocabulary; ``test_talon_state_labels_match_talons_vocabulary`` pins it.
+TALON_STATE_LABELS = frozenset(
+    {
+        "agent-analyzing",
+        "agent-clarifying",
+        "agent-claimed",
+        "agent-blocked",
+        "agent-failed",
+    }
+)
+
 
 def parse_issue_ref(value: object) -> tuple[Optional[str], Optional[int]]:
     """Split an issue reference into its repository and its number.
@@ -71,6 +91,7 @@ async def pick_top_issue(
         diagnostics = {}
     diagnostics.setdefault("blockers_checked", 0)
     diagnostics.setdefault("blockers_unreadable", 0)
+    diagnostics.setdefault("blockers_talon_owned", 0)
     token = get_github_token()
     if not token:
         logger.info("No GITHUB_TOKEN — cannot pick top issue")
@@ -125,6 +146,18 @@ async def pick_top_issue(
         if issue is None:
             diagnostics["blockers_unreadable"] += 1
         if not _is_open_issue(issue):
+            continue
+        owned_by = _talon_state_labels(issue)
+        if owned_by:
+            # Open, but Talon has already claimed it, is waiting for an answer
+            # on it, or failed on it and asked for the label to be cleared.
+            # Dispatching again is the same run again; the decision belongs
+            # to whoever reads Talon's comment (#3294).
+            diagnostics["blockers_talon_owned"] += 1
+            logger.info(
+                "Not dispatching %s#%s: Talon labels %s",
+                repo, issue_number, sorted(owned_by),
+            )
             continue
         return {
             "repo": repo,
@@ -212,6 +245,16 @@ def _is_open_issue(issue: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def _talon_state_labels(issue: Dict[str, Any]) -> set:
+    """The Talon state labels on ``issue`` -- non-empty means not dispatchable."""
+    names = set()
+    for label in issue.get("labels") or ():
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str):
+            names.add(name.lower())
+    return names & TALON_STATE_LABELS
+
+
 async def _fetch_milestone_issues(
     repo: str, milestone_name: str, token: str
 ) -> List[Dict[str, Any]]:
@@ -261,6 +304,7 @@ def _select_best_candidate(issues: List[Dict[str, Any]]) -> Optional[Dict[str, A
         issue
         for issue in issues
         if not ({label["name"].lower() for label in issue.get("labels", [])} & skip_labels)
+        and not _talon_state_labels(issue)
     ]
     if not candidates:
         return None
