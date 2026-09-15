@@ -554,8 +554,13 @@ function makeHoldControls(doc, item, ctx) {
     // unbound with the nodes, so a card without the Hold surface keeps the
     // browser's own context menu.
     function onContextMenu(event) {
-        if (typeof event.preventDefault === 'function') event.preventDefault();
+        // Disabled FIRST: an accelerator may only take the browser's own menu
+        // when it has one of ours to put there. A non-sovereign caller, a
+        // stale reading, or a card the host's inventory does not name all
+        // leave the kebab disabled — suppressing the native menu for those
+        // turns a right-click into a gesture that does nothing at all.
         if (kebabBtn.disabled) return;
+        if (typeof event.preventDefault === 'function') event.preventDefault();
         openMenuAt(menuItems(), positionFromEvent(event), { ownerDocument: doc });
     }
 

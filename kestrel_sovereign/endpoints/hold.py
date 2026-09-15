@@ -243,6 +243,14 @@ def _refuse_store_failure(error: HoldStateError) -> ApiHTTPException:
     )
 
 
+def _active_latches(
+    snapshot: tuple[HoldState, ...],
+) -> dict[tuple[HoldScope, str], HoldState]:
+    """Index one validated Hold snapshot by the key a card is rendered from."""
+
+    return {(latch.scope, latch.target_id): latch for latch in snapshot}
+
+
 def _agent_entry(agent_id: str, host: Optional[HoldState], agent: Optional[HoldState]):
     # Compose through the runtime dataclass rather than an `or` here: "held"
     # is an authority rule, and the console must not own a second copy of it.
@@ -263,18 +271,24 @@ async def host_hold_state(request: Request, response: Response):
     response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
     store = _hold_store(request)
     targets = _inventory(request)
+    # ONE validated snapshot, not one read per card. Every `get_hold` enters
+    # the Hold evidence protocol, takes its cross-process serialization lock,
+    # and revalidates the database-wide receipt graph — work that is O(the
+    # whole receipt history) and does not shrink because the caller only wants
+    # one target. Every open console polls this route every few seconds, so
+    # 1 + N of those would contend with real Hold mutations and with the
+    # turn-start check for the whole fleet. `read_boot_state` is the store's
+    # own "every active latch from one stable snapshot" read: one protocol
+    # entry, one locked history validation, every latch this door projects.
     try:
-        host = await store.get_hold(HoldScope.HOST)
-        agents = [
-            _agent_entry(
-                agent_id,
-                host,
-                await store.get_hold(HoldScope.AGENT, agent_id),
-            )
-            for agent_id in targets
-        ]
+        active = _active_latches(await store.read_boot_state())
     except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
+    host = active.get((HoldScope.HOST, HOST_HOLD_TARGET))
+    agents = [
+        _agent_entry(agent_id, host, active.get((HoldScope.AGENT, agent_id)))
+        for agent_id in targets
+    ]
     return {
         "can_hold": caller_is_sovereign(request),
         "host_hold": hold_latch_payload(host),

@@ -8,9 +8,11 @@ host cannot read is reported as unreadable rather than as "nothing is held".
 """
 
 import sqlite3
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -27,10 +29,13 @@ from kestrel_sovereign.hold import (
     HoldReceipt,
     HoldScope,
     HoldState,
+    HoldStore,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 ALPHA = "did:test:alpha"
 BETA = "did:test:beta"
+GAMMA = "did:test:gamma"
 WHEN = "2026-09-15T10:00:00+00:00"
 
 
@@ -75,12 +80,31 @@ class _Store:
         self.set_calls = []
         self.release_calls = []
         self.read_error = None
+        # Which read the door made, in order, so "one snapshot" is asserted as
+        # a count rather than inferred from the body it happened to produce.
+        self.reads = []
 
+    # The real store still offers the per-target read, so the double keeps it:
+    # it is what makes "one snapshot" a measurement rather than an assumption.
+    # Removing it would turn a per-card read into an AttributeError instead of
+    # a legible count.
     async def get_hold(self, scope, target_id=None):
+        self.reads.append("get_hold")
         if self.read_error is not None:
             raise self.read_error
         key = (HoldScope(scope), target_id or "host")
         return self.latches.get(key)
+
+    async def read_boot_state(self):
+        self.reads.append("read_boot_state")
+        if self.read_error is not None:
+            raise self.read_error
+        return tuple(
+            sorted(
+                self.latches.values(),
+                key=lambda latch: (latch.scope.value, latch.target_id),
+            )
+        )
 
     async def set_hold(self, *, scope, actor_id, reason, operation_id, target_id=None):
         self.set_calls.append(
@@ -198,6 +222,101 @@ def test_read_composes_the_two_independent_latches_per_agent():
     assert beta["agent_hold"] is None
     assert beta["held"] is True
     assert beta["sources"] == ["host"]
+
+
+def test_the_inventory_costs_one_store_read_not_one_per_card():
+    store = _Store(
+        latches={
+            (HoldScope.HOST, "host"): _latch(HoldScope.HOST, "host", reason="fleet freeze"),
+            (HoldScope.AGENT, ALPHA): _latch(HoldScope.AGENT, ALPHA, receipt="agent-7"),
+        }
+    )
+    app, _ = _app(
+        agents=(("Alpha", ALPHA), ("Beta", BETA), ("Gamma", GAMMA)),
+        caller=_sovereign(),
+        store=store,
+    )
+
+    payload = TestClient(app).get("/api/host/hold").json()
+
+    # Every console polls this route every few seconds. A per-card read would
+    # re-enter the evidence protocol and revalidate the whole receipt graph
+    # once per agent, contending with real Hold mutations for the whole fleet.
+    assert store.reads == ["read_boot_state"], (
+        f"the poll made {len(store.reads)} store reads for 3 cards: {store.reads}"
+    )
+    # ...and the same body a per-card read produced, for all three shapes.
+    assert payload["host_hold"]["reason"] == "fleet freeze"
+    alpha, beta, gamma = payload["agents"]
+    assert alpha["sources"] == ["host", "agent"]
+    assert alpha["agent_hold"]["hold_receipt_id"] == "agent-7"
+    assert beta["agent_hold"] is None and beta["held"] is True
+    assert gamma["sources"] == ["host"]
+
+
+async def test_one_snapshot_is_measured_against_the_real_store(tmp_path, monkeypatch):
+    """The cost this door pays, counted where the double cannot flatter it.
+
+    The stand-in above proves the door makes ONE call; only the real store
+    proves that call is one evidence-protocol entry and that its snapshot
+    carries the host latch under the key this door indexes by.
+    """
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "host.db"))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        await store.set_hold(
+            scope=HoldScope.HOST,
+            actor_id="sovereign-key",
+            reason="fleet freeze",
+            operation_id="op-host",
+        )
+        await store.set_hold(
+            scope=HoldScope.AGENT,
+            target_id=ALPHA,
+            actor_id="sovereign-key",
+            reason="runaway",
+            operation_id="op-alpha",
+        )
+        app, _ = _app(
+            agents=(("Alpha", ALPHA), ("Beta", BETA), ("Gamma", GAMMA)),
+            caller=_sovereign(),
+            store=store,
+        )
+
+        entries = 0
+        enter_protocol = HoldStore._evidence_protocol
+
+        @asynccontextmanager
+        async def counting_protocol(self):
+            nonlocal entries
+            entries += 1
+            async with enter_protocol(self):
+                yield
+
+        monkeypatch.setattr(HoldStore, "_evidence_protocol", counting_protocol)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/api/host/hold")
+
+        assert response.status_code == 200, response.text
+        assert entries == 1, (
+            f"one poll took the Hold evidence lock {entries} times for 3 cards"
+        )
+        payload = response.json()
+        assert payload["host_hold"]["reason"] == "fleet freeze"
+        assert payload["host_hold"]["target_id"] == "host"
+        alpha, beta, gamma = payload["agents"]
+        assert alpha["agent_id"] == ALPHA
+        assert alpha["sources"] == ["host", "agent"]
+        assert alpha["agent_hold"]["reason"] == "runaway"
+        assert beta["agent_hold"] is None and beta["held"] is True
+        assert gamma["sources"] == ["host"]
+    finally:
+        await db.close()
 
 
 def test_read_reports_authority_without_refusing_the_view():

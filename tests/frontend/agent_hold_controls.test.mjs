@@ -203,9 +203,19 @@ function mountInto(config, items = [agentItem()]) {
     return { el, handle };
 }
 
-function openContextMenu(row) {
-    const event = new dom.window.MouseEvent('contextmenu', { bubbles: true, clientX: 5, clientY: 5 });
+// `contextmenu` is cancelable in a browser, so dispatch it that way: whether
+// the handler took the gesture from the browser is only observable on an event
+// that could actually be cancelled.
+function rightClick(row) {
+    const event = new dom.window.MouseEvent('contextmenu', {
+        bubbles: true, cancelable: true, clientX: 5, clientY: 5,
+    });
     row.dispatchEvent(event);
+    return event;
+}
+
+function openContextMenu(row) {
+    rightClick(row);
     return document.querySelector('.kebab-menu');
 }
 
@@ -601,6 +611,39 @@ test('right-click is an accelerator onto the same menu, beside a focusable butto
     handle.destroy();
 });
 
+// An accelerator may only take the browser's own context menu when it has one
+// of ours to put there. Suppressing the native menu on a card whose kebab is
+// disabled leaves the right-click doing nothing at all — the opposite of an
+// accelerator beside a visible path.
+test('right-click keeps the browser menu when there is no menu of ours to open', async () => {
+    const api = holdApi();
+    const { el, handle } = mountInto({ api });
+    await tick();
+    await tick();
+
+    const row = el.querySelector('.agent-card');
+    const kebab = el.querySelector('.agent-card-kebab');
+    assert.equal(kebab.disabled, false);
+    const accelerated = rightClick(row);
+    assert.ok(document.querySelector('.kebab-menu'), 'our menu opened');
+    assert.equal(accelerated.defaultPrevented, true,
+        'so the gesture is ours and the browser must not also answer it');
+    closeKebabMenu();
+
+    // The caller turns out to lack sovereign authority, so the kebab disables
+    // and no menu of ours can open for this gesture.
+    api.canHold = false;
+    await handle.refreshHoldState();
+    assert.equal(el.querySelector('.agent-card-kebab').disabled, true);
+
+    const suppressed = rightClick(row);
+    assert.equal(document.querySelector('.kebab-menu'), null,
+        'the accelerator cannot bypass the disabled control');
+    assert.equal(suppressed.defaultPrevented, false,
+        'and with nothing of ours to show, the browser keeps its own menu');
+    handle.destroy();
+});
+
 test('the latch is addressed by the host record, not by whatever matched the card', async () => {
     const api = holdApi({ agentHold: latch({ receipt: 'agent-3' }) });
     // The default adapter falls back to the ROUTING KEY for `id` when a payload
@@ -639,9 +682,11 @@ test('an unresolved or ambiguous card identity never invents a latch target', as
     const kebab = el.querySelector('.agent-card-kebab');
     assert.equal(kebab.disabled, true);
     assert.equal(kebab.title, 'Hold controls are unavailable');
-    openContextMenu(el.querySelector('.agent-card'));
+    const event = rightClick(el.querySelector('.agent-card'));
     assert.equal(document.querySelector('.kebab-menu'), null,
         'the accelerator cannot bypass the disabled control');
+    assert.equal(event.defaultPrevented, false,
+        'and a card with no latch target keeps the browser context menu');
     handle.destroy();
 });
 
