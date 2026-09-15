@@ -29,7 +29,7 @@ from kestrel_sovereign.storage.session_grouping import (
     parse_message_metadata,
     summarize_sessions,
 )
-from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -53,7 +53,7 @@ from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
 )
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
-from kestrel_sovereign.knowledge import Visibility
+from kestrel_sovereign.knowledge import IRI, Visibility
 
 # Lazy import to avoid circular dependency with features.privacy
 # Note: This global cache is shared across all instances and async contexts.
@@ -1579,6 +1579,12 @@ class PrivacyEnforcingStorage:
         # and the producer returning its registered artifact.
         self._active_semantic_artifact_producer_leases = 0
         self._active_session_projection_leases = 0
+        # The strategy-ledger assertion producer (#3051) reads the canonical
+        # assertions for its predicates and then writes, supersedes or retracts
+        # across many awaits. It needs the same synchronous linearization point:
+        # a transition landing between the binding and a commit would classify a
+        # write under a policy that is no longer in force.
+        self._active_ledger_assertion_leases = 0
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -2236,6 +2242,43 @@ class PrivacyEnforcingStorage:
             if self._active_semantic_artifact_producer_leases <= 0:
                 raise RuntimeError("semantic artifact producer privacy lease underflow")
             self._active_semantic_artifact_producer_leases -= 1
+
+    def _acquire_ledger_assertion_binding(self) -> SemanticAssertionBinding:
+        """Atomically check policy, lease the transition, and bind metadata.
+
+        One step, under the lock every other lease uses, and returning the
+        binding is the point: a producer that checks the policy, then reads the
+        binding, then awaits, has three separate observations of a value that
+        can change between them. A transition landing mid-projection would
+        classify an assertion ``normal``/``private`` under a policy that had
+        already become ``public`` — a durable record of the wrong policy, which
+        no later reconciliation corrects because the row itself is unchanged.
+        """
+        with self._explicit_fact_lease_lock:
+            self._assert_semantic_assertion_write_allowed(
+                "strategy_ledger_assertions"
+            )
+            raw_binding = self._storage.semantic_assertion_binding()
+            is_public = self._privacy_config.sharing == "public"
+            self._active_ledger_assertion_leases += 1
+            return SemanticAssertionBinding(
+                tenant_id=raw_binding.tenant_id,
+                owning_agent_id=raw_binding.owning_agent_id,
+                privacy_classification="public" if is_public else "normal",
+                release_policy_reference=(
+                    "policy:privacy:public-v1"
+                    if is_public
+                    else "policy:privacy:normal-v1"
+                ),
+                visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
+            )
+
+    def _release_ledger_assertion_lease(self) -> None:
+        """Release one ledger-projection lease, including cancellation paths."""
+        with self._explicit_fact_lease_lock:
+            if self._active_ledger_assertion_leases <= 0:
+                raise RuntimeError("strategy ledger assertion privacy lease underflow")
+            self._active_ledger_assertion_leases -= 1
     
     def set_privacy_mode(self, mode: Union[PrivacyMode, PrivacyConfig, str]) -> None:
         """
@@ -2261,13 +2304,15 @@ class PrivacyEnforcingStorage:
                     or self._active_semantic_vector_leases > 0
                     or self._active_semantic_artifact_producer_leases > 0
                     or self._active_session_projection_leases > 0
+                    or self._active_ledger_assertion_leases > 0
                 )
             ):
                 raise PrivacyViolationError(
                     "privacy configuration transition refused while an "
                     "explicit semantic fact, vector operation, governed artifact "
-                    "producer, or session-projection read is in flight; retry "
-                    "the transition after that operation completes"
+                    "producer, strategy-ledger assertion projection, or "
+                    "session-projection read is in flight; retry the transition "
+                    "after that operation completes"
                 )
             was_ephemeral = old_config.is_ephemeral()
             is_ephemeral = new_config.is_ephemeral()
@@ -3285,6 +3330,325 @@ class PrivacyEnforcingStorage:
                 "semantic persistence requires an approved redacted assertion "
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
+
+    async def project_strategy_ledger_assertions(self, ledger):
+        """Project the canonical strategy ledger into canonical assertions (#3051).
+
+        The producer's awaits live here rather than in the feature, for the same
+        reason the explicit-fact lifecycle does: a privacy-transition lease has
+        to span the binding, every read and every write. The mapping itself owns
+        no storage handle and no policy — see
+        :mod:`kestrel_sovereign.features.strategic_memory.ledger_assertions`.
+
+        Best-effort at the boundary: ``STRATEGY_LEDGER.yaml`` is canonical and
+        has already persisted, so a semantic write that cannot land must not
+        fail the ledger mutation. The report says what happened; the next
+        projection reconciles.
+        """
+        from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
+            LedgerAssertionReport,
+        )
+
+        report = LedgerAssertionReport()
+        try:
+            binding = self._acquire_ledger_assertion_binding()
+        except PrivacyViolationError as error:
+            # Not a failure to write — a policy that forbids writing at all.
+            # Reported as its own outcome so a caller cannot read it as "the
+            # ledger projected cleanly and found nothing to do".
+            report.skipped_reason = "privacy_denied"
+            logger.debug("strategy ledger assertions not projected: %s", error)
+            return report
+        try:
+            return await self._project_strategy_ledger_assertions_leased(
+                ledger, binding, report
+            )
+        finally:
+            self._release_ledger_assertion_lease()
+
+    async def _project_strategy_ledger_assertions_leased(
+        self, ledger, binding, report
+    ):
+        """Run one projection pass while the privacy lease is held."""
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.knowledge import AssertionStatus
+
+        # A StrategyLedger, never a bare mapping. A mapping cannot express the
+        # difference between "no rows", "could not be read" and "never
+        # existed", and both of those distinctions gate an irreversible
+        # retraction sweep. ``ledger_index`` takes the ledger for the weaker
+        # version of this reason; here accepting a mapping as a convenience
+        # would leave the next caller a fast path around both guards below.
+        if isinstance(ledger, Mapping):
+            raise TypeError(
+                "project_strategy_ledger_assertions requires a StrategyLedger, "
+                "not a bare mapping: readability and file presence must travel "
+                "with the rows"
+            )
+        if not getattr(ledger, "readable", True):
+            report.skipped_reason = "ledger_unavailable"
+            return report
+        if not getattr(ledger, "has_canonical_file", True):
+            # A file that was never opened is not a file whose rows were
+            # deleted, and here the difference is irreversible: the keep-set
+            # would be empty, every assertion would be retracted, and
+            # retraction is terminal for this adapter — restoring the file
+            # afterwards reports ``blocked_terminal`` forever. The graph index
+            # survives the same event because its writes are upserts; this one
+            # has to refuse instead.
+            report.skipped_reason = "ledger_absent"
+            return report
+        ledger_data = getattr(ledger, "data", {}) or {}
+
+        try:
+            plan = ledger_assertions.build_proposal_plan(
+                ledger_data, tenant_id=binding.tenant_id
+            )
+        except Exception as error:  # noqa: BLE001 - never fail a persisted write
+            logger.warning("strategy ledger assertion mapping unavailable: %s", error)
+            report.skipped_reason = "mapping_unavailable"
+            return report
+
+        report.unmappable = plan.unmappable
+        report.skipped = plan.skipped
+        report.refused_sections = dict(plan.refused_sections)
+
+        current = await self._read_ledger_assertions(plan, report)
+        if current is None:
+            return report
+
+        # Seeded with the rows that are present but unassertable, so
+        # reconciliation leaves them alone. "The row is gone" and "the row is
+        # here but currently says nothing" are different facts.
+        keep: set[str] = set(plan.protected)
+        for proposal in plan.proposals:
+            keep.add(proposal.assertion_id)
+            await self._apply_ledger_proposal(
+                proposal, current.get(proposal.assertion_id), binding, report
+            )
+
+        # Reconcile: an assertion whose row is gone, or retired in place, stops
+        # being held. Scoped to this adapter's own predicates, its own
+        # provenance grammar, and sections whose canonical state is unambiguous.
+        for assertion_id, held in current.items():
+            if assertion_id in keep:
+                continue
+            if held.status is not AssertionStatus.ACTIVE:
+                continue
+            section_key = plan.predicates.get(held.predicate.value)
+            if section_key is None or section_key in plan.refused_sections:
+                continue
+            await self._retract_ledger_assertion(held, report)
+        return report
+
+    async def _read_ledger_assertions(self, plan, report):
+        """Every current assertion on this adapter's predicates, paged in full.
+
+        Returns ``None`` when the read failed, which is deliberately different
+        from an empty mapping: "no assertions" authorizes writes and
+        retractions, "could not read" authorizes neither.
+
+        Terminal statuses are read too. Filtering to active would make a
+        retracted row indistinguishable from one never written, and the
+        difference is load-bearing — the store replays the original accepted
+        receipt for a repeated operation, so writing over a retraction reports
+        success while nothing becomes active.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.knowledge import AssertionQuery
+
+        statuses = ledger_assertions.statuses_for_current_read()
+        page_size = ledger_assertions.READ_PAGE_SIZE
+        current: dict = {}
+        for predicate_value in sorted(plan.predicates):
+            cursor = None
+            while True:
+                try:
+                    page = await self.query_assertions(
+                        AssertionQuery(
+                            subject=plan.subject,
+                            predicate=IRI(predicate_value),
+                            statuses=statuses,
+                            limit=page_size,
+                            cursor=cursor,
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(
+                        "strategy ledger assertion read failed: %s", error
+                    )
+                    report.skipped_reason = "assertion_read_failed"
+                    return None
+                for assertion in page:
+                    current[assertion.assertion_id] = assertion
+                if len(page) < page_size:
+                    break
+                # The store pages on ``revision_id ASC`` with a strict ``>``
+                # cursor, so the last row of a full page is the next cursor.
+                cursor = page[-1].revision_id
+        return current
+
+    async def _apply_ledger_proposal(self, proposal, held, binding, report):
+        """Write, revise, or decline one row's assertion."""
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.knowledge import AssertionStatus
+
+        if held is None:
+            action = ledger_assertions.ACTION_WRITE
+            predecessor = None
+        else:
+            # Cheap unchanged-check FIRST, and only on the branch that mutates
+            # nothing. ``revision_id`` carries the content digest in a parseable
+            # position exactly so a steady-state pass costs one paged query
+            # rather than a provenance read per row — and reindex runs after
+            # every ledger mutation, so on a production-shaped ledger (358
+            # patterns) the read-per-row was 358 extra awaits each time.
+            #
+            # Safe because this branch can only decline to act: every branch
+            # below that actually writes still proves ownership from
+            # provenance, so P1 "markers are not ownership" holds regardless.
+            #
+            # Stated plainly rather than implied: an assertion that reproduces
+            # our markers AND our revision grammar AND the row's exact content
+            # digest is counted ``unchanged`` here without a provenance read,
+            # so a foreign writer who managed all three is reported as
+            # unchanged rather than foreign. It is still never superseded or
+            # retracted. Distinguishing it would cost the per-row read this
+            # branch exists to avoid, and by construction it asserts
+            # byte-identical content to what we would have written; only its
+            # lineage differs. A competing writer with anything to say will
+            # differ in content and is reported foreign below.
+            if (
+                held.status is AssertionStatus.ACTIVE
+                and ledger_assertions.declares_adapter_markers(
+                    held, proposal.ontology
+                )
+                and ledger_assertions.content_digest_of(held)
+                == proposal.content_digest
+            ):
+                report.unchanged += 1
+                return
+            if not await self._ledger_assertion_is_ours(held, proposal):
+                report.foreign += 1
+                return
+            if held.status is not AssertionStatus.ACTIVE:
+                # Terminal for this adapter: the canonical store offers
+                # restoration only to the save_fact shell and reactivation only
+                # to inferred assertions. Calling put_assertion here would
+                # replay the original receipt and report a success that left
+                # the assertion terminal.
+                report.blocked_terminal += 1
+                return
+            # Reaching here means the cheap check above already established the
+            # content differs; re-deciding it would be a second copy of one
+            # rule, and a second copy is a rule that eventually disagrees with
+            # itself.
+            action = ledger_assertions.ACTION_REVISE
+            predecessor = held.revision_id
+
+        transition = ledger_assertions.transition_digest(
+            content_digest=proposal.content_digest,
+            predecessor_revision_id=predecessor,
+            action=action,
+        )
+        source = ledger_assertions.build_source(
+            proposal,
+            transition=transition,
+            owning_agent_id=binding.owning_agent_id,
+        )
+        assertion = ledger_assertions.build_assertion(
+            binding=binding,
+            proposal=proposal,
+            source=source,
+            transition=transition,
+            supersedes_revision_id=predecessor,
+        )
+        operation_id = ledger_assertions.operation_id(
+            action=action, transition=transition
+        )
+        try:
+            if action == ledger_assertions.ACTION_WRITE:
+                result = await self.put_assertion(
+                    assertion,
+                    source_occurrences=(source,),
+                    operation_id=operation_id,
+                )
+            else:
+                result = await self.supersede_assertion(
+                    predecessor,
+                    assertion,
+                    source_occurrences=(source,),
+                    operation_id=operation_id,
+                )
+        except Exception as error:  # noqa: BLE001 - the YAML write already landed
+            logger.warning(
+                "strategy ledger assertion %s failed: %s", action, error
+            )
+            report.failed += 1
+            return
+        if not getattr(result, "accepted", False):
+            report.failed += 1
+            return
+        if action == ledger_assertions.ACTION_WRITE:
+            report.projected += 1
+        else:
+            report.revised += 1
+
+    async def _retract_ledger_assertion(self, held, report):
+        """Retract one adapter assertion whose canonical row no longer holds."""
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+
+        if not await self._ledger_assertion_is_ours(held):
+            report.foreign += 1
+            return
+        content_digest = ledger_assertions.content_digest_of(held) or ""
+        transition = ledger_assertions.transition_digest(
+            content_digest=content_digest,
+            predecessor_revision_id=held.revision_id,
+            action=ledger_assertions.ACTION_RETRACT,
+        )
+        try:
+            await self.retract_assertion(
+                held.assertion_id,
+                held.revision_id,
+                operation_id=ledger_assertions.operation_id(
+                    action=ledger_assertions.ACTION_RETRACT,
+                    transition=transition,
+                ),
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning("strategy ledger assertion retraction failed: %s", error)
+            report.failed += 1
+            return
+        report.retracted += 1
+
+    async def _ledger_assertion_is_ours(self, held, proposal=None) -> bool:
+        """Whether this adapter may change ``held``.
+
+        Marker fields are necessary and never sufficient: any canonical writer
+        can set ``confidence_method`` and ``confidence_basis``, so ownership is
+        settled by the bounded provenance grammar the adapter actually wrote.
+        An assertion that merely claims our markers is reported foreign and left
+        exactly as it is.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+
+        ontology_ref = proposal.ontology if proposal is not None else None
+        if ontology_ref is None:
+            try:
+                ontology_ref = ledger_assertions.ontology()
+            except Exception:  # noqa: BLE001
+                return False
+        if not ledger_assertions.declares_adapter_markers(held, ontology_ref):
+            return False
+        try:
+            sources = await self.list_assertion_sources(held.assertion_id)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "strategy ledger assertion provenance read failed: %s", error
+            )
+            return False
+        return ledger_assertions.has_adapter_provenance(sources)
 
     async def save_explicit_fact(
         self,

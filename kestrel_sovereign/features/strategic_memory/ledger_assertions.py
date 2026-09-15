@@ -164,6 +164,19 @@ ACTION_WRITE = "write"
 ACTION_REVISE = "revise"
 ACTION_RETRACT = "retract"
 
+#: Page size for the executor's read of current adapter assertions.
+#:
+#: The read is deliberately paged to exhaustion rather than capped: it is the
+#: keep-set's own baseline, and a saturated page is indistinguishable from a
+#: complete one. Capping it would make every assertion past the cap look like a
+#: row that was never written — so the next pass would write over it, and the
+#: pass after that would retract whatever fell off the far end. There is no
+#: per-pass write budget for the same reason: a partial pass that nothing
+#: resumes leaves the store permanently short of the canonical file, and the
+#: ledger's production shape (Emma: 358 patterns, 80 blockers) is already past
+#: any cap worth naming.
+READ_PAGE_SIZE = 200
+
 
 class LedgerAssertionMappingError(ValueError):
     """A ledger row cannot be represented by this bounded adapter."""
@@ -239,11 +252,24 @@ def row_content_digest(section: LedgerSection, row: Mapping[str, Any]) -> str:
     rather than revised: the digest answers "is this row the same row it was",
     and a rule that answers it differently depending on which branch is about
     to consume it is two rules.
+
+    Includes the row's own id for the same reason, and it is load-bearing.
+    Every derived identity — revision, source occurrence, operation — descends
+    from this digest, while the ASSERTION id descends from the row id. Two
+    byte-identical rows are two rows (``_unique_id`` mints ``pat_X`` and
+    ``pat_X-2`` precisely so one can be resolved without the other), so a
+    content-only digest gave two distinct assertions one revision id and one
+    operation id. That is reachable from the shipped tool: ``strategy_add_pattern``
+    twice with the same text on the same day, since ``recorded_at`` is
+    date-only. The second row then failed to write on every reindex, forever,
+    with the store correctly refusing an operation id already spent on a
+    different mutation.
     """
     fields = _SECTION_CONTENT_FIELDS[section.ledger_key]
     material = {
         "adapter_version": LEDGER_ADAPTER_VERSION,
         "section": section.ledger_key,
+        "row": section.row_id(row),
         "fields": {name: str(row.get(name) or "") for name in fields},
     }
     return _canonical_digest(material)
@@ -322,6 +348,10 @@ class LedgerRowProposal:
 class LedgerProposalPlan:
     """What the canonical ledger says, ready for the governed executor."""
 
+    #: The one subject every row of this tenant's ledger asserts against, so
+    #: the executor's read is scoped by the same term the write uses rather
+    #: than by a second derivation of it.
+    subject: IRI
     proposals: Tuple[LedgerRowProposal, ...]
     #: Predicate IRI value -> section key, for scoping reconciliation.
     predicates: Mapping[str, str]
@@ -331,6 +361,18 @@ class LedgerProposalPlan:
     refused_sections: Mapping[str, str]
     #: Rows that cannot be addressed as an IRI at all.
     unmappable: int
+    #: Assertion ids whose canonical row is still PRESENT and active but which
+    #: this pass does not assert — today, a row whose text has been blanked.
+    #:
+    #: They are protected from reconciliation rather than retracted. "The row
+    #: is gone" and "the row is here but currently says nothing" are different
+    #: facts, and conflating them is irreversible here: retraction is terminal
+    #: for this adapter, so restoring the text later reports
+    #: ``blocked_terminal`` forever. Absence of a claim is not a claim of
+    #: absence.
+    protected: Tuple[str, ...] = ()
+    #: How many present rows were protected rather than asserted.
+    skipped: int = 0
 
 
 def map_ledger_row(
@@ -380,21 +422,63 @@ def build_proposal_plan(
     reconciliation either, because a keep-set built from an ambiguous section
     cannot distinguish "this row was removed" from "this row lost a
     collision".
+
+    A row that is PRESENT but unassertable is handled differently from a row
+    that is gone, and the distinction is load-bearing because retraction is
+    terminal here:
+
+    * **Text blanked** (``is_projectable`` false) — the row still exists and is
+      still active, it just currently says nothing. Its assertion is
+      ``protected`` from reconciliation rather than retracted, so restoring the
+      text re-projects instead of hitting ``blocked_terminal`` forever.
+    * **Row id not IRI-safe** — the section is refused whole, exactly as for
+      duplicates, and for the same reason: the id is unusable, so the assertion
+      it would name cannot be computed, so it cannot be protected individually
+      either. Refusing is the only option that does not risk retracting it.
+    * **Retired in place** (``superseded_at``/``resolved_at``) — genuinely no
+      longer held, so it is deliberately absent from both sets and the
+      reconciliation retracts it. That is a deliberate, tool-supported act;
+      blanking a text field is not.
     """
     ontology_ref = ontology_ref or ontology()
     proposals: List[LedgerRowProposal] = []
+    protected: List[str] = []
     predicates: Dict[str, str] = {}
     refused: Dict[str, str] = {}
     unmappable = 0
+    skipped = 0
 
+    data = dict(ledger_data or {})
     for section in _SECTIONS:
         predicate = IRI(f"{ontology_ref.namespace}{section_term(section)}")
         predicates[predicate.value] = section.ledger_key
-        rows = [
-            row
-            for row in section.rows(dict(ledger_data or {}))
-            if section.is_projectable(row)
-        ]
+        # Every row, not only the projectable ones: a blank-texted row still
+        # occupies its id, so a duplicate between it and an asserted row is the
+        # same ambiguity a duplicate between two asserted rows is.
+        rows = section.rows(data)
+
+        # A section member that is not a mapping is silently dropped by
+        # ``_dict_rows``, so it is invisible to BOTH classifications while its
+        # section stays in scope for reconciliation. If that member used to be
+        # a well-formed row, its assertion is then terminally retracted by a
+        # hand edit that mangled one line. Refuse the section instead, exactly
+        # as for an unusable id.
+        raw = data.get(section.ledger_key)
+        if isinstance(raw, list) and len(raw) != len(rows):
+            unmappable += len(raw) - len(rows)
+            refused[section.ledger_key] = "malformed_rows"
+            continue
+
+        # An id-less row is addressed by a digest of its own TEXT, so editing
+        # that text moves its address and orphans the assertion written under
+        # the old one — terminally. ``StrategyLedger.normalize`` mints ids and
+        # the feature persists them before projecting, so this is unreachable
+        # on the healthy path; it becomes reachable when that save failed. The
+        # keep-set must not depend on a write having succeeded elsewhere.
+        if any(not str(row.get("id") or "").strip() for row in rows):
+            refused[section.ledger_key] = "unaddressed_rows"
+            continue
+
         seen: Dict[str, int] = {}
         for row in rows:
             seen[section.row_id(row)] = seen.get(section.row_id(row), 0) + 1
@@ -402,28 +486,38 @@ def build_proposal_plan(
         if duplicates:
             refused[section.ledger_key] = "duplicate_row_ids"
             continue
+        unusable = [
+            row for row in rows
+            if not _ROW_ID_RE.fullmatch(section.row_id(row) or "")
+        ]
+        if unusable:
+            unmappable += len(unusable)
+            refused[section.ledger_key] = "unmappable_row_ids"
+            continue
         for row in rows:
             if not section.is_active(row):
                 # A retired row is still a row; it simply no longer supports
                 # the claim. Reconciliation retracts its assertion by way of
                 # the keep-set, so it is deliberately absent from here.
                 continue
-            try:
-                proposals.append(
-                    map_ledger_row(
-                        section,
-                        row,
-                        tenant_id=tenant_id,
-                        ontology_ref=ontology_ref,
-                    )
-                )
-            except LedgerAssertionMappingError:
-                unmappable += 1
+            mapped = map_ledger_row(
+                section, row, tenant_id=tenant_id, ontology_ref=ontology_ref
+            )
+            if not section.is_projectable(row):
+                # Present, active, and currently says nothing. Keep it; do not
+                # assert it, and above all do not retract it.
+                protected.append(mapped.assertion_id)
+                skipped += 1
+                continue
+            proposals.append(mapped)
     return LedgerProposalPlan(
+        subject=ledger_subject(tenant_id),
         proposals=tuple(proposals),
         predicates=predicates,
         refused_sections=refused,
         unmappable=unmappable,
+        protected=tuple(protected),
+        skipped=skipped,
     )
 
 
@@ -504,13 +598,24 @@ def declares_adapter_markers(
     strings, so nothing is superseded or retracted on their evidence alone —
     :func:`is_adapter_source` checks the provenance grammar before any
     mutation.
+
+    Deliberately says nothing about the revision id. Ownership ("did this
+    adapter author this assertion") and content ("which row state does this
+    revision stand for") are two questions, and a retraction answers them
+    differently: the store mints its own opaque revision id for the tombstone
+    while preserving the markers and provenance. Folding the revision shape in
+    here made the adapter's OWN retracted assertion unrecognizable, so
+    re-adding a hand-deleted row reported ``foreign`` — a claim that some other
+    writer owns the subject, which was false and would have sent an operator
+    looking for a competing producer that does not exist. Content is answered
+    separately by :func:`content_digest_of`, which returns ``None`` rather than
+    a wrong digest for any revision it did not write.
     """
     return (
         assertion.confidence_method == _CONFIDENCE_METHOD
         and assertion.confidence_basis == _CONFIDENCE_BASIS
         and assertion.ontology_version == ontology_ref
         and isinstance(assertion.lineage, DirectLineage)
-        and assertion.revision_id.startswith(_REVISION_PREFIX)
     )
 
 
@@ -547,6 +652,8 @@ class LedgerAssertionReport:
     revised: int = 0
     unchanged: int = 0
     retracted: int = 0
+    #: Present rows this pass deliberately did not assert and did not retract.
+    skipped: int = 0
     foreign: int = 0
     blocked_terminal: int = 0
     unmappable: int = 0
@@ -560,6 +667,7 @@ class LedgerAssertionReport:
             "revised": self.revised,
             "unchanged": self.unchanged,
             "retracted": self.retracted,
+            "skipped": self.skipped,
             "foreign": self.foreign,
             "blocked_terminal": self.blocked_terminal,
             "unmappable": self.unmappable,
@@ -609,6 +717,7 @@ def summarize(reports: Sequence[LedgerAssertionReport]) -> LedgerAssertionReport
         total.revised += item.revised
         total.unchanged += item.unchanged
         total.retracted += item.retracted
+        total.skipped += item.skipped
         total.foreign += item.foreign
         total.blocked_terminal += item.blocked_terminal
         total.unmappable += item.unmappable

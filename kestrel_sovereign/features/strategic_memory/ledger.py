@@ -195,6 +195,26 @@ class StrategyLedger:
         return self.load_error is None
 
     @property
+    def has_canonical_file(self) -> bool:
+        """Whether a canonical file was actually there to be read.
+
+        :meth:`load` treats a missing file as a NEW ledger rather than an
+        error, which is right -- that is how an agent that has never recorded a
+        pattern starts. But "new" and "empty" are the same in-memory state, and
+        a consumer that reconciles against this ledger cannot tell them apart
+        from :attr:`readable` alone: an unmounted volume, a wiped data
+        directory, or a ``StrategyLedger(None)`` all present as a readable
+        ledger with zero rows, which reads as "every row was deleted".
+
+        The graph index tolerates that because its writes are upserts and the
+        next projection rebuilds what it removed. The canonical assertion
+        producer does not: retraction is terminal for it, so a keep-set derived
+        from a file that was never opened destroys the projection permanently.
+        A consumer whose removals are irreversible must check this too.
+        """
+        return self.path is not None and self.path.exists()
+
+    @property
     def needs_save(self) -> bool:
         """Whether normalization minted ids that are still only in memory."""
         return self._unsaved_normalization > 0

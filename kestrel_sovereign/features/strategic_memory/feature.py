@@ -450,13 +450,22 @@ class StrategicMemoryFeature(Feature):
         )
 
     async def _reindex_ledger(self) -> Dict[str, Any]:
-        """Project the ledger into the graph.
+        """Project the ledger into the graph AND into canonical assertions.
 
         Never raises and never touches the ledger file: the canonical record is
         already on disk, so a graph failure must not turn into a strategic-
         memory failure. Reconciles rather than merely upserting, for the same
         reason the decision index does -- a row deleted from the canonical file
         must stop being reachable through the index.
+
+        The two projections are siblings, not a chain. They answer different
+        questions (structural index vs. canonical semantic claim), they fail
+        for different reasons, and the graph's own guards -- notably the
+        ``agent_id`` it derives node ids from -- say nothing about whether the
+        assertion store can be written. Sequencing the assertion producer
+        behind a graph early-return would have made an agent with no readable
+        ``agent_id`` silently produce nothing here, which is the shape #3051
+        exists to close.
         """
         if not self._ledger.readable:
             # An unreadable ledger is not an empty one. Reconciliation derives
@@ -472,6 +481,12 @@ class StrategicMemoryFeature(Feature):
             )
             return {"projected": 0, "skipped": 0, "failed": 0,
                     "skipped_reason": "ledger_unavailable"}
+        report = await self._project_ledger_graph()
+        report["assertions"] = await self._project_ledger_assertions()
+        return report
+
+    async def _project_ledger_graph(self) -> Dict[str, Any]:
+        """Upsert the ledger's rows as typed graph nodes (#2954)."""
         agent_id = self._projection_agent_id()
         if not agent_id:
             logger.warning(
@@ -489,6 +504,34 @@ class StrategicMemoryFeature(Feature):
         if report.get("failed") or report.get("skipped_reason"):
             logger.info("strategy ledger index: %s", report)
         return report
+
+    async def _project_ledger_assertions(self) -> Dict[str, Any]:
+        """Project the ledger's rows as canonical semantic assertions (#3051).
+
+        Delegates every await to the privacy wrapper, which holds a
+        privacy-transition lease across the whole pass. The feature deliberately
+        holds no binding and makes no policy decision of its own -- a producer
+        that classified its own writes would be declaring a privacy mode rather
+        than obeying one.
+
+        Best-effort at exactly the same bar as the graph index: the canonical
+        YAML has already persisted, so nothing here may fail a ledger mutation.
+        """
+        storage = getattr(self.agent, "storage", None)
+        project = getattr(storage, "project_strategy_ledger_assertions", None)
+        if project is None:
+            # A storage facade without the governed producer -- notably a raw
+            # AsyncStorage, which has no privacy policy to project under.
+            return {"skipped_reason": "assertion_producer_unavailable"}
+        try:
+            report = await project(self._ledger)
+        except Exception as e:  # noqa: BLE001 - the producer is best-effort
+            logger.warning("strategy ledger assertion projection failed: %s", e)
+            return {"skipped_reason": "assertion_projection_failed"}
+        data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        if getattr(report, "needs_attention", False):
+            logger.info("strategy ledger assertions: %s", data)
+        return data
 
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
