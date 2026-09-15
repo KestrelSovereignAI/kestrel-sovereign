@@ -27,6 +27,7 @@ from kestrel_sovereign.agent.invocation import (
     validate_invocation_id,
 )
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
+from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
     database_backend_type,
     database_now_sql,
@@ -36,6 +37,37 @@ from .receipt import StopReceiptStore, opaque_stop_identifier
 from .types import StopDisposition
 
 _SCHEMA_LOCK = "stop_invocations_v1"
+
+# Canonical DDL for the two generation ledgers. ONE spelling each: the same
+# template creates a table fresh and adopts a legacy-shaped one, so the two
+# cannot drift (#2804). ``{table}`` is the only placeholder.
+STOP_ACTIVE_INVOCATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS {table} ("
+    "generation_id TEXT NOT NULL PRIMARY KEY, "
+    "agent_id TEXT NOT NULL, "
+    "turn_digest TEXT NOT NULL, "
+    "public_turn_digest TEXT, "
+    "request_generation INTEGER NOT NULL, "
+    "owner_id TEXT NOT NULL, "
+    "stop_requested INTEGER NOT NULL DEFAULT 0, "
+    "registered_at TEXT NOT NULL, "
+    "heartbeat_at TEXT NOT NULL, "
+    "CHECK (request_generation > 0), "
+    "CHECK (stop_requested IN (0, 1)))"
+)
+STOP_UNRESOLVED_INVOCATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS {table} ("
+    "generation_id TEXT NOT NULL PRIMARY KEY, "
+    "agent_id TEXT NOT NULL, "
+    "turn_digest TEXT NOT NULL, "
+    "public_turn_digest TEXT, "
+    "request_generation INTEGER NOT NULL, "
+    "owner_id TEXT NOT NULL, "
+    "expired_at TEXT NOT NULL, "
+    "CHECK (request_generation > 0))"
+)
+_EXACT_GENERATION_COLUMN = "request_generation"
+_EXACT_GENERATION_CHECK = "request_generation > 0"
 _TURN_ID_DOMAIN = b"kestrel:distributed-stop-turn:v1\0"
 _PUBLIC_TURN_ID_DOMAIN = b"kestrel:distributed-stop-public-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
@@ -84,6 +116,32 @@ def _required_opaque_identity(value: object, field: str) -> str:
         ) from error
 
 
+class StopLegacyRegistrationsError(RuntimeError):
+    """A generation ledger predates exact generations and still holds rows.
+
+    Raised by :meth:`DistributedInvocationStore.ensure_schema` instead of
+    adopting the table. A registration written before ``request_generation``
+    existed has no recorded generation, and no value in the column's domain
+    is honest for it: inventing one is exactly the imprecision the column was
+    added to remove (``cb5154e2b``). The boot that raises this never registers
+    a turn, so nothing runs against the half-shaped ledger; it keeps refusing
+    until the rows are gone (#3292).
+    """
+
+    def __init__(self, table: str, count: int):
+        self.table = table
+        self.count = count
+        message = (
+            f"{table} predates exact Stop generations and still holds {count} "
+            "registration(s) with no recorded generation; refusing to adopt "
+            "the schema. Those rows were written by pre-release Stop code "
+            "(#3292): confirm no owner is live, delete the rows WHERE "
+            f"{_EXACT_GENERATION_COLUMN} IS NULL, and start again. No value "
+            "can be invented for them."
+        )
+        super().__init__(message)
+
+
 @dataclass(frozen=True, slots=True)
 class DistributedStopTicket:
     """The exact durable generations selected at Stop linearization."""
@@ -128,18 +186,9 @@ class DistributedInvocationStore:
         await StopReceiptStore(self._db).ensure_schema()
         async with self._db.migration_lock(_SCHEMA_LOCK):
             await self._db.execute(
-                "CREATE TABLE IF NOT EXISTS stop_active_invocations ("
-                "generation_id TEXT NOT NULL PRIMARY KEY, "
-                "agent_id TEXT NOT NULL, "
-                "turn_digest TEXT NOT NULL, "
-                "public_turn_digest TEXT, "
-                "request_generation INTEGER NOT NULL, "
-                "owner_id TEXT NOT NULL, "
-                "stop_requested INTEGER NOT NULL DEFAULT 0, "
-                "registered_at TEXT NOT NULL, "
-                "heartbeat_at TEXT NOT NULL, "
-                "CHECK (request_generation > 0), "
-                "CHECK (stop_requested IN (0, 1)))"
+                STOP_ACTIVE_INVOCATIONS_DDL.format(
+                    table="stop_active_invocations"
+                )
             )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS stop_invocation_fences ("
@@ -149,15 +198,9 @@ class DistributedInvocationStore:
                 "PRIMARY KEY (agent_id, turn_digest))"
             )
             await self._db.execute(
-                "CREATE TABLE IF NOT EXISTS stop_unresolved_invocations ("
-                "generation_id TEXT NOT NULL PRIMARY KEY, "
-                "agent_id TEXT NOT NULL, "
-                "turn_digest TEXT NOT NULL, "
-                "public_turn_digest TEXT, "
-                "request_generation INTEGER NOT NULL, "
-                "owner_id TEXT NOT NULL, "
-                "expired_at TEXT NOT NULL, "
-                "CHECK (request_generation > 0))"
+                STOP_UNRESOLVED_INVOCATIONS_DDL.format(
+                    table="stop_unresolved_invocations"
+                )
             )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_active_agent_turn "
@@ -175,6 +218,19 @@ class DistributedInvocationStore:
                 "CREATE INDEX IF NOT EXISTS idx_stop_unresolved_owner "
                 "ON stop_unresolved_invocations(owner_id)"
             )
+        # A ledger created before ``request_generation`` (pre-release Stop
+        # code, #3292) must reach the canonical shape before anything reads or
+        # writes it: ``register()`` names the column on every cognition turn.
+        await self._adopt_exact_generation(
+            "stop_active_invocations",
+            STOP_ACTIVE_INVOCATIONS_DDL,
+            lock_name=f"{_SCHEMA_LOCK}:active",
+        )
+        await self._adopt_exact_generation(
+            "stop_unresolved_invocations",
+            STOP_UNRESOLVED_INVOCATIONS_DDL,
+            lock_name=f"{_SCHEMA_LOCK}:unresolved",
+        )
         await self._db.migrate_columns_once(
             "stop_active_invocations",
             (("public_turn_digest", "TEXT"),),
@@ -197,6 +253,68 @@ class DistributedInvocationStore:
             "agent_id, public_turn_digest",
             where="public_turn_digest IS NOT NULL",
         )
+
+    async def _adopt_exact_generation(
+        self, table: str, canonical_ddl: str, *, lock_name: str
+    ) -> None:
+        """Carry a ledger created before ``request_generation`` to canonical.
+
+        ``cb5154e2b`` put the column in the ``CREATE TABLE`` alone, so a table
+        that already existed never gained it, and on such a host every
+        ``register()`` fails at its INSERT: no agent can begin a cognition
+        turn, while every action-mode scheduled tool still reports success
+        (#3292). Adoption takes the #3289 posture: an **empty** legacy ledger
+        is carried to the canonical shape; one that still holds rows is
+        refused with the reason named, because a registration that never
+        recorded its exact generation has no honest value for the column.
+
+        The column is added nullable first (``migrate_columns_once`` is the
+        only portable ALTER: SQLite cannot add a NOT NULL column without a
+        default, and a default *is* the invented value), which makes a legacy
+        row exactly a NULL row. ``ensure_check_constraint`` then converges the
+        shape inside one migration transaction: its remediation refuses while
+        any NULL row exists and, on PostgreSQL, sets NOT NULL in place (a
+        rebuild there discards concurrent writes; on SQLite the rebuild into
+        ``canonical_ddl`` supplies NOT NULL itself). A refused host refuses on
+        every boot until the rows are gone and registers nothing in between:
+        the server does not come up. Both probes are no-ops on a canonical
+        ledger, so a fresh host pays two reads per boot and is never rebuilt.
+        """
+        await self._db.migrate_columns_once(
+            table,
+            ((_EXACT_GENERATION_COLUMN, "INTEGER"),),
+            lock_name=f"{lock_name}-request-generation",
+        )
+
+        async def _refuse_unrecorded_generations() -> None:
+            unrecorded = await self._db.fetchval(
+                f"SELECT COUNT(*) FROM {table} "
+                f"WHERE {_EXACT_GENERATION_COLUMN} IS NULL"
+            )
+            if unrecorded:
+                raise StopLegacyRegistrationsError(table, int(unrecorded))
+            if self._db.backend_type == "postgres":
+                await self._db.execute(
+                    f"ALTER TABLE {table} "
+                    f"ALTER COLUMN {_EXACT_GENERATION_COLUMN} SET NOT NULL"
+                )
+
+        try:
+            await self._db.ensure_check_constraint(
+                table,
+                f"{table}_{_EXACT_GENERATION_COLUMN}_check",
+                _EXACT_GENERATION_CHECK,
+                canonical_ddl=canonical_ddl,
+                remediation=_refuse_unrecorded_generations,
+                lock_name=f"{lock_name}-request-generation-check",
+            )
+        except TransactionError as exc:
+            # The migration transaction wraps whatever its block raised. The
+            # refusal is a named boot outcome, not a storage fault: surface it
+            # as itself so the boot log and any caller can tell the two apart.
+            if isinstance(exc.__cause__, StopLegacyRegistrationsError):
+                raise exc.__cause__ from exc
+            raise
 
     async def _lock_agent(self, agent_id: str) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
