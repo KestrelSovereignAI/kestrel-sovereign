@@ -537,6 +537,10 @@ function makeHoldControls(doc, item, ctx) {
         className: 'agent-card-kebab',
         ariaLabel: `Actions for ${displayName}`,
         title: `${displayName} actions`,
+        // The same document every sibling node above is built in. An embedding
+        // host mounts into ITS document, so a kebab (and the menu it opens)
+        // built in the console's would belong to a tree that host never shows.
+        ownerDocument: doc,
     });
     kebabBtn.disabled = true;
 
@@ -552,7 +556,7 @@ function makeHoldControls(doc, item, ctx) {
     function onContextMenu(event) {
         if (typeof event.preventDefault === 'function') event.preventDefault();
         if (kebabBtn.disabled) return;
-        openMenuAt(menuItems(), positionFromEvent(event));
+        openMenuAt(menuItems(), positionFromEvent(event), { ownerDocument: doc });
     }
 
     function apply(shell, { entry, canHold, hostHold, stale }) {

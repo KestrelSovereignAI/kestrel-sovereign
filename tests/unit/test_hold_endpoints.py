@@ -7,6 +7,7 @@ one, that a release names the receipt the caller saw, and that a store the
 host cannot read is reported as unreadable rather than as "nothing is held".
 """
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -391,6 +392,148 @@ def test_an_agent_scope_hold_requires_a_target():
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "hold_target_required"
     assert store.set_calls == []
+
+
+def _mutations(client):
+    """Every door that reaches the store, so one failure class is asserted at all three."""
+
+    return (
+        ("read", client.get("/api/host/hold")),
+        (
+            "hold",
+            client.post(
+                "/api/host/hold",
+                json={
+                    "scope": "agent",
+                    "target_id": ALPHA,
+                    "reason": "why",
+                    "operation_id": "op-1",
+                },
+            ),
+        ),
+        (
+            "release",
+            client.post(
+                "/api/host/hold/release",
+                json={
+                    "scope": "agent",
+                    "target_id": ALPHA,
+                    "reason": "why",
+                    "operation_id": "op-2",
+                    "expected_hold_receipt_id": "agent-7",
+                },
+            ),
+        ),
+    )
+
+
+def test_an_unexpected_storage_failure_is_never_reported_as_a_caller_mistake():
+    # A driver fault or a programming error is not a bad request, and its text
+    # is not the caller's business: it names the store's internals. Answering
+    # 400 with that text on the wire says the operator sent something wrong,
+    # and tells them what a retriable server failure looked like from inside.
+    boom = sqlite3.OperationalError("no such column: hold_actor_secret")
+    store = _Store(set_error=boom, release_error=boom)
+    store.read_error = boom
+    app, _ = _app(caller=_sovereign(), store=store)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for door, response in _mutations(client):
+        assert response.status_code >= 500, f"{door} misreported a server fault as a 4xx"
+        assert response.json()["error"]["code"] == "internal_error", door
+        assert "hold_actor_secret" not in response.text, f"{door} leaked the store's text"
+        assert "OperationalError" not in response.text, door
+
+
+def test_a_programming_error_in_the_store_is_not_a_bad_request_either():
+    boom = AttributeError("'NoneType' object has no attribute 'execute'")
+    store = _Store(set_error=boom, release_error=boom)
+    store.read_error = boom
+    app, _ = _app(caller=_sovereign(), store=store)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for door, response in _mutations(client):
+        assert response.status_code >= 500, door
+        assert "NoneType" not in response.text, f"{door} leaked the raw exception text"
+
+
+def test_an_unexpected_value_error_in_the_store_is_not_a_bad_request_either():
+    # The hole the two tests above would otherwise leave open. `ValueError` is
+    # what the store raises to refuse a caller argument, so it is the one
+    # server fault that looks like a caller mistake from the outside. This door
+    # answers every caller-chosen argument itself, so a `ValueError` arriving
+    # from the store means a bug here or below -- never a bad request.
+    boom = ValueError("hold latch row shape changed under the reader")
+    store = _Store(set_error=boom, release_error=boom)
+    store.read_error = boom
+    app, _ = _app(caller=_sovereign(), store=store)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    for door, response in _mutations(client):
+        assert response.status_code >= 500, f"{door} misreported a server fault as a 4xx"
+        assert response.json()["error"]["code"] == "internal_error", door
+        assert "row shape changed" not in response.text, f"{door} leaked the raw text"
+
+
+def test_the_host_scope_refuses_a_caller_chosen_target_before_the_store():
+    # The other end of the same boundary: this refusal is real, and answering
+    # it HERE is what lets the store's own `ValueError` be read as a fault
+    # above. A target the store would reject must never reach it.
+    app, store = _app(caller=_sovereign())
+
+    response = TestClient(app).post(
+        "/api/host/hold",
+        json={
+            "scope": "host",
+            "target_id": ALPHA,
+            "reason": "fleet freeze",
+            "operation_id": "op-1",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "hold_request_invalid"
+    assert store.set_calls == [], "a target the store would refuse still reached it"
+    # Our own words, not the store's internals echoed back.
+    assert "host control store" not in response.json()["error"]["message"]
+
+
+def test_the_host_scope_release_refuses_a_caller_chosen_target_too():
+    app, store = _app(caller=_sovereign())
+
+    response = TestClient(app).post(
+        "/api/host/hold/release",
+        json={
+            "scope": "host",
+            "target_id": ALPHA,
+            "reason": "thaw",
+            "operation_id": "op-1",
+            "expected_hold_receipt_id": "receipt-1",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "hold_request_invalid"
+    assert store.release_calls == []
+
+
+def test_the_host_scope_accepts_its_own_fixed_target_name():
+    # `host` is the store's own target for this scope, so naming it explicitly
+    # is not a foreign target -- the refusal above must not swallow it.
+    app, store = _app(caller=_sovereign())
+
+    response = TestClient(app).post(
+        "/api/host/hold",
+        json={
+            "scope": "host",
+            "target_id": "host",
+            "reason": "fleet freeze",
+            "operation_id": "op-1",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert store.set_calls[0]["target_id"] == "host"
 
 
 def test_an_agent_without_a_resolvable_identity_fails_the_inventory_closed():

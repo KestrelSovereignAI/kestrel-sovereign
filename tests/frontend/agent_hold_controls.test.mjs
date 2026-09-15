@@ -28,7 +28,9 @@ globalThis.kicon = globalThis.window.kicon;
 const { mountAgentList, mountAgentListPane } = await import(
     '../../kestrel_sovereign/static/js/agent_list.js'
 );
-const { closeKebabMenu } = await import('../../kestrel_sovereign/static/js/kebab_menu.js');
+const { closeKebabMenu, createKebabButton } = await import(
+    '../../kestrel_sovereign/static/js/kebab_menu.js'
+);
 const { createApiClient } = await import('../../kestrel_sovereign/static/js/api_client.mjs');
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
@@ -867,4 +869,80 @@ test('the pane forwards hold:true — an asserted door draws the surface without
         'asserting the door exists is not asserting this caller may use it');
     assert.ok(el.querySelector('.agent-hold-badge'), 'the resting badge is present, hidden');
     assert.equal(el.querySelector('.agent-hold-badge').hidden, true);
+});
+
+// The component derives every node from `containerEl.ownerDocument`, which is
+// how an embedding host (#3165's shared pane) mounts this list into ITS
+// document rather than the console's. The Hold surface has to honour the same
+// abstraction: a kebab built in the module-global `document` belongs to a tree
+// the host never renders, so the control is simply absent where it matters.
+test('the Hold surface is built in the container\'s document, not the console\'s', async () => {
+    const other = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
+    const otherDoc = other.window.document;
+    assert.notEqual(otherDoc, document, 'the embedding host owns a different document');
+
+    const el = otherDoc.createElement('div');
+    otherDoc.body.appendChild(el);
+    const api = holdApi({ agentHold: latch() });
+    const handle = mountAgentList(el, {
+        api,
+        adapter: { mode: 'multi_agent', listAgents: async () => [agentItem()] },
+        holdStatusIntervalMs: 1e7,
+        askHoldReason: () => 'operator reason',
+    });
+    mounted.push(handle);
+    try {
+        await tick();
+        await tick();
+
+        const kebab = el.querySelector('.agent-card-kebab');
+        assert.ok(kebab, 'the embedded card carries the Hold kebab');
+        assert.equal(kebab.ownerDocument, otherDoc,
+            'the kebab belongs to the document the list was mounted into');
+        // The siblings it sits beside already do — the kebab was the outlier.
+        for (const selector of ['.agent-hold-badge', '.agent-resume-btn', '.agent-hold-outcome']) {
+            assert.equal(el.querySelector(selector).ownerDocument, otherDoc, selector);
+        }
+        assert.equal(document.querySelector('.agent-card-kebab'), null,
+            'and nothing was left behind in the console document');
+
+        // `appendChild` ADOPTS across documents, so the assertion above is
+        // satisfied even by a button created in the console document and then
+        // attached here — it cannot, on its own, tell the defect from the fix.
+        // The menu is what adoption does not launder: it is mounted on the
+        // creating document's own `body`, so a kebab built in the wrong
+        // document opens its menu in a tree the embedding host never renders.
+        kebab.click();
+        const fromButton = otherDoc.querySelector('.kebab-menu');
+        assert.ok(fromButton, 'the menu opens in the embedding document');
+        assert.equal(document.querySelector('.kebab-menu'), null);
+        closeKebabMenu();
+
+        el.querySelector('.agent-card').dispatchEvent(
+            new other.window.MouseEvent('contextmenu', { bubbles: true, clientX: 5, clientY: 5 }),
+        );
+        assert.ok(otherDoc.querySelector('.kebab-menu'),
+            'the right-click accelerator opens the same menu in the same document');
+        assert.equal(document.querySelector('.kebab-menu'), null);
+    } finally {
+        closeKebabMenu();
+        handle.destroy();
+        other.window.close();
+    }
+});
+
+// The primitive's own boundary, asserted where adoption cannot launder it: a
+// button that has never been appended anywhere. Both ends — the option is
+// honoured, and the default that every existing console caller relies on is
+// unchanged.
+test('the kebab primitive builds in the document it is given, and still defaults to the console\'s', () => {
+    const other = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
+    try {
+        const given = createKebabButton(() => [], { ownerDocument: other.window.document });
+        assert.equal(given.ownerDocument, other.window.document);
+        assert.equal(createKebabButton(() => []).ownerDocument, document,
+            'a caller that names no document keeps the module-global one');
+    } finally {
+        other.window.close();
+    }
 });

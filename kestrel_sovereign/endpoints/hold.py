@@ -28,6 +28,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_scoped_agent_did,
 )
 from kestrel_sovereign.hold import (
+    HOST_HOLD_TARGET,
     EffectiveHoldState,
     HoldCorruptStateError,
     HoldIdempotencyConflict,
@@ -165,10 +166,22 @@ def _inventory(request: Request) -> tuple[str, ...]:
 
 
 def _resolve_target(request: Request, scope: HoldScope, target_id: str | None) -> Optional[str]:
-    """Bind an agent latch to a live agent, never to an unread string."""
+    """Bind an agent latch to a live agent, never to an unread string.
+
+    Every caller-supplied target is answered HERE, so that by the time the
+    store is called the only argument it can refuse is one this door got
+    wrong. That is what lets the store's exceptions below be read as server
+    faults rather than sorted, at the wire, into "probably the caller's".
+    """
 
     if scope is HoldScope.HOST:
-        # The store owns the fixed host target; a foreign one is a 400 there.
+        # The host scope has exactly one latch, so there is nothing to name.
+        if target_id not in (None, HOST_HOLD_TARGET):
+            raise ApiHTTPException(
+                status_code=400,
+                code="hold_request_invalid",
+                message="The host Hold scope takes no caller-chosen target.",
+            )
         return target_id
     if target_id is None:
         raise ApiHTTPException(
@@ -192,7 +205,25 @@ def _mutation_payload(mutation: HoldMutation) -> dict[str, Any]:
     }
 
 
-def _refuse_store_failure(error: Exception) -> ApiHTTPException:
+# What the store is expected to raise at this door, and nothing else. A
+# storage driver's OperationalError, or any other unexpected exception —
+# `ValueError` included, since this door validates its own arguments before
+# the store sees them — is neither a caller mistake nor something whose text
+# belongs on the wire. Those are deliberately absent here: they propagate to
+# the server's own handler and become a sanitized 500, the way the sibling
+# host Stop door leaves its own mutation path unwrapped.
+_EXPECTED_HOLD_STORE_FAILURES = HoldStateError
+
+
+def _refuse_store_failure(error: HoldStateError) -> ApiHTTPException:
+    """Project one EXPECTED store refusal onto the wire.
+
+    Total over ``HoldStateError``: the two subclasses carry their own wire
+    meaning, and the base class is the store telling this door its durable
+    state cannot be served. No branch here reports a caller error, because by
+    this point no argument the caller chose is still unvalidated.
+    """
+
     if isinstance(error, HoldIdempotencyConflict):
         return ApiHTTPException(
             status_code=409,
@@ -205,16 +236,10 @@ def _refuse_store_failure(error: Exception) -> ApiHTTPException:
             code="hold_state_corrupt",
             message="Durable Hold state could not be interpreted safely.",
         )
-    if isinstance(error, HoldStateError):
-        return ApiHTTPException(
-            status_code=503,
-            code="hold_state_unavailable",
-            message="Durable Hold state is unavailable.",
-        )
     return ApiHTTPException(
-        status_code=400,
-        code="hold_request_invalid",
-        message=str(error),
+        status_code=503,
+        code="hold_state_unavailable",
+        message="Durable Hold state is unavailable.",
     )
 
 
@@ -248,7 +273,7 @@ async def host_hold_state(request: Request, response: Response):
             )
             for agent_id in targets
         ]
-    except Exception as error:
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
     return {
         "can_hold": caller_is_sovereign(request),
@@ -275,7 +300,7 @@ async def set_host_hold(request: Request, response: Response, body: HoldBody):
             reason=body.reason,
             operation_id=body.operation_id,
         )
-    except Exception as error:
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
     return _mutation_payload(mutation)
 
@@ -299,7 +324,7 @@ async def release_host_hold(
             operation_id=body.operation_id,
             expected_hold_receipt_id=body.expected_hold_receipt_id,
         )
-    except Exception as error:
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
     return _mutation_payload(mutation)
 
