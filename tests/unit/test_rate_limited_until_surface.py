@@ -206,6 +206,31 @@ def test_the_invoke_endpoint_logs_the_decline_at_its_own_logger():
     assert not any(PROVIDER_PROSE in line for line in rendered)
 
 
+def test_the_invoke_endpoint_logs_the_failure_class_and_nothing_of_the_message():
+    """#3297: a 500 that logs only "Agent invocation failed" hides which layer
+    failed. The class name carries no caller content or provider prose and
+    is enough to tell a ``TransactionError`` from a provider error."""
+    from kestrel_sovereign.endpoints import agent as agent_endpoints
+
+    class StorageBroke(RuntimeError):
+        pass
+
+    app, restore = _boot_app(StorageBroke(PROVIDER_PROSE))
+    try:
+        with patch.object(agent_endpoints.logger, "error") as log_error:
+            response = _invoke(app)
+    finally:
+        restore()
+    assert response.status_code == 500
+    rendered = [call.args[0] % tuple(call.args[1:]) for call in log_error.call_args_list]
+    assert any(
+        line == f"Agent invocation failed: {__name__}.{StorageBroke.__qualname__}"
+        for line in rendered
+    ), rendered
+    assert not any(PROVIDER_PROSE in line for line in rendered)
+    assert not any(kw.get("exc_info") for call in log_error.call_args_list for kw in [call.kwargs])
+
+
 def test_chat_completions_answers_429_with_retry_after_when_the_route_declined_to_wait():
     """The OpenAI-compatible surface, whose clients honour Retry-After on a
     429, answered 500 for the same aggregate."""
