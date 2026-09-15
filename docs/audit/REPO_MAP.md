@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-09-15
-**Scope:** 2455 tracked files (1685 `.py`, 346 `.md`, 424 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 2457 tracked files (1686 `.py`, 347 `.md`, 424 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -481,13 +481,13 @@ Repo entry points and standard project files.
   - `class ContextFeature`
 - **kestrel_sovereign/features/contribution_runtime.py** — Atomic lifecycle wiring for SDK feature contributions.
   - `class FeatureContributionRuntimeError`; `def validate_bootstrap_audit_namespace(names)`; `class FeatureContributionCollectionError`; `class PermissionDefaultRegistration`; `class ResolvedContextClause`; `class ContextClauseRegistry`; `class CompositeContextClauseRegistry`; `class PermissionDefaultsRegistry`; `…`
-- **kestrel_sovereign/features/delivery/__init__.py** — —
+- **kestrel_sovereign/features/delivery/__init__.py** — Durable outbound delivery queue public surface.
 - **kestrel_sovereign/features/delivery/feature.py** — Delivery Feature -- durable outbound message queue with retry and dead letter queue.
   - `class DeliveryFeature`
 - **kestrel_sovereign/features/delivery/models.py** — Data models for the Delivery Queue feature.
   - `class DeliveryStatus`; `class QueueEntry`
 - **kestrel_sovereign/features/delivery/queue.py** — Durable delivery queue with retry logic, exponential backoff, and dead letter queue.
-  - `class DeliveryQueue`
+  - `class DeliveryIdempotencyError`; `class DeliveryIdempotencyConflict`; `class DeliveryIdempotencyTerminal`; `class DeliveryIdempotencyStateError`; `class DeliveryQueue`
 - **kestrel_sovereign/features/deploy/__init__.py** — Deploy Feature.
 - **kestrel_sovereign/features/deploy/_gcp_auth.py** — Shared GCP credential discovery for the deploy package.
   - `def setup_gcp_auth()`
@@ -1715,6 +1715,7 @@ Repo entry points and standard project files.
 - **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — PRD: Multi-Model Foundational Support — > **Historical PRD — preserved for context, do not follow as guidance.** This describes the *original* multi-model support architecture from initial build.
 - **docs/architecture/core/SCOPED_PEER_DIRECTORY.md** — Scoped peer directories — `PeersFeature` treats a peer as an entry in the caller's **automatic peer directory**, not as an arbitrary agent address.
 - **docs/architecture/core/SERVER_LAUNCH_CONTRACT.md** — Server Launch Contract — Kestrel has one human-operated direct-server command:
+- **docs/architecture/delivery_idempotency.md** — Delivery enqueue idempotency — Programmatic callers may pass an optional owner-scoped `idempotency_key` to `DeliveryFeature.enqueue_message`.
 - **docs/architecture/economics/AGENT_ECONOMICS.md** — Agent Economics: Autonomous Economic Entities — ## 1.
 - **docs/architecture/economics/ECONOMICS_WORK_SESSION.md** — Economics Work Session – Kestrel / Sovereign Agents — **Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod, Filecoin, infra), revenue distribution (pl…
 - **docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md** — Economic Incentives Deep Dive - Constitutional AI System — **Date:** November 11, 2025 **Focus:** Detailed explanation of payment flows and economic mechanisms **Audience:** Users and stakeholders
@@ -2243,6 +2244,8 @@ Repo entry points and standard project files.
   - `async def test_hard_purge_distinguishes_degraded_and_inconsistent_schemas(db_backend, lexical_owner_column, token_table)`; `async def test_rolled_back_lexical_migration_keeps_hard_purge_available(db_backend, monkeypatch)`
 - **tests/integration/test_core_only_boot.py** — Core-Only Boot Integration Tests
   - `def client(monkeypatch)`; `class TestCoreOnlyBoot`; `class TestCoreEndpoints`; `class TestPrivacyMode`; `class TestMemoryStorage`; `class TestConstitutionEnforcement`; `class TestAgentInvoke`; `class TestNoFeatureCrashes`
+- **tests/integration/test_delivery_idempotency_backend_parity.py** — SQLite/PostgreSQL parity for owner-scoped delivery idempotency.
+  - `async def test_delivery_enqueue_idempotency_backend_parity(db_backend)`; `async def test_distinct_replay_keys_share_content_dedup_gate(db_backend)`; `async def test_keyed_and_plain_enqueues_share_content_gate(db_backend)`; `async def test_stale_claim_repair_preserves_effective_retry_policy(db_backend)`; `async def test_stale_claim_does_not_treat_different_policy_as_compatible(db_backend)`; `async def test_dead_letter_retry_preserves_legacy_content_hash(db_backend)`; `async def test_dead_letter_retry_prefers_attached_ledger_policy(db_backend)`; `async def test_rolling_retry_metadata_recovers_from_replay_ledger(db_backend)`; `…`
 - **tests/integration/test_deploy_e2e.py** — Integration tests for Deploy Feature - Real Cloud Run deployments.
   - `class TestDeployModelsUnit`; `class TestDeployManagerCoreUnit`; `class TestAzureProviderStub`; `class TestCloudRunDeployE2E`; `class TestDeployFeature`
 - **tests/integration/test_docker.py** — Docker integration tests for Kestrel.
