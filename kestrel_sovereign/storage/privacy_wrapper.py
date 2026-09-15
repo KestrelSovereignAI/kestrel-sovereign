@@ -1618,20 +1618,7 @@ class PrivacyEnforcingStorage:
         max_fact_state_retries = 4
 
         def fact_binding() -> SemanticAssertionBinding:
-            self._assert_semantic_assertion_write_allowed("explicit_fact")
-            raw_binding = self._storage.semantic_assertion_binding()
-            is_public = self._privacy_config.sharing == "public"
-            return SemanticAssertionBinding(
-                tenant_id=raw_binding.tenant_id,
-                owning_agent_id=raw_binding.owning_agent_id,
-                privacy_classification="public" if is_public else "normal",
-                release_policy_reference=(
-                    "policy:privacy:public-v1"
-                    if is_public
-                    else "policy:privacy:normal-v1"
-                ),
-                visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
-            )
+            return self.governed_semantic_assertion_binding("explicit_fact")
 
         async def has_adapter_provenance(assertion) -> bool:
             sources = await self.list_assertion_sources(assertion.assertion_id)
@@ -3285,6 +3272,38 @@ class PrivacyEnforcingStorage:
                 "semantic persistence requires an approved redacted assertion "
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
+
+    def governed_semantic_assertion_binding(
+        self, operation: str
+    ) -> SemanticAssertionBinding:
+        """Return the wrapper-governed tenant/owner/privacy fields for a producer.
+
+        ``AsyncStorage.semantic_assertion_binding`` is deliberately raw: it
+        always reports ``normal``/``PRIVATE`` because it cannot see the live
+        privacy policy.  A foreground producer must not read that directly, so
+        this is the one place the policy check and the classification live
+        together.  ``save_fact`` uses it too — a second copy of the rule is a
+        rule that will disagree with itself.
+
+        This is not an authorization capability.  The canonical assertion store
+        still checks its own private tenant capability on every write; this
+        only keeps a producer from taking tenant, owner, or privacy fields from
+        anything other than its own bound storage.
+        """
+        self._assert_semantic_assertion_write_allowed(operation)
+        raw_binding = self._storage.semantic_assertion_binding()
+        is_public = self._privacy_config.sharing == "public"
+        return SemanticAssertionBinding(
+            tenant_id=raw_binding.tenant_id,
+            owning_agent_id=raw_binding.owning_agent_id,
+            privacy_classification="public" if is_public else "normal",
+            release_policy_reference=(
+                "policy:privacy:public-v1"
+                if is_public
+                else "policy:privacy:normal-v1"
+            ),
+            visibility=Visibility.PUBLIC if is_public else Visibility.PRIVATE,
+        )
 
     async def save_explicit_fact(
         self,

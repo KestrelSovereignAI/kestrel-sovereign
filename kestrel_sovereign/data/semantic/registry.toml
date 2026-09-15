@@ -388,6 +388,24 @@ selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kes
 imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
 capabilities = ["ontology:kestrel-vocab-1.1"]
 
+[resource.kestrel-vocab-1-2]
+# Adds the two strategic-memory domain predicates a ledger row renders to.
+# 1.1.0 is untouched: an immutable release is never edited in place, so the
+# RDF codec keeps selecting `ontology:kestrel-vocab-1.1` and is unaffected.
+identifier = "kestrel-vocab"
+version = "1.2.0"
+namespace = "https://kestrel.ai/vocab/"
+package_resource = "data/semantic/ontologies/kestrel-vocab-1.2.0.ttl"
+sha256 = "25f6bbbae5d10ef699b55dab788147bf96a257e84b8d027f9ff5c2d5c8587a46"
+maturity = "stable"
+kind = "ontology"
+uri = "https://kestrel.ai/vocab/1.2.0"
+published_date = "2026-09-15"
+description = "Versioned Kestrel ontology adding the strategic-memory pattern and blocker claim predicates; it grants no authority."
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:projectedTenantId", "kestrel:lineagePosition", "kestrel:strategicPattern", "kestrel:strategicBlocker"]
+imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
+capabilities = ["ontology:kestrel-vocab-1.2"]
+
 [resource.kestrel-assertion-shapes]
 version = "1.0.0"
 namespace = "https://kestrel.ai/shapes/"

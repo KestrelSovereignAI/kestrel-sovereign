@@ -46,6 +46,7 @@ from .ledger import (
     has_ledger_sections,
     strip_ledger_sections,
 )
+from .ledger_assertions import project_ledger_assertions
 from .ledger_index import (
     MEMBERSHIP_READ_CAP,
     BLOCKER_SECTION,
@@ -486,9 +487,47 @@ class StrategicMemoryFeature(Feature):
         except Exception as e:  # noqa: BLE001 - the index is best-effort
             logger.warning("strategy ledger index projection failed: %s", e)
             return {"projected": 0, "skipped": 0, "failed": 0, "error": str(e)}
+        report["assertions"] = await self._reindex_ledger_assertions()
         if report.get("failed") or report.get("skipped_reason"):
             logger.info("strategy ledger index: %s", report)
         return report
+
+    async def _reindex_ledger_assertions(self) -> Dict[str, Any]:
+        """Project the ledger's rows into canonical semantic assertions (#3051).
+
+        The structural index above and this are two layers, not two copies: the
+        graph answers type/property/edge questions and the assertion store owns
+        rendering, provenance and governance. Reported under its own key so a
+        reader can tell which layer a count came from.
+
+        Best-effort on the same terms as the graph index — the canonical record
+        is already on disk, so a governed write that cannot land must not turn
+        into a strategic-memory failure.
+        """
+        try:
+            storage = getattr(self.agent, "storage", None)
+            return await project_ledger_assertions(
+                storage,
+                self._ledger,
+                ledger_locator=self._ledger_locator(),
+            )
+        except Exception as e:  # noqa: BLE001 - the producer is best-effort
+            logger.warning("strategy ledger assertion projection failed: %s", e)
+            return {"projected": 0, "skipped": 0, "failed": 0, "error": str(e)}
+
+    def _ledger_locator(self) -> str:
+        """Name the ledger for provenance without leaking the host's layout.
+
+        A source locator is durable and travels in an identity export, so the
+        absolute path is the wrong identifier twice over: it discloses where
+        this operator keeps their agent data, and it is not stable across the
+        hosts the same agent runs on. The filename is what actually identifies
+        the record; there is one ledger per agent.
+        """
+        path = getattr(self._ledger, "path", None)
+        if not path:
+            return "strategy-ledger"
+        return Path(str(path)).name or "strategy-ledger"
 
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
