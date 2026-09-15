@@ -722,6 +722,7 @@ ROUTED_MODULES = {
     "a2a/local_submission.py",
     "command_handler.py",
     "endpoints/agent.py",
+    "endpoints/hold.py",  # the host Hold door's latch target (#3164)
     "endpoints/observability.py",
     "endpoints/restart_events.py",
     "features/audit_anchor/feature.py",

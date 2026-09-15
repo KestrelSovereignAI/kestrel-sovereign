@@ -803,6 +803,10 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 - [`kestrel_sovereign/endpoints/github.py`](kestrel_sovereign/endpoints/github.py)
   - `GET /api/github/repos`
   - `GET /api/github/{path:path}`
+- [`kestrel_sovereign/endpoints/hold.py`](kestrel_sovereign/endpoints/hold.py)
+  - `GET /api/host/hold`
+  - `POST /api/host/hold`
+  - `POST /api/host/hold/release`
 - [`kestrel_sovereign/endpoints/host_stop.py`](kestrel_sovereign/endpoints/host_stop.py)
   - `POST /api/host/stop`
   - `GET /api/host/stop/status`

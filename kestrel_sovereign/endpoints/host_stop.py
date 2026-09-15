@@ -8,7 +8,10 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
-from kestrel_sovereign.endpoints.agent_helpers import caller_is_sovereign, get_caller
+from kestrel_sovereign.endpoints.agent_helpers import (
+    caller_is_sovereign,
+    sovereign_actor_id,
+)
 from kestrel_sovereign.rate_limit import (
     stop_admission_rate_limit,
 )
@@ -57,17 +60,6 @@ class HostStopBody(BaseModel):
         if len(encoded) > MAX_STOP_CORRELATION_ID_BYTES:
             raise ValueError("correlation_id exceeds its UTF-8 byte limit")
         return value
-
-
-def _sovereign_actor(request: Request) -> str:
-    if not caller_is_sovereign(request):
-        raise ApiHTTPException(
-            status_code=403,
-            code="sovereign_authority_required",
-            message="Host Stop requires sovereign authority.",
-        )
-    identity = get_caller(request).identity
-    return identity if isinstance(identity, str) and identity.strip() else "api_key"
 
 
 def _caller_can_stop_host(request: Request) -> bool:
@@ -176,7 +168,7 @@ async def stop_host(
 ):
     """Cooperatively stop every currently loaded agent; never stop a process."""
 
-    actor_id = _sovereign_actor(request)
+    actor_id = sovereign_actor_id(request)
     try:
         targets = _host_targets(request)
     except (TypeError, ValueError, RuntimeError) as error:

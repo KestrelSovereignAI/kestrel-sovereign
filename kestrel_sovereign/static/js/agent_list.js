@@ -28,6 +28,7 @@ import { escapeHtml as sharedEscapeHtml } from './ui.js';
 import { UI } from './ui-ext/registry.js';
 import { storeGet, storeSet } from './ui_state.mjs';
 import { validateHostStopEnvelope } from './stop_evidence.js';
+import { createKebabButton, openMenuAt, positionFromEvent } from './kebab_menu.js';
 
 // One pane owns one set of component listeners. A host may remount into
 // adopted chrome without first retaining/destroying the old handle; carrying
@@ -37,11 +38,15 @@ const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
 const AGENT_LIST_STOP_ALL_OPERATION = Symbol.for('kestrel.agentListPane.stopAllOperation');
 const AGENT_LIST_STOP_ALL_RETRY = Symbol.for('kestrel.agentListPane.stopAllRetry');
 
-function newStopAllCorrelationId() {
+function newOperationId(prefix) {
     if (typeof globalThis.crypto?.randomUUID === 'function') {
-        return `ui-host-stop:${globalThis.crypto.randomUUID()}`;
+        return `${prefix}:${globalThis.crypto.randomUUID()}`;
     }
-    return `ui-host-stop:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    return `${prefix}:${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function newStopAllCorrelationId() {
+    return newOperationId('ui-host-stop');
 }
 
 // ============================================================================
@@ -155,6 +160,68 @@ function makeConsoleRenderer() {
     };
 }
 
+// The identities a card may be MATCHED by in a host payload. A lookup key set,
+// not an authority — the default adapter falls back to the routing key for
+// `id`, so one of these can be a name. What an operation is ADDRESSED to comes
+// from the matched host record (`agent_id` / `resolved_target`) or from the
+// routing key captured at render, never from whichever candidate matched.
+function cardTargetIds(item) {
+    return [
+        item.id,
+        item.raw && item.raw.did,
+        item.raw && item.raw.id,
+    ].filter((value) => typeof value === 'string' && value);
+}
+
+const STOP_DISPOSITION_LABELS = {
+    stopped: 'Stopped',
+    already_complete: 'Already complete',
+    refused: 'Stop refused',
+    unreachable: 'Stop unreachable',
+    indeterminate: 'Stop indeterminate',
+};
+
+// One renderer for the typed Stop result, so the Stop button and the kebab's
+// "Stop and hold" cannot describe the same receipt differently.
+function renderStopOutcome(outcomeEl, item, routedTarget, result) {
+    const outcomes = Array.isArray(result?.outcomes)
+        ? result.outcomes
+        : (
+            Array.isArray(result?.stop_outcomes)
+                ? result.stop_outcomes
+                : (
+                    Array.isArray(result?.response?.stop_outcomes)
+                        ? result.response.stop_outcomes
+                        : []
+                )
+        );
+    const targetIds = [routedTarget, ...cardTargetIds(item)]
+        .filter((value) => typeof value === 'string' && value);
+    const outcome = outcomes.find((candidate) => (
+        candidate
+        && targetIds.includes(candidate.resolved_target || candidate.agent_id)
+    )) || outcomes[0] || null;
+    const disposition = outcome && typeof outcome.disposition === 'string'
+        ? outcome.disposition
+        : (result === true ? 'stopped' : 'unreachable');
+    outcomeEl.hidden = false;
+    outcomeEl.dataset.disposition = disposition;
+    outcomeEl.textContent = STOP_DISPOSITION_LABELS[disposition] || `Stop: ${disposition}`;
+    outcomeEl.title = outcome && typeof outcome.detail === 'string'
+        ? outcome.detail
+        : outcomeEl.textContent;
+    return disposition;
+}
+
+function renderStopFailure(outcomeEl, error) {
+    outcomeEl.hidden = false;
+    outcomeEl.dataset.disposition = 'unreachable';
+    outcomeEl.textContent = 'Stop unreachable';
+    outcomeEl.title = error && error.message
+        ? error.message
+        : 'Cooperative Stop request failed';
+}
+
 // Stop is behavior, not card presentation. Keep the control on the component-
 // owned seam so a host's custom portrait renderer cannot replace cancellation
 // when it replaces the console body. Default rows receive these nodes directly;
@@ -177,64 +244,377 @@ function makeStopControls(doc, item, onStop) {
     // Capture the immutable routing key at render time. Display-name changes
     // and selection changes during an awaited Stop may never retarget retries.
     const routedTarget = item.name;
-    stopBtn.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        if (stopBtn.disabled || typeof onStop !== 'function') return;
+    const runStop = async () => {
+        if (stopBtn.disabled || typeof onStop !== 'function') return null;
         stopBtn.disabled = true;
         outcomeEl.hidden = false;
         outcomeEl.dataset.disposition = 'requested';
         outcomeEl.textContent = 'Stopping…';
         try {
-            const result = await onStop(routedTarget);
-            const outcomes = Array.isArray(result?.outcomes)
-                ? result.outcomes
-                : (
-                    Array.isArray(result?.stop_outcomes)
-                        ? result.stop_outcomes
-                        : (
-                            Array.isArray(result?.response?.stop_outcomes)
-                                ? result.response.stop_outcomes
-                                : []
-                        )
-                );
-            const targetIds = [
+            const disposition = renderStopOutcome(
+                outcomeEl,
+                item,
                 routedTarget,
-                item.id,
-                item.raw && item.raw.did,
-                item.raw && item.raw.id,
-            ].filter((value) => typeof value === 'string' && value);
-            const outcome = outcomes.find((candidate) => (
-                candidate
-                && targetIds.includes(candidate.resolved_target || candidate.agent_id)
-            )) || outcomes[0] || null;
-            const disposition = outcome && typeof outcome.disposition === 'string'
-                ? outcome.disposition
-                : (result === true ? 'stopped' : 'unreachable');
-            const labels = {
-                stopped: 'Stopped',
-                already_complete: 'Already complete',
-                refused: 'Stop refused',
-                unreachable: 'Stop unreachable',
-                indeterminate: 'Stop indeterminate',
-            };
-            outcomeEl.dataset.disposition = disposition;
-            outcomeEl.textContent = labels[disposition] || `Stop: ${disposition}`;
-            outcomeEl.title = outcome && typeof outcome.detail === 'string'
-                ? outcome.detail
-                : outcomeEl.textContent;
+                await onStop(routedTarget),
+            );
+            return disposition;
         } catch (error) {
-            outcomeEl.dataset.disposition = 'unreachable';
-            outcomeEl.textContent = 'Stop unreachable';
-            outcomeEl.title = error && error.message
-                ? error.message
-                : 'Cooperative Stop request failed';
+            renderStopFailure(outcomeEl, error);
+            return null;
         } finally {
             stopBtn.disabled = false;
         }
+    };
+    stopBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        void runStop();
     });
     frag.appendChild(stopBtn);
     frag.appendChild(outcomeEl);
-    return frag;
+    // `tail` stays a live reference after the fragment is appended, so Hold's
+    // nodes can be inserted immediately after Stop's whenever they arrive —
+    // whether that is at build time or once the host confirms the Hold door.
+    return { nodes: frag, runStop, tail: outcomeEl };
+}
+
+// ============================================================================
+// Hold — the durable latch, drawn on the CARD (not on the Stop button)
+// ============================================================================
+//
+// `.agent-stop-btn` is `display:none` until the row is thinking, and Hold's
+// primary case is an IDLE agent about to heartbeat — so a gesture on Stop is
+// unreachable exactly when Hold is most needed (#3135 §7). Hold therefore
+// lives on the card's own kebab, a visible focusable control, with the row's
+// `contextmenu` as an accelerator onto the same menu. A held card renders a
+// persistent badge and puts Resume in the Stop slot, so a hold set on Tuesday
+// is still legible on Friday with nothing in flight.
+
+const HOLD_DISPOSITION_LABELS = {
+    applied: 'Held',
+    already_in_state: 'Already held',
+};
+
+const RESUME_DISPOSITION_LABELS = {
+    applied: 'Resumed',
+    already_in_state: 'Not held',
+    refused_stale: 'Hold changed — refreshed',
+};
+
+function formatHoldTime(value) {
+    if (typeof value !== 'string' || !value) return '';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    try { return parsed.toLocaleString(); } catch (_) { return value; }
+}
+
+// A mutation's `current` is the host's authoritative post-mutation latch for
+// that exact scope and target, under EVERY disposition — the fresh latch, the
+// pre-existing one, `null` once a release lands, or the superseding latch a
+// stale release was refused against. It is a committed fact the follow-up read
+// may never get to confirm, so the card applies it directly; `undefined` here
+// means the response carried no usable evidence and nothing is applied.
+function mutationLatch(response) {
+    if (!response || typeof response !== 'object') return undefined;
+    if (!('current' in response)) return undefined;
+    const current = response.current;
+    if (current === null) return null;
+    if (typeof current !== 'object' || Array.isArray(current)) return undefined;
+    return typeof current.hold_receipt_id === 'string' && current.hold_receipt_id
+        ? current
+        : undefined;
+}
+
+// The latch a card is held by, from the host's own inventory. A card with no
+// entry has no resolved identity, so it offers no Hold at all rather than
+// inventing a target the latch table would never be read for.
+function holdEntryForItem(item, byAgent) {
+    if (!byAgent || typeof byAgent.get !== 'function') return null;
+    let resolved = null;
+    for (const candidate of cardTargetIds(item)) {
+        const entry = byAgent.get(candidate);
+        if (!entry) continue;
+        if (resolved && resolved.agent_id !== entry.agent_id) return null; // ambiguous
+        resolved = entry;
+    }
+    return resolved;
+}
+
+function makeHoldControls(doc, item, ctx) {
+    const displayName = item.displayName || item.name || 'Unnamed Agent';
+
+    const badge = doc.createElement('span');
+    badge.className = 'agent-hold-badge';
+    badge.setAttribute('role', 'status');
+    badge.hidden = true;
+    const badgeLabel = doc.createElement('span');
+    badgeLabel.className = 'agent-hold-badge-label';
+    badgeLabel.textContent = 'Held';
+    const badgeReason = doc.createElement('span');
+    badgeReason.className = 'agent-hold-badge-reason';
+    const badgeActor = doc.createElement('span');
+    badgeActor.className = 'agent-hold-badge-actor';
+    const badgeTime = doc.createElement('span');
+    badgeTime.className = 'agent-hold-badge-time';
+    badge.appendChild(badgeLabel);
+    badge.appendChild(badgeReason);
+    badge.appendChild(badgeActor);
+    badge.appendChild(badgeTime);
+
+    const outcomeEl = doc.createElement('span');
+    outcomeEl.className = 'agent-hold-outcome';
+    outcomeEl.setAttribute('role', 'status');
+    outcomeEl.setAttribute('aria-live', 'polite');
+    outcomeEl.hidden = true;
+
+    const resumeBtn = doc.createElement('button');
+    resumeBtn.type = 'button';
+    resumeBtn.className = 'agent-resume-btn';
+    resumeBtn.textContent = 'Resume';
+    resumeBtn.title = `Resume ${displayName}`;
+    resumeBtn.setAttribute('aria-label', `Resume ${displayName}`);
+
+    const state = { entry: null, canHold: false, hostHold: null, busy: false };
+
+    function renderOutcome(labels, disposition, detail) {
+        outcomeEl.hidden = false;
+        outcomeEl.dataset.disposition = disposition;
+        outcomeEl.textContent = labels[disposition] || disposition;
+        outcomeEl.title = detail || outcomeEl.textContent;
+    }
+
+    function renderFailure(message) {
+        outcomeEl.hidden = false;
+        outcomeEl.dataset.disposition = 'unreachable';
+        outcomeEl.textContent = 'Hold unreachable';
+        outcomeEl.title = message || 'The durable Hold request failed';
+    }
+
+    async function withBusy(run) {
+        if (state.busy) return;
+        state.busy = true;
+        resumeBtn.disabled = true;
+        try {
+            await run();
+        } finally {
+            state.busy = false;
+            resumeBtn.disabled = false;
+            await ctx.refreshHoldState();
+        }
+    }
+
+    // Hold BEFORE Stop: latching willingness first closes the window in which
+    // a heartbeat could start a fresh turn between the two operations. They
+    // stay two typed requests with two receipts — the gesture is compound,
+    // the operations are not.
+    async function hold({ alsoStop }) {
+        const entry = state.entry;
+        if (!entry || !state.canHold) return;
+        const reason = ctx.askReason(
+            alsoStop
+                ? `Stop ${displayName} and hold it. Reason:`
+                : `Hold ${displayName}. Reason:`,
+            '',
+        );
+        if (!reason) return;
+        await withBusy(async () => {
+            let response;
+            try {
+                response = await ctx.setHold({
+                    scope: 'agent',
+                    target_id: entry.agent_id,
+                    reason,
+                    operation_id: newOperationId('ui-hold'),
+                });
+            } catch (error) {
+                renderFailure(error && error.message);
+                return;
+            }
+            const receipt = response && response.receipt;
+            // BOTH Hold dispositions leave a latch, so a response carrying no
+            // current latch contradicts its own receipt. Say indeterminate
+            // rather than reading that receipt as a hold.
+            const current = mutationLatch(response);
+            const latched = !!current;
+            // Paint the committed latch NOW, from the mutation that committed
+            // it. The refresh in `withBusy`'s finally is confirmation, not the
+            // source of truth: if that read fails, a card whose Hold demonstrably
+            // landed must still render as held rather than reverting to the
+            // pre-mutation reading while the outcome says "Held".
+            if (current !== undefined) ctx.applyLatch(entry.agent_id, current);
+            const disposition = latched && receipt && typeof receipt.disposition === 'string'
+                ? receipt.disposition
+                : 'indeterminate';
+            renderOutcome(
+                HOLD_DISPOSITION_LABELS,
+                disposition,
+                receipt && receipt.receipt_id
+                    ? `Hold receipt ${receipt.receipt_id}`
+                    : null,
+            );
+            // Only proceed to the Stop half once the latch is demonstrably
+            // active; a bare Stop after a failed Hold is a different action
+            // from the one the operator asked for.
+            if (alsoStop && latched) {
+                await ctx.runStop();
+            }
+        });
+    }
+
+    async function resume() {
+        const entry = state.entry;
+        const latch = entry && entry.agent_hold;
+        if (!latch || !state.canHold) return;
+        const reason = ctx.askReason(
+            `Resume ${displayName}. Reason:`,
+            'Resumed from the agent card',
+        );
+        if (!reason) return;
+        await withBusy(async () => {
+            let response;
+            try {
+                response = await ctx.releaseHold({
+                    scope: 'agent',
+                    target_id: entry.agent_id,
+                    reason,
+                    operation_id: newOperationId('ui-resume'),
+                    // The receipt the operator SAW. A hold replaced since the
+                    // last poll is refused as stale rather than released.
+                    expected_hold_receipt_id: latch.hold_receipt_id,
+                });
+            } catch (error) {
+                renderFailure(error && error.message);
+                return;
+            }
+            const receipt = response && response.receipt;
+            // Same rule in the other direction, and it covers `refused_stale`
+            // too: the latch that came back is the one that actually holds this
+            // agent now, so the badge and the next Resume's compare-and-set both
+            // name it without waiting on a read that may not arrive.
+            const current = mutationLatch(response);
+            if (current !== undefined) ctx.applyLatch(entry.agent_id, current);
+            const disposition = receipt && typeof receipt.disposition === 'string'
+                ? receipt.disposition
+                : 'indeterminate';
+            renderOutcome(
+                RESUME_DISPOSITION_LABELS,
+                disposition,
+                receipt && receipt.receipt_id
+                    ? `Release receipt ${receipt.receipt_id}`
+                    : null,
+            );
+        });
+    }
+
+    function menuItems() {
+        const entry = state.entry;
+        if (!entry || !state.canHold) return [];
+        const items = [];
+        const thinking = ctx.isThinking();
+        if (entry.agent_hold) {
+            items.push({ label: `Resume ${displayName}`, action: 'resume', onSelect: () => { void resume(); } });
+        } else {
+            items.push({ label: `Hold ${displayName}…`, action: 'hold', onSelect: () => { void hold({ alsoStop: false }); } });
+            if (thinking) {
+                items.push({
+                    label: 'Stop and hold…',
+                    action: 'stop-and-hold',
+                    onSelect: () => { void hold({ alsoStop: true }); },
+                });
+            }
+        }
+        if (thinking) {
+            items.push({
+                label: `Stop ${displayName}`,
+                action: 'stop',
+                separatorBefore: true,
+                onSelect: () => { void ctx.runStop(); },
+            });
+        }
+        return items;
+    }
+
+    const kebabBtn = createKebabButton(menuItems, {
+        className: 'agent-card-kebab',
+        ariaLabel: `Actions for ${displayName}`,
+        title: `${displayName} actions`,
+        // The same document every sibling node above is built in. An embedding
+        // host mounts into ITS document, so a kebab (and the menu it opens)
+        // built in the console's would belong to a tree that host never shows.
+        ownerDocument: doc,
+    });
+    kebabBtn.disabled = true;
+
+    resumeBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        void resume();
+    });
+
+    // The kebab button is the visible, focusable path; `contextmenu` is an
+    // accelerator onto the SAME menu, never the only way in. It is bound and
+    // unbound with the nodes, so a card without the Hold surface keeps the
+    // browser's own context menu.
+    function onContextMenu(event) {
+        // Disabled FIRST: an accelerator may only take the browser's own menu
+        // when it has one of ours to put there. A non-sovereign caller, a
+        // stale reading, or a card the host's inventory does not name all
+        // leave the kebab disabled — suppressing the native menu for those
+        // turns a right-click into a gesture that does nothing at all.
+        if (kebabBtn.disabled) return;
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        openMenuAt(menuItems(), positionFromEvent(event), { ownerDocument: doc });
+    }
+
+    function apply(shell, { entry, canHold, hostHold, stale }) {
+        state.entry = entry || null;
+        state.canHold = canHold === true;
+        state.hostHold = hostHold || null;
+        const unconfirmed = stale === true;
+        const agentHold = entry && entry.agent_hold;
+        const sources = Array.isArray(entry && entry.sources) ? entry.sources : [];
+        const held = !!(entry && entry.held === true);
+        const primary = agentHold || (sources.includes('host') ? state.hostHold : null);
+
+        kebabBtn.disabled = !(state.entry && state.canHold);
+        kebabBtn.title = kebabBtn.disabled
+            ? 'Hold controls are unavailable'
+            : `${displayName} actions`;
+
+        if (shell && shell.classList) {
+            shell.classList.toggle('agent-held', held);
+        }
+        badge.hidden = !held;
+        if (!held) {
+            delete badge.dataset.holdSources;
+            delete badge.dataset.holdStale;
+            resumeBtn.hidden = true;
+            return;
+        }
+        badge.dataset.holdSources = sources.join(' ');
+        if (unconfirmed) badge.dataset.holdStale = 'true';
+        else delete badge.dataset.holdStale;
+        badgeLabel.textContent = sources.includes('agent') ? 'Held' : 'Held by host';
+        badgeReason.textContent = (primary && primary.reason) || '';
+        badgeActor.textContent = (primary && primary.actor_id) || '';
+        badgeTime.textContent = formatHoldTime(primary && primary.set_at);
+        const scopeText = sources.includes('agent')
+            ? 'Held'
+            : 'Held by the host-wide Hold';
+        const detail = primary
+            ? `${scopeText} by ${primary.actor_id} at ${primary.set_at} — ${primary.reason}`
+            : scopeText;
+        // Say WHICH it is: a latch the host just confirmed, or the last one it
+        // did. Silently presenting the second as the first is the lie.
+        badge.title = unconfirmed
+            ? `${detail} (last confirmed reading; the host Hold state is currently unreadable)`
+            : detail;
+        // Resume releases ONLY the latch this card owns. A card held solely by
+        // the host latch gets no Resume here: releasing that one from an agent
+        // card would release a latch the operator did not intend.
+        resumeBtn.hidden = !(agentHold && state.canHold);
+        resumeBtn.title = `Resume ${displayName} — releases this agent's hold only`;
+    }
+
+    return { nodes: [badge, resumeBtn, outcomeEl, kebabBtn], apply, onContextMenu };
 }
 
 // ============================================================================
@@ -252,6 +632,20 @@ function makeStopControls(doc, item, onStop) {
  * note) — then invokes the host `onSelect`. Card RENDERING is `config.renderCard`
  * (default = the console row); the component owns the outer shell, the status
  * dot, and the per-card `agent-card-actions` slot anchor.
+ *
+ * Hold (#3164) is component-owned too, so every host that adopts this list —
+ * the console and Frinz's companions pane — inherits the same latch surface.
+ * Whether a host HAS that door is a server fact, so the component asks the
+ * server: the API client exposing `getHostHoldState` / `setHostHold` /
+ * `releaseHostHold` only makes the question askable (the standard
+ * `createApiClient()` exposes all three regardless of what the backend mounts),
+ * and no Hold affordance is drawn until `GET /api/host/hold` answers. A host
+ * that answers "no such route" retires the surface and stops polling, so its
+ * cards are exactly today's cards.
+ *   - `hold` — skip the probe: `false` never offers Hold, `true` asserts the
+ *     door exists (for a host that knows its own backend).
+ *   - `holdStatusIntervalMs` — authoritative latch-poll cadence (default 5s).
+ *   - `askHoldReason(message, defaultValue)` — reason prompt override.
  */
 export function mountAgentList(containerEl, config = {}) {
     if (!containerEl) throw new Error('mountAgentList requires a container element');
@@ -276,6 +670,69 @@ export function mountAgentList(containerEl, config = {}) {
     let activeName = config.selectedName || null;
     let refreshSeq = 0;
 
+    // --- Hold: the durable latch surface (#3164) ---------------------------
+    // Two different questions, deliberately kept apart. `holdCallable` is only
+    // "can this client ASK" — the standard createApiClient() always exposes the
+    // three methods, so treating their presence as proof the backend mounts
+    // /api/host/hold would opt an embedding host in by accident. `holdSupported`
+    // is the answer: null until the host has replied, true once it has, false
+    // once it has said there is no such door.
+    const holdCallable = !!(api
+        && typeof api.getHostHoldState === 'function'
+        && typeof api.setHostHold === 'function'
+        && typeof api.releaseHostHold === 'function');
+    let holdSupported = null;
+    if (!holdCallable || config.hold === false) holdSupported = false;
+    else if (config.hold === true) holdSupported = true;
+    const askHoldReason = typeof config.askHoldReason === 'function'
+        ? config.askHoldReason
+        : ((message, defaultValue) => (
+            typeof window !== 'undefined' && typeof window.prompt === 'function'
+                ? window.prompt(message, defaultValue)
+                : null
+        ));
+    // A Hold and a Resume are receipted governance acts, so both carry an
+    // operator reason. A blank or cancelled answer aborts rather than
+    // silently substituting one.
+    function askReason(message, defaultValue) {
+        const answer = askHoldReason(message, defaultValue);
+        return typeof answer === 'string' && answer.trim() ? answer.trim() : null;
+    }
+    // The browser never derives "held" — the host composes the two
+    // independent latches and says so. Until a read succeeds the controls
+    // stay inert rather than drawing an agent as un-held.
+    let holdState = {
+        loaded: false,
+        stale: false,
+        canHold: false,
+        hostHold: null,
+        byAgent: new Map(),
+    };
+    let holdSeq = 0;
+    let holdPromise = null;
+    const holdViews = [];
+
+    // Hold is durable state a card must keep showing with nothing in flight,
+    // and it can be set from another tab, the CLI, or a mandate holder. Poll
+    // the authoritative latch rather than trusting this document's memory.
+    // The poll is retired with the surface: a host with no Hold door must not
+    // be asked for one every few seconds forever.
+    const holdIntervalMs = Number.isFinite(config.holdStatusIntervalMs)
+        ? Math.max(250, config.holdStatusIntervalMs)
+        : 5000;
+    const setIntervalFn = doc.defaultView && doc.defaultView.setInterval;
+    const clearIntervalFn = doc.defaultView && doc.defaultView.clearInterval;
+    let holdInterval = holdSupported !== false && typeof setIntervalFn === 'function'
+        ? setIntervalFn.call(doc.defaultView, () => { void refreshHoldState(); }, holdIntervalMs)
+        : null;
+    function stopHoldPolling() {
+        if (holdInterval === null) return;
+        if (typeof clearIntervalFn === 'function') {
+            clearIntervalFn.call(doc.defaultView, holdInterval);
+        }
+        holdInterval = null;
+    }
+
     if (containerEl.classList) containerEl.classList.add('agent-list-component');
     const root = doc.createElement('div');
     root.className = 'agent-list-root';
@@ -294,6 +751,150 @@ export function mountAgentList(containerEl, config = {}) {
             try { return adapter.avatarUrl(item); } catch (_) { /* fall through */ }
         }
         return item ? item.avatarUrl : undefined;
+    }
+
+    // Put a card's Hold nodes immediately after its Stop nodes — the position
+    // they occupy when the host's answer arrives before the card is built — so
+    // the surface lands in one place whichever race wins.
+    function attachHoldView(view) {
+        if (view.attached) return;
+        view.attached = true;
+        let cursor = view.anchor;
+        const parent = (cursor && cursor.parentNode) || view.shell;
+        for (const node of view.controls.nodes) {
+            parent.insertBefore(node, cursor ? cursor.nextSibling : null);
+            cursor = node;
+        }
+        view.shell.addEventListener('contextmenu', view.controls.onContextMenu);
+    }
+
+    function detachHoldView(view) {
+        if (!view.attached) return;
+        view.attached = false;
+        for (const node of view.controls.nodes) {
+            if (node.parentNode) node.parentNode.removeChild(node);
+        }
+        view.shell.removeEventListener('contextmenu', view.controls.onContextMenu);
+        if (view.shell.classList) view.shell.classList.remove('agent-held');
+    }
+
+    // The host says there is no Hold door. Take the surface off every card,
+    // stop asking, and build no more of it — an operator must not be left a
+    // permanently disabled control and a poll against a route that 404s.
+    function retireHoldSurface() {
+        if (holdSupported === false) return;
+        holdSupported = false;
+        holdSeq++; // orphan any in-flight read
+        holdState = {
+            loaded: true, stale: false, canHold: false, hostHold: null, byAgent: new Map(),
+        };
+        stopHoldPolling();
+        for (const view of holdViews) detachHoldView(view);
+        holdViews.length = 0;
+    }
+
+    // "No such route" is a structural answer, not a blip: the door is absent,
+    // and retrying cannot make it appear. Every other failure (auth, 5xx,
+    // offline) leaves the question open and the last reading standing.
+    function holdRouteAbsent(error) {
+        const status = error && error.status;
+        return status === 404 || status === 405 || status === 501;
+    }
+
+    // Repaint every card's Hold affordances in place. Like renderHighlight,
+    // this never rebuilds the list — a latch poll must not tear down the
+    // per-card slot anchors and their contributions.
+    function renderHoldState() {
+        for (const view of holdViews) {
+            if (holdSupported === true) attachHoldView(view);
+            if (!view.attached) continue;
+            view.controls.apply(view.shell, {
+                entry: holdEntryForItem(view.item, holdState.byAgent),
+                canHold: holdState.canHold,
+                hostHold: holdState.hostHold,
+                stale: holdState.stale === true,
+            });
+        }
+    }
+
+    async function refreshHoldState() {
+        if (!holdCallable || holdSupported === false) return false;
+        if (holdPromise) return holdPromise;
+        const request = (async () => {
+            const seq = ++holdSeq;
+            try {
+                const payload = await api.getHostHoldState();
+                if (seq !== holdSeq) return false;
+                const byAgent = new Map();
+                const entries = Array.isArray(payload && payload.agents)
+                    ? payload.agents
+                    : [];
+                for (const entry of entries) {
+                    if (entry && typeof entry.agent_id === 'string' && entry.agent_id) {
+                        byAgent.set(entry.agent_id, entry);
+                    }
+                }
+                // The host answered, so the door exists. This is the only place
+                // support is established; method presence never establishes it.
+                holdSupported = true;
+                holdState = {
+                    loaded: true,
+                    stale: false,
+                    canHold: !!(payload && payload.can_hold === true),
+                    hostHold: (payload && payload.host_hold) || null,
+                    byAgent,
+                };
+            } catch (error) {
+                if (seq !== holdSeq) return false;
+                if (holdRouteAbsent(error)) {
+                    retireHoldSurface();
+                    return false;
+                }
+                // A failed read is not "nothing is held" — erasing the badge on
+                // a network blip is exactly the defect Hold exists to prevent
+                // (a latch whose only record is the operator's memory). Keep
+                // the last observed latch, mark it unconfirmed, and withdraw
+                // authority: a mutation needs a receipt this read did not get.
+                holdState = { ...holdState, loaded: true, canHold: false, stale: true };
+            }
+            renderHoldState();
+            return holdState.canHold;
+        })();
+        holdPromise = request;
+        try {
+            return await request;
+        } finally {
+            if (holdPromise === request) holdPromise = null;
+        }
+    }
+
+    // Write the latch a mutation committed into the state the cards render
+    // from. `held`/`sources` are composed by the SAME rule the host applies
+    // (EffectiveHoldState): held if either independent latch is set, in
+    // host-then-agent order. The host latch is untouched by an agent mutation,
+    // so the last reading of it remains the best evidence there is.
+    function applyLatch(agentId, latch) {
+        if (typeof agentId !== 'string' || !agentId) return;
+        // A read that started BEFORE this mutation carries a pre-mutation
+        // reading of the very latch just committed, so letting it land would
+        // undo a committed fact with a stale one. Orphan it — the same
+        // sequence fence retireHoldSurface uses. Reads started after this
+        // point take a higher sequence and are still free to confirm.
+        holdSeq++;
+        const previous = holdState.byAgent.get(agentId) || null;
+        const sources = [];
+        if (holdState.hostHold) sources.push('host');
+        if (latch) sources.push('agent');
+        const byAgent = new Map(holdState.byAgent);
+        byAgent.set(agentId, {
+            ...(previous || {}),
+            agent_id: agentId,
+            held: sources.length > 0,
+            sources,
+            agent_hold: latch || null,
+        });
+        holdState = { ...holdState, loaded: true, byAgent };
+        renderHoldState();
     }
 
     function buildCard(item) {
@@ -323,7 +924,24 @@ export function mountAgentList(containerEl, config = {}) {
         actionsAnchor.dataset.slot = 'agent-card-actions';
         actionsAnchor.className = 'agent-card-actions';
         const stopControls = makeStopControls(doc, item, onStop);
-        if (!usingDefaultRenderer) actionsAnchor.appendChild(stopControls);
+        // Hold rides the same component-owned seam as Stop, so a host renderer
+        // that replaces the card body cannot replace the latch surface either.
+        // Its nodes are built here but ATTACHED only once the host has answered
+        // that it has a Hold door — see attachHoldView.
+        const holdControls = holdSupported !== false
+            ? makeHoldControls(doc, item, {
+                isThinking: () => !!isThinking(item.name),
+                askReason,
+                setHold: (payload) => api.setHostHold(payload),
+                releaseHold: (payload) => api.releaseHostHold(payload),
+                runStop: () => stopControls.runStop(),
+                refreshHoldState: () => refreshHoldState(),
+                applyLatch,
+            })
+            : null;
+        if (!usingDefaultRenderer) {
+            actionsAnchor.appendChild(stopControls.nodes);
+        }
 
         // Component-owned status dot — a config flag (`showStatusDot`, default
         // true = console behavior); a host renderCard may omit it entirely.
@@ -360,8 +978,25 @@ export function mountAgentList(containerEl, config = {}) {
         // portrait), in which case the component leaves it where the host put it.
         if (statusDot) shell.appendChild(statusDot);
         if (body) shell.appendChild(body);
-        if (usingDefaultRenderer) shell.appendChild(stopControls);
+        if (usingDefaultRenderer) {
+            shell.appendChild(stopControls.nodes);
+        }
         if (!actionsAnchor.parentNode) shell.appendChild(actionsAnchor);
+
+        if (holdControls) {
+            const view = {
+                shell,
+                item,
+                controls: holdControls,
+                // Stop's last node, live in whichever parent the card put it in
+                // (the shell for the console row, the actions anchor for a host
+                // renderer). Hold's nodes follow it.
+                anchor: stopControls.tail,
+                attached: false,
+            };
+            holdViews.push(view);
+            if (holdSupported === true) attachHoldView(view);
+        }
 
         // NOTE: the `agent-card-actions` slot is rendered by `renderList` AFTER
         // this shell is appended to the live `root`, NOT here. Slot code
@@ -392,6 +1027,7 @@ export function mountAgentList(containerEl, config = {}) {
 
     function renderList() {
         root.innerHTML = '';
+        holdViews.length = 0;
         if (!items.length) {
             const empty = doc.createElement('p');
             empty.className = 'agent-list-empty empty-state';
@@ -406,6 +1042,9 @@ export function mountAgentList(containerEl, config = {}) {
             root.appendChild(shell);
             mountActionsSlot(actionsAnchor, item);
         }
+        // A rebuilt card starts un-held; repaint from the latch state already
+        // read so a list refresh never blanks a hold badge for a poll interval.
+        renderHoldState();
     }
 
     // Repaint the active-selection highlight only — no rebuild, so per-card slot
@@ -475,14 +1114,22 @@ export function mountAgentList(containerEl, config = {}) {
 
     function destroy() {
         refreshSeq++; // orphan any in-flight refresh
+        holdSeq++;    // and any in-flight latch read
+        holdViews.length = 0;
+        stopHoldPolling();
         containerEl.innerHTML = '';
     }
 
     if (config.autoLoad !== false) refresh();
+    // Ask the host for its latch immediately: the answer both establishes that
+    // the Hold door exists and paints a reloaded page's held cards as held on
+    // first render, rather than a poll interval later.
+    void refreshHoldState();
 
     return {
         element: root,
         refresh,
+        refreshHoldState,
         select,
         setActiveName,
         getActive: () => findItem(activeName),
@@ -525,7 +1172,12 @@ export function mountAgentList(containerEl, config = {}) {
  * Config (all optional except where the list needs them):
  *   - api, adapter, renderCard, showStatusDot, isThinking, onStop, onSelect,
  *     onLoaded, onError, autoLoad, autoSelectFirst, selectedName, escapeHtml,
- *     emptyText, errorText — forwarded verbatim to `mountAgentList`.
+ *     emptyText, errorText, hold, holdStatusIntervalMs, askHoldReason —
+ *     forwarded verbatim to `mountAgentList`. This list is the pane's whole
+ *     forwarding surface, so an option `mountAgentList` reads and this call
+ *     site omits is silently ignored — the shape that dropped `hold` (#3164).
+ *     The drift test in tests/frontend/agent_hold_controls.test.mjs holds the
+ *     two lists together.
  *   - onNew()          — the "+ New" header action (Add-a-Companion / new agent).
  *                        The New button is only built/adopted when this is a fn.
  *   - onPrepareStopAll(items) — REQUIRED to enable Stop All: synchronous
@@ -674,6 +1326,9 @@ export function mountAgentListPane(containerEl, config = {}) {
         escapeHtml: config.escapeHtml,
         emptyText: config.emptyText,
         errorText: config.errorText,
+        askHoldReason: config.askHoldReason,
+        hold: config.hold,
+        holdStatusIntervalMs: config.holdStatusIntervalMs,
     });
 
     // --- Fleet cooperative Stop (andon cord) -------------------------------
@@ -1086,6 +1741,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         element: paneEl,
         list: listHandle,
         refresh: (...a) => listHandle.refresh(...a),
+        refreshHoldState: (...a) => listHandle.refreshHoldState(...a),
         select: (...a) => listHandle.select(...a),
         setActiveName: (...a) => listHandle.setActiveName(...a),
         getActive: (...a) => listHandle.getActive(...a),

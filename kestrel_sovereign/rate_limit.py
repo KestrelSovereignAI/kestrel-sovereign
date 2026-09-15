@@ -18,15 +18,24 @@ STOP_ADMISSION_RATE_LIMIT = f"{STOP_ADMISSION_RATE_LIMIT_COUNT}/minute"
 STOP_ADMISSION_RATE_LIMIT_SCOPE = "durable-stop-admission"
 _STOP_RATE_KEY_DOMAIN = b"kestrel:durable-stop-rate-limit:v1\0"
 
+HOLD_ADMISSION_RATE_LIMIT_COUNT = 60
+HOLD_ADMISSION_RATE_LIMIT_WINDOW_SECONDS = 60
+HOLD_ADMISSION_RATE_LIMIT = f"{HOLD_ADMISSION_RATE_LIMIT_COUNT}/minute"
+HOLD_ADMISSION_RATE_LIMIT_SCOPE = "durable-hold-admission"
 
-def durable_stop_rate_limit_key(request: Request) -> str:
-    """Return a private, per-caller key for durable Stop admissions.
+
+def durable_control_plane_rate_limit_key(request: Request) -> str:
+    """Return a private, per-caller key for durable control-plane admissions.
 
     Authentication middleware binds ``request.state.caller`` before endpoint
     dispatch. Prefer the credential fingerprint so aliases of one sovereign
     key share a bucket, and hash every fallback so rate-limit logs never repeat
     a principal identifier. A narrow network fallback protects standalone apps
     that deliberately mount a Stop router without authentication middleware.
+
+    The derivation is the caller's identity, not one verb's semantics, so Stop
+    and Hold share it. Their BUDGETS stay separate (each has its own limiter
+    scope): a Hold storm must not spend the andon cord's admissions.
     """
 
     caller = getattr(request.state, "caller", None)
@@ -48,20 +57,36 @@ def durable_stop_rate_limit_key(request: Request) -> str:
         _STOP_RATE_KEY_DOMAIN + payload
     ).hexdigest()
 
+
+# The historical name of the shared derivation above, kept because callers
+# outside this repository import it.
+durable_stop_rate_limit_key = durable_control_plane_rate_limit_key
+
 limiter = Limiter(key_func=get_remote_address)
 stop_admission_rate_limit = limiter.shared_limit(
     STOP_ADMISSION_RATE_LIMIT,
     scope=STOP_ADMISSION_RATE_LIMIT_SCOPE,
-    key_func=durable_stop_rate_limit_key,
+    key_func=durable_control_plane_rate_limit_key,
+)
+hold_admission_rate_limit = limiter.shared_limit(
+    HOLD_ADMISSION_RATE_LIMIT,
+    scope=HOLD_ADMISSION_RATE_LIMIT_SCOPE,
+    key_func=durable_control_plane_rate_limit_key,
 )
 
 
 __all__ = [
+    "HOLD_ADMISSION_RATE_LIMIT",
+    "HOLD_ADMISSION_RATE_LIMIT_COUNT",
+    "HOLD_ADMISSION_RATE_LIMIT_SCOPE",
+    "HOLD_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
     "STOP_ADMISSION_RATE_LIMIT",
     "STOP_ADMISSION_RATE_LIMIT_COUNT",
     "STOP_ADMISSION_RATE_LIMIT_SCOPE",
     "STOP_ADMISSION_RATE_LIMIT_WINDOW_SECONDS",
+    "durable_control_plane_rate_limit_key",
     "durable_stop_rate_limit_key",
+    "hold_admission_rate_limit",
     "limiter",
     "stop_admission_rate_limit",
 ]

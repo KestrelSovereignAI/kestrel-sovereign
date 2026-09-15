@@ -1012,6 +1012,46 @@ class HoldMutation:
     current: Optional[HoldState]
 
 
+def hold_latch_payload(latch: Optional[HoldState]) -> Optional[dict[str, Any]]:
+    """The one wire projection of a latch, shared by every transport.
+
+    The turn-start refusal envelope and the host Hold door describe the same
+    durable fact; a second hand-written dict would let the console and the
+    refusal disagree about what "held" carries.
+    """
+
+    if latch is None:
+        return None
+    return {
+        "scope": latch.scope.value,
+        "target_id": latch.target_id,
+        "reason": latch.reason,
+        "actor_id": latch.actor_id,
+        "set_at": latch.set_at,
+        "hold_receipt_id": latch.hold_receipt_id,
+        "revision": latch.revision,
+    }
+
+
+def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
+    """The wire projection of one immutable Hold receipt."""
+
+    return {
+        "receipt_id": receipt.receipt_id,
+        "operation_id": receipt.operation_id,
+        "action": receipt.action.value,
+        "disposition": receipt.disposition.value,
+        "scope": receipt.scope.value,
+        "target_id": receipt.target_id,
+        "reason": receipt.reason,
+        "actor_id": receipt.actor_id,
+        "occurred_at": receipt.occurred_at,
+        "expected_hold_receipt_id": receipt.expected_hold_receipt_id,
+        "prior_hold_receipt_id": receipt.prior_hold_receipt_id,
+        "resulting_hold_receipt_id": receipt.resulting_hold_receipt_id,
+    }
+
+
 def hold_initialization_witness_path(control_db_path: str | Path) -> Path:
     """Return the external witness paired with one host control database."""
 
