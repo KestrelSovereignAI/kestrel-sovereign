@@ -158,7 +158,14 @@ def test_subagent_dispatch_closure_is_complete():
 
 
 def _self_call_names(func) -> set[str]:
-    """Names invoked as ``self.<name>(...)`` in ``func``'s own source.
+    """Names referenced as ``self.<name>`` in ``func``'s own source.
+
+    Calls *and* bare attribute reads. #3245 added a class attribute the
+    cluster read as ``self._SUBAGENT_CONTEXT_FRACTION`` and the walk below,
+    which then saw only ``self.<name>(...)`` calls, let it through; every
+    external feature's subagent died on its first budget check (#3298). A
+    borrowed method may only touch what the SDK base provides or what is
+    borrowed with it, however it touches it.
 
     Parsed under a synthetic block header rather than dedented: these methods
     embed prompt literals whose continuation lines sit at a shallower indent
@@ -168,12 +175,11 @@ def _self_call_names(func) -> set[str]:
     """
     tree = ast.parse("if True:\n" + inspect.getsource(func))
     return {
-        node.func.attr
+        node.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "self"
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
     }
 
 
@@ -192,3 +198,33 @@ async def test_external_feature_executes_as_subagent_end_to_end():
     assert result["success"] is True
     assert result["result"] == "all done"
     fake_agent.llm_service.generate.assert_awaited_once()
+
+
+def test_external_feature_gets_a_subagent_context_budget():
+    """The exact door #3298 opened: a borrowed budget check on an SDK feature.
+
+    ``_subagent_context_budget`` is borrowed onto external features; anything
+    it reads through ``self`` must come with it. A model whose context limit
+    resolves yields an integer budget rather than an ``AttributeError``
+    swallowed into ``success: False`` at runtime.
+    """
+    from unittest.mock import patch
+
+    from kestrel_sovereign.features.base import SUBAGENT_CONTEXT_FRACTION
+
+    cls = ensure_subagent_dispatch(_ExternalFeature)
+    feature = cls.__new__(cls)
+    feature.name = "external"
+    counter = SimpleNamespace(resolved_context_limit=lambda: 200_000)
+
+    # The limit is resolved through the token counter; pin it so the test
+    # measures the borrowed budget arithmetic, not model discovery.
+    with patch(
+        "kestrel_sovereign.agent.token_counter.get_token_counter",
+        return_value=counter,
+    ):
+        budget = feature._subagent_context_budget("any-model")
+
+    assert budget == int(200_000 * SUBAGENT_CONTEXT_FRACTION)
+    assert 0 < SUBAGENT_CONTEXT_FRACTION < 1
+
