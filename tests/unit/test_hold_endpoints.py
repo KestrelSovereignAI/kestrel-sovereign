@@ -319,6 +319,80 @@ async def test_one_snapshot_is_measured_against_the_real_store(tmp_path, monkeyp
         await db.close()
 
 
+async def test_a_host_resume_leaves_an_agents_own_hold_standing(tmp_path):
+    """The reading the banner's held count is computed from, across a resume.
+
+    The store's own independence is proven in ``test_hold_state``; what this
+    pins is the DOOR: that a host release through ``POST /hold/release``
+    converges the very projection the console tallies onto a PARTIALLY held
+    fleet, rather than clearing latches it never addressed. A held count that
+    fell to zero here would be a console telling an operator an agent they
+    held individually had been resumed for them (#3165).
+    """
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "host.db"))
+    store = HoldStore(db)
+    await store.ensure_schema()
+    try:
+        app, _ = _app(
+            agents=(("Alpha", ALPHA), ("Beta", BETA), ("Gamma", GAMMA)),
+            caller=_sovereign(),
+            store=store,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            agent_hold = await client.post(
+                "/api/host/hold",
+                json={
+                    "scope": "agent",
+                    "target_id": BETA,
+                    "reason": "runaway loop",
+                    "operation_id": "op-beta",
+                },
+            )
+            assert agent_hold.status_code == 200, agent_hold.text
+            host_hold = await client.post(
+                "/api/host/hold",
+                json={"scope": "host", "reason": "fleet freeze", "operation_id": "op-host"},
+            )
+            assert host_hold.status_code == 200, host_hold.text
+            host_receipt = host_hold.json()["current"]["hold_receipt_id"]
+
+            held_everywhere = (await client.get("/api/host/hold")).json()
+            assert [entry["held"] for entry in held_everywhere["agents"]] == [
+                True,
+                True,
+                True,
+            ]
+
+            released = await client.post(
+                "/api/host/hold/release",
+                json={
+                    "scope": "host",
+                    "reason": "fleet cleared",
+                    "operation_id": "op-host-release",
+                    "expected_hold_receipt_id": host_receipt,
+                },
+            )
+            assert released.status_code == 200, released.text
+            assert released.json()["receipt"]["disposition"] == "applied"
+            assert released.json()["current"] is None
+
+            after = (await client.get("/api/host/hold")).json()
+
+        assert after["host_hold"] is None
+        assert [entry["held"] for entry in after["agents"]] == [False, True, False], (
+            "a host resume releases the host latch and nothing else"
+        )
+        beta = after["agents"][1]
+        assert beta["agent_id"] == BETA
+        assert beta["sources"] == ["agent"]
+        assert beta["agent_hold"]["reason"] == "runaway loop"
+    finally:
+        await db.close()
+
+
 def test_read_reports_authority_without_refusing_the_view():
     app, _ = _app(caller=_authenticated())
 

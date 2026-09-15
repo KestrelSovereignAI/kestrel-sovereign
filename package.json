@@ -1,4 +1,5 @@
 {
+  "name": "kestrel-sovereign",
   "scripts": {
     "test:js": "node --test tests/frontend/*.test.mjs"
   },

@@ -49,6 +49,24 @@ function newStopAllCorrelationId() {
     return newOperationId('ui-host-stop');
 }
 
+// A Hold and a Resume are receipted governance acts, so both carry an operator
+// reason. A blank or cancelled answer aborts rather than silently substituting
+// one. Card-scoped and fleet-scoped Hold share this asker so the two cannot
+// drift into different ideas of what counts as a reason.
+function makeReasonAsker(override) {
+    const ask = typeof override === 'function'
+        ? override
+        : ((message, defaultValue) => (
+            typeof window !== 'undefined' && typeof window.prompt === 'function'
+                ? window.prompt(message, defaultValue)
+                : null
+        ));
+    return (message, defaultValue) => {
+        const answer = ask(message, defaultValue);
+        return typeof answer === 'string' && answer.trim() ? answer.trim() : null;
+    };
+}
+
 // ============================================================================
 // Default adapter — the standalone console's `/api/agents` data source
 // ============================================================================
@@ -646,6 +664,10 @@ function makeHoldControls(doc, item, ctx) {
  *     door exists (for a host that knows its own backend).
  *   - `holdStatusIntervalMs` — authoritative latch-poll cadence (default 5s).
  *   - `askHoldReason(message, defaultValue)` — reason prompt override.
+ *   - `onHoldState(snapshot)` — republishes the host's latch table after every
+ *     read and every committed mutation, so a surface OUTSIDE the list (the
+ *     pane's banner held count, #3165) renders host verdicts rather than
+ *     composing "held" a second time.
  */
 export function mountAgentList(containerEl, config = {}) {
     if (!containerEl) throw new Error('mountAgentList requires a container element');
@@ -684,32 +706,34 @@ export function mountAgentList(containerEl, config = {}) {
     let holdSupported = null;
     if (!holdCallable || config.hold === false) holdSupported = false;
     else if (config.hold === true) holdSupported = true;
-    const askHoldReason = typeof config.askHoldReason === 'function'
-        ? config.askHoldReason
-        : ((message, defaultValue) => (
-            typeof window !== 'undefined' && typeof window.prompt === 'function'
-                ? window.prompt(message, defaultValue)
-                : null
-        ));
-    // A Hold and a Resume are receipted governance acts, so both carry an
-    // operator reason. A blank or cancelled answer aborts rather than
-    // silently substituting one.
-    function askReason(message, defaultValue) {
-        const answer = askHoldReason(message, defaultValue);
-        return typeof answer === 'string' && answer.trim() ? answer.trim() : null;
-    }
+    const askReason = makeReasonAsker(config.askHoldReason);
+    // The banner's held count and fleet menu are drawn by the PANE, which owns
+    // no latch state of its own — it renders what the host said, republished
+    // here after every read and after every mutation this document committed.
+    const onHoldState = typeof config.onHoldState === 'function' ? config.onHoldState : null;
     // The browser never derives "held" — the host composes the two
     // independent latches and says so. Until a read succeeds the controls
     // stay inert rather than drawing an agent as un-held.
+    //
+    // `stale` and `composed` are deliberately two fields, because they are two
+    // different failures of confirmation and only one of them is visible as a
+    // failure. `stale` says a READ did not arrive. `composed` says this
+    // document painted a committed mutation over the last reading before any
+    // read confirmed it — which leaves `stale` false while the table is no
+    // longer purely the host's. A surface that presents entries as EVIDENCE
+    // (the fleet fan-out, #3165) needs both to be clear; one that merely
+    // renders the best current knowledge (a badge) needs only `stale`.
     let holdState = {
         loaded: false,
         stale: false,
+        composed: false,
         canHold: false,
         hostHold: null,
         byAgent: new Map(),
     };
     let holdSeq = 0;
     let holdPromise = null;
+    let holdPromiseSeq = 0;
     const holdViews = [];
 
     // Hold is durable state a card must keep showing with nothing in flight,
@@ -778,6 +802,44 @@ export function mountAgentList(containerEl, config = {}) {
         if (view.shell.classList) view.shell.classList.remove('agent-held');
     }
 
+    // The public projection of the host's latch table: the entries the host
+    // itself named, its own composed `held` verdict for each, and the tallies a
+    // banner renders. The count is a SUM of host verdicts, never a second
+    // composition rule — the browser derives "held" in exactly one place
+    // (applyLatch / applyHostLatch, for the mutation it just committed) and
+    // nowhere else.
+    //
+    // `confirmed` is the load-bearing field for any consumer presenting these
+    // entries as evidence: it is true only when every entry here came from ONE
+    // host read that this document has not painted over. A false `confirmed`
+    // does not mean the entries are wrong — it means they are this document's
+    // best guess at a table only the host can state, and the fleet membership
+    // or an agent's own latch may have moved since the read they were composed
+    // from.
+    function holdSnapshot() {
+        const agents = Array.from(holdState.byAgent.values());
+        return {
+            supported: holdSupported === true,
+            loaded: holdState.loaded === true,
+            stale: holdState.stale === true,
+            composed: holdState.composed === true,
+            confirmed: holdState.loaded === true
+                && holdState.stale !== true
+                && holdState.composed !== true,
+            canHold: holdState.canHold === true,
+            hostHold: holdState.hostHold || null,
+            agents,
+            targetCount: agents.length,
+            heldCount: agents.filter((entry) => entry && entry.held === true).length,
+        };
+    }
+
+    function publishHoldState() {
+        if (!onHoldState) return;
+        // A host callback is not allowed to break the list it is watching.
+        try { onHoldState(holdSnapshot()); } catch (_) { /* best-effort */ }
+    }
+
     // The host says there is no Hold door. Take the surface off every card,
     // stop asking, and build no more of it — an operator must not be left a
     // permanently disabled control and a poll against a route that 404s.
@@ -786,11 +848,19 @@ export function mountAgentList(containerEl, config = {}) {
         holdSupported = false;
         holdSeq++; // orphan any in-flight read
         holdState = {
-            loaded: true, stale: false, canHold: false, hostHold: null, byAgent: new Map(),
+            loaded: true,
+            stale: false,
+            composed: false,
+            canHold: false,
+            hostHold: null,
+            byAgent: new Map(),
         };
         stopHoldPolling();
         for (const view of holdViews) detachHoldView(view);
         holdViews.length = 0;
+        // The banner hangs off the same answer: a host with no Hold door must
+        // lose its fleet menu and held count too, not keep a dead one.
+        publishHoldState();
     }
 
     // "No such route" is a structural answer, not a blip: the door is absent,
@@ -815,11 +885,26 @@ export function mountAgentList(containerEl, config = {}) {
                 stale: holdState.stale === true,
             });
         }
+        publishHoldState();
     }
 
-    async function refreshHoldState() {
+    /**
+     * Read the host's latch table.
+     *
+     * `{ fresh: true }` demands a read that STARTS now. Plain coalescing is
+     * wrong for a caller whose own evidence the read has to postdate: an
+     * in-flight read may have been issued before the mutation that caller just
+     * committed, and joining it reports a confirmation that never happened.
+     * Worse, a mutation orphans an in-flight read by sequence, so joining one
+     * is frequently joining a promise that resolves to nothing at all — which
+     * is what left the post-mutation refresh a no-op until the next poll tick.
+     */
+    async function refreshHoldState(options = {}) {
         if (!holdCallable || holdSupported === false) return false;
-        if (holdPromise) return holdPromise;
+        const fresh = !!(options && options.fresh === true);
+        // Join only a read that can still land, and only when the caller did
+        // not ask for one strictly newer than itself.
+        if (holdPromise && !fresh && holdPromiseSeq === holdSeq) return holdPromise;
         const request = (async () => {
             const seq = ++holdSeq;
             try {
@@ -837,9 +922,14 @@ export function mountAgentList(containerEl, config = {}) {
                 // The host answered, so the door exists. This is the only place
                 // support is established; method presence never establishes it.
                 holdSupported = true;
+                // One read, wholesale: the entries, the host latch and the
+                // membership are all the host's, so nothing this document
+                // composed earlier survives into the table. That is what makes
+                // the snapshot presentable as evidence again.
                 holdState = {
                     loaded: true,
                     stale: false,
+                    composed: false,
                     canHold: !!(payload && payload.can_hold === true),
                     hostHold: (payload && payload.host_hold) || null,
                     byAgent,
@@ -861,6 +951,10 @@ export function mountAgentList(containerEl, config = {}) {
             return holdState.canHold;
         })();
         holdPromise = request;
+        // The IIFE above takes its sequence synchronously, so this is THIS
+        // read's fence. A later mutation moving `holdSeq` past it is precisely
+        // how a joiner learns the in-flight read can no longer land.
+        holdPromiseSeq = holdSeq;
         try {
             return await request;
         } finally {
@@ -893,7 +987,44 @@ export function mountAgentList(containerEl, config = {}) {
             sources,
             agent_hold: latch || null,
         });
-        holdState = { ...holdState, loaded: true, byAgent };
+        // `composed`: a paint, not a reading. The badge may render it (that is
+        // what it is for), but nothing may present it as the host's own answer
+        // until a read confirms the whole table.
+        holdState = { ...holdState, loaded: true, composed: true, byAgent };
+        renderHoldState();
+    }
+
+    // The same rule on the OTHER independent axis, for a host-scope mutation
+    // the banner committed. Every entry's `held`/`sources` is recomposed from
+    // (host latch, that entry's own agent latch) — which is why releasing the
+    // host latch here leaves an agent someone held individually still held,
+    // exactly as EffectiveHoldState leaves it server-side. Nothing about an
+    // agent's own latch is read from, or written by, the host mutation.
+    //
+    // What this CANNOT do is learn anything the last read did not contain. The
+    // membership it iterates, and every per-agent latch it carries forward, are
+    // as old as that read; if an agent joined the fleet or somebody held one
+    // individually since, this recomposition is confidently wrong about them.
+    // That is why it marks the table `composed` — see holdSnapshot.
+    function applyHostLatch(latch) {
+        if (latch !== null && (typeof latch !== 'object' || Array.isArray(latch))) return;
+        holdSeq++; // orphan a read that started before this mutation committed
+        const hostHold = latch || null;
+        const byAgent = new Map();
+        for (const [agentId, previous] of holdState.byAgent) {
+            const agentHold = (previous && previous.agent_hold) || null;
+            const sources = [];
+            if (hostHold) sources.push('host');
+            if (agentHold) sources.push('agent');
+            byAgent.set(agentId, {
+                ...(previous || {}),
+                agent_id: agentId,
+                held: sources.length > 0,
+                sources,
+                agent_hold: agentHold,
+            });
+        }
+        holdState = { ...holdState, loaded: true, composed: true, hostHold, byAgent };
         renderHoldState();
     }
 
@@ -935,7 +1066,10 @@ export function mountAgentList(containerEl, config = {}) {
                 setHold: (payload) => api.setHostHold(payload),
                 releaseHold: (payload) => api.releaseHostHold(payload),
                 runStop: () => stopControls.runStop(),
-                refreshHoldState: () => refreshHoldState(),
+                // A card's post-mutation confirmation is subject to exactly the
+                // same rule as the banner's: it has to be a read that started
+                // after the latch this card just committed.
+                refreshHoldState: () => refreshHoldState({ fresh: true }),
                 applyLatch,
             })
             : null;
@@ -1124,12 +1258,15 @@ export function mountAgentList(containerEl, config = {}) {
     // Ask the host for its latch immediately: the answer both establishes that
     // the Hold door exists and paints a reloaded page's held cards as held on
     // first render, rather than a poll interval later.
+    publishHoldState();
     void refreshHoldState();
 
     return {
         element: root,
         refresh,
         refreshHoldState,
+        getHoldState: holdSnapshot,
+        applyHostLatch,
         select,
         setActiveName,
         getActive: () => findItem(activeName),
@@ -1171,8 +1308,9 @@ export function mountAgentList(containerEl, config = {}) {
  *
  * Config (all optional except where the list needs them):
  *   - api, adapter, renderCard, showStatusDot, isThinking, onStop, onSelect,
- *     onLoaded, onError, autoLoad, autoSelectFirst, selectedName, escapeHtml,
- *     emptyText, errorText, hold, holdStatusIntervalMs, askHoldReason —
+ *     onLoaded, onError, onHoldState, autoLoad, autoSelectFirst, selectedName,
+ *     escapeHtml, emptyText, errorText, hold, holdStatusIntervalMs,
+ *     askHoldReason —
  *     forwarded verbatim to `mountAgentList`. This list is the pane's whole
  *     forwarding surface, so an option `mountAgentList` reads and this call
  *     site omits is silently ignored — the shape that dropped `hold` (#3164).
@@ -1185,12 +1323,19 @@ export function mountAgentList(containerEl, config = {}) {
  *                        callback invoked with (response, error, correlationId).
  *   - confirmStopAll(message) — host confirmation override (defaults to confirm).
  *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence.
+ *   - stopAllReason / fleetHoldReason — wording carried on the fleet requests.
  *   - newLabel         — accessible label / tooltip for the New button.
  *   - collapsed        — initial collapsed state (overridden by persistence).
  *   - storageKey       — persistence namespace (default 'kestrel:agents-pane').
  *   - title            — pane header title (default 'Agents').
  *   - onToggle(bool)   — fired after every collapse/expand with the new state.
  *   - minWidth/maxWidth — resize clamps (default 200 / 500, matching the CSS).
+ *
+ * The banner also carries the FLEET Hold surface (#3165): a persistent held
+ * count and a menu with "Hold all", "Stop all and hold", and the release of the
+ * host latch. Both are pane-owned for the same reason Stop All is — the pane is
+ * what the console and Frinz's companions pane both mount, so one
+ * implementation serves two products.
  *
  * Returns a handle:
  *   `{ element, list, refresh, select, setActiveName, getActive,
@@ -1300,6 +1445,24 @@ export function mountAgentListPane(containerEl, config = {}) {
     let stopAllPending = false;
     let refreshStopAllState = async () => false;
     let invalidateStopAllState = () => {};
+    // The banner's own view of the host latch table. It is never composed here:
+    // every field arrives from the inner list's republication of what the host
+    // said (`onHoldState`). Until the host answers, the banner knows nothing —
+    // which is a distinct state from "nothing is held".
+    let holdBanner = {
+        supported: false,
+        loaded: false,
+        stale: false,
+        canHold: false,
+        hostHold: null,
+        agents: [],
+        targetCount: 0,
+        heldCount: 0,
+    };
+    // Assigned once the header chrome exists. The inner mount can publish
+    // synchronously, before the banner nodes are built — the same stub shape
+    // `refreshStopAllState` uses for `onLoaded`.
+    let renderFleetHoldState = () => {};
     const listHandle = mountAgentList(body, {
         api: config.api,
         adapter: config.adapter,
@@ -1319,6 +1482,11 @@ export function mountAgentListPane(containerEl, config = {}) {
         onError: (error) => {
             invalidateStopAllState();
             if (typeof config.onError === 'function') config.onError(error);
+        },
+        onHoldState: (snapshot) => {
+            holdBanner = snapshot;
+            renderFleetHoldState();
+            if (typeof config.onHoldState === 'function') config.onHoldState(snapshot);
         },
         autoLoad: config.autoLoad,
         autoSelectFirst: config.autoSelectFirst,
@@ -1431,9 +1599,11 @@ export function mountAgentListPane(containerEl, config = {}) {
         }
     };
 
-    function displayTarget(outcome) {
-        const ids = [outcome && outcome.agent_id, outcome && outcome.resolved_target]
-            .filter((value) => typeof value === 'string' && value);
+    // A host record names an agent by identity; the card names it by the
+    // display name an operator recognises. Both the Stop fan-out and the Hold
+    // fan-out address agents by identity, so both read them back through here.
+    function displayIdentity(ids) {
+        const known = ids.filter((value) => typeof value === 'string' && value);
         const item = loadedItems.find((candidate) => {
             if (!candidate) return false;
             const candidateIds = [
@@ -1442,9 +1612,16 @@ export function mountAgentListPane(containerEl, config = {}) {
                 candidate.raw && candidate.raw.did,
                 candidate.raw && candidate.raw.id,
             ];
-            return candidateIds.some((value) => ids.includes(value));
+            return candidateIds.some((value) => known.includes(value));
         });
-        return (item && (item.displayName || item.name)) || ids[0] || 'Unknown target';
+        return (item && (item.displayName || item.name)) || known[0] || 'Unknown target';
+    }
+
+    function displayTarget(outcome) {
+        return displayIdentity([
+            outcome && outcome.agent_id,
+            outcome && outcome.resolved_target,
+        ]);
     }
 
     function renderStopAllOutcomes(response, expectedCorrelationId) {
@@ -1484,7 +1661,11 @@ export function mountAgentListPane(containerEl, config = {}) {
                 ? window.confirm(message)
                 : false
         ));
-    const onStopAllClick = async () => {
+    // `confirm` is false for the compound "Stop all and hold" gesture, whose
+    // single gate is the reason prompt the Hold already asked — the same shape
+    // the card's "Stop and hold" uses. Everything else about the fan-out is
+    // identical, so the two gestures cannot report a fan-out differently.
+    async function runStopAll({ confirm = true } = {}) {
         if (!stopAllOptIn || !listEverLoaded || stopAllPending
             || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
         const count = stopAllStatus.inFlightCount;
@@ -1503,7 +1684,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         const confirmation = retryPending && count === 0
             ? 'Recover the durable result of the prior Stop All request?'
             : `Stop all ${count} in-flight ${noun}?`;
-        if (!confirmStopAll(confirmation)) return;
+        if (confirm && !confirmStopAll(confirmation)) return;
 
         containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
         stopAllPending = true;
@@ -1582,7 +1763,8 @@ export function mountAgentListPane(containerEl, config = {}) {
                 void currentOwner.refreshStopAllState();
             }
         }
-    };
+    }
+    const onStopAllClick = () => { void runStopAll({ confirm: true }); };
     if (stopAllOptIn) stopAllBtn.addEventListener('click', onStopAllClick);
 
     // Host work can originate in another tab, through the API, or from a
@@ -1603,6 +1785,378 @@ export function mountAgentListPane(containerEl, config = {}) {
         : null;
     renderStopAllState();
     void refreshStopAllState();
+
+    // --- Fleet Hold: the banner latch surface (#3165) ----------------------
+    // Hold is a LATCH, so the banner's job is different from Stop All's: Stop
+    // All reports a momentary fan-out and goes quiet, while the held count is
+    // a RESTING reading of durable state — it must still be there tomorrow,
+    // after a reload, with nothing in flight. It is therefore drawn from the
+    // host's own per-agent verdicts (republished by the list), never from this
+    // document's memory of what somebody clicked.
+    //
+    // The menu's Hold is HOST-scope: one latch, every agent. That is what makes
+    // its release safe to offer from a fleet control — a host resume releases
+    // exactly the latch it set and leaves an agent someone held individually
+    // still held, which the per-agent rows below say out loud.
+    const askFleetReason = makeReasonAsker(config.askHoldReason);
+    const fleetHoldReason = typeof config.fleetHoldReason === 'string'
+        && config.fleetHoldReason.trim()
+        ? config.fleetHoldReason.trim()
+        : 'Held from the agents banner';
+    let fleetHoldPending = false;
+
+    let holdCountEl = header.querySelector('.agent-hold-count');
+    const builtHoldCountEl = !holdCountEl;
+    if (!holdCountEl) {
+        holdCountEl = doc.createElement('span');
+        holdCountEl.className = 'agent-hold-count';
+        holdCountEl.setAttribute('role', 'status');
+        holdCountEl.setAttribute('aria-live', 'polite');
+        holdCountEl.hidden = true;
+        // Left of Stop All when that exists, so the banner reads
+        // "<held count> <Stop all> <fleet menu> <collapse>". Same
+        // parent-relative insert as Stop All: an adopted header may nest its
+        // chevron in a wrapper, and `header.insertBefore` would throw.
+        const anchor = stopAllBtn && stopAllBtn.parentNode ? stopAllBtn : collapseBtn;
+        (anchor.parentNode || header).insertBefore(holdCountEl, anchor);
+    }
+
+    // Always built, never adopted: `createKebabButton` binds its own click
+    // listener, so adopting a previous mount's button would leave two menus
+    // racing one gesture. It is removed again by this mount's destroy().
+    const fleetKebab = createKebabButton(() => fleetMenuItems(), {
+        className: 'agent-fleet-kebab',
+        ariaLabel: 'Fleet Hold actions',
+        title: 'Fleet actions',
+        // The embedding host's document, not the console's — a menu built in
+        // the wrong tree is a control nobody can reach.
+        ownerDocument: doc,
+    });
+    fleetKebab.hidden = true;
+    fleetKebab.disabled = true;
+    (collapseBtn.parentNode || header).insertBefore(fleetKebab, collapseBtn);
+
+    const fleetHoldResults = doc.createElement('div');
+    fleetHoldResults.className = 'agent-fleet-hold-results';
+    fleetHoldResults.setAttribute('role', 'status');
+    fleetHoldResults.setAttribute('aria-live', 'polite');
+    fleetHoldResults.hidden = true;
+    // Above the Stop fan-out's results, because "Stop all and hold" holds
+    // first: the two receipts read top-to-bottom in the order they happened.
+    body.insertBefore(fleetHoldResults, stopAllResults || listHandle.element);
+
+    const FLEET_HOLD_LABELS = {
+        applied: 'Held',
+        already_in_state: 'Already held',
+        unreachable: 'Hold unreachable',
+        indeterminate: 'Hold indeterminate',
+    };
+    const FLEET_RELEASE_LABELS = {
+        applied: 'Host hold released',
+        already_in_state: 'No host hold was set',
+        refused_stale: 'Host hold changed — release refused',
+        unreachable: 'Resume unreachable',
+        indeterminate: 'Resume indeterminate',
+    };
+    // A disposition that left the fleet's latch table unknown or unchanged by
+    // the operator's intent. Kept apart from partial/empty so "some agents are
+    // held" is never read as "the request was refused".
+    const FLEET_REFUSED_DISPOSITIONS = ['unreachable', 'indeterminate', 'refused_stale'];
+
+    function fleetHoldState(snapshot = holdBanner) {
+        if (!snapshot || !snapshot.supported || !snapshot.loaded) return 'unknown';
+        if (snapshot.targetCount === 0) return 'empty';
+        if (snapshot.heldCount === 0) return 'none';
+        if (snapshot.heldCount < snapshot.targetCount) return 'partial';
+        return 'all';
+    }
+
+    function fleetMenuItems() {
+        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return [];
+        const total = holdBanner.targetCount;
+        const noun = total === 1 ? 'agent' : 'agents';
+        const items = [];
+        if (holdBanner.hostHold) {
+            items.push({
+                label: 'Resume — release the host hold…',
+                action: 'resume-host-hold',
+                onSelect: () => { void releaseFleetHold(); },
+            });
+            return items;
+        }
+        items.push({
+            label: `Hold all ${total} ${noun}…`,
+            action: 'hold-all',
+            onSelect: () => { void holdFleet({ alsoStop: false }); },
+        });
+        // Only while there is work to stop, for the same reason the card offers
+        // "Stop and hold" only on a thinking row: with nothing in flight the
+        // compound gesture IS the plain Hold above it.
+        if (stopAllOptIn && stopAllStatus.canStop && stopAllStatus.inFlightCount > 0) {
+            items.push({
+                label: 'Stop all and hold…',
+                action: 'stop-all-and-hold',
+                separatorBefore: true,
+                onSelect: () => { void holdFleet({ alsoStop: true }); },
+            });
+        }
+        return items;
+    }
+
+    renderFleetHoldState = () => {
+        const state = fleetHoldState();
+        fleetKebab.hidden = !holdBanner.supported;
+        fleetKebab.disabled = !holdBanner.supported
+            || !holdBanner.canHold
+            || fleetHoldPending;
+        fleetKebab.title = holdBanner.supported && !holdBanner.canHold
+            ? 'Sovereign host authority is required to Hold agents'
+            : 'Fleet actions';
+
+        holdCountEl.dataset.holdState = state;
+        holdCountEl.dataset.heldCount = String(holdBanner.heldCount);
+        holdCountEl.dataset.targetCount = String(holdBanner.targetCount);
+        if (holdBanner.stale) holdCountEl.dataset.holdStale = 'true';
+        else delete holdCountEl.dataset.holdStale;
+
+        const visible = state === 'partial' || state === 'all';
+        holdCountEl.hidden = !visible;
+        if (!visible) {
+            holdCountEl.textContent = '';
+            holdCountEl.removeAttribute('title');
+            return;
+        }
+        holdCountEl.textContent = state === 'all'
+            ? `All ${holdBanner.targetCount} held`
+            : `${holdBanner.heldCount} of ${holdBanner.targetCount} held`;
+        const detail = holdBanner.hostHold
+            ? `A host-wide Hold is set by ${holdBanner.hostHold.actor_id} — ${holdBanner.hostHold.reason}`
+            : 'Held by their own independent agent holds';
+        // Say WHICH it is: a reading the host just confirmed, or the last one
+        // it did. Presenting the second as the first is the lie.
+        holdCountEl.title = holdBanner.stale
+            ? `${detail} (last confirmed reading; the host Hold state is currently unreadable)`
+            : detail;
+    };
+
+    function applyFleetLatch(current) {
+        // `undefined` is the one value that means "no usable evidence"; every
+        // other value — `null` for a released latch included — is a committed
+        // fact this document may paint before any confirming read arrives.
+        if (current === undefined) return;
+        listHandle.applyHostLatch(current);
+    }
+
+    // Per-agent rows are EVIDENCE about a fleet, and this document cannot
+    // produce them. `applyHostLatch` recomposes only the membership and the
+    // agent latches the LAST read happened to carry, so an agent that joined
+    // the fleet since, or one somebody held individually from another tab or
+    // the CLI, is named wrongly and with total confidence. Ask the host with a
+    // read that STARTS after the mutation committed, and hand the answer to the
+    // renderer; a read that does not land leaves the fan-out unconfirmed rather
+    // than restating a cached snapshot as a receipt.
+    async function confirmFleetProjection() {
+        await listHandle.refreshHoldState({ fresh: true });
+        const snapshot = typeof listHandle.getHoldState === 'function'
+            ? listHandle.getHoldState()
+            : null;
+        return snapshot && snapshot.confirmed === true ? snapshot : null;
+    }
+
+    // Per-agent rows for the fan-out, read back from the host's own composed
+    // verdicts. This is where a partially-held fleet becomes legible: an agent
+    // held by BOTH latches says so, and after a host resume the ones still held
+    // by their own latch are exactly the ones still listed as held.
+    //
+    // `projection` is the ONLY source of those rows and of the tallies beside
+    // them. A null (or unconfirmed) projection prints no rows and no counts:
+    // "the fan-out could not be confirmed" is a true statement, and "3 of 3
+    // agents held" drawn from a pre-mutation reading is not.
+    function renderFleetHoldOutcomes({ action, disposition, detail, projection }) {
+        const labels = action === 'release' ? FLEET_RELEASE_LABELS : FLEET_HOLD_LABELS;
+        const confirmed = projection && projection.confirmed === true ? projection : null;
+        const state = FLEET_REFUSED_DISPOSITIONS.includes(disposition)
+            ? 'refused'
+            : fleetHoldState(confirmed);
+        fleetHoldResults.hidden = false;
+        fleetHoldResults.textContent = '';
+        fleetHoldResults.dataset.action = action;
+        fleetHoldResults.dataset.disposition = disposition;
+        fleetHoldResults.dataset.holdState = state;
+        fleetHoldResults.dataset.fanout = confirmed ? 'confirmed' : 'unconfirmed';
+
+        const summary = doc.createElement('p');
+        const label = labels[disposition] || `${action === 'release' ? 'Resume' : 'Hold'}: ${disposition}`;
+        if (!confirmed) {
+            summary.textContent = `${label}. The host's per-agent Hold state could not be confirmed.`;
+        } else if (confirmed.targetCount === 0) {
+            summary.textContent = `${label}. The host named no agents to hold.`;
+        } else {
+            summary.textContent = `${label}. ${confirmed.heldCount} of ${confirmed.targetCount} agent${confirmed.targetCount === 1 ? '' : 's'} held.`;
+        }
+        if (detail) summary.title = detail;
+        fleetHoldResults.appendChild(summary);
+
+        if (!confirmed || !confirmed.agents.length) return;
+        const list = doc.createElement('ul');
+        for (const entry of confirmed.agents) {
+            const sources = Array.isArray(entry && entry.sources) ? entry.sources : [];
+            const row = doc.createElement('li');
+            row.dataset.agentId = (entry && entry.agent_id) || '';
+            row.dataset.held = entry && entry.held === true ? 'true' : 'false';
+            row.dataset.sources = sources.join(' ');
+            row.textContent = `${displayIdentity([entry && entry.agent_id])}: ${
+                entry && entry.held === true
+                    ? `held (${sources.join(', ') || 'unknown source'})`
+                    : 'not held'
+            }`;
+            list.appendChild(row);
+        }
+        fleetHoldResults.appendChild(list);
+    }
+
+    async function holdFleet({ alsoStop }) {
+        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return;
+        const total = holdBanner.targetCount;
+        const noun = total === 1 ? 'agent' : 'agents';
+        const reason = askFleetReason(
+            alsoStop
+                ? `Stop all in-flight work and hold the host — all ${total} ${noun} will refuse to begin a turn. Reason:`
+                : `Hold the host — all ${total} ${noun} will refuse to begin a turn. Reason:`,
+            fleetHoldReason,
+        );
+        if (!reason) return;
+        fleetHoldPending = true;
+        renderFleetHoldState();
+        let latched = false;
+        let confirmingRead = false;
+        try {
+            let response;
+            try {
+                response = await api.setHostHold({
+                    scope: 'host',
+                    reason,
+                    operation_id: newOperationId('ui-host-hold'),
+                });
+            } catch (error) {
+                // Nothing reached the host, so this panel states no fleet fact.
+                // The only per-agent table it could restate is the pre-request
+                // one already on screen — which is exactly what a receipt may
+                // not be drawn from.
+                renderFleetHoldOutcomes({
+                    action: 'hold',
+                    disposition: 'unreachable',
+                    detail: error && error.message,
+                    projection: null,
+                });
+                return;
+            }
+            // BOTH Hold dispositions leave a latch, so a response carrying no
+            // current latch contradicts its own receipt. Say indeterminate
+            // rather than reading that receipt as a hold — and, below, rather
+            // than proceeding to Stop on the strength of it.
+            const current = mutationLatch(response);
+            latched = !!current;
+            // Paint the committed latch NOW so a confirming read that never
+            // arrives cannot roll it back; the rows below still come only from
+            // a read, never from this paint.
+            applyFleetLatch(current);
+            const receipt = response && response.receipt;
+            const disposition = latched && receipt && typeof receipt.disposition === 'string'
+                ? receipt.disposition
+                : 'indeterminate';
+            const projection = await confirmFleetProjection();
+            confirmingRead = true;
+            renderFleetHoldOutcomes({
+                action: 'hold',
+                disposition,
+                detail: receipt && receipt.receipt_id
+                    ? `Hold receipt ${receipt.receipt_id}`
+                    : null,
+                projection,
+            });
+        } finally {
+            fleetHoldPending = false;
+            renderFleetHoldState();
+            // Only on the paths that did not already take one: the badge still
+            // converges after a request that never reached the host.
+            if (!confirmingRead) void listHandle.refreshHoldState({ fresh: true });
+        }
+        // A bare Stop All after a failed Hold is a different action from the
+        // one the operator asked for: the fleet would stop and then start again
+        // on the next heartbeat, with nothing latched and nothing saying so.
+        if (alsoStop && latched) await runStopAll({ confirm: false });
+    }
+
+    async function releaseFleetHold() {
+        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return;
+        const latch = holdBanner.hostHold;
+        const observed = latch && typeof latch.hold_receipt_id === 'string'
+            ? latch.hold_receipt_id
+            : '';
+        if (!observed) return;
+        const reason = askFleetReason(
+            'Release the host hold. Agents held individually stay held. Reason:',
+            'Resumed from the agents banner',
+        );
+        if (!reason) return;
+        fleetHoldPending = true;
+        renderFleetHoldState();
+        let confirmingRead = false;
+        try {
+            let response;
+            try {
+                response = await api.releaseHostHold({
+                    scope: 'host',
+                    reason,
+                    operation_id: newOperationId('ui-host-resume'),
+                    // The receipt the operator SAW. A host hold replaced since
+                    // the last poll is refused as stale rather than released.
+                    expected_hold_receipt_id: observed,
+                });
+            } catch (error) {
+                renderFleetHoldOutcomes({
+                    action: 'release',
+                    disposition: 'unreachable',
+                    detail: error && error.message,
+                    projection: null,
+                });
+                return;
+            }
+            // `current` is authoritative under every disposition, including the
+            // superseding latch a stale release was refused against.
+            applyFleetLatch(mutationLatch(response));
+            const receipt = response && response.receipt;
+            const disposition = receipt && typeof receipt.disposition === 'string'
+                ? receipt.disposition
+                : 'indeterminate';
+            // Which agents a host resume LEFT held is the whole point of this
+            // panel, and it is the one thing releasing the host latch cannot
+            // tell this document: an agent's own latch is on the other axis.
+            const projection = await confirmFleetProjection();
+            confirmingRead = true;
+            renderFleetHoldOutcomes({
+                action: 'release',
+                disposition,
+                detail: receipt && receipt.receipt_id
+                    ? `Release receipt ${receipt.receipt_id}`
+                    : null,
+                projection,
+            });
+        } finally {
+            fleetHoldPending = false;
+            renderFleetHoldState();
+            if (!confirmingRead) void listHandle.refreshHoldState({ fresh: true });
+        }
+    }
+
+    // The inner list may already have published (a synchronous `hold: false`,
+    // or a read that resolved before this chrome existed); paint from whatever
+    // it last said rather than waiting for the next poll.
+    if (typeof listHandle.getHoldState === 'function') {
+        holdBanner = listHandle.getHoldState();
+    }
+    renderFleetHoldState();
 
     // --- "+ New" header action (adopt existing, else build) ----------------
     // Component-owned so embed hosts — which never run the console's
@@ -1731,6 +2285,12 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (builtNewBtn && newBtn) newBtn.remove();
         if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
         if (stopAllResults && stopAllResults.parentNode) stopAllResults.remove();
+        // The fleet Hold surface is always built by this mount, never adopted,
+        // so it always leaves with it — a leaked kebab keeps a dead menu
+        // callback alive over a list handle that has already been destroyed.
+        if (builtHoldCountEl && holdCountEl) holdCountEl.remove();
+        fleetKebab.remove();
+        if (fleetHoldResults.parentNode) fleetHoldResults.remove();
         // The built resize handle too (codex P2): a leaked absolutely-positioned
         // .resize-handle overlays the container edge and gets ADOPTED by the
         // next mount into the same container, doubling listeners over time.
@@ -1742,6 +2302,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         list: listHandle,
         refresh: (...a) => listHandle.refresh(...a),
         refreshHoldState: (...a) => listHandle.refreshHoldState(...a),
+        getHoldState: (...a) => listHandle.getHoldState(...a),
         select: (...a) => listHandle.select(...a),
         setActiveName: (...a) => listHandle.setActiveName(...a),
         getActive: (...a) => listHandle.getActive(...a),
