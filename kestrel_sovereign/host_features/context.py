@@ -512,7 +512,7 @@ async def build_host_context(
         # ERROR, not warning: everything that depends on the host store is
         # about to be dropped, and each of those drops reports an empty
         # result rather than a failure (#3058).
-        logger.error("Could not open host backend/session factory: %s", exc)
+        logger.exception("Could not open host backend/session factory: %s", exc)
 
     return SovereignHostContext(
         db=db,
