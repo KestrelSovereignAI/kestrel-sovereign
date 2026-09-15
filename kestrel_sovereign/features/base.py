@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
 
+# Fraction of the model's context window a subagent may fill before the loop
+# refuses to continue. The remainder covers the response and the provider's
+# own accounting slack. A module constant, not a class attribute: the dispatch
+# cluster is grafted onto external features method by method
+# (``subagent_dispatch.ensure_subagent_dispatch``), and a class attribute
+# read through ``self`` is not carried across — #3298, where every external
+# feature's subagent died on its first budget check.
+SUBAGENT_CONTEXT_FRACTION = 0.85
+
+
 class SubagentContextBudgetExceeded(RuntimeError):
     """A subagent's accumulated messages no longer fit its model's window.
 
@@ -1848,11 +1858,6 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 - If a tool call fails or is not available, say so explicitly - do not fill in fake values
 - A fabricated cryptographic value is a lie and a constitutional violation"""
 
-    # Fraction of the model's context window a subagent may fill before the
-    # loop refuses to continue. The remainder covers the response and the
-    # provider's own accounting slack.
-    _SUBAGENT_CONTEXT_FRACTION = 0.85
-
     def _subagent_context_budget(self, model: Optional[str]) -> Optional[int]:
         """Token ceiling for one subagent's message array, or None to skip.
 
@@ -1874,7 +1879,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             return None
         if not limit or limit <= 0:
             return None
-        return int(limit * self._SUBAGENT_CONTEXT_FRACTION)
+        return int(limit * SUBAGENT_CONTEXT_FRACTION)
 
     @staticmethod
     def _subagent_wire_chars(messages: List[Dict[str, Any]]) -> str:
