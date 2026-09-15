@@ -13,6 +13,7 @@ from .invocation import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
     DistributedStopTicket,
+    StopLegacyRegistrationsError,
 )
 from .receipt import (
     StopOperationClaim,
@@ -42,6 +43,7 @@ __all__ = [
     "DistributedStopTicket",
     "StopCleanupRegistry",
     "StopDisposition",
+    "StopLegacyRegistrationsError",
     "StopOperationClaim",
     "StopOutcome",
     "StopReceipt",
