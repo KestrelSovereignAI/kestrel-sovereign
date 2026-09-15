@@ -231,10 +231,15 @@ def _open_private_file(
                 f"{label} custody file has {st.st_nlink} hard links; exclusive "
                 f"custody cannot be established: {path}"
             )
-        if harden:
+        if harden and os.name != "nt":
+            # Windows' CRT exposes fchmod on some Python versions, but it
+            # cannot establish POSIX owner-only custody. In particular it
+            # rejects a read-only descriptor when an immutable Hold witness
+            # is verified after publication. Windows custody is checked by
+            # file type/link count here, not by a misleading chmod call.
             if hasattr(os, "fchmod"):
                 os.fchmod(fd, PRIVATE_FILE_MODE)
-            else:  # pragma: no cover - Windows has no POSIX mode enforcement
+            else:  # pragma: no cover - POSIX Python normally has fchmod
                 path.chmod(PRIVATE_FILE_MODE)
         elif os.name != "nt" and stat.S_IMODE(st.st_mode) != PRIVATE_FILE_MODE:
             raise PrivateStorageError(
