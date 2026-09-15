@@ -661,8 +661,16 @@ async def invoke_agent(request: Request, http_response: Response):
             raise rate_limited_until(declined)
         # Invocation failures can wrap caller content, provider errors, or a
         # client-controlled retry id.  Keep the operator event useful without
-        # recording any of those values outside the governed request path.
-        logger.error("Agent invocation failed")
+        # recording any of those values outside the governed request path:
+        # the exception's class carries none of them and is the one fact that
+        # tells storage from provider from code at a glance -- four days of
+        # ``TransactionError`` were findable only in signal_log without it
+        # (#3297, #3292). Never the message, never a traceback.
+        logger.error(
+            "Agent invocation failed: %s.%s",
+            type(exc).__module__,
+            type(exc).__qualname__,
+        )
         raise ApiHTTPException(
             status_code=500,
             code="invoke_failed",
