@@ -440,7 +440,7 @@ function makeHoldControls(doc, item, ctx) {
             // source of truth: if that read fails, a card whose Hold demonstrably
             // landed must still render as held rather than reverting to the
             // pre-mutation reading while the outcome says "Held".
-            // MUTANT
+            if (current !== undefined) ctx.applyLatch(entry.agent_id, current);
             const disposition = latched && receipt && typeof receipt.disposition === 'string'
                 ? receipt.disposition
                 : 'indeterminate';
@@ -866,6 +866,12 @@ export function mountAgentList(containerEl, config = {}) {
     // so the last reading of it remains the best evidence there is.
     function applyLatch(agentId, latch) {
         if (typeof agentId !== 'string' || !agentId) return;
+        // A read that started BEFORE this mutation carries a pre-mutation
+        // reading of the very latch just committed, so letting it land would
+        // undo a committed fact with a stale one. Orphan it — the same
+        // sequence fence retireHoldSurface uses. Reads started after this
+        // point take a higher sequence and are still free to confirm.
+        holdSeq++;
         const previous = holdState.byAgent.get(agentId) || null;
         const sources = [];
         if (holdState.hostHold) sources.push('host');
@@ -1157,7 +1163,12 @@ export function mountAgentList(containerEl, config = {}) {
  * Config (all optional except where the list needs them):
  *   - api, adapter, renderCard, showStatusDot, isThinking, onStop, onSelect,
  *     onLoaded, onError, autoLoad, autoSelectFirst, selectedName, escapeHtml,
- *     emptyText, errorText — forwarded verbatim to `mountAgentList`.
+ *     emptyText, errorText, hold, holdStatusIntervalMs, askHoldReason —
+ *     forwarded verbatim to `mountAgentList`. This list is the pane's whole
+ *     forwarding surface, so an option `mountAgentList` reads and this call
+ *     site omits is silently ignored — the shape that dropped `hold` (#3164).
+ *     The drift test in tests/frontend/agent_hold_controls.test.mjs holds the
+ *     two lists together.
  *   - onNew()          — the "+ New" header action (Add-a-Companion / new agent).
  *                        The New button is only built/adopted when this is a fn.
  *   - onPrepareStopAll(items) — REQUIRED to enable Stop All: synchronous
@@ -1307,6 +1318,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         emptyText: config.emptyText,
         errorText: config.errorText,
         askHoldReason: config.askHoldReason,
+        hold: config.hold,
         holdStatusIntervalMs: config.holdStatusIntervalMs,
     });
 

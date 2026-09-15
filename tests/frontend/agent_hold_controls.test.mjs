@@ -6,7 +6,7 @@
 // accelerator beside a visible focusable control; and the component — not the
 // console — owns all of it, so an embedding host inherits it.
 
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -29,8 +29,37 @@ const { mountAgentList, mountAgentListPane } = await import(
     '../../kestrel_sovereign/static/js/agent_list.js'
 );
 const { closeKebabMenu } = await import('../../kestrel_sovereign/static/js/kebab_menu.js');
+const { createApiClient } = await import('../../kestrel_sovereign/static/js/api_client.mjs');
 
 function tick() { return new Promise((r) => setTimeout(r, 0)); }
+
+// The REAL console API client over a scripted host, so the component's
+// adoption check is exercised against the client every embedding host
+// actually passes it rather than a hand-written stand-in.
+function makeRealClient(route) {
+    return createApiClient({
+        fetchFn: async (url, opts) => {
+            const reply = route(url, opts) || { ok: true, status: 200 };
+            const payload = reply.body === undefined ? {} : reply.body;
+            return {
+                ok: reply.ok !== false,
+                status: reply.status || 200,
+                json: async () => payload,
+                text: async () => JSON.stringify(payload),
+                headers: { get: () => null },
+            };
+        },
+        sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+        location: { href: '/', search: '' },
+        AbortControllerCtor: globalThis.AbortController,
+        TextDecoderCtor: globalThis.TextDecoder,
+        authProvider: {
+            async ensureAuthenticated() {},
+            applyAuth: async (h) => ({ ...h, 'X-API-Key': 'k' }),
+            async onUnauthorized() { return 'failed'; },
+        },
+    });
+}
 
 const EMMA = 'did:agent:emma';
 
@@ -119,6 +148,45 @@ function holdApi({ canHold = true, hostHold = null, agentHold = null, failRead =
     return api;
 }
 
+// Count the intervals the component opens against the window it mounted into,
+// so "polling stopped" can be asserted as a released timer rather than as a
+// request that happened not to be sent.
+function watchTimers() {
+    const realSet = dom.window.setInterval;
+    const realClear = dom.window.clearInterval;
+    const live = new Set();
+    dom.window.setInterval = function patchedSetInterval(...args) {
+        const id = realSet.apply(this, args);
+        live.add(id);
+        return id;
+    };
+    dom.window.clearInterval = function patchedClearInterval(id) {
+        live.delete(id);
+        return realClear.call(this, id);
+    };
+    return {
+        outstanding: () => Array.from(live),
+        restore() {
+            for (const id of live) realClear.call(dom.window, id);
+            live.clear();
+            dom.window.setInterval = realSet;
+            dom.window.clearInterval = realClear;
+        },
+    };
+}
+
+// A mount holds a latch-poll interval, so a test that throws before its own
+// destroy() would leave the event loop open and turn a FAILING suite into a
+// HANGING one — which reports nothing. Every mount is torn down here.
+const mounted = [];
+
+afterEach(() => {
+    closeKebabMenu();
+    for (const handle of mounted.splice(0)) {
+        try { handle.destroy(); } catch (_) { /* best-effort teardown */ }
+    }
+});
+
 function mountInto(config, items = [agentItem()]) {
     const el = document.createElement('div');
     document.body.appendChild(el);
@@ -129,6 +197,7 @@ function mountInto(config, items = [agentItem()]) {
         askHoldReason: () => 'operator reason',
         ...config,
     });
+    mounted.push(handle);
     return { el, handle };
 }
 
@@ -407,6 +476,59 @@ test('a Hold that committed keeps the card held when the confirming read fails',
     handle.destroy();
 });
 
+// The 5s latch poll and an operator's Hold are independent, so the read that
+// was already in flight when the mutation committed carries a PRE-mutation
+// reading of the very latch that just landed. Letting it land last would undo
+// a committed fact with a stale one — the same "held card silently unheld"
+// failure as the test above, reached by the other door.
+test('a poll that started before a Hold cannot overwrite the latch the Hold committed', async () => {
+    const api = holdApi();
+    const { el, handle } = mountInto({ api, askHoldReason: () => 'runaway loop' });
+    await tick();
+    await tick();
+    assert.equal(el.querySelector('.agent-hold-badge').hidden, true);
+
+    // A poll reads "not held" — and then stalls before it can be applied.
+    let releaseRead;
+    const stalled = new Promise((resolve) => { releaseRead = resolve; });
+    const liveRead = api.getHostHoldState;
+    api.getHostHoldState = async () => {
+        const payload = await liveRead.call(api); // captured BEFORE the mutation
+        await stalled;
+        return payload;
+    };
+    const inFlight = handle.refreshHoldState();
+    await tick();
+    assert.equal(api.calls.read >= 2, true, 'a read is outstanding');
+
+    // A failed assertion below must not leave the stalled read — and the
+    // mounted poll — holding the event loop open.
+    try {
+        // The operator holds while that read is still outstanding.
+        el.querySelector('.agent-card-kebab').click();
+        clickMenuAction('hold');
+        await tick();
+        await tick();
+        assert.equal(api.calls.set.length, 1, 'the mutation was made');
+        assert.equal(el.querySelector('.agent-hold-badge').hidden, false);
+
+        // Now the stale reading lands, last.
+        releaseRead();
+        await inFlight;
+        await tick();
+        await tick();
+
+        assert.equal(el.querySelector('.agent-hold-badge').hidden, false,
+            'a read that predates the mutation must not undo the latch it committed');
+        assert.ok(el.querySelector('.agent-card').classList.contains('agent-held'));
+        assert.equal(el.querySelector('.agent-hold-badge-reason').textContent, 'runaway loop');
+    } finally {
+        releaseRead();
+        closeKebabMenu();
+        handle.destroy();
+    }
+});
+
 test('a Resume that committed stops showing held when the confirming read fails', async () => {
     const api = holdApi({ agentHold: latch({ receipt: 'agent-receipt-7' }) });
     const originalRelease = api.releaseHostHold;
@@ -530,6 +652,7 @@ test('a non-sovereign caller gets no Hold controls, and the pane inherits the su
         adapter: { mode: 'multi_agent', listAgents: async () => [agentItem()] },
         holdStatusIntervalMs: 1e7,
     });
+    mounted.push(pane);
     await tick();
     await tick();
 
@@ -579,4 +702,169 @@ test('a host whose API client lacks the Hold door renders exactly the old card',
     assert.equal(el.querySelector('.agent-resume-btn'), null);
     assert.ok(el.querySelector('.agent-stop-btn'), 'Stop is untouched');
     handle.destroy();
+});
+
+// The test above hand-writes an API object WITHOUT the three Hold methods, so
+// on its own it would pass against a component that read method presence as
+// proof of support. The real standard client always exposes all three whatever
+// the backend mounts, so the adoption question has to be asked of THAT client
+// against a host with no Hold route.
+test('the standard API client exposes the Hold methods even where no Hold route is mounted', () => {
+    const client = makeRealClient(() => ({ ok: true, status: 200 }));
+    for (const method of ['getHostHoldState', 'setHostHold', 'releaseHostHold']) {
+        assert.equal(typeof client[method], 'function',
+            `${method} is unconditional on the client — presence cannot mean the door exists`);
+    }
+});
+
+test('the real client against a host with no Hold route leaves the old card alone and stops polling', async () => {
+    const requested = [];
+    const client = makeRealClient((url) => {
+        requested.push(String(url));
+        return String(url).includes('/api/host/hold')
+            ? { ok: false, status: 404, body: { detail: 'Not Found' } }
+            : { ok: true, status: 200 };
+    });
+
+    // A short real interval, so "stopped polling" is observed rather than
+    // inferred from a cadence too slow to have fired. The timers are watched
+    // too: a retired surface must release its interval, not merely decline to
+    // use it — an ignored timer left running forever is still a leak.
+    const timers = watchTimers();
+    let el;
+    let handle;
+    try {
+        ({ el, handle } = mountInto({ api: client, holdStatusIntervalMs: 250 }));
+        await tick();
+        await tick();
+        await tick();
+
+        const holdReads = () => requested.filter((u) => u.includes('/api/host/hold')).length;
+        assert.equal(holdReads(), 1, 'the component asked the host exactly once');
+        assert.equal(el.querySelector('.agent-card-kebab'), null,
+            'a 404 must leave no permanently disabled control behind');
+        assert.equal(el.querySelector('.agent-hold-badge'), null);
+        assert.equal(el.querySelector('.agent-resume-btn'), null);
+        assert.ok(el.querySelector('.agent-stop-btn'), 'Stop is untouched');
+
+        // Past two poll intervals: the retired surface must not keep asking a
+        // route that answered "no such door".
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.equal(holdReads(), 1, 'polling stopped with the surface');
+        assert.deepEqual(timers.outstanding(), [],
+            'the latch poll interval is cleared, not just ignored');
+        assert.equal(await handle.refreshHoldState(), false);
+        assert.equal(holdReads(), 1, 'and an explicit refresh does not revive it');
+    } finally {
+        timers.restore();
+        if (handle) handle.destroy();
+    }
+});
+
+// Retirement only fires on a structural "no such route". A host that answers
+// the probe with a 500 (or never answers at all) has told us nothing, so the
+// component must not have drawn a Hold control on the strength of the client
+// merely having the methods — that is the accidental opt-in, and it leaves a
+// permanently disabled kebab on a card that never had a Hold door.
+test('a Hold probe that never succeeds never grows a Hold control', async () => {
+    const client = makeRealClient((url) => (String(url).includes('/api/host/hold')
+        ? { ok: false, status: 500, body: { detail: 'boom' } }
+        : { ok: true, status: 200 }));
+
+    const { el, handle } = mountInto({ api: client });
+    await tick();
+    await tick();
+    await tick();
+
+    assert.equal(el.querySelector('.agent-card-kebab'), null,
+        'an unanswered probe is not permission to draw the surface');
+    assert.equal(el.querySelector('.agent-hold-badge'), null);
+    assert.equal(el.querySelector('.agent-resume-btn'), null);
+    assert.ok(el.querySelector('.agent-stop-btn'), 'Stop is untouched');
+    handle.destroy();
+});
+
+// `hold` is the escape hatch from the probe, and the PANE is what Frinz and the
+// console actually mount. A pane that accepts the option and drops it on the
+// floor is worse than one that never had it: the embedder's configuration is
+// silently ignored, so the two paths below assert the option ARRIVES, by the
+// two behaviours only the inner component can produce.
+
+test('the pane forwards hold:false — the standard client cannot opt an embedding host in', async () => {
+    const requested = [];
+    // A host that WOULD answer the probe. If `hold: false` is dropped, the pane
+    // probes, the door answers, and the surface appears — which is exactly the
+    // accidental opt-in an embedder passed `hold: false` to prevent.
+    const client = makeRealClient((url) => {
+        requested.push(String(url));
+        return String(url).includes('/api/host/hold')
+            ? { ok: true, status: 200, body: { can_hold: true, host_hold: null, agents: [] } }
+            : { ok: true, status: 200 };
+    });
+
+    const timers = watchTimers();
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    try {
+        const pane = mountAgentListPane(el, {
+            api: client,
+            adapter: { mode: 'multi_agent', listAgents: async () => [agentItem()] },
+            hold: false,
+            holdStatusIntervalMs: 250,
+        });
+        mounted.push(pane);
+        await tick();
+        await tick();
+        await tick();
+
+        assert.ok(el.querySelector('.agent-card'), 'the pane still renders its cards');
+        assert.ok(el.querySelector('.agent-stop-btn'), 'Stop is untouched');
+        assert.equal(el.querySelector('.agent-card-kebab'), null,
+            'hold:false must reach the inner component and suppress the surface');
+        assert.equal(el.querySelector('.agent-hold-badge'), null);
+        assert.equal(el.querySelector('.agent-resume-btn'), null);
+        assert.equal(requested.filter((u) => u.includes('/api/host/hold')).length, 0,
+            'and it must not probe a door the embedder disabled');
+
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.equal(requested.filter((u) => u.includes('/api/host/hold')).length, 0,
+            'nor keep probing it on the poll');
+        assert.deepEqual(timers.outstanding(), [],
+            'a disabled Hold opens no latch-poll interval at all');
+        assert.equal(await pane.refreshHoldState(), false);
+    } finally {
+        timers.restore();
+    }
+});
+
+test('the pane forwards hold:true — an asserted door draws the surface without waiting for a probe', async () => {
+    // The probe never answers, so ONLY a forwarded `hold: true` can attach the
+    // surface here. With the option dropped, holdSupported stays null and the
+    // controls are built-but-detached exactly as in the unanswered-probe test.
+    let reads = 0;
+    const api = {
+        setHostAgent() {},
+        getHostHoldState: () => { reads++; return new Promise(() => {}); },
+        setHostHold: async () => ({}),
+        releaseHostHold: async () => ({}),
+    };
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const pane = mountAgentListPane(el, {
+        api,
+        adapter: { mode: 'multi_agent', listAgents: async () => [agentItem()] },
+        hold: true,
+        holdStatusIntervalMs: 1e7,
+    });
+    mounted.push(pane);
+    await tick();
+    await tick();
+
+    assert.equal(reads, 1, 'an asserted door is still read for its latches');
+    const kebab = el.querySelector('.agent-card-kebab');
+    assert.ok(kebab, 'hold:true must reach the inner component and attach the surface');
+    assert.equal(kebab.disabled, true,
+        'asserting the door exists is not asserting this caller may use it');
+    assert.ok(el.querySelector('.agent-hold-badge'), 'the resting badge is present, hidden');
+    assert.equal(el.querySelector('.agent-hold-badge').hidden, true);
 });

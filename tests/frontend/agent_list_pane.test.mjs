@@ -13,6 +13,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { JSDOM } from 'jsdom';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
@@ -1140,4 +1143,126 @@ test('an adopted header whose collapse button is nested still mounts', async () 
         'the Stop All control is still placed');
     assert.equal(typeof handle.destroy, 'function');
     handle.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Option-forwarding drift gate (#3164)
+// ---------------------------------------------------------------------------
+// The pane forwards list options through an explicit, hand-maintained object
+// literal. That literal is a CLAIM of parity with `mountAgentList`, and a claim
+// nothing checks drifts: an option the list reads and the pane omits is
+// accepted from the embedder and silently dropped on the floor. That is how
+// `hold` was lost — `mountAgentList` honoured it, `mountAgentListPane` never
+// passed it, so an embedder's `hold: false` did nothing at all. The census is
+// made a test here so the NEXT option fails a check, not a deployment.
+
+const AGENT_LIST_PATH = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '..', '..', 'kestrel_sovereign', 'static', 'js', 'agent_list.js',
+);
+const AGENT_LIST_SOURCE = readFileSync(AGENT_LIST_PATH, 'utf8');
+
+// Blank every comment and string body, preserving length so offsets still line
+// up with the original. Prose must not be read as code: the pane's own JSDoc
+// names `config.onNew`, and counting that would report drift that is not there.
+// agent_list.js contains no regex literals (a `/` here is division or a
+// comment); if one is ever added the sentinel assertions below fail loudly
+// rather than letting this quietly read less than the whole body.
+function blankCommentsAndStrings(source) {
+    const out = source.split('');
+    const blank = (from, to) => {
+        for (let k = from; k <= to && k < out.length; k++) {
+            if (out[k] !== '\n') out[k] = ' ';
+        }
+    };
+    for (let i = 0; i < source.length; i++) {
+        const ch = source[i];
+        const next = source[i + 1];
+        if (ch === '/' && next === '/') {
+            const nl = source.indexOf('\n', i);
+            const end = nl < 0 ? source.length - 1 : nl - 1;
+            blank(i, end);
+            i = end;
+        } else if (ch === '/' && next === '*') {
+            const close = source.indexOf('*/', i + 2);
+            if (close < 0) throw new Error('unterminated block comment');
+            blank(i, close + 1);
+            i = close + 1;
+        } else if (ch === "'" || ch === '"' || ch === '`') {
+            let j = i + 1;
+            for (; j < source.length; j++) {
+                if (source[j] === '\\') { j++; continue; }
+                if (source[j] === ch) break;
+            }
+            if (j >= source.length) throw new Error('unterminated string literal');
+            blank(i + 1, j - 1); // keep the quotes, blank the body
+            i = j;
+        }
+    }
+    return out.join('');
+}
+
+// Top-level keys of the object literal whose opening `{` is at `start`. Nested
+// literals, arrow-function bodies and call arguments are not the pane's
+// forwarding list, so only depth-1 `identifier:` entries count.
+function topLevelKeysOfObjectLiteral(source, start) {
+    if (source[start] !== '{') throw new Error('expected an object literal');
+    const keys = new Set();
+    let depth = 0;
+    let prev = '';
+    for (let i = start; i < source.length; i++) {
+        const ch = source[i];
+        if (/\s/.test(ch)) continue;
+        if (ch === '{') { depth++; prev = ch; continue; }
+        if (ch === '}') {
+            depth--;
+            if (depth === 0) return keys;
+            prev = ch;
+            continue;
+        }
+        if (depth === 1 && (prev === '{' || prev === ',') && /[A-Za-z_$]/.test(ch)) {
+            const m = /^([A-Za-z_$][\w$]*)\s*:/.exec(source.slice(i));
+            if (m) {
+                keys.add(m[1]);
+                i += m[1].length - 1;
+                prev = m[1].slice(-1);
+                continue;
+            }
+        }
+        prev = ch;
+    }
+    throw new Error('unbalanced object literal');
+}
+
+test('every option mountAgentList reads is forwarded by mountAgentListPane', () => {
+    const code = blankCommentsAndStrings(AGENT_LIST_SOURCE);
+
+    // The list function's body: its own `export function` up to the next
+    // top-level `export`, which is `mountAgentListPane`.
+    const listStart = code.search(/export function mountAgentList\s*\(/);
+    assert.ok(listStart > 0, 'found mountAgentList');
+    const listEnd = code.indexOf('\nexport ', listStart + 1);
+    assert.ok(listEnd > listStart, 'found the end of mountAgentList');
+    const listBody = code.slice(listStart, listEnd);
+
+    // Anti-false-clean sentinels. A stripper that derailed part-way would read
+    // LESS than the whole body and report a vacuous all-clear, so pin code from
+    // the body's start, middle and very end before trusting the census.
+    assert.match(listBody, /config\.hold === false/, 'body start is readable');
+    assert.match(listBody, /config\.autoLoad !== false/, 'body end is readable');
+    assert.match(listBody, /void refreshHoldState\(\);/, 'the last statement is present');
+
+    const read = new Set(
+        Array.from(listBody.matchAll(/\bconfig\.([A-Za-z_$][\w$]*)/g), (m) => m[1]),
+    );
+    assert.ok(read.size >= 15, `extractor found only ${read.size} options`);
+
+    const callAt = code.indexOf('mountAgentList(body, {', listEnd);
+    assert.ok(callAt > listEnd, 'found the pane forwarding call site');
+    const forwarded = topLevelKeysOfObjectLiteral(code, code.indexOf('{', callAt));
+    assert.ok(forwarded.has('api') && forwarded.has('adapter'), 'extractor read real keys');
+
+    const dropped = Array.from(read).filter((key) => !forwarded.has(key)).sort();
+    assert.deepEqual(dropped, [],
+        `mountAgentListPane accepts these options and silently drops them: ${dropped.join(', ')}`);
 });
