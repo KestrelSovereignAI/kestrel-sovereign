@@ -3359,12 +3359,47 @@ class PrivacyEnforcingStorage:
             report.skipped_reason = "privacy_denied"
             logger.debug("strategy ledger assertions not projected: %s", error)
             return report
-        try:
-            return await self._project_strategy_ledger_assertions_leased(
-                ledger, binding, report
-            )
-        finally:
-            self._release_ledger_assertion_lease()
+        # Serialize per ledger. The keep-set is frozen by
+        # ``build_proposal_plan`` but acted on after ``_read_ledger_assertions``,
+        # so two overlapping passes over the SAME ledger let the later pass add
+        # a row inside the earlier pass's window; the earlier pass then finds it
+        # in the store, does not find it in its stale keep-set, and reconciles
+        # it away. Retraction is terminal for this adapter, so that row is gone
+        # for good. Plan and reconcile therefore have to be one critical
+        # section. Keyed by ledger identity, not globally: unrelated ledgers do
+        # not race each other and should not queue behind one another.
+        async with self._ledger_projection_lock(ledger):
+            try:
+                return await self._project_strategy_ledger_assertions_leased(
+                    ledger, binding, report
+                )
+            finally:
+                self._release_ledger_assertion_lease()
+
+    def _ledger_projection_lock(self, ledger):
+        """Return the projection lock for one ledger, creating it on first use.
+
+        Keyed by the ledger's canonical file path when it has one, falling back
+        to object identity. Two handles onto the same file are the same ledger
+        for this purpose -- that is exactly the case the P1 describes -- while
+        two genuinely different ledgers keep independent locks and never block
+        each other.
+        """
+        import asyncio
+
+        path = getattr(ledger, "path", None) or getattr(
+            ledger, "canonical_path", None
+        )
+        key = str(path) if path else f"id:{id(ledger)}"
+        locks = getattr(self, "_ledger_projection_locks", None)
+        if locks is None:
+            locks = {}
+            self._ledger_projection_locks = locks
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
     async def _project_strategy_ledger_assertions_leased(
         self, ledger, binding, report
@@ -3397,6 +3432,16 @@ class PrivacyEnforcingStorage:
             # survives the same event because its writes are upserts; this one
             # has to refuse instead.
             report.skipped_reason = "ledger_absent"
+            return report
+        if getattr(ledger, "needs_save", False):
+            # Normalization minted row ids that live only in memory. Assertion
+            # identity derives from the row id, so projecting now writes rows
+            # under addresses that change on the next load -- and this adapter
+            # retracts terminally, so the next pass would find those
+            # assertions unmatched and kill them for good. The ledger is
+            # canonical and its own caller persists it; waiting one pass costs
+            # nothing, and the next projection reconciles.
+            report.skipped_reason = "ledger_ids_unpersisted"
             return report
         ledger_data = getattr(ledger, "data", {}) or {}
 
