@@ -254,6 +254,17 @@ async function settle() {
     for (let i = 0; i < 6; i++) await tick();
 }
 
+// For the one test that drives the real latch POLL: wait for the condition, not
+// for a duration, so a slow machine does not decide the result. A wait that
+// runs out is the failure under test, and names the condition that never came.
+async function waitFor(predicate, label, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+        if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+}
+
 function countEl(el) { return el.querySelector('.agent-hold-count'); }
 function kebab(el) { return el.querySelector('.agent-fleet-kebab'); }
 
@@ -514,6 +525,80 @@ test('a fan-out the host could not confirm is reported unconfirmed, and names no
     // unconfirmed — and it must not lose the latch that demonstrably committed.
     assert.equal(countEl(el).textContent, 'All 3 held');
     assert.equal(countEl(el).dataset.holdStale, 'true');
+});
+
+// A read that never settles is a different failure from a read that fails, and
+// it lands somewhere else: the list COALESCES on the read it has in flight and
+// retires that join target only when it settles. So a confirming read the host
+// accepts and never answers stands in front of every later poll — each tick
+// joins a promise that cannot land, no request goes out, and the banner's count
+// and Hold authority never recover even once the host does. The leash bounds
+// the gesture's WAIT; it has to retire the read as well, or one hung request
+// takes the fleet surface down for the life of the mount.
+test('a confirming read that never settles is retired by the leash, so the poll recovers', async () => {
+    const host = makeHost();
+    // Real timers. 250ms is the list's own floor — a smaller interval is
+    // silently clamped up to it — and the leash deliberately outlives a tick,
+    // so the hung read is demonstrably JOINED by a poll before the leash runs
+    // out. With a leash inside one tick nothing polls during the gesture and
+    // the coalescing assertion below would hold for want of a poll.
+    const { el } = mountPane({
+        host,
+        extra: { holdStatusIntervalMs: 250, fleetHoldConfirmTimeoutMs: 400 },
+    });
+    await settle();
+    assert.equal(countEl(el).dataset.holdState, 'none');
+    assert.equal(kebab(el).disabled, false, 'the fleet menu starts live');
+
+    // Accepted and never answered — a hung connection, a proxy holding the
+    // socket. Only reads that actually START are affected, so a poll that joins
+    // the hung one is invisible here, which is the point.
+    const live = host.getHostHoldState.bind(host);
+    let started = 0;
+    let hang = true;
+    host.getHostHoldState = async (...args) => {
+        started += 1;
+        if (hang) return new Promise(() => {});
+        return live(...args);
+    };
+
+    await chooseFleetAction(el, 'hold-all');
+    await waitFor(() => started >= 1, 'the confirming read to leave');
+    const startedWhileHung = started;
+    // The host is reachable again from here; nothing may reach it while the
+    // wedge stands, so flipping this now cannot rescue the assertion below.
+    hang = false;
+    host.failRead = true;
+    // A membership only the host can state, so the count below cannot have been
+    // composed by this document from anything it already had.
+    host.agents = [EMMA, NELLIE, KITE, WREN];
+
+    const results = el.querySelector('.agent-fleet-hold-results');
+    await waitFor(() => results.dataset.fanout === 'unconfirmed',
+        'the gesture to give up waiting for its confirming read');
+    assert.equal(countEl(el).textContent, 'All 3 held',
+        'the committed latch still paints, over the pre-mutation membership');
+    assert.equal(countEl(el).dataset.holdStale, undefined,
+        'and that composition presents itself as a current reading — which is '
+        + 'exactly why it must not be the last word the surface ever has');
+    assert.equal(started, startedWhileHung,
+        'every poll across the gesture joined the hung read rather than issuing');
+
+    // The recovery. A read the poll issues of its own accord is the only thing
+    // that can produce either of the two states below.
+    await waitFor(() => countEl(el).dataset.holdStale === 'true',
+        'the latch poll to issue a NEW read once the leash retired the hung one');
+    assert.ok(started > startedWhileHung, 'which means a request actually left');
+    assert.equal(kebab(el).disabled, true,
+        'a read that failed withdraws Hold authority, as it always did');
+
+    host.failRead = false;
+    await waitFor(() => countEl(el).textContent === 'All 4 held',
+        'the poll to converge onto the host\'s own tally');
+    assert.equal(countEl(el).dataset.holdStale, undefined, 'confirmed again');
+    assert.equal(countEl(el).dataset.targetCount, '4',
+        'read from the host, not recomposed from the membership it had before');
+    assert.equal(kebab(el).disabled, false, 'and the authority came back with it');
 });
 
 test('the confirming read is never a read that was already in flight', async () => {

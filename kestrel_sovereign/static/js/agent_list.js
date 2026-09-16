@@ -907,6 +907,34 @@ export function mountAgentList(containerEl, config = {}) {
         publishHoldState();
     }
 
+    // The stored read is the join target for every coalescing caller, and it is
+    // cleared when it SETTLES — which is precisely what a read that never
+    // settles does not do. `api.getHostHoldState()` hands the browser's fetch
+    // no signal, so a host that accepts the connection and never answers leaves
+    // one promise standing in front of every later poll for the life of the
+    // mount: each tick joins a read that cannot land, no request is issued, and
+    // the badge's count and Hold authority never recover even once the host
+    // does.
+    //
+    // A caller that has stopped waiting retires it here. The request is
+    // deliberately left in flight — a late answer still converges through the
+    // sequence fence, which is strictly more than aborting would leave behind —
+    // but it stops standing in for a read nobody is going to get, so the next
+    // poll issues one. The check is by identity: a caller giving up on ITS read
+    // must not retire a later read that is still doing its job.
+    //
+    // Clearing the promise IS the whole retirement. `holdPromiseSeq` is read
+    // only alongside a stored promise, so it goes stale here exactly as it does
+    // when a read settles normally below — one rule for when that fence means
+    // anything, rather than a second write that cannot be observed.
+    function makeHoldReadAbandon(request) {
+        return () => {
+            if (holdPromise !== request) return false;
+            holdPromise = null;
+            return true;
+        };
+    }
+
     /**
      * Read the host's latch table.
      *
@@ -917,6 +945,11 @@ export function mountAgentList(containerEl, config = {}) {
      * Worse, a mutation orphans an in-flight read by sequence, so joining one
      * is frequently joining a promise that resolves to nothing at all — which
      * is what left the post-mutation refresh a no-op until the next poll tick.
+     *
+     * `{ onReadStarted }` is handed a function that retires THIS read as the
+     * join target, for a caller that bounds how long it will wait for it. It is
+     * called only when this call actually starts a read, never when it joins
+     * one: a joiner did not start the read and may not retire it.
      */
     async function refreshHoldState(options = {}) {
         if (!holdCallable || holdSupported === false) return false;
@@ -974,6 +1007,11 @@ export function mountAgentList(containerEl, config = {}) {
         // read's fence. A later mutation moving `holdSeq` past it is precisely
         // how a joiner learns the in-flight read can no longer land.
         holdPromiseSeq = holdSeq;
+        if (options && typeof options.onReadStarted === 'function') {
+            // Synchronous, and before the first await, so a caller that arms a
+            // leash on the next line already holds the key to this read.
+            options.onReadStarted(makeHoldReadAbandon(request));
+        }
         try {
             return await request;
         } finally {
@@ -2195,9 +2233,19 @@ export function mountAgentListPane(containerEl, config = {}) {
     // than aborting it would leave behind. A wait that runs out reports the
     // fan-out `unconfirmed`, which is the same true statement the panel already
     // makes about a read that failed.
+    //
+    // Running out must ALSO retire that read as the list's coalescing join
+    // target. Leaving it there bounds the wait and then wedges the poll: every
+    // later tick joins a promise that never settles, so no request is issued
+    // and the badge's count and authority never recover. One hung request would
+    // otherwise take the whole fleet surface down for the life of the mount.
     async function confirmFleetProjection() {
+        let abandonRead = null;
         const read = (async () => {
-            await listHandle.refreshHoldState({ fresh: true });
+            await listHandle.refreshHoldState({
+                fresh: true,
+                onReadStarted: (abandon) => { abandonRead = abandon; },
+            });
             const snapshot = typeof listHandle.getHoldState === 'function'
                 ? listHandle.getHoldState()
                 : null;
@@ -2232,7 +2280,13 @@ export function mountAgentListPane(containerEl, config = {}) {
             fleetConfirmWaits.add(wait);
             wait.timer = setTimeoutFn.call(
                 view,
-                () => wait.settle(null),
+                () => {
+                    // Only the leash retires the read. A read that LANDED
+                    // cleared itself, and destroy() retires the whole list
+                    // behind it — neither has a join target to give up on.
+                    if (abandonRead) abandonRead();
+                    wait.settle(null);
+                },
                 fleetConfirmTimeoutMs,
             );
             // `refreshHoldState` swallows its own read errors, so the rejection
