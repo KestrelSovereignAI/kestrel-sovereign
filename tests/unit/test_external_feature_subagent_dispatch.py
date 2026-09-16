@@ -200,6 +200,77 @@ async def test_external_feature_executes_as_subagent_end_to_end():
     fake_agent.llm_service.generate.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
+    """Published visual features still implement the old prompt override.
+
+    Core must not fail the whole subagent before its tool can run merely
+    because the injected dispatch loop gained a runtime-toolset argument.
+    """
+
+    class LegacyVisualPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self) -> str:
+            return "legacy visual identity prompt"
+
+    cls = ensure_subagent_dispatch(LegacyVisualPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+    feature = cls(agent=fake_agent)
+
+    result = await feature.execute_as_subagent(task="make a selfie")
+
+    assert result["success"] is True, result
+    assert result["result"] == "all done"
+    assert fake_agent.llm_service.generate.await_args.kwargs["system_prompt"] == (
+        "legacy visual identity prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
+    seen = []
+
+    class KeywordPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self, *, runtime_tools) -> str:
+            seen.append([tool.name for tool in runtime_tools])
+            return "keyword-only prompt"
+
+    cls = ensure_subagent_dispatch(KeywordPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+
+    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+
+    assert result["success"] is True, result
+    assert seen == [["ping"]]
+    assert fake_agent.llm_service.generate.await_args.kwargs["system_prompt"] == (
+        "keyword-only prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_builder_internal_type_error_is_not_signature_fallback():
+    class BrokenPrompt(_ExternalFeature):
+        def _get_subagent_prompt(self, runtime_tools=None) -> str:
+            raise TypeError("internal prompt builder defect")
+
+    cls = ensure_subagent_dispatch(BrokenPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="not reached")),
+        hooks_manager=None,
+    )
+
+    result = await cls(agent=fake_agent).execute_as_subagent(task="ping")
+
+    assert result["success"] is False
+    assert "internal prompt builder defect" in result["error"]
+    fake_agent.llm_service.generate.assert_not_awaited()
+
+
 def test_external_feature_gets_a_subagent_context_budget():
     """The exact door #3298 opened: a borrowed budget check on an SDK feature.
 
@@ -227,4 +298,3 @@ def test_external_feature_gets_a_subagent_context_budget():
 
     assert budget == int(200_000 * SUBAGENT_CONTEXT_FRACTION)
     assert 0 < SUBAGENT_CONTEXT_FRACTION < 1
-

@@ -152,6 +152,30 @@ def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
     return len(_json.dumps(payload))
 
 
+def _invoke_subagent_prompt(
+    prompt_builder: Callable[..., str], runtime_tools: list[Any]
+) -> str:
+    """Call a feature prompt override through its published signature.
+
+    The SDK's external-feature contract allowed ``_get_subagent_prompt(self)``
+    before Core supplied the filtered runtime toolset. Published features such
+    as VisualIdentityFeature still use that override. Inspect the *bound*
+    method before calling it; do not catch a TypeError raised inside a prompt
+    builder, which would disguise a real feature bug as an old signature.
+    """
+    signature = inspect.signature(prompt_builder)
+    try:
+        signature.bind(runtime_tools)
+    except TypeError:
+        try:
+            signature.bind(runtime_tools=runtime_tools)
+        except TypeError:
+            signature.bind()
+            return prompt_builder()
+        return prompt_builder(runtime_tools=runtime_tools)
+    return prompt_builder(runtime_tools)
+
+
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 
@@ -1432,9 +1456,13 @@ class Feature(_SdkFeature):
             ]
             logger.debug(f"Feature {self.name} has {len(feature_tools)} tools available")
 
-            # Feature-specific system prompt, named from the SAME list the
-            # model is given so the two cannot disagree.
-            system_prompt = self._get_subagent_prompt(available_tools)
+            # Core's prompt receives the canonical runtime toolset. Existing
+            # external features may still override the old no-argument
+            # signature; invoking that published contract must not fail the
+            # entire subagent before its tools can run.
+            system_prompt = _invoke_subagent_prompt(
+                self._get_subagent_prompt, available_tools
+            )
 
             # Build user prompt with task and context
             user_prompt = f"Task: {task}"
@@ -1823,7 +1851,8 @@ class Feature(_SdkFeature):
         this invocation (see ``_compose_subagent_runtime_tools``). It is passed
         rather than re-derived so the prompt cannot name a different set from
         the one the loop advertises and executes. Omitted, it falls back to
-        ``get_tools()`` for callers and subclasses that predate this.
+        ``get_tools()`` for callers and subclasses that predate this. The
+        dispatch boundary also accepts a feature's older no-argument override.
 
         Override this in subclasses for more specialized prompts.
         """
