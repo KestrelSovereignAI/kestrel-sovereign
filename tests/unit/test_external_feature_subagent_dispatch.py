@@ -229,6 +229,52 @@ async def test_external_feature_legacy_no_argument_prompt_override_dispatches():
 
 
 @pytest.mark.asyncio
+async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
+    """A hard-coded old prompt must not contradict the executable palette."""
+
+    class LegacyVisualPrompt(_ExternalFeature):
+        @property
+        def tool_description(self) -> str:
+            return "Generate selfies and avatars"
+
+        @sdk_tool(
+            name="generate_selfie",
+            description="Generate a selfie",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_selfie(self) -> str:
+            return "selfie"
+
+        @sdk_tool(
+            name="generate_avatar",
+            description="Generate an avatar",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_avatar(self) -> str:
+            return "avatar"
+
+        def _get_subagent_prompt(self) -> str:
+            return "Available tools: generate_selfie, generate_avatar"
+
+    cls = ensure_subagent_dispatch(LegacyVisualPrompt)
+    fake_agent = SimpleNamespace(
+        llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+        hooks_manager=None,
+    )
+    feature = cls(agent=fake_agent)
+
+    result = await feature.execute_as_subagent(
+        task="make an avatar", denied_tools={"ping", "generate_selfie"}
+    )
+
+    assert result["success"] is True, result
+    prompt = fake_agent.llm_service.generate.await_args.kwargs["system_prompt"]
+    assert "Available tools: generate_avatar" in prompt
+    assert "ping" not in prompt
+    assert "selfie" not in prompt.lower()
+
+
+@pytest.mark.asyncio
 async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
     seen = []
 

@@ -153,7 +153,10 @@ def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
 
 
 def _invoke_subagent_prompt(
-    prompt_builder: Callable[..., str], runtime_tools: list[Any]
+    prompt_builder: Callable[..., str],
+    runtime_tools: list[Any],
+    *,
+    filtered_legacy_fallback: Callable[[list[Any]], str] | None = None,
 ) -> str:
     """Call a feature prompt override through its published signature.
 
@@ -161,7 +164,9 @@ def _invoke_subagent_prompt(
     before Core supplied the filtered runtime toolset. Published features such
     as VisualIdentityFeature still use that override. Inspect the *bound*
     method before calling it; do not catch a TypeError raised inside a prompt
-    builder, which would disguise a real feature bug as an old signature.
+    builder, which would disguise a real feature bug as an old signature. A
+    legacy prompt can hard-code tools that policy removed; in that case use
+    Core's canonical filtered prompt instead of advertising unavailable tools.
     """
     signature = inspect.signature(prompt_builder)
     try:
@@ -171,6 +176,8 @@ def _invoke_subagent_prompt(
             signature.bind(runtime_tools=runtime_tools)
         except TypeError:
             signature.bind()
+            if filtered_legacy_fallback is not None:
+                return filtered_legacy_fallback(runtime_tools)
             return prompt_builder()
         return prompt_builder(runtime_tools=runtime_tools)
     return prompt_builder(runtime_tools)
@@ -1460,8 +1467,23 @@ class Feature(_SdkFeature):
             # external features may still override the old no-argument
             # signature; invoking that published contract must not fail the
             # entire subagent before its tools can run.
+            filtered_feature_tools = bool(denied_tools) and any(
+                tool.name in denied_tools for tool in self.get_tools()
+            )
             system_prompt = _invoke_subagent_prompt(
-                self._get_subagent_prompt, available_tools
+                self._get_subagent_prompt,
+                available_tools,
+                filtered_legacy_fallback=(
+                    (
+                        lambda tools: Feature._get_subagent_prompt(
+                            self,
+                            tools,
+                            capability_description="Only the available tools listed below",
+                        )
+                    )
+                    if filtered_feature_tools
+                    else None
+                ),
             )
 
             # Build user prompt with task and context
@@ -1843,7 +1865,12 @@ class Feature(_SdkFeature):
         denied = set(denied_tools or ())
         return [t for t in self.get_tools() if t.name not in denied]
 
-    def _get_subagent_prompt(self, runtime_tools: Optional[List[Any]] = None) -> str:
+    def _get_subagent_prompt(
+        self,
+        runtime_tools: Optional[List[Any]] = None,
+        *,
+        capability_description: Optional[str] = None,
+    ) -> str:
         """
         Get the system prompt for this feature's subagent context.
 
@@ -1859,6 +1886,11 @@ class Feature(_SdkFeature):
         source = runtime_tools if runtime_tools is not None else self.get_tools()
         tool_names = [t.name for t in source]
         tools_list = ", ".join(tool_names) if tool_names else "None"
+        description = (
+            capability_description
+            if capability_description is not None
+            else self.tool_description
+        )
 
         return f"""EXECUTION MODE: You are now executing as the {self.name} subagent.
 
@@ -1867,7 +1899,7 @@ DO NOT ask clarifying questions. DO NOT respond with greetings or pleasantries.
 DO NOT say you are "awaiting task input" - you already have a task.
 EXECUTE THE TASK IMMEDIATELY using your tools.
 
-Your capabilities: {self.tool_description}
+Your capabilities: {description}
 Available tools: {tools_list}
 
 EXECUTION PROTOCOL:
