@@ -19,13 +19,16 @@ from __future__ import annotations
 import asyncio
 
 from kestrel_sovereign.knowledge import AssertionStatus
-from tests.unit.test_strategic_memory_ledger_assertions import (  # noqa: F401
-    every,
-    governed,
-    ledger,
-    seed,
-    tenant_identity,
-)
+from tests.unit import test_strategic_memory_ledger_assertions as base
+
+# Fixtures are re-exported by binding, not by `from ... import`: a test
+# signature that takes `governed`/`ledger` would otherwise read as F811
+# redefinition of the imported names.
+every = base.every
+seed = base.seed
+tenant_identity = base.tenant_identity
+governed = base.governed
+ledger = base.ledger
 
 
 async def test_overlapping_passes_do_not_retract_a_concurrently_added_row(
