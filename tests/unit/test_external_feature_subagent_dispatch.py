@@ -275,6 +275,50 @@ async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
 
 
 @pytest.mark.asyncio
+async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools():
+    """Current positional and keyword-only overrides also yield to policy."""
+    called = []
+
+    class PositionalPrompt(_ExternalFeature):
+        @property
+        def tool_description(self) -> str:
+            return "Use ping and generate_avatar"
+
+        @sdk_tool(
+            name="generate_avatar",
+            description="Generate an avatar",
+            category=ToolCategory.DATA_ACCESS,
+        )
+        async def generate_avatar(self) -> str:
+            return "avatar"
+
+        def _get_subagent_prompt(self, runtime_tools) -> str:
+            called.append("positional")
+            return "Use ping and generate_avatar"
+
+    class KeywordPrompt(PositionalPrompt):
+        def _get_subagent_prompt(self, *, runtime_tools) -> str:
+            called.append("keyword")
+            return "Use ping and generate_avatar"
+
+    for prompt_class in (PositionalPrompt, KeywordPrompt):
+        cls = ensure_subagent_dispatch(prompt_class)
+        fake_agent = SimpleNamespace(
+            llm_service=SimpleNamespace(generate=AsyncMock(return_value="all done")),
+            hooks_manager=None,
+        )
+        result = await cls(agent=fake_agent).execute_as_subagent(
+            task="make an avatar", denied_tools={"ping"}
+        )
+        assert result["success"] is True, result
+        prompt = fake_agent.llm_service.generate.await_args.kwargs["system_prompt"]
+        assert "Available tools: generate_avatar" in prompt
+        assert "ping" not in prompt
+
+    assert called == []
+
+
+@pytest.mark.asyncio
 async def test_external_feature_keyword_only_runtime_prompt_receives_toolset():
     seen = []
 

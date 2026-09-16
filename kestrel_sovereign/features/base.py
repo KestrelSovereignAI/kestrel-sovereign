@@ -155,8 +155,6 @@ def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
 def _invoke_subagent_prompt(
     prompt_builder: Callable[..., str],
     runtime_tools: list[Any],
-    *,
-    filtered_legacy_fallback: Callable[[list[Any]], str] | None = None,
 ) -> str:
     """Call a feature prompt override through its published signature.
 
@@ -164,9 +162,7 @@ def _invoke_subagent_prompt(
     before Core supplied the filtered runtime toolset. Published features such
     as VisualIdentityFeature still use that override. Inspect the *bound*
     method before calling it; do not catch a TypeError raised inside a prompt
-    builder, which would disguise a real feature bug as an old signature. A
-    legacy prompt can hard-code tools that policy removed; in that case use
-    Core's canonical filtered prompt instead of advertising unavailable tools.
+    builder, which would disguise a real feature bug as an old signature.
     """
     signature = inspect.signature(prompt_builder)
     try:
@@ -176,8 +172,6 @@ def _invoke_subagent_prompt(
             signature.bind(runtime_tools=runtime_tools)
         except TypeError:
             signature.bind()
-            if filtered_legacy_fallback is not None:
-                return filtered_legacy_fallback(runtime_tools)
             return prompt_builder()
         return prompt_builder(runtime_tools=runtime_tools)
     return prompt_builder(runtime_tools)
@@ -1465,26 +1459,22 @@ class Feature(_SdkFeature):
 
             # Core's prompt receives the canonical runtime toolset. Existing
             # external features may still override the old no-argument
-            # signature; invoking that published contract must not fail the
-            # entire subagent before its tools can run.
+            # signature. A policy-filtered feature cannot trust ANY override
+            # or tool_description to avoid mentioning the denied capability;
+            # use the canonical prompt with only the executable palette.
             filtered_feature_tools = bool(denied_tools) and any(
                 tool.name in denied_tools for tool in self.get_tools()
             )
-            system_prompt = _invoke_subagent_prompt(
-                self._get_subagent_prompt,
-                available_tools,
-                filtered_legacy_fallback=(
-                    (
-                        lambda tools: Feature._get_subagent_prompt(
-                            self,
-                            tools,
-                            capability_description="Only the available tools listed below",
-                        )
-                    )
-                    if filtered_feature_tools
-                    else None
-                ),
-            )
+            if filtered_feature_tools:
+                system_prompt = Feature._get_subagent_prompt(
+                    self,
+                    available_tools,
+                    capability_description="Only the available tools listed below",
+                )
+            else:
+                system_prompt = _invoke_subagent_prompt(
+                    self._get_subagent_prompt, available_tools
+                )
 
             # Build user prompt with task and context
             user_prompt = f"Task: {task}"
