@@ -268,6 +268,24 @@ function menuActions(el, ownerDocument = document) {
     return openFleetMenu(el, ownerDocument).map((item) => item.dataset.action);
 }
 
+// Two doors fence these controls: the button's `disabled` attribute, and
+// `fleetMenuItems()` behind it. jsdom suppresses `click()` on a disabled
+// button, so asserting an empty menu without forcing the button open restates
+// the attribute and proves nothing about the gate behind it. Force it, read the
+// menu, and put the attribute back — so the repaint that ends the fence is
+// still the thing under test afterwards.
+function menuActionsBehindTheFence(el, ownerDocument = document) {
+    const btn = kebab(el);
+    const wasDisabled = btn.disabled;
+    btn.disabled = false;
+    try {
+        return menuActions(el, ownerDocument);
+    } finally {
+        closeKebabMenu();
+        btn.disabled = wasDisabled;
+    }
+}
+
 async function chooseFleetAction(el, action, ownerDocument = document) {
     const items = openFleetMenu(el, ownerDocument);
     const item = items.find((candidate) => candidate.dataset.action === action);
@@ -867,6 +885,655 @@ test('destroy() takes the fleet Hold chrome out of adopted chrome that survives 
     assert.equal(kebab(pane), null, 'a leaked kebab keeps a dead menu callback alive');
     assert.equal(countEl(pane), null);
     assert.equal(pane.querySelector('.agent-fleet-hold-results'), null);
+});
+
+// ---------------------------------------------------------------------------
+// Lifecycle: a fleet gesture outlives the mount that started it
+//
+// "Stop all and hold" is three awaits deep — mutate, confirm, stop — and a host
+// may remount the pane across any of them. The gesture is therefore fenced on
+// the CONTAINER, not in the mount's closure, so that a replacement mount
+// inherits the fence and the retired continuation can discover it no longer
+// owns the gesture. What must hold across every remount point:
+//
+//   - a retired mount renders nothing and publishes nothing, because its chrome
+//     is detached and its embedding host cannot tell which mount is speaking;
+//   - the replacement's controls stay fenced while the gesture is in flight,
+//     and are released when it ends — a fence nobody clears is a dead control;
+//   - and the Stop half never fires from a retired continuation, so exactly one
+//     Stop can reach the host for one operator gesture.
+// ---------------------------------------------------------------------------
+
+// Remount into the same container, the way a host does: `mountAgentListPane`
+// retires the prior owner itself (#3155), so this is one call, not two.
+function remount(pane, host) {
+    const handle = mountAgentListPane(pane, {
+        api: host,
+        adapter: {
+            mode: 'multi_agent',
+            listAgents: async () => host.agents.map((agentId) => ({
+                name: agentId.split(':').pop(),
+                displayName: agentId.split(':').pop(),
+                id: agentId,
+                status: 'online',
+            })),
+        },
+        askHoldReason: () => 'operator reason',
+        confirmStopAll: () => true,
+        onPrepareStopAll: () => () => {},
+        holdStatusIntervalMs: 1e7,
+        stopAllStatusIntervalMs: 1e7,
+    });
+    mounted.push(handle);
+    return handle;
+}
+
+// Hold the named host call open, and hand back the key. Every lifecycle test
+// below needs the remount to land while exactly one await is outstanding.
+function gate(host, method) {
+    let release;
+    const opened = new Promise((resolve) => { release = resolve; });
+    const live = host[method].bind(host);
+    let entered = null;
+    const arrived = new Promise((resolve) => { entered = resolve; });
+    // `calls.*` on the double is pushed by `live`, which a gated call has not
+    // reached yet — so a test asking "how many requests were STARTED" has to
+    // count arrivals here, not completions there.
+    const state = { entries: 0 };
+    host[method] = async (...args) => {
+        state.entries += 1;
+        entered();
+        await opened;
+        return live(...args);
+    };
+    return {
+        release,
+        arrived,
+        state,
+        restore: () => { host[method] = live; },
+    };
+}
+
+test('a pane remounted mid-Hold neither paints nor publishes from the retired mount', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    const published = [];
+    const { handle: first } = mountPane({
+        host,
+        container: pane,
+        extra: { onHoldState: (snapshot) => published.push(snapshot) },
+    });
+    await settle();
+    const retiredResults = pane.querySelector('.agent-fleet-hold-results');
+
+    const held = gate(host, 'setHostHold');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await held.arrived;
+
+    const publishedBefore = published.length;
+    remount(pane, host);
+    await settle();
+
+    held.release();
+    await gesture;
+    await settle();
+
+    assert.equal(published.length, publishedBefore,
+        'a destroyed mount must not keep telling its embedding host about fleet state');
+    assert.equal(retiredResults.parentNode, null,
+        'the retired results node left with its mount');
+    assert.equal(retiredResults.hidden, true,
+        'and the retired continuation never rendered into it');
+    assert.equal(host.calls.stop.length, 0,
+        'the Stop half belongs to the gesture the operator was watching, and that '
+        + 'pane is gone; a replacement pane never asked for it');
+    // The Hold itself DID commit, and that is the point of a latch: it is
+    // durable, so the replacement reads it back rather than inheriting a claim.
+    assert.equal(host.calls.set.length, 1);
+    assert.equal(countEl(pane).dataset.holdState, 'all',
+        'the replacement mount shows the fleet as held, read from the host');
+});
+
+test('a replacement mount inherits the fence, and is released when the gesture ends', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+    assert.equal(kebab(pane).disabled, false, 'the fleet menu starts live');
+
+    const held = gate(host, 'setHostHold');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await held.arrived;
+
+    remount(pane, host);
+    await settle();
+    assert.equal(kebab(pane).disabled, true,
+        'the replacement must not offer a second fleet gesture over the first');
+    assert.deepEqual(menuActionsBehindTheFence(pane), [],
+        'and its menu composes nothing while the inherited operation is in flight');
+
+    held.release();
+    await gesture;
+    await settle();
+
+    assert.equal(kebab(pane).disabled, false,
+        'a fence the retired mount never cleared would disable this control for '
+        + 'the life of the page, with no gesture left to justify it');
+    assert.ok(menuActions(pane).length > 0, 'and the menu works again');
+    closeKebabMenu();
+});
+
+test('a pane remounted during the CONFIRMING read publishes no fan-out, and its already-started Stop lands once', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+    const retiredResults = pane.querySelector('.agent-fleet-hold-results');
+
+    // Past the mutation, inside the read that would have become the fan-out.
+    // The latch is committed by now, so this is the window where a retired
+    // continuation is most tempted to "just finish the job".
+    //
+    // The Stop half is DELIBERATELY already on the wire here: it is authorised
+    // by the committed Hold and started in the same turn, precisely so a host
+    // that answers the POST and then never answers this GET cannot leave the
+    // fleet held but never stopped. Retiring the pane after that cannot un-send
+    // a request, and must not send a second one — so what a remount here owes
+    // is silence about the fan-out, not the un-stopping of a stopped fleet.
+    const read = gate(host, 'getHostHoldState');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await read.arrived;
+    assert.equal(host.calls.set.length, 1, 'the mutation already committed');
+    assert.equal(host.calls.stop.length, 1,
+        'and the Stop it authorised went with it, rather than queueing behind '
+        + 'a read that exists only to draw a receipt');
+
+    remount(pane, host);
+    await settle();
+
+    read.restore();
+    read.release();
+    await gesture;
+    await settle();
+
+    assert.equal(retiredResults.hidden, true,
+        'a fan-out nobody can see is not a receipt');
+    assert.equal(retiredResults.querySelectorAll('li').length, 0);
+    assert.equal(host.calls.stop.length, 1,
+        'and the retired continuation adds no second Stop on its way out');
+    assert.deepEqual(host.calls.order.filter((c) => c !== 'release'), ['hold', 'stop'],
+        'one gesture, in the order it was asked for');
+    assert.equal(kebab(pane).disabled, false, 'the replacement is unfenced when it ends');
+    assert.equal(pane.querySelector('.agent-stop-all-btn').disabled, false,
+        'and so is the Stop lane the gesture reserved');
+});
+
+test('a pane remounted during a host release publishes nothing from the retired mount', async () => {
+    const host = makeHost({ hostHold: latch({ scope: 'host', target: 'host', receipt: 'receipt-host-1' }) });
+    const pane = makeConsolePane();
+    const published = [];
+    mountPane({
+        host,
+        container: pane,
+        extra: { onHoldState: (snapshot) => published.push(snapshot) },
+    });
+    await settle();
+    const retiredResults = pane.querySelector('.agent-fleet-hold-results');
+
+    const release = gate(host, 'releaseHostHold');
+    const gesture = chooseFleetAction(pane, 'resume-host-hold');
+    await release.arrived;
+
+    const publishedBefore = published.length;
+    remount(pane, host);
+    await settle();
+    const readsBefore = host.calls.read;
+
+    release.release();
+    await gesture;
+    await settle();
+
+    assert.equal(published.length, publishedBefore,
+        'the retired mount stays silent about a release it can no longer show');
+    assert.equal(retiredResults.hidden, true);
+    assert.equal(host.calls.release.length, 1, 'the release itself committed exactly once');
+    assert.equal(kebab(pane).disabled, false, 'and the replacement is unfenced');
+    assert.equal(countEl(pane).hidden, true,
+        'the replacement reads the released state from the host');
+    // Exactly one: the convergence the retired mount owes the CURRENT owner.
+    // A second would be the retired mount confirming a fan-out for itself —
+    // going back to the host for evidence it has nowhere to render.
+    assert.equal(host.calls.read - readsBefore, 1,
+        'a retired mount converges the new owner and asks nothing for itself');
+});
+
+test('a pane remounted during a RELEASE\'s confirming read renders no fan-out', async () => {
+    const host = makeHost({ hostHold: latch({ scope: 'host', target: 'host', receipt: 'receipt-host-1' }) });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+    const retiredResults = pane.querySelector('.agent-fleet-hold-results');
+
+    // Past the release mutation, inside the read that says WHICH agents the
+    // resume left held — the one thing this panel exists to show, and the
+    // window where ownership is lost after the mount was entitled to ask.
+    const read = gate(host, 'getHostHoldState');
+    const gesture = chooseFleetAction(pane, 'resume-host-hold');
+    await read.arrived;
+    assert.equal(host.calls.release.length, 1, 'the release already committed');
+
+    remount(pane, host);
+    await settle();
+
+    read.restore();
+    read.release();
+    await gesture;
+    await settle();
+
+    assert.equal(retiredResults.hidden, true,
+        'the projection arrived for a pane that can no longer show it');
+    assert.equal(retiredResults.querySelectorAll('li').length, 0);
+    assert.equal(kebab(pane).disabled, false, 'and the replacement is unfenced when it ends');
+});
+
+test('the fence is released by the gesture ending, not by a host read landing', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    const held = gate(host, 'setHostHold');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await held.arrived;
+
+    remount(pane, host);
+    await settle();
+    assert.equal(kebab(pane).disabled, true, 'the replacement inherited the fence');
+
+    // From here the host stops answering reads. The convergence refresh the
+    // retired mount owes the new owner can no longer land, so the ONLY thing
+    // that can give the replacement its menu back is the direct handoff when
+    // the operation clears. Leaning on the refresh instead would leave a
+    // console whose fleet menu is dead until the network recovers — and the
+    // fence is local state, so there is nothing to ask the host about.
+    host.getHostHoldState = () => new Promise(() => {});
+
+    held.release();
+    await gesture;
+    await settle();
+
+    assert.equal(kebab(pane).disabled, false,
+        'the operation is over, so the control it fenced is live again');
+    assert.ok(menuActions(pane).length > 0);
+    closeKebabMenu();
+});
+
+test('a destroyed pane publishes nothing, even when its handle is asked to refresh', async () => {
+    const host = makeHost();
+    const published = [];
+    const { handle } = mountPane({
+        host,
+        extra: { onHoldState: (snapshot) => published.push(snapshot) },
+    });
+    await settle();
+    assert.ok(published.length > 0, 'a live pane does publish');
+
+    handle.destroy();
+    mounted.pop();
+    const publishedBefore = published.length;
+
+    // The handle survives its pane, and a host holding one has no way to know
+    // the mount behind it is gone. A read it starts here resolves into a mount
+    // whose chrome is detached — it must not be reported to the embedding host
+    // as this pane's fleet state.
+    await handle.refreshHoldState({ fresh: true });
+    await settle();
+
+    assert.equal(published.length, publishedBefore,
+        'a destroyed pane is inert, not merely invisible');
+});
+
+test('a second click on a fleet action starts nothing, and asks nothing', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    const asked = [];
+    mountPane({
+        host,
+        container: pane,
+        extra: { askHoldReason: (message) => { asked.push(message); return 'operator reason'; } },
+    });
+    await settle();
+
+    // `kebab_menu` closes the menu and THEN calls onSelect, leaving its click
+    // listener bound to the now-detached node — so a rapid second click (or a
+    // double-click) re-enters the same action while the first is still in
+    // flight. The fence has to refuse that before the reason prompt, not after:
+    // prompting an operator and then discarding the answer is its own defect.
+    const held = gate(host, 'setHostHold');
+    const items = openFleetMenu(pane);
+    const compound = items.find((item) => item.dataset.action === 'stop-all-and-hold');
+    assert.ok(compound, 'the compound gesture is the one with a second half to duplicate');
+    compound.click();
+    await held.arrived;
+    assert.equal(asked.length, 1, 'the first click asked for a reason');
+
+    compound.click();
+    await settle();
+
+    assert.equal(asked.length, 1,
+        'the second click is refused by the fence, not by discarding an answer');
+    assert.equal(held.state.entries, 1, 'and only one Hold request was ever started');
+
+    held.release();
+    await settle();
+    await settle();
+    assert.equal(host.calls.set.length, 1, 'exactly one Hold reached the host');
+    assert.equal(host.calls.stop.length, 1, 'one gesture, one Stop');
+    closeKebabMenu();
+});
+
+test('exactly one Stop reaches the host when the pane survives the whole gesture', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    // The control case for the three remount tests above: with nothing retired,
+    // the compound gesture must still perform its Stop — otherwise those three
+    // would pass against a component that had simply stopped stopping.
+    await chooseFleetAction(pane, 'stop-all-and-hold');
+    await settle();
+
+    assert.equal(host.calls.set.length, 1);
+    assert.equal(host.calls.stop.length, 1, 'one gesture, one Stop');
+    assert.deepEqual(host.calls.order.filter((c) => c !== 'release'), ['hold', 'stop']);
+});
+
+test('the fence outlives the Hold half, because the Stop half is the same gesture', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    // Past the Hold and its confirming read, INSIDE the Stop request. The latch
+    // is committed by now, so the menu's live offer here is Resume — and taking
+    // it mid-gesture lands the fleet stopped and unheld, free to start again on
+    // the next heartbeat. That is the one outcome "Stop all and hold" exists to
+    // prevent, so the fence may not end when the Hold half does.
+    const stopped = gate(host, 'stopHost');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await stopped.arrived;
+    assert.equal(host.calls.set.length, 1, 'the Hold half already committed');
+
+    assert.equal(kebab(pane).disabled, true,
+        'the gesture is not over until its Stop is');
+    assert.deepEqual(menuActionsBehindTheFence(pane), [],
+        'so no Resume is on offer while the Stop request is still open');
+
+    stopped.release();
+    await gesture;
+    await settle();
+
+    assert.equal(host.calls.release.length, 0, 'and none was made');
+    assert.equal(host.calls.stop.length, 1, 'one gesture, one Stop');
+    assert.equal(kebab(pane).disabled, false, 'the fence ends with the gesture, not before it');
+    assert.deepEqual(menuActions(pane), ['resume-host-hold'],
+        'and the held fleet is resumable once the gesture has actually finished');
+    closeKebabMenu();
+});
+
+test('the fence ends with the Stop, not with the bookkeeping read that follows it', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    // The Stop lands; the status read AFTER it never does. That read is
+    // convergence bookkeeping — the durable Stop is already over — so a fence
+    // that waits for it hands a hung host the power to disable this console's
+    // fleet menu for the life of the page, with the gesture finished and
+    // nothing in flight to justify it. The fence is local state; ending it is
+    // not the host's to answer.
+    let releaseStatus;
+    const hungStatus = new Promise((resolve) => { releaseStatus = resolve; });
+    const liveStatus = host.getHostStopStatus.bind(host);
+    const liveStop = host.stopHost.bind(host);
+    host.stopHost = async (payload) => {
+        const envelope = await liveStop(payload);
+        host.getHostStopStatus = () => hungStatus.then(() => liveStatus());
+        return envelope;
+    };
+
+    await chooseFleetAction(pane, 'stop-all-and-hold');
+    await settle();
+
+    assert.equal(host.calls.set.length, 1, 'the Hold half committed');
+    assert.equal(host.calls.stop.length, 1, 'and so did the Stop half');
+    assert.equal(kebab(pane).disabled, false,
+        'the gesture is over the moment its Stop is');
+    assert.deepEqual(menuActions(pane), ['resume-host-hold'],
+        'and the held fleet is resumable again without waiting on a read the '
+        + 'host may never answer');
+    closeKebabMenu();
+
+    // Let the trailing read land so this test leaves nothing pending behind it.
+    releaseStatus();
+    await settle();
+});
+
+test('a pane remounted during the STOP half inherits the fence, and cannot resume under it', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    const stopped = gate(host, 'stopHost');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await stopped.arrived;
+
+    remount(pane, host);
+    await settle();
+
+    // The replacement read the committed host latch back, so Resume is what its
+    // menu would offer — this is the mount a fence scoped to the Hold half
+    // hands the release to, with the Stop request still open.
+    assert.equal(kebab(pane).disabled, true,
+        'the replacement inherited the whole gesture, Stop half included');
+    assert.deepEqual(menuActionsBehindTheFence(pane), [],
+        'and the gate behind its button refuses the Resume too');
+
+    stopped.release();
+    await gesture;
+    await settle();
+
+    assert.equal(host.calls.release.length, 0, 'no Resume ran underneath the gesture');
+    assert.equal(host.calls.stop.length, 1, 'and the Stop the operator asked for did');
+    assert.equal(kebab(pane).disabled, false);
+    assert.deepEqual(menuActions(pane), ['resume-host-hold'],
+        'the replacement gets its fleet menu back when the gesture ends');
+    closeKebabMenu();
+});
+
+// ---------------------------------------------------------------------------
+// One gesture, two lanes, one reservation.
+//
+// "Stop all and hold" is ONE operator action whose halves live in two different
+// lanes — the fleet Hold lane and the Stop All lane. Guarding each lane with its
+// own token leaves a gap between the two claims: a Stop All started while the
+// Hold half is awaiting takes the second lane, and the compound gesture's Stop
+// then either declines silently (a gesture that reports a Hold and never stops)
+// or runs a second Stop behind the competitor off a stale in-flight count.
+//
+// So the gesture reserves BOTH lanes before its first request leaves, and
+// releases both exactly once when it settles. These pin the consequences.
+// ---------------------------------------------------------------------------
+
+test('the compound gesture reserves the Stop lane before its Hold leaves, so no Stop can race it', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+    const stopAllBtn = pane.querySelector('.agent-stop-all-btn');
+    assert.equal(stopAllBtn.disabled, false, 'there is work to stop');
+
+    // Inside the Hold half — the window where the Stop lane used to be free,
+    // and where a click on the still-live Stop All button took it.
+    const held = gate(host, 'setHostHold');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await held.arrived;
+
+    assert.equal(stopAllBtn.disabled, true,
+        'the lane this gesture reserved reads as busy — a fence the operator '
+        + 'cannot see is one they walk straight into');
+    assert.match(stopAllBtn.title, /Stop all and hold/,
+        'and says WHICH gesture owns it, not merely that it is unavailable');
+
+    // Force the click past the attribute: `disabled` is one door, and the
+    // reservation behind it is the one that has to hold.
+    stopAllBtn.disabled = false;
+    stopAllBtn.click();
+    await settle();
+    assert.equal(host.calls.stop.length, 0,
+        'a competing Stop All cannot start under the reservation');
+
+    held.release();
+    await gesture;
+    await settle();
+
+    assert.equal(host.calls.set.length, 1);
+    assert.equal(host.calls.stop.length, 1, 'one gesture, one Stop');
+    assert.equal(host.calls.stop[0].reason, 'Stopped from the agents banner');
+    assert.deepEqual(host.calls.order.filter((c) => c !== 'release'), ['hold', 'stop'],
+        'Hold first, then Stop, exactly once each');
+    assert.equal(stopAllBtn.disabled, false,
+        'and the reservation released BOTH lanes when the gesture settled');
+});
+
+test('a Stop All started while the menu sat open refuses the compound gesture rather than half-doing it', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    const asked = [];
+    mountPane({
+        host,
+        container: pane,
+        extra: { askHoldReason: (message) => { asked.push(message); return 'operator reason'; } },
+    });
+    await settle();
+
+    // A menu is composed when it OPENS. Taking the Stop lane afterwards leaves
+    // a compound entry on screen that can no longer be honoured — the reachable
+    // half of the race the reservation closes.
+    const items = openFleetMenu(pane);
+    const compound = items.find((item) => item.dataset.action === 'stop-all-and-hold');
+    assert.ok(compound, 'the entry was offered while the lane was free');
+
+    const stopped = gate(host, 'stopHost');
+    pane.querySelector('.agent-stop-all-btn').click();
+    await stopped.arrived;
+
+    compound.click();
+    await settle();
+
+    assert.equal(asked.length, 0,
+        'refused before the prompt: asking an operator for a reason and then '
+        + 'discarding the answer is its own defect');
+    assert.equal(host.calls.set.length, 0,
+        'and no Hold went out, because a bare Hold is not what was asked for');
+
+    stopped.release();
+    await settle();
+    assert.equal(host.calls.stop.length, 1, 'the Stop All the operator did start ran once');
+});
+
+test('a replacement mount inherits BOTH reserved lanes, not just the fleet menu', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    const held = gate(host, 'setHostHold');
+    const gesture = chooseFleetAction(pane, 'stop-all-and-hold');
+    await held.arrived;
+
+    remount(pane, host);
+    await settle();
+
+    assert.equal(kebab(pane).disabled, true, 'the replacement inherited the fleet lane');
+    const replacementStopAll = pane.querySelector('.agent-stop-all-btn');
+    assert.equal(replacementStopAll.disabled, true,
+        'and the Stop lane with it — a replacement that came up unfenced on one '
+        + 'lane is exactly how a second Stop got started');
+    replacementStopAll.disabled = false;
+    replacementStopAll.click();
+    await settle();
+    assert.equal(host.calls.stop.length, 0,
+        'and the gate behind the button refuses it too');
+
+    held.release();
+    await gesture;
+    await settle();
+
+    assert.equal(kebab(pane).disabled, false, 'both lanes are released together');
+    assert.equal(pane.querySelector('.agent-stop-all-btn').disabled, false,
+        'and the replacement gets a FRESH reading of the lane it inherited fenced '
+        + '— status reads are suppressed while an operation holds it, so a mount '
+        + 'that arrived during the reservation has never read it, and a repaint '
+        + 'alone would leave its Stop All dead until the next poll');
+});
+
+test('a release reserves only its own lane, so a Stop All still runs beside it', async () => {
+    const host = makeHost({
+        inFlight: 2,
+        hostHold: latch({ scope: 'host', target: 'host', receipt: 'receipt-host-1' }),
+    });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    // Resume stops nothing, so it has no business reserving the Stop lane: a
+    // reservation wider than the gesture is a fence with nothing behind it.
+    const release = gate(host, 'releaseHostHold');
+    const gesture = chooseFleetAction(pane, 'resume-host-hold');
+    await release.arrived;
+
+    const stopAllBtn = pane.querySelector('.agent-stop-all-btn');
+    assert.equal(stopAllBtn.disabled, false, 'the Stop lane is untouched by a release');
+    stopAllBtn.click();
+    await settle();
+    assert.equal(host.calls.stop.length, 1, 'and a Stop All runs beside it');
+
+    release.release();
+    await gesture;
+    await settle();
+    assert.equal(host.calls.release.length, 1);
+});
+
+test('"Stop all and hold" is not offered while a Stop All is already running', async () => {
+    const host = makeHost({ inFlight: 2 });
+    const pane = makeConsolePane();
+    mountPane({ host, container: pane });
+    await settle();
+
+    const stopAllBtn = pane.querySelector('.agent-stop-all-btn');
+    assert.equal(stopAllBtn.disabled, false, 'there is work to stop');
+    const stopped = gate(host, 'stopHost');
+    stopAllBtn.click();
+    await stopped.arrived;
+
+    // `runStopAll` admits one operation per container, so the compound
+    // gesture's second half would early-return against this one and the panel
+    // would report a Stop this gesture never made. The half that remains IS the
+    // plain Hold above it, so offering only that takes nothing away.
+    assert.deepEqual(menuActions(pane), ['hold-all']);
+    closeKebabMenu();
+
+    stopped.release();
+    await settle();
+
+    assert.equal(host.calls.stop.length, 1);
+    assert.deepEqual(menuActions(pane), ['hold-all', 'stop-all-and-hold'],
+        'and the compound gesture comes back when the Stop All is over');
+    closeKebabMenu();
 });
 
 test('the banner reads left to right: held count, Stop all, fleet menu, collapse', async () => {

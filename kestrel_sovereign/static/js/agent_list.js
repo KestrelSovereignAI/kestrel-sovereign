@@ -37,6 +37,25 @@ import { createKebabButton, openMenuAt, positionFromEvent } from './kebab_menu.j
 const AGENT_LIST_PANE_OWNER = Symbol.for('kestrel.agentListPane.owner');
 const AGENT_LIST_STOP_ALL_OPERATION = Symbol.for('kestrel.agentListPane.stopAllOperation');
 const AGENT_LIST_STOP_ALL_RETRY = Symbol.for('kestrel.agentListPane.stopAllRetry');
+// A fleet Hold gesture outlives the mount that started it: "Stop all and hold"
+// awaits a mutation, then a confirming read, and only then stops. A host may
+// remount the pane across any of those awaits, so the in-flight operation is
+// carried on the CONTAINER — the one thing both mounts share — rather than in
+// a closure the retired mount takes with it. That is what lets a replacement
+// mount inherit the fence, and what lets the retired continuation discover it
+// no longer owns the gesture (#3165).
+//
+// "Stop all and hold" is ONE operator action that spans TWO lanes, and the two
+// symbols above are per-lane. A gesture that takes them one at a time has a gap
+// between the two claims: another surface takes the Stop lane while the Hold
+// half is still awaiting, and the Stop half then either declines silently — a
+// gesture that reports a Hold and never stops — or runs a second Stop behind
+// the competitor with a stale in-flight count. So the compound gesture takes
+// ONE reservation covering both lanes, synchronously, before its first request
+// leaves, and releases both exactly once when the whole gesture settles: the
+// same operation object is written into both slots, and `endFleetHoldGesture`
+// is the only place either is cleared.
+const AGENT_LIST_FLEET_HOLD_OPERATION = Symbol.for('kestrel.agentListPane.fleetHoldOperation');
 
 function newOperationId(prefix) {
     if (typeof globalThis.crypto?.randomUUID === 'function') {
@@ -1324,6 +1343,11 @@ export function mountAgentList(containerEl, config = {}) {
  *   - confirmStopAll(message) — host confirmation override (defaults to confirm).
  *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence.
  *   - stopAllReason / fleetHoldReason — wording carried on the fleet requests.
+ *   - fleetHoldConfirmTimeoutMs — how long a fleet gesture waits for the
+ *                        confirming latch read that draws its fan-out before
+ *                        reporting that fan-out unconfirmed (default 5s). The
+ *                        read has no timeout of its own, and presentation
+ *                        evidence may not fence an operator control.
  *   - newLabel         — accessible label / tooltip for the New button.
  *   - collapsed        — initial collapsed state (overridden by persistence).
  *   - storageKey       — persistence namespace (default 'kestrel:agents-pane').
@@ -1366,6 +1390,14 @@ export function mountAgentListPane(containerEl, config = {}) {
         containerEl.classList.add('pane-sidebar', 'agent-list-pane');
     }
     const paneEl = containerEl;
+
+    // Declared here, not beside `destroy()` at the foot of the mount, because
+    // the inner list publishes its Hold state SYNCHRONOUSLY from inside
+    // `mountAgentList` below — a guard reading `destroyed` from that callback
+    // would hit the temporal dead zone and throw during mount. Every
+    // lifecycle-fenced continuation in this mount reads these two.
+    let destroyed = false;
+    let handle = null;
 
     // --- Header (adopt existing .pane-header, else build one) ---------------
     let header = paneEl.querySelector('.pane-header');
@@ -1484,6 +1516,13 @@ export function mountAgentListPane(containerEl, config = {}) {
             if (typeof config.onError === 'function') config.onError(error);
         },
         onHoldState: (snapshot) => {
+            // A retired mount's list handle can still resolve a read it issued
+            // before `destroy()` — the inner list orphans in-flight reads by
+            // sequence but a request already past that fence still republishes.
+            // Painting detached chrome would be harmless; telling the EMBEDDING
+            // HOST that a destroyed pane has fleet state is not, because the
+            // host has no way to tell which mount is speaking.
+            if (destroyed) return;
             holdBanner = snapshot;
             renderFleetHoldState();
             if (typeof config.onHoldState === 'function') config.onHoldState(snapshot);
@@ -1545,12 +1584,19 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (!stopAllOptIn || !stopAllBtn) return;
         const { loaded, canStop, inFlightCount } = stopAllStatus;
         const retryPending = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string';
+        // A fleet gesture holding this lane is the same fence as a Stop All
+        // holding it — one slot, read once — but it is a different SENTENCE, and
+        // a control disabled for a reason the operator cannot read is the thing
+        // a busy lane must not look like.
+        const laneHolder = containerEl[AGENT_LIST_STOP_ALL_OPERATION];
         stopAllBtn.disabled = stopAllPending
-            || Boolean(containerEl[AGENT_LIST_STOP_ALL_OPERATION])
+            || Boolean(laneHolder)
             || !listEverLoaded || !loaded || !canStop
             || (inFlightCount === 0 && !retryPending);
         stopAllBtn.dataset.inFlightCount = String(inFlightCount);
-        if (!loaded) {
+        if (laneHolder && laneHolder.reservesStopAll === true) {
+            stopAllBtn.title = 'A "Stop all and hold" gesture already owns this Stop';
+        } else if (!loaded) {
             stopAllBtn.title = 'Checking cooperative Stop availability';
         } else if (!canStop) {
             stopAllBtn.title = 'Sovereign host authority is required to Stop all agents';
@@ -1665,27 +1711,54 @@ export function mountAgentListPane(containerEl, config = {}) {
     // single gate is the reason prompt the Hold already asked — the same shape
     // the card's "Stop and hold" uses. Everything else about the fan-out is
     // identical, so the two gestures cannot report a fan-out differently.
-    async function runStopAll({ confirm = true } = {}) {
-        if (!stopAllOptIn || !listEverLoaded || stopAllPending
-            || containerEl[AGENT_LIST_STOP_ALL_OPERATION]) return;
+    // `onSettled` fires where this function releases its OWN operation token —
+    // the moment the durable Stop is over, and deliberately before the
+    // convergence read below, which is bookkeeping a hung host can stall
+    // forever. A caller whose gesture wraps this one (the compound "Stop all
+    // and hold") ends its fence there for exactly the same reason.
+    //
+    // `reservation` is that wrapping gesture's already-taken claim on this lane.
+    // A compound gesture cannot claim the Stop lane HERE — by the time it gets
+    // here its Hold has committed, and a lane taken in between is a race it can
+    // only lose — so it takes both lanes up front and hands its reservation
+    // down. Under one, this function neither re-claims the lane nor releases it:
+    // one reservation, released once, by the gesture that took it.
+    //
+    // Returns TRUE only when it actually held the lane and ran a Stop to
+    // settlement. A wrapping gesture may not read a decline as a Stop it made.
+    async function runStopAll({ confirm = true, onSettled = null, reservation = null } = {}) {
+        if (!stopAllOptIn || !listEverLoaded || stopAllPending) return false;
+        // One sentence for both doors: this lane must hold nothing except the
+        // reservation this call was handed. With no reservation that reads as
+        // the familiar "the lane must be free" — which is what refuses a Stop
+        // All clicked while a compound gesture holds it. With one, it also
+        // admits that exact object and nothing else, so a gesture can never
+        // stop the fleet under a claim it does not hold.
+        const laneHolder = containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+        if (laneHolder && laneHolder !== reservation) return false;
         const count = stopAllStatus.inFlightCount;
         const retryCorrelationId = typeof containerEl[AGENT_LIST_STOP_ALL_RETRY] === 'string'
             ? containerEl[AGENT_LIST_STOP_ALL_RETRY]
             : null;
         const recoverBeforeFresh = retryCorrelationId !== null && count > 0;
-        const operation = {
-            correlationId: retryCorrelationId && !recoverBeforeFresh
-                ? retryCorrelationId
-                : newStopAllCorrelationId(),
-            recoveryCorrelationId: recoverBeforeFresh ? retryCorrelationId : null,
-        };
+        // ONE token holds this lane for the whole run — the wrapping gesture's
+        // reservation when there is one, otherwise this call's own record — so
+        // every ownership recheck below reads the same slot against the same
+        // value whichever gesture is driving.
+        const operation = reservation || {};
+        operation.correlationId = retryCorrelationId && !recoverBeforeFresh
+            ? retryCorrelationId
+            : newStopAllCorrelationId();
+        operation.recoveryCorrelationId = recoverBeforeFresh ? retryCorrelationId : null;
         const retryPending = retryCorrelationId !== null;
         const noun = count === 1 ? 'agent' : 'agents';
         const confirmation = retryPending && count === 0
             ? 'Recover the durable result of the prior Stop All request?'
             : `Stop all ${count} in-flight ${noun}?`;
-        if (confirm && !confirmStopAll(confirmation)) return;
+        if (confirm && !confirmStopAll(confirmation)) return false;
 
+        // A no-op re-assignment under a reservation: the slot already holds this
+        // exact object, claimed before the gesture's first request.
         containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
         stopAllPending = true;
         renderStopAllState();
@@ -1753,8 +1826,15 @@ export function mountAgentListPane(containerEl, config = {}) {
                 }
             }
             stopAllPending = false;
-            if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+            // A reservation spans two lanes and is released ONCE, by the gesture
+            // that took it — `onSettled` below is where that happens. Clearing
+            // half of it here would split one release across two places, which
+            // is the shape that let the two lanes drift apart to begin with.
+            if (!reservation && containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
                 delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+            }
+            if (typeof onSettled === 'function') {
+                try { onSettled(); } catch (_) { /* a fence is not a reporting surface */ }
             }
             const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
             if (!destroyed && currentOwner === handle) {
@@ -1763,6 +1843,7 @@ export function mountAgentListPane(containerEl, config = {}) {
                 void currentOwner.refreshStopAllState();
             }
         }
+        return true;
     }
     const onStopAllClick = () => { void runStopAll({ confirm: true }); };
     if (stopAllOptIn) stopAllBtn.addEventListener('click', onStopAllClick);
@@ -1803,7 +1884,137 @@ export function mountAgentListPane(containerEl, config = {}) {
         && config.fleetHoldReason.trim()
         ? config.fleetHoldReason.trim()
         : 'Held from the agents banner';
-    let fleetHoldPending = false;
+    // How long a fleet gesture will wait for the confirming latch read that
+    // draws its fan-out before reporting that fan-out unconfirmed. See
+    // `confirmFleetProjection` for why a bound is required rather than tuned.
+    const fleetConfirmTimeoutMs = Number.isFinite(config.fleetHoldConfirmTimeoutMs)
+        ? Math.max(0, config.fleetHoldConfirmTimeoutMs)
+        : 5000;
+    // Every leash still outstanding, so destroy() can settle them. A retired
+    // mount has no business waiting for evidence it may no longer paint, and a
+    // timer nobody cancels keeps its host's event loop alive.
+    const fleetConfirmWaits = new Set();
+
+    // Pending is READ from the container, never stored beside it. A boolean in
+    // this closure answers "did THIS mount start a fleet gesture", and that is
+    // the wrong question in both directions: a replacement mount would answer
+    // "no" while a retired continuation is still mid-gesture and unfence its
+    // controls, and the retired mount would answer "yes" forever if its own
+    // `finally` were skipped. One container-scoped operation object answers the
+    // question every mount actually has — "is a fleet gesture in flight here".
+    function fleetHoldIsPending() {
+        return Boolean(containerEl[AGENT_LIST_FLEET_HOLD_OPERATION]);
+    }
+    // The Stop-All lane, read once, in the one place both the menu's offer and
+    // the compound gesture's claim consult it. Free means nothing holds it: not
+    // a bare Stop All, and not another fleet reservation.
+    function fleetStopLaneIsFree() {
+        return stopAllOptIn && !containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+    }
+    // ONE reservation, every lane the gesture will touch, taken synchronously
+    // before its first request leaves. `reservesStopAll` is the record of which
+    // lanes it covers, so the release below and the Stop-All button's own
+    // rendering read the same fact rather than re-deriving it.
+    function claimFleetGesture(operation) {
+        containerEl[AGENT_LIST_FLEET_HOLD_OPERATION] = operation;
+        if (operation.reservesStopAll) {
+            containerEl[AGENT_LIST_STOP_ALL_OPERATION] = operation;
+        }
+        renderFleetHoldState();
+        renderStopAllState();
+    }
+    // Ownership, checked after every await. `destroyed` and the token are two
+    // independent losses: this mount can be retired without the gesture being
+    // taken over (destroy leaves the token so a replacement inherits the
+    // fence), and the token can be taken over without this mount being
+    // destroyed. AUTHORISING anything requires BOTH still to hold.
+    function ownsFleetHold(operation) {
+        return !destroyed && containerEl[AGENT_LIST_FLEET_HOLD_OPERATION] === operation;
+    }
+    // Conducting a gesture and painting its receipt are two different
+    // permissions, and the compound gesture is where they come apart: its fence
+    // ends when the durable Stop settles, while the confirming read it started
+    // may land after that. Requiring gesture OWNERSHIP to paint would silently
+    // drop the fan-out from the host's own per-agent rows to nothing at all.
+    // What the panel actually requires is narrower: this mount is still on
+    // screen, and no LATER gesture has claimed the panel out from under it.
+    //
+    // The rule across both gestures: `ownsFleetHold` authorises an ACTION,
+    // `mayPublishFleetOutcome` authorises a PAINT. One panel, one predicate.
+    function mayPublishFleetOutcome(operation) {
+        if (destroyed) return false;
+        const current = containerEl[AGENT_LIST_FLEET_HOLD_OPERATION];
+        return current === undefined || current === operation;
+    }
+    // The gesture's fence ends HERE and nowhere else, so every path ends it the
+    // same way and none of them can drift into a different idea of ownership.
+    //
+    // Idempotent by identity, and it has to be: the compound gesture ends its
+    // fence the moment its Stop settles, and the `finally` that wraps that Stop
+    // still runs afterwards — on a path where a hung convergence read means
+    // "afterwards" may be never. Clearing only our own token is also what keeps
+    // a retired continuation from unfencing a gesture it no longer owns; no
+    // path can currently hand the token to a second gesture, since the entry
+    // fence admits one at a time, so that half is an invariant guard rather
+    // than a tested branch.
+    function endFleetHoldGesture(operation) {
+        let released = false;
+        if (containerEl[AGENT_LIST_FLEET_HOLD_OPERATION] === operation) {
+            delete containerEl[AGENT_LIST_FLEET_HOLD_OPERATION];
+            released = true;
+        }
+        // Both lanes, one release, keyed by the same identity. A reservation
+        // released by halves leaves the Stop All button disabled with no gesture
+        // behind it — the fence outliving the thing it was fencing.
+        if (containerEl[AGENT_LIST_STOP_ALL_OPERATION] === operation) {
+            delete containerEl[AGENT_LIST_STOP_ALL_OPERATION];
+            released = true;
+        }
+        if (!released) return;
+        releaseFleetFenceThroughOwner();
+    }
+    // Clearing the fence is only half of unfencing: the DISABLED control is on
+    // whichever mount is showing the banner now, and after a remount that is
+    // not this one. A retired continuation that cleared the token without this
+    // handoff would leave the replacement's fleet menu disabled for the life of
+    // the page, with no gesture in flight to justify it.
+    //
+    // BOTH lanes, because one reservation fenced both: handing back only the
+    // fleet menu would leave the Stop All button dead.
+    //
+    // The Stop lane gets a fresh READING, not just a repaint, and that is not
+    // tidiness. Status reads are suppressed while an operation holds that lane —
+    // the count is in flux mid-Stop — so a mount that arrived DURING the
+    // reservation has never read it: repainting alone would show a replacement
+    // pane a permanently disabled Stop All until the next poll. The gesture may
+    // also have just stopped the very work the old count described.
+    function releaseFleetFenceThroughOwner() {
+        const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
+        if (!destroyed && currentOwner === handle) {
+            renderFleetHoldState();
+            renderStopAllState();
+            void refreshStopAllState();
+            return;
+        }
+        if (currentOwner && typeof currentOwner.refreshFleetHoldFence === 'function') {
+            currentOwner.refreshFleetHoldFence();
+        }
+    }
+    // The latch table must still converge after a mount is retired mid-gesture,
+    // so the refresh goes to whoever owns the pane NOW — exactly the handoff
+    // Stop All performs in its own `finally`. Asking our own destroyed list
+    // handle would re-publish state from a retired mount, which is the thing
+    // the fence exists to prevent.
+    function refreshFleetHoldThroughOwner() {
+        const currentOwner = containerEl[AGENT_LIST_PANE_OWNER];
+        if (!destroyed && currentOwner === handle) {
+            void listHandle.refreshHoldState({ fresh: true });
+            return;
+        }
+        if (currentOwner && typeof currentOwner.refreshHoldState === 'function') {
+            void currentOwner.refreshHoldState({ fresh: true });
+        }
+    }
 
     let holdCountEl = header.querySelector('.agent-hold-count');
     const builtHoldCountEl = !holdCountEl;
@@ -1872,7 +2083,8 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     function fleetMenuItems() {
-        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return [];
+        if (destroyed || !holdBanner.supported || !holdBanner.canHold
+            || fleetHoldIsPending()) return [];
         const total = holdBanner.targetCount;
         const noun = total === 1 ? 'agent' : 'agents';
         const items = [];
@@ -1892,7 +2104,14 @@ export function mountAgentListPane(containerEl, config = {}) {
         // Only while there is work to stop, for the same reason the card offers
         // "Stop and hold" only on a thinking row: with nothing in flight the
         // compound gesture IS the plain Hold above it.
-        if (stopAllOptIn && stopAllStatus.canStop && stopAllStatus.inFlightCount > 0) {
+        //
+        // A Stop All already in flight reaches the same answer by a different
+        // road: this gesture cannot reserve a lane somebody else holds, so it
+        // would refuse at the claim and the operator would get a prompt for a
+        // gesture that never ran. "Hold all" above is exactly the half that
+        // remains, so nothing is taken away by not offering it.
+        if (stopAllStatus.canStop && stopAllStatus.inFlightCount > 0
+            && fleetStopLaneIsFree()) {
             items.push({
                 label: 'Stop all and hold…',
                 action: 'stop-all-and-hold',
@@ -1908,7 +2127,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         fleetKebab.hidden = !holdBanner.supported;
         fleetKebab.disabled = !holdBanner.supported
             || !holdBanner.canHold
-            || fleetHoldPending;
+            || fleetHoldIsPending();
         fleetKebab.title = holdBanner.supported && !holdBanner.canHold
             ? 'Sovereign host authority is required to Hold agents'
             : 'Fleet actions';
@@ -1955,12 +2174,72 @@ export function mountAgentListPane(containerEl, config = {}) {
     // read that STARTS after the mutation committed, and hand the answer to the
     // renderer; a read that does not land leaves the fan-out unconfirmed rather
     // than restating a cached snapshot as a receipt.
+    //
+    // This read is the longest await in the gesture, so it is also where a
+    // remount is most likely to land. Ownership is deliberately NOT rechecked
+    // here: every caller holds a gate immediately after, and a duplicate check
+    // inside would be a guard no test could distinguish from its absence.
+    //
+    // It is also on a LEASH, and that is load-bearing. `refreshHoldState`
+    // awaits `api.getHostHoldState()`, which has no timeout of its own — the
+    // client hands the browser's `fetch` no signal — so a host that accepts the
+    // connection and never answers holds this promise open for the life of the
+    // page. Everything downstream of an unbounded await inherits the hang: the
+    // receipt panel, and the `finally` that ends the gesture's fence, which
+    // would leave the fleet menu disabled forever with nothing in flight to
+    // justify it. Presentation evidence may not fence an operator control.
+    //
+    // The leash bounds the WAIT, never the read. The request is deliberately
+    // left in flight: if it lands late the inner list still publishes it
+    // through its own sequence fence and the badge converges — strictly more
+    // than aborting it would leave behind. A wait that runs out reports the
+    // fan-out `unconfirmed`, which is the same true statement the panel already
+    // makes about a read that failed.
     async function confirmFleetProjection() {
-        await listHandle.refreshHoldState({ fresh: true });
-        const snapshot = typeof listHandle.getHoldState === 'function'
-            ? listHandle.getHoldState()
-            : null;
-        return snapshot && snapshot.confirmed === true ? snapshot : null;
+        const read = (async () => {
+            await listHandle.refreshHoldState({ fresh: true });
+            const snapshot = typeof listHandle.getHoldState === 'function'
+                ? listHandle.getHoldState()
+                : null;
+            return snapshot && snapshot.confirmed === true ? snapshot : null;
+        })();
+        const view = doc.defaultView;
+        const setTimeoutFn = view && view.setTimeout;
+        const clearTimeoutFn = view && view.clearTimeout;
+        if (typeof setTimeoutFn !== 'function') {
+            // No clock to hang a leash from. An unbounded wait is the defect
+            // itself, so decline to wait at all rather than fail open: the read
+            // still runs and still converges the badge, and the fan-out says
+            // what is true — it could not be confirmed. A document with no
+            // window cannot poll either, so this surface is already degraded.
+            void read.catch(() => {});
+            return null;
+        }
+        return await new Promise((resolve) => {
+            const wait = {
+                timer: null,
+                // Idempotent by membership, because three things race to end
+                // this wait: the read landing, the leash running out, and
+                // destroy() retiring the mount underneath it.
+                settle: (projection) => {
+                    if (!fleetConfirmWaits.delete(wait)) return;
+                    if (typeof clearTimeoutFn === 'function') {
+                        clearTimeoutFn.call(view, wait.timer);
+                    }
+                    resolve(projection);
+                },
+            };
+            fleetConfirmWaits.add(wait);
+            wait.timer = setTimeoutFn.call(
+                view,
+                () => wait.settle(null),
+                fleetConfirmTimeoutMs,
+            );
+            // `refreshHoldState` swallows its own read errors, so the rejection
+            // arm is belt-and-braces rather than a live path — but an
+            // unhandled rejection here would be a hang by another name.
+            read.then((projection) => wait.settle(projection), () => wait.settle(null));
+        });
     }
 
     // Per-agent rows for the fan-out, read back from the host's own composed
@@ -2016,7 +2295,16 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
 
     async function holdFleet({ alsoStop }) {
-        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return;
+        if (destroyed || !holdBanner.supported || !holdBanner.canHold
+            || fleetHoldIsPending()) return;
+        // A compound gesture needs BOTH lanes, so it needs both before it asks
+        // the operator for anything. The menu already declines to offer the
+        // entry while a Stop All runs, but a menu is composed when it OPENS: a
+        // Stop All started while the menu sat open would otherwise be discovered
+        // only after the reason prompt, leaving a gesture that either degrades
+        // into a bare Hold or throws away an answer it asked for. Refuse here,
+        // before the prompt, rather than deliver half of what was asked for.
+        if (alsoStop && !fleetStopLaneIsFree()) return;
         const total = holdBanner.targetCount;
         const noun = total === 1 ? 'agent' : 'agents';
         const reason = askFleetReason(
@@ -2026,12 +2314,26 @@ export function mountAgentListPane(containerEl, config = {}) {
             fleetHoldReason,
         );
         if (!reason) return;
-        fleetHoldPending = true;
-        renderFleetHoldState();
-        let latched = false;
+        // Test-and-claim, stated together — and for the compound gesture, ONE
+        // claim over both lanes with no await between the test and the set, so
+        // nothing can take the Stop lane in between. The reason prompt cannot
+        // currently yield — an async host asker returns a Promise, which
+        // `makeReasonAsker` rejects as a non-string — so this re-read is
+        // unreachable today and is deliberately not presented as a tested
+        // guard. It is here so the condition the reservation is taken under is
+        // written beside the claim rather than inferred from a check upstream.
+        if (destroyed || fleetHoldIsPending()) return;
+        if (alsoStop && !fleetStopLaneIsFree()) return;
+        const operation = { kind: 'hold', reservesStopAll: !!alsoStop };
+        claimFleetGesture(operation);
+        // "This gesture has already asked the host for a fresh reading." The
+        // `finally` below exists for the paths that never asked at all; once a
+        // read has been ISSUED a second one is churn, and against the hung host
+        // this leash was built for it would be a second hung request.
         let confirmingRead = false;
         try {
-            let response;
+            let response = null;
+            let unreachable = null;
             try {
                 response = await api.setHostHold({
                     scope: 'host',
@@ -2039,57 +2341,138 @@ export function mountAgentListPane(containerEl, config = {}) {
                     operation_id: newOperationId('ui-host-hold'),
                 });
             } catch (error) {
+                unreachable = error || new Error('request failed');
+            }
+            if (unreachable) {
                 // Nothing reached the host, so this panel states no fleet fact.
                 // The only per-agent table it could restate is the pre-request
                 // one already on screen — which is exactly what a receipt may
                 // not be drawn from.
-                renderFleetHoldOutcomes({
-                    action: 'hold',
-                    disposition: 'unreachable',
-                    detail: error && error.message,
-                    projection: null,
-                });
-                return;
-            }
-            // BOTH Hold dispositions leave a latch, so a response carrying no
-            // current latch contradicts its own receipt. Say indeterminate
-            // rather than reading that receipt as a hold — and, below, rather
-            // than proceeding to Stop on the strength of it.
-            const current = mutationLatch(response);
-            latched = !!current;
-            // Paint the committed latch NOW so a confirming read that never
-            // arrives cannot roll it back; the rows below still come only from
-            // a read, never from this paint.
-            applyFleetLatch(current);
-            const receipt = response && response.receipt;
-            const disposition = latched && receipt && typeof receipt.disposition === 'string'
-                ? receipt.disposition
-                : 'indeterminate';
-            const projection = await confirmFleetProjection();
-            confirmingRead = true;
-            renderFleetHoldOutcomes({
-                action: 'hold',
-                disposition,
-                detail: receipt && receipt.receipt_id
+                if (mayPublishFleetOutcome(operation)) {
+                    renderFleetHoldOutcomes({
+                        action: 'hold',
+                        disposition: 'unreachable',
+                        detail: unreachable.message,
+                        projection: null,
+                    });
+                }
+            // A retired mount paints nothing, reports nothing and stops nothing.
+            // The Hold it committed is durable and unaffected: the replacement
+            // mount reads it back from the host, which is the only place either
+            // mount was ever entitled to learn it from.
+            } else if (ownsFleetHold(operation)) {
+                // BOTH Hold dispositions leave a latch, so a response carrying
+                // no current latch contradicts its own receipt. Say
+                // indeterminate rather than reading that receipt as a hold —
+                // and, below, rather than stopping on the strength of it.
+                const current = mutationLatch(response);
+                const latched = !!current;
+                // Paint the committed latch NOW so a confirming read that never
+                // arrives cannot roll it back; the rows below still come only
+                // from a read, never from this paint.
+                applyFleetLatch(current);
+                const receipt = response && response.receipt;
+                const disposition = latched && receipt && typeof receipt.disposition === 'string'
+                    ? receipt.disposition
+                    : 'indeterminate';
+                const detail = receipt && receipt.receipt_id
                     ? `Hold receipt ${receipt.receipt_id}`
-                    : null,
-                projection,
-            });
+                    : null;
+
+                // The compound gesture's second half is authorised HERE, from
+                // the committed mutation and nothing else: this mount still
+                // owns the gesture, and the Hold it is compounding actually
+                // latched. A bare Stop All after a failed Hold is a DIFFERENT
+                // action from the one the operator asked for — the fleet would
+                // stop and then start again on the next heartbeat, with
+                // nothing latched and nothing on screen saying so.
+                //
+                // It is also STARTED here, in the same turn as the mutation
+                // that authorised it, with no await in between. Stopping the
+                // fleet is the durable half of what the operator asked for; it
+                // may not queue behind a read that exists only to draw a
+                // receipt, and against a host that answers the POST and then
+                // never answers the GET, queueing it there meant the fleet was
+                // held but never stopped — the silent half-gesture this
+                // ordering exists to make impossible.
+                //
+                // The half runs INSIDE the fence, because "Stop all and hold"
+                // is ONE gesture and a fence that ends halfway through is not a
+                // fence. Released at the end of the Hold half, this banner's
+                // menu — and a replacement mount's, which inherits the token
+                // rather than a local flag — would offer "Resume" while the
+                // Stop request was still open, and the gesture could finish
+                // with the fleet stopped and UNHELD: free to start again on the
+                // next heartbeat, which is the exact state it was asked to
+                // prevent.
+                //
+                // It runs under the reservation this gesture took before its
+                // Hold, so the lane was never open for a competing Stop All to
+                // claim while that Hold was in flight. Passing the reservation
+                // is also what keeps this from looking like a second claim.
+                const stopWork = alsoStop && latched
+                    ? runStopAll({
+                        confirm: false,
+                        reservation: operation,
+                        // The gesture is over when its Stop is — NOT when the
+                        // status read that follows the Stop lands. That read is
+                        // convergence bookkeeping, a hung host can stall it
+                        // forever, and this fence is local state: nothing about
+                        // ending it is the host's to answer. The `finally`
+                        // below still ends the fence on every path that never
+                        // reached here (including a `runStopAll` that
+                        // early-returned without settling), and ending it twice
+                        // is a no-op by identity.
+                        onSettled: () => endFleetHoldGesture(operation),
+                    })
+                    : null;
+                // Created now, awaited at the bottom. A rejection arriving in
+                // that gap would be an unhandled rejection; attaching a handler
+                // marks it handled, and the `await` below still reports it.
+                if (stopWork) void stopWork.catch(() => { /* reported below */ });
+
+                // Only now the evidence, and only on a leash. Issued AFTER the
+                // Stop deliberately: `runStopAll` runs its synchronous
+                // browser-work fence before its first await, and a fence that
+                // paints a latch would orphan a read issued ahead of it — which
+                // would report this fan-out unconfirmed for no better reason
+                // than the order two calls were written in.
+                confirmingRead = true;
+                const projection = await confirmFleetProjection();
+                if (mayPublishFleetOutcome(operation)) {
+                    renderFleetHoldOutcomes({
+                        action: 'hold',
+                        disposition,
+                        detail,
+                        projection,
+                    });
+                }
+                // The Stop half's own verdict, not an assumption that calling it
+                // stopped anything. It holds the lane by reservation, so a
+                // decline here is an invariant guard rather than a live path —
+                // but a compound gesture that silently reported a Stop it never
+                // made is precisely what the reservation was built to prevent,
+                // so the one place that could still say it says the truth.
+                if (stopWork && (await stopWork) === false
+                    && mayPublishFleetOutcome(operation) && stopAllResults) {
+                    stopAllResults.hidden = false;
+                    stopAllResults.textContent = 'The host hold is set, but the Stop half did '
+                        + 'not run: in-flight work was NOT stopped.';
+                }
+            }
         } finally {
-            fleetHoldPending = false;
-            renderFleetHoldState();
+            endFleetHoldGesture(operation);
             // Only on the paths that did not already take one: the badge still
-            // converges after a request that never reached the host.
-            if (!confirmingRead) void listHandle.refreshHoldState({ fresh: true });
+            // converges after a request that never reached the host. A mount
+            // that lost the gesture still owes the CURRENT owner that
+            // convergence — the latch it may have committed is real.
+            if (!confirmingRead) refreshFleetHoldThroughOwner();
         }
-        // A bare Stop All after a failed Hold is a different action from the
-        // one the operator asked for: the fleet would stop and then start again
-        // on the next heartbeat, with nothing latched and nothing saying so.
-        if (alsoStop && latched) await runStopAll({ confirm: false });
     }
 
     async function releaseFleetHold() {
-        if (!holdBanner.supported || !holdBanner.canHold || fleetHoldPending) return;
+        if (destroyed || !holdBanner.supported || !holdBanner.canHold
+            || fleetHoldIsPending()) return;
         const latch = holdBanner.hostHold;
         const observed = latch && typeof latch.hold_receipt_id === 'string'
             ? latch.hold_receipt_id
@@ -2100,8 +2483,12 @@ export function mountAgentListPane(containerEl, config = {}) {
             'Resumed from the agents banner',
         );
         if (!reason) return;
-        fleetHoldPending = true;
-        renderFleetHoldState();
+        // Same test-and-claim as holdFleet, and unreachable for the same reason.
+        // A release touches one lane: it stops nothing, so it reserves nothing
+        // of the Stop lane and leaves a Stop All free to run beside it.
+        if (destroyed || fleetHoldIsPending()) return;
+        const operation = { kind: 'release', reservesStopAll: false };
+        claimFleetGesture(operation);
         let confirmingRead = false;
         try {
             let response;
@@ -2115,14 +2502,19 @@ export function mountAgentListPane(containerEl, config = {}) {
                     expected_hold_receipt_id: observed,
                 });
             } catch (error) {
-                renderFleetHoldOutcomes({
-                    action: 'release',
-                    disposition: 'unreachable',
-                    detail: error && error.message,
-                    projection: null,
-                });
+                if (mayPublishFleetOutcome(operation)) {
+                    renderFleetHoldOutcomes({
+                        action: 'release',
+                        disposition: 'unreachable',
+                        detail: error && error.message,
+                        projection: null,
+                    });
+                }
                 return;
             }
+            // A retired mount publishes nothing. The release it committed is
+            // durable; the replacement mount reads it from the host.
+            if (!ownsFleetHold(operation)) return;
             // `current` is authoritative under every disposition, including the
             // superseding latch a stale release was refused against.
             applyFleetLatch(mutationLatch(response));
@@ -2133,8 +2525,12 @@ export function mountAgentListPane(containerEl, config = {}) {
             // Which agents a host resume LEFT held is the whole point of this
             // panel, and it is the one thing releasing the host latch cannot
             // tell this document: an agent's own latch is on the other axis.
-            const projection = await confirmFleetProjection();
+            // On the same leash as the Hold's: this gesture has no second half
+            // to unblock, but a hung read here would still hold its fence past
+            // the end of the page.
             confirmingRead = true;
+            const projection = await confirmFleetProjection();
+            if (!mayPublishFleetOutcome(operation)) return;
             renderFleetHoldOutcomes({
                 action: 'release',
                 disposition,
@@ -2144,9 +2540,8 @@ export function mountAgentListPane(containerEl, config = {}) {
                 projection,
             });
         } finally {
-            fleetHoldPending = false;
-            renderFleetHoldState();
-            if (!confirmingRead) void listHandle.refreshHoldState({ fresh: true });
+            endFleetHoldGesture(operation);
+            if (!confirmingRead) refreshFleetHoldThroughOwner();
         }
     }
 
@@ -2261,8 +2656,6 @@ export function mountAgentListPane(containerEl, config = {}) {
     }
     resizeHandle.addEventListener('mousedown', onResizeDown);
 
-    let destroyed = false;
-    let handle = null;
     function destroy() {
         if (destroyed) return;
         destroyed = true;
@@ -2275,6 +2668,14 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (statusInterval !== null && typeof clearIntervalFn === 'function') {
             clearIntervalFn.call(doc.defaultView, statusInterval);
         }
+        // Settle every confirming-read leash this mount still holds, rather
+        // than cancel it: a retired gesture must still reach its `finally` to
+        // hand the fence back to the current owner, and cancelling the timer
+        // alone would strand it on an await nothing can now resolve. `null` is
+        // the honest answer anyway — a mount that is gone may not paint the
+        // fan-out it was waiting for. It also puts the timer out, so a long
+        // leash cannot keep the embedding host's event loop alive past teardown.
+        for (const wait of Array.from(fleetConfirmWaits)) wait.settle(null);
         if (newBtn && onNewClick) newBtn.removeEventListener('click', onNewClick);
         resizeHandle.removeEventListener('mousedown', onResizeDown);
         doc.removeEventListener('mousemove', onMouseMove);
@@ -2303,6 +2704,16 @@ export function mountAgentListPane(containerEl, config = {}) {
         refresh: (...a) => listHandle.refresh(...a),
         refreshHoldState: (...a) => listHandle.refreshHoldState(...a),
         getHoldState: (...a) => listHandle.getHoldState(...a),
+        // Repaint the fleet controls against the container-scoped fence. Called
+        // by a RETIRED mount whose fleet gesture has just finished, so this
+        // mount's menu stops being disabled by an operation that is over. Both
+        // lanes, because one reservation fenced both.
+        refreshFleetHoldFence: () => {
+            if (destroyed) return;
+            renderFleetHoldState();
+            renderStopAllState();
+            void refreshStopAllState();
+        },
         select: (...a) => listHandle.select(...a),
         setActiveName: (...a) => listHandle.setActiveName(...a),
         getActive: (...a) => listHandle.getActive(...a),
