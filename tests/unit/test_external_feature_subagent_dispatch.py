@@ -272,6 +272,7 @@ async def test_legacy_prompt_does_not_advertise_a_policy_denied_tool():
     assert "Available tools: generate_avatar" in prompt
     assert "ping" not in prompt
     assert "selfie" not in prompt.lower()
+    assert "Markdown image" in prompt
 
 
 @pytest.mark.asyncio
@@ -314,6 +315,7 @@ async def test_filtered_current_prompt_overrides_cannot_advertise_denied_tools()
         prompt = fake_agent.llm_service.generate.await_args.kwargs["system_prompt"]
         assert "Available tools: generate_avatar" in prompt
         assert "ping" not in prompt
+        assert "Markdown image" in prompt
 
     assert called == []
 
