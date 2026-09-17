@@ -3368,13 +3368,20 @@ class PrivacyEnforcingStorage:
         # for good. Plan and reconcile therefore have to be one critical
         # section. Keyed by ledger identity, not globally: unrelated ledgers do
         # not race each other and should not queue behind one another.
-        async with self._ledger_projection_lock(ledger):
-            try:
+        #
+        # The lease is taken ABOVE, before this queue. The release therefore
+        # has to wrap the lock acquisition itself, not sit inside it: a pass
+        # cancelled while WAITING for the lock never enters the ``async with``
+        # body, so a ``finally`` nested inside it never runs and the lease
+        # counter stays positive for the life of the process -- permanently
+        # refusing every later privacy transition.
+        try:
+            async with self._ledger_projection_lock(ledger):
                 return await self._project_strategy_ledger_assertions_leased(
                     ledger, binding, report
                 )
-            finally:
-                self._release_ledger_assertion_lease()
+        finally:
+            self._release_ledger_assertion_lease()
 
     def _ledger_projection_lock(self, ledger):
         """Return the projection lock for one ledger, creating it on first use.
@@ -3686,8 +3693,15 @@ class PrivacyEnforcingStorage:
                 return False
         if not ledger_assertions.declares_adapter_markers(held, ontology_ref):
             return False
+        # Revision-scoped, deliberately. ``list_assertion_sources`` joins
+        # ``semantic_assertion_revisions`` across the WHOLE assertion, so a
+        # source occurrence this adapter wrote for a superseded revision still
+        # answers for the current one: a foreign writer that revises one of our
+        # assertions, keeping the marker fields, would be judged ours and
+        # retracted -- terminally -- when its ledger row goes away. Ownership
+        # has to be asked of the revision actually held.
         try:
-            sources = await self.list_assertion_sources(held.assertion_id)
+            sources = await self.list_assertion_revision_sources(held.revision_id)
         except Exception as error:  # noqa: BLE001
             logger.warning(
                 "strategy ledger assertion provenance read failed: %s", error
