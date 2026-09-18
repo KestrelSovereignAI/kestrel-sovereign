@@ -5476,7 +5476,7 @@ Expected Duration: {expected_duration}
         return None
 
     @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, *, invocation_id: Optional[str] = None, invocation_provenance=None, turn_precondition: Optional[Callable[[], None]] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -5515,6 +5515,17 @@ Expected Duration: {expected_duration}
             invocation_provenance: Endpoint-owned authenticated actor and
                 transport metadata. This is task-local only; tools cannot
                 provide or override it through their arguments.
+            turn_precondition: Optional caller-owned precondition, revalidated
+                inside this turn's CONVERSATION → privacy-transition span
+                immediately before the prompt is consumed. It must be
+                SYNCHRONOUS and it aborts the turn by RAISING (see
+                ``signals.pre_turn_guard.TurnPreconditionRefused``): nothing is
+                persisted, no LLM call is made, and the caller sees a refusal
+                rather than a response. Used by the SignalDispatcher (#3101) so
+                a COGNITION source whose precondition can go stale — e.g. a
+                queued self-followup whose privacy mode turned volatile — is
+                judged against the mode in force *inside the span the writer
+                must acquire*, not against a read taken before it.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -5594,7 +5605,33 @@ Expected Duration: {expected_duration}
         # turn appends user/assistant messages). Acquire the turn
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
-        async with self._turn_lifecycle():
+        #
+        # The privacy-transition lock is taken in the SAME span, in the SAME
+        # order the streaming turn has always used — CONVERSATION (via
+        # `_turn_lifecycle`) BEFORE the transition lock. That order is the
+        # deadlock-freedom invariant; acquiring the pair in one `async with`
+        # makes it structurally impossible to get backwards here. The lock is
+        # task-reentrant, so the in-turn `!privacy` command path and inline
+        # identity-writing tools still re-enter their own span rather than
+        # waiting on it (see ReentrantTransitionLock).
+        #
+        # #3101 review P1: holding it for the whole turn is what makes
+        # `turn_precondition` below authoritative instead of advisory. Before
+        # this, the non-streaming turn took neither lock against a privacy
+        # transition, so every check the dispatcher could make was a read-side
+        # test racing a write-side flip — the flip merely had to land in one of
+        # the awaits between the check and the prompt being consumed. A writer
+        # must now acquire this lock, so it either lands before the
+        # precondition (which sees it and refuses) or waits for the turn.
+        async with self._turn_lifecycle(), self._get_privacy_transition_lock():
+            # FIRST act inside the span, before any state is touched: give the
+            # caller its last word on whether this turn may run at all. Sync by
+            # contract — an awaitable precondition would reopen the window
+            # inside the span that exists to close it — and it refuses by
+            # raising, so a refusal can never be mistaken for a response.
+            if turn_precondition is not None:
+                turn_precondition()
+
             # Record THIS turn's session as soon as the turn lock is held —
             # before command handling — so tools invoked via an explicit
             # ``!command`` (e.g. request_restart's origin-session capture) see

@@ -506,16 +506,24 @@ class SourceRegistry:
         throttling (rate limit + coalescing window), attention policy, resource
         ownership + self-loop policy, the redaction policy's *flags and
         summarizer* (not merely its class), retention, the four
-        constitutional-injection fields, and the per-signal prompt-override
-        opt-in (``allow_prompt_override``). A re-registration that changes any
-        of them is therefore caught as a MISMATCH instead of being silently
-        accepted as equivalent.
+        constitutional-injection fields, the per-signal prompt-override
+        opt-in (``allow_prompt_override``), and the pre-turn guard. A
+        re-registration that changes any of them is therefore caught as a
+        MISMATCH instead of being silently accepted as equivalent.
 
         ``allow_prompt_override`` is validated at registration time (only a
         ``bool`` is accepted) yet governs a real dispatch decision — whether a
         signal's ``prompt_template_override`` is honored — so two otherwise
         identical registrations that differ only in that flag are a genuine
         contract mismatch and must not compare equivalent (#2522 P1).
+
+        ``pre_turn_guard`` is the same shape of field and the same trap
+        (#3101 review P2): it decides whether a COGNITION dispatch is refused
+        at the handoff into the turn. Omitting it here made a guarded and an
+        unguarded registration compare equivalent, so an optional/idempotent
+        re-registration would keep the UNGUARDED one — silently dropping the
+        refusal — and report no mismatch. Guard identity is part of the
+        contract.
 
         Callables are fingerprinted by :func:`_callable_identity`, which folds
         in a bound method's owner and a closure's *captured free variables* by
@@ -572,6 +580,7 @@ class SourceRegistry:
             reg.constitution_injection,
             reg.system_prompt_budget_bytes,
             getattr(reg, "allow_prompt_override", False),
+            _callable_identity(getattr(reg, "pre_turn_guard", None)),
         )
 
     @classmethod
@@ -654,6 +663,18 @@ class SourceRegistry:
             raise RegistrationError(
                 f"Source '{reg.name}': allow_prompt_override must be a bool "
                 f"when declared, got {type(allow_prompt_override).__name__}."
+            )
+
+        # A declared-but-uncallable pre-turn guard is a refusal that can never
+        # fire. The dispatcher calls it fail-closed, so a non-callable would
+        # turn EVERY dispatch of this source into a refusal at the handoff —
+        # far better caught here, at registration, than as a permanently
+        # silent source in production (#3101 review P2).
+        pre_turn_guard = getattr(reg, "pre_turn_guard", None)
+        if pre_turn_guard is not None and not callable(pre_turn_guard):
+            raise RegistrationError(
+                f"Source '{reg.name}': pre_turn_guard must be callable when "
+                f"declared, got {type(pre_turn_guard).__name__}."
             )
 
     @staticmethod

@@ -329,45 +329,50 @@ async def test_a_transition_cannot_interleave_with_the_write(followup_env):
 
 
 # ---------------------------------------------------------------------------
-# The fourth finding is deliberately not "fixed"
+# The fourth finding WAS real — the earlier test asserted the wrong property
 # ---------------------------------------------------------------------------
 
 
-def test_fire_time_check_and_dispatch_have_no_await_between_them():
-    """The review's second P1 claimed the mode can change between the fire-time
-    check and `dispatch_signal`. It cannot: on the branch that dispatches, the
-    code from the guard to the call is straight-line, so in single-threaded
-    asyncio nothing can interleave there. The only awaits between them belong
-    to the two early-return branches.
+def test_no_await_between_the_pre_turn_guard_and_the_turn():
+    """The revalidation seam is only worth anything if nothing can interleave.
 
-    Adding a re-check immediately before `dispatch_signal` would guard against
-    something that cannot happen. This test pins the property the argument
-    rests on, so if someone later introduces an await in that stretch the
-    claim becomes live and this fails loudly rather than silently.
+    This replaces an earlier test that measured the wrong stretch. That one
+    proved there is no ``await`` between the scheduler's fire-time privacy
+    check and its ``dispatch_signal(...)`` call, and concluded from it that a
+    re-check "would guard against something that cannot happen". The stretch
+    was straight-line, but the conclusion did not follow: ``dispatch_signal``
+    is itself a suspension point, and the transition only had to land inside
+    it. Reproduced against the real dispatcher — the persisted intent reached
+    ``process_input`` under ``storage="none"`` and the occurrence reported
+    success. See ``test_self_followup_fire_time_privacy.py``.
+
+    So the property that actually carries the guarantee is measured here
+    instead: between the dispatcher's pre-turn guard and the ``process_input``
+    that starts the turn, there is no ``await`` for a privacy transition to
+    occupy.
     """
     import inspect
 
-    from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+    from kestrel_sovereign.signals.dispatcher import SignalDispatcher
 
-    src = inspect.getsource(SchedulerFeature._dispatch_scheduled_task)
-    guard = src.index("hides_persisted_user_content(self.agent)")
-    dispatch = src.index("dispatch_signal(")
-    # Cut at the START of the dispatching statement — the `await dispatcher.`
-    # that performs it is the boundary, not something between the two.
-    stmt_start = src.rindex("\n", 0, dispatch)
+    src = inspect.getsource(SignalDispatcher._run_cognition_with_audit)
+    guard = src.index("self._pre_turn_refusal(signal, registration)")
+    turn = src.index("self._agent.process_input(prompt")
+    stmt_start = src.rindex("\n", 0, turn)
     between = src[guard:stmt_start]
 
-    # Awaits belonging to the early-return fallbacks are not on the dispatch
-    # path; anything else would be.
+    # ``await await_monitored_execution(...)`` is the await that PERFORMS the
+    # turn, so it is the boundary rather than something sitting inside it --
+    # the same carve-out the superseded test made for ``await dispatcher.``.
     offenders = [
         line.strip()
         for line in between.splitlines()
-        if "await " in line and "_lookup_and_run_tool" not in line
+        if "await " in line and "await_monitored_execution" not in line
     ]
     assert not offenders, (
-        "an await now sits between the fire-time privacy check and dispatch, "
-        "so the mode CAN change in between and the check must be repeated: "
-        f"{offenders}"
+        "an await now sits between the pre-turn guard and the turn, so a "
+        "privacy transition can land in between and the guard no longer "
+        f"means anything at the moment the intent is used: {offenders}"
     )
 
 

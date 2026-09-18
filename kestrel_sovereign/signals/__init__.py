@@ -75,6 +75,11 @@ from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
 )
+from kestrel_sovereign.signals.pre_turn_guard import (
+    PreTurnGuard,
+    SourceRegistrationWithPreTurnGuard,
+    TurnPreconditionRefused,
+)
 from kestrel_sovereign.signals.registry import (
     CLAIM_CONTRIBUTION,
     CLAIM_IMPERATIVE,
@@ -99,11 +104,14 @@ __all__ = [
     "SignalHandle",
     "SignalMode",
     "SignalResult",
+    "PreTurnGuard",
     "SignalWithPromptTemplateOverride",
     "SourceRegistration",
+    "SourceRegistrationWithPreTurnGuard",
     "SourceRegistrationWithPromptOverride",
     "Status",
     "Trust",
+    "TurnPreconditionRefused",
     "Urgency",
     "Visibility",
     # Runtime

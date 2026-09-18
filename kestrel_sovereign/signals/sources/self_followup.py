@@ -35,15 +35,20 @@ import hashlib
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from kestrel_sdk.signals import (
     AttentionPolicy,
     RateLimit,
     RedactionPolicy,
     SignalMode,
-    SourceRegistration,
     Trust,
+)
+
+# Imported from the defining module rather than the ``signals`` package so this
+# source stays off the dispatcher's import graph.
+from kestrel_sovereign.signals.pre_turn_guard import (
+    SourceRegistrationWithPreTurnGuard,
 )
 
 # Bare scheduler task name. `cron.self_followup` is the source name; the
@@ -177,9 +182,45 @@ def self_followup_result_summary(body: Any) -> str:
     return text
 
 
-def build_self_followup_registration() -> SourceRegistration:
+def refuse_followup_under_volatile_privacy(
+    signal: Any, agent: Any
+) -> Optional[str]:
+    """Refuse the turn when the mode now forbids resurfacing stored content.
+
+    ``SchedulerFeature._dispatch_scheduled_task`` already checks this before
+    dispatching, and there is no ``await`` between its check and
+    ``dispatch_signal``. That was mistaken for safety: ``dispatch_signal`` is
+    itself a suspension point, so a transition to EPHEMERAL / ISOLATED /
+    DEIDENTIFIED could land during durable admission or lock acquisition and
+    the persisted intent still reached a turn (#3101 review P1, reproduced
+    against the real dispatcher).
+
+    The dispatcher runs this at two boundaries: once at the last synchronous
+    instant of its pipeline (an early refusal), and once more inside the
+    turn's own CONVERSATION → privacy-transition span, immediately before the
+    prompt is consumed. The second is the one that makes the answer
+    authoritative — a transition must acquire that same lock, so it cannot
+    slip between this check and the turn. See
+    :mod:`kestrel_sovereign.signals.pre_turn_guard` for why one boundary was
+    not enough and why this function must stay synchronous.
+
+    Returns a reason that names the mode class only — never the intent.
+    """
+    from kestrel_sovereign.features.storage_access import (
+        hides_persisted_user_content,
+    )
+
+    if not hides_persisted_user_content(agent):
+        return None
+    return (
+        "refused: privacy mode became volatile after this follow-up was "
+        "queued, so its persisted intent is not read back into a turn"
+    )
+
+
+def build_self_followup_registration() -> SourceRegistrationWithPreTurnGuard:
     """Source registration for the agent's own scheduled follow-up turn."""
-    return SourceRegistration(
+    return SourceRegistrationWithPreTurnGuard(
         name=f"cron.{TASK_NAME}",
         schema=_schema,
         default_mode=SignalMode.COGNITION,
@@ -216,4 +257,9 @@ def build_self_followup_registration() -> SourceRegistration:
         # the follow-up is bound to a chat session.
         result_summary=self_followup_result_summary,
         retention_days=30,
+        # Revalidated by the dispatcher at the last synchronous instant of its
+        # pipeline AND again inside the turn's own CONVERSATION ->
+        # privacy-transition span, because the scheduler's fire-time check and
+        # the turn are separated by the whole pipeline plus the handoff.
+        pre_turn_guard=refuse_followup_under_volatile_privacy,
     )

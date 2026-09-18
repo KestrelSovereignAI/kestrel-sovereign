@@ -141,6 +141,7 @@ from kestrel_sovereign.signals.durable import (
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.signals.pre_turn_guard import TurnPreconditionRefused
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
@@ -4452,6 +4453,63 @@ class SignalDispatcher:
                 "mode": signal.mode.value,
             }
 
+        # Hand the source's guard DOWN into the turn, so it is revalidated
+        # inside the turn's own CONVERSATION -> privacy-transition span
+        # immediately before the prompt is consumed (#3101 review P1). This is
+        # the authoritative evaluation: a privacy transition must acquire that
+        # same lock, so it either lands before the guard runs (and the guard
+        # refuses) or blocks until the turn is over. The early check below
+        # cannot achieve that on its own — `await_monitored_execution` yields
+        # to create the execution task, and `process_input` awaits readiness,
+        # before the prompt is consumed.
+        #
+        # Feature-detected like every other optional kwarg: a duck-typed agent
+        # that cannot take a precondition keeps exactly the early check, which
+        # is a real narrowing of the window but not authority.
+        if (
+            getattr(registration, "pre_turn_guard", None) is not None
+            and _agent_accepts_kwarg(
+                self._agent.process_input, "turn_precondition"
+            )
+        ):
+            def _turn_precondition() -> None:
+                reason = self._pre_turn_refusal(signal, registration)
+                if reason is not None:
+                    raise TurnPreconditionRefused(reason)
+
+            process_input_kwargs["turn_precondition"] = _turn_precondition
+
+        # EARLY refusal, before the cognition turn is even created. Cheap, and
+        # it closes the long I/O-bound stretch this pipeline just awaited on
+        # the way here — durable admission, event persistence, lock
+        # acquisition — where a transition had the most room to land. It is an
+        # optimization plus a duck-typed-agent fallback, NOT the guarantee; see
+        # `signals/pre_turn_guard.py` for why the caller must not try to become
+        # the guarantee by taking the privacy-transition lock itself (it would
+        # invert the CONVERSATION-before-transition lock order).
+        pre_turn_refusal = self._pre_turn_refusal(signal, registration)
+        if pre_turn_refusal is not None:
+            # Same unwind as the `execution_withdrawal` branch below: the
+            # causation-chain ContextVar is already set by this point and its
+            # `finally` belongs to the try we are about to skip, so clear it
+            # here or the in-flight chain leaks into subsequent task lineage.
+            if clear_chain is not None:
+                clear_chain(token)
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=pre_turn_refusal,
+                registration=registration,
+                audit=audit,
+            )
+
         execution_withdrawal = None
         injection_tracking = None
         try:
@@ -4467,6 +4525,26 @@ class SignalDispatcher:
                     self._agent.process_input(prompt)
                     )
                 )
+        except TurnPreconditionRefused as exc:
+            # The turn refused itself inside its own lock span, before
+            # persisting or processing anything (#3101 review P1). Same
+            # disposition as a durable withdrawal: DROPPED_VALIDATION, so the
+            # occurrence is recorded as a refusal an operator can find rather
+            # than as a turn that ran. The `finally` below clears the chain.
+            if receipt_tool_registered:
+                clear_receipt = getattr(
+                    self._agent, "clear_constitution_receipt_tool", None
+                )
+                if callable(clear_receipt):
+                    clear_receipt()
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=str(exc),
+                registration=registration,
+                audit=audit,
+            )
         except Exception:
             if receipt_tool_registered:
                 clear_receipt = getattr(
@@ -4761,6 +4839,49 @@ class SignalDispatcher:
                 audit.echo_canary_status = CanaryStatus.MISSING
         else:
             audit.echo_canary_status = CanaryStatus.MISSING
+
+    def _pre_turn_refusal(
+        self, signal: Signal, registration: SourceRegistration
+    ) -> Optional[str]:
+        """Ask the source whether its precondition still holds, or ``None``.
+
+        Called from BOTH guard boundaries: the early pipeline check, and the
+        ``turn_precondition`` closure the turn runs inside its own
+        CONVERSATION → privacy-transition span. One implementation for both so
+        the two boundaries can never drift into disagreeing about what the
+        source permits.
+
+        Read defensively off the registration so an ordinary SDK
+        ``SourceRegistration`` — which has no such field — costs one
+        ``getattr`` and never changes behaviour. See
+        :mod:`kestrel_sovereign.signals.pre_turn_guard` for the contract and
+        for why the guard is synchronous.
+
+        Fails CLOSED. A guard exists to refuse, so one that raises has told us
+        nothing about whether refusing was required; running the turn anyway
+        would convert a broken guard into an absent one, which is exactly the
+        silent-accept shape these sources are written to avoid.
+        """
+        guard = getattr(registration, "pre_turn_guard", None)
+        if guard is None:
+            return None
+        try:
+            reason = guard(signal, self._agent)
+        except Exception:
+            logger.exception(
+                "pre_turn_guard for source %s raised on signal %s; refusing "
+                "the turn rather than treating a broken guard as consent",
+                registration.name,
+                signal.id,
+            )
+            return (
+                f"pre-turn guard for '{registration.name}' raised; refused "
+                "fail-closed"
+            )
+        if reason is None:
+            return None
+        text = str(reason).strip()
+        return text or f"refused by the '{registration.name}' pre-turn guard"
 
     def _render_prompt(
         self,
