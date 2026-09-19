@@ -37,13 +37,19 @@ wheel.
 
 `https://kestrel.ai/vocab/` is the Kestrel term namespace. Its ontology IRI is
 versioned (`https://kestrel.ai/vocab/1.0.0`,
-`https://kestrel.ai/vocab/1.1.0`); this preserves stable term IRIs such as
+`https://kestrel.ai/vocab/1.1.0`, `https://kestrel.ai/vocab/1.2.0`); this
+preserves stable term IRIs such as
 `https://kestrel.ai/vocab/preferredDeployRegion` while pinning each schema
-interpretation. The original `1.0.0` bytes and digest remain immutable; the RDF
-assertion codec selects its expanded vocabulary through the separate exact
-`ontology:kestrel-vocab-1.1` capability. The Kestrel ontology contains
-assertion/revision/source and temporal/provenance schema only. It explicitly
-grants no permission, role, approval, visibility change, or tool access.
+interpretation. Every released version's bytes and digest remain immutable, and
+each release is selected through its own exact capability rather than by
+recency: the RDF assertion codec selects its expanded vocabulary through
+`ontology:kestrel-vocab-1.1`, and `1.2.0` adds the `kestrel:strategicPattern` /
+`kestrel:strategicBlocker` claim terms used by the strategy-ledger assertion
+producer (`ontology:kestrel-vocab-1.2`). Adding a release therefore cannot
+retroactively reinterpret what an earlier pin already wrote. The Kestrel
+ontology contains assertion/revision/source, temporal/provenance, and
+strategy-ledger claim schema only. It explicitly grants no permission, role,
+approval, visibility change, or tool access.
 
 The stable registry packages and pins the dated RFC 3986 artifact used by
 the IRI profile, plus the dated W3C source documents for RDF 1.1 Concepts,

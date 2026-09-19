@@ -388,6 +388,24 @@ selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kes
 imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
 capabilities = ["ontology:kestrel-vocab-1.1"]
 
+[resource.kestrel-vocab-1-2]
+# A third immutable release of the same logical ontology. `identifier` stays
+# the durable logical name; the version-qualified table name is what lets
+# 1.0.0, 1.1.0 and 1.2.0 coexist without either replacing the other's pin.
+identifier = "kestrel-vocab"
+version = "1.2.0"
+namespace = "https://kestrel.ai/vocab/"
+package_resource = "data/semantic/ontologies/kestrel-vocab-1.2.0.ttl"
+sha256 = "bb478873295e36ce3aa71656279c9f8a279b5dac289834d1becf406ef4e47eff"
+maturity = "stable"
+kind = "ontology"
+uri = "https://kestrel.ai/vocab/1.2.0"
+published_date = "2026-09-15"
+description = "Adds the strategy-ledger claim terms used by the canonical pattern/blocker assertion producer; it grants no authority."
+selected_terms = ["kestrel:SemanticAssertion", "kestrel:AssertionRevision", "kestrel:SourceOccurrence", "kestrel:hasRevision", "kestrel:hasSourceOccurrence", "kestrel:validTime", "kestrel:observedTime", "kestrel:confidence", "kestrel:projectedTenantId", "kestrel:lineagePosition", "kestrel:StrategyLedgerRow", "kestrel:strategicPattern", "kestrel:strategicBlocker"]
+imports = ["rdfs-20140225@1.0.0", "skos-20090818@1.0.0", "prov-o-20130430@1.0.0", "owl-time-20171019@1.0.0"]
+capabilities = ["ontology:kestrel-vocab-1.2"]
+
 [resource.kestrel-assertion-shapes]
 version = "1.0.0"
 namespace = "https://kestrel.ai/shapes/"

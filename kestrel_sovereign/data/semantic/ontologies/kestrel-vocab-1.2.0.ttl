@@ -1,0 +1,82 @@
+@prefix kestrel: <https://kestrel.ai/vocab/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix time: <http://www.w3.org/2006/time#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://kestrel.ai/vocab/> a owl:Ontology ;
+    owl:versionIRI <https://kestrel.ai/vocab/1.2.0> ;
+    rdfs:label "Kestrel semantic vocabulary"@en ;
+    rdfs:comment "Schema only. This ontology grants no authority, permission, role, or tool access."@en .
+
+kestrel:SemanticAssertion a rdfs:Class ; rdfs:label "semantic assertion"@en .
+kestrel:AssertionRevision a rdfs:Class ; rdfs:label "assertion revision"@en .
+kestrel:SourceOccurrence a rdfs:Class ; rdfs:subClassOf prov:Entity .
+kestrel:hasRevision a rdf:Property ; rdfs:domain kestrel:SemanticAssertion ; rdfs:range kestrel:AssertionRevision .
+kestrel:hasSourceOccurrence a rdf:Property ; rdfs:domain kestrel:AssertionRevision ; rdfs:range kestrel:SourceOccurrence .
+kestrel:validTime a rdf:Property ; rdfs:range time:TemporalEntity .
+kestrel:observedTime a rdf:Property ; rdfs:range time:TemporalEntity .
+kestrel:confidence a rdf:Property ; rdfs:range xsd:decimal .
+kestrel:preferredDeployRegion a rdf:Property ; rdfs:label "preferred deploy region"@en .
+
+# RDF 1.1 assertion projection. A revision is an RDF statement resource; the
+# canonical Kestrel assertion remains outside RDF and carries identity.
+kestrel:assertionId a rdf:Property ; rdfs:range xsd:string .
+kestrel:revisionId a rdf:Property ; rdfs:range xsd:string .
+kestrel:projectedTenantId a rdf:Property ; rdfs:range xsd:string ;
+    rdfs:comment "Projection metadata only; RDF never authorizes tenant ownership."@en .
+kestrel:projectedOwnerId a rdf:Property ; rdfs:range xsd:string ;
+    rdfs:comment "Projection metadata only; RDF never authorizes source ownership."@en .
+kestrel:identityVersion a rdf:Property ; rdfs:range xsd:string .
+kestrel:confidenceMethod a rdf:Property ; rdfs:range xsd:string .
+kestrel:confidenceBasis a rdf:Property ; rdfs:range xsd:string .
+kestrel:epistemicState a rdf:Property ; rdfs:range xsd:string .
+kestrel:assertedAt a rdf:Property ; rdfs:range xsd:dateTimeStamp .
+kestrel:status a rdf:Property ; rdfs:range xsd:string .
+kestrel:supersedesRevisionId a rdf:Property ; rdfs:range xsd:string .
+kestrel:visibility a rdf:Property ; rdfs:range xsd:string .
+kestrel:privacyClassification a rdf:Property ; rdfs:range xsd:string .
+kestrel:releasePolicyReference a rdf:Property ; rdfs:range xsd:string .
+kestrel:iriProfile a rdf:Property ; rdfs:range xsd:string .
+kestrel:literalProfile a rdf:Property ; rdfs:range xsd:string .
+kestrel:ontologyVersion a rdf:Property .
+kestrel:ontologyNamespace a rdf:Property ; rdfs:range xsd:string .
+kestrel:ontologyVersionLabel a rdf:Property ; rdfs:range xsd:string .
+kestrel:ontologyContentDigest a rdf:Property ; rdfs:range xsd:string .
+kestrel:compatibilityProfile a rdf:Property ; rdfs:range xsd:string .
+kestrel:lineageType a rdf:Property ; rdfs:range xsd:string .
+kestrel:LineageMember a rdfs:Class .
+kestrel:sourceMembership a rdf:Property ; rdfs:range kestrel:LineageMember .
+kestrel:inputMembership a rdf:Property ; rdfs:range kestrel:LineageMember .
+kestrel:lineagePosition a rdf:Property ; rdfs:range xsd:integer .
+kestrel:sourceOccurrenceId a rdf:Property ; rdfs:range xsd:string .
+kestrel:derivation a rdf:Property ; rdfs:range prov:Activity .
+kestrel:ruleId a rdf:Property ; rdfs:range xsd:string .
+kestrel:engineVersion a rdf:Property ; rdfs:range xsd:string .
+kestrel:profileVersion a rdf:Property ; rdfs:range xsd:string .
+kestrel:inputDigest a rdf:Property ; rdfs:range xsd:string .
+kestrel:runId a rdf:Property ; rdfs:range xsd:string .
+kestrel:generatedAt a rdf:Property ; rdfs:range xsd:dateTimeStamp .
+kestrel:derivationReference a rdf:Property ; rdfs:range xsd:string .
+kestrel:inputRevisionId a rdf:Property ; rdfs:range xsd:string .
+
+# 1.2.0: strategy-ledger claim terms (#3051).
+#
+# A strategic pattern or blocker recorded in an agent's STRATEGY_LEDGER.yaml is
+# already a coherent claim, so it projects to exactly one canonical assertion.
+# The row TYPE is the predicate and the stable row identity is the object, so
+# assertion identity does not change when the row's prose is edited; the prose
+# itself stays in the canonical YAML ledger and is never smuggled into an IRI.
+kestrel:StrategyLedgerRow a rdfs:Class ;
+    rdfs:label "strategy ledger row"@en ;
+    rdfs:comment "One addressable row of an agent's canonical strategy ledger. Schema only; it grants no authority."@en .
+kestrel:strategicPattern a rdf:Property ;
+    rdfs:label "strategic pattern"@en ;
+    rdfs:range kestrel:StrategyLedgerRow ;
+    rdfs:comment "The subject agent currently holds the strategic pattern recorded in the named ledger row."@en .
+kestrel:strategicBlocker a rdf:Property ;
+    rdfs:label "strategic blocker"@en ;
+    rdfs:range kestrel:StrategyLedgerRow ;
+    rdfs:comment "The subject agent currently holds the strategic blocker recorded in the named ledger row."@en .
