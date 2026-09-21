@@ -41,6 +41,7 @@ from kestrel_sovereign.features.scheduler.status import (
     DEFAULT_MISFIRE_GRACE_SECONDS,
     emit_runtime_status,
     ensure_runtime_status_table,
+    mark_runtime_owner_stopped,
     scheduler_tick_in_progress_limit_seconds,
 )
 
@@ -917,6 +918,10 @@ class SchedulerRunner:
                 ],
             ]
         ] = None,
+        is_agent_authorized: Optional[
+            Callable[[str], Union[bool, Awaitable[bool]]]
+        ] = None,
+        on_protocol_failure: Optional[Callable[[BaseException], None]] = None,
         authorized_agent_ids_page_provider: Optional[
             Callable[
                 [Optional[str], int],
@@ -924,10 +929,6 @@ class SchedulerRunner:
             ]
         ] = None,
         authorized_agent_ids_page_size: int = 500,
-        is_agent_authorized: Optional[
-            Callable[[str], Union[bool, Awaitable[bool]]]
-        ] = None,
-        on_protocol_failure: Optional[Callable[[BaseException], None]] = None,
     ):
         try:
             normalized_lease_seconds = int(lease_seconds)
@@ -1324,6 +1325,9 @@ class SchedulerRunner:
         await emit_runtime_status(
             self._db,
             agent_ids=agent_ids,
+            complete_authority_snapshot=(
+                self._authorized_agent_ids_page_provider is None
+            ),
             owner_id=self._owner_id,
             worker_state=worker_state,
             last_tick_started_at=last_tick_started_at,
@@ -1332,6 +1336,19 @@ class SchedulerRunner:
             consecutive_failures=self._consecutive_worker_failures,
             last_error_type=self._last_worker_error_type,
         )
+        if (
+            worker_state == "stopped"
+            and self._authorized_agent_ids_page_provider is not None
+        ):
+            await mark_runtime_owner_stopped(
+                self._db,
+                owner_id=self._owner_id,
+                last_tick_started_at=last_tick_started_at,
+                last_tick_completed_at=last_tick_completed_at,
+                restart_count=self._worker_restart_count,
+                consecutive_failures=self._consecutive_worker_failures,
+                last_error_type=self._last_worker_error_type,
+            )
 
     async def _publish_runtime_status_best_effort(
         self,

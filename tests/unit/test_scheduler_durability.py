@@ -3596,6 +3596,26 @@ def test_paged_host_authority_requires_live_check_and_strict_configuration():
             is_agent_authorized=lambda _agent_id: True,
         )
 
+    live_check = lambda _agent_id: True
+    failure_callback = lambda _error: None
+    compatible = SchedulerRunner(
+        object(),
+        None,
+        AsyncMock(),
+        5,
+        60,
+        1,
+        30,
+        "positional-owner",
+        (),
+        lambda: (),
+        live_check,
+        failure_callback,
+    )
+    assert compatible._is_agent_authorized is live_check
+    assert compatible._on_protocol_failure is failure_callback
+    assert compatible._authorized_agent_ids_page_provider is None
+
 
 @pytest.mark.asyncio
 async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
