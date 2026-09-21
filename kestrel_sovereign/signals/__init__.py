@@ -71,6 +71,12 @@ from kestrel_sovereign.signals.durable import (
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
 from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
+from kestrel_sovereign.signals.pre_turn_guard import (
+    BoundPreTurnGuard,
+    PreTurnGuard,
+    PreTurnRefusal,
+    SourceRegistrationWithPreTurnGuard,
+)
 from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
@@ -101,6 +107,7 @@ __all__ = [
     "SignalResult",
     "SignalWithPromptTemplateOverride",
     "SourceRegistration",
+    "SourceRegistrationWithPreTurnGuard",
     "SourceRegistrationWithPromptOverride",
     "Status",
     "Trust",
