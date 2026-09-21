@@ -518,6 +518,59 @@ async def test_runtime_status_reaps_revoked_tenants_without_deleting_peer_rows(
 
 
 @pytest.mark.asyncio
+async def test_paged_runtime_status_retains_other_authority_pages(tmp_path):
+    """Publishing one bounded page must not reap this owner's prior pages."""
+
+    db = await _database(tmp_path / "scheduler-paged-runtime-status.db")
+    authority = ("tenant-a", "tenant-b")
+
+    async def page_provider(after, limit):
+        remaining = tuple(
+            agent_id
+            for agent_id in authority
+            if after is None or agent_id > after
+        )
+        return remaining[:limit]
+
+    runner = SchedulerRunner(
+        db,
+        None,
+        lambda *_: None,
+        owner_id="paged-runner",
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=page_provider,
+        authorized_agent_ids_page_size=1,
+        is_agent_authorized=lambda agent_id: agent_id in authority,
+    )
+    try:
+        await runner._ensure_tables()
+        await runner._tick()
+        await runner._publish_runtime_status("running")
+        await runner._tick()
+        await runner._publish_runtime_status("running")
+
+        assert await db.fetchall(
+            "SELECT agent_id, owner_id FROM scheduler_runtime_status "
+            "ORDER BY agent_id, owner_id"
+        ) == [
+            ("tenant-a", "paged-runner"),
+            ("tenant-b", "paged-runner"),
+        ]
+
+        await runner._publish_runtime_status("stopped")
+        assert await db.fetchall(
+            "SELECT agent_id, worker_state FROM scheduler_runtime_status "
+            "WHERE owner_id = ? ORDER BY agent_id",
+            ("paged-runner",),
+        ) == [
+            ("tenant-a", "stopped"),
+            ("tenant-b", "stopped"),
+        ]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_status_migrates_agent_primary_key_without_losing_report(
     tmp_path,
 ):
