@@ -3420,6 +3420,184 @@ async def test_host_runner_cannot_claim_or_advance_foreign_fleet_rows(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_paged_host_authority_is_bounded_and_reaches_later_did(tmp_path):
+    """Keyset pages bound SQL scope without starving a later tenant."""
+
+    db = await _database(tmp_path / "scheduler-paged-authority.db")
+    authorized = tuple(f"agent-{number}" for number in range(1, 6))
+    provider_calls = []
+    observed_scope_sizes = []
+    original_fetchall = db.fetchall
+
+    async def page_provider(after, limit):
+        provider_calls.append((after, limit))
+        remaining = tuple(
+            agent_id
+            for agent_id in authorized
+            if after is None or agent_id > after
+        )
+        return remaining[:limit]
+
+    async def record_fetchall(query, params=()):
+        if "FROM scheduled_tasks" in query and "agent_id IN" in query:
+            scope_sql = query[: query.index("scheduler_protocol_version")]
+            observed_scope_sizes.append(scope_sql.count("?"))
+        return await original_fetchall(query, params)
+
+    executor = AsyncMock(return_value="paged delivery")
+    runner = SchedulerRunner(
+        db,
+        None,
+        executor,
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=page_provider,
+        authorized_agent_ids_page_size=2,
+        is_agent_authorized=lambda agent_id: agent_id in authorized,
+    )
+    db.fetchall = record_fetchall
+    try:
+        await runner._ensure_tables()
+        assert provider_calls == []
+        await _seed_due(db, task_id="later-page", agent_id="agent-5")
+        await _seed_due(db, task_id="foreign-before", agent_id="agent-0")
+        await _seed_due(db, task_id="foreign-between", agent_id="agent-3.5")
+
+        await runner._tick()
+        await runner._tick()
+        executor.assert_not_awaited()
+        await runner._tick()
+        executor.assert_awaited_once_with("test_task", {})
+
+        assert provider_calls == [(None, 2), ("agent-2", 2), ("agent-4", 2)]
+        assert observed_scope_sizes and max(observed_scope_sizes) <= 2
+        for task_id in ("foreign-before", "foreign-between"):
+            assert await db.fetchone(
+                "SELECT lease_owner FROM scheduled_tasks WHERE id = ?",
+                (task_id,),
+            ) == (None,)
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_paged_host_authority_retries_cancelled_page(tmp_path):
+    """Cancellation cannot advance past an unprocessed authority page."""
+
+    db = await _database(tmp_path / "scheduler-paged-cancel.db")
+    provider_cursors = []
+
+    async def page_provider(after, _limit):
+        provider_cursors.append(after)
+        return ("agent-1",)
+
+    runner = SchedulerRunner(
+        db,
+        None,
+        AsyncMock(),
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=page_provider,
+        authorized_agent_ids_page_size=1,
+        is_agent_authorized=lambda _agent_id: True,
+    )
+    try:
+        await runner._ensure_tables()
+        original_rollout = runner._ensure_protocol_rollout
+        cancelled_once = False
+
+        async def cancel_first_rollout(**kwargs):
+            nonlocal cancelled_once
+            if not cancelled_once:
+                cancelled_once = True
+                raise asyncio.CancelledError
+            return await original_rollout(**kwargs)
+
+        runner._ensure_protocol_rollout = cancel_first_rollout
+        with pytest.raises(asyncio.CancelledError):
+            await runner._tick()
+        assert runner._authorized_agent_ids_page_cursor is None
+
+        await runner._tick()
+        assert provider_cursors == [None, None]
+        assert runner._authorized_agent_ids_page_cursor == "agent-1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_paged_host_authority_removal_before_claim_fails_closed(tmp_path):
+    """A page cannot claim after its DID loses live host authority."""
+
+    db = await _database(tmp_path / "scheduler-paged-revocation.db")
+    authority = {"active": True}
+
+    class RevokingExecutor:
+        async def scheduler_dispatch_enabled(self, _agent_id):
+            authority["active"] = False
+            return True
+
+        async def execute_scheduled(self, _execution):
+            raise AssertionError("revoked tenant must not dispatch")
+
+    runner = SchedulerRunner(
+        db,
+        None,
+        RevokingExecutor(),
+        authorized_agent_ids=(),
+        authorized_agent_ids_page_provider=lambda _after, _limit: ("agent-1",),
+        authorized_agent_ids_page_size=1,
+        is_agent_authorized=lambda _agent_id: authority["active"],
+    )
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db, task_id="revoked-page", agent_id="agent-1")
+        await runner._tick()
+        assert await db.fetchone(
+            "SELECT enabled, lease_owner FROM scheduled_tasks WHERE id = ?",
+            ("revoked-page",),
+        ) == (1, None)
+        assert await db.fetchone(
+            "SELECT COUNT(*) FROM task_execution_log WHERE task_id = ?",
+            ("revoked-page",),
+        ) == (0,)
+    finally:
+        await db.close()
+
+
+def test_paged_host_authority_requires_live_check_and_strict_configuration():
+    """Paged authority is explicit, hosted-only, and always revalidated."""
+
+    def page_provider(_after, _limit):
+        return ()
+
+    with pytest.raises(ValueError, match="requires is_agent_authorized"):
+        SchedulerRunner(
+            object(),
+            None,
+            AsyncMock(),
+            authorized_agent_ids=(),
+            authorized_agent_ids_page_provider=page_provider,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SchedulerRunner(
+            object(),
+            None,
+            AsyncMock(),
+            authorized_agent_ids=(),
+            authorized_agent_ids_provider=lambda: (),
+            authorized_agent_ids_page_provider=page_provider,
+            is_agent_authorized=lambda _agent_id: True,
+        )
+    with pytest.raises(ValueError, match="cannot use paged"):
+        SchedulerRunner(
+            object(),
+            "agent-1",
+            AsyncMock(),
+            authorized_agent_ids_page_provider=page_provider,
+            is_agent_authorized=lambda _agent_id: True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_renewal_exception_before_effect_fails_closed(tmp_path, caplog):
     """A renewal failure observed before dispatch never invokes the effect."""
     db = await _database(tmp_path / "scheduler.db")
