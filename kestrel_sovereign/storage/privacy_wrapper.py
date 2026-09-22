@@ -1585,6 +1585,12 @@ class PrivacyEnforcingStorage:
         # a transition landing between the binding and a commit would classify a
         # write under a policy that is no longer in force.
         self._active_ledger_assertion_leases = 0
+        # One projection lock per canonical ledger file, so overlapping passes
+        # over the same ledger serialize while unrelated ledgers do not queue
+        # behind one another.  Declared here rather than minted on first use:
+        # the map is wrapper state, and a lazily created one is a second place
+        # that decides whether this wrapper has any.
+        self._ledger_projection_locks: Dict[str, Any] = {}
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -3386,22 +3392,24 @@ class PrivacyEnforcingStorage:
     def _ledger_projection_lock(self, ledger):
         """Return the projection lock for one ledger, creating it on first use.
 
-        Keyed by the ledger's canonical file path when it has one, falling back
-        to object identity. Two handles onto the same file are the same ledger
-        for this purpose -- that is exactly the case the P1 describes -- while
-        two genuinely different ledgers keep independent locks and never block
-        each other.
+        Keyed by the ledger's canonical file path. Two handles onto the same
+        file are the same ledger for this purpose -- that is exactly the case
+        the P1 describes -- while two genuinely different ledgers keep
+        independent locks and never block each other.
+
+        Every pathless ledger shares one key rather than getting a per-object
+        one. A pathless ledger has no canonical file, so the pass refuses
+        before it writes anything and there is nothing to serialize; keying
+        those by ``id()`` would instead grow the map once per ledger object
+        this wrapper ever sees, and reuse a freed id for an unrelated one.
         """
         import asyncio
 
         path = getattr(ledger, "path", None) or getattr(
             ledger, "canonical_path", None
         )
-        key = str(path) if path else f"id:{id(ledger)}"
-        locks = getattr(self, "_ledger_projection_locks", None)
-        if locks is None:
-            locks = {}
-            self._ledger_projection_locks = locks
+        key = str(path) if path else "\x00pathless"
+        locks = self._ledger_projection_locks
         lock = locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
