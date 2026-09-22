@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Optional
 
 from kestrel_sovereign.security.sovereign_key import sovereign_key_fingerprint
+from kestrel_sovereign.turn_scope import turn_scoped
 
 
 def normalize_api_key(value: Optional[str]) -> Optional[str]:
@@ -170,6 +171,18 @@ def caller_context_binding_scope(
         yield current_caller_context()
     finally:
         _current_caller_context.reset(token)
+
+
+# A turn's caller authority follows its tools onto foreign tasks as the
+# revocable binding object, never as a copied CallerContext value: the endpoint
+# that owns the lifetime can still revoke it mid-turn, and an executor built
+# without a caller explicitly clears whatever the foreign task inherited.
+turn_scoped(
+    "caller_context",
+    variables=(_current_caller_context,),
+    capture=lambda _agent: capture_caller_context_binding(),
+    bind=caller_context_binding_scope,
+)
 
 
 @contextmanager

@@ -59,7 +59,10 @@ from kestrel_sovereign.agent.orchestrator_engine import (
 from kestrel_sovereign.agent.context_manager import ContextManager
 from kestrel_sovereign.agent.memory_manager import MemoryManager
 from kestrel_sovereign.agent.streaming import StreamingMixin
-from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.agent.turn_lifecycle import (
+    TurnLifecycleMixin,
+    publish_turn_ownership,
+)
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.context.feature import ContextFeature
 from kestrel_sovereign.features.memory.feature import MemoryFeature
@@ -144,7 +147,9 @@ def _correlated_turn_host(turn_id: str, **overrides):
 
     @asynccontextmanager
     async def lifecycle():
-        with telemetry.turn_span_scope(turn_id):
+        with telemetry.turn_span_scope(turn_id), publish_turn_ownership(
+            host, turn_id
+        ):
             host._live_turn_id = turn_id
             try:
                 yield turn_id

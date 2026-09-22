@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.turn_scope import turn_scoped
+
 logger = logging.getLogger(__name__)
 
 # Sentinel: are OTEL packages available?
@@ -329,6 +331,35 @@ def turn_span_scope(turn_id: str):
         yield turn_id
     finally:
         _CURRENT_TURN_ID.reset(token)
+
+
+@contextmanager
+def bind_current_turn_id(turn_id: Optional[str]):
+    """Re-present a captured turn id on a task whose context predates the turn.
+
+    Unlike :func:`turn_span_scope` this does not announce a new turn to
+    :func:`capture_turn_ids`: the turn already exists, a foreign task (the
+    codex app-server reader) is merely running work on its behalf. The value is
+    observability — span stamping, ``todo`` metadata, ``origin_turn_id`` — and
+    confers no authority: every live-turn gate consults the lifecycle's
+    ``_BOUND_TURN_SESSION`` pairing instead (#3114). Binding ``None`` clears a
+    stale id the foreign task inherited.
+    """
+    if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip()):
+        raise ValueError("turn_id must be a concrete string or None")
+    token = _CURRENT_TURN_ID.set(turn_id)
+    try:
+        yield turn_id
+    finally:
+        _CURRENT_TURN_ID.reset(token)
+
+
+turn_scoped(
+    "turn_id",
+    variables=(_CURRENT_TURN_ID,),
+    capture=lambda _agent: current_turn_id(),
+    bind=bind_current_turn_id,
+)
 
 
 @contextmanager

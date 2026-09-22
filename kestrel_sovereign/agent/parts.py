@@ -42,6 +42,8 @@ from kestrel_sdk.tools.parts import (  # noqa: F401  (re-export)
     tool_result_parts_buffer,
 )
 
+from kestrel_sovereign.turn_scope import turn_scoped
+
 # Wire format mirrors the TOOL/THINK/REVISE sentinels: an ASCII Record
 # Separator (0x1e) bookends a ``KESTREL:PART:`` namespaced JSON payload. The RS
 # byte never appears in normal model prose and ``json.dumps`` escapes it inside
@@ -93,8 +95,9 @@ def current_part_collector() -> Optional[List[dict]]:
     task, which inherits a frozen copy of the reader's context — not the turn's)
     must capture this list *inside* the turn task and re-enter it around the tool
     execution via :func:`bind_part_collector`, so ``emit_part`` lands on the
-    owning turn's buffer rather than a stale one. See
-    ``OrchestratorEngineMixin._make_inline_tool_executor``.
+    owning turn's buffer rather than a stale one. The collector is declared
+    below as a turn-scoped carrier, so such transports get both halves from
+    :func:`kestrel_sovereign.turn_scope.capture_turn_scope`.
     """
     return _part_collector.get()
 
@@ -115,6 +118,15 @@ def bind_part_collector(collector: Optional[List[dict]]):
         yield
     finally:
         _part_collector.reset(token)
+
+
+# The owning turn's collector must follow its tools onto foreign tasks (#2081).
+turn_scoped(
+    "part_collector",
+    variables=(_part_collector,),
+    capture=lambda _agent: current_part_collector(),
+    bind=bind_part_collector,
+)
 
 
 def _sanitize_type(part_type: Any) -> Optional[str]:

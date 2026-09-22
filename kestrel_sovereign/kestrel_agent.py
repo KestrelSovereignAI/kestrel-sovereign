@@ -1529,11 +1529,13 @@ class KestrelAgent(
         # request_restart's origin-session capture, #1809). None = no turn.
         self._active_session_id: Optional[str] = None
         # The turn id that currently HOLDS the turn lock, set/cleared by
-        # `_turn_lifecycle`. Pairs with the task-local `_CURRENT_TURN_ID`
-        # ContextVar so a caller can tell "I own the live turn" from "my task
-        # inherited a finished turn's context" — the check that keeps a
-        # detached task from reading a concurrent turn's `_active_session_id`
-        # (#2877). Read via `get_turn_bound_session_id`, not directly.
+        # `_turn_lifecycle`. Pairs with the task-local `_BOUND_TURN_SESSION`
+        # binding the lifecycle publishes, so a caller can tell "I belong to
+        # the live turn" from "my task inherited a finished turn's context" —
+        # the check that keeps a detached task from reading a concurrent
+        # turn's `_active_session_id` (#2877). The raw `_CURRENT_TURN_ID` is
+        # attribution only and is not consulted (#3114). Read via
+        # `get_turn_bound_session_id`, not directly.
         self._live_turn_id: Optional[str] = None
         # Concrete owner of the live CONVERSATION span.  ContextVars are copied
         # into detached children, so task identity is required when deciding

@@ -40,7 +40,6 @@ from kestrel_sdk.llm import ToolCallStarted
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
 from kestrel_sovereign.agent.parts import (
-    bind_part_collector,
     build_part_sentinel,
     current_part_collector,
     drain_parts,
@@ -51,13 +50,10 @@ from kestrel_sovereign.agent.invocation import (
     current_invocation_id,
     mark_current_invocation_effect_completed,
 )
-from kestrel_sovereign.agent.turn_lifecycle import (
-    bind_turn_session,
-    capture_turn_session_binding,
-)
 from kestrel_sovereign.storage.privacy_wrapper import (
-    bind_transition_lock_reentry,
+    held_transition_reentry_token,
 )
+from kestrel_sovereign.turn_scope import capture_turn_scope
 from kestrel_sovereign.agent.streaming import (
     _DeferredToolBatchCancellation,
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
@@ -661,49 +657,20 @@ class OrchestratorEngineMixin:
         dispatch. Adapters that don't run an inline tool loop ignore
         the callable.
         """
-        # Capture the OWNING turn's #1914 part collector at closure-creation
-        # time — this method is called inside ``process_input_streaming``'s
-        # ``part_collector()`` scope, on the turn's asyncio task. The codex
-        # app-server dispatches each ``item/tool/call`` on its own reader-spawned
-        # task, which inherits a frozen copy of the reader's context (turn-1's,
-        # captured once at ``ensure_started``) — NOT the current turn's. Without
-        # re-binding, ``emit_part`` calls made by an inline tool would land on a
-        # stale/abandoned collector and be silently dropped on every turn after
-        # the first. Binding per closure (per turn) keeps concurrent turns —
-        # multiplexed by threadId over one long-lived app-server — routing to
-        # their own buffers; a process-global "current collector" would clobber.
-        turn_part_collector = current_part_collector()
-        # Capture the OWNING turn's privacy-transition reentry token the same way,
-        # and for the same reason (#2672 review P1). A streamed turn holds the
-        # transition lock across the whole turn; the codex app-server dispatches
-        # each inline tool on its own reader-spawned task, so a durable-identity
-        # write (rename / description / discovery history / user name / SOUL) run
-        # inline re-acquires that lock from a DIFFERENT task — a deadlock, because
-        # the write waits on the lock the turn holds while the turn waits on the
-        # app-server's tool result. Capturing the token here (on the turn task,
-        # which holds the lock) and re-presenting it around the tool execution lets
-        # THAT turn's write re-enter the lock; a genuinely concurrent transition
-        # from an unrelated task still serializes. ``None`` off a streamed turn /
-        # when no lock is held (anthropic path runs the tool on the turn task, so
-        # reentry is by task identity and needs no token).
-        transition_reentry_token = self._capture_transition_reentry_token()
-        # Capture the authoritative lifecycle binding on the OWNING turn task.
-        # The codex app-server reader was spawned before this turn and therefore
-        # carries a frozen pre-turn ContextVar snapshot. Re-presenting this exact
-        # turn/session pair inside the callback lets lifecycle-only consumers
-        # such as ``request_restart`` preserve wake routing without trusting the
-        # transport parameter, logging context, or agent-global session. The
-        # binding is explicitly empty when this executor was built off-turn.
-        turn_session_binding = capture_turn_session_binding(self)
-        # Caller authority follows the same cross-task rule as the turn/session
-        # binding, but its lifetime is endpoint-owned and revocable.  Capture
-        # the binding object rather than the CallerContext value: callbacks on
-        # the long-lived Codex reader may re-present it only while the endpoint
-        # generator remains alive, and an executor built without a caller
-        # explicitly clears whatever authority the reader task inherited.
-        from kestrel_sovereign.auth import capture_caller_context_binding
-
-        turn_caller_binding = capture_caller_context_binding()
+        # Capture EVERY turn-scoped value on the OWNING turn task, at closure
+        # creation. The codex app-server dispatches each ``item/tool/call`` on
+        # a reader-spawned task whose context is a frozen copy of the reader's
+        # — taken before this turn published anything — so without
+        # re-presentation an inline tool reads each turn-scoped ContextVar at
+        # its default: parts dropped (#2081), transition-lock deadlock (#2672),
+        # restart wakes routed nowhere (#2965), the dispatching signal lost
+        # (#3112), and ``turn_id`` / the causation chain stamped as empty
+        # (#3114). The set is declared where each ContextVar is defined (see
+        # ``kestrel_sovereign.turn_scope``), not listed here, so a new
+        # turn-scoped value is carried without touching this executor. Capture
+        # per closure (per turn) keeps concurrent turns multiplexed over one
+        # app-server routing to their own state.
+        turn_scope = capture_turn_scope(self)
         request_id = current_invocation_id()
         effect_checkpoint = current_invocation_effect_checkpoint()
 
@@ -713,12 +680,7 @@ class OrchestratorEngineMixin:
             # redactors stay applied in audit/UI/STOP-hook
             # surfaces — pre-hook args would leak redacted values).
             capture: Dict[str, Any] = {}
-            from kestrel_sovereign.auth import caller_context_binding_scope
-
-            with bind_part_collector(turn_part_collector), \
-                    bind_transition_lock_reentry(transition_reentry_token), \
-                    bind_turn_session(turn_session_binding), \
-                    caller_context_binding_scope(turn_caller_binding):
+            with turn_scope.bind():
                 result = await self.execute_named_tool(
                     name, args, session_id=session_id, source="codex_app_server",
                     _capture=capture,
@@ -784,15 +746,7 @@ class OrchestratorEngineMixin:
         (tests / CLI), in which case the inline write runs unguarded or on the turn
         task. Never raises — token capture must not break tool dispatch.
         """
-        getter = getattr(self, "_get_privacy_transition_lock", None)
-        if not callable(getter):
-            return None
-        try:
-            lock = getter()
-            grab = getattr(lock, "current_reentry_token", None)
-            return grab() if callable(grab) else None
-        except Exception:  # noqa: BLE001 - never let token capture break dispatch
-            return None
+        return held_transition_reentry_token(self)
 
     async def _append_executed_tool_breadcrumbs(
         self, messages: list,
@@ -2374,13 +2328,15 @@ class OrchestratorEngineMixin:
         prevents another tool or provider round-trip.
         """
 
-        capture_reentry = getattr(self, "_capture_transition_reentry_token", None)
-        transition_reentry_token = (
-            capture_reentry() if callable(capture_reentry) else None
-        )
+        # The batch context below is a copy of this one, so ContextVars carry
+        # over by inheritance; what does not is authority defined relative to
+        # this task — the held transition span's reentry token and the
+        # explicit turn/session pairing. Re-present the whole turn scope, as
+        # every closure that runs turn work on another task does.
+        turn_scope = capture_turn_scope(self)
 
         async def run_owned_batch():
-            with bind_transition_lock_reentry(transition_reentry_token):
+            with turn_scope.bind():
                 return await self._execute_tool_batch(*args, **kwargs)
 
         # This moves the SAME logical turn into a cancellable task, which is
