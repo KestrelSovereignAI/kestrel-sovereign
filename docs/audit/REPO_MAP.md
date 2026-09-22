@@ -18,7 +18,7 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-21
+**Generated:** 2026-09-22
 **Scope:** 2463 tracked files (1690 `.py`, 347 `.md`, 426 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -600,7 +600,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/scheduler/runner.py** — Durable scheduler execution with claims, leases, and recovery.
   - `class SchedulerRolloutQuiescenceRequired`; `class SchedulerProtocolVersionIncompatible`; `async def adopt_scheduler_registration_ownership(db)`; `class SchedulerFeatureUnavailable`; `def validate_schedule_idempotency_base(base)`; `class SchedulerExecution`; `class SchedulerTenantProtocolRegistration`; `def get_current_scheduler_execution()`; `…`
 - **kestrel_sovereign/features/scheduler/status.py** — Canonical scheduler runtime and schedule-state reporting.
-  - `def scheduler_tick_in_progress_limit_seconds()`; `def classify_disablement()`; `async def ensure_runtime_status_table(db)`; `def scheduler_status_parameters(feature)`; `async def emit_runtime_status(db)`; `async def scheduler_status(db)`
+  - `def scheduler_tick_in_progress_limit_seconds()`; `def classify_disablement()`; `async def ensure_runtime_status_table(db)`; `def scheduler_status_parameters(feature)`; `async def emit_runtime_status(db)`; `async def mark_runtime_owner_stopped(db)`; `async def scheduler_status(db)`
 - **kestrel_sovereign/features/security/__init__.py** — Kestrel Security Feature - Permission management and approval queue.
 - **kestrel_sovereign/features/security/approval_queue.py** — Kestrel Security - Queue-based Approval System.
   - `class ApprovalStatus`; `class ApprovalRequest`; `class DecisionResult`; `class DenialClassification`; `def classify_denial(scope)`; `class ApprovalQueue`
@@ -2361,7 +2361,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_scheduler_postgres_protocol_bootstrap.py** — Fresh-fleet scheduler protocol bootstrap coverage on real backends.
   - `async def test_scheduler_table_detection_uses_the_active_schema(db_backend)`; `async def test_bootstrap_keeps_existing_transaction_usable_after_additive_migration(db_backend)`; `async def test_runtime_telemetry_primary_key_migrates_on_real_backend(db_backend)`; `async def test_fresh_host_bootstrap_seeds_all_configured_dids_before_scoped_runners(db_backend)`; `async def test_new_did_in_fresh_shared_fleet_is_seeded_without_legacy_quiescence(db_backend)`; `async def test_newer_protocol_state_fails_before_any_scheduler_mutation(db_backend, future_state)`; `async def test_future_scheduled_task_row_fails_before_bootstrap_mutation(db_backend)`; `async def test_postgres_future_schedule_probe_follows_search_path_relation(db_backend)`; `…`
 - **tests/integration/test_scheduler_reliability_status.py** — Shared scheduler reliability states across worker, health, and recovery.
-  - `async def test_runtime_report_distinguishes_missing_zero_and_system_disabled(tmp_path)`; `async def test_enabled_schedules_without_valid_next_run_are_not_runnable(tmp_path)`; `async def test_multi_owner_health_uses_fresh_healthy_worker_without_peer_flap(tmp_path)`; `async def test_runtime_status_bounds_historical_owners_and_reaps_expired_rows(tmp_path)`; `async def test_runtime_status_reaps_revoked_tenants_without_deleting_peer_rows(tmp_path)`; `async def test_runtime_status_migrates_agent_primary_key_without_losing_report(tmp_path)`; `async def test_terminal_one_shot_is_history_not_recoverable_disablement(tmp_path)`; `async def test_one_shot_safety_disablement_is_not_terminal_history(tmp_path, terminal_status)`; `…`
+  - `async def test_runtime_report_distinguishes_missing_zero_and_system_disabled(tmp_path)`; `async def test_enabled_schedules_without_valid_next_run_are_not_runnable(tmp_path)`; `async def test_multi_owner_health_uses_fresh_healthy_worker_without_peer_flap(tmp_path)`; `async def test_runtime_status_bounds_historical_owners_and_reaps_expired_rows(tmp_path)`; `async def test_runtime_status_reaps_revoked_tenants_without_deleting_peer_rows(tmp_path)`; `async def test_paged_runtime_status_retains_other_authority_pages(tmp_path)`; `async def test_runtime_status_migrates_agent_primary_key_without_losing_report(tmp_path)`; `async def test_terminal_one_shot_is_history_not_recoverable_disablement(tmp_path)`; `…`
 - **tests/integration/test_security_hook_alive.py** — Sanity tests for the SecurityHook chain in integration mode.
   - `async def bare_agent(temp_db)`; `async def test_security_guard_hook_is_registered_on_pre_tool_use(bare_agent)`; `async def test_ungranted_tool_queues_for_approval(bare_agent)`; `async def test_explicit_grant_lets_hook_short_circuit(bare_agent)`
 - **tests/integration/test_session_context.py** — Tests for session-based conversation context loading.
