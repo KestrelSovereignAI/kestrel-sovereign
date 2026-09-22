@@ -294,6 +294,98 @@ async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock():
     assert not agent._get_lock_manager().is_held(ResourceLock.CONVERSATION)
 
 
+@pytest.mark.asyncio
+async def test_bootstrap_transition_lock_writers_run_inside_the_span():
+    """Bootstrap now runs INSIDE the span, and takes the same lock.
+
+    `bootstrap/service.py` serializes its own privacy check against the durable
+    write with `optional_transition_lock(self._privacy_transition_lock)` — the
+    SAME lock object `process_input` now holds for its whole body (lines 768 /
+    802 / 1212, plus `persist_agent_description` at 218). Before #3310 the
+    non-streaming turn held nothing those writers contend on, so they acquired
+    freely. Now they re-acquire a lock their own turn owns, and only same-task
+    reentry saves them from waiting on it forever.
+
+    This drives the real shape: `process_input` → `_handle_bootstrap` →
+    `optional_transition_lock(<the agent's lock>)` on the turn task.
+    """
+    agent = _turn_agent("did:test:3310-bootstrap")
+    writes: list[str] = []
+
+    async def bootstrap_write() -> None:
+        # Exactly bootstrap/service.py's shape, on the turn task.
+        async with optional_transition_lock(agent._get_privacy_transition_lock()):
+            writes.append("discovery_history")
+            # A nested writer too: save_soul_md calls persist_agent_description
+            # while already holding the lock.
+            async with optional_transition_lock(
+                agent._get_privacy_transition_lock()
+            ):
+                writes.append("agent_description")
+
+    class _BootstrapService:
+        async def is_bootstrap_needed(self) -> bool:
+            return True
+
+    agent.bootstrap_service = _BootstrapService()
+
+    async def handle_bootstrap(user_input, session_id=None, **kwargs):
+        assert agent._get_privacy_transition_lock().locked(), (
+            "bootstrap must run inside the turn's privacy span"
+        )
+        await bootstrap_write()
+        return "welcome"
+
+    agent._handle_bootstrap = handle_bootstrap
+    agent._post_response_pipeline = AsyncMock()
+
+    response = await asyncio.wait_for(agent.process_input("hello"), timeout=5)
+
+    assert response == "welcome"
+    assert writes == ["discovery_history", "agent_description"], (
+        "a bootstrap durable write deadlocked on the lock its own turn holds"
+    )
+    assert not agent._get_privacy_transition_lock().locked()
+
+
+@pytest.mark.asyncio
+async def test_an_in_turn_privacy_transition_reenters_rather_than_wedging():
+    """`!privacy` / `confirm_privacy_transition` run inside the span now.
+
+    The command handler is inside the span since #3310, and those commands go
+    through `agent.privacy_transition()`, which takes CONVERSATION then the
+    privacy mutex for an EXTERNAL caller. On the turn task it must instead take
+    only the (task-reentrant) mutex — re-acquiring CONVERSATION would wedge on
+    the lock the turn itself is holding.
+    """
+    agent = _turn_agent("did:test:3310-in-turn-transition")
+    entered = asyncio.Event()
+
+    class _CommandHandler:
+        async def handle(self, user_input, caller=None):
+            assert agent._get_privacy_transition_lock().locked(), (
+                "the command handler must run inside the turn's privacy span"
+            )
+            # The shape command_handler.handle() reaches via set_privacy_mode /
+            # confirm_privacy_transition, on the turn task.
+            async with agent.privacy_transition():
+                entered.set()
+            return "privacy mode updated"
+
+    agent.command_handler = _CommandHandler()
+
+    response = await asyncio.wait_for(
+        agent.process_input("!privacy ephemeral"), timeout=5
+    )
+
+    assert response == "privacy mode updated"
+    assert entered.is_set(), (
+        "an in-turn privacy transition waited on a lock its own turn holds"
+    )
+    assert not agent._get_privacy_transition_lock().locked()
+    assert not agent._get_lock_manager().is_held(ResourceLock.CONVERSATION)
+
+
 def test_process_input_takes_conversation_before_the_transition_lock():
     """Source-level guard on the acquisition ORDER (the AB-BA tripwire).
 
@@ -316,9 +408,14 @@ def test_process_input_takes_conversation_before_the_transition_lock():
         "privacy-transition lock — see SIGNAL_DISPATCHER.md and 9da78c16"
     )
 
-    # Everything that consumes the prompt stays inside the span.
+    # Everything that consumes the prompt stays inside the span — and so does
+    # the source's admission check. Hoisting `_evaluate_pre_turn_guard` even one
+    # line above the mutex is precisely what rounds 1-3 of #3101 each did, and
+    # each time a transition landed in a later `await`; a concurrent run cannot
+    # reliably reproduce that interleaving, so it is pinned at the source.
     transition_pos = src.index("self._get_privacy_transition_lock()")
     for marker in (
+        "_evaluate_pre_turn_guard",
         "BOOTSTRAP CHECK",
         "Handle explicit commands",
         "_process_input_traced_locked",

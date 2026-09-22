@@ -110,6 +110,12 @@ __all__ = [
     "SourceRegistrationWithPreTurnGuard",
     "SourceRegistrationWithPromptOverride",
     "Status",
+    # Pre-turn admission (#3310). `PreTurnRefusal` is part of the contract, not
+    # an internal: the dispatcher maps it to `Status.DROPPED_VALIDATION`, so a
+    # source author or host that needs to recognize a refusal imports it here.
+    "BoundPreTurnGuard",
+    "PreTurnGuard",
+    "PreTurnRefusal",
     "Trust",
     "Urgency",
     "Visibility",
