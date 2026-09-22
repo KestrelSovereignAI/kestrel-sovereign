@@ -78,6 +78,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import copy
+import functools
 import hashlib
 import hmac
 import inspect
@@ -143,6 +144,7 @@ from kestrel_sovereign.signals.durable import (
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.signals.pre_turn_guard import PreTurnRefusal
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
@@ -500,6 +502,37 @@ def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
         if param.name == name:
             return True
     return False
+
+
+def _agent_declares_kwarg(callable_: Any, name: str) -> bool:
+    """Return True iff `callable_` names `name` as an actual parameter.
+
+    Deliberately stricter than :func:`_agent_accepts_kwarg`: a permissive
+    ``**kwargs`` does NOT count, and an uninspectable callable does not count
+    either.
+
+    The difference matters for exactly one kwarg — ``pre_turn_guard`` (#3310).
+    Every other optional kwarg here degrades harmlessly when the agent ignores
+    it (a missing prompt addendum, a turn that opens its own session). An
+    admission guard does not: an agent that swallows it into ``**kwargs``
+    would run the turn with the source's precondition silently unevaluated,
+    which is the precise failure mode the guard exists to remove. Naming the
+    parameter is the positive signal that the agent implements the contract;
+    anything less is refused by the caller.
+    """
+    try:
+        sig = inspect.signature(callable_)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        param.name == name
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        for param in sig.parameters.values()
+    )
 
 
 def _audit_to_log_kwargs(audit: Optional[_ConstitutionAudit]) -> dict:
@@ -5048,6 +5081,34 @@ class SignalDispatcher:
                     audit=audit,
                 )
 
+        # #3310. A source's pre-turn admission is NOT evaluated here. Every
+        # check the dispatcher makes on its own task — including the two
+        # `validate_execution` reads above — is a read racing a write, because
+        # everything between it and the turn consuming its prompt (durable
+        # admission, task creation, the turn's own readiness awaits) is a
+        # suspension point. The guard is therefore handed to `process_input`,
+        # which runs it as the first operation inside the turn's
+        # CONVERSATION -> privacy-transition span. What IS decided here is only
+        # whether this agent can evaluate it at all; see
+        # `kestrel_sovereign/signals/pre_turn_guard.py`.
+        pre_turn_guard = getattr(registration, "pre_turn_guard", None)
+        if pre_turn_guard is not None and not _agent_declares_kwarg(
+            self._agent.process_input, "pre_turn_guard"
+        ):
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=(
+                    f"source '{registration.name}' declares a pre_turn_guard "
+                    "but this agent's process_input does not implement the "
+                    "in-span admission contract; refusing rather than running "
+                    "the turn unadmitted"
+                ),
+                registration=registration,
+                audit=audit,
+            )
+
         async def await_monitored_execution(execution):
             """Race cognition against source-owned durable withdrawal."""
 
@@ -5522,6 +5583,15 @@ class SignalDispatcher:
         # receipt in the process-input/terminal-NACK crash window.
         if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
             process_input_kwargs["invocation_id"] = signal.id
+        if pre_turn_guard is not None:
+            # Bind the signal now; evaluate inside the turn's span. The turn
+            # decides an admission, it does not read signal envelopes, so what
+            # crosses the boundary is a zero-argument verdict. The agent's
+            # capability was already checked above, so this cannot be dropped
+            # silently here.
+            process_input_kwargs["pre_turn_guard"] = functools.partial(
+                pre_turn_guard, signal
+            )
         if addendum is not None and accepts_addendum:
             process_input_kwargs["system_prompt_addendum"] = addendum
         if budget is not None and accepts_budget:
@@ -5549,6 +5619,7 @@ class SignalDispatcher:
             }
 
         execution_withdrawal = None
+        pre_turn_refusal: Optional[str] = None
         injection_tracking = None
         with capture_turn_ids() as cognition_turn_ids:
             try:
@@ -5564,6 +5635,20 @@ class SignalDispatcher:
                             self._agent.process_input(prompt)
                         )
                     )
+            except PreTurnRefusal as refusal:
+                # #3310: the source's guard refused from inside the turn's
+                # privacy-transition span, before any of the turn body ran.
+                # That is a policy decision, not a failure — it gets the same
+                # DROPPED_VALIDATION shape as a durable withdrawal, so the
+                # occurrence is non-success and no turn is behind it.
+                if receipt_tool_registered:
+                    clear_receipt = getattr(
+                        self._agent, "clear_constitution_receipt_tool", None
+                    )
+                    if callable(clear_receipt):
+                        clear_receipt()
+                    receipt_tool_registered = False
+                pre_turn_refusal = str(refusal) or "pre_turn_guard refused the turn"
             except Exception:
                 if receipt_tool_registered:
                     clear_receipt = getattr(
@@ -5575,6 +5660,16 @@ class SignalDispatcher:
             finally:
                 if clear_chain is not None:
                     clear_chain(token)
+
+        if pre_turn_refusal is not None:
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=pre_turn_refusal,
+                registration=registration,
+                audit=audit,
+            )
 
         if execution_withdrawal is not None:
             if receipt_tool_registered:

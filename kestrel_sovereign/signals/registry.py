@@ -555,16 +555,21 @@ class SourceRegistry:
         throttling (rate limit + coalescing window), attention policy, resource
         ownership + self-loop policy, the redaction policy's *flags and
         summarizer* (not merely its class), retention, the four
-        constitutional-injection fields, and the per-signal prompt-override
-        opt-in (``allow_prompt_override``). A re-registration that changes any
-        of them is therefore caught as a MISMATCH instead of being silently
-        accepted as equivalent.
+        constitutional-injection fields, the per-signal prompt-override
+        opt-in (``allow_prompt_override``), and the pre-turn admission guard
+        (``pre_turn_guard``). A re-registration that changes any of them is
+        therefore caught as a MISMATCH instead of being silently accepted as
+        equivalent.
 
         ``allow_prompt_override`` is validated at registration time (only a
         ``bool`` is accepted) yet governs a real dispatch decision — whether a
         signal's ``prompt_template_override`` is honored — so two otherwise
         identical registrations that differ only in that flag are a genuine
         contract mismatch and must not compare equivalent (#2522 P1).
+        ``pre_turn_guard`` is in for the same reason and with more at stake: a
+        re-registration that swaps or drops the guard changes what admits the
+        source's turns, and comparing those equivalent would keep the OLD
+        admission decision in force (#3310).
 
         Callables are fingerprinted by :func:`_callable_identity`, which folds
         in a bound method's owner and a closure's *captured free variables* by
@@ -621,6 +626,7 @@ class SourceRegistry:
             reg.constitution_injection,
             reg.system_prompt_budget_bytes,
             getattr(reg, "allow_prompt_override", False),
+            _callable_identity(getattr(reg, "pre_turn_guard", None)),
         )
 
     @classmethod
@@ -703,6 +709,50 @@ class SourceRegistry:
             raise RegistrationError(
                 f"Source '{reg.name}': allow_prompt_override must be a bool "
                 f"when declared, got {type(allow_prompt_override).__name__}."
+            )
+
+        # Pre-turn admission — kestrel-sovereign#3310.
+        SourceRegistry._validate_pre_turn_guard(reg)
+
+    @staticmethod
+    def _validate_pre_turn_guard(reg: SourceRegistration) -> None:
+        """A declared ``pre_turn_guard`` must be usable where it is evaluated.
+
+        The dispatcher hands the guard to ``process_input``, which runs it as
+        the first operation inside the turn's CONVERSATION -> privacy-transition
+        span (see `kestrel_sovereign/signals/pre_turn_guard.py`). Two invariants
+        are checked here rather than at dispatch time, because a guard that
+        cannot run is a source contract error and the registry is the v1
+        boundary:
+
+        * COGNITION-only. A guard exists to stop a turn; an ACTION or ARTIFACT
+          dispatch has no turn, so a guard declared there would never run — the
+          silent no-op this whole seam exists to avoid.
+        * Synchronous. The span's value is that it holds no suspension point
+          between the check and the prompt being consumed. A coroutine function
+          is rejected outright; a plain callable that returns an awaitable is
+          caught at call time by ``process_input``.
+        """
+        guard = getattr(reg, "pre_turn_guard", None)
+        if guard is None:
+            return
+        if not callable(guard):
+            raise RegistrationError(
+                f"Source '{reg.name}': pre_turn_guard must be callable when "
+                f"declared, got {type(guard).__name__}."
+            )
+        if SignalMode.COGNITION not in reg.allowed_modes:
+            raise RegistrationError(
+                f"Source '{reg.name}' declares a pre_turn_guard but does not "
+                "allow COGNITION. A pre-turn guard admits or refuses a turn, "
+                "and ACTION / ARTIFACT dispatches have no turn to refuse."
+            )
+        if inspect.iscoroutinefunction(guard):
+            raise RegistrationError(
+                f"Source '{reg.name}': pre_turn_guard must be synchronous. It "
+                "runs inside the turn's privacy-transition span, whose whole "
+                "purpose is to contain no suspension point between the check "
+                "and the turn consuming its prompt."
             )
 
     @staticmethod

@@ -275,12 +275,13 @@ def current_bound_reentry_token() -> Optional[object]:
 class ReentrantTransitionLock:
     """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
 
-    ``asyncio.Lock`` is NOT reentrant. A streamed turn holds the privacy-transition
-    lock across the ENTIRE turn — including feature/tool execution
-    (``agent/streaming.py`` acquires it before dispatching tools) — so a durable
+    ``asyncio.Lock`` is NOT reentrant. A turn holds the privacy-transition lock
+    across the ENTIRE turn — including feature/tool execution (``agent/streaming.py``
+    acquires it before dispatching tools, and since #3310 so does
+    ``KestrelAgent.process_input``) — so a durable
     identity write invoked as a tool WITHIN that turn (rename / description /
     discovery history / user name / SOUL) that re-acquires the SAME lock would wait
-    forever on a lock its own turn already holds, hanging the stream. This lock
+    forever on a lock its own turn already holds, hanging the turn. This lock
     admits such a nested write via TWO scoped-to-the-held-span signals:
 
       * SAME-TASK reentry — the task that acquired the lock re-acquires it. This

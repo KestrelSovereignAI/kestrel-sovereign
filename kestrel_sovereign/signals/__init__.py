@@ -71,6 +71,12 @@ from kestrel_sovereign.signals.durable import (
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
 from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
+from kestrel_sovereign.signals.pre_turn_guard import (
+    BoundPreTurnGuard,
+    PreTurnGuard,
+    PreTurnRefusal,
+    SourceRegistrationWithPreTurnGuard,
+)
 from kestrel_sovereign.signals.prompt_overrides import (
     SignalWithPromptTemplateOverride,
     SourceRegistrationWithPromptOverride,
@@ -101,8 +107,15 @@ __all__ = [
     "SignalResult",
     "SignalWithPromptTemplateOverride",
     "SourceRegistration",
+    "SourceRegistrationWithPreTurnGuard",
     "SourceRegistrationWithPromptOverride",
     "Status",
+    # Pre-turn admission (#3310). `PreTurnRefusal` is part of the contract, not
+    # an internal: the dispatcher maps it to `Status.DROPPED_VALIDATION`, so a
+    # source author or host that needs to recognize a refusal imports it here.
+    "BoundPreTurnGuard",
+    "PreTurnGuard",
+    "PreTurnRefusal",
     "Trust",
     "Urgency",
     "Visibility",
