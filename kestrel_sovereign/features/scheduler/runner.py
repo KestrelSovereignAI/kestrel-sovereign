@@ -330,6 +330,24 @@ class SchedulerFeatureUnavailable(RuntimeError):
         )
 
 
+class SchedulerAuthorityRevoked(RuntimeError):
+    """Scheduler work observed its occurrence after the runner revoked it.
+
+    This is deliberately distinct from "not scheduler work".  A task that
+    inherited a scheduler scope (for example, a detached child created during
+    dispatch) is still scheduler-originated after the runner finalizes or
+    loses the occurrence.  Treating that as absence would let the child run as
+    ordinary interactive work without the occurrence's effect identity, so the
+    reader fails closed instead.
+    """
+
+    def __init__(self, execution_id: str) -> None:
+        self.execution_id = execution_id
+        super().__init__(
+            f"scheduler authority for occurrence {execution_id!r} was revoked"
+        )
+
+
 def validate_schedule_idempotency_base(base: str) -> Optional[str]:
     """Return an invariant error when ``base`` cannot form an SDK-safe key."""
 
@@ -355,7 +373,8 @@ class SchedulerExecution:
     Target tools can call :func:`get_current_scheduler_execution` while a
     scheduler dispatch is active instead of receiving undocumented arguments.
     The identity is revoked as soon as that dispatch returns, including from
-    child tasks that inherited the parent task's context.
+    child tasks that inherited the parent task's context: reading it there
+    raises :class:`SchedulerAuthorityRevoked`.
     """
 
     id: str
@@ -425,6 +444,12 @@ _current_execution: contextvars.ContextVar[Optional[_SchedulerExecutionScope]] =
 def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     """Return the active execution identity, or ``None`` outside a schedule.
 
+    ``None`` means only that this is not scheduler work.  A context that
+    carries a scheduler scope the runner has revoked raises
+    :class:`SchedulerAuthorityRevoked` rather than returning ``None``: that
+    work is still scheduler-originated, and reading it as absent would let it
+    proceed as interactive work without its occurrence identity.
+
     Tools that cause externally-visible effects should use
     ``execution.idempotency_key`` at their effect boundary.  The value is not
     added to a tool's normal arguments, which keeps existing tool signatures
@@ -432,8 +457,10 @@ def get_current_scheduler_execution() -> Optional[SchedulerExecution]:
     """
 
     scope = _current_execution.get()
-    if scope is None or not scope.active:
+    if scope is None:
         return None
+    if not scope.active:
+        raise SchedulerAuthorityRevoked(scope.execution.id)
     return scope.execution
 
 

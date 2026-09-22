@@ -17,6 +17,7 @@ import pytest
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.isolated_runtime import ProxyFeature
 from kestrel_sovereign.features.scheduler.runner import (
+    SchedulerAuthorityRevoked,
     SchedulerExecution,
     _SchedulerExecutionScope,
     _current_execution,
@@ -131,6 +132,24 @@ def _execution(*, attempt: int, schedule_id: str = "daily-report") -> SchedulerE
     )
 
 
+async def _initialized_proxy(monkeypatch, tmp_path, adapter: Any) -> ProxyFeature:
+    runtime = InstalledFeatureRuntime(
+        class_name="ExecutionFeature",
+        entry_point="execution.feature:ExecutionFeature",
+        distribution="execution-feature",
+        runtime="isolated-venv",
+        service="execution-service",
+    )
+    monkeypatch.setenv("KESTREL_FEATURE_EXECUTIONFEATURE_BIN", "/bin/execution-service")
+    agent = SimpleNamespace(
+        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
+        features={},
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=lambda **_: adapter)
+    await feature.initialize()
+    return feature
+
+
 async def _execute_scheduled(tool: Any, execution: SchedulerExecution, **arguments: Any) -> Any:
     scope = _SchedulerExecutionScope(execution)
     token = _current_execution.set(scope)
@@ -206,21 +225,7 @@ async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
         sync_handler,
     )
     adapter = _SdkJsonRpcAdapter(service, IsolatedFeatureClient)
-
-    runtime = InstalledFeatureRuntime(
-        class_name="ExecutionFeature",
-        entry_point="execution.feature:ExecutionFeature",
-        distribution="execution-feature",
-        runtime="isolated-venv",
-        service="execution-service",
-    )
-    monkeypatch.setenv("KESTREL_FEATURE_EXECUTIONFEATURE_BIN", "/bin/execution-service")
-    agent = SimpleNamespace(
-        storage_path=str(tmp_path / "agent" / "kestrel_prime.db"),
-        features={},
-    )
-    feature = ProxyFeature(agent, runtime, client_factory=lambda **_: adapter)
-    await feature.initialize()
+    feature = await _initialized_proxy(monkeypatch, tmp_path, adapter)
 
     try:
         tools = {tool.name: tool for tool in feature.get_tools()}
@@ -260,4 +265,76 @@ async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(
         assert child_context == [None]
     finally:
         inspect_child.set()
+        await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_revoked_core_scope_fails_closed_before_sdk_json_rpc(monkeypatch, tmp_path):
+    """A Core child that outlives its occurrence never reaches the service.
+
+    The child inherits the scheduler scope through ``asyncio.create_task``.
+    Once the scope is revoked the child is still scheduler work: its late call
+    must neither carry the completed occurrence's identity nor degrade to an
+    interactive call without one.  It fails closed before any RPC.
+    """
+
+    try:
+        from kestrel_sdk.isolated_feature import (
+            IsolatedFeatureClient,
+            IsolatedFeatureService,
+            ToolMetadata,
+            get_tool_execution_context,
+        )
+    except ImportError:
+        pytest.skip("requires the kestrel-sovereign-sdk execution-context API")
+
+    service = IsolatedFeatureService(name="revocation-test", version="1.0.0")
+    seen: list[tuple[dict[str, Any], Any]] = []
+
+    async def handler(arguments: dict[str, Any]) -> dict[str, Any]:
+        seen.append((dict(arguments), get_tool_execution_context()))
+        return {"ok": True}
+
+    service.register_tool(
+        ToolMetadata(
+            name="effect",
+            description="revocation test",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        handler,
+    )
+    adapter = _SdkJsonRpcAdapter(service, IsolatedFeatureClient)
+    feature = await _initialized_proxy(monkeypatch, tmp_path, adapter)
+
+    release_child = asyncio.Event()
+    try:
+        tool = {tool.name: tool for tool in feature.get_tools()}["effect"]
+
+        async def late_call() -> Any:
+            await release_child.wait()
+            return await tool.execute(payload="late")
+
+        scope = _SchedulerExecutionScope(_execution(attempt=1))
+        token = _current_execution.set(scope)
+        try:
+            await tool.execute(payload="owned")
+            child = asyncio.create_task(late_call())
+        finally:
+            scope.revoke()
+            _current_execution.reset(token)
+
+        release_child.set()
+        with pytest.raises(SchedulerAuthorityRevoked):
+            await asyncio.wait_for(child, timeout=1)
+
+        # Only the owned call reached the service, with its trusted identity.
+        assert [arguments for arguments, _ in seen] == [{"payload": "owned"}]
+        assert seen[0][1].idempotency_key == "durable-effect-42"
+
+        # Absence is still interactive: a call outside any scheduler scope
+        # reaches the service without scheduler metadata.
+        await tool.execute(payload="interactive")
+        assert seen[-1] == ({"payload": "interactive"}, None)
+    finally:
+        release_child.set()
         await feature.shutdown()

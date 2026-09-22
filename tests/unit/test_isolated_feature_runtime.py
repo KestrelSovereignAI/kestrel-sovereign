@@ -66,6 +66,7 @@ from kestrel_sovereign.features.isolated_runtime import (
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     ScheduledTask,
+    SchedulerAuthorityRevoked,
     SchedulerExecution,
     SchedulerRunner,
     _current_execution,
@@ -4087,8 +4088,10 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
     ``asyncio.create_task`` copies the scheduler ContextVar.  Exercise the
     production runner and proxy together: the child inherits the context
     during dispatch, waits for the runner to clear the occurrence, then calls
-    the isolated tool.  That late call must be a normal untrusted call, never
-    an RPC bearing the stale scheduler idempotency identity.
+    the isolated tool.  That late call is still scheduler-originated work
+    whose authority was revoked: it must fail closed without any RPC, neither
+    bearing the stale idempotency identity nor degrading to an interactive
+    call that carries no identity at all.
     """
 
     class ContextAwareClient(FakeIsolatedClient):
@@ -4162,11 +4165,73 @@ async def test_scheduler_revokes_context_for_detached_core_child_before_late_iso
 
     release_child.set()
     assert child is not None
-    await child
+    with pytest.raises(SchedulerAuthorityRevoked) as revoked:
+        await child
+    assert revoked.value.execution_id == "execution-1"
 
     # A stale scope would give this call a ToolExecutionContext with the
-    # completed occurrence ID and stable idempotency key.  It must be absent.
-    assert client.calls == [("ping", {"message": "late"}, None)]
+    # completed occurrence ID and stable idempotency key; reading revocation
+    # as absence would send it with no context.  Neither call may happen.
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_revocation_while_awaiting_admission_blocks_isolated_rpc(
+    tmp_path,
+):
+    """Authority is re-read at the effect boundary, not only at call entry.
+
+    The scheduler context is translated before traffic admission, which can
+    wait on a config transition.  An occurrence revoked during that wait must
+    not reach the service with the idempotency key it captured earlier.
+    """
+
+    class ContextAwareClient(FakeIsolatedClient):
+        supports_tool_execution_context = True
+
+        async def call_tool(self, name, args, *, context=None):
+            self.calls.append((name, args, context))
+            return {"echo": args}
+
+    agent = Mock(did=_TEST_AGENT_DID)
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=FakeIsolatedClient)
+    client = ContextAwareClient()
+    feature._client = client
+    execution = SchedulerExecution(
+        id="execution-waiting",
+        schedule_id="schedule-1",
+        agent_id="agent-1",
+        task_name="ping",
+        args={},
+        scheduled_for="2026-07-25T15:00:00+00:00",
+        idempotency_key="stable-effect-key",
+        attempt=1,
+        owner="runner-1",
+    )
+
+    await feature._traffic_gate.close()
+    scope = _SchedulerExecutionScope(execution)
+    token = _current_execution.set(scope)
+    try:
+        call = asyncio.create_task(feature.call_isolated_tool("ping", {}))
+    finally:
+        _current_execution.reset(token)
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not call.done()
+
+        scope.revoke()
+        await feature._traffic_gate.reopen()
+        with pytest.raises(SchedulerAuthorityRevoked):
+            await asyncio.wait_for(call, timeout=1)
+    finally:
+        if not call.done():
+            call.cancel()
+
+    assert client.calls == []
 
 
 def test_service_command_console_script(tmp_path):

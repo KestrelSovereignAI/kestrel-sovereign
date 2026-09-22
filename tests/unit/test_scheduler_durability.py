@@ -23,11 +23,14 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_ROLLOUT_ACK_ENV,
     SCHEDULER_ROLLOUT_STATE_ACTIVE,
     SCHEDULER_SCHEMA_PROVENANCE_FRESH_V2,
+    SchedulerAuthorityRevoked,
     SchedulerProtocolVersionIncompatible,
     SchedulerRolloutQuiescenceRequired,
     SchedulerExecution,
     SchedulerRunner,
     ScheduledTask,
+    _current_execution,
+    _SchedulerExecutionScope,
     get_current_scheduler_execution,
 )
 from kestrel_sovereign.features.scheduler.status import (
@@ -3791,6 +3794,76 @@ async def test_renewal_loss_during_preparation_never_enters_effect(tmp_path):
         if tick is not None and not tick.done():
             tick.cancel()
             await asyncio.gather(tick, return_exceptions=True)
+        await db.close()
+
+
+def test_current_scheduler_execution_distinguishes_absent_active_and_revoked():
+    """``None`` means "not scheduler work"; revoked authority fails closed."""
+
+    execution = SchedulerExecution(
+        id="execution-1",
+        schedule_id="task-1",
+        agent_id="agent-1",
+        task_name="ping",
+        args={},
+        scheduled_for="2026-07-25T15:00:00+00:00",
+        idempotency_key="stable-effect",
+        attempt=1,
+        owner="owner-1",
+    )
+
+    assert get_current_scheduler_execution() is None
+
+    scope = _SchedulerExecutionScope(execution)
+    token = _current_execution.set(scope)
+    try:
+        assert get_current_scheduler_execution() is execution
+        scope.revoke()
+        with pytest.raises(SchedulerAuthorityRevoked) as revoked:
+            get_current_scheduler_execution()
+        assert revoked.value.execution_id == "execution-1"
+    finally:
+        _current_execution.reset(token)
+
+    assert get_current_scheduler_execution() is None
+
+
+@pytest.mark.asyncio
+async def test_detached_child_observes_runner_revocation_not_absence(tmp_path):
+    """A child that outlives dispatch sees revocation, never interactive absence."""
+
+    db = await _database(tmp_path / "detached-child.db")
+    child_started = asyncio.Event()
+    release_child = asyncio.Event()
+    child: asyncio.Task | None = None
+
+    async def late_read():
+        child_started.set()
+        await release_child.wait()
+        return get_current_scheduler_execution()
+
+    async def executor(_name, _args):
+        nonlocal child
+        assert get_current_scheduler_execution() is not None
+        child = asyncio.create_task(late_read())
+        await child_started.wait()
+        return "dispatched"
+
+    runner = SchedulerRunner(db, "agent-1", executor, owner_id="child-owner")
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        await runner._tick()
+        assert get_current_scheduler_execution() is None
+
+        release_child.set()
+        assert child is not None
+        with pytest.raises(SchedulerAuthorityRevoked):
+            await child
+    finally:
+        release_child.set()
+        if child is not None and not child.done():
+            child.cancel()
         await db.close()
 
 

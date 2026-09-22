@@ -2303,6 +2303,12 @@ def _scheduled_tool_execution_context() -> Any | None:
     published SDK.  Once a scheduled isolated invocation is attempted, the
     missing SDK contract is a safety failure rather than a reason to smuggle
     scheduler fields into user-controlled tool arguments.
+
+    ``None`` is returned only when the caller is not scheduler work.  A caller
+    whose inherited scheduler scope was revoked receives
+    :class:`~kestrel_sovereign.features.scheduler.runner.SchedulerAuthorityRevoked`
+    from the reader: degrading it to an interactive, context-free call would
+    drop the occurrence's idempotency key and its fail-closed admission.
     """
 
     from kestrel_sovereign.features.scheduler.runner import (
@@ -11974,7 +11980,18 @@ class ProxyFeature(Feature):
     ) -> Dict[str, Any]:
         """Dispatch one tool after :meth:`call_isolated_tool` admitted traffic."""
 
+        from kestrel_sovereign.features.scheduler.runner import (
+            SchedulerAuthorityRevoked,
+            get_current_scheduler_execution,
+        )
+
         try:
+            if context is not None:
+                # The context was translated before admission, which can wait
+                # on a config transition or an idle wake.  Re-read authority
+                # at the effect boundary so an occurrence revoked meanwhile
+                # cannot still reach the service with its idempotency key.
+                get_current_scheduler_execution()
             if self._client is None:
                 raise RuntimeError("isolated feature client is unavailable")
             if context is None:
@@ -12009,7 +12026,7 @@ class ProxyFeature(Feature):
                 "result": result,
                 "tool": name,
             }
-        except SchedulerExecutionContextUnavailable:
+        except (SchedulerExecutionContextUnavailable, SchedulerAuthorityRevoked):
             raise
         except Exception as exc:  # noqa: BLE001
             if context is not None:
