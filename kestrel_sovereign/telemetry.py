@@ -38,9 +38,12 @@ _CURRENT_TURN_ID: ContextVar[Optional[str]] = ContextVar(
     "kestrel_telemetry_current_turn_id",
     default=None,
 )
-_TURN_ID_CAPTURE: ContextVar[Optional[list[str]]] = ContextVar(
-    "kestrel_telemetry_turn_id_capture",
-    default=None,
+# Every enclosing capture, innermost last, each paired with the turn that was
+# live when it opened. A tuple rather than one list so a nested capture (a turn
+# entry point recording its own address) cannot shadow an outer one (the
+# dispatcher recording which turn its wake produced).
+_TURN_ID_CAPTURE: ContextVar[tuple[tuple[Optional[str], list[str]], ...]] = (
+    ContextVar("kestrel_telemetry_turn_id_capture", default=())
 )
 
 try:
@@ -258,15 +261,6 @@ def annotate_turn_outcome(span, outcome: "TurnOutcome", *, error=None) -> None:
             record_exception(error)
 
 
-def end_turn_span(span, outcome: "TurnOutcome", *, error=None) -> None:
-    """Annotate and end a caller-owned turn span on EVERY exit path."""
-
-    if span is None:
-        return
-    annotate_turn_outcome(span, outcome, error=error)
-    span.end()
-
-
 @contextmanager
 def turn_span(name: str, attributes: Optional[Dict[str, Any]] = None):
     """A current-context turn span whose OUTCOME, not its exception, sets status.
@@ -411,9 +405,16 @@ def turn_span_scope(turn_id: str):
 
     if not isinstance(turn_id, str) or not turn_id.strip():
         raise ValueError("turn_id must be a concrete string")
-    capture = _TURN_ID_CAPTURE.get()
-    if capture is not None:
-        capture.append(turn_id)
+    enclosing_turn = _CURRENT_TURN_ID.get()
+    for opened_under, capture in _TURN_ID_CAPTURE.get():
+        # A capture records only the turns minted directly beneath it. A turn
+        # minted under ANOTHER turn — a background cognition task spawned
+        # from a live turn inherits this context by copy, captures included —
+        # belongs to that turn's subtree, not to a capture that opened before
+        # the other turn existed. Without this, a child's address could land
+        # in its parent's capture and be reported as the parent's own.
+        if opened_under == enclosing_turn:
+            capture.append(turn_id)
     token = _CURRENT_TURN_ID.set(turn_id)
     try:
         yield turn_id
@@ -423,10 +424,19 @@ def turn_span_scope(turn_id: str):
 
 @contextmanager
 def capture_turn_ids():
-    """Capture lifecycle-created turn addresses in this task subtree."""
+    """Capture lifecycle-created turn addresses in this task subtree.
+
+    Captures nest: an inner capture records into every enclosing one too, so a
+    dispatcher still learns the turn its wake produced when the turn entry
+    point opens its own capture. Only turns minted directly beneath the
+    capture are recorded — never a turn minted inside another turn, even one
+    running in a task that inherited this context (see ``turn_span_scope``).
+    """
 
     captured: list[str] = []
-    token = _TURN_ID_CAPTURE.set(captured)
+    token = _TURN_ID_CAPTURE.set(
+        (*_TURN_ID_CAPTURE.get(), (_CURRENT_TURN_ID.get(), captured))
+    )
     try:
         yield captured
     finally:

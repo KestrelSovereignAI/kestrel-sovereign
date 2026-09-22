@@ -268,7 +268,16 @@ class TestStreamingTurnEndsOnEveryExit:
         assert span.status.status_code is not StatusCode.ERROR
 
     @pytest.mark.asyncio
-    async def test_consumer_that_walks_away_is_disconnected(self, span_exporter):
+    async def test_a_bare_close_records_nothing_and_is_interrupted(
+        self, span_exporter
+    ):
+        """``GeneratorExit`` is an exception type, not a record.
+
+        A closer that recorded no consumer close is not evidence of a
+        disconnect; the served path records one (see
+        ``TestADisconnectIsRecordedNotInferred``).
+        """
+
         async def forever(*_a, **_k):
             while True:
                 yield "tick"
@@ -276,11 +285,10 @@ class TestStreamingTurnEndsOnEveryExit:
         host = _turn_host()
         stream = _streaming(host, forever)
         assert await stream.__anext__() == "tick"
-        # GeneratorExit: what a closed response body raises into the generator.
         await stream.aclose()
 
         span = _only(span_exporter, STREAM_SPAN)
-        assert dict(span.attributes)[TURN_OUTCOME] == "disconnected"
+        assert dict(span.attributes)[TURN_OUTCOME] == "interrupted"
         assert span.status.status_code is not StatusCode.ERROR
 
     @pytest.mark.asyncio
@@ -534,3 +542,520 @@ def _raise(error):
         yield  # pragma: no cover - generator marker
 
     return body
+
+
+# --------------------------------------------------------------------------
+# The REAL lifecycle, non-streaming (#3159 review: the double above raised
+# from a lifecycle this module wrote; these run TurnLifecycleMixin's own
+# `_turn_lifecycle` and its durable-admission refusal).
+# --------------------------------------------------------------------------
+
+
+def _real_lifecycle_host(*, admitted=True, **overrides):
+    host = _turn_host(**overrides)
+    host._host_context_publication_gate = None
+    host._host_context_publication_state = None
+    host._lock_manager = None
+    host._live_turn_task = None
+    host._turn_request_ids = {}
+    for name in (
+        "_turn_lifecycle",
+        "_active_turn_scope",
+        "_get_lock_manager",
+        "_await_host_context_publication",
+        "_synchronize_host_context_publication",
+        "_register_turn_request_id",
+        "_unregister_turn_request_id",
+        "_turn_request_index",
+    ):
+        setattr(host, name, getattr(TurnLifecycleMixin, name).__get__(host))
+    host.await_durable_turn_admission = AsyncMock(return_value=admitted)
+    return host
+
+
+def _listen(host):
+    seen = []
+    host.add_turn_outcome_listener(
+        lambda turn_id, outcome: seen.append((turn_id, outcome))
+    )
+    return seen
+
+
+class TestInvokeTurnOverTheRealLifecycle:
+    @pytest.mark.asyncio
+    async def test_pre_admission_stop_is_stopped_and_published(
+        self, span_exporter
+    ):
+        """The lifecycle's own entry raises; the span and listener still see it."""
+
+        host = _real_lifecycle_host(admitted=False)
+        _record_stop(host)
+        seen = _listen(host)
+        body = AsyncMock(side_effect=AssertionError("body must not run"))
+
+        with pytest.raises(InvocationCancelledError):
+            await _run_invoke(host, body)
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        attributes = dict(span.attributes)
+        assert attributes[TURN_OUTCOME] == "stopped"
+        assert span.status.status_code is not StatusCode.ERROR
+        # The real lifecycle minted the address before refusing admission.
+        assert len(seen) == 1
+        turn_id, outcome = seen[0]
+        assert turn_id.startswith("turn_")
+        assert outcome is TurnOutcome.STOPPED
+        assert attributes["kestrel.turn_id"] == turn_id
+        body.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_publishes_the_real_turn_id(
+        self, span_exporter
+    ):
+        host = _real_lifecycle_host()
+        seen = _listen(host)
+
+        assert await _run_invoke(host, AsyncMock(return_value="42")) == "42"
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "completed"
+        assert seen == [(dict(span.attributes)["kestrel.turn_id"],
+                         TurnOutcome.COMPLETED)]
+
+    @pytest.mark.asyncio
+    async def test_safe_mode_recheck_early_return_ends_the_span(
+        self, span_exporter, monkeypatch
+    ):
+        answers = iter([None, "[safe mode]"])
+        monkeypatch.setattr(
+            "kestrel_sovereign.kestrel_agent.safe_mode_cognition_block",
+            lambda _agent, _text: next(answers),
+        )
+        host = _real_lifecycle_host()
+        seen = _listen(host)
+        body = AsyncMock(side_effect=AssertionError("body must not run"))
+
+        assert await _run_invoke(host, body) == "[safe mode]"
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "completed"
+        assert [outcome for _turn, outcome in seen] == [TurnOutcome.COMPLETED]
+
+    @pytest.mark.asyncio
+    async def test_command_early_return_ends_the_span(self, span_exporter):
+        host = _real_lifecycle_host()
+        host.command_handler.handle = AsyncMock(return_value="command done")
+        seen = _listen(host)
+        host._process_input_traced_locked = AsyncMock(
+            side_effect=AssertionError("body must not run")
+        )
+        host.process_input = KestrelAgent.process_input.__get__(host)
+
+        assert await host.process_input(
+            "!status", session_id=SESSION, invocation_id=REQUEST_ID
+        ) == "command done"
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "completed"
+        assert [outcome for _turn, outcome in seen] == [TurnOutcome.COMPLETED]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_pre_turn_guard_is_not_a_failure(
+        self, span_exporter
+    ):
+        """A source's guard declining the turn is policy (DROPPED_VALIDATION)."""
+
+        from kestrel_sovereign.signals.pre_turn_guard import PreTurnRefusal
+
+        host = _real_lifecycle_host()
+        host._evaluate_pre_turn_guard = KestrelAgent._evaluate_pre_turn_guard
+        host._process_input_traced_locked = AsyncMock(
+            side_effect=AssertionError("body must not run")
+        )
+        host.process_input = KestrelAgent.process_input.__get__(host)
+
+        with pytest.raises(PreTurnRefusal):
+            await host.process_input(
+                "wake",
+                session_id=SESSION,
+                invocation_id=REQUEST_ID,
+                pre_turn_guard=lambda: "privacy mode forbids this wake",
+            )
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "completed"
+        assert span.status.status_code is not StatusCode.ERROR
+
+
+class TestTurnCapturesNest:
+    """An entry point's own capture must not hide its turn from an outer one.
+
+    The dispatcher wraps ``process_input`` in ``capture_turn_ids`` to learn the
+    turn its wake produced. The entry point now captures too; a shadowing
+    capture would silently empty the dispatcher's list.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_dispatchers_capture_still_sees_the_turn(
+        self, span_exporter
+    ):
+        host = _real_lifecycle_host()
+
+        with telemetry.capture_turn_ids() as outer:
+            await _run_invoke(host, AsyncMock(return_value="42"))
+
+        span = _only(span_exporter, INVOKE_SPAN)
+        assert outer == [dict(span.attributes)["kestrel.turn_id"]]
+
+
+class TestStreamingTurnOverTheRealLifecycle:
+    @pytest.mark.asyncio
+    async def test_pre_admission_stop_is_stopped_and_names_its_turn(
+        self, span_exporter
+    ):
+        host = _real_lifecycle_host(admitted=False)
+        _record_stop(host)
+        seen = _listen(host)
+
+        with pytest.raises(InvocationCancelledError):
+            await _drain(_streaming(host, _answer))
+
+        span = _only(span_exporter, STREAM_SPAN)
+        attributes = dict(span.attributes)
+        assert attributes[TURN_OUTCOME] == "stopped"
+        assert span.status.status_code is not StatusCode.ERROR
+        assert seen == [(attributes["kestrel.turn_id"], TurnOutcome.STOPPED)]
+
+
+# --------------------------------------------------------------------------
+# A disconnect is a RECORDED disposition, through the real transport (#3159
+# review r2): the production endpoints wrap the agent stream in an
+# ``OwnedAsyncIterator`` served by ``ClosingStreamingResponse``, whose close
+# CANCELS the owner task. A producer blocked awaiting its next token then
+# unwinds with ``CancelledError`` — the same exception a host teardown raises —
+# so only the consumer-close record can say "the reader went away".
+# --------------------------------------------------------------------------
+
+
+def _real_agent(did="did:test:3159-outcome"):
+    """A real agent stopped just short of the machinery a turn body needs."""
+
+    agent = KestrelAgent(did=did, storage_path=":memory:")
+    agent.storage = object()
+    agent.context_manager = object()
+    agent.bootstrap_service = None
+    agent._safe_mode = False
+    agent._maybe_audit = AsyncMock()
+    agent._maybe_refresh_user_byok_resolver = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    return agent
+
+
+def _served_stream(agent, body):
+    from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+
+    agent._process_input_streaming_traced_locked = body
+    return OwnedAsyncIterator(
+        lambda: agent.process_input_streaming(
+            "what is 6*7?", session_id=SESSION, request_id=REQUEST_ID
+        ),
+        operation="test agent stream",
+    )
+
+
+def _blocked_after_first_token(first_sent):
+    async def body(*_a, **_k):
+        yield "tick"
+        first_sent.set()
+        # The next provider token never arrives: blocked inside ``anext``.
+        await asyncio.Event().wait()
+        yield "never"  # pragma: no cover - unreachable
+
+    return body
+
+
+async def _serve(stream, receive, send):
+    from kestrel_sovereign.endpoints.closing_streaming_response import (
+        ClosingStreamingResponse,
+    )
+
+    response = ClosingStreamingResponse(stream, media_type="text/plain")
+    scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+    try:
+        await response(scope, receive, send)
+    except BaseException as error:  # noqa: BLE001 - transport outcome varies
+        return error
+    return None
+
+
+class TestADisconnectIsRecordedNotInferred:
+    @pytest.mark.asyncio
+    async def test_client_gone_while_producer_awaits_its_next_token(
+        self, span_exporter
+    ):
+        agent = _real_agent()
+        seen = _listen(agent)
+        first_sent = asyncio.Event()
+        delivered = []
+
+        async def receive():
+            await first_sent.wait()
+            await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            delivered.append(message)
+
+        await asyncio.wait_for(
+            _serve(
+                _served_stream(agent, _blocked_after_first_token(first_sent)),
+                receive,
+                send,
+            ),
+            timeout=10,
+        )
+
+        assert any(m.get("body") == b"tick" for m in delivered)
+        span = _only(span_exporter, STREAM_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "disconnected"
+        assert span.status.status_code is not StatusCode.ERROR
+        assert [outcome for _turn, outcome in seen] == [
+            TurnOutcome.DISCONNECTED
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_send_is_a_disconnect(self, span_exporter):
+        agent = _real_agent()
+        seen = _listen(agent)
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise OSError("client connection reset")
+
+        await asyncio.wait_for(
+            _serve(_served_stream(agent, _forever), receive, send),
+            timeout=10,
+        )
+
+        span = _only(span_exporter, STREAM_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "disconnected"
+        assert [outcome for _turn, outcome in seen] == [
+            TurnOutcome.DISCONNECTED
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_same_cancel_without_a_close_record_is_interrupted(
+        self, span_exporter
+    ):
+        """Cancel the owner task directly — what a teardown does — and the
+        producer unwinds with the very same ``CancelledError``. No consumer
+        recorded a close, so it is NOT reported as a disconnect."""
+
+        agent = _real_agent()
+        first_sent = asyncio.Event()
+        stream = _served_stream(agent, _blocked_after_first_token(first_sent))
+
+        assert await stream.__anext__() == "tick"
+        consumer = asyncio.create_task(stream.__anext__())
+        await asyncio.wait_for(first_sent.wait(), timeout=5)
+        await asyncio.sleep(0)
+        stream.owner_task.cancel()
+        with pytest.raises((StopAsyncIteration, asyncio.CancelledError)):
+            await asyncio.wait_for(consumer, timeout=5)
+
+        span = _only(span_exporter, STREAM_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_stop_outranks_the_consumer_close(
+        self, span_exporter
+    ):
+        """The endpoint breaks and closes after a Stop: that is a Stop."""
+
+        host = _turn_host()
+        stopped = asyncio.Event()
+
+        async def body(*_a, **_k):
+            yield "partial"
+            _record_stop(host)
+            stopped.set()
+            await asyncio.Event().wait()
+            yield "never"  # pragma: no cover - unreachable
+
+        from kestrel_sovereign._async_ownership import OwnedAsyncIterator
+
+        stream = OwnedAsyncIterator(
+            lambda: _streaming(host, body), operation="test stop then close"
+        )
+        assert await stream.__anext__() == "partial"
+        consumer = asyncio.create_task(stream.__anext__())
+        await asyncio.wait_for(stopped.wait(), timeout=5)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        await stream.aclose()
+
+        span = _only(span_exporter, STREAM_SPAN)
+        assert dict(span.attributes)[TURN_OUTCOME] == "stopped"
+
+
+class TestADispositionBelongsToExactlyOneTask:
+    """#3159 review r3: context is inherited by copy; a disposition is not.
+
+    A streamed turn that enqueues cognition hands its context — close record
+    and turn-address captures included — to the child task. Neither may let
+    the child report the parent's facts as its own.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_child_of_a_disconnected_stream_reports_its_own_outcome(
+        self, span_exporter
+    ):
+        agent = _real_agent()
+        seen = _listen(agent)
+        agent._process_input_traced_locked = AsyncMock(return_value="child")
+        first_sent = asyncio.Event()
+        children = []
+
+        async def body(*_a, **_k):
+            # What ``enqueue_signal`` does through ``_track_background_task``:
+            # a task created by the producer, inheriting its context.
+            children.append(asyncio.create_task(agent.process_input("wake")))
+            yield "tick"
+            first_sent.set()
+            await asyncio.Event().wait()
+            yield "never"  # pragma: no cover - unreachable
+
+        async def receive():
+            await first_sent.wait()
+            await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        await asyncio.wait_for(
+            _serve(_served_stream(agent, body), receive, send), timeout=10
+        )
+        assert await asyncio.wait_for(children[0], timeout=10) == "child"
+
+        assert dict(_only(span_exporter, STREAM_SPAN).attributes)[
+            TURN_OUTCOME
+        ] == "disconnected"
+        assert dict(_only(span_exporter, INVOKE_SPAN).attributes)[
+            TURN_OUTCOME
+        ] == "completed"
+        assert [outcome for _turn, outcome in seen] == [
+            TurnOutcome.DISCONNECTED,
+            TurnOutcome.COMPLETED,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_child_turn_never_lands_in_its_parents_capture(
+        self, span_exporter
+    ):
+        """The dispatcher reports ``turn_id`` only when its capture holds
+        exactly one address. A child turn minted into the parent's capture
+        made it two, and the wake lost the turn it produced."""
+
+        agent = _real_agent()
+        seen = _listen(agent)
+        children = []
+
+        async def traced(*_a, **_k):
+            if not children:
+                children.append(
+                    asyncio.create_task(agent.process_input("child wake"))
+                )
+            return "42"
+
+        agent._process_input_traced_locked = traced
+        with telemetry.capture_turn_ids() as outer:
+            assert await agent.process_input("parent wake") == "42"
+        assert await asyncio.wait_for(children[0], timeout=10) == "42"
+
+        parent_turn, child_turn = [turn for turn, _outcome in seen]
+        assert parent_turn != child_turn
+        assert outer == [parent_turn]
+        invokes = [
+            dict(s.attributes)["kestrel.turn_id"]
+            for s in span_exporter.get_finished_spans()
+            if s.name == INVOKE_SPAN
+        ]
+        # Each span still names its OWN turn: the child's entry capture saw
+        # the child's address first.
+        assert invokes == [parent_turn, child_turn]
+
+
+async def _forever(*_a, **_k):
+    while True:
+        yield "tick"
+        await asyncio.sleep(0)
+
+
+class TestTheListenerSeamOnARealAgent:
+    """The seam obs#118 consumes: a real listener on a real ``KestrelAgent``."""
+
+    @pytest.mark.asyncio
+    async def test_invoke_and_stream_each_publish_once_with_the_span_value(
+        self, span_exporter
+    ):
+        agent = _real_agent()
+        seen = _listen(agent)
+        agent._process_input_traced_locked = AsyncMock(return_value="42")
+
+        assert await agent.process_input("wake") == "42"
+
+        async def failing(*_a, **_k):
+            raise ValueError("provider exploded")
+            yield  # pragma: no cover - generator marker
+
+        agent._process_input_streaming_traced_locked = failing
+        with pytest.raises(ValueError):
+            await _drain(agent.process_input_streaming("again"))
+
+        invoke = dict(_only(span_exporter, INVOKE_SPAN).attributes)
+        stream = dict(_only(span_exporter, STREAM_SPAN).attributes)
+        assert seen == [
+            (invoke["kestrel.turn_id"], TurnOutcome.COMPLETED),
+            (stream["kestrel.turn_id"], TurnOutcome.FAILED),
+        ]
+        assert invoke[TURN_OUTCOME] == "completed"
+        assert stream[TURN_OUTCOME] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_a_raising_listener_never_reaches_the_turn(self, span_exporter):
+        agent = _real_agent()
+        after = _listen(agent)
+
+        def explode(_turn_id, _outcome):
+            raise RuntimeError("the observability feature is broken")
+
+        agent.add_turn_outcome_listener(explode)
+        agent._process_input_traced_locked = AsyncMock(return_value="42")
+
+        assert await agent.process_input("wake") == "42"
+        assert [outcome for _turn, outcome in after] == [TurnOutcome.COMPLETED]
+        assert dict(_only(span_exporter, INVOKE_SPAN).attributes)[
+            TURN_OUTCOME
+        ] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_a_removed_listener_is_not_called(self, span_exporter):
+        agent = _real_agent()
+        seen = []
+
+        def listener(turn_id, outcome):
+            seen.append(outcome)
+
+        agent.add_turn_outcome_listener(listener)
+        agent.add_turn_outcome_listener(listener)  # idempotent
+        agent._process_input_traced_locked = AsyncMock(return_value="42")
+        await agent.process_input("wake")
+        agent.remove_turn_outcome_listener(listener)
+        await agent.process_input("wake")
+
+        assert seen == [TurnOutcome.COMPLETED]

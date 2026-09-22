@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request, Response
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
@@ -13,13 +13,12 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     sovereign_actor_id,
 )
 from kestrel_sovereign.endpoints.receipt_feed import (
-    MAX_RECEIPT_CURSOR_LENGTH,
-    MAX_RECEIPT_PAGE_SIZE,
     RECEIPT_FEED_SCHEMA_VERSION,
+    bounded_filter_text,
     decode_cursor,
     disclosable_identity,
     encode_cursor,
-    parse_time_bound,
+    parse_time_window,
     resolve_page_size,
 )
 from kestrel_sovereign.rate_limit import (
@@ -216,6 +215,11 @@ async def stop_host(
     )
 
 
+# Filter bounds: an agent DID of any method, and a W3C trace id (32 hex).
+MAX_STOP_AGENT_FILTER_LENGTH = 512
+MAX_STOP_TRACE_FILTER_LENGTH = 32
+
+
 def _stop_receipt_payload(record: StopReceiptRecord) -> dict:
     """Project one immutable receipt for the observability read surface.
 
@@ -229,6 +233,7 @@ def _stop_receipt_payload(record: StopReceiptRecord) -> dict:
     """
 
     return {
+        "feed_seq": record.feed_seq,
         "receipt_id": record.receipt_id,
         "scope": record.scope,
         "actor_id": record.actor_id,
@@ -255,14 +260,12 @@ def _stop_receipt_payload(record: StopReceiptRecord) -> dict:
 async def host_stop_receipts(
     request: Request,
     response: Response,
-    since: Annotated[str | None, Query(max_length=64)] = None,
-    until: Annotated[str | None, Query(max_length=64)] = None,
-    agent_id: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
-    trace_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
-    cursor: Annotated[
-        str | None, Query(min_length=1, max_length=MAX_RECEIPT_CURSOR_LENGTH)
-    ] = None,
-    limit: Annotated[int | None, Query(ge=1, le=MAX_RECEIPT_PAGE_SIZE)] = None,
+    since: str | None = None,
+    until: str | None = None,
+    agent_id: str | None = None,
+    trace_id: str | None = None,
+    cursor: str | None = None,
+    limit: str | None = None,
 ):
     """Read the durable Stop evidence an observability view renders from.
 
@@ -276,23 +279,22 @@ async def host_stop_receipts(
     """
 
     # Authority first, before any filter is interpreted, so a refusal cannot
-    # become a probe for which agents or traces exist.
+    # become a probe for which agents or traces exist. Every filter is taken as
+    # raw text for the same reason: a constrained ``Query`` annotation would be
+    # validated by FastAPI BEFORE this line runs (see ``receipt_feed``).
     sovereign_actor_id(request)
     response.headers["Cache-Control"] = "private, no-store"
     response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
 
-    window_start = parse_time_bound(since, "since")
-    window_end = parse_time_bound(until, "until")
-    if (
-        window_start is not None
-        and window_end is not None
-        and window_end <= window_start
-    ):
-        raise ApiHTTPException(
-            status_code=400,
-            code="receipt_window_invalid",
-            message="until must be later than since.",
-        )
+    window_start, window_end = parse_time_window(since, until)
+    agent_filter = bounded_filter_text(
+        agent_id, "agent_id", max_length=MAX_STOP_AGENT_FILTER_LENGTH
+    )
+    trace_filter = bounded_filter_text(
+        trace_id, "trace_id", max_length=MAX_STOP_TRACE_FILTER_LENGTH
+    )
+    after = decode_cursor(cursor)
+    page_size = resolve_page_size(limit)
 
     store = getattr(request.app.state, "stop_receipt_store", None)
     if store is None:
@@ -301,10 +303,10 @@ async def host_stop_receipts(
         page = await store.list_receipts(
             since=window_start,
             until=window_end,
-            agent_id=agent_id,
-            trace_id=trace_id,
-            after=decode_cursor(cursor),
-            limit=resolve_page_size(limit),
+            agent_id=agent_filter,
+            trace_id=trace_filter,
+            after=after,
+            limit=page_size,
         )
     except StopReceiptError as error:
         # An unreadable history is reported as unreadable. An empty list here

@@ -113,18 +113,13 @@ from kestrel_sovereign.security.input_guardrails import (
     check_prompt_injection,
     append_security_addendum,
 )
-from kestrel_sovereign.agent.turn_outcome import (
-    TurnOutcome,
-    publish_turn_outcome,
-    resolve_turn_outcome,
-)
+from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
-    annotate_turn_outcome,
-    optional_span,
+    capture_turn_ids,
     turn_span,
 )
 
@@ -1614,6 +1609,9 @@ class KestrelAgent(
         # Observable turn IDs resolve to the task-local invocation/request IDs
         # that the cooperative Stop loop already understands (#3141).
         self._turn_request_ids: dict[str, str] = {}
+        # Feature-owned turn roots told how each turn ended (#3159); see
+        # ``TurnLifecycleMixin.add_turn_outcome_listener`` for the contract.
+        self._turn_outcome_listeners: list = []
         self._cancelled_requests: set = set()
         self._cancelled_request_generations: set[tuple[str, int]] = set()
         # An exact Stop can race ahead of the matching HTTP request's lifecycle
@@ -6365,143 +6363,151 @@ Expected Duration: {expected_duration}
         # turn appends user/assistant messages). Acquire the turn
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
-        async with self._turn_lifecycle():
-            # A feature/privacy transition can latch Safe Mode while this turn
-            # is queued for the same boundary. Recheck after acquisition so a
-            # request admitted under the prior generation cannot execute over
-            # prompt authority that failed quarantine.
-            safe_mode_block = safe_mode_cognition_block(self, user_input)
-            if safe_mode_block is not None:
-                return safe_mode_block
-
-            # Lock order — CONVERSATION (via `_turn_lifecycle`) BEFORE the
-            # privacy-transition lock — is the deadlock-freedom invariant, and
-            # `SIGNAL_DISPATCHER.md` pins CONVERSATION as the highest-order
-            # acquisition system-wide. `process_input_streaming` takes the same
-            # pair in the same order; taking the transition lock first (here or
-            # in a caller such as the dispatcher/scheduler) is the AB-BA wedge
-            # reverted in 9da78c16 and must not be reintroduced.
-            #
-            # #3310: without this span the non-streaming turn — the entry point
-            # the SignalDispatcher uses for EVERY COGNITION wake — had no region
-            # a privacy-mode check could run inside and be authoritative. Every
-            # check outside it (at schedule creation, at fire time, immediately
-            # before handoff) is a read racing a write-side transition, because
-            # the turn itself never serialized against the transition: each
-            # remaining `await` on the way to consuming the prompt is a window a
-            # transition can land in. Holding the same mutex a privacy
-            # transition must take (`privacy_transition`) for the whole body
-            # closes the window instead of narrowing it: a transition either
-            # completes fully before the turn reads any policy, or waits until
-            # the turn has finished consuming its prompt.
-            transition_lock = self._get_privacy_transition_lock()
-            async with transition_lock:
-                # The source's own admission runs HERE, first, and nowhere
-                # else. Placing it one line earlier — outside the mutex — is
-                # what rounds 1-3 each did, and each time a transition landed
-                # in a later `await`. Inside, its answer holds for the rest of
-                # the turn by construction: a transition needs this same mutex.
-                self._evaluate_pre_turn_guard(pre_turn_guard)
-
-                # Record THIS turn's session as soon as the turn lock is held —
-                # before command handling — so tools invoked via an explicit
-                # ``!command`` (e.g. request_restart's origin-session capture) see
-                # this turn's session, not a stale value. Setting it UNDER the lock
-                # (which serializes turns per agent) means an overlapping turn
-                # waiting on the lock cannot overwrite it mid-handling (#1809). Set
-                # even when None so a session-less turn never inherits a prior
-                # window. The traced-locked bodies re-affirm it for the
-                # streaming-delegation path.
-                self._active_session_id = session_id
-
-                # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
-                if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
-                    command = prefixed_command_token(user_input)
-                    if command in BOOTSTRAP_ALLOWED_COMMANDS:
-                        pass  # Let command handler process these
-                    elif command is not None:
-                        # Never feed command text into discovery. Bootstrap may
-                        # persist its input and response or even complete before it
-                        # returns, which would leave the operator's transcript out
-                        # of sync with durable state when we replace that response.
-                        logging.info(
-                            "[BOOTSTRAP] Command %s unavailable until onboarding completes",
-                            command,
-                        )
-                        return (
-                            f"❌ Command unavailable during bootstrap: {command}\n\n"
-                            "Complete onboarding first, or use !skip-discovery to "
-                            "finish bootstrap with the default personality."
-                        )
-                    else:
-                        bootstrap_response = await self._handle_bootstrap(
-                            user_input, session_id,
-                            invocation_context=invocation_context,
-                        )
-                        if bootstrap_response:
-                            # Bootstrap persists real conversation rows and must
-                            # enter the same privacy-gated memory ingestion path as
-                            # every later exchange. Returning here without this
-                            # call leaves first-turn importance, emotion, concepts,
-                            # and schema routing permanently absent (#2331).
-                            await self._post_response_pipeline(
-                                user_input, bootstrap_response, session_id
-                            )
-                            return bootstrap_response
-
-                # Handle explicit commands first (using the CommandHandler)
-                if user_input.startswith("!"):
-                    # Special handling for !continue - replace with continuation prompt
-                    if user_input.strip().lower() == "!continue":
-                        user_input = "Please continue from where you left off."
-                    else:
-                        response = await self.command_handler.handle(user_input, caller=caller)
-                        if response:
-                            return response
-
-                # The remainder of the turn (build_context, the LLM call, episode
-                # bookkeeping) requires the context manager. A COGNITION signal
-                # dispatch — notably the restart.completed wake fired from
-                # RestartCoordinatorFeature.initialize() — can reach here before
-                # initialize() has constructed it. Defer with a clear, retryable
-                # error rather than crash on a half-built agent: the dispatcher
-                # records this as Status.FAILED (not delivered), so the restart row
-                # stays ``executing`` and the #1797 sweep retries the wake once init
-                # completes. Bootstrap / safe-mode / !command paths above do not need
-                # the context manager and still run pre-init.
-                if self.context_manager is None:
-                    raise RuntimeError(
-                        "agent not fully initialized: context_manager unavailable; "
-                        "deferring turn for retry until initialize() completes"
-                    )
-
-                # --- OpenTelemetry span for the full request lifecycle ---
-                # `turn_span` rather than `optional_span` (#3159): the turn's
-                # own outcome sets the status, because OpenTelemetry's default
-                # would mark the pre-admission Stop's InvocationCancelledError
-                # ERROR — reading a turn an operator deliberately stopped as a
-                # failure. The span is still ended on every exit, BaseException
-                # included, by the context manager itself.
-                with turn_span("agent.process_input", {
-                    OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-                    KESTREL_AGENT_NAME: self.agent_name,
-                    "agent.did": self.did,
-                    "agent.session_id": session_id or "",
-                    # #2916: the key the fleet Timeline actually groups on. Omitted
-                    # (None, not "") when the turn has no session, so a sessionless
-                    # turn stays absent rather than carrying an empty attribute.
-                    KESTREL_SESSION_ID: session_id or None,
-                    "agent.input_length": len(user_input),
-                }) as _otel_span:
+        #
+        # #3159: the turn span opens BEFORE the lifecycle and every exit ends
+        # it, saying how the turn ended. Opening it inside, around only the
+        # traced body, left the durable pre-admission Stop (raised by the
+        # lifecycle's own entry) and every early return below — safe mode,
+        # bootstrap, commands, a refused pre-turn guard — with no span and no
+        # outcome delivered to a feature-owned turn root. `turn_span` rather
+        # than `optional_span`: the OUTCOME sets the status, because
+        # OpenTelemetry's default would mark a Stop's InvocationCancelledError
+        # ERROR. `capture_turn_ids` records the turn address as the lifecycle
+        # mints it, the only way to still know it after the lifecycle resets
+        # that scope on the way out.
+        _turn_error: BaseException | None = None
+        with capture_turn_ids() as _turn_ids, turn_span("agent.process_input", {
+            OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+            # Defensive reads: the span now opens before bootstrap / command
+            # handling, which a partially-constructed agent can still reach.
+            # `turn_span` drops a None rather than stamping it.
+            KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
+            "agent.did": getattr(self, "did", None),
+            "agent.session_id": session_id or "",
+            # #2916: the key the fleet Timeline actually groups on. Omitted
+            # (None, not "") when the turn has no session, so a sessionless
+            # turn stays absent rather than carrying an empty attribute.
+            KESTREL_SESSION_ID: session_id or None,
+            "agent.input_length": len(user_input),
+        }) as _otel_span:
+            try:
+                async with self._turn_lifecycle():
                     # Correlation is optional evidence, never cancellation
-                    # authority. The observability feature may replace this with
-                    # its dedicated turn-root span later in USER_PROMPT_SUBMIT.
+                    # authority. The observability feature may replace this
+                    # with its dedicated turn-root span in USER_PROMPT_SUBMIT.
                     self.bind_current_turn_span(_otel_span)
-                    _turn_id = self.get_current_turn_id()
-                    try:
+                    # A feature/privacy transition can latch Safe Mode while this turn
+                    # is queued for the same boundary. Recheck after acquisition so a
+                    # request admitted under the prior generation cannot execute over
+                    # prompt authority that failed quarantine.
+                    safe_mode_block = safe_mode_cognition_block(self, user_input)
+                    if safe_mode_block is not None:
+                        return safe_mode_block
+
+                    # Lock order — CONVERSATION (via `_turn_lifecycle`) BEFORE the
+                    # privacy-transition lock — is the deadlock-freedom invariant, and
+                    # `SIGNAL_DISPATCHER.md` pins CONVERSATION as the highest-order
+                    # acquisition system-wide. `process_input_streaming` takes the same
+                    # pair in the same order; taking the transition lock first (here or
+                    # in a caller such as the dispatcher/scheduler) is the AB-BA wedge
+                    # reverted in 9da78c16 and must not be reintroduced.
+                    #
+                    # #3310: without this span the non-streaming turn — the entry point
+                    # the SignalDispatcher uses for EVERY COGNITION wake — had no region
+                    # a privacy-mode check could run inside and be authoritative. Every
+                    # check outside it (at schedule creation, at fire time, immediately
+                    # before handoff) is a read racing a write-side transition, because
+                    # the turn itself never serialized against the transition: each
+                    # remaining `await` on the way to consuming the prompt is a window a
+                    # transition can land in. Holding the same mutex a privacy
+                    # transition must take (`privacy_transition`) for the whole body
+                    # closes the window instead of narrowing it: a transition either
+                    # completes fully before the turn reads any policy, or waits until
+                    # the turn has finished consuming its prompt.
+                    transition_lock = self._get_privacy_transition_lock()
+                    async with transition_lock:
+                        # The source's own admission runs HERE, first, and nowhere
+                        # else. Placing it one line earlier — outside the mutex — is
+                        # what rounds 1-3 each did, and each time a transition landed
+                        # in a later `await`. Inside, its answer holds for the rest of
+                        # the turn by construction: a transition needs this same mutex.
+                        self._evaluate_pre_turn_guard(pre_turn_guard)
+
+                        # Record THIS turn's session as soon as the turn lock is held —
+                        # before command handling — so tools invoked via an explicit
+                        # ``!command`` (e.g. request_restart's origin-session capture) see
+                        # this turn's session, not a stale value. Setting it UNDER the lock
+                        # (which serializes turns per agent) means an overlapping turn
+                        # waiting on the lock cannot overwrite it mid-handling (#1809). Set
+                        # even when None so a session-less turn never inherits a prior
+                        # window. The traced-locked bodies re-affirm it for the
+                        # streaming-delegation path.
+                        self._active_session_id = session_id
+
+                        # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
+                        if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
+                            command = prefixed_command_token(user_input)
+                            if command in BOOTSTRAP_ALLOWED_COMMANDS:
+                                pass  # Let command handler process these
+                            elif command is not None:
+                                # Never feed command text into discovery. Bootstrap may
+                                # persist its input and response or even complete before it
+                                # returns, which would leave the operator's transcript out
+                                # of sync with durable state when we replace that response.
+                                logging.info(
+                                    "[BOOTSTRAP] Command %s unavailable until onboarding completes",
+                                    command,
+                                )
+                                return (
+                                    f"❌ Command unavailable during bootstrap: {command}\n\n"
+                                    "Complete onboarding first, or use !skip-discovery to "
+                                    "finish bootstrap with the default personality."
+                                )
+                            else:
+                                bootstrap_response = await self._handle_bootstrap(
+                                    user_input, session_id,
+                                    invocation_context=invocation_context,
+                                )
+                                if bootstrap_response:
+                                    # Bootstrap persists real conversation rows and must
+                                    # enter the same privacy-gated memory ingestion path as
+                                    # every later exchange. Returning here without this
+                                    # call leaves first-turn importance, emotion, concepts,
+                                    # and schema routing permanently absent (#2331).
+                                    await self._post_response_pipeline(
+                                        user_input, bootstrap_response, session_id
+                                    )
+                                    return bootstrap_response
+
+                        # Handle explicit commands first (using the CommandHandler)
+                        if user_input.startswith("!"):
+                            # Special handling for !continue - replace with continuation prompt
+                            if user_input.strip().lower() == "!continue":
+                                user_input = "Please continue from where you left off."
+                            else:
+                                response = await self.command_handler.handle(user_input, caller=caller)
+                                if response:
+                                    return response
+
+                        # The remainder of the turn (build_context, the LLM call, episode
+                        # bookkeeping) requires the context manager. A COGNITION signal
+                        # dispatch — notably the restart.completed wake fired from
+                        # RestartCoordinatorFeature.initialize() — can reach here before
+                        # initialize() has constructed it. Defer with a clear, retryable
+                        # error rather than crash on a half-built agent: the dispatcher
+                        # records this as Status.FAILED (not delivered), so the restart row
+                        # stays ``executing`` and the #1797 sweep retries the wake once init
+                        # completes. Bootstrap / safe-mode / !command paths above do not need
+                        # the context manager and still run pre-init.
+                        if self.context_manager is None:
+                            raise RuntimeError(
+                                "agent not fully initialized: context_manager unavailable; "
+                                "deferring turn for retry until initialize() completes"
+                            )
+
                         # Lifecycle is already entered; call the locked body
                         # directly.
-                        response = await self._process_input_traced_locked(
+                        return await self._process_input_traced_locked(
                             user_input, model_override, session_id, _otel_span,
                             include_memories,
                             system_prompt_addendum=system_prompt_addendum,
@@ -6510,21 +6516,13 @@ Expected Duration: {expected_duration}
                             signal_wake=signal_wake,
                             invocation_context=invocation_context,
                         )
-                    except BaseException as turn_error:
-                        # BaseException, not Exception: a Stop and a host
-                        # shutdown both arrive as CancelledError, and a turn
-                        # that ends without saying how is the defect #3159 was
-                        # filed for.
-                        outcome = resolve_turn_outcome(self, turn_error)
-                        annotate_turn_outcome(
-                            _otel_span, outcome, error=turn_error
-                        )
-                        publish_turn_outcome(self, _turn_id, outcome)
-                        raise
-                    outcome = resolve_turn_outcome(self, None)
-                    annotate_turn_outcome(_otel_span, outcome)
-                    publish_turn_outcome(self, _turn_id, outcome)
-                    return response
+            except BaseException as exc:
+                # BaseException, not Exception: a Stop and a host shutdown
+                # both arrive as CancelledError.
+                _turn_error = exc
+                raise
+            finally:
+                settle_turn_outcome(self, _otel_span, _turn_ids, _turn_error)
 
     def _assemble_post_build_system_prompt(
         self, base_system_prompt: str, context_result, *,

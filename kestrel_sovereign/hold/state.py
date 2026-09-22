@@ -14,7 +14,6 @@ import hashlib
 import logging
 import os
 import sqlite3
-import stat
 from contextlib import AsyncExitStack, asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,6 +47,7 @@ from kestrel_sovereign.storage.database_clock import (
     database_timestamp_bound_text,
 )
 from kestrel_sovereign.storage.db.interface import DatabaseError
+from kestrel_sovereign.storage.feed_sequence import ensure_feed_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -1017,6 +1017,18 @@ class HoldMutation:
 
 
 @dataclass(frozen=True)
+class HoldFeedEntry:
+    """One Hold receipt at its commit-ordered position in the history feed.
+
+    ``feed_seq`` is the paging key; the receipt's ``occurred_at`` is the
+    database clock's reading and is for display (#3159 R6).
+    """
+
+    feed_seq: int
+    receipt: HoldReceipt
+
+
+@dataclass(frozen=True)
 class HoldReceiptPage:
     """One bounded page of immutable Hold history plus its continuation.
 
@@ -1026,8 +1038,8 @@ class HoldReceiptPage:
     it ended, never a mutation of the hold event (#3159 R5).
     """
 
-    receipts: tuple[HoldReceipt, ...]
-    next_key: Optional[tuple[str, str]]
+    entries: tuple[HoldFeedEntry, ...]
+    next_key: Optional[int]
 
 
 def hold_latch_payload(latch: Optional[HoldState]) -> Optional[dict[str, Any]]:
@@ -1440,6 +1452,19 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
         set_at=set_at,
         hold_receipt_id=hold_receipt_id,
         revision=revision,
+    )
+
+
+def _feed_entry_from_row(row: Any) -> HoldFeedEntry:
+    """Split a feed row into its paging key and its validated receipt."""
+
+    if row is None or len(row) != 13:
+        raise HoldCorruptStateError("hold feed row has an unexpected shape")
+    feed_seq = row[12]
+    if isinstance(feed_seq, bool) or not isinstance(feed_seq, int) or feed_seq < 1:
+        raise HoldCorruptStateError("hold receipt feed sequence is invalid")
+    return HoldFeedEntry(
+        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:12])
     )
 
 
@@ -3658,11 +3683,15 @@ class HoldStore:
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
-            # The exact order the sovereign receipt feed pages in (#3159 R2/R6):
-            # one fleet-wide history, oldest first, without a full sort.
-            await self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_hold_receipts_occurred_at "
-                "ON hold_receipts(occurred_at, receipt_id)"
+            # The commit-ordered key the sovereign receipt feed pages on
+            # (#3159 R2/R6). ``feed_seq`` is outside every content digest and
+            # witness, which cover exactly ``_RECEIPT_COLUMNS``, so numbering a
+            # pre-existing row changes no evidence. The exclusive history lock
+            # is the one every receipt writer holds until commit, so numbering
+            # cannot collide with a concurrent append from another process.
+            await self._lock_write_history()
+            await ensure_feed_sequence(
+                self._db, table="hold_receipts", lock_key=_HISTORY_LOCK_KEY
             )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS hold_receipt_witnesses ("
@@ -4009,10 +4038,17 @@ class HoldStore:
         until: Optional[datetime] = None,
         scope: Optional[HoldScope] = None,
         target_id: Optional[str] = None,
-        after: Optional[tuple[str, str]] = None,
+        after: Optional[int] = None,
         limit: int,
     ) -> HoldReceiptPage:
         """Read one bounded page of Hold history, oldest first.
+
+        Pages on ``feed_seq``, which the table's insert trigger allocates for
+        every receipt write under the exclusive history lock (or SQLite's
+        writer slot), so a receipt that
+        commits after a page was served always sorts after that page's cursor
+        (#3159 R6). ``since`` / ``until`` filter on the displayed
+        ``occurred_at``.
 
         ``refused_stale`` and ``already_in_state`` rows are returned rather
         than filtered: an operator really did ask, and the answer they got is
@@ -4022,6 +4058,13 @@ class HoldStore:
         read uses, and validates the database-wide receipt graph once, so a
         deleted or forged row is reported as corrupt instead of rendered as
         history.
+
+        The page bounds rows RETURNED, not work done: that validation hashes
+        the complete receipt set, exactly as turn-start ``get_effective`` and
+        every mutation already do, because the external anchor is a whole-set
+        digest. Making the anchor incremental changes the custody evidence
+        format and is #3321; skipping the check here instead would render a
+        forged or deleted row as history.
 
         A backend that cannot answer raises :class:`HoldStateError`, never a
         raw ``DatabaseError``. The evidence protocol itself talks to both
@@ -4066,13 +4109,9 @@ class HoldStore:
                 ) from exc
             raise
         has_more = len(rows) > limit
-        receipts = tuple(_receipt_from_row(row) for row in rows[:limit])
-        next_key = (
-            (receipts[-1].occurred_at, receipts[-1].receipt_id)
-            if has_more and receipts
-            else None
-        )
-        return HoldReceiptPage(receipts=receipts, next_key=next_key)
+        entries = tuple(_feed_entry_from_row(row) for row in rows[:limit])
+        next_key = entries[-1].feed_seq if has_more and entries else None
+        return HoldReceiptPage(entries=entries, next_key=next_key)
 
     async def _read_receipt_page(
         self,
@@ -4081,20 +4120,20 @@ class HoldStore:
         until: Optional[datetime],
         scope: Optional[HoldScope],
         target_id: Optional[str],
-        after: Optional[tuple[str, str]],
+        after: Optional[int],
         limit: int,
     ) -> tuple[Any, ...]:
-        filters = ["1 = 1"]
+        filters = ["feed_seq IS NOT NULL"]
         params: list[Any] = []
         if since is not None:
             filters.append("occurred_at >= ?")
             params.append(
-                database_timestamp_bound_text(self._db, since, round_up=False)
+                database_timestamp_bound_text(self._db, since)
             )
         if until is not None:
             filters.append("occurred_at < ?")
             params.append(
-                database_timestamp_bound_text(self._db, until, round_up=True)
+                database_timestamp_bound_text(self._db, until)
             )
         if scope is not None:
             filters.append("scope = ?")
@@ -4104,19 +4143,17 @@ class HoldStore:
             params.append(target_id)
         if after is not None:
             # Strict keyset successor: a page boundary can neither repeat a
-            # receipt nor skip one sharing its ``occurred_at``.
-            filters.append(
-                "(occurred_at > ? OR (occurred_at = ? AND receipt_id > ?))"
-            )
-            params.extend((after[0], after[0], after[1]))
+            # receipt nor skip one.
+            filters.append("feed_seq > ?")
+            params.append(after)
         # One row beyond the page so a cursor is issued only when more history
         # actually exists.
         params.append(limit + 1)
         return tuple(
             await self._db.fetchall(
-                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+                f"SELECT {_RECEIPT_COLUMNS}, feed_seq FROM hold_receipts "
                 f"WHERE {' AND '.join(filters)} "
-                "ORDER BY occurred_at, receipt_id LIMIT ?",
+                "ORDER BY feed_seq LIMIT ?",
                 tuple(params),
             )
         )
@@ -4139,6 +4176,16 @@ class HoldStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
                 (key,),
             )
+
+    async def _lock_write_history(self) -> None:
+        """Take PostgreSQL's exclusive receipt-history slot until commit."""
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        await self._db.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            (_HISTORY_LOCK_KEY,),
+        )
 
     async def _lock_read_history(self) -> None:
         """Stabilize PostgreSQL's global receipt set before inspecting it."""
@@ -4398,6 +4445,10 @@ class HoldStore:
         receipt_id: Optional[str] = None,
     ) -> HoldReceipt:
         receipt_id = receipt_id or str(uuid4())
+        # ``feed_seq`` is deliberately absent: the insert trigger allocates it
+        # under the exclusive history lock (PostgreSQL) or the ``BEGIN
+        # IMMEDIATE`` writer slot (SQLite), which every caller already holds
+        # until commit, so the position is commit-ordered (#3159 R6).
         now_sql = database_now_sql(self._db)
         await self._db.execute(
             "INSERT INTO hold_receipts ("

@@ -38,10 +38,7 @@ from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
 )
-from kestrel_sovereign.agent.turn_outcome import (
-    publish_turn_outcome,
-    resolve_turn_outcome,
-)
+from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
@@ -49,7 +46,6 @@ from kestrel_sovereign.telemetry import (
     OI_SPAN_KIND_CHAIN,
     capture_turn_ids,
     start_span,
-    end_turn_span,
 )
 
 
@@ -1209,11 +1205,13 @@ class StreamingMixin:
                 # Synchronous only: this also runs while `GeneratorExit` is
                 # propagating, where an await would raise RuntimeError and
                 # swallow the very exit it is here to record.
-                outcome = resolve_turn_outcome(self, _turn_error)
-                end_turn_span(_otel_span, outcome, error=_turn_error)
-                publish_turn_outcome(
-                    self, _turn_ids[0] if _turn_ids else None, outcome
-                )
+                try:
+                    settle_turn_outcome(
+                        self, _otel_span, _turn_ids, _turn_error
+                    )
+                finally:
+                    if _otel_span is not None:
+                        _otel_span.end()
 
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,

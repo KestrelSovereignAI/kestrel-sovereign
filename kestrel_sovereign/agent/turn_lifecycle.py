@@ -354,11 +354,26 @@ class TurnLifecycleMixin:
     def add_turn_outcome_listener(self, listener) -> None:
         """Subscribe a feature-owned turn root to this agent's turn outcomes.
 
-        The listener is called ``listener(turn_id, outcome)`` on EVERY exit of
-        a turn that reached the lifecycle — including the cancel paths that
-        skip the SDK ``Stop`` hook, which is why a feature cannot derive this
-        for itself (#3159). ``outcome`` is a ``str`` enum member, so a consumer
-        may compare it to the plain strings without importing core.
+        The contract (#3159), for the consumer kestrel-feature-observability
+        #118, which reaches it duck-typed and never imports core:
+
+        * **When.** ``listener(turn_id, outcome)`` is called exactly once per
+          turn whose lifecycle minted a turn address, on EVERY exit — normal
+          return, early return, exception, ``CancelledError``, and the stream
+          close paths that skip the SDK ``Stop`` hook, which is why a feature
+          cannot derive this for itself. It runs in the turn entry point's own
+          ``finally``, after the core turn span carries the same outcome. A
+          turn refused before its address existed has no ``turn_id`` and is
+          not published.
+        * **Synchronous.** The call is not awaited, because it also runs while
+          ``GeneratorExit`` propagates, where an ``await`` would raise. A
+          listener must not block and must not schedule work on the turn.
+        * **Never raises into the turn.** An exception from a listener is
+          logged and swallowed; the turn's own exit is unchanged.
+
+        ``outcome`` is a ``str`` enum member, so a consumer may compare it to
+        the plain strings (``completed``/``failed``/``stopped``/
+        ``disconnected``/``interrupted``) without importing core.
         """
 
         if not callable(listener):

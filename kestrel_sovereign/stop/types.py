@@ -95,25 +95,17 @@ class StopRequest:
             raise ValueError(
                 f"{self.scope.value} Stop requires the owning agent identity"
             )
-        if self.scope is StopScope.AGENT:
-            # #3159 R3: an agent-scope receipt must be able to say WHICH agent
-            # was stopped. Its ``target`` is durably recorded only as an
-            # unkeyed digest — correct for the caller-supplied, process-private
-            # request ids and turn handles that column was built for, and
-            # useless for reading a receipt back. The agent identity is the
-            # target itself, so default it here rather than making every door
-            # repeat the address; supplying a different one is a caller bug,
-            # not a second addressing mode.
-            if self.target_agent_id is None:
-                object.__setattr__(self, "target_agent_id", self.target)
-            elif self.target_agent_id != self.target:
-                raise ValueError(
-                    "agent Stop owning agent must match its target identity"
-                )
-        elif self.scope is StopScope.HOST and self.target_agent_id is not None:
-            raise ValueError(
-                "host Stop cannot carry a separate owning agent"
-            )
+        if self.scope is StopScope.HOST and self.target_agent_id is not None:
+            raise ValueError("host Stop cannot carry a separate owning agent")
+        if self.scope is StopScope.AGENT and self.target_agent_id is not None and (
+            not isinstance(self.target_agent_id, str)
+            or not self.target_agent_id.strip()
+        ):
+            # #3159 R3: for agent scope this is the DID the authority RESOLVED
+            # ``target`` to, recorded so a receipt can say which agent it
+            # stopped. ``target`` may be a routing name, so the two may differ;
+            # only :class:`CancellationAuthority` sets it, from its inventory.
+            raise ValueError("agent Stop resolved identity must be concrete")
         if self.reason is not None and (
             not isinstance(self.reason, str) or not self.reason.strip()
         ):
