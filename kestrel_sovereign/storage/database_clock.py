@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -25,6 +25,45 @@ def database_now_sql(db: Any) -> str:
     if backend_type == "sqlite":
         return "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
     raise RuntimeError("database statement clock is unavailable for this backend")
+
+
+def database_timestamp_bound_text(
+    db: Any,
+    value: datetime,
+    *,
+    round_up: bool,
+) -> str:
+    """Render one instant in the exact text shape this backend's clock writes.
+
+    Receipt ``occurred_at`` columns are written by :func:`database_now_sql`, so
+    every row in one database shares a fixed-width UTC format and therefore
+    orders lexicographically. A filter bound must be rendered in that SAME
+    width or it compares wrongly at the boundary: SQLite stores milliseconds,
+    and the text ``...:00.500+00:00`` sorts BELOW a six-digit
+    ``...:00.500000+00:00`` bound even though both name one instant.
+
+    ``round_up`` resolves precision the backend cannot store: an inclusive
+    lower bound truncates and an exclusive upper bound rounds up, so neither
+    can drop a row that belongs inside the window.
+    """
+
+    backend_type = database_backend_type(db)
+    utc = (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
+    if backend_type == "postgres":
+        # Microsecond precision is exactly what a ``datetime`` carries.
+        return utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "+00:00"
+    if backend_type != "sqlite":
+        raise RuntimeError(
+            "database statement clock is unavailable for this backend"
+        )
+    remainder = utc.microsecond % 1000
+    if round_up and remainder:
+        utc = utc + timedelta(microseconds=1000 - remainder)
+    return f"{utc.strftime('%Y-%m-%dT%H:%M:%S')}.{utc.microsecond // 1000:03d}+00:00"
 
 
 async def database_clock(db: Any) -> datetime:
@@ -65,4 +104,9 @@ async def database_clock(db: Any) -> datetime:
     )
 
 
-__all__ = ["database_backend_type", "database_clock", "database_now_sql"]
+__all__ = [
+    "database_backend_type",
+    "database_clock",
+    "database_now_sql",
+    "database_timestamp_bound_text",
+]

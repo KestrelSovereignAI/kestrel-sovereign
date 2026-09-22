@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
 from kestrel_sovereign.agent.invocation import validate_invocation_id
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql,
+    database_timestamp_bound_text,
+)
+from kestrel_sovereign.storage.db.interface import DatabaseError
 
 from .types import StopOutcome, StopRequest
 
@@ -45,6 +50,47 @@ class StopOperationClaim:
     operation_id: str
     request_fingerprint: str
     claim_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptOutcomeRecord:
+    """One per-target outcome read back WITHOUT the originating request.
+
+    ``resolved_target`` and ``agent_id`` are ``None`` when the row holds only
+    the blinded digest of a caller-supplied address. A reader has no key to
+    reverse it, and presenting a digest as an identity would invent one the
+    receipt never recorded (#3159 R3).
+    """
+
+    ordinal: int
+    resolved_target: str | None
+    agent_id: str | None
+    disposition: str
+    detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptRecord:
+    """One immutable Stop receipt as the sovereign read surface renders it."""
+
+    receipt_id: str
+    scope: str
+    actor_id: str
+    target_agent_id: str | None
+    reason: str | None
+    cascade: bool
+    occurred_at: str
+    span_id: str | None
+    trace_id: str | None
+    outcomes: tuple[StopReceiptOutcomeRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptPage:
+    """One bounded page plus the keyset position that continues it."""
+
+    receipts: tuple[StopReceiptRecord, ...]
+    next_key: tuple[str, str] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +249,13 @@ class StopReceiptStore:
                 "CREATE INDEX IF NOT EXISTS idx_stop_receipts_target "
                 "ON stop_receipts(scope, requested_target, occurred_at, receipt_id)"
             )
+            # The exact order the sovereign receipt feed pages in (#3159 R2/R6).
+            # Without it every poll of the history route is a full scan plus a
+            # sort of the whole table.
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stop_receipts_occurred_at "
+                "ON stop_receipts(occurred_at, receipt_id)"
+            )
 
     async def _lock_operation(self, operation_id: str) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
@@ -258,6 +311,214 @@ class StopReceiptStore:
             (agent_id, _identifier_digest("target", turn_id)),
         )
         return row is not None
+
+    async def list_receipts(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        agent_id: str | None = None,
+        trace_id: str | None = None,
+        after: tuple[str, str] | None = None,
+        limit: int,
+    ) -> StopReceiptPage:
+        """Read one bounded page of immutable Stop evidence, oldest first.
+
+        Ordering is ``(occurred_at, receipt_id)`` on the DATABASE clock, which
+        is total over immutable rows. That is what makes the feed converge
+        under late or out-of-order telemetry: the same window always yields the
+        same rows in the same order however a consumer walked to it (#3159 R6).
+
+        ``agent_id`` matches the receipt's own recorded target agent OR any of
+        its per-target outcomes, so a host-scope fan-out — whose header names
+        no single agent — is still findable by the agent it reached.
+
+        A backend that cannot answer raises :class:`StopReceiptError`, never a
+        raw ``DatabaseError``: the caller's promise is a 503 saying the history
+        is unreadable, and an untyped backend failure would escape that
+        translation and arrive as a sanitized 500 instead.
+        """
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("Stop receipt page size must be a positive integer")
+
+        try:
+            return await self._read_receipt_page(
+                since=since,
+                until=until,
+                agent_id=agent_id,
+                trace_id=trace_id,
+                after=after,
+                limit=limit,
+            )
+        except StopReceiptError:
+            # Corruption and conflict are already the precise answer. Only an
+            # untyped backend failure needs a name.
+            raise
+        except DatabaseError as error:
+            raise StopReceiptError(
+                "Durable Stop evidence could not be read"
+            ) from error
+
+    async def _read_receipt_page(
+        self,
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        agent_id: str | None,
+        trace_id: str | None,
+        after: tuple[str, str] | None,
+        limit: int,
+    ) -> StopReceiptPage:
+        filters = ["1 = 1"]
+        params: list[Any] = []
+        if since is not None:
+            filters.append("receipt.occurred_at >= ?")
+            params.append(
+                database_timestamp_bound_text(self._db, since, round_up=False)
+            )
+        if until is not None:
+            filters.append("receipt.occurred_at < ?")
+            params.append(
+                database_timestamp_bound_text(self._db, until, round_up=True)
+            )
+        if trace_id is not None:
+            filters.append("receipt.trace_id = ?")
+            params.append(trace_id)
+        if agent_id is not None:
+            filters.append(
+                "(receipt.target_agent_id = ? OR EXISTS ("
+                "SELECT 1 FROM stop_receipt_outcomes AS scoped "
+                "WHERE scoped.receipt_id = receipt.receipt_id "
+                "AND scoped.agent_id = ?))"
+            )
+            params.extend((agent_id, agent_id))
+        if after is not None:
+            # Strict keyset successor, so a page boundary can neither repeat a
+            # receipt nor skip one that shares an ``occurred_at`` with it.
+            filters.append(
+                "(receipt.occurred_at > ? OR "
+                "(receipt.occurred_at = ? AND receipt.receipt_id > ?))"
+            )
+            params.extend((after[0], after[0], after[1]))
+
+        # One row over the page so the cursor is emitted only when more
+        # evidence actually exists.
+        params.append(limit + 1)
+        rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts AS receipt "
+            f"WHERE {' AND '.join(filters)} "
+            "ORDER BY receipt.occurred_at, receipt.receipt_id LIMIT ?",
+            tuple(params),
+        )
+        rows = tuple(rows)
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        receipts = [
+            await self._record_from_row(row) for row in page_rows
+        ]
+        next_key = (
+            (receipts[-1].occurred_at, receipts[-1].receipt_id)
+            if has_more and receipts
+            else None
+        )
+        return StopReceiptPage(receipts=tuple(receipts), next_key=next_key)
+
+    async def _record_from_row(self, row: Any) -> StopReceiptRecord:
+        """Project one stored receipt WITHOUT its originating request.
+
+        :meth:`_receipt_from_row` exists to prove a retry against the request
+        that produced it. A history reader has no such request, so this path
+        validates the row's own shape and deliberately makes no attempt to
+        de-blind an opaque address.
+        """
+
+        if row is None or len(row) != 13:
+            raise StopReceiptCorruptError(
+                "Stop receipt row has an unexpected shape"
+            )
+        receipt_id = _required_text(row[0], "receipt_id")
+        scope = _required_text(row[3], "scope")
+        if scope not in {"host", "agent", "turn", "tool_call"}:
+            raise StopReceiptCorruptError("Stop receipt scope is invalid")
+        try:
+            cascade_int = int(row[8])
+        except (TypeError, ValueError) as error:
+            raise StopReceiptCorruptError(
+                "Stop receipt cascade flag is invalid"
+            ) from error
+        if cascade_int not in (0, 1):
+            raise StopReceiptCorruptError("Stop receipt cascade flag is invalid")
+        for field_name, value in (
+            ("target_agent_id", row[6]),
+            ("reason", row[7]),
+            ("span_id", row[11]),
+            ("trace_id", row[12]),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise StopReceiptCorruptError(
+                    f"Stop receipt {field_name} is invalid"
+                )
+        outcome_rows = await self._db.fetchall(
+            f"SELECT {_OUTCOME_COLUMNS} FROM stop_receipt_outcomes "
+            "WHERE receipt_id = ? ORDER BY ordinal",
+            (receipt_id,),
+        )
+        outcomes: list[StopReceiptOutcomeRecord] = []
+        for expected_ordinal, outcome_row in enumerate(outcome_rows):
+            if outcome_row is None or len(outcome_row) != 6:
+                raise StopReceiptCorruptError(
+                    "Stop outcome row has an unexpected shape"
+                )
+            try:
+                ordinal = int(outcome_row[1])
+            except (TypeError, ValueError) as error:
+                raise StopReceiptCorruptError(
+                    "Stop outcome ordinal is invalid"
+                ) from error
+            if ordinal != expected_ordinal:
+                raise StopReceiptCorruptError(
+                    "Stop outcome order is not contiguous"
+                )
+            disposition = _required_text(outcome_row[4], "outcome disposition")
+            if disposition not in {
+                "stopped",
+                "already_complete",
+                "refused",
+                "unreachable",
+            }:
+                raise StopReceiptCorruptError(
+                    "Stop outcome disposition is invalid"
+                )
+            outcomes.append(
+                StopReceiptOutcomeRecord(
+                    ordinal=ordinal,
+                    resolved_target=_required_text(
+                        outcome_row[2], "outcome resolved_target"
+                    ),
+                    agent_id=_required_text(outcome_row[3], "outcome agent_id"),
+                    disposition=disposition,
+                    detail=outcome_row[5],
+                )
+            )
+        if not outcomes:
+            raise StopReceiptCorruptError(
+                "Stop receipt is missing its target outcome"
+            )
+        return StopReceiptRecord(
+            receipt_id=receipt_id,
+            scope=scope,
+            actor_id=_required_text(row[4], "actor_id"),
+            target_agent_id=row[6],
+            reason=row[7],
+            cascade=bool(cascade_int),
+            occurred_at=_required_text(row[9], "occurred_at"),
+            span_id=row[11],
+            trace_id=row[12],
+            outcomes=tuple(outcomes),
+        )
 
     async def claim(
         self,
@@ -695,6 +956,11 @@ class UnavailableStopReceiptStore:
     ) -> StopReceipt:
         raise StopReceiptError(self._reason)
 
+    async def list_receipts(self, **_kwargs: Any) -> StopReceiptPage:
+        # A history nobody can read is reported as unreadable, never as an
+        # empty history (#3159 R2).
+        raise StopReceiptError(self._reason)
+
 
 __all__ = [
     "StopReceipt",
@@ -702,6 +968,9 @@ __all__ = [
     "StopReceiptConflict",
     "StopReceiptCorruptError",
     "StopReceiptError",
+    "StopReceiptOutcomeRecord",
+    "StopReceiptPage",
+    "StopReceiptRecord",
     "StopReceiptStore",
     "UnavailableStopReceiptStore",
 ]

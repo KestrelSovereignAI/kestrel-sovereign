@@ -43,7 +43,11 @@ from kestrel_sovereign.private_storage import (
     open_private_file_for_validation,
     path_exists,
 )
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql,
+    database_timestamp_bound_text,
+)
+from kestrel_sovereign.storage.db.interface import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -1010,6 +1014,20 @@ class HoldReceipt:
 class HoldMutation:
     receipt: HoldReceipt
     current: Optional[HoldState]
+
+
+@dataclass(frozen=True)
+class HoldReceiptPage:
+    """One bounded page of immutable Hold history plus its continuation.
+
+    Hold history is append-only and is the ONLY record of a resume: the latch
+    row is blanked on release, so a released hold survives nowhere else. A
+    resume is therefore its own ``action='release'`` receipt linked to the hold
+    it ended, never a mutation of the hold event (#3159 R5).
+    """
+
+    receipts: tuple[HoldReceipt, ...]
+    next_key: Optional[tuple[str, str]]
 
 
 def hold_latch_payload(latch: Optional[HoldState]) -> Optional[dict[str, Any]]:
@@ -3640,6 +3658,12 @@ class HoldStore:
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
+            # The exact order the sovereign receipt feed pages in (#3159 R2/R6):
+            # one fleet-wide history, oldest first, without a full sort.
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hold_receipts_occurred_at "
+                "ON hold_receipts(occurred_at, receipt_id)"
+            )
             await self._db.execute(
                 "CREATE TABLE IF NOT EXISTS hold_receipt_witnesses ("
                 "scope TEXT NOT NULL, "
@@ -3977,6 +4001,125 @@ class HoldStore:
                     "Hold boot validators disagree on active latch state"
                 )
             return validated
+
+    async def list_receipts(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        scope: Optional[HoldScope] = None,
+        target_id: Optional[str] = None,
+        after: Optional[tuple[str, str]] = None,
+        limit: int,
+    ) -> HoldReceiptPage:
+        """Read one bounded page of Hold history, oldest first.
+
+        ``refused_stale`` and ``already_in_state`` rows are returned rather
+        than filtered: an operator really did ask, and the answer they got is
+        part of the history they are reading (#3159 R5).
+
+        The page is taken inside the same evidence protocol every other live
+        read uses, and validates the database-wide receipt graph once, so a
+        deleted or forged row is reported as corrupt instead of rendered as
+        history.
+
+        A backend that cannot answer raises :class:`HoldStateError`, never a
+        raw ``DatabaseError``. The evidence protocol itself talks to both
+        databases, so the translation wraps it too: the caller's promise is a
+        503 saying the history is unreadable, and an untyped backend failure
+        would escape that and arrive as a sanitized 500.
+        """
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("Hold receipt page size must be a positive integer")
+        if scope is not None and not isinstance(scope, HoldScope):
+            raise TypeError("Hold receipt scope filter must be a HoldScope")
+        if target_id is not None and (
+            not isinstance(target_id, str) or not target_id.strip()
+        ):
+            raise ValueError("Hold receipt target filter must be a concrete id")
+
+        try:
+            async with self._evidence_protocol():
+                async with self._db.transaction():
+                    await self._lock_read_history()
+                    await self._assert_global_history_intact()
+                    rows = await self._read_receipt_page(
+                        since=since,
+                        until=until,
+                        scope=scope,
+                        target_id=target_id,
+                        after=after,
+                        limit=limit,
+                    )
+        except Exception as exc:
+            # Corruption stays corruption: it is a HoldStateError subclass and
+            # is recovered from the chain before anything is renamed.
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                if domain_error is exc:
+                    raise
+                raise domain_error from exc
+            if isinstance(exc, DatabaseError):
+                raise HoldStateError(
+                    "Hold receipt history could not be read"
+                ) from exc
+            raise
+        has_more = len(rows) > limit
+        receipts = tuple(_receipt_from_row(row) for row in rows[:limit])
+        next_key = (
+            (receipts[-1].occurred_at, receipts[-1].receipt_id)
+            if has_more and receipts
+            else None
+        )
+        return HoldReceiptPage(receipts=receipts, next_key=next_key)
+
+    async def _read_receipt_page(
+        self,
+        *,
+        since: Optional[datetime],
+        until: Optional[datetime],
+        scope: Optional[HoldScope],
+        target_id: Optional[str],
+        after: Optional[tuple[str, str]],
+        limit: int,
+    ) -> tuple[Any, ...]:
+        filters = ["1 = 1"]
+        params: list[Any] = []
+        if since is not None:
+            filters.append("occurred_at >= ?")
+            params.append(
+                database_timestamp_bound_text(self._db, since, round_up=False)
+            )
+        if until is not None:
+            filters.append("occurred_at < ?")
+            params.append(
+                database_timestamp_bound_text(self._db, until, round_up=True)
+            )
+        if scope is not None:
+            filters.append("scope = ?")
+            params.append(scope.value)
+        if target_id is not None:
+            filters.append("target_id = ?")
+            params.append(target_id)
+        if after is not None:
+            # Strict keyset successor: a page boundary can neither repeat a
+            # receipt nor skip one sharing its ``occurred_at``.
+            filters.append(
+                "(occurred_at > ? OR (occurred_at = ? AND receipt_id > ?))"
+            )
+            params.extend((after[0], after[0], after[1]))
+        # One row beyond the page so a cursor is issued only when more history
+        # actually exists.
+        params.append(limit + 1)
+        return tuple(
+            await self._db.fetchall(
+                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+                f"WHERE {' AND '.join(filters)} "
+                "ORDER BY occurred_at, receipt_id LIMIT ?",
+                tuple(params),
+            )
+        )
 
     async def _lock_operation_and_target(
         self, operation_id: str, scope: HoldScope, target_id: str

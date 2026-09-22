@@ -38,13 +38,18 @@ from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
 )
+from kestrel_sovereign.agent.turn_outcome import (
+    publish_turn_outcome,
+    resolve_turn_outcome,
+)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
+    capture_turn_ids,
     start_span,
-    end_span,
+    end_turn_span,
 )
 
 
@@ -1147,42 +1152,68 @@ class StreamingMixin:
             "agent.streaming": True,
         })
 
-        try:
-            # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
-            # transition lock — is the deadlock-freedom invariant. The in-turn
-            # `!privacy` path runs inside process_input, which already holds
-            # CONVERSATION and then acquires the transition lock; acquiring in the
-            # same order here means no two callers can take this pair in opposite
-            # directions (the AB-BA wedge this replaces, where streaming took the
-            # transition lock first and then blocked on CONVERSATION).
-            async with self._turn_lifecycle():
-                # `start_span` precedes lifecycle acquisition so setup failures
-                # remain observable. Bind its concrete identity only once the
-                # canonical turn address exists; a feature-owned turn root may
-                # supersede this optional correlation at USER_PROMPT_SUBMIT.
-                self.bind_current_turn_span(_otel_span)
-                safe_mode_block = safe_mode_cognition_block(self, user_input)
-                if safe_mode_block is not None:
-                    yield safe_mode_block
-                    return
-                transition_lock = self._get_privacy_transition_lock()
-                async with transition_lock:
-                    # #1914: bind a per-turn part buffer so tools/features can
-                    # ``emit_part`` typed component bubbles; the orchestrator
-                    # drains it into PART sentinels at the point each tool ran.
-                    with part_collector():
-                        async for chunk in self._process_input_streaming_traced_locked(
-                            user_input, model_override, session_id, _otel_span,
-                            request_id=request_id, attachments=attachments,
-                            invocation_context=invocation_context,
-                        ):
-                            yield chunk
-        except Exception as exc:
-            end_span(_otel_span, error=exc)
-            raise
-        else:
-            end_span(_otel_span)
-            return
+        # #3159: EVERY exit ends this span, and says how the turn ended.
+        #
+        # The pair this replaces was `except Exception` / `else`, which missed
+        # three whole classes of exit: `CancelledError` (what a hard Stop or a
+        # host shutdown raises), `GeneratorExit` (what a consumer that walked
+        # away raises), and the safe-mode early `return` below — because a
+        # `return` inside `try` skips `else`. Each of those left the span open
+        # and unexported, so a stopped turn and a disconnected one both read as
+        # "nothing arrived".
+        #
+        # `capture_turn_ids` records the canonical turn address as the
+        # lifecycle mints it, which is the only way to still know it out here:
+        # the lifecycle resets that scope on the way out, and the durable
+        # pre-admission Stop raises from INSIDE it, after the address exists.
+        _turn_error: BaseException | None = None
+        with capture_turn_ids() as _turn_ids:
+            try:
+                # Lock order — CONVERSATION (via _turn_lifecycle) BEFORE the privacy
+                # transition lock — is the deadlock-freedom invariant. The in-turn
+                # `!privacy` path runs inside process_input, which already holds
+                # CONVERSATION and then acquires the transition lock; acquiring in the
+                # same order here means no two callers can take this pair in opposite
+                # directions (the AB-BA wedge this replaces, where streaming took the
+                # transition lock first and then blocked on CONVERSATION).
+                async with self._turn_lifecycle():
+                    # `start_span` precedes lifecycle acquisition so setup failures
+                    # remain observable. Bind its concrete identity only once the
+                    # canonical turn address exists; a feature-owned turn root may
+                    # supersede this optional correlation at USER_PROMPT_SUBMIT.
+                    self.bind_current_turn_span(_otel_span)
+                    safe_mode_block = safe_mode_cognition_block(self, user_input)
+                    if safe_mode_block is not None:
+                        # A refusal the agent delivered is a turn that ran to
+                        # its own end, so it is `completed` — the outcome
+                        # separates HOW a turn ended, not whether its answer
+                        # was the one the caller wanted.
+                        yield safe_mode_block
+                        return
+                    transition_lock = self._get_privacy_transition_lock()
+                    async with transition_lock:
+                        # #1914: bind a per-turn part buffer so tools/features can
+                        # ``emit_part`` typed component bubbles; the orchestrator
+                        # drains it into PART sentinels at the point each tool ran.
+                        with part_collector():
+                            async for chunk in self._process_input_streaming_traced_locked(
+                                user_input, model_override, session_id, _otel_span,
+                                request_id=request_id, attachments=attachments,
+                                invocation_context=invocation_context,
+                            ):
+                                yield chunk
+            except BaseException as exc:
+                _turn_error = exc
+                raise
+            finally:
+                # Synchronous only: this also runs while `GeneratorExit` is
+                # propagating, where an await would raise RuntimeError and
+                # swallow the very exit it is here to record.
+                outcome = resolve_turn_outcome(self, _turn_error)
+                end_turn_span(_otel_span, outcome, error=_turn_error)
+                publish_turn_outcome(
+                    self, _turn_ids[0] if _turn_ids else None, outcome
+                )
 
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,

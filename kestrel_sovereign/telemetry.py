@@ -16,6 +16,7 @@ import logging
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from enum import Enum
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,95 @@ def end_span(span, error: Optional[Exception] = None):
         span.set_status(StatusCode.ERROR, str(error))
         span.record_exception(error)
     span.end()
+
+
+# ---------------------------------------------------------------------------
+# How a turn ENDED (issue #3159)
+#
+# A turn span that simply stops emitting says nothing: a cooperative Stop, a
+# client that walked away, and a host shutdown all used to read as "nothing
+# arrived", while a pre-admission Stop read as a failure. The outcome below is
+# the one attribute that distinguishes them, and it is computed from the
+# request lifecycle's own record rather than from the exception type — a Stop
+# and a disconnect can both surface as ``CancelledError``.
+# ---------------------------------------------------------------------------
+
+KESTREL_TURN_OUTCOME = "kestrel.turn.outcome"
+
+
+class TurnOutcome(str, Enum):
+    """The truthful terminal disposition of one cognition turn."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STOPPED = "stopped"
+    DISCONNECTED = "disconnected"
+    INTERRUPTED = "interrupted"
+
+
+def annotate_turn_outcome(span, outcome: "TurnOutcome", *, error=None) -> None:
+    """Stamp ``kestrel.turn.outcome`` and the status that outcome implies.
+
+    Only ``failed`` is an ERROR. A stopped turn did exactly what an operator
+    asked of it, a disconnected turn lost its reader, and an interrupted turn
+    was cancelled by neither — marking any of them ERROR would put an operator
+    act, a browser tab closing, and a bug in one bucket. The exception is
+    recorded only for ``failed`` for the same reason.
+    """
+
+    if span is None:
+        return
+    if not isinstance(outcome, TurnOutcome):
+        raise TypeError("turn outcome must be a TurnOutcome")
+    set_attribute = getattr(span, "set_attribute", None)
+    if callable(set_attribute):
+        set_attribute(KESTREL_TURN_OUTCOME, outcome.value)
+    if outcome is not TurnOutcome.FAILED:
+        return
+    if _OTEL_AVAILABLE:
+        span.set_status(StatusCode.ERROR, str(error) if error is not None else "")
+    if error is not None:
+        record_exception = getattr(span, "record_exception", None)
+        if callable(record_exception):
+            record_exception(error)
+
+
+def end_turn_span(span, outcome: "TurnOutcome", *, error=None) -> None:
+    """Annotate and end a caller-owned turn span on EVERY exit path."""
+
+    if span is None:
+        return
+    annotate_turn_outcome(span, outcome, error=error)
+    span.end()
+
+
+@contextmanager
+def turn_span(name: str, attributes: Optional[Dict[str, Any]] = None):
+    """A current-context turn span whose OUTCOME, not its exception, sets status.
+
+    ``optional_span`` lets OpenTelemetry mark any escaping ``BaseException`` as
+    ERROR. For a turn that is wrong: the pre-admission Stop path raises, and a
+    stopped turn is not a failed one. The span is still ended on every exit —
+    including ``BaseException`` — by the underlying context manager; the caller
+    supplies the outcome through :func:`annotate_turn_outcome` before it exits.
+    """
+
+    tracer = get_tracer()
+    if tracer is None:
+        yield None
+        return
+
+    with tracer.start_as_current_span(
+        name,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        effective_attributes = dict(attributes or {})
+        effective_attributes.update(current_turn_span_attributes())
+        for key, value in effective_attributes.items():
+            if value is not None:
+                span.set_attribute(key, value)
+        yield span
 
 
 # ---------------------------------------------------------------------------

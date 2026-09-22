@@ -340,6 +340,40 @@ class TurnLifecycleMixin:
 
         return dict(self._turn_trace_index())
 
+    def _turn_outcome_listener_registry(self) -> list:
+        """Return the outcome listener list, creating it for test doubles."""
+
+        listeners = getattr(self, "_turn_outcome_listeners", None)
+        if listeners is None:
+            listeners = []
+            self._turn_outcome_listeners = listeners
+        if not isinstance(listeners, list):
+            raise TypeError("turn outcome listener registry has an invalid type")
+        return listeners
+
+    def add_turn_outcome_listener(self, listener) -> None:
+        """Subscribe a feature-owned turn root to this agent's turn outcomes.
+
+        The listener is called ``listener(turn_id, outcome)`` on EVERY exit of
+        a turn that reached the lifecycle — including the cancel paths that
+        skip the SDK ``Stop`` hook, which is why a feature cannot derive this
+        for itself (#3159). ``outcome`` is a ``str`` enum member, so a consumer
+        may compare it to the plain strings without importing core.
+        """
+
+        if not callable(listener):
+            raise TypeError("turn outcome listener must be callable")
+        listeners = self._turn_outcome_listener_registry()
+        if listener not in listeners:
+            listeners.append(listener)
+
+    def remove_turn_outcome_listener(self, listener) -> None:
+        """Unsubscribe a listener; unknown listeners are a no-op."""
+
+        listeners = self._turn_outcome_listener_registry()
+        if listener in listeners:
+            listeners.remove(listener)
+
     def _unregister_turn_request_id(
         self,
         turn_id: str,

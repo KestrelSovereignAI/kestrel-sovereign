@@ -15,13 +15,22 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     sovereign_actor_id,
+)
+from kestrel_sovereign.endpoints.receipt_feed import (
+    MAX_RECEIPT_CURSOR_LENGTH,
+    MAX_RECEIPT_PAGE_SIZE,
+    RECEIPT_FEED_SCHEMA_VERSION,
+    decode_cursor,
+    encode_cursor,
+    parse_time_bound,
+    resolve_page_size,
 )
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
@@ -296,6 +305,83 @@ async def host_hold_state(request: Request, response: Response):
     }
 
 
+@router.get("/hold/receipts")
+async def host_hold_receipts(
+    request: Request,
+    response: Response,
+    since: Annotated[str | None, Query(max_length=64)] = None,
+    until: Annotated[str | None, Query(max_length=64)] = None,
+    scope: HoldScope | None = None,
+    agent_id: Annotated[
+        str | None, Query(min_length=1, max_length=MAX_HOLD_TARGET_ID_LENGTH)
+    ] = None,
+    cursor: Annotated[
+        str | None, Query(min_length=1, max_length=MAX_RECEIPT_CURSOR_LENGTH)
+    ] = None,
+    limit: Annotated[int | None, Query(ge=1, le=MAX_RECEIPT_PAGE_SIZE)] = None,
+):
+    """Read the append-only Hold history a held agent's card is explained by.
+
+    ``GET /api/host/hold`` answers "what is latched NOW" and forgets
+    everything else: the latch row is blanked on release, so a hold that was
+    resumed survives only here. That makes this route the only place a resume
+    is legible — it is its own ``release`` receipt, linked by
+    ``prior_hold_receipt_id`` to the hold it ended, and it neither rewrites nor
+    erases that hold (#3159 R5).
+
+    Sovereign-only, matching ``POST /api/host/hold``. This deliberately does
+    not widen ``GET /api/host/hold``'s existing exposure; that surface is its
+    own ticket.
+    """
+
+    sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+
+    window_start = parse_time_bound(since, "since")
+    window_end = parse_time_bound(until, "until")
+    if (
+        window_start is not None
+        and window_end is not None
+        and window_end <= window_start
+    ):
+        raise ApiHTTPException(
+            status_code=400,
+            code="receipt_window_invalid",
+            message="until must be later than since.",
+        )
+    if agent_id is not None:
+        if scope is HoldScope.HOST:
+            raise ApiHTTPException(
+                status_code=400,
+                code="hold_request_invalid",
+                message="The host Hold scope takes no caller-chosen target.",
+            )
+        # Naming an agent means the agent latch, never the host one: a host
+        # hold is not that agent's receipt even though it holds that agent.
+        scope = HoldScope.AGENT
+
+    store = _hold_store(request)
+    try:
+        page = await store.list_receipts(
+            since=window_start,
+            until=window_end,
+            scope=scope,
+            target_id=agent_id,
+            after=decode_cursor(cursor),
+            limit=resolve_page_size(limit),
+        )
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
+        raise _refuse_store_failure(error) from error
+    return {
+        "schema_version": RECEIPT_FEED_SCHEMA_VERSION,
+        "receipts": [
+            hold_receipt_payload(receipt) for receipt in page.receipts
+        ],
+        "next_cursor": encode_cursor(page.next_key),
+    }
+
+
 @router.post("/hold")
 @hold_admission_rate_limit
 async def set_host_hold(request: Request, response: Response, body: HoldBody):
@@ -346,6 +432,7 @@ async def release_host_hold(
 __all__ = [
     "HoldBody",
     "HoldReleaseBody",
+    "host_hold_receipts",
     "host_hold_state",
     "release_host_hold",
     "router",

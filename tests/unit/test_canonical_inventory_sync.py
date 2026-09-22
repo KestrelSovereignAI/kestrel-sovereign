@@ -122,6 +122,10 @@ def test_endpoint_helpers_are_not_reported_as_router_files():
 
     assert "agent_helpers.py" not in router_files
     assert "closing_streaming_response.py" not in router_files
+    # Shared wire vocabulary for the two receipt-history doors (#3159); it
+    # mounts nothing, so naming it would advertise a surface that does not
+    # exist.
+    assert "receipt_feed.py" not in router_files
 
 
 def test_canonical_inventory_mentions_all_discoverable_feature_modules():

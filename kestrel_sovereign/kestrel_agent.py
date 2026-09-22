@@ -113,12 +113,19 @@ from kestrel_sovereign.security.input_guardrails import (
     check_prompt_injection,
     append_security_addendum,
 )
+from kestrel_sovereign.agent.turn_outcome import (
+    TurnOutcome,
+    publish_turn_outcome,
+    resolve_turn_outcome,
+)
 from kestrel_sovereign.telemetry import (
     KESTREL_AGENT_NAME,
     KESTREL_SESSION_ID,
     OI_SPAN_KIND,
     OI_SPAN_KIND_CHAIN,
+    annotate_turn_outcome,
     optional_span,
+    turn_span,
 )
 
 if TYPE_CHECKING:
@@ -6469,7 +6476,13 @@ Expected Duration: {expected_duration}
                     )
 
                 # --- OpenTelemetry span for the full request lifecycle ---
-                with optional_span("agent.process_input", {
+                # `turn_span` rather than `optional_span` (#3159): the turn's
+                # own outcome sets the status, because OpenTelemetry's default
+                # would mark the pre-admission Stop's InvocationCancelledError
+                # ERROR — reading a turn an operator deliberately stopped as a
+                # failure. The span is still ended on every exit, BaseException
+                # included, by the context manager itself.
+                with turn_span("agent.process_input", {
                     OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
                     KESTREL_AGENT_NAME: self.agent_name,
                     "agent.did": self.did,
@@ -6484,15 +6497,34 @@ Expected Duration: {expected_duration}
                     # authority. The observability feature may replace this with
                     # its dedicated turn-root span later in USER_PROMPT_SUBMIT.
                     self.bind_current_turn_span(_otel_span)
-                    # Lifecycle is already entered; call the locked body directly.
-                    return await self._process_input_traced_locked(
-                        user_input, model_override, session_id, _otel_span, include_memories,
-                        system_prompt_addendum=system_prompt_addendum,
-                        system_prompt_budget_bytes=system_prompt_budget_bytes,
-                        anchored_doctrine=anchored_doctrine,
-                        signal_wake=signal_wake,
-                        invocation_context=invocation_context,
-                    )
+                    _turn_id = self.get_current_turn_id()
+                    try:
+                        # Lifecycle is already entered; call the locked body
+                        # directly.
+                        response = await self._process_input_traced_locked(
+                            user_input, model_override, session_id, _otel_span,
+                            include_memories,
+                            system_prompt_addendum=system_prompt_addendum,
+                            system_prompt_budget_bytes=system_prompt_budget_bytes,
+                            anchored_doctrine=anchored_doctrine,
+                            signal_wake=signal_wake,
+                            invocation_context=invocation_context,
+                        )
+                    except BaseException as turn_error:
+                        # BaseException, not Exception: a Stop and a host
+                        # shutdown both arrive as CancelledError, and a turn
+                        # that ends without saying how is the defect #3159 was
+                        # filed for.
+                        outcome = resolve_turn_outcome(self, turn_error)
+                        annotate_turn_outcome(
+                            _otel_span, outcome, error=turn_error
+                        )
+                        publish_turn_outcome(self, _turn_id, outcome)
+                        raise
+                    outcome = resolve_turn_outcome(self, None)
+                    annotate_turn_outcome(_otel_span, outcome)
+                    publish_turn_outcome(self, _turn_id, outcome)
+                    return response
 
     def _assemble_post_build_system_prompt(
         self, base_system_prompt: str, context_result, *,

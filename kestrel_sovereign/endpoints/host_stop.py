@@ -4,13 +4,23 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     sovereign_actor_id,
+)
+from kestrel_sovereign.endpoints.receipt_feed import (
+    MAX_RECEIPT_CURSOR_LENGTH,
+    MAX_RECEIPT_PAGE_SIZE,
+    RECEIPT_FEED_SCHEMA_VERSION,
+    decode_cursor,
+    disclosable_identity,
+    encode_cursor,
+    parse_time_bound,
+    resolve_page_size,
 )
 from kestrel_sovereign.rate_limit import (
     stop_admission_rate_limit,
@@ -19,6 +29,8 @@ from kestrel_sovereign.stop import (
     MAX_STOP_CORRELATION_ID_BYTES,
     CooperativeStopTarget,
     StopCleanupRegistry,
+    StopReceiptError,
+    StopReceiptRecord,
     UnavailableStopReceiptStore,
     execute_fleet_stop,
     fleet_in_flight_count,
@@ -204,4 +216,117 @@ async def stop_host(
     )
 
 
-__all__ = ["HostStopBody", "host_stop_status", "router", "stop_host"]
+def _stop_receipt_payload(record: StopReceiptRecord) -> dict:
+    """Project one immutable receipt for the observability read surface.
+
+    The header answers actor / scope / reason / cascade / when / which agent;
+    the ordered outcomes answer what actually happened to each target. What it
+    deliberately does NOT do is present a blinded digest as an identity: a
+    pre-#3159 agent-scope row recorded no agent DID at all, and it reads back
+    as ``null`` — "agent not recorded" — rather than being recovered by
+    re-hashing the live inventory, which would guess an identity the receipt
+    never held.
+    """
+
+    return {
+        "receipt_id": record.receipt_id,
+        "scope": record.scope,
+        "actor_id": record.actor_id,
+        "target_agent_id": disclosable_identity(record.target_agent_id),
+        "reason": record.reason,
+        "cascade": record.cascade,
+        "occurred_at": record.occurred_at,
+        "trace_id": record.trace_id,
+        "span_id": record.span_id,
+        "outcomes": [
+            {
+                "ordinal": outcome.ordinal,
+                "disposition": outcome.disposition,
+                "detail": outcome.detail,
+                "agent_id": disclosable_identity(outcome.agent_id),
+                "resolved_target": disclosable_identity(outcome.resolved_target),
+            }
+            for outcome in record.outcomes
+        ],
+    }
+
+
+@router.get("/stop/receipts")
+async def host_stop_receipts(
+    request: Request,
+    response: Response,
+    since: Annotated[str | None, Query(max_length=64)] = None,
+    until: Annotated[str | None, Query(max_length=64)] = None,
+    agent_id: Annotated[str | None, Query(min_length=1, max_length=512)] = None,
+    trace_id: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
+    cursor: Annotated[
+        str | None, Query(min_length=1, max_length=MAX_RECEIPT_CURSOR_LENGTH)
+    ] = None,
+    limit: Annotated[int | None, Query(ge=1, le=MAX_RECEIPT_PAGE_SIZE)] = None,
+):
+    """Read the durable Stop evidence an observability view renders from.
+
+    Sovereign-only, the same gate as ``POST /api/host/stop``: these rows carry
+    operator-written reasons for acts performed on other agents, and the actor
+    who performed them.
+
+    Spans are joined to THESE receipts, never the reverse — the receipt is the
+    only authority for "stopped", and nothing copies its reason or actor onto
+    a span (#3159 R1).
+    """
+
+    # Authority first, before any filter is interpreted, so a refusal cannot
+    # become a probe for which agents or traces exist.
+    sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+
+    window_start = parse_time_bound(since, "since")
+    window_end = parse_time_bound(until, "until")
+    if (
+        window_start is not None
+        and window_end is not None
+        and window_end <= window_start
+    ):
+        raise ApiHTTPException(
+            status_code=400,
+            code="receipt_window_invalid",
+            message="until must be later than since.",
+        )
+
+    store = getattr(request.app.state, "stop_receipt_store", None)
+    if store is None:
+        store = UnavailableStopReceiptStore()
+    try:
+        page = await store.list_receipts(
+            since=window_start,
+            until=window_end,
+            agent_id=agent_id,
+            trace_id=trace_id,
+            after=decode_cursor(cursor),
+            limit=resolve_page_size(limit),
+        )
+    except StopReceiptError as error:
+        # An unreadable history is reported as unreadable. An empty list here
+        # would tell a console that nothing was ever stopped.
+        raise ApiHTTPException(
+            status_code=503,
+            code="stop_receipts_unavailable",
+            message="Durable Stop evidence is unavailable.",
+        ) from error
+    return {
+        "schema_version": RECEIPT_FEED_SCHEMA_VERSION,
+        "receipts": [
+            _stop_receipt_payload(record) for record in page.receipts
+        ],
+        "next_cursor": encode_cursor(page.next_key),
+    }
+
+
+__all__ = [
+    "HostStopBody",
+    "host_stop_receipts",
+    "host_stop_status",
+    "router",
+    "stop_host",
+]
