@@ -997,6 +997,36 @@ async def test_a_legacy_writer_after_migration_is_visible_without_a_restart(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_the_feed_sequence_holds_the_whole_advertised_cursor_range(
+    db_backend,
+):
+    """The cursor contract is 64-bit, so the column must be too.
+
+    A 32-bit column would refuse the insert that numbers the row after
+    ``2**31 - 1``, failing every later Stop or Hold receipt write.
+    """
+
+    store = await _stop_store(db_backend)
+    agent = _fresh("did:test:")
+    await _record_agent_stop(store, agent, _fresh("op-wide-"))
+    first = (await store.list_receipts(agent_id=agent, limit=10)).receipts[-1]
+    # Relative to the table's maximum: a shared Postgres database keeps every
+    # earlier run's rows, and the column is uniquely indexed.
+    row = await store._db.fetchone("SELECT MAX(feed_seq) FROM stop_receipts")
+    wide = max(row[0], 2**31 - 1) + 1
+    await store._db.execute(
+        "UPDATE stop_receipts SET feed_seq = ? WHERE receipt_id = ?",
+        (wide, first.receipt_id),
+    )
+
+    await _record_agent_stop(store, agent, _fresh("op-past-32-bit-"))
+
+    later = await store.list_receipts(agent_id=agent, after=wide, limit=10)
+    assert [record.feed_seq for record in later.receipts] == [wide + 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_the_database_numbers_every_insert_that_names_no_sequence(
     db_backend,
 ):

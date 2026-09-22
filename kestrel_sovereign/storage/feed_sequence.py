@@ -88,7 +88,7 @@ async def ensure_feed_sequence(db: Any, *, table: str, lock_key: str) -> None:
     lock_key = _checked_lock_key(lock_key)
     if not await db.column_exists(table, FEED_SEQUENCE_COLUMN):
         await db.execute(
-            f"ALTER TABLE {table} ADD COLUMN {FEED_SEQUENCE_COLUMN} INTEGER"
+            f"ALTER TABLE {table} ADD COLUMN {FEED_SEQUENCE_COLUMN} BIGINT"
         )
     unnumbered = await db.fetchall(
         f"SELECT receipt_id FROM {table} "
