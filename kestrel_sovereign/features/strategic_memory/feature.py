@@ -19,12 +19,13 @@ This feature also provides !strategy commands for querying and updating
 strategic context at runtime.
 """
 
+import asyncio
 import copy
 import logging
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -40,6 +41,7 @@ from .ledger import (
     BLOCKERS_KEY,
     LEDGER_FILENAME,
     PATTERNS_KEY,
+    LedgerSnapshot,
     StrategyLedger,
     active_blockers,
     active_patterns,
@@ -187,6 +189,12 @@ class StrategicMemoryFeature(Feature):
         self._data: Dict[str, Any] = {}
         self._strategy_path: Optional[Path] = None
         self._ledger = StrategyLedger(None)
+        # One per feature, because the ledger is one shared object per feature.
+        # Every ledger mutation, its save, and the snapshot of what that save
+        # confirmed happen under it, so no snapshot can include another call's
+        # in-memory change that never reached disk (#3320). Projection runs
+        # AFTER release: it reads only the snapshot, never the live ledger.
+        self._ledger_mutation_lock = asyncio.Lock()
 
     @property
     def tool_description(self) -> str:
@@ -261,16 +269,19 @@ class StrategicMemoryFeature(Feature):
         # The ledger is loaded even when STRATEGY.yaml failed above: the two
         # files are independent canonical records, and a broken brief must not
         # take the pattern/blocker log down with it.
-        try:
-            self._ledger = StrategyLedger(
-                self._strategy_path.parent / LEDGER_FILENAME
-                if self._strategy_path
-                else None
-            )
-            self._ledger.load()
-            self._migrate_ledger_sections()
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to load strategy ledger: {e}")
+        snapshot: Optional[LedgerSnapshot] = None
+        async with self._ledger_mutation_lock:
+            try:
+                self._ledger = StrategyLedger(
+                    self._strategy_path.parent / LEDGER_FILENAME
+                    if self._strategy_path
+                    else None
+                )
+                self._ledger.load()
+                self._migrate_ledger_sections()
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Failed to load strategy ledger: {e}")
+            snapshot = self._ledger.persisted_snapshot
 
         # Rebuild the graph index from what YAML says (#2851). Doing it at load
         # is what makes the index genuinely derived: an agent whose database was
@@ -278,7 +289,7 @@ class StrategicMemoryFeature(Feature):
         # gets a correct index on next start with no migration step. It is also
         # how decisions recorded before this existed become reachable at all.
         await self._reindex_decisions()
-        await self._reindex_ledger()
+        await self._reindex_ledger(snapshot)
 
     # ------------------------------------------------------------------
     # Ledger: migration, persistence, projection
@@ -292,6 +303,9 @@ class StrategicMemoryFeature(Feature):
         confirmed persisted. An interrupted migration therefore leaves the rows
         duplicated across both files -- recoverable, and converged by the next
         run, because :meth:`StrategyLedger.absorb` skips ids it already holds.
+
+        Mutates and saves the ledger, so the caller holds
+        ``_ledger_mutation_lock`` (``initialize`` does).
         """
         report = {"migrated": False, "patterns": 0, "blockers": 0}
         if not self._ledger.readable:
@@ -423,18 +437,26 @@ class StrategicMemoryFeature(Feature):
 
     def _persisted_ledger_result(
         self, confirmation: str, data: Dict[str, Any]
-    ) -> ToolResult:
-        """Turn a ledger write into an honest ToolResult, as ``_save`` does."""
+    ) -> Tuple[ToolResult, Optional[LedgerSnapshot]]:
+        """Turn a ledger write into an honest ToolResult, as ``_save`` does.
+
+        Also returns the snapshot that save confirmed, or ``None`` when nothing
+        was persisted. Must be called under ``_ledger_mutation_lock``: the
+        snapshot is only this call's state because no other mutation can land
+        between the save and the capture. A failed save yields no snapshot,
+        and so authorizes no projection at all -- the in-memory change it left
+        behind is invisible to the assertion producer.
+        """
         if not self._ledger.readable:
             return self._ledger_unreadable_result(
                 {**data, "persisted": False}
-            )
+            ), None
         if not self._ledger.path:
             return ToolResult.failed(
                 "No strategy ledger path configured -- strategic memory is "
                 "not active, so nothing was persisted.",
                 data={**data, "persisted": False},
-            )
+            ), None
         error = self._ledger.save()
         if error:
             return ToolResult.partial(
@@ -443,20 +465,38 @@ class StrategicMemoryFeature(Feature):
                     f"In-memory update applied but the write failed: {error}"
                 ),
                 data={**data, "persisted": False},
-            )
+            ), None
         return ToolResult.ok(
             confirmation=confirmation,
             data={**data, "persisted": True},
-        )
+        ), self._ledger.persisted_snapshot
 
-    async def _reindex_ledger(self) -> Dict[str, Any]:
-        """Project the ledger into the graph.
+    async def _reindex_ledger(
+        self, snapshot: Optional[LedgerSnapshot] = None
+    ) -> Dict[str, Any]:
+        """Project the ledger into the graph AND into canonical assertions.
+
+        ``snapshot`` is the confirmed on-disk state the assertion producer
+        reconciles against -- normally the one a mutating tool captured under
+        ``_ledger_mutation_lock`` right after its save. Omitted, it is the
+        ledger's latest confirmed snapshot, which is equally on disk. The live
+        ledger is never handed to the producer: its retraction is terminal,
+        and the live ledger can hold another call's unpersisted mutation.
 
         Never raises and never touches the ledger file: the canonical record is
         already on disk, so a graph failure must not turn into a strategic-
         memory failure. Reconciles rather than merely upserting, for the same
         reason the decision index does -- a row deleted from the canonical file
         must stop being reachable through the index.
+
+        The two projections are siblings, not a chain. They answer different
+        questions (structural index vs. canonical semantic claim), they fail
+        for different reasons, and the graph's own guards -- notably the
+        ``agent_id`` it derives node ids from -- say nothing about whether the
+        assertion store can be written. Sequencing the assertion producer
+        behind a graph early-return would have made an agent with no readable
+        ``agent_id`` silently produce nothing here, which is the shape #3051
+        exists to close.
         """
         if not self._ledger.readable:
             # An unreadable ledger is not an empty one. Reconciliation derives
@@ -472,6 +512,14 @@ class StrategicMemoryFeature(Feature):
             )
             return {"projected": 0, "skipped": 0, "failed": 0,
                     "skipped_reason": "ledger_unavailable"}
+        if snapshot is None:
+            snapshot = self._ledger.persisted_snapshot
+        report = await self._project_ledger_graph()
+        report["assertions"] = await self._project_ledger_assertions(snapshot)
+        return report
+
+    async def _project_ledger_graph(self) -> Dict[str, Any]:
+        """Upsert the ledger's rows as typed graph nodes (#2954)."""
         agent_id = self._projection_agent_id()
         if not agent_id:
             logger.warning(
@@ -489,6 +537,40 @@ class StrategicMemoryFeature(Feature):
         if report.get("failed") or report.get("skipped_reason"):
             logger.info("strategy ledger index: %s", report)
         return report
+
+    async def _project_ledger_assertions(
+        self, snapshot: Optional[LedgerSnapshot]
+    ) -> Dict[str, Any]:
+        """Project a confirmed ledger snapshot as canonical assertions (#3051).
+
+        Delegates every await to the privacy wrapper, which holds a
+        privacy-transition lease across the whole pass. The feature deliberately
+        holds no binding and makes no policy decision of its own -- a producer
+        that classified its own writes would be declaring a privacy mode rather
+        than obeying one.
+
+        Best-effort at exactly the same bar as the graph index: the canonical
+        YAML has already persisted, so nothing here may fail a ledger mutation.
+        """
+        storage = getattr(self.agent, "storage", None)
+        project = getattr(storage, "project_strategy_ledger_assertions", None)
+        if project is None:
+            # A storage facade without the governed producer -- notably a raw
+            # AsyncStorage, which has no privacy policy to project under.
+            return {"skipped_reason": "assertion_producer_unavailable"}
+        if snapshot is None:
+            # Nothing has ever been confirmed on disk, so there is no state the
+            # producer may reconcile against.
+            return {"skipped_reason": "ledger_ids_unpersisted"}
+        try:
+            report = await project(snapshot)
+        except Exception as e:  # noqa: BLE001 - the producer is best-effort
+            logger.warning("strategy ledger assertion projection failed: %s", e)
+            return {"skipped_reason": "assertion_projection_failed"}
+        data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        if getattr(report, "needs_attention", False):
+            logger.info("strategy ledger assertions: %s", data)
+        return data
 
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
@@ -764,36 +846,40 @@ class StrategicMemoryFeature(Feature):
                 f"Invalid severity '{severity}'. Must be one of: low, medium, high, critical.",
                 data={"severity": severity},
             )
-        if not self._ledger.readable:
-            return self._ledger_unreadable_result({"recorded": False})
+        async with self._ledger_mutation_lock:
+            if not self._ledger.readable:
+                return self._ledger_unreadable_result({"recorded": False})
 
-        # Bind the repository now, while the caller is here to say which one.
-        # A row written without it is a row a later reconcile has to guess
-        # about, and "#42 is closed" is only true of a specific repository --
-        # binding to the first configured repo that happens to have an issue 42
-        # is how a blocker gets resolved against a different project's ticket.
-        resolved_repo, repo_error = self._resolve_blocker_repo(issue, repo)
-        if repo_error:
-            return ToolResult.failed(
-                repo_error, data={"recorded": False, "issue": issue}
+            # Bind the repository now, while the caller is here to say which
+            # one. A row written without it is a row a later reconcile has to
+            # guess about, and "#42 is closed" is only true of a specific
+            # repository -- binding to the first configured repo that happens
+            # to have an issue 42 is how a blocker gets resolved against a
+            # different project's ticket.
+            resolved_repo, repo_error = self._resolve_blocker_repo(issue, repo)
+            if repo_error:
+                return ToolResult.failed(
+                    repo_error, data={"recorded": False, "issue": issue}
+                )
+            entry = self._ledger.add_blocker(
+                issue=issue,
+                title=title,
+                severity=severity,
+                owner=owner,
+                notes=notes,
+                repo=resolved_repo,
             )
-        entry = self._ledger.add_blocker(
-            issue=issue,
-            title=title,
-            severity=severity,
-            owner=owner,
-            notes=notes,
-            repo=resolved_repo,
-        )
-        result = self._persisted_ledger_result(
-            confirmation=f"Blocker recorded: {title} (id {entry['id']})",
-            data={"recorded": True, "blocker": entry, "blocker_id": entry["id"]},
-        )
+            result, snapshot = self._persisted_ledger_result(
+                confirmation=f"Blocker recorded: {title} (id {entry['id']})",
+                data={
+                    "recorded": True, "blocker": entry, "blocker_id": entry["id"]
+                },
+            )
         # Index only what reached the canonical file, for the same reason
         # ``strategy_add_decision`` does: a derived index must not publish a row
         # its source does not contain.
-        if (result.data or {}).get("persisted"):
-            await self._reindex_ledger()
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
         return result
 
     @tool(
@@ -810,22 +896,25 @@ class StrategicMemoryFeature(Feature):
             source: Where this was observed
             implication: What this means for future work
         """
-        if not self._ledger.readable:
-            # Refuse before mutating, not after. ``_persisted_ledger_result``
-            # would catch the write, but the row would already be sitting in
-            # the in-memory ledger, where ``strategy_search`` and
-            # ``strategy_view`` would show it as recorded -- a row that exists
-            # nowhere on disk and vanishes on restart.
-            return self._ledger_unreadable_result({"recorded": False})
-        entry = self._ledger.add_pattern(
-            pattern=pattern, source=source, implication=implication
-        )
-        result = self._persisted_ledger_result(
-            confirmation=f"Pattern recorded: {pattern} (id {entry['id']})",
-            data={"recorded": True, "pattern": entry, "pattern_id": entry["id"]},
-        )
-        if (result.data or {}).get("persisted"):
-            await self._reindex_ledger()
+        async with self._ledger_mutation_lock:
+            if not self._ledger.readable:
+                # Refuse before mutating, not after. ``_persisted_ledger_result``
+                # would catch the write, but the row would already be sitting
+                # in the in-memory ledger, where ``strategy_search`` and
+                # ``strategy_view`` would show it as recorded -- a row that
+                # exists nowhere on disk and vanishes on restart.
+                return self._ledger_unreadable_result({"recorded": False})
+            entry = self._ledger.add_pattern(
+                pattern=pattern, source=source, implication=implication
+            )
+            result, snapshot = self._persisted_ledger_result(
+                confirmation=f"Pattern recorded: {pattern} (id {entry['id']})",
+                data={
+                    "recorded": True, "pattern": entry, "pattern_id": entry["id"]
+                },
+            )
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
         return result
 
     @tool(
@@ -847,45 +936,46 @@ class StrategicMemoryFeature(Feature):
             reason: Why the pattern no longer holds
             superseded_by: Optional id of the pattern that replaces it
         """
-        if not self._ledger.readable:
-            # Without this the lookup below runs against the empty default
-            # ledger and returns "No pattern found with id" -- a false negative
-            # that reads as "you never recorded that", when the truth is that
-            # the file holding it could not be read.
-            return self._ledger_unreadable_result(
-                {"pattern_id": pattern_id, "superseded": False}
-            )
-        key, row = self._ledger.find(pattern_id)
-        if row is None or key != PATTERNS_KEY:
-            return ToolResult.failed(
-                f"No pattern found with id: {pattern_id}. Use strategy_search "
-                "to find a pattern's id.",
-                data={"pattern_id": pattern_id, "superseded": False},
-            )
-        if row.get("superseded_at"):
-            return ToolResult.failed(
-                f"Pattern {pattern_id} was already superseded on "
-                f"{row['superseded_at']}.",
-                data={"pattern_id": pattern_id, "superseded": False},
-            )
-        if superseded_by:
-            replacement_key, replacement = self._ledger.find(superseded_by)
-            if replacement is None or replacement_key != PATTERNS_KEY:
+        async with self._ledger_mutation_lock:
+            if not self._ledger.readable:
+                # Without this the lookup below runs against the empty default
+                # ledger and returns "No pattern found with id" -- a false negative
+                # that reads as "you never recorded that", when the truth is that
+                # the file holding it could not be read.
+                return self._ledger_unreadable_result(
+                    {"pattern_id": pattern_id, "superseded": False}
+                )
+            key, row = self._ledger.find(pattern_id)
+            if row is None or key != PATTERNS_KEY:
                 return ToolResult.failed(
-                    f"No pattern found with id: {superseded_by} -- refusing to "
-                    "record a replacement that does not exist.",
+                    f"No pattern found with id: {pattern_id}. Use strategy_search "
+                    "to find a pattern's id.",
                     data={"pattern_id": pattern_id, "superseded": False},
                 )
+            if row.get("superseded_at"):
+                return ToolResult.failed(
+                    f"Pattern {pattern_id} was already superseded on "
+                    f"{row['superseded_at']}.",
+                    data={"pattern_id": pattern_id, "superseded": False},
+                )
+            if superseded_by:
+                replacement_key, replacement = self._ledger.find(superseded_by)
+                if replacement is None or replacement_key != PATTERNS_KEY:
+                    return ToolResult.failed(
+                        f"No pattern found with id: {superseded_by} -- refusing to "
+                        "record a replacement that does not exist.",
+                        data={"pattern_id": pattern_id, "superseded": False},
+                    )
 
-        self._ledger.supersede_pattern(
-            row, reason=reason, superseded_by=superseded_by
-        )
-        result = self._persisted_ledger_result(
-            confirmation=f"Pattern {pattern_id} superseded.",
-            data={"superseded": True, "pattern_id": pattern_id, "pattern": row},
-        )
-        if (result.data or {}).get("persisted"):
-            await self._reindex_ledger()
+            self._ledger.supersede_pattern(
+                row, reason=reason, superseded_by=superseded_by
+            )
+            result, snapshot = self._persisted_ledger_result(
+                confirmation=f"Pattern {pattern_id} superseded.",
+                data={"superseded": True, "pattern_id": pattern_id, "pattern": row},
+            )
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
         return result
 
     @tool(
@@ -907,50 +997,51 @@ class StrategicMemoryFeature(Feature):
             issue: The blocker row id, or the issue number/identifier
             resolution: Optional note describing how it was resolved
         """
-        if not self._ledger.readable:
-            # Same false negative as strategy_supersede_pattern: an empty
-            # in-memory ledger answers "no blocker found with issue X" for a
-            # blocker that is sitting in the file, unread.
-            return self._ledger_unreadable_result(
-                {"issue": issue, "removed_count": 0}
-            )
-        matches = self._ledger.blockers_matching(issue)
-        if not matches:
-            return ToolResult.failed(
-                f"No blocker found with issue: {issue}",
-                data={"issue": issue, "removed_count": 0},
-            )
-        if len(matches) > 1:
-            # The defect this ticket was filed on: matching by issue key alone
-            # removed every row that shared it -- one call returned
-            # removed_count 10. Ambiguity is now a refusal with the ids needed
-            # to be specific, not a bulk delete the caller never asked for.
-            ids = [str(m.get("id") or "?") for m in matches]
-            return ToolResult.failed(
-                f"{len(matches)} blockers share issue {issue}: "
-                + ", ".join(ids)
-                + ". Resolve them one at a time by id.",
+        async with self._ledger_mutation_lock:
+            if not self._ledger.readable:
+                # Same false negative as strategy_supersede_pattern: an empty
+                # in-memory ledger answers "no blocker found with issue X" for a
+                # blocker that is sitting in the file, unread.
+                return self._ledger_unreadable_result(
+                    {"issue": issue, "removed_count": 0}
+                )
+            matches = self._ledger.blockers_matching(issue)
+            if not matches:
+                return ToolResult.failed(
+                    f"No blocker found with issue: {issue}",
+                    data={"issue": issue, "removed_count": 0},
+                )
+            if len(matches) > 1:
+                # The defect this ticket was filed on: matching by issue key alone
+                # removed every row that shared it -- one call returned
+                # removed_count 10. Ambiguity is now a refusal with the ids needed
+                # to be specific, not a bulk delete the caller never asked for.
+                ids = [str(m.get("id") or "?") for m in matches]
+                return ToolResult.failed(
+                    f"{len(matches)} blockers share issue {issue}: "
+                    + ", ".join(ids)
+                    + ". Resolve them one at a time by id.",
+                    data={
+                        "issue": issue,
+                        "removed_count": 0,
+                        "ambiguous": True,
+                        "candidate_ids": ids,
+                    },
+                )
+
+            row = matches[0]
+            self._ledger.resolve_blocker(row, resolution=resolution)
+            result, snapshot = self._persisted_ledger_result(
+                confirmation=f"Blocker {row.get('id')} ({issue}) resolved.",
                 data={
+                    "resolved": True,
                     "issue": issue,
-                    "removed_count": 0,
-                    "ambiguous": True,
-                    "candidate_ids": ids,
+                    "blocker_id": row.get("id"),
+                    "removed_count": 1,
                 },
             )
-
-        row = matches[0]
-        self._ledger.resolve_blocker(row, resolution=resolution)
-        result = self._persisted_ledger_result(
-            confirmation=f"Blocker {row.get('id')} ({issue}) resolved.",
-            data={
-                "resolved": True,
-                "issue": issue,
-                "blocker_id": row.get("id"),
-                "removed_count": 1,
-            },
-        )
-        if (result.data or {}).get("persisted"):
-            await self._reindex_ledger()
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
         return result
 
     @tool(
@@ -1464,34 +1555,42 @@ class StrategicMemoryFeature(Feature):
                 data=data,
             )
 
-        resolved: List[str] = []
-        for entry in closed:
-            _, row = self._ledger.find(str(entry.get("id") or ""))
-            if row is None:
-                continue
-            self._ledger.resolve_blocker(
-                row,
-                resolution=(
-                    f"GitHub issue {entry.get('issue')} is closed "
-                    f"({entry.get('repo') or 'unknown repo'})"
+        # The GitHub check above ran without the lock -- it is a network read
+        # of live state, not a ledger mutation. The rows are re-found by id
+        # under the lock, so a row another call changed meanwhile is resolved
+        # against its current state.
+        async with self._ledger_mutation_lock:
+            resolved: List[str] = []
+            for entry in closed:
+                _, row = self._ledger.find(str(entry.get("id") or ""))
+                if row is None:
+                    continue
+                self._ledger.resolve_blocker(
+                    row,
+                    resolution=(
+                        f"GitHub issue {entry.get('issue')} is closed "
+                        f"({entry.get('repo') or 'unknown repo'})"
+                    ),
+                )
+                resolved.append(str(row.get("id")))
+            data["resolved_ids"] = resolved
+            if not resolved:
+                # Nothing was written, so there is no persist outcome to
+                # report. Claiming ``persisted: True`` off a run that touched
+                # no row would be a small lie in the same envelope the honesty
+                # layer reads.
+                return ToolResult.ok(
+                    confirmation=f"{body}\n\nNo blocker needed resolving.",
+                    data={**data, "applied": True},
+                )
+            result, snapshot = self._persisted_ledger_result(
+                confirmation=(
+                    f"{body}\n\nResolved {len(resolved)} stale blocker(s)."
                 ),
-            )
-            resolved.append(str(row.get("id")))
-        data["resolved_ids"] = resolved
-        if not resolved:
-            # Nothing was written, so there is no persist outcome to report.
-            # Claiming ``persisted: True`` off a run that touched no row would
-            # be a small lie in the same envelope the honesty layer reads.
-            return ToolResult.ok(
-                confirmation=f"{body}\n\nNo blocker needed resolving.",
                 data={**data, "applied": True},
             )
-        result = self._persisted_ledger_result(
-            confirmation=f"{body}\n\nResolved {len(resolved)} stale blocker(s).",
-            data={**data, "applied": True},
-        )
-        if (result.data or {}).get("persisted"):
-            await self._reindex_ledger()
+        if snapshot is not None:
+            await self._reindex_ledger(snapshot)
         return result
 
     @staticmethod
