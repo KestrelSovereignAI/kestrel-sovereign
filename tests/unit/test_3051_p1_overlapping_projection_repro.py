@@ -25,6 +25,7 @@ from tests.unit import test_strategic_memory_ledger_assertions as base
 # signature that takes `governed`/`ledger` would otherwise read as F811
 # redefinition of the imported names.
 every = base.every
+project = base.project
 seed = base.seed
 tenant_identity = base.tenant_identity
 governed = base.governed
@@ -36,7 +37,7 @@ async def test_overlapping_passes_do_not_retract_a_concurrently_added_row(
 ):
     storage, _raw, _tenant = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     original_read = storage._read_ledger_assertions
     state: dict = {"fired": False, "pass_b": None}
@@ -53,7 +54,7 @@ async def test_overlapping_passes_do_not_retract_a_concurrently_added_row(
             # Start pass B as an independent task and give the loop a real
             # chance to run it to completion. Unserialized, it finishes here.
             state["pass_b"] = asyncio.create_task(
-                storage.project_strategy_ledger_assertions(ledger)
+                project(storage, ledger)
             )
             for _ in range(50):
                 if state["pass_b"].done():
@@ -63,7 +64,7 @@ async def test_overlapping_passes_do_not_retract_a_concurrently_added_row(
 
     storage._read_ledger_assertions = racing_read
     try:
-        await storage.project_strategy_ledger_assertions(ledger)  # pass A
+        await project(storage, ledger)  # pass A
     finally:
         storage._read_ledger_assertions = original_read
 

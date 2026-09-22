@@ -29,6 +29,7 @@ from tests.unit import test_strategic_memory_ledger_assertions as base
 # redefinition of the imported names.
 active = base.active
 every = base.every
+project = base.project
 seed = base.seed
 tenant_identity = base.tenant_identity
 governed = base.governed
@@ -46,7 +47,7 @@ async def test_a_foreign_revision_of_our_assertion_is_not_retracted(governed, le
     _pattern, _blocker = seed(ledger)
 
     # Revision 1 is genuinely ours.
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     ours = next(
         a
         for a in await active(storage)
@@ -84,7 +85,7 @@ async def test_a_foreign_revision_of_our_assertion_is_not_retracted(governed, le
     ledger.data["patterns_learned"] = []
     ledger.normalize()
     assert ledger.save() is None
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.foreign == 1, (
         "ownership was decided from assertion-wide provenance, so a source we "
@@ -102,12 +103,12 @@ async def test_our_own_current_revision_is_still_ours(governed, ledger):
     """The guard must not make the adapter foreign to its own work."""
     storage, _raw, _tenant = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"] = []
     ledger.normalize()
     assert ledger.save() is None
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.retracted == 1
     assert report.foreign == 0

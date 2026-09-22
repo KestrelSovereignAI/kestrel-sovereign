@@ -29,7 +29,7 @@ from kestrel_sovereign.storage.session_grouping import (
     parse_message_metadata,
     summarize_sessions,
 )
-from typing import Dict, List, Mapping, Optional, Any, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
@@ -1591,6 +1591,12 @@ class PrivacyEnforcingStorage:
         # the map is wrapper state, and a lazily created one is a second place
         # that decides whether this wrapper has any.
         self._ledger_projection_locks: Dict[str, Any] = {}
+        # The newest confirmed ledger state each ledger has been projected
+        # from, keyed like the locks. Snapshots are captured when a save lands
+        # but projected later, after other awaits, so two passes can arrive in
+        # the opposite order to their saves; the older one must not reconcile
+        # away a row the newer one already wrote.
+        self._ledger_projected_sequences: Dict[str, int] = {}
 
         # Explicit semantic teaching is intentionally captured per wrapper.
         # There is no module-level adapter that accepts caller-supplied storage
@@ -3337,8 +3343,15 @@ class PrivacyEnforcingStorage:
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
 
-    async def project_strategy_ledger_assertions(self, ledger):
+    async def project_strategy_ledger_assertions(self, snapshot):
         """Project the canonical strategy ledger into canonical assertions (#3051).
+
+        Takes a :class:`LedgerSnapshot` -- a deep copy the ledger captured the
+        moment a save was confirmed -- never the live ``StrategyLedger``. The
+        live object is shared with every mutating tool, and a mutation whose
+        save failed stays in it; reading it here let a failed write authorize a
+        terminal retraction (#3320). A snapshot cannot be re-read and cannot
+        see anything that is not on disk.
 
         The producer's awaits live here rather than in the feature, for the same
         reason the explicit-fact lifecycle does: a privacy-transition lease has
@@ -3382,33 +3395,37 @@ class PrivacyEnforcingStorage:
         # counter stays positive for the life of the process -- permanently
         # refusing every later privacy transition.
         try:
-            async with self._ledger_projection_lock(ledger):
+            async with self._ledger_projection_lock(snapshot):
                 return await self._project_strategy_ledger_assertions_leased(
-                    ledger, binding, report
+                    snapshot, binding, report
                 )
         finally:
             self._release_ledger_assertion_lease()
 
-    def _ledger_projection_lock(self, ledger):
-        """Return the projection lock for one ledger, creating it on first use.
-
-        Keyed by the ledger's canonical file path. Two handles onto the same
-        file are the same ledger for this purpose -- that is exactly the case
-        the P1 describes -- while two genuinely different ledgers keep
-        independent locks and never block each other.
+    @staticmethod
+    def _ledger_projection_key(snapshot) -> str:
+        """The canonical-file key a ledger's lock and ordering share.
 
         Every pathless ledger shares one key rather than getting a per-object
         one. A pathless ledger has no canonical file, so the pass refuses
         before it writes anything and there is nothing to serialize; keying
-        those by ``id()`` would instead grow the map once per ledger object
-        this wrapper ever sees, and reuse a freed id for an unrelated one.
+        those by ``id()`` would instead grow the map once per snapshot this
+        wrapper ever sees, and reuse a freed id for an unrelated one.
+        """
+        path = getattr(snapshot, "path", None)
+        return str(path) if path else "\x00pathless"
+
+    def _ledger_projection_lock(self, snapshot):
+        """Return the projection lock for one ledger, creating it on first use.
+
+        Keyed by the ledger's canonical file path. Two snapshots of the same
+        file are the same ledger for this purpose -- that is exactly the case
+        the P1 describes -- while two genuinely different ledgers keep
+        independent locks and never block each other.
         """
         import asyncio
 
-        path = getattr(ledger, "path", None) or getattr(
-            ledger, "canonical_path", None
-        )
-        key = str(path) if path else "\x00pathless"
+        key = self._ledger_projection_key(snapshot)
         locks = self._ledger_projection_locks
         lock = locks.get(key)
         if lock is None:
@@ -3417,28 +3434,31 @@ class PrivacyEnforcingStorage:
         return lock
 
     async def _project_strategy_ledger_assertions_leased(
-        self, ledger, binding, report
+        self, snapshot, binding, report
     ):
         """Run one projection pass while the privacy lease is held."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.features.strategic_memory.ledger import (
+            LedgerSnapshot,
+        )
         from kestrel_sovereign.knowledge import AssertionStatus
 
-        # A StrategyLedger, never a bare mapping. A mapping cannot express the
-        # difference between "no rows", "could not be read" and "never
-        # existed", and both of those distinctions gate an irreversible
-        # retraction sweep. ``ledger_index`` takes the ledger for the weaker
-        # version of this reason; here accepting a mapping as a convenience
-        # would leave the next caller a fast path around both guards below.
-        if isinstance(ledger, Mapping):
+        # A LedgerSnapshot, never a bare mapping and never the live ledger. A
+        # mapping cannot express the difference between "no rows", "could not
+        # be read" and "never existed", and both of those distinctions gate an
+        # irreversible retraction sweep. The live ledger can express them, but
+        # it also carries every in-memory mutation, persisted or not.
+        if not isinstance(snapshot, LedgerSnapshot):
             raise TypeError(
-                "project_strategy_ledger_assertions requires a StrategyLedger, "
-                "not a bare mapping: readability and file presence must travel "
-                "with the rows"
+                "project_strategy_ledger_assertions requires a LedgerSnapshot "
+                "(StrategyLedger.persisted_snapshot), not "
+                f"{type(snapshot).__name__}: readability, file presence and "
+                "persistence must travel with the rows"
             )
-        if not getattr(ledger, "readable", True):
+        if not snapshot.readable:
             report.skipped_reason = "ledger_unavailable"
             return report
-        if not getattr(ledger, "has_canonical_file", True):
+        if not snapshot.has_canonical_file:
             # A file that was never opened is not a file whose rows were
             # deleted, and here the difference is irreversible: the keep-set
             # would be empty, every assertion would be retracted, and
@@ -3448,17 +3468,29 @@ class PrivacyEnforcingStorage:
             # has to refuse instead.
             report.skipped_reason = "ledger_absent"
             return report
-        if getattr(ledger, "needs_save", False):
-            # Normalization minted row ids that live only in memory. Assertion
-            # identity derives from the row id, so projecting now writes rows
-            # under addresses that change on the next load -- and this adapter
-            # retracts terminally, so the next pass would find those
-            # assertions unmatched and kill them for good. The ledger is
-            # canonical and its own caller persists it; waiting one pass costs
-            # nothing, and the next projection reconciles.
+        if not snapshot.confirmed_persisted:
+            # The ledger did not vouch that these rows are the file's rows —
+            # typically a load whose normalization minted ids that only exist
+            # in memory. Assertion identity derives from the row id, so
+            # projecting now writes rows under addresses that change on the
+            # next load, and this adapter retracts terminally. The ledger is
+            # canonical and its own caller persists it; the next confirmed
+            # snapshot reconciles.
             report.skipped_reason = "ledger_ids_unpersisted"
             return report
-        ledger_data = getattr(ledger, "data", {}) or {}
+        key = self._ledger_projection_key(snapshot)
+        newest = self._ledger_projected_sequences.get(key)
+        if newest is not None and snapshot.persisted_sequence < newest:
+            # A later confirmed state has already been projected. This one is
+            # a subset of history, and reconciling against it would retract
+            # whatever the later save added -- terminally.
+            report.skipped_reason = "ledger_snapshot_superseded"
+            return report
+        # Recorded before any await, not on success: a newer pass that failed
+        # part-way must still fence an older one out, or the older state would
+        # be reconciled after the newer one was acted on.
+        self._ledger_projected_sequences[key] = snapshot.persisted_sequence
+        ledger_data = snapshot.data
 
         try:
             plan = ledger_assertions.build_proposal_plan(

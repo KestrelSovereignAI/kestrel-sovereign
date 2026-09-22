@@ -33,7 +33,6 @@ from kestrel_sovereign.knowledge import (
     AssertionStatus,
     DirectLineage,
     EpistemicState,
-    IRI,
     SourceOccurrence,
 )
 from kestrel_sovereign.privacy import PrivacyMode
@@ -94,6 +93,18 @@ def ledger(tmp_path: Path) -> StrategyLedger:
     # from one whose rows were all deleted.
     assert book.save() is None
     return book
+
+
+async def project(storage, book: StrategyLedger):
+    """Persist the ledger, then project exactly the state that save confirmed.
+
+    The producer takes a confirmed on-disk :class:`LedgerSnapshot`, never the
+    live ledger (#3320) -- the same order every mutating tool follows. Tests
+    that mutate ``book`` in memory therefore save before projecting, which is
+    also the only way production reaches the producer.
+    """
+    assert book.save() is None
+    return await storage.project_strategy_ledger_assertions(book.persisted_snapshot)
 
 
 async def active(storage) -> list[Assertion]:
@@ -215,7 +226,7 @@ async def test_initial_projection_writes_both_row_types(governed, ledger):
     storage, _, tenant_id = governed
     seed(ledger)
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.to_dict() == {
         "projected": 2,
@@ -239,7 +250,7 @@ async def test_producer_sets_lineage_and_owning_agent_at_write_time(governed, le
     """#3060 needs real lineage on real assertions, not a backfill."""
     storage, _, tenant_id = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     for assertion in await active(storage):
         assert assertion.owning_agent_id == tenant_id
@@ -254,9 +265,9 @@ async def test_producer_sets_lineage_and_owning_agent_at_write_time(governed, le
 async def test_reprojection_is_idempotent(governed, ledger):
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert (report.projected, report.revised, report.unchanged) == (0, 0, 2)
     assert len(await active(storage)) == 2
@@ -267,11 +278,11 @@ async def test_an_edited_row_revises_rather_than_duplicating(governed, ledger):
     """The property the ticket asked for, measured on the store."""
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     before = {a.assertion_id for a in await active(storage)}
 
     ledger.patterns[0]["implication"] = "a different implication"
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert (report.revised, report.projected) == (1, 0)
     held = await active(storage)
@@ -311,11 +322,11 @@ async def test_a_row_that_oscillates_between_two_states_keeps_projecting(
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     for expected in ("B", "keep them", "B", "keep them"):
         ledger.patterns[0]["implication"] = expected
-        report = await storage.project_strategy_ledger_assertions(ledger)
+        report = await project(storage, ledger)
         assert (report.revised, report.failed, report.projected) == (1, 0, 0)
 
         pattern = next(
@@ -332,7 +343,7 @@ async def test_a_row_that_oscillates_between_two_states_keeps_projecting(
         )
 
     # And the very next pass agrees nothing is outstanding.
-    assert (await storage.project_strategy_ledger_assertions(ledger)).unchanged == 2
+    assert (await project(storage, ledger)).unchanged == 2
 
 
 @pytest.mark.asyncio
@@ -340,10 +351,10 @@ async def test_resolving_a_blocker_retracts_its_assertion(governed, ledger):
     """The live tool retires the row IN PLACE; the claim must stop being held."""
     storage, _, _ = governed
     _, blocker = seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.resolve_blocker(blocker, "fixed upstream")
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.retracted == 1
     held = await active(storage)
@@ -356,10 +367,10 @@ async def test_resolving_a_blocker_retracts_its_assertion(governed, ledger):
 async def test_superseding_a_pattern_retracts_its_assertion(governed, ledger):
     storage, _, _ = governed
     pattern, _ = seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.supersede_pattern(pattern, reason="learned better")
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.retracted == 1
     held = await active(storage)
@@ -371,11 +382,11 @@ async def test_a_retired_row_stays_retracted_on_the_next_pass(governed, ledger):
     """Reconciliation must not thrash a row it already retracted."""
     storage, _, _ = governed
     _, blocker = seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     ledger.resolve_blocker(blocker, "fixed")
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert (report.retracted, report.failed, report.projected) == (0, 0, 0)
     assert report.unchanged == 1
@@ -385,10 +396,10 @@ async def test_a_retired_row_stays_retracted_on_the_next_pass(governed, ledger):
 async def test_a_row_removed_from_the_file_is_retracted(governed, ledger):
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"] = []
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.retracted == 1
     assert len(await active(storage)) == 1
@@ -406,14 +417,14 @@ async def test_re_adding_a_removed_row_reports_blocked_rather_than_lying(
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     ledger.data["patterns_learned"] = []
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.add_pattern(
         "Reviews find real defects", source="#3051", implication="keep them"
     )
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.blocked_terminal == 1
     assert report.projected == 0
@@ -433,13 +444,13 @@ async def test_duplicate_row_ids_refuse_the_section_whole(governed, ledger):
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"] = [
         {"id": "dup", "pattern": "one"},
         {"id": "dup", "pattern": "two"},
     ]
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.refused_sections == {"patterns_learned": "duplicate_row_ids"}
     assert (report.projected, report.retracted, report.failed) == (0, 0, 0)
@@ -461,11 +472,11 @@ async def test_blanking_a_rows_text_protects_it_rather_than_retracting(
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     assert len(await active(storage)) == 2
 
     ledger.patterns[0]["pattern"] = "   "
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.skipped == 1
     assert report.retracted == 0
@@ -474,7 +485,7 @@ async def test_blanking_a_rows_text_protects_it_rather_than_retracting(
     # Restoring the text re-projects, which is only possible because nothing
     # was retracted.
     ledger.patterns[0]["pattern"] = "Reviews find real defects"
-    restored = await storage.project_strategy_ledger_assertions(ledger)
+    restored = await project(storage, ledger)
     assert (restored.unchanged, restored.blocked_terminal) == (2, 0)
 
 
@@ -487,12 +498,12 @@ async def test_an_unmappable_row_id_refuses_its_section_whole(governed, ledger):
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"].append(
         {"id": "hand/edited/id", "pattern": "still here"}
     )
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.refused_sections == {"patterns_learned": "unmappable_row_ids"}
     assert report.unmappable == 1
@@ -512,10 +523,10 @@ async def test_an_id_less_row_refuses_its_section(governed, ledger):
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"].append({"pattern": "no id on this row"})
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.refused_sections == {"patterns_learned": "unaddressed_rows"}
     assert report.retracted == 0
@@ -532,10 +543,10 @@ async def test_a_malformed_row_refuses_its_section(governed, ledger):
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     ledger.data["patterns_learned"].append("a bare string, not a row")
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.refused_sections == {"patterns_learned": "malformed_rows"}
     assert report.retracted == 0
@@ -547,10 +558,25 @@ async def test_the_producer_refuses_a_bare_mapping(governed):
     """A mapping cannot carry readability or file presence, and both gate a
     retraction sweep that cannot be undone."""
     storage, _, _ = governed
-    with pytest.raises(TypeError, match="StrategyLedger"):
+    with pytest.raises(TypeError, match="LedgerSnapshot"):
         await storage.project_strategy_ledger_assertions(
             {"patterns_learned": [], "blockers": []}
         )
+
+
+@pytest.mark.asyncio
+async def test_the_producer_refuses_the_live_ledger(governed, ledger):
+    """The live ledger carries unpersisted mutations, so it is refused outright.
+
+    Accepting it "for convenience" is the fast path back to #3320: a mutation
+    whose save failed would be readable here and could authorize a terminal
+    retraction.
+    """
+    storage, _, _ = governed
+    seed(ledger)
+    with pytest.raises(TypeError, match="LedgerSnapshot"):
+        await storage.project_strategy_ledger_assertions(ledger)
+    assert await every(storage) == []
 
 
 @pytest.mark.asyncio
@@ -564,13 +590,13 @@ async def test_a_ledger_larger_than_one_read_page_projects_in_one_pass(
         ledger.add_pattern(f"pattern number {index}", source="bulk")
     ledger.normalize()
 
-    first = await storage.project_strategy_ledger_assertions(ledger)
+    first = await project(storage, ledger)
     assert first.projected == count
     assert len(await active(storage)) == count
 
     # And the second pass sees every one of them as unchanged, which is only
     # true if the read paged to exhaustion rather than stopping at a cap.
-    second = await storage.project_strategy_ledger_assertions(ledger)
+    second = await project(storage, ledger)
     assert second.unchanged == count
     assert (second.projected, second.retracted) == (0, 0)
 
@@ -595,7 +621,7 @@ async def test_paging_survives_tombstones_filling_whole_pages(governed, ledger):
     ledger.normalize()
     assert ledger.save() is None
 
-    first = await storage.project_strategy_ledger_assertions(ledger)
+    first = await project(storage, ledger)
     assert first.projected == retired + surviving
 
     # Retire in place, exactly as ``strategy_supersede_pattern`` does.
@@ -603,12 +629,12 @@ async def test_paging_survives_tombstones_filling_whole_pages(governed, ledger):
         row["superseded_at"] = "2026-01-01"
     assert ledger.save() is None
 
-    second = await storage.project_strategy_ledger_assertions(ledger)
+    second = await project(storage, ledger)
     assert (second.retracted, second.unchanged) == (retired, surviving)
 
     # The pass that would expose an early-stopping cursor: every surviving row
     # is still recognized, and no tombstone is rewritten or re-retracted.
-    third = await storage.project_strategy_ledger_assertions(ledger)
+    third = await project(storage, ledger)
     assert third.unchanged == surviving
     assert (third.projected, third.revised, third.retracted) == (0, 0, 0)
     assert not third.needs_attention
@@ -618,7 +644,7 @@ async def test_paging_survives_tombstones_filling_whole_pages(governed, ledger):
     # than duplicating, which needs the cursor to have reached it at all.
     ledger.data["patterns_learned"][-1]["implication"] = "changed"
     assert ledger.save() is None
-    fourth = await storage.project_strategy_ledger_assertions(ledger)
+    fourth = await project(storage, ledger)
     assert (fourth.revised, fourth.unchanged) == (1, surviving - 1)
     assert len(await active(storage)) == surviving
 
@@ -668,7 +694,7 @@ async def test_a_foreign_assertion_wearing_our_markers_is_not_superseded(
     )
     assert written.accepted
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.foreign == 1
     assert (report.revised, report.retracted) == (0, 0)
@@ -717,7 +743,7 @@ async def test_a_foreign_assertion_is_not_retracted_by_reconciliation(
     # Now remove the row entirely: reconciliation would retract it if it
     # believed the assertion were ours.
     ledger.data["patterns_learned"] = []
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.foreign == 1
     assert report.retracted == 0
@@ -773,7 +799,7 @@ async def test_an_impostor_matching_our_content_exactly_is_still_never_mutated(
         operation_id="foreign-writer:4",
     )
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert (report.revised, report.retracted) == (0, 0)
     survivor = next(
@@ -826,7 +852,7 @@ async def test_a_privacy_transition_is_refused_mid_projection(governed, ledger):
         return await original(*args, **kwargs)
 
     storage.query_assertions = blocked_query
-    task = asyncio.create_task(storage.project_strategy_ledger_assertions(ledger))
+    task = asyncio.create_task(project(storage, ledger))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         with pytest.raises(PrivacyViolationError, match="in flight"):
@@ -855,7 +881,7 @@ async def test_a_cancelled_projection_releases_its_lease(governed, ledger):
         await asyncio.Event().wait()
 
     storage.query_assertions = hang
-    task = asyncio.create_task(storage.project_strategy_ledger_assertions(ledger))
+    task = asyncio.create_task(project(storage, ledger))
     await asyncio.wait_for(entered.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -874,7 +900,7 @@ async def test_a_privacy_mode_without_durable_writes_projects_nothing(
     seed(ledger)
     storage.set_privacy_mode(PrivacyMode.EPHEMERAL)
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert report.skipped_reason == "privacy_denied"
     assert report.to_dict()["projected"] == 0
@@ -890,11 +916,17 @@ async def test_an_unreadable_ledger_retracts_nothing(governed, ledger):
     """An unreadable file is not an empty one — that distinction is the fix."""
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
-    ledger.load_error = "STRATEGY_LEDGER.yaml could not be parsed"
-    ledger.data = {"patterns_learned": [], "blockers": []}
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    # A restart over a file that no longer parses: ``load()`` still yields a
+    # snapshot, so the producer is told WHY it may not act.
+    ledger.path.write_text("patterns_learned: [unclosed\n", encoding="utf-8")
+    restarted = StrategyLedger(ledger.path)
+    restarted.load()
+    assert not restarted.readable
+    report = await storage.project_strategy_ledger_assertions(
+        restarted.persisted_snapshot
+    )
 
     assert report.skipped_reason == "ledger_unavailable"
     assert report.retracted == 0
@@ -913,7 +945,7 @@ async def test_a_missing_ledger_file_retracts_nothing(governed, ledger):
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
     assert len(await active(storage)) == 2
 
     rows = copy.deepcopy(ledger.data)
@@ -926,7 +958,9 @@ async def test_a_missing_ledger_file_retracts_nothing(governed, ledger):
     assert restarted.readable
     assert restarted.patterns == [] and restarted.blockers == []
 
-    report = await storage.project_strategy_ledger_assertions(restarted)
+    report = await storage.project_strategy_ledger_assertions(
+        restarted.persisted_snapshot
+    )
 
     assert report.skipped_reason == "ledger_absent"
     assert report.retracted == 0
@@ -935,8 +969,7 @@ async def test_a_missing_ledger_file_retracts_nothing(governed, ledger):
     # And the projection is still healthy once the file comes back, which is
     # only true because nothing was retracted: retraction is terminal here.
     restarted.data = rows
-    assert restarted.save() is None
-    recovered = await storage.project_strategy_ledger_assertions(restarted)
+    recovered = await project(storage, restarted)
     assert (recovered.unchanged, recovered.blocked_terminal) == (2, 0)
     assert len(await active(storage)) == 2
 
@@ -948,7 +981,9 @@ async def test_a_pathless_ledger_retracts_nothing(governed):
     real = StrategyLedger(None)
     real.load()
 
-    report = await storage.project_strategy_ledger_assertions(real)
+    report = await storage.project_strategy_ledger_assertions(
+        real.persisted_snapshot
+    )
 
     assert report.skipped_reason == "ledger_absent"
     assert report.retracted == 0
@@ -970,14 +1005,14 @@ async def test_two_byte_identical_rows_both_project(governed, ledger):
     second = ledger.add_pattern("Identical wording", source="s", implication="i")
     assert first["id"] != second["id"]          # ...but the content matches
 
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     assert (report.projected, report.failed) == (2, 0)
     assert len(await active(storage)) == 2
 
     # The steady state is clean too: the earlier defect surfaced as a permanent
     # per-pass failure rather than a one-off.
-    again = await storage.project_strategy_ledger_assertions(ledger)
+    again = await project(storage, ledger)
     assert (again.unchanged, again.failed) == (2, 0)
 
 
@@ -991,7 +1026,7 @@ async def test_an_unchanged_pass_does_not_read_provenance_per_row(governed, ledg
     """
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     reads = 0
     original = storage.list_assertion_sources
@@ -1003,7 +1038,7 @@ async def test_an_unchanged_pass_does_not_read_provenance_per_row(governed, ledg
 
     storage.list_assertion_sources = counted
     try:
-        report = await storage.project_strategy_ledger_assertions(ledger)
+        report = await project(storage, ledger)
     finally:
         storage.list_assertion_sources = original
 
@@ -1016,7 +1051,7 @@ async def test_a_failed_assertion_read_retracts_nothing(governed, ledger):
     """'Could not read' authorizes neither a write nor a retraction."""
     storage, _, _ = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     async def broken(*args, **kwargs):
         raise RuntimeError("assertion store unavailable")
@@ -1024,7 +1059,7 @@ async def test_a_failed_assertion_read_retracts_nothing(governed, ledger):
     original = storage.query_assertions
     storage.query_assertions = broken
     try:
-        report = await storage.project_strategy_ledger_assertions(ledger)
+        report = await project(storage, ledger)
     finally:
         storage.query_assertions = original
 
@@ -1038,7 +1073,7 @@ async def test_the_report_carries_no_row_prose(governed, ledger):
     """Callers log this; a pattern's text must not travel into a log line."""
     storage, _, _ = governed
     seed(ledger)
-    report = await storage.project_strategy_ledger_assertions(ledger)
+    report = await project(storage, ledger)
 
     rendered = repr(report.to_dict())
     assert "Reviews find real defects" not in rendered

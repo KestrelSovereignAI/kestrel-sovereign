@@ -27,6 +27,7 @@ from tests.unit import test_strategic_memory_ledger_assertions as base
 # signature that takes `governed`/`ledger` would otherwise read as F811
 # redefinition of the imported names.
 every = base.every
+project = base.project
 seed = base.seed
 tenant_identity = base.tenant_identity
 governed = base.governed
@@ -44,7 +45,7 @@ async def test_cancelled_while_queued_releases_the_privacy_lease(governed, ledge
     """
     storage, _raw, _tenant = governed
     seed(ledger)
-    await storage.project_strategy_ledger_assertions(ledger)
+    await project(storage, ledger)
 
     release_a = asyncio.Event()
     a_inside = asyncio.Event()
@@ -59,13 +60,13 @@ async def test_cancelled_while_queued_releases_the_privacy_lease(governed, ledge
     storage._read_ledger_assertions = slow_read
     try:
         pass_a = asyncio.create_task(
-            storage.project_strategy_ledger_assertions(ledger)
+            project(storage, ledger)
         )
         await asyncio.wait_for(a_inside.wait(), timeout=5)
 
         # B takes the lease, then queues on the lock A holds.
         pass_b = asyncio.create_task(
-            storage.project_strategy_ledger_assertions(ledger)
+            project(storage, ledger)
         )
         for _ in range(50):
             await asyncio.sleep(0)

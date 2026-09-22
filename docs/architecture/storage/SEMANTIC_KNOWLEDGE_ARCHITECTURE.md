@@ -587,6 +587,19 @@ or unaddressable row ids, malformed members — and protects a present row whose
 text was blanked rather than retracting it. Absence of a claim is not a claim
 of absence.
 
+The producer reconciles only against a state the canonical file actually
+holds. It accepts a `LedgerSnapshot` — never the live `StrategyLedger`, never a
+bare mapping — and only `StrategyLedger` can confirm one: a deep copy taken when
+`save()` succeeds, or on a `load()` that minted no ids. `StrategicMemoryFeature`
+performs every ledger mutation, its save, and that capture under one
+`_ledger_mutation_lock`, and projects after releasing it, so a mutation whose
+save failed produces no snapshot and cannot authorize a retraction (#3320).
+Snapshots carry a process-wide persisted sequence; because they are projected
+after other awaits, a pass holding an older snapshot than one already projected
+for the same file is refused (`ledger_snapshot_superseded`) rather than allowed
+to reconcile away what the newer save added. An unconfirmed snapshot is refused
+as `ledger_ids_unpersisted`.
+
 Ownership is settled by the bounded provenance grammar the producer actually
 wrote, never by the marker fields alone, which any canonical writer can supply.
 Ownership is asked of the revision held, not of the assertion's whole history:
