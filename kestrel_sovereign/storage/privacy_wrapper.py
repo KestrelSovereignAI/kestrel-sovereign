@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Any, Sequence, Tuple, Union
 from enum import Enum
 from dataclasses import dataclass
 
+from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.privacy import (
     PrivacyMode,
     PrivacyConfig,
@@ -270,6 +271,46 @@ def current_bound_reentry_token() -> Optional[object]:
     serializes.
     """
     return _transition_lock_reentry_token.get()
+
+
+def held_transition_reentry_token(agent: object) -> Optional[object]:
+    """The reentry token of ``agent``'s transition span held by THIS task, or ``None``.
+
+    Reads the token off the lock (:meth:`ReentrantTransitionLock.current_reentry_token`),
+    so it is non-``None`` only on the task that owns the span — the turn task
+    of a streamed turn. Never raises: token capture must not break dispatch.
+    """
+    getter = getattr(agent, "_get_privacy_transition_lock", None)
+    if not callable(getter):
+        return None
+    try:
+        lock = getter()
+    except Exception:  # noqa: BLE001 - never let token capture break dispatch
+        return None
+    if not isinstance(lock, ReentrantTransitionLock):
+        return None
+    return lock.current_reentry_token()
+
+
+def capture_transition_lock_reentry(agent: object) -> Optional[object]:
+    """Capture the reentry authority a foreign task needs for ``agent``'s turn.
+
+    The span owner reads it off the lock; a task that is not the owner but is
+    running under a re-presented token (a nested inline executor built on a
+    reader task, #2672 review P1 follow-up) passes that bound token on. Both
+    halves matter: an executor built on the turn task has no bound token, and
+    one built on a reader task does not own the lock.
+    """
+    held = held_transition_reentry_token(agent)
+    return held if held is not None else current_bound_reentry_token()
+
+
+turn_scoped(
+    "transition_lock_reentry",
+    variables=(_transition_lock_reentry_token,),
+    capture=capture_transition_lock_reentry,
+    bind=bind_transition_lock_reentry,
+)
 
 
 class ReentrantTransitionLock:

@@ -1606,50 +1606,30 @@ class Feature(_SdkFeature):
         — without this, hook-gated policies were bypassed by the
         inline-execution path).
 
-        NESTED cross-task bindings (#2672 review P1 follow-up, #2928). This
-        executor is BUILT while ``execute_as_subagent`` runs on the PARENT inline
-        executor's reader task, INSIDE that executor's
-        ``bind_transition_lock_reentry`` scope, so the owning turn's
-        transition-lock reentry token is visible in the ContextVar here. But the
-        codex app-server dispatches THIS subagent's OWN inline tools on a
-        SEPARATE, freshly-spawned reader task that does NOT inherit that binding
-        — so a nested durable-identity write (rename / description / discovery
-        history / user name / SOUL) invoked by the subagent would
-        re-acquire the transition lock from a token-less foreign task and DEADLOCK
-        against the turn that holds it (the turn is blocked awaiting the app-server
-        result; the write is blocked acquiring the lock the turn holds). Capture the
-        bound token here and re-present it around the subagent tool call — the exact
-        cross-task seam ``OrchestratorEngineMixin._make_inline_tool_executor``
-        installs for the parent turn — so that one write re-enters the owning turn's
-        span. The parent executor also carries the lifecycle-authorized turn/session
-        binding; capture and re-present that binding here so a nested lifecycle tool
-        (notably ``request_restart``) can name the originating window after this
-        second reader-task boundary. An executor built outside a live turn captures
-        an explicit unbound value, so neither binding grants authority to unrelated
-        background work.
+        NESTED cross-task bindings (#2672 review P1 follow-up, #2928, #3114).
+        This executor is BUILT while ``execute_as_subagent`` runs either on the
+        turn's own task tree or on the PARENT inline executor's reader task,
+        inside that executor's re-presented turn scope. The codex app-server
+        dispatches THIS subagent's OWN inline tools on a SEPARATE,
+        freshly-spawned reader task that inherits none of it — so without
+        re-presentation a nested durable-identity write would re-acquire the
+        transition lock from a token-less foreign task and DEADLOCK against the
+        turn that holds it, a nested ``request_restart`` could not name the
+        originating window, and ``turn_id`` / the causation chain / the
+        dispatching signal would read empty. Capture the whole declared turn
+        scope here (``kestrel_sovereign.turn_scope``) and re-present it around
+        the subagent tool call — the same seam
+        ``OrchestratorEngineMixin._make_inline_tool_executor`` installs for the
+        parent turn. Authority-bearing values keep their own rules: an executor
+        built outside a live turn captures an explicit unbound value, so it
+        grants nothing to unrelated background work.
         """
-        from kestrel_sovereign.agent.turn_lifecycle import (
-            bind_turn_session,
-            capture_turn_session_binding,
-        )
-        from kestrel_sovereign.storage.privacy_wrapper import (
-            bind_transition_lock_reentry,
-            current_bound_reentry_token,
-        )
-        transition_reentry_token = current_bound_reentry_token()
-        turn_session_binding = capture_turn_session_binding(self.agent)
-        from kestrel_sovereign.auth import capture_caller_context_binding
+        from kestrel_sovereign.turn_scope import capture_turn_scope
 
-        turn_caller_binding = capture_caller_context_binding()
+        turn_scope = capture_turn_scope(self.agent)
 
         async def _exec(name: str, args: Dict[str, Any]):
-            from kestrel_sovereign.auth import caller_context_binding_scope
-
-            with (
-                bind_transition_lock_reentry(transition_reentry_token),
-                bind_turn_session(turn_session_binding),
-                caller_context_binding_scope(turn_caller_binding),
-            ):
+            with turn_scope.bind():
                 return await self._execute_subagent_tool(
                     tool_name=name,
                     args=args or {},
