@@ -750,8 +750,14 @@ async def insert_request(
     requester_request_id: str = "",
     origin_session_id: str = "",
     delegation_id: str = "",
+    allow_agent_request: bool = False,
 ) -> RestartRequest:
-    """Insert a fresh pending request. Returns the dataclass row."""
+    """Insert a fresh pending request. Returns the dataclass row.
+
+    ``allow_agent_request`` permits sealing on the agent-request basis when
+    there is no sovereign caller and no delegation (#3339); the seal still
+    refuses anything outside the agent-requestable bounds.
+    """
     req_id = uuid.uuid4().hex
     requested_at = (await database_clock(db)).isoformat()
     async with db.transaction(immediate=True):
@@ -785,6 +791,7 @@ async def insert_request(
             origin_session_id=origin_session_id,
             requested_at=requested_at,
             delegation=delegation,
+            allow_agent_request=allow_agent_request and delegation is None,
         )
         generation = restart_authority_evidence_generation(authority_evidence)
         await db.execute(

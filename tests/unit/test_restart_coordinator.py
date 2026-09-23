@@ -622,18 +622,39 @@ async def test_request_restart_creates_pending_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_request_restart_requires_sovereign_caller(tmp_path):
+async def test_request_beyond_agent_bounds_requires_sovereign_caller(tmp_path):
+    """#3339: with no sovereign caller only the agent-requestable bounds file.
+
+    Before #3339 this asserted that a plain ``restart_only`` with no sovereign
+    caller was refused; that is now the agent's own in-bounds request (see the
+    agent-request tests below). What still needs a sovereign caller or a
+    delegation is anything wider, here another repository.
+    """
     feat, backend = await _make_feature(tmp_path)
+    elsewhere = str(tmp_path / "some-other-checkout")
+    wider = {
+        "operation": "update_then_restart",
+        "update_profile": "sovereign_local_uv_sync",
+        "target_ref": "main",
+        "repo_path": elsewhere,
+    }
 
     with caller_context_scope(None):
-        absent = await feat.request_restart(reason="agent decided autonomously")
+        absent = await feat.request_restart(
+            reason="agent decided autonomously", **wider,
+        )
     with caller_context_scope(CallerContext.authenticated("oauth@example.test")):
-        oauth = await feat.request_restart(reason="generic authenticated user")
+        oauth = await feat.request_restart(
+            reason="generic authenticated user", **wider,
+        )
 
-    assert absent.status is ToolResultStatus.ERROR
-    assert oauth.status is ToolResultStatus.ERROR
-    assert absent.data["created"] is False
-    assert oauth.data["created"] is False
+    for refused in (absent, oauth):
+        assert refused.status is ToolResultStatus.ERROR
+        assert refused.data["created"] is False
+        assert refused.data["authority"] == "required"
+        assert refused.data["exceeded_bound"] == "repo_path"
+        assert "sovereign-key caller" in refused.error
+        assert "delegation" in refused.error
     assert await list_requests(backend) == []
 
 
@@ -3472,7 +3493,15 @@ async def test_request_update_then_restart_creates_row(tmp_path):
 
 @pytest.mark.asyncio
 async def test_denied_update_request_never_inspects_checkout_paths(tmp_path):
+    """An out-of-bounds path is refused before anything inspects it.
+
+    Before #3339 the denied request omitted repo_path, because every
+    non-sovereign request was denied; an omitted repo_path now means the
+    default checkout, which is inside the agent bounds. The filesystem-oracle
+    property is about a caller-chosen path, so the request names one.
+    """
     feat, backend = await _make_feature(tmp_path)
+    probe = str(tmp_path / "probe" / "does-this-exist")
     with (
         caller_context_scope(CallerContext.authenticated("oauth@example.test")),
         patch(
@@ -3483,18 +3512,26 @@ async def test_denied_update_request_never_inspects_checkout_paths(tmp_path):
             "kestrel_sovereign.features.restart_coordinator.feature."
             "repo_is_git_checkout"
         ) as inspect_checkout,
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "_canonical_update_repo_path"
+        ) as resolve_path,
     ):
         result = await feat.request_restart(
             reason="denied update",
             operation="update_then_restart",
             update_profile="sovereign_local_uv_sync",
             target_ref="main",
+            repo_path=probe,
         )
 
     assert result.status is ToolResultStatus.ERROR
     assert result.data["authority"] == "required"
+    assert result.data["exceeded_bound"] == "repo_path"
+    assert probe not in result.error
     default_path.assert_not_called()
     inspect_checkout.assert_not_called()
+    resolve_path.assert_not_called()
     assert await list_requests(backend) == []
 
 
@@ -4513,7 +4550,13 @@ async def test_inline_restart_carries_owning_caller_across_frozen_reader_task(
 async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller(
     tmp_path,
 ):
-    """A callback is authorized by its owning turn, never the reader's turn."""
+    """A callback is authorized by its owning turn, never the reader's turn.
+
+    Before #3339 turn B's plain restart was refused outright. B may now file
+    its own in-bounds request, so the borrowing question is asked two ways: a
+    request wider than the agent bounds is still refused, and B's in-bounds
+    request is sealed as B's own agent request, never as turn A's sovereign.
+    """
 
     backend = await _backend(tmp_path)
     agent = _InlineRestartAgent(backend)
@@ -4535,17 +4578,34 @@ async def test_inline_restart_cannot_borrow_readers_overlapping_sovereign_caller
         try:
             with caller_context_scope(None):
                 executor = agent._make_inline_tool_executor("unowned-turn")
-                _effective_args, result = await reader.dispatch(
+                _effective_args, wider = await reader.dispatch(
                     executor,
                     "request_restart",
-                    {"reason": "must not borrow reader authority"},
+                    {
+                        "reason": "must not borrow reader authority",
+                        "operation": "update_then_restart",
+                        "update_profile": "sovereign_local_uv_sync",
+                        "target_ref": "main",
+                        "repo_path": str(tmp_path / "not-the-default"),
+                    },
+                )
+                _effective_args, own = await reader.dispatch(
+                    executor,
+                    "request_restart",
+                    {"reason": "the agent's own plain restart"},
                 )
         finally:
             await reader.stop()
 
-    assert result["success"] is False
-    assert "authenticated sovereign-key caller" in result["error"]
-    assert await list_requests(backend) == []
+    assert wider["success"] is False
+    assert "authenticated sovereign-key caller" in wider["error"]
+    assert own["success"] is True
+    rows = await list_requests(backend)
+    assert [row.reason for row in rows] == ["the agent's own plain restart"]
+    evidence = json.loads(rows[0].authority_evidence)
+    assert evidence["basis"] == "agent_request"
+    assert evidence["actor"] == agent.did
+    assert evidence["actor"] != "other-turn-sovereign"
 
 
 @pytest.mark.asyncio
@@ -6995,3 +7055,532 @@ async def test_request_readers_see_what_the_writer_wrote_for_a_padded_did(tmp_pa
     assert listed.status is ToolResultStatus.OK, listed.error
     assert listed.data["count"] == 1
     assert feat._agent_requester_id() == padded
+
+
+# ---------------------------------------------------------------------------
+# Agent-requested restarts (#3339)
+#
+# Doctrine: an agent can request a whole-host restart from its own work; the
+# coordinator's idle/timeout gate is the control. With no sovereign caller and
+# no delegation, a request inside the agent-requestable bounds is sealed on the
+# ``agent_request`` basis; anything wider still needs sovereign authority.
+# ---------------------------------------------------------------------------
+
+
+_AGENT_UPDATE = {
+    "operation": "update_then_restart",
+    "update_profile": "sovereign_local_uv_sync",
+    "target_ref": "main",
+}
+
+
+def _point_origin_head(checkout, branch):
+    from kestrel_sovereign.features.restart_coordinator import update_profiles
+
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "symbolic-ref",
+            "refs/remotes/origin/HEAD", f"refs/remotes/origin/{branch}",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    update_profiles.clear_checkout_default_branch_cache()
+
+
+def _agent_default_checkout(tmp_path, monkeypatch, *, default_branch="main"):
+    """A real git checkout standing in for this host's Sovereign checkout."""
+    from kestrel_sovereign.features.restart_coordinator import (
+        feature as feature_module,
+        update_profiles,
+    )
+
+    checkout = tmp_path / "sovereign-default"
+    checkout.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", str(checkout)], check=True, capture_output=True,
+    )
+    if default_branch is not None:
+        _point_origin_head(checkout, default_branch)
+    else:
+        update_profiles.clear_checkout_default_branch_cache()
+    path = str(checkout.resolve())
+    monkeypatch.setattr(update_profiles, "default_sovereign_repo_path", lambda: path)
+    monkeypatch.setattr(feature_module, "default_sovereign_repo_path", lambda: path)
+    return path
+
+
+def _resigned(row, mutate):
+    """Evidence re-signed under the host key after ``mutate`` edits it.
+
+    Models a seal the host itself produced with those contents, so only the
+    agent-request checks (not the HMAC) can refuse it.
+    """
+    from kestrel_sovereign.features.restart_coordinator import authority
+
+    document = json.loads(row.authority_evidence)
+    mutate(document)
+    return (
+        authority._canonical(document).decode("utf-8"),
+        authority._signature(document),
+    )
+
+
+async def _write_evidence(backend, request_id, evidence, signature):
+    await backend.execute(
+        "UPDATE restart_requests SET authority_evidence = ?, "
+        "authority_signature = ? WHERE id = ?",
+        (evidence, signature, request_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_restart_only_without_caller_is_sealed_verified_and_executes(
+    tmp_path,
+):
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="deploy after merge")
+        assert created.status is ToolResultStatus.OK, created.error
+        request_id = created.data["request"]["id"]
+        row = await get_request(backend, request_id)
+        evidence = json.loads(row.authority_evidence)
+        verified = await verify_restart_authority_at_use(backend, row)
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            result = await feat.restart_coordinator()
+
+    assert evidence["basis"] == "agent_request"
+    assert evidence["actor"] == "did:test:agent"
+    assert "delegation" not in evidence
+    assert verified == (
+        True, "verified agent-requested restart within agent bounds",
+    )
+    spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_sovereign_caller_seal_is_unchanged_by_agent_request_basis(tmp_path):
+    """The sovereign path never labels a seal as an agent request."""
+    feat, backend = await _make_feature(tmp_path)
+
+    created = await feat.request_restart(reason="operator restart")
+    row = await get_request(backend, created.data["request"]["id"])
+
+    evidence = json.loads(row.authority_evidence)
+    assert "basis" not in evidence
+    assert evidence["actor"] == "test-sovereign"
+    assert verify_restart_authority(row) == (
+        True, "verified sovereign-key authority",
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_insert_without_agent_request_still_requires_sovereign(
+    tmp_path,
+):
+    """Only the request tool opts into the agent-request basis."""
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend, requested_by_agent="did:test:agent", reason="direct",
+        )
+    # The store's transaction wrapper re-raises with the refusal as cause.
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "authenticated sovereign-key caller" in str(refusal)
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_seal_refuses_agent_request_beyond_bounds_independently(
+    tmp_path, monkeypatch,
+):
+    """The host seal re-checks the bounds; the tool's screen is not the gate."""
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend,
+            requested_by_agent="did:test:agent",
+            reason="wider than the agent bounds",
+            operation="update_then_restart",
+            update_repo_path=default_repo,
+            update_target_ref="release",
+            update_profile="sovereign_local_uv_sync",
+            allow_agent_request=True,
+        )
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "bound on target_ref" in str(refusal)
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_repo", [False, True])
+async def test_agent_update_to_default_branch_is_accepted(
+    tmp_path, monkeypatch, explicit_repo,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    extra = {"repo_path": default_repo} if explicit_repo else {}
+
+    with caller_context_scope(None):
+        created = await feat.request_restart(
+            reason="land merged main", **_AGENT_UPDATE, **extra,
+        )
+
+    assert created.status is ToolResultStatus.OK, created.error
+    row = await get_request(backend, created.data["request"]["id"])
+    assert row.update_repo_path == default_repo
+    assert row.update_target_ref == "main"
+    assert row.update_allow_migrations is False
+    assert json.loads(row.authority_evidence)["basis"] == "agent_request"
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "bound"),
+    [
+        ({"target_ref": "release"}, "target_ref"),
+        ({"allow_migrations": True}, "allow_migrations"),
+        ({"repo_path": "OTHER"}, "repo_path"),
+        ({"update_profile": "not_a_profile"}, "update_profile"),
+    ],
+    ids=["other-ref", "migrations", "other-repo", "other-profile"],
+)
+async def test_agent_update_beyond_bounds_is_refused_by_name(
+    tmp_path, monkeypatch, overrides, bound,
+):
+    _agent_default_checkout(tmp_path, monkeypatch)
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+    _git_checkout(other)
+    if overrides.get("repo_path") == "OTHER":
+        overrides = {"repo_path": str(other)}
+    feat, backend = await _make_feature(tmp_path)
+
+    with (
+        caller_context_scope(None),
+        patch(
+            "kestrel_sovereign.features.restart_coordinator.feature."
+            "repo_is_git_checkout"
+        ) as inspect_checkout,
+    ):
+        refused = await feat.request_restart(
+            reason="too wide", **{**_AGENT_UPDATE, **overrides},
+        )
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data == {
+        "created": False, "authority": "required", "exceeded_bound": bound,
+    }
+    assert f"bound on {bound}" in refused.error
+    assert (
+        "requires an authenticated sovereign-key caller or a sovereign-signed "
+        "restart delegation"
+    ) in refused.error
+    inspect_checkout.assert_not_called()
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_update_without_known_default_branch_is_refused(
+    tmp_path, monkeypatch,
+):
+    """No ``origin/HEAD`` means no default branch, never a guessed ``main``."""
+    _agent_default_checkout(tmp_path, monkeypatch, default_branch=None)
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(reason="guess", **_AGENT_UPDATE)
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "target_ref"
+    assert "origin/HEAD" in refused.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_restart_only_carrying_migrations_is_refused(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(
+            reason="plain restart", allow_migrations=True,
+        )
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "allow_migrations"
+    assert await list_requests(backend) == []
+
+
+def _drop_basis(document):
+    document.pop("basis")
+
+
+def _other_actor(document):
+    document["actor"] = "did:test:someone-else"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edit",
+    [
+        "UPDATE restart_requests SET update_target_ref = 'release' WHERE id = ?",
+        "UPDATE restart_requests SET update_allow_migrations = 1 WHERE id = ?",
+        "UPDATE restart_requests SET update_repo_path = '/elsewhere' WHERE id = ?",
+        "UPDATE restart_requests SET update_profile = 'other' WHERE id = ?",
+        "actor",
+        "basis",
+    ],
+    ids=["ref", "migrations", "repo", "profile", "actor", "basis"],
+)
+async def test_edited_agent_request_row_fails_verification_at_executor(
+    tmp_path, monkeypatch, edit,
+):
+    _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+
+    if edit in {"actor", "basis"}:
+        # An unsigned edit of the evidence itself: changing the actor, or
+        # dropping the basis so the seal reads as a sovereign-caller seal.
+        document = json.loads(row.authority_evidence)
+        (_other_actor if edit == "actor" else _drop_basis)(document)
+        await _write_evidence(
+            backend, request_id,
+            json.dumps(document, sort_keys=True, separators=(",", ":")),
+            row.authority_signature,
+        )
+    else:
+        await backend.execute(edit, (request_id,))
+
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("edited row reached the update runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    edited = await get_request(backend, request_id)
+    assert edited.status == "rejected"
+    assert edited.status_reason.startswith("authority denied")
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_request_seal_with_actor_other_than_requester_fails(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+    await _write_evidence(backend, request_id, *_resigned(row, _other_actor))
+
+    forged = await get_request(backend, request_id)
+    assert verify_restart_authority(forged) == (
+        False, "agent-request restart authority actor is not the requester",
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    assert (await get_request(backend, request_id)).status == "rejected"
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_signed_agent_request_outside_bounds_fails_verification(tmp_path):
+    """A validly signed agent seal is still re-checked against the bounds."""
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+    request_id = created.data["request"]["id"]
+    row = await get_request(backend, request_id)
+
+    def widen(document):
+        document["request"]["update_allow_migrations"] = True
+
+    await backend.execute(
+        "UPDATE restart_requests SET update_allow_migrations = 1 WHERE id = ?",
+        (request_id,),
+    )
+    await _write_evidence(backend, request_id, *_resigned(row, widen))
+
+    widened = await get_request(backend, request_id)
+    verified, reason = verify_restart_authority(widened)
+    assert verified is False
+    assert "outside the agent-requestable bound on allow_migrations" in reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_is_rechecked_when_default_branch_moves(
+    tmp_path, monkeypatch,
+):
+    """The executor re-checks the bounds as they stand, not as sealed."""
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+
+    _point_origin_head(default_repo, "trunk")
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("stale-bound row reached the update runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_update_runs_update_then_restart_without_caller(
+    tmp_path, monkeypatch,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+
+    async def _fake_run_update(self, req, profile):
+        assert req.update_repo_path == default_repo
+        return {
+            "ok": True,
+            "profile": "sovereign_local_uv_sync",
+            "repo_path": default_repo,
+            "target_ref": "main",
+            "resolved_ref": "abc1234",
+            "steps": [],
+            "migration": {"ran": False, "reason": "additive"},
+            "failed_step": None,
+        }
+
+    with (
+        caller_context_scope(None),
+        patch.object(RestartCoordinatorFeature, "_run_update", _fake_run_update),
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert (await get_request(backend, request_id)).status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_agent_filed_idle_only_request_escalates_after_bounded_deferral(
+    tmp_path,
+):
+    """"Or after a timeout": an agent's request is not starved by a busy host."""
+    feat, backend = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="deploy while busy")
+        request_id = created.data["request"]["id"]
+        feat.agent._active_request_ids.add("unrelated-busy-turn")
+
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            await feat.restart_coordinator()
+        spawn.assert_not_called()
+        blocked = await get_request(backend, request_id)
+        # The deferral clock was resealed with no sovereign caller present.
+        assert blocked.first_blocked_at
+        assert blocked.escalation_acknowledged is True
+        assert json.loads(blocked.authority_evidence)["basis"] == "agent_request"
+
+        assert await clear_deferral_started(
+            backend, request_id, expected_current_status="pending",
+        )
+        assert await mark_deferral_started(
+            backend,
+            request_id,
+            expected_current_status="pending",
+            blocked_at=(
+                datetime.now(timezone.utc)
+                - timedelta(seconds=MAX_IDLE_ONLY_DEFERRAL_SECONDS + 1)
+            ).isoformat(),
+        )
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            result = await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    assert result.data["executed"][0]["request_id"] == request_id
+    assert (await get_request(backend, request_id)).status == "executing"
+    assert any(
+        event["status"] == "escalated" and event["request_id"] == request_id
+        for event in _restart_status_events(captured)
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_request_retry_reseals_without_sovereign_caller(tmp_path):
+    """A failed dispatch returns the row for retry under the same agent bounds."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    feat._restart_dispatch_grace = 0
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship")
+        request_id = created.data["request"]["id"]
+        first = json.loads(
+            (await get_request(backend, request_id)).authority_evidence
+        )
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_dead_child(tmp_path),
+        ):
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+
+        retried = await get_request(backend, request_id)
+        assert retried.status == "pending"
+        resealed = json.loads(retried.authority_evidence)
+        assert resealed["basis"] == "agent_request"
+        assert resealed["actor"] == first["actor"] == agent.did
+        assert resealed["lifecycle_generation"] != first["lifecycle_generation"]
+        assert (await verify_restart_authority_at_use(backend, retried))[0]
+
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            return_value=_LiveChild(),
+        ) as spawn:
+            await feat.restart_coordinator()
+        await agent.drain_background_tasks()
+
+    spawn.assert_called_once()
+    assert (await get_request(backend, request_id)).status == "executing"

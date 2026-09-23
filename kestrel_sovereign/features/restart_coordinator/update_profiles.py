@@ -16,7 +16,9 @@ select a profile, never compose one.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -60,6 +62,67 @@ def default_sovereign_repo_path() -> str:
         if (parent / ".git").exists():
             return str(parent)
     return ""
+
+
+# How long one resolved default branch is reused. The executor re-verifies an
+# agent-filed update row at several boundaries per coordinator tick, and the
+# boot-time issuance adoption re-verifies every stored row; one ``git`` process
+# per verification would block the event loop for ~10ms each. ``origin/HEAD``
+# changes only when an operator re-points it, so a short reuse window cannot
+# meaningfully widen what an agent may request.
+_DEFAULT_BRANCH_TTL_SECONDS = 30.0
+_default_branch_cache: dict[str, tuple[float, str]] = {}
+
+
+def _read_checkout_default_branch(repo_path: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", repo_path,
+                "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    ref = (result.stdout or "").strip()
+    # The full target (not ``--short``, which may keep a disambiguating
+    # prefix) is ``refs/remotes/origin/<branch>``. The update profile fetches
+    # from ``origin``, so only a branch of that remote is the default.
+    prefix = "refs/remotes/origin/"
+    if not ref.startswith(prefix):
+        return ""
+    branch = ref[len(prefix):]
+    return branch if is_valid_target_ref(branch) else ""
+
+
+def checkout_default_branch(repo_path: str) -> str:
+    """The checkout's default branch as ``origin/HEAD`` names it, or ``""``.
+
+    The same source ``kestrel update`` reattaches a detached checkout to
+    (``cli_lifecycle._git_reattach_if_safely_detached``), but with no fallback:
+    this answers an authority question (#3339), so an unconfigured
+    ``origin/HEAD`` means "no default branch is known", never ``"main"``.
+    """
+    if not repo_path:
+        return ""
+    now = time.monotonic()
+    cached = _default_branch_cache.get(repo_path)
+    if cached is not None and now - cached[0] < _DEFAULT_BRANCH_TTL_SECONDS:
+        return cached[1]
+    branch = _read_checkout_default_branch(repo_path)
+    _default_branch_cache[repo_path] = (now, branch)
+    return branch
+
+
+def clear_checkout_default_branch_cache() -> None:
+    """Forget every resolved default branch (tests re-point ``origin/HEAD``)."""
+    _default_branch_cache.clear()
 
 
 @dataclass(frozen=True)

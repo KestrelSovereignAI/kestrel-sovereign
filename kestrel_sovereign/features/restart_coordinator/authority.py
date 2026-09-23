@@ -1,11 +1,21 @@
-"""Durable sovereign and delegated authority for whole-host restarts.
+"""Durable authority for whole-host restarts.
 
-RestartCoordinator is a host mutation surface, not a capability conferred by
-being an agent, a peer, a task recipient, or the cause of a turn. A request is
-accepted only for an endpoint-bound sovereign caller or for the exact subject
-of a narrow sovereign-signed delegation. The host seals the request bounds and
-every executor re-verifies both that seal and any delegation immediately before
-update and restart boundaries.
+A request is sealed on one of three bases:
+
+* an endpoint-bound **sovereign-key caller** — any bounds;
+* the exact subject of a narrow **sovereign-signed delegation** — the
+  delegation's bounds;
+* an **agent request** (#3339) — an agent may ask for a whole-host restart
+  from its own work (a scheduler wake, a signal, any autonomous turn), but
+  only inside the *agent-requestable bounds*: a plain restart, or the default
+  update profile landing the default Sovereign checkout's default branch with
+  no migrations. The coordinator's idle/timeout gate is the control for these;
+  anything wider still needs a sovereign caller or a delegation.
+
+The host seals the request bounds (and, for an agent request, the basis and
+the requesting agent as actor) under the sovereign key, and every executor
+re-verifies that seal, any delegation, and an agent request's bounds
+immediately before update and restart boundaries.
 
 Rotating ``KESTREL_API_KEY`` revokes pending evidence. Unsigned legacy rows and
 rows whose immutable request fields were edited fail closed.
@@ -20,6 +30,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 from kestrel_sovereign.security.host_authority import (
@@ -27,6 +38,8 @@ from kestrel_sovereign.security.host_authority import (
     require_sovereign_caller,
     stable_sovereign_secret,
 )
+
+from . import update_profiles
 
 
 AUTHORITY_KIND = "sovereign_api_key_hmac_v2"
@@ -40,6 +53,18 @@ REVOCATION_VERSION = 1
 _REVOCATION_DOMAIN = b"kestrel/restart-delegation-revocation/v1\x00"
 _GENERATION_RE = re.compile(r"[0-9a-f]{32}")
 _SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
+
+# The seal's ``basis`` for a request an agent filed with no sovereign caller
+# and no delegation (#3339). Sovereign-caller and delegated seals carry no
+# ``basis`` field, exactly as before, so every existing row verifies unchanged.
+AGENT_REQUEST_BASIS = "agent_request"
+
+# Policies an agent may choose for its own request. Every one of them leaves
+# execution to the coordinator's idle/timeout gate (``manual_only`` never
+# auto-executes at all).
+AGENT_REQUESTABLE_POLICIES = frozenset(
+    {"idle_agents_only", "allow_busy_after_timeout", "manual_only"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +126,77 @@ def require_restart_request_authority() -> str:
         return require_sovereign_caller(_OPERATION)
     except HostAuthorityError as error:
         raise RestartAuthorityError(str(error)) from error
+
+
+def _canonical_path(path: str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return ""
+
+
+def agent_request_bounds_violation(
+    *,
+    operation: str,
+    policy: str,
+    update_repo_path: str,
+    update_target_ref: str,
+    update_profile: str,
+    update_allow_migrations: bool,
+) -> tuple[str, str] | None:
+    """Return ``(bound, detail)`` for the first exceeded agent bound, else None.
+
+    The agent-requestable bounds (#3339): ``restart_only`` with no update
+    fields, or ``update_then_restart`` with a known update profile, the
+    default Sovereign checkout, that checkout's default branch (``origin/HEAD``)
+    and no migrations; any policy the coordinator gates. The inputs are the
+    values a durable row stores, so the same predicate serves request-time
+    screening, sealing, and executor re-verification. It never inspects a
+    caller-supplied path: the only filesystem it reads is the default checkout.
+    """
+
+    if policy not in AGENT_REQUESTABLE_POLICIES:
+        return "policy", f"policy {policy!r} is not agent-requestable"
+    if bool(update_allow_migrations):
+        return "allow_migrations", "an agent request cannot allow migrations"
+    if operation == "restart_only":
+        if update_repo_path or update_target_ref or update_profile:
+            return "operation", "a restart_only request carries update bounds"
+        return None
+    if operation != "update_then_restart":
+        return "operation", f"operation {operation!r} is not agent-requestable"
+    if update_profile not in update_profiles.KNOWN_UPDATE_PROFILES:
+        return "update_profile", (
+            f"update_profile {update_profile!r} is not a known update profile"
+        )
+    default_repo = update_profiles.default_sovereign_repo_path()
+    default_repo = _canonical_path(default_repo) if default_repo else ""
+    if not default_repo:
+        return "repo_path", "this host has no default Sovereign checkout"
+    if update_repo_path != default_repo:
+        return "repo_path", "repo_path is not the default Sovereign checkout"
+    default_branch = update_profiles.checkout_default_branch(default_repo)
+    if not default_branch:
+        return "target_ref", (
+            "the default Sovereign checkout's default branch is unknown "
+            "(origin/HEAD is not set)"
+        )
+    if update_target_ref != default_branch:
+        return "target_ref", (
+            "target_ref must be the default Sovereign checkout's default "
+            f"branch {default_branch!r}; got {update_target_ref!r}"
+        )
+    return None
+
+
+def agent_request_refusal(bound: str, detail: str) -> str:
+    """The refusal for an agent request outside the agent-requestable bounds."""
+
+    return (
+        f"restart request exceeds the agent-requestable bound on {bound}: "
+        f"{detail}; a request beyond those bounds requires an authenticated "
+        "sovereign-key caller or a sovereign-signed restart delegation"
+    )
 
 
 def _request_claims(
@@ -421,12 +517,44 @@ def issue_restart_authority(
     requested_at: str,
     first_blocked_at: str = "",
     delegation: RestartDelegation | None = None,
+    allow_agent_request: bool = False,
 ) -> tuple[str, str]:
-    """Seal exact bounds for a sovereign caller or verified delegation."""
+    """Seal exact bounds for a sovereign caller, delegation, or agent request.
 
+    ``allow_agent_request`` lets a request with neither a sovereign caller nor
+    a delegation be sealed on the agent-request basis, but only inside the
+    agent-requestable bounds; its actor is ``requested_by_agent``, the
+    filing tool's own scoped DID, never a caller-supplied value.
+    """
+
+    basis = None
     if delegation is None:
-        actor = require_restart_request_authority()
         delegation_binding = None
+        try:
+            actor = require_restart_request_authority()
+        except RestartAuthorityError:
+            if not allow_agent_request:
+                raise
+            exceeded = agent_request_bounds_violation(
+                operation=operation,
+                policy=policy,
+                update_repo_path=update_repo_path,
+                update_target_ref=update_target_ref,
+                update_profile=update_profile,
+                update_allow_migrations=update_allow_migrations,
+            )
+            if exceeded is not None:
+                raise RestartAuthorityError(
+                    agent_request_refusal(*exceeded)
+                ) from None
+            if not isinstance(requested_by_agent, str) or not (
+                requested_by_agent.strip()
+            ):
+                raise RestartAuthorityError(
+                    "agent restart request has no durable requesting agent"
+                ) from None
+            actor = requested_by_agent
+            basis = AGENT_REQUEST_BASIS
     else:
         parsed, _verification_reason = verify_restart_delegation(
             delegation.evidence, delegation.signature
@@ -481,6 +609,10 @@ def issue_restart_authority(
     }
     if delegation_binding is not None:
         document["delegation"] = delegation_binding
+    if basis is not None:
+        # Signed with everything else: an editor can neither add, drop, nor
+        # change the basis without failing the HMAC.
+        document["basis"] = basis
     evidence = _canonical(document).decode("utf-8")
     return evidence, _signature(document)
 
@@ -535,9 +667,10 @@ def reseal_restart_safety_state(
     """Authenticate a host-owned deferral-clock transition.
 
     This is deliberately not a new request-authority door: the existing seal
-    must verify first, and every immutable request claim and sovereign actor is
-    preserved. The coordinator uses it only while atomically changing the
-    safety timestamp whose age may release an idle-only gate.
+    must verify first, and every immutable request claim, the actor, and the
+    authority basis are preserved. The coordinator uses it only while
+    atomically changing the safety timestamp whose age may release an
+    idle-only gate.
     """
 
     verified, reason = verify_restart_authority(request)
@@ -614,6 +747,14 @@ def verify_restart_authority(request: Any) -> tuple[bool, str]:
             return False, "restart authority delegation signature is malformed"
         if actor != str(getattr(request, "requested_by_agent", "")):
             return False, "restart authority delegation actor is not the requester"
+    agent_request = "basis" in document
+    if agent_request:
+        if document.get("basis") != AGENT_REQUEST_BASIS:
+            return False, "restart authority basis is unsupported"
+        if delegation is not None:
+            return False, "agent-request restart authority carries a delegation"
+        if actor != str(getattr(request, "requested_by_agent", "")):
+            return False, "agent-request restart authority actor is not the requester"
 
     expected_claims = _request_claims(
         request_id=str(getattr(request, "id", "")),
@@ -642,6 +783,25 @@ def verify_restart_authority(request: Any) -> tuple[bool, str]:
         return False, str(error)
     if not hmac.compare_digest(signature, expected_signature):
         return False, "restart authority signature verification failed"
+    if agent_request:
+        # The seal proves what the agent asked for; it does not make those
+        # bounds agent-requestable. Re-check the durable row against the
+        # bounds as they stand now (default checkout, its default branch).
+        exceeded = agent_request_bounds_violation(
+            operation=expected_claims["operation"],
+            policy=expected_claims["policy"],
+            update_repo_path=expected_claims["update_repo_path"],
+            update_target_ref=expected_claims["update_target_ref"],
+            update_profile=expected_claims["update_profile"],
+            update_allow_migrations=expected_claims["update_allow_migrations"],
+        )
+        if exceeded is not None:
+            bound, detail = exceeded
+            return False, (
+                "agent-requested restart is outside the agent-requestable "
+                f"bound on {bound}: {detail}"
+            )
+        return True, "verified agent-requested restart within agent bounds"
     return True, (
         "verified sovereign-signed delegated request seal"
         if delegation is not None

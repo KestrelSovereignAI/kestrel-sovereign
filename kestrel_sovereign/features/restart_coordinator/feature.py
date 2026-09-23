@@ -47,6 +47,8 @@ from kestrel_sovereign.storage.db.interface import TransactionError
 
 from .authority import (
     RestartAuthorityError,
+    agent_request_bounds_violation,
+    agent_request_refusal,
     require_restart_request_authority,
 )
 from .event_store import (
@@ -746,15 +748,19 @@ class RestartCoordinatorFeature(Feature):
     @tool(
         name="request_restart",
         description=(
-            "File an authorized durable whole-host restart request. This tool "
-            "requires either the endpoint-authenticated sovereign API key or "
-            "an explicit delegation_id for this agent and these exact mutation "
-            "bounds. Agent identity, peer status, causation, and generic "
-            "ASK/AUTO approval do not confer authority. The exact "
+            "File a durable whole-host restart request. An agent may file one "
+            "from its own work, with no sovereign caller, inside the "
+            "agent-requestable bounds: operation='restart_only', or "
+            "operation='update_then_restart' with a known update_profile, "
+            "the default Sovereign checkout (omit repo_path), target_ref set "
+            "to that checkout's default branch, and allow_migrations=false. "
+            "Anything wider (another ref, repository, or profile, or "
+            "migrations) requires the endpoint-authenticated sovereign API "
+            "key or an explicit delegation_id for this agent and those exact "
+            "bounds; the refusal names the exceeded bound. The exact "
             "operation/update bounds are sealed durably and re-verified by "
-            "the host coordinator. "
-            "The host coordinator "
-            "evaluates safety and executes when conditions are met.\n\n"
+            "the host coordinator, which executes when every agent is idle "
+            "or, per policy, after a bounded timeout.\n\n"
             "urgency: one of low|normal|high|critical (default 'normal'); "
             "common synonyms are accepted ('medium'→normal, 'urgent'→high, "
             "'emergency'→critical). Higher urgency is executed first.\n"
@@ -837,17 +843,46 @@ class RestartCoordinatorFeature(Feature):
                 data={"created": False},
             )
         delegation_id = (delegation_id or "").strip()
+        agent_request = False
         if not delegation_id:
             # Authority is checked before update-mode path discovery or checkout
             # inspection. A caller who cannot request a whole-host mutation must
             # not be able to use its validation errors as a filesystem oracle.
             try:
                 require_restart_request_authority()
-            except RestartAuthorityError as error:
-                return ToolResult.failed(
-                    str(error),
-                    data={"created": False, "authority": "required"},
+            except RestartAuthorityError:
+                # No sovereign caller: this is the agent's own request (#3339),
+                # allowed only inside the agent-requestable bounds. Screen the
+                # values the row would store. A caller-supplied repo_path is
+                # compared lexically to the default checkout, never resolved or
+                # inspected, so an out-of-bounds path learns nothing about the
+                # filesystem; the seal and every executor re-check the bounds.
+                updating = operation == "update_then_restart"
+                requested_repo = (repo_path or "").strip() if updating else ""
+                if updating and not requested_repo:
+                    requested_repo = default_sovereign_repo_path()
+                exceeded = agent_request_bounds_violation(
+                    operation=operation,
+                    policy=policy,
+                    update_repo_path=(
+                        os.path.normpath(requested_repo) if requested_repo else ""
+                    ),
+                    update_target_ref=(
+                        (target_ref or "").strip() if updating else ""
+                    ),
+                    update_profile=update_profile if updating else "",
+                    update_allow_migrations=bool(allow_migrations),
                 )
+                if exceeded is not None:
+                    return ToolResult.failed(
+                        agent_request_refusal(*exceeded),
+                        data={
+                            "created": False,
+                            "authority": "required",
+                            "exceeded_bound": exceeded[0],
+                        },
+                    )
+                agent_request = True
 
         # Validate and normalise the update-mode parameters up front so an
         # unsafe/unknown profile never reaches the durable table.
@@ -955,6 +990,7 @@ class RestartCoordinatorFeature(Feature):
                 requester_request_id=str(requester_request_id),
                 origin_session_id=origin_session_id,
                 delegation_id=delegation_id,
+                allow_agent_request=agent_request,
             )
         except (RestartAuthorityError, TransactionError) as error:
             authority_error = (
