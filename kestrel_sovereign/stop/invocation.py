@@ -1668,28 +1668,34 @@ class DistributedInvocationRegistry:
                 done, _ = await asyncio.wait(pending, timeout=remaining)
                 if not done:
                     continue
-        # Fenced epochs keep their own identity on rows they still hold.
-        owner_ids = sorted(
-            {self._owner_id}
-            | {target.owner_id for target in self._active.values()}
+        # Fenced epochs keep their own identity on rows they still hold. The
+        # current owner goes first so its rows are the likeliest to settle
+        # before the deadline, and each owner is attempted independently: one
+        # epoch's failure must not skip the others (#3342).
+        owner_ids = [self._owner_id] + sorted(
+            {target.owner_id for target in self._active.values()}
+            - {self._owner_id}
         )
-
-        async def abandon_owners() -> None:
-            for owner_id in owner_ids:
-                await self._store.abandon_owner(owner_id)
-
-        try:
-            await asyncio.wait_for(
-                abandon_owners(),
-                timeout=max(1.0, deadline - loop.time()),
-            )
-        except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001
-            # Owner abandonment is recoverable: the lease expires and another
-            # replica reclaims. Never hold teardown open for it.
-            logger.warning(
-                "Distributed Stop owner abandonment did not complete (%s)",
-                type(error).__name__,
-            )
+        abandon_deadline = max(deadline, loop.time() + 1.0)
+        for owner_id in owner_ids:
+            remaining = abandon_deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(
+                    self._store.abandon_owner(owner_id),
+                    timeout=remaining,
+                )
+            except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001
+                # Owner abandonment is recoverable: the lease expires and
+                # reap_expired() retires the rows into the unresolved ledger.
+                # Never hold teardown open for it.
+                logger.warning(
+                    "Distributed Stop owner abandonment did not complete for "
+                    "the %s owner (%s)",
+                    "current" if owner_id == self._owner_id else "fenced",
+                    type(error).__name__,
+                )
         self._active.clear()
         self._by_local_generation.clear()
         self._cleanup_keys.clear()

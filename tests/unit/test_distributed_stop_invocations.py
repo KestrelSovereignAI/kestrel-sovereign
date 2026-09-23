@@ -1062,6 +1062,75 @@ async def test_registry_close_drains_queued_completed_settlement(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failing_owner", ["fenced", "current"])
+async def test_registry_close_abandons_each_owner_epoch_independently(
+    tmp_path, failing_owner
+):
+    """One epoch's abandonment failure cannot skip another's rows (#3342)."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "independent-abandon.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:independent-abandon")
+    original_abandon_owner = store.abandon_owner
+    try:
+        assert await registry.register(agent, "fenced-turn", 1)
+        fenced_owner_id = registry._owner_id
+        fenced_generation_id = registry._by_local_generation[
+            (id(agent), "fenced-turn", 1)
+        ]
+        registry._fail_closed_owner("owner lease renewal was late in the relay")
+        async with registry._registration_lock:
+            await registry._reacquire_owner_lease()
+        assert await registry.register(agent, "current-turn", 1)
+        current_owner_id = registry._owner_id
+        current_generation_id = registry._by_local_generation[
+            (id(agent), "current-turn", 1)
+        ]
+        assert current_owner_id != fenced_owner_id
+
+        failing_owner_id, failing_generation_id, surviving_generation_id = (
+            (fenced_owner_id, fenced_generation_id, current_generation_id)
+            if failing_owner == "fenced"
+            else (current_owner_id, current_generation_id, fenced_generation_id)
+        )
+        attempted = []
+
+        async def fail_one_owner(owner_id):
+            attempted.append(owner_id)
+            if owner_id == failing_owner_id:
+                raise RuntimeError("abandonment write failed")
+            await original_abandon_owner(owner_id)
+
+        store.abandon_owner = fail_one_owner
+        await registry.close()
+
+        # The current owner is attempted first; every owner is attempted.
+        assert attempted[0] == current_owner_id
+        assert sorted(attempted) == sorted({current_owner_id, fenced_owner_id})
+        unresolved = await db.fetchall(
+            "SELECT generation_id FROM stop_unresolved_invocations"
+        )
+        assert unresolved == [(surviving_generation_id,)]
+        # The failed owner's row stays active for reap_expired() to retire.
+        active = await db.fetchall(
+            "SELECT generation_id FROM stop_active_invocations"
+        )
+        assert active == [(failing_generation_id,)]
+    finally:
+        store.abandon_owner = original_abandon_owner
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
