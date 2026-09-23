@@ -30,6 +30,20 @@ from kestrel_sovereign.stop import (
 )
 
 
+# A lease the HEALTHY steps of a test must never exhaust (#3330).
+#
+# Several tests below need a real SQLite round trip to finish inside the owner
+# lease before they reach the expiry they actually assert. At 30-40 ms that
+# was a bet on runner speed: with 45 ms of latency injected before each store
+# call, five of them failed and one hung for the full per-test timeout, and
+# the slower CI event path failed two of them on a tree whose other run
+# passed. Tests that need expiry now produce it deterministically -- by
+# sleeping past this lease or by gating a reply -- rather than by hoping the
+# healthy path is faster than the one they are trying to outlast.
+_HEALTHY_LEASE_SECONDS = 0.5
+_PAST_HEALTHY_LEASE_SECONDS = _HEALTHY_LEASE_SECONDS + 0.1
+
+
 class _ReplicaAgent(RequestLifecycleMixin):
     def __init__(self, agent_id: str):
         self.agent_id = agent_id
@@ -615,7 +629,7 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
     first_db, second_db, store, replica_a, replica_b = await _shared_registries(
         tmp_path
     )
-    replica_a._owner_lease_seconds = 0.04
+    replica_a._owner_lease_seconds = _HEALTHY_LEASE_SECONDS
     agent = _ReplicaAgent("did:test:self-fenced-agent")
     replica_a.attach(agent)
     entered = asyncio.Event()
@@ -637,10 +651,19 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         raise RuntimeError("database partition")
 
     try:
-        await entered.wait()
+        # Race admission against the operation: an admission that self-fences
+        # never sets `entered`, and waiting on the event alone would hang until
+        # the per-test timeout instead of surfacing that error.
+        entering = asyncio.ensure_future(entered.wait())
+        await asyncio.wait(
+            {entering, operation}, return_when=asyncio.FIRST_COMPLETED
+        )
+        entering.cancel()
+        if operation.done():
+            operation.result()
         store.poll_owner = unavailable_poll
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(operation, timeout=0.5)
+            await asyncio.wait_for(operation, timeout=10)
         assert replica_a._lease_lost is True
         assert replica_a.owner_lifecycle_status == "self_fenced"
         with pytest.raises(InvocationSelfFencedError):
@@ -783,7 +806,7 @@ async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path)
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=0.03,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:idle-agent")
     try:
@@ -796,7 +819,7 @@ async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path)
         assert registry._active == {}
         assert registry._last_heartbeat_monotonic is None
 
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
 
         assert await registry.register(agent, "later-turn", 2)
         assert registry._lease_lost is False
@@ -817,17 +840,19 @@ async def test_single_row_admission_does_not_refresh_owner_wide_lease(tmp_path):
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=1.0,
+        owner_lease_seconds=2 * _HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:owner-wide-lease")
     try:
         assert await registry.register(agent, "older-turn", 1)
+        # Leave exactly one healthy lease of the owner-wide lease: enough for
+        # the newer admission's insert, which must not refresh it.
         registry._last_heartbeat_monotonic = (
-            asyncio.get_running_loop().time() - 0.95
+            asyncio.get_running_loop().time() - _HEALTHY_LEASE_SECONDS
         )
 
         assert await registry.register(agent, "newer-turn", 2)
-        await asyncio.sleep(0.08)
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
 
         with pytest.raises(InvocationSelfFencedError):
             await registry.register(agent, "third-turn", 3)
@@ -851,7 +876,7 @@ async def test_registration_that_outlasts_existing_owner_lease_self_fences(
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=0.2,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:admission-lease-race")
     original_register = store.register
@@ -875,7 +900,7 @@ async def test_registration_that_outlasts_existing_owner_lease_self_fences(
             registry.register(agent, "provisional-turn", 2)
         )
         await asyncio.wait_for(inserted.wait(), timeout=1)
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
         release_insert.set()
 
         with pytest.raises(InvocationSelfFencedError):
@@ -968,12 +993,12 @@ async def test_public_turn_binding_rejects_expired_local_owner_lease(tmp_path):
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=0.03,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:binding-expired-lease")
     try:
         assert await registry.register(agent, "private-request", 1)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
 
         with pytest.raises(InvocationSelfFencedError):
             await registry.bind_public_turn(
@@ -1004,7 +1029,7 @@ async def test_public_turn_binding_rejects_lease_expiring_during_sql(tmp_path):
     registry = DistributedInvocationRegistry(
         store,
         poll_seconds=0.01,
-        owner_lease_seconds=0.03,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:binding-reply-race")
     original_bind = store.bind_public_turn
@@ -1029,7 +1054,7 @@ async def test_public_turn_binding_rejects_lease_expiring_during_sql(tmp_path):
             )
         )
         await asyncio.wait_for(bound.wait(), timeout=1)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
         release_reply.set()
 
         with pytest.raises(InvocationSelfFencedError):

@@ -369,8 +369,7 @@ jobs:
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
         # (already a dev dep). Note that ``auto`` resolves to **2 workers**
         # on the standard GitHub-hosted runner, not the 16 an earlier
-        # revision of this comment assumed — 12.4k tests take ~5 min across
-        # five observed runs (one outlier at 8). Runner sizing is tracked in
+        # revision of this comment assumed. Runner sizing is tracked in
         # #2795. The PYTHONHASHSEED env at the workflow level keeps
         # parametrize ordering deterministic across workers.
         #
@@ -393,20 +392,38 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60
-        # 10 was too tight and started killing PASSING runs. The tier was
-        # measured at 7:43 on the 2-core runner (#2795) and has since grown —
-        # #2465, #2890 and #2902 added ~1.2k lines of tests in one week. The
-        # median push still lands at 5.6-6.7 min, but the distribution now
-        # crosses 10 and which side you land on is runner luck: 0.51.0's
-        # release PR timed out twice on a tree whose `main` push had passed in
-        # 6.4 min, stalling at 97% and then 88% — different points, so not a
-        # hung test.
+        run: uv run pytest tests/unit/ -n auto -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        # Budgeted the way the integration tier below is (#3212), because the
+        # unit tier hit the same wall for the same reason (#3330). 10 min was
+        # too tight, then 20 was: at 44e77ec5 the push run passed the step in
+        # 12.4 min while the pull_request run of the IDENTICAL tree was killed
+        # at 20:00 with 72% done. Its progress was uniformly slow, not stalled
+        # — 2.3x the push run at the same percentage (19.2 vs 8.4 min to 72%),
+        # and 3.7x that PR run's own rerun, which passed in 8.3. That is runner
+        # speed, not event type: across 51 successful steps the push and
+        # pull_request medians are both 11.3 min (max 13.8).
         #
-        # This does not mask a hang. Per-test `--timeout=60` above is what
-        # catches those; the job wall clock only decides how much passing work
-        # gets thrown away. Runner sizing — the real fix — stays in #2795.
-        timeout-minutes: 20
+        # The runner's kill is the failure worth removing. pytest writes
+        # tracebacks and the short summary only in its epilogue, so a killed
+        # step names FAILED tests and says nothing about why — #3330's
+        # 27k-line log had no traceback at all. `--session-timeout` makes
+        # pytest stop itself first: under xdist the worker that crosses it
+        # stops, the controller shuts the others down after their current
+        # test, and the FAILURES section and summary still print.
+        #
+        # Sizing: the slowest pass observed (13.8) on the slowest runner
+        # observed (2.3x) is 31.7 min; the 35 min session deadline clears it.
+        # The deadline is checked BETWEEN tests, so a run can overshoot it by
+        # up to the longest per-test ceiling — 300s, from the unit tier's
+        # `timeout(300)` markers, which tests/unit/conftest.py now refuses to
+        # exceed. 35 + 5, plus teardown, is why the runner backstop is 45.
+        #
+        # This does not mask a hang. Per-test `--timeout=60` catches those in
+        # a minute; the wall clock only decides how much passing work is
+        # thrown away. Runner sizing — the real fix — stays in #2795.
+        #
+        # budget-basis(unit): slowest-pass=13.8 worst-runner-ratio=2.3 samples=51 longest-test=300
+        timeout-minutes: 45
         env:
           KESTREL_AUDIT_MODE: skip
 
@@ -661,9 +678,10 @@ jobs:
         # runner speed, not growth: the slowest pass ever observed (20.6),
         # on the slowest runner ever observed (1.85x), is 38.1 min. The
         # `--session-timeout=2700` above (45 min) clears that by ~18%, and
-        # `budget-basis` below states those inputs where a test can check
-        # them — because the previous version of this comment made the same
-        # argument in prose and was falsified without anything noticing.
+        # `budget-basis(integration)` below states those inputs where a test
+        # can check them — because the previous version of this comment made
+        # the same argument in prose and was falsified without anything
+        # noticing.
         #
         # Two numbers, and the order between them is the point. pytest owns
         # the deadline, the runner owns the backstop: when a run really is
@@ -687,7 +705,7 @@ jobs:
         # Parallelizing this tier (#2794) is the fix that would actually
         # lower the number; runner sizing is #2795.
         #
-        # budget-basis: slowest-pass=20.6 worst-runner-ratio=1.85 samples=19 longest-test=180
+        # budget-basis(integration): slowest-pass=20.6 worst-runner-ratio=1.85 samples=19 longest-test=180
         timeout-minutes: 50
         env:
           KESTREL_AUDIT_MODE: skip

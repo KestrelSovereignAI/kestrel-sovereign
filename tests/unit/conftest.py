@@ -58,6 +58,7 @@ from kestrel_sovereign.host_features.storage import (
     HOST_DB_PATH_ENV,
     HOST_FEATURE_DB_FILENAME,
 )
+from tests.utils.ci_budget import refuse_unbudgeted_timeouts
 
 #: Marker name for tests that own host/home path resolution themselves.
 OWNS_HOST_PATHS_MARKER = "owns_host_paths"
@@ -77,6 +78,11 @@ HOST_FEATURES_DISABLED_MANIFEST = (
     f"[{HOST_SCOPE_TABLE}]\n"
     f"{DEFAULT_ENABLED_KEY} = false\n"
 )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Refuse a per-test timeout the tier's wall-clock budget cannot hold."""
+    refuse_unbudgeted_timeouts(config, items, "unit")
 
 
 @pytest.fixture(autouse=True)
