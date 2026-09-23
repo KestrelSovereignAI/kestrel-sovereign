@@ -222,6 +222,10 @@ _HOSTED_PROVISIONING_TIMEOUT_ENV = (
 )
 _DEFAULT_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 240.0
 _MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 300.0
+_HOSTED_PROVISIONING_DEADLINE: ContextVar[float | None] = ContextVar(
+    "isolated_hosted_provisioning_deadline",
+    default=None,
+)
 # Host telemetry is advisory. An async observer that wedges must never acquire
 # ownership of child startup, retirement, reload, or shutdown progress.
 _TELEMETRY_OBSERVER_TIMEOUT = 1.0
@@ -13060,7 +13064,20 @@ class ProxyFeature(Feature):
             )
 
     def ensure_venv(self) -> bool:
-        """Ensure the runtime environment and report whether Core mutated it."""
+        """Ensure the runtime environment within one hosted mutation budget."""
+
+        if not self._runtime_is_hosted():
+            return self._ensure_venv_with_active_budget()
+        timeout = _hosted_provisioning_timeout_seconds()
+        token = _HOSTED_PROVISIONING_DEADLINE.set(time.monotonic() + timeout)
+        try:
+            return self._ensure_venv_with_active_budget()
+        finally:
+            _HOSTED_PROVISIONING_DEADLINE.reset(token)
+
+    def _ensure_venv_with_active_budget(self) -> bool:
+        """Perform preparation under the caller's hosted deadline, if any."""
+
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -13278,7 +13295,14 @@ class ProxyFeature(Feature):
             uv_cache_dir=self._hosted_provisioning_cache_dir(),
         )
         env["PATH"] = trusted_path
-        timeout = _hosted_provisioning_timeout_seconds()
+        deadline = _HOSTED_PROVISIONING_DEADLINE.get()
+        timeout = (
+            _hosted_provisioning_timeout_seconds()
+            if deadline is None
+            else max(deadline - time.monotonic(), 0.0)
+        )
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired([executable, *cmd[1:]], timeout)
         completed = asyncio.run(
             run_bounded_subprocess(
                 [executable, *cmd[1:]],

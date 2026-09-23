@@ -10963,6 +10963,93 @@ def test_hosted_uv_provisioning_inherits_only_explicit_package_authority(
         assert secret not in env
 
 
+def test_hosted_uv_commands_share_one_provisioning_deadline(monkeypatch, tmp_path):
+    import kestrel_sovereign.features.isolated_runtime as ir
+    from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "tenant/agent"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path = feature._default_venv_path()
+    feature._prepare_runtime_workspace()
+    trusted_bin = tmp_path / "operator-bin"
+    trusted_bin.mkdir()
+    trusted_uv = trusted_bin / "uv"
+    trusted_uv.write_text("#!/bin/sh\nexit 0\n")
+    trusted_uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(trusted_bin))
+    monkeypatch.setenv(
+        "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS", "12.5"
+    )
+    clock = [100.0]
+    monkeypatch.setattr(ir.time, "monotonic", lambda: clock[0])
+    observed_timeouts = []
+
+    async def fake_run(cmd, **kwargs):
+        observed_timeouts.append(kwargs["timeout"])
+        clock[0] += 6.0
+        return BoundedProcessResult(tuple(cmd), 0, b"", b"", 1)
+
+    monkeypatch.setattr(ir, "run_bounded_subprocess", fake_run)
+
+    def provision():
+        feature._run(["uv", "venv", str(feature._venv_path)])
+        feature._run(["uv", "pip", "install", "example"])
+        return True
+
+    monkeypatch.setattr(feature, "_ensure_venv_with_active_budget", provision)
+
+    assert feature.ensure_venv() is True
+    assert observed_timeouts == [12.5, 6.5]
+
+
+def test_hosted_provisioning_refuses_spawn_after_shared_deadline(
+    monkeypatch, tmp_path
+):
+    import kestrel_sovereign.features.isolated_runtime as ir
+    from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "tenant/agent"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path = feature._default_venv_path()
+    feature._prepare_runtime_workspace()
+    trusted_bin = tmp_path / "operator-bin"
+    trusted_bin.mkdir()
+    trusted_uv = trusted_bin / "uv"
+    trusted_uv.write_text("#!/bin/sh\nexit 0\n")
+    trusted_uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(trusted_bin))
+    monkeypatch.setenv(
+        "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS", "12.5"
+    )
+    clock = [100.0]
+    monkeypatch.setattr(ir.time, "monotonic", lambda: clock[0])
+    spawned = []
+
+    async def fake_run(cmd, **_kwargs):
+        spawned.append(tuple(cmd))
+        clock[0] += 13.0
+        return BoundedProcessResult(tuple(cmd), 0, b"", b"", 1)
+
+    monkeypatch.setattr(ir, "run_bounded_subprocess", fake_run)
+
+    def provision():
+        feature._run(["uv", "venv", str(feature._venv_path)])
+        feature._run(["uv", "pip", "install", "example"])
+        return True
+
+    monkeypatch.setattr(feature, "_ensure_venv_with_active_budget", provision)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        feature.ensure_venv()
+    assert len(spawned) == 1
+
+
 @pytest.mark.parametrize("value", ("0", "301", "nan", "not-a-number"))
 def test_hosted_uv_provisioning_rejects_invalid_timeout_before_spawn(
     monkeypatch, tmp_path, value
