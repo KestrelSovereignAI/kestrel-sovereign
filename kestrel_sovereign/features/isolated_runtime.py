@@ -66,6 +66,7 @@ from kestrel_sdk.isolated_feature import (
 )
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
+from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 from kestrel_sovereign.features.channels.route_ownership import (
@@ -212,6 +213,19 @@ def set_hosted_telegram_route_attestation_resolver(
 # answers health() must not silently kill supervision forever (F013) — treat a
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
+# Hosted venv mutation runs in an owned worker, so its process-tree deadline
+# must be shorter than an embedding host's recovery-owner stale threshold. The
+# explicit maximum lets hosts calculate that threshold without trusting an
+# unbounded environment override.
+_HOSTED_PROVISIONING_TIMEOUT_ENV = (
+    "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS"
+)
+_DEFAULT_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 240.0
+_MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 300.0
+_HOSTED_PROVISIONING_DEADLINE: ContextVar[float | None] = ContextVar(
+    "isolated_hosted_provisioning_deadline",
+    default=None,
+)
 # Host telemetry is advisory. An async observer that wedges must never acquire
 # ownership of child startup, retirement, reload, or shutdown progress.
 _TELEMETRY_OBSERVER_TIMEOUT = 1.0
@@ -222,6 +236,27 @@ _TELEMETRY_FORCED_RETRY_LIMIT = 5
 _DISK_TELEMETRY_ENTRY_BUDGET = 250_000
 _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
+
+
+def _hosted_provisioning_timeout_seconds() -> float:
+    raw = os.getenv(_HOSTED_PROVISIONING_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_HOSTED_PROVISIONING_TIMEOUT_SECONDS
+    error = (
+        f"{_HOSTED_PROVISIONING_TIMEOUT_ENV} must be a finite number in "
+        f"(0, {_MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS:g}]"
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(error) from None
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value > _MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS
+    ):
+        raise ValueError(error)
+    return value
 
 
 class _TelemetryObserverSubmissionError(RuntimeError):
@@ -13029,7 +13064,20 @@ class ProxyFeature(Feature):
             )
 
     def ensure_venv(self) -> bool:
-        """Ensure the runtime environment and report whether Core mutated it."""
+        """Ensure the runtime environment within one hosted mutation budget."""
+
+        if not self._runtime_is_hosted():
+            return self._ensure_venv_with_active_budget()
+        timeout = _hosted_provisioning_timeout_seconds()
+        token = _HOSTED_PROVISIONING_DEADLINE.set(time.monotonic() + timeout)
+        try:
+            return self._ensure_venv_with_active_budget()
+        finally:
+            _HOSTED_PROVISIONING_DEADLINE.reset(token)
+
+    def _ensure_venv_with_active_budget(self) -> bool:
+        """Perform preparation under the caller's hosted deadline, if any."""
+
         assert self._venv_path is not None
         python_path = _venv_python(self._venv_path)
 
@@ -13247,7 +13295,25 @@ class ProxyFeature(Feature):
             uv_cache_dir=self._hosted_provisioning_cache_dir(),
         )
         env["PATH"] = trusted_path
-        subprocess.run([executable, *cmd[1:]], check=True, env=env)
+        deadline = _HOSTED_PROVISIONING_DEADLINE.get()
+        timeout = (
+            _hosted_provisioning_timeout_seconds()
+            if deadline is None
+            else max(deadline - time.monotonic(), 0.0)
+        )
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired([executable, *cmd[1:]], timeout)
+        completed = asyncio.run(
+            run_bounded_subprocess(
+                [executable, *cmd[1:]],
+                env=env,
+                timeout=timeout,
+            )
+        )
+        if completed.timed_out:
+            raise subprocess.TimeoutExpired(completed.argv, timeout)
+        if completed.returncode != 0:
+            raise subprocess.CalledProcessError(completed.returncode, completed.argv)
 
     def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
         factory = self._client_factory
