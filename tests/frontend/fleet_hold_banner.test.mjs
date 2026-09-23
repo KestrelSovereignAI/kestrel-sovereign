@@ -27,6 +27,8 @@ if (!globalThis.CSS || typeof globalThis.CSS.escape !== 'function') {
     globalThis.CSS = { escape: (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&') };
 }
 globalThis.location = dom.window.location;
+// Explicit, not ambient: Node 25+ exposes a global sessionStorage, Node 22 (CI) does not.
+globalThis.sessionStorage = dom.window.sessionStorage;
 globalThis.window.kicon = (name) => `<span class="ki ki-${name}" aria-hidden="true"></span>`;
 globalThis.kicon = globalThis.window.kicon;
 globalThis.localStorage = {

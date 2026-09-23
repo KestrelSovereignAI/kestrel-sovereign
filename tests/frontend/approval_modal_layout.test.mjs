@@ -15,6 +15,9 @@ globalThis.document = dom.window.document;
 globalThis.Node = dom.window.Node;
 globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.location = dom.window.location;
+// Explicit, not ambient: Node 25+ exposes global Web Storage, Node 22 (CI) does not.
+globalThis.sessionStorage = dom.window.sessionStorage;
+globalThis.localStorage = dom.window.localStorage;
 globalThis.window.kicon = (n) => `<span class="ki ki-${n}"></span>`;
 globalThis.kicon = globalThis.window.kicon;
 

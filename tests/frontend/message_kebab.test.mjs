@@ -17,6 +17,9 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http:
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 globalThis.location = dom.window.location;
+// Explicit, not ambient: Node 25+ exposes global Web Storage, Node 22 (CI) does not.
+globalThis.sessionStorage = dom.window.sessionStorage;
+globalThis.localStorage = dom.window.localStorage;
 globalThis.Node = dom.window.Node;
 globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.kicon = () => '⋯';
