@@ -1889,7 +1889,10 @@ async def test_postgres_large_scope_backfill_plan_and_work_scale_linearly(
             assert "durable_signal_source_sequence_event_work_pkey" in rendered_plan
             assert "Index Scan" in rendered_plan or "Index Only Scan" in rendered_plan
             release_first_batch.set()
-            await asyncio.wait_for(migration_task, timeout=30)
+            # This 10k-row CI workload normally takes ~26s; allow runner
+            # scheduling variance while the plan and batch-count checks below
+            # continue to enforce bounded, linear work.
+            await asyncio.wait_for(migration_task, timeout=90)
         finally:
             release_first_batch.set()
             await _cancel_and_drain(migration_task)
