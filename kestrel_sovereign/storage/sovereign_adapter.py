@@ -10,11 +10,13 @@ This adapter implements the "Convergent Sharding" protocol:
 
 import abc
 import asyncio
+import enum
 import json
 import logging
 import hashlib
 import hmac
 import os
+import warnings
 from typing import (
     TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Any, Tuple,
 )
@@ -280,6 +282,61 @@ class SovereignImportResult:
             "timestamp": self.timestamp,
             "source_cid": self.source_cid,
         }
+
+
+class UnsupportedImportDestinationError(ValueError):
+    """``import_agent`` was asked to restore into a database it is not bound to.
+
+    An adapter imports into exactly one destination: the ``AsyncDatabase``
+    it was constructed with. The deprecated ``target_db_path`` keyword never
+    selected another database — every mutation went to the bound one — so
+    any value other than ``None`` is refused before the package is fetched,
+    verified, audited, or restored (#2525). Construct a
+    :class:`SovereignStorageAdapter` over the intended destination instead.
+    """
+
+
+class _Unset(enum.Enum):
+    """Distinguishes an omitted keyword from an explicit ``None``."""
+
+    TOKEN = enum.auto()
+
+
+_UNSET = _Unset.TOKEN
+
+#: Release in which ``import_agent(target_db_path=...)`` is removed (#2525).
+TARGET_DB_PATH_REMOVAL_RELEASE = "0.55.0"
+
+
+def _refuse_ignored_import_destination(
+    target_db_path: Optional[str] | _Unset,
+) -> None:
+    """Fail closed on the deprecated ``target_db_path`` keyword (#2525).
+
+    Runs before ``import_agent`` touches the package, the bound database,
+    the import audit log, or any asset restorer. The supplied value is
+    never interpreted — not as a SQLite path, and never as a DSN for a
+    PostgreSQL or other backend — and never echoed, because a caller may
+    have passed a connection string carrying credentials.
+    """
+    if target_db_path is _UNSET:
+        return
+    warnings.warn(
+        "SovereignStorageAdapter.import_agent(target_db_path=...) is "
+        "deprecated and will be removed in kestrel-sovereign "
+        f"{TARGET_DB_PATH_REMOVAL_RELEASE}. An import always restores into "
+        "the adapter's bound database; omit the keyword.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    if target_db_path is not None:
+        raise UnsupportedImportDestinationError(
+            "import_agent does not support target_db_path: an import always "
+            "restores into the adapter's bound database, and this keyword "
+            "was never honored. Nothing was fetched, verified, audited, or "
+            "restored. Construct a SovereignStorageAdapter over the intended "
+            "destination database instead."
+        )
 
 
 class ConvergentEncryptor:
@@ -581,7 +638,7 @@ class SovereignStorageAdapter:
         source_did: Optional[str] = None,
         verify_continuity: bool = True,
         continuity_threshold: float = 0.7,
-        target_db_path: Optional[str] = None,
+        target_db_path: Optional[str] | _Unset = _UNSET,
         grant: Optional["DataAccessGrant"] = None,
         host_did: Optional[str] = None,
         host_policy: Optional[
@@ -609,6 +666,12 @@ class SovereignStorageAdapter:
         one row to the append-only ``agent_import_log``, keyed by agent
         DID + source DID + package hash + continuity score + timestamp.
 
+        Destination (#2525): the import restores into — and audits to —
+        the ``AsyncDatabase`` this adapter was constructed with, whatever
+        its backend (SQLite or PostgreSQL). There is no other destination.
+        To import into a different database, construct an adapter bound to
+        it.
+
         Consent gate (#1379, follow-up to #1273): when ``grant`` is
         provided, owner-consent is verified AFTER CAR integrity but
         BEFORE any host-DB mutation. The CAR's structural integrity
@@ -622,6 +685,15 @@ class SovereignStorageAdapter:
         pre-#1379 unauthenticated-host-trust behavior.
 
         Args:
+            target_db_path: Deprecated; removed in
+                :data:`TARGET_DB_PATH_REMOVAL_RELEASE`. It never selected a
+                destination. Passing it emits a ``DeprecationWarning``; any
+                value other than ``None`` additionally raises
+                :class:`UnsupportedImportDestinationError` before the
+                package is fetched and before any database, audit-log, or
+                asset-restorer side effect. Such a refused call is an
+                invalid invocation, not an import attempt, so it appends no
+                ``agent_import_log`` row.
             grant: Optional owner-signed :class:`DataAccessGrant`
                 authorizing this import. Required to be paired with
                 ``host_did`` so the grant has a receiver DID to bind
@@ -661,6 +733,8 @@ class SovereignStorageAdapter:
                 still populates from the manifest, and
                 ``asset_payload_counts`` is empty.
         """
+        _refuse_ignored_import_destination(target_db_path)
+
         source_cid: Optional[str] = None
         try:
             if isinstance(package, (bytes, bytearray)):
@@ -905,7 +979,7 @@ class SovereignStorageAdapter:
                 # beside the pass, so some imported rows still do not name
                 # their session and a lifecycle op on them is back to inferring
                 # membership from neighbours until it is run again.
-                logger.warning(
+                self.logger.warning(
                     "import_agent: %s legacy rows still do not name their "
                     "session for %s; run `kestrel storage stamp-sessions` "
                     "(#3120)",
