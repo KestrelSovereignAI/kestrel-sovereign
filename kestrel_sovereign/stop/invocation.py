@@ -157,6 +157,22 @@ class _OwnerPoll:
     stop_generation_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _LocalGeneration:
+    """One in-process generation and the owner identity that admitted it.
+
+    The owner is recorded per generation because a fenced owner is replaced
+    rather than revived (#3337): settlement and turn binding must keep using
+    the identity the durable row was written under, while the lease relay
+    renews only the current owner's rows.
+    """
+
+    agent: object
+    turn_id: str
+    generation: int
+    owner_id: str
+
+
 def _lease_cutoff_sql(db: Any, lease_seconds: float) -> tuple[str, tuple[object, ...]]:
     backend_type = database_backend_type(db)
     if backend_type == "postgres":
@@ -860,7 +876,15 @@ class DistributedInvocationStore:
 
 
 class DistributedInvocationRegistry:
-    """One process's live map and relay for shared Stop requests."""
+    """One process's live map and relay for shared Stop requests.
+
+    Owner lease loss fences the owner's in-flight generations immediately; it
+    is never a permanent state of the process (#3337). The fenced owner
+    identity is retired, and ownership for new work is re-established under a
+    fresh owner identity and epoch, so a stale lease can never be revived. If
+    re-establishment fails, the registry stays fenced and reports why through
+    :attr:`owner_fence_reason` until a later attempt succeeds.
+    """
 
     def __init__(
         self,
@@ -879,9 +903,10 @@ class DistributedInvocationRegistry:
             )
         self._store = store
         self._owner_id = uuid4().hex
+        self._owner_epoch = 1
         self._poll_seconds = float(poll_seconds)
         self._owner_lease_seconds = float(owner_lease_seconds)
-        self._active: dict[str, tuple[object, str, int]] = {}
+        self._active: dict[str, _LocalGeneration] = {}
         self._by_local_generation: dict[tuple[int, str, int], str] = {}
         self._registration_lock = asyncio.Lock()
         self._registration_tasks: set[asyncio.Task[bool]] = set()
@@ -891,6 +916,9 @@ class DistributedInvocationRegistry:
         self._relay_task: asyncio.Task[None] | None = None
         self._closing = False
         self._lease_lost = False
+        self._fence_reason: str | None = None
+        self._reacquisition_failure: str | None = None
+        self._next_relay_reacquisition_at: float | None = None
         self._last_heartbeat_monotonic: float | None = None
 
     def start(self) -> None:
@@ -908,9 +936,44 @@ class DistributedInvocationRegistry:
 
     @property
     def owner_lifecycle_status(self) -> str:
-        """Health-facing status of this process's permanent owner lease."""
+        """Health-facing status of this process's current owner lease."""
 
         return "self_fenced" if self._lease_lost else "healthy"
+
+    @property
+    def owner_epoch(self) -> int:
+        """Monotonic count of owner identities this registry has held."""
+
+        return self._owner_epoch
+
+    @property
+    def owner_fence_reason(self) -> str | None:
+        """Why the registry is fenced now, or ``None`` while it can admit.
+
+        Names both the lease loss and, once one was attempted, why ownership
+        could not yet be re-established.
+        """
+
+        if not self._lease_lost:
+            return None
+        reason = self._fence_reason or "owner lease lost"
+        if self._reacquisition_failure is None:
+            return f"epoch {self._owner_epoch}: {reason}"
+        return (
+            f"epoch {self._owner_epoch}: {reason}; re-establishment failed: "
+            f"{self._reacquisition_failure}"
+        )
+
+    def _lease_owned_generation_ids(self) -> tuple[str, ...]:
+        """Generations the current owner's lease must keep renewed."""
+
+        owner_id = self._owner_id
+        return tuple(
+            generation_id
+            for generation_id, target in self._active.items()
+            if target.owner_id == owner_id
+            and generation_id not in self._completing_generation_ids
+        )
 
     @staticmethod
     def _agent_id(agent: object) -> str:
@@ -937,7 +1000,10 @@ class DistributedInvocationRegistry:
                 lease_seconds=self._owner_lease_seconds,
             )
         except Exception as error:
-            self._fail_closed_owner()
+            self._fail_closed_owner(
+                f"owner lease could not be renewed {operation} "
+                f"({type(error).__name__})"
+            )
             raise InvocationSelfFencedError(
                 f"distributed Stop owner lease could not be renewed {operation}"
             ) from error
@@ -946,12 +1012,12 @@ class DistributedInvocationRegistry:
         # delayed database response from making an already-expired lease look
         # fresh to this process.
         if loop.time() - poll_started >= self._owner_lease_seconds:
-            self._fail_closed_owner()
+            self._fail_closed_owner(f"owner lease renewal was late {operation}")
             raise InvocationSelfFencedError(
                 f"distributed Stop owner lease expired {operation}"
             )
         if generation_id not in polled.live_generation_ids:
-            self._fail_closed_owner()
+            self._fail_closed_owner(f"durable generation was lost {operation}")
             raise InvocationSelfFencedError(
                 f"distributed Stop durable generation was lost {operation}"
             )
@@ -966,31 +1032,31 @@ class DistributedInvocationRegistry:
     ) -> bool:
         if self._closing:
             raise RuntimeError("distributed Stop registry is closing")
-        if self._lease_lost:
-            raise InvocationSelfFencedError(
-                "distributed Stop owner lease was already lost"
-            )
         key = (id(agent), turn_id, generation)
 
         async def publish() -> bool:
             async with self._registration_lock:
                 if self._lease_lost:
+                    # The fenced owner's generations were already cancelled
+                    # when the lease was lost. New work never inherits that
+                    # identity: it waits for a fresh owner or is refused.
+                    await self._reacquire_owner_lease()
+                if self._lease_lost:
                     raise InvocationSelfFencedError(
-                        "distributed Stop owner lease was lost before admission"
+                        "distributed Stop owner lease was lost and could not "
+                        f"be re-established ({self.owner_fence_reason})"
                     )
                 last_heartbeat = self._last_heartbeat_monotonic
-                lease_owned_generation_ids = tuple(
-                    generation_id
-                    for generation_id in self._active
-                    if generation_id not in self._completing_generation_ids
-                )
+                lease_owned_generation_ids = self._lease_owned_generation_ids()
                 if (
                     lease_owned_generation_ids
                     and last_heartbeat is not None
                     and asyncio.get_running_loop().time() - last_heartbeat
                     >= self._owner_lease_seconds
                 ):
-                    self._fail_closed_owner()
+                    self._fail_closed_owner(
+                        "owner lease expired before admission"
+                    )
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease expired before admission"
                     )
@@ -998,32 +1064,30 @@ class DistributedInvocationRegistry:
                     return True
                 generation_id = uuid4().hex
                 admission_started = asyncio.get_running_loop().time()
+                owner_id = self._owner_id
                 admitted = await self._store.register(
                     generation_id=generation_id,
                     agent_id=self._agent_id(agent),
                     turn_id=turn_id,
-                    owner_id=self._owner_id,
+                    owner_id=owner_id,
                     request_generation=generation,
                 )
                 if not admitted:
                     return False
-                had_other_lease_owned_work = any(
-                    active_generation_id
-                    not in self._completing_generation_ids
-                    for active_generation_id in self._active
-                )
+                still_lease_owned = self._lease_owned_generation_ids()
+                had_other_lease_owned_work = bool(still_lease_owned)
                 # The durable insert establishes cleanup ownership. Publish
                 # that ownership locally before any lease-loss branch can
                 # fail, so complete_soon can retry transient deletion errors.
                 self._by_local_generation[key] = generation_id
-                self._active[generation_id] = (agent, turn_id, generation)
+                self._active[generation_id] = _LocalGeneration(
+                    agent, turn_id, generation, owner_id
+                )
                 lease_expired_during_admission = bool(
                     lease_owned_generation_ids
                     and last_heartbeat is not None
                     and any(
-                        owned_generation_id in self._active
-                        and owned_generation_id
-                        not in self._completing_generation_ids
+                        owned_generation_id in still_lease_owned
                         for owned_generation_id in lease_owned_generation_ids
                     )
                     and asyncio.get_running_loop().time() - last_heartbeat
@@ -1035,7 +1099,9 @@ class DistributedInvocationRegistry:
                     # not have observed this yet, while another replica is
                     # already entitled to reap the older rows. The new row is
                     # provisional, never authority to revive that owner.
-                    self._fail_closed_owner()
+                    self._fail_closed_owner(
+                        "owner lease expired during admission"
+                    )
                 if self._lease_lost:
                     self.complete_soon(agent, turn_id, generation)
                     raise InvocationSelfFencedError(
@@ -1050,7 +1116,9 @@ class DistributedInvocationRegistry:
                         asyncio.get_running_loop().time() - admission_started
                         >= self._owner_lease_seconds
                     ):
-                        self._fail_closed_owner()
+                        self._fail_closed_owner(
+                            "first admission reply outlasted the owner lease"
+                        )
                         self.complete_soon(agent, turn_id, generation)
                         raise InvocationSelfFencedError(
                             "distributed Stop owner lease expired during admission"
@@ -1099,13 +1167,22 @@ class DistributedInvocationRegistry:
                 or generation_id in self._completing_generation_ids
             ):
                 return False
+            target = self._active.get(generation_id)
+            if target is None or target.owner_id != self._owner_id:
+                # Admitted under an owner that was fenced and replaced. Its
+                # lease cannot be revived by the owner that succeeded it.
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner lease was lost before turn binding"
+                )
             last_heartbeat = self._last_heartbeat_monotonic
             if (
                 last_heartbeat is None
                 or asyncio.get_running_loop().time() - last_heartbeat
                 >= self._owner_lease_seconds
             ):
-                self._fail_closed_owner()
+                self._fail_closed_owner(
+                    "owner lease expired before turn binding"
+                )
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired before turn binding"
                 )
@@ -1127,7 +1204,9 @@ class DistributedInvocationRegistry:
                 or asyncio.get_running_loop().time() - last_heartbeat
                 >= self._owner_lease_seconds
             ):
-                self._fail_closed_owner()
+                self._fail_closed_owner(
+                    "owner lease expired during turn binding"
+                )
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired during turn binding"
                 )
@@ -1152,6 +1231,9 @@ class DistributedInvocationRegistry:
         generation_id = self._by_local_generation.get(key)
         if generation_id is None or key in self._cleanup_keys:
             return
+        # Settle under the owner that wrote the durable row, even when that
+        # owner has since been fenced and replaced by a newer epoch.
+        owner_id = self._active[generation_id].owner_id
         self._cleanup_keys.add(key)
         # Durable deletion may become visible to a concurrent relay before
         # this task resumes to retire the local map. Mark the row synchronously
@@ -1164,7 +1246,7 @@ class DistributedInvocationRegistry:
                     try:
                         await self._store.settle(
                             generation_id,
-                            self._owner_id,
+                            owner_id,
                             disposition,
                         )
                     except asyncio.CancelledError:
@@ -1187,11 +1269,7 @@ class DistributedInvocationRegistry:
                     self._by_local_generation.pop(key, None)
                     self._active.pop(generation_id, None)
                     self._completing_generation_ids.discard(generation_id)
-                    if not any(
-                        active_generation_id
-                        not in self._completing_generation_ids
-                        for active_generation_id in self._active
-                    ):
+                    if not self._lease_owned_generation_ids():
                         # A lease protects durable owner rows, not an idle
                         # process identity. The next admission starts a fresh
                         # lease generation instead of inheriting elapsed idle
@@ -1262,13 +1340,12 @@ class DistributedInvocationRegistry:
             target = self._active.get(generation_id)
             if target is None:
                 continue
-            agent, turn_id, generation = target
-            cancel = getattr(agent, "cancel_current_request", None)
+            cancel = getattr(target.agent, "cancel_current_request", None)
             if callable(cancel) and cancel(
-                request_id=turn_id,
-                generation=generation,
+                request_id=target.turn_id,
+                generation=target.generation,
             ):
-                cancelled.append((turn_id, generation))
+                cancelled.append((target.turn_id, target.generation))
         return tuple(cancelled)
 
     async def wait_for_stop(
@@ -1296,16 +1373,41 @@ class DistributedInvocationRegistry:
                 return StopDisposition.UNREACHABLE
             await asyncio.sleep(self._poll_seconds)
 
-    def _fail_closed_owner(self) -> None:
+    def _fail_closed_owner(
+        self,
+        reason: str = "owner lease lost",
+        *,
+        owner_id: str | None = None,
+    ) -> None:
+        """Fence every generation the current owner's lease protects.
+
+        ``owner_id`` names the owner an asynchronous observation was made
+        about. An observation about an owner that has already been replaced
+        must not fence its successor.
+        """
+
         if self._lease_lost:
             return
+        if owner_id is not None and owner_id != self._owner_id:
+            return
         self._lease_lost = True
+        self._fence_reason = reason
+        self._reacquisition_failure = None
+        self._next_relay_reacquisition_at = None
         live_work = tuple(
-            target
-            for generation_id, target in self._active.items()
-            if generation_id not in self._completing_generation_ids
+            self._active[generation_id]
+            for generation_id in self._lease_owned_generation_ids()
         )
-        for agent, turn_id, generation in live_work:
+        logger.error(
+            "Distributed Stop owner FENCED (epoch %d): %s. %d in-flight "
+            "generation(s) self-fenced; new admissions wait for ownership to "
+            "be re-established under a fresh owner identity.",
+            self._owner_epoch,
+            reason,
+            len(live_work),
+        )
+        for target in live_work:
+            agent = target.agent
             self_fence = getattr(
                 type(agent),
                 "self_fence_current_request",
@@ -1317,37 +1419,148 @@ class DistributedInvocationRegistry:
                     if callable(self_fence):
                         self_fence(
                             agent,
-                            request_id=turn_id,
-                            generation=generation,
+                            request_id=target.turn_id,
+                            generation=target.generation,
                         )
                     else:
-                        cancel(request_id=turn_id, generation=generation)
+                        cancel(
+                            request_id=target.turn_id,
+                            generation=target.generation,
+                        )
                 except Exception:
                     logger.exception(
                         "Distributed Stop owner self-fence cancellation failed"
                     )
 
+    def _record_reacquisition_failure(self, failure: str) -> None:
+        if failure != self._reacquisition_failure:
+            logger.error(
+                "Distributed Stop owner lease could NOT be re-established "
+                "(fenced epoch %d: %s): %s. Every new invocation on this "
+                "process is refused until it is; /health/detailed reports "
+                "distributed_invocation_owner. Operator action: restore the "
+                "Stop database's availability and latency; the registry "
+                "retries on its own.",
+                self._owner_epoch,
+                self._fence_reason,
+                failure,
+            )
+        self._reacquisition_failure = failure
+
+    async def _reacquire_owner_lease(self) -> None:
+        """Re-establish ownership for new work under a fresh owner identity.
+
+        Callers hold ``_registration_lock``. The fenced owner identity is
+        retired, never renewed: its rows keep that identity, stop being
+        heartbeated, and are either settled by their own cleanup or reaped by
+        a peer. The replacement identity must prove the shared lease clock
+        answers inside one lease before it may admit anything. An idle owner
+        holds no durable rows, so that round trip is the whole acquisition;
+        the first admission then starts the new owner's lease as usual.
+        """
+
+        if not self._lease_lost or self._closing:
+            return
+        loop = asyncio.get_running_loop()
+        candidate = uuid4().hex
+        started = loop.time()
+        try:
+            polled = await self._store.poll_owner(
+                candidate,
+                lease_seconds=self._owner_lease_seconds,
+            )
+        except Exception as error:
+            self._record_reacquisition_failure(
+                f"owner lease store unavailable ({type(error).__name__})"
+            )
+            return
+        if loop.time() - started >= self._owner_lease_seconds:
+            self._record_reacquisition_failure(
+                "owner lease store answered after the lease window"
+            )
+            return
+        if polled.live_generation_ids:
+            self._record_reacquisition_failure(
+                "fresh owner identity already holds durable generations"
+            )
+            return
+        if not self._lease_lost or self._closing:
+            return
+        fenced_epoch = self._owner_epoch
+        fenced_reason = self._fence_reason
+        self._owner_id = candidate
+        self._owner_epoch = fenced_epoch + 1
+        self._last_heartbeat_monotonic = None
+        self._lease_lost = False
+        self._fence_reason = None
+        self._reacquisition_failure = None
+        self._next_relay_reacquisition_at = None
+        logger.warning(
+            "Distributed Stop owner lease re-established as epoch %d after "
+            "epoch %d was fenced (%s); admitting new invocations.",
+            self._owner_epoch,
+            fenced_epoch,
+            fenced_reason,
+        )
+
+    async def _relay_reacquire_owner_lease(self) -> None:
+        """Converge a fenced registry without waiting for new traffic.
+
+        Readiness reports a fenced owner as unhealthy, so a load balancer may
+        stop sending the very admissions that would otherwise heal it.
+        """
+
+        loop = asyncio.get_running_loop()
+        next_attempt = self._next_relay_reacquisition_at
+        if next_attempt is not None and loop.time() < next_attempt:
+            return
+        async with self._registration_lock:
+            await self._reacquire_owner_lease()
+        if self._lease_lost:
+            self._next_relay_reacquisition_at = (
+                loop.time() + self._owner_lease_seconds
+            )
+
     async def _relay(self) -> None:
         while not self._closing:
-            lease_owned_generation_ids = tuple(
-                generation_id
-                for generation_id in self._active
-                if generation_id not in self._completing_generation_ids
-            )
+            if self._lease_lost:
+                try:
+                    await self._relay_reacquire_owner_lease()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error(
+                        "Distributed Stop owner re-establishment failed (%s)",
+                        type(error).__name__,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                await asyncio.sleep(self._poll_seconds)
+                continue
+            owner_id = self._owner_id
+            lease_owned_generation_ids = self._lease_owned_generation_ids()
             if not lease_owned_generation_ids:
                 await asyncio.sleep(self._poll_seconds)
                 continue
             try:
                 poll_started = asyncio.get_running_loop().time()
                 polled = await self._store.poll_owner(
-                    self._owner_id,
+                    owner_id,
                     lease_seconds=self._owner_lease_seconds,
                 )
+                if owner_id != self._owner_id:
+                    # The owner this poll renewed was fenced and replaced
+                    # while it was in flight; its result describes no
+                    # generation the current lease protects.
+                    await asyncio.sleep(self._poll_seconds)
+                    continue
                 if (
                     asyncio.get_running_loop().time() - poll_started
                     >= self._owner_lease_seconds
                 ):
-                    self._fail_closed_owner()
+                    self._fail_closed_owner(
+                        "owner lease renewal was late in the relay",
+                        owner_id=owner_id,
+                    )
                 else:
                     self._last_heartbeat_monotonic = poll_started
                 live = set(polled.live_generation_ids)
@@ -1360,26 +1573,33 @@ class DistributedInvocationRegistry:
                 # legitimately absent. Compare the captured inventory only
                 # after subtracting rows that have since completed or begun
                 # completion; fresh admissions are covered by the next poll.
+                still_lease_owned = set(self._lease_owned_generation_ids())
                 lease_owned_generation_ids = tuple(
                     generation_id
                     for generation_id in lease_owned_generation_ids
-                    if generation_id in self._active
-                    and generation_id not in self._completing_generation_ids
+                    if generation_id in still_lease_owned
                 )
                 if any(
                     generation_id not in live
                     for generation_id in lease_owned_generation_ids
                 ):
-                    self._fail_closed_owner()
+                    self._fail_closed_owner(
+                        "durable generation was lost in the relay",
+                        owner_id=owner_id,
+                    )
                 else:
                     for generation_id in polled.stop_generation_ids:
                         target = self._active.get(generation_id)
                         if target is None:
                             continue
-                        agent, turn_id, generation = target
-                        cancel = getattr(agent, "cancel_current_request", None)
+                        cancel = getattr(
+                            target.agent, "cancel_current_request", None
+                        )
                         if callable(cancel):
-                            cancel(request_id=turn_id, generation=generation)
+                            cancel(
+                                request_id=target.turn_id,
+                                generation=target.generation,
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1394,7 +1614,11 @@ class DistributedInvocationRegistry:
                     and asyncio.get_running_loop().time() - last_heartbeat
                     >= self._owner_lease_seconds
                 ):
-                    self._fail_closed_owner()
+                    self._fail_closed_owner(
+                        "owner lease could not be renewed in the relay "
+                        f"({type(error).__name__})",
+                        owner_id=owner_id,
+                    )
             await asyncio.sleep(self._poll_seconds)
 
     async def close(self) -> None:
@@ -1433,9 +1657,19 @@ class DistributedInvocationRegistry:
                 done, _ = await asyncio.wait(pending, timeout=remaining)
                 if not done:
                     continue
+        # Fenced epochs keep their own identity on rows they still hold.
+        owner_ids = sorted(
+            {self._owner_id}
+            | {target.owner_id for target in self._active.values()}
+        )
+
+        async def abandon_owners() -> None:
+            for owner_id in owner_ids:
+                await self._store.abandon_owner(owner_id)
+
         try:
             await asyncio.wait_for(
-                self._store.abandon_owner(self._owner_id),
+                abandon_owners(),
                 timeout=max(1.0, deadline - loop.time()),
             )
         except (asyncio.TimeoutError, Exception) as error:  # noqa: BLE001

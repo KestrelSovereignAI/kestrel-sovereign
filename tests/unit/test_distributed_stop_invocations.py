@@ -679,6 +679,221 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         await second_db.close()
 
 
+async def _wait_for(predicate, *, timeout: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition was not reached")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
+    tmp_path,
+):
+    """One missed renewal must not fence every later turn (#3337)."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "owner-reacquisition.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:owner-reacquisition")
+    registry.attach(agent)
+    original_poll = store.poll_owner
+    original_settle = store.settle
+    faulted = asyncio.Event()
+    settle_entered = asyncio.Event()
+    release_settle = asyncio.Event()
+
+    async def settle_after_successor(generation_id, owner_id, disposition):
+        # Keep the fenced generation locally owned until a successor owner
+        # exists, then fail that attempt, so the settlement that finally
+        # lands is a retry issued under the successor's epoch.
+        if not settle_entered.is_set():
+            settle_entered.set()
+            await release_settle.wait()
+            raise RuntimeError("transient settlement failure")
+        await original_settle(generation_id, owner_id, disposition)
+
+    async def one_missed_renewal(*args, **kwargs):
+        if not faulted.is_set():
+            # One renewal answers after the lease it was renewing expired.
+            faulted.set()
+            await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
+        return await original_poll(*args, **kwargs)
+
+    in_flight = asyncio.create_task(agent.run_turn("in-flight-turn"))
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        fenced_owner_id = registry._owner_id
+        fenced_generation_id = next(iter(registry._active))
+        assert registry.owner_epoch == 1
+
+        store.poll_owner = one_missed_renewal
+        store.settle = settle_after_successor
+        registry.start()
+
+        with pytest.raises(InvocationSelfFencedError):
+            await asyncio.wait_for(in_flight, timeout=10)
+        assert faulted.is_set()
+        await asyncio.wait_for(settle_entered.wait(), timeout=10)
+
+        later = _ReplicaAgent("did:test:owner-reacquisition")
+        assert await registry.register(later, "later-turn", 1)
+
+        assert registry.owner_lifecycle_status == "healthy"
+        assert registry.owner_fence_reason is None
+        assert registry.owner_epoch == 2
+        assert registry._owner_id != fenced_owner_id
+        later_generation_id = registry._by_local_generation[
+            (id(later), "later-turn", 1)
+        ]
+        row = await db.fetchone(
+            "SELECT owner_id FROM stop_active_invocations "
+            "WHERE generation_id = ?",
+            (later_generation_id,),
+        )
+        assert row == (registry._owner_id,)
+
+        # The successor's relay renews only its own rows: the fenced
+        # generation, still awaiting settlement, cannot read as its loss.
+        await asyncio.sleep(0.1)
+        assert registry.owner_lifecycle_status == "healthy"
+        assert fenced_generation_id in registry._active
+
+        # The fenced generation settles under the identity that wrote it,
+        # not under its successor, and the new owner never renews it.
+        release_settle.set()
+        await _wait_for(lambda: fenced_generation_id not in registry._active)
+        assert await store.remaining((fenced_generation_id,)) == ()
+        assert (
+            await store.poll_owner(
+                fenced_owner_id, lease_seconds=_HEALTHY_LEASE_SECONDS
+            )
+        ).live_generation_ids == ()
+    finally:
+        agent.release_operation.set()
+        release_settle.set()
+        store.poll_owner = original_poll
+        store.settle = original_settle
+        await asyncio.gather(in_flight, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_reacquisition_stays_fenced_and_names_its_reason(tmp_path):
+    """No new owner without a proven lease clock; the relay heals later."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "failed-reacquisition.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:failed-reacquisition")
+    original_poll = store.poll_owner
+
+    async def partitioned_poll(*args, **kwargs):
+        raise RuntimeError("database partition")
+
+    try:
+        fenced_owner_id = registry._owner_id
+        registry._fail_closed_owner("owner lease renewal was late in the relay")
+        store.poll_owner = partitioned_poll
+
+        with pytest.raises(InvocationSelfFencedError):
+            await registry.register(agent, "refused-turn", 1)
+
+        assert registry.owner_lifecycle_status == "self_fenced"
+        assert registry.owner_epoch == 1
+        assert registry._owner_id == fenced_owner_id
+        reason = registry.owner_fence_reason
+        assert reason is not None
+        assert "owner lease renewal was late in the relay" in reason
+        assert "re-establishment failed" in reason
+        assert "RuntimeError" in reason
+        assert await db.fetchall("SELECT generation_id FROM stop_active_invocations") == []
+
+        # Once the store answers again the relay converges on its own: a
+        # fenced replica is out of rotation and may receive no admissions.
+        store.poll_owner = original_poll
+        registry.start()
+        await _wait_for(lambda: registry.owner_lifecycle_status == "healthy")
+        assert registry.owner_epoch == 2
+        assert registry._owner_id != fenced_owner_id
+        assert await registry.register(agent, "admitted-turn", 2)
+    finally:
+        store.poll_owner = original_poll
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_relay_observation_cannot_fence_successor_owner(tmp_path):
+    """A poll about a replaced owner describes nothing its successor owns."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "stale-relay-owner.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:stale-relay-owner")
+    original_poll = store.poll_owner
+    fenced_owner_id = registry._owner_id
+    stale_poll_entered = asyncio.Event()
+    release_stale_poll = asyncio.Event()
+
+    async def pause_fenced_owner_poll(owner_id, **kwargs):
+        if owner_id == fenced_owner_id:
+            stale_poll_entered.set()
+            await release_stale_poll.wait()
+            # Every row the fenced owner held reads as lost.
+            return type(await original_poll(owner_id, **kwargs))((), ())
+        return await original_poll(owner_id, **kwargs)
+
+    try:
+        assert await registry.register(agent, "fenced-turn", 1)
+        store.poll_owner = pause_fenced_owner_poll
+        registry.start()
+        await asyncio.wait_for(stale_poll_entered.wait(), timeout=30)
+
+        registry._fail_closed_owner("owner lease renewal was late in the relay")
+        async with registry._registration_lock:
+            await registry._reacquire_owner_lease()
+        assert registry.owner_epoch == 2
+
+        # The stale reply arrives after a full lease: late, and missing every
+        # row. Both describe the fenced owner, never its idle successor.
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
+        release_stale_poll.set()
+        await asyncio.sleep(0.05)
+
+        assert registry.owner_lifecycle_status == "healthy"
+        assert registry.owner_epoch == 2
+        assert await registry.register(agent, "successor-turn", 2)
+    finally:
+        release_stale_poll.set()
+        store.poll_owner = original_poll
+        await registry.close()
+        await db.close()
+
+
 @pytest.mark.asyncio
 async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
     """ABANDONED is uncertainty, never evidence that remote work stopped."""
