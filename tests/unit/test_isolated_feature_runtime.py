@@ -10920,18 +10920,23 @@ def test_hosted_uv_provisioning_inherits_only_explicit_package_authority(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "host-config"))
     captured = {}
 
-    def fake_run(cmd, **kwargs):
+    async def fake_run(cmd, **kwargs):
+        from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+
         captured["cmd"] = cmd
         captured.update(kwargs)
-        return ir.subprocess.CompletedProcess(cmd, 0)
+        return BoundedProcessResult(tuple(cmd), 0, b"", b"", 1)
 
-    monkeypatch.setattr(ir.subprocess, "run", fake_run)
+    monkeypatch.setattr(ir, "run_bounded_subprocess", fake_run)
+    monkeypatch.setenv(
+        "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS", "12.5"
+    )
 
     command = ["uv", "pip", "install", "--python", "/scoped/python", "pkg"]
     feature._run(command)
 
     assert captured["cmd"] == [str(trusted_uv.resolve()), *command[1:]]
-    assert captured["check"] is True
+    assert captured["timeout"] == 12.5
     env = captured["env"]
     assert env["PATH"] == str(trusted_bin.resolve())
     assert str(hostile_uv.parent) not in env["PATH"]
@@ -10956,6 +10961,107 @@ def test_hosted_uv_provisioning_inherits_only_explicit_package_authority(
         "XDG_CONFIG_HOME",
     ):
         assert secret not in env
+
+
+@pytest.mark.parametrize("value", ("0", "301", "nan", "not-a-number"))
+def test_hosted_uv_provisioning_rejects_invalid_timeout_before_spawn(
+    monkeypatch, tmp_path, value
+):
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "tenant/agent"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path = feature._default_venv_path()
+    feature._prepare_runtime_workspace()
+    trusted_bin = tmp_path / "operator-bin"
+    trusted_bin.mkdir()
+    trusted_uv = trusted_bin / "uv"
+    trusted_uv.write_text("#!/bin/sh\nexit 0\n")
+    trusted_uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(trusted_bin))
+    monkeypatch.setenv(
+        "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS", value
+    )
+    run = AsyncMock(side_effect=AssertionError("invalid timeout spawned uv"))
+    monkeypatch.setattr(ir, "run_bounded_subprocess", run)
+
+    with pytest.raises(ValueError, match="must be a finite number in"):
+        feature._run(["uv", "venv", str(feature._venv_path)])
+
+    run.assert_not_called()
+
+
+def test_hosted_uv_provisioning_timeout_maps_to_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "tenant/agent"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path = feature._default_venv_path()
+    feature._prepare_runtime_workspace()
+    trusted_bin = tmp_path / "operator-bin"
+    trusted_bin.mkdir()
+    trusted_uv = trusted_bin / "uv"
+    trusted_uv.write_text("#!/bin/sh\nexit 0\n")
+    trusted_uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(trusted_bin))
+
+    async def timed_out(cmd, **_kwargs):
+        from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+
+        return BoundedProcessResult(tuple(cmd), -9, b"", b"", 240_000, True)
+
+    monkeypatch.setattr(ir, "run_bounded_subprocess", timed_out)
+
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="venv provisioning could not be completed",
+    ):
+        feature._run_provisioning_command(
+            ["uv", "venv", str(feature._venv_path)]
+        )
+
+
+def test_hosted_uv_provisioning_nonzero_exit_maps_to_preparation_failure(
+    monkeypatch, tmp_path
+):
+    import kestrel_sovereign.features.isolated_runtime as ir
+
+    feature = ProxyFeature(
+        _hosted_postgres_agent(tmp_path / "runtime", "tenant/agent"),
+        _isolated_runtime(),
+        client_factory=FakeIsolatedClient,
+    )
+    feature._venv_path = feature._default_venv_path()
+    feature._prepare_runtime_workspace()
+    trusted_bin = tmp_path / "operator-bin"
+    trusted_bin.mkdir()
+    trusted_uv = trusted_bin / "uv"
+    trusted_uv.write_text("#!/bin/sh\nexit 0\n")
+    trusted_uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(trusted_bin))
+
+    async def failed(cmd, **_kwargs):
+        from kestrel_sovereign._bounded_subprocess import BoundedProcessResult
+
+        return BoundedProcessResult(tuple(cmd), 7, b"", b"", 1)
+
+    monkeypatch.setattr(ir, "run_bounded_subprocess", failed)
+
+    with pytest.raises(
+        IsolatedRuntimePreparationError,
+        match="venv provisioning could not be completed",
+    ):
+        feature._run_provisioning_command(
+            ["uv", "venv", str(feature._venv_path)]
+        )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cache ownership contract")

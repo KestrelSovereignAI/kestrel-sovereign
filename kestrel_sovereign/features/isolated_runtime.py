@@ -66,6 +66,7 @@ from kestrel_sdk.isolated_feature import (
 )
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolParameter, ToolSchema
 
+from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.base import Feature, UIContributions
 from kestrel_sovereign.features.channels.route_ownership import (
@@ -212,6 +213,15 @@ def set_hosted_telegram_route_attestation_resolver(
 # answers health() must not silently kill supervision forever (F013) — treat a
 # probe that exceeds this as unhealthy and fall through to the restart path.
 _HEALTH_PROBE_TIMEOUT = 5.0
+# Hosted venv mutation runs in an owned worker, so its process-tree deadline
+# must be shorter than an embedding host's recovery-owner stale threshold. The
+# explicit maximum lets hosts calculate that threshold without trusting an
+# unbounded environment override.
+_HOSTED_PROVISIONING_TIMEOUT_ENV = (
+    "KESTREL_HOSTED_ISOLATED_PROVISIONING_TIMEOUT_SECONDS"
+)
+_DEFAULT_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 240.0
+_MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS = 300.0
 # Host telemetry is advisory. An async observer that wedges must never acquire
 # ownership of child startup, retirement, reload, or shutdown progress.
 _TELEMETRY_OBSERVER_TIMEOUT = 1.0
@@ -222,6 +232,27 @@ _TELEMETRY_FORCED_RETRY_LIMIT = 5
 _DISK_TELEMETRY_ENTRY_BUDGET = 250_000
 _DISK_TELEMETRY_TIME_BUDGET_SECONDS = 1.0
 _DISK_TELEMETRY_DEPTH_BUDGET = 64
+
+
+def _hosted_provisioning_timeout_seconds() -> float:
+    raw = os.getenv(_HOSTED_PROVISIONING_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_HOSTED_PROVISIONING_TIMEOUT_SECONDS
+    error = (
+        f"{_HOSTED_PROVISIONING_TIMEOUT_ENV} must be a finite number in "
+        f"(0, {_MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS:g}]"
+    )
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(error) from None
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value > _MAX_HOSTED_PROVISIONING_TIMEOUT_SECONDS
+    ):
+        raise ValueError(error)
+    return value
 
 
 class _TelemetryObserverSubmissionError(RuntimeError):
@@ -13247,7 +13278,18 @@ class ProxyFeature(Feature):
             uv_cache_dir=self._hosted_provisioning_cache_dir(),
         )
         env["PATH"] = trusted_path
-        subprocess.run([executable, *cmd[1:]], check=True, env=env)
+        timeout = _hosted_provisioning_timeout_seconds()
+        completed = asyncio.run(
+            run_bounded_subprocess(
+                [executable, *cmd[1:]],
+                env=env,
+                timeout=timeout,
+            )
+        )
+        if completed.timed_out:
+            raise subprocess.TimeoutExpired(completed.argv, timeout)
+        if completed.returncode != 0:
+            raise subprocess.CalledProcessError(completed.returncode, completed.argv)
 
     def _build_client(self, config: Optional[Dict[str, Any]] = None) -> Any:
         factory = self._client_factory
