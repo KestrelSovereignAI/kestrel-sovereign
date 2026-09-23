@@ -5,14 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
 from kestrel_sovereign.agent.invocation import validate_invocation_id
-from kestrel_sovereign.storage.database_clock import database_now_sql
+from kestrel_sovereign.storage.database_clock import (
+    database_now_sql,
+    database_timestamp_bound_text,
+)
+from kestrel_sovereign.storage.db.interface import DatabaseError
+from kestrel_sovereign.storage.feed_sequence import ensure_feed_sequence
 
-from .types import StopOutcome, StopRequest
-
+from .types import StopOutcome, StopRequest, StopScope
 
 _SCHEMA_LOCK = "stop_receipts_v1"
 _RECEIPT_COLUMNS = (
@@ -24,6 +29,12 @@ _OUTCOME_COLUMNS = (
     "receipt_id, ordinal, resolved_target, agent_id, disposition, detail"
 )
 _OPAQUE_ID_DOMAIN = b"kestrel:stop-receipt-opaque-id:v1\0"
+# Serializes every receipt append on PostgreSQL from ``feed_seq`` allocation to
+# commit, so the feed's keyset order is commit order (#3159 R6). The allocating
+# insert trigger takes it, so a writer holds it AFTER its per-operation lock;
+# the schema backfill takes it inside the schema lock, which no writer holds,
+# so the two orders cannot cycle.
+_RECEIPT_FEED_LOCK_KEY = "kestrel:stop:receipt-feed"
 
 
 class StopReceiptError(RuntimeError):
@@ -45,6 +56,52 @@ class StopOperationClaim:
     operation_id: str
     request_fingerprint: str
     claim_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptOutcomeRecord:
+    """One per-target outcome read back WITHOUT the originating request.
+
+    ``resolved_target`` and ``agent_id`` are ``None`` when the row holds only
+    the blinded digest of a caller-supplied address. A reader has no key to
+    reverse it, and presenting a digest as an identity would invent one the
+    receipt never recorded (#3159 R3).
+    """
+
+    ordinal: int
+    resolved_target: str | None
+    agent_id: str | None
+    disposition: str
+    detail: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptRecord:
+    """One immutable Stop receipt as the sovereign read surface renders it.
+
+    ``feed_seq`` is the commit-ordered paging key; ``occurred_at`` is the
+    database clock's reading and is for display, not for ordering.
+    """
+
+    feed_seq: int
+    receipt_id: str
+    scope: str
+    actor_id: str
+    target_agent_id: str | None
+    reason: str | None
+    cascade: bool
+    occurred_at: str
+    span_id: str | None
+    trace_id: str | None
+    outcomes: tuple[StopReceiptOutcomeRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StopReceiptPage:
+    """One bounded page plus the keyset position that continues it."""
+
+    receipts: tuple[StopReceiptRecord, ...]
+    next_key: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +130,13 @@ def _fingerprint(request: StopRequest) -> str:
     semantic_request.pop("span_id", None)
     semantic_request.pop("trace_id", None)
     semantic_request.pop("turn_id", None)
+    if request.scope is StopScope.AGENT:
+        # An agent-scope request addresses its agent by ``target``. The DID in
+        # ``target_agent_id`` is what the authority RESOLVED that address to
+        # (#3159 R3) — evidence about the inventory at Stop time, exactly like
+        # the trace above. A retry after that agent was unloaded resolves to
+        # nothing and is still the same request.
+        semantic_request["target_agent_id"] = None
     canonical = json.dumps(
         semantic_request,
         sort_keys=True,
@@ -203,6 +267,16 @@ class StopReceiptStore:
                 "CREATE INDEX IF NOT EXISTS idx_stop_receipts_target "
                 "ON stop_receipts(scope, requested_target, occurred_at, receipt_id)"
             )
+            # The commit-ordered key the sovereign receipt feed pages on
+            # (#3159 R2/R6), with its unique index. Numbering pre-existing rows
+            # must exclude a concurrent append from another process, which
+            # holds the feed lock but never this schema lock.
+            await self._lock_receipt_feed()
+            await ensure_feed_sequence(
+                self._db,
+                table="stop_receipts",
+                lock_key=_RECEIPT_FEED_LOCK_KEY,
+            )
 
     async def _lock_operation(self, operation_id: str) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
@@ -213,6 +287,29 @@ class StopReceiptStore:
                 "kestrel:stop:operation:"
                 f"{_identifier_digest('operation', operation_id)}",
             ),
+        )
+
+    async def _lock_receipt_feed(self) -> None:
+        """Hold PostgreSQL's receipt-append slot until this transaction ends.
+
+        Per-operation locks let two different Stops commit concurrently. Then
+        transaction A can allocate a smaller key than B, B commits and is
+        paged, and A commits BEHIND the cursor a consumer already holds —
+        skipped forever. One writer at a time from ``feed_seq`` allocation to
+        commit makes every later receipt sort after every earlier one.
+
+        Appends take this inside the allocating insert trigger
+        (:mod:`kestrel_sovereign.storage.feed_sequence`), which is what also
+        serializes an older binary that never heard of the lock. Only the
+        schema backfill takes it here. SQLite needs no key: ``BEGIN
+        IMMEDIATE`` already grants the database's single writer slot.
+        """
+
+        if getattr(self._db, "backend_type", "") != "postgres":
+            return
+        await self._db.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            (_RECEIPT_FEED_LOCK_KEY,),
         )
 
     async def load(self, request: StopRequest) -> StopReceipt | None:
@@ -258,6 +355,218 @@ class StopReceiptStore:
             (agent_id, _identifier_digest("target", turn_id)),
         )
         return row is not None
+
+    async def list_receipts(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        agent_id: str | None = None,
+        trace_id: str | None = None,
+        after: int | None = None,
+        limit: int,
+    ) -> StopReceiptPage:
+        """Read one bounded page of immutable Stop evidence, oldest first.
+
+        Ordering is ``feed_seq``, which the table's insert trigger allocates
+        in commit order for every writer, including an older binary's. That is what makes the feed converge under late or out-of-order
+        telemetry: the same window always yields the same rows in the same
+        order however a consumer walked to it, and a receipt committed after a
+        page was read always sorts after that page's cursor instead of being
+        skipped by it (#3159 R6). ``since`` / ``until`` filter on the displayed
+        ``occurred_at``.
+
+        ``agent_id`` matches the receipt's own recorded target agent OR any of
+        its per-target outcomes, so a host-scope fan-out — whose header names
+        no single agent — is still findable by the agent it reached.
+
+        A backend that cannot answer raises :class:`StopReceiptError`, never a
+        raw ``DatabaseError``: the caller's promise is a 503 saying the history
+        is unreadable, and an untyped backend failure would escape that
+        translation and arrive as a sanitized 500 instead.
+        """
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("Stop receipt page size must be a positive integer")
+
+        try:
+            return await self._read_receipt_page(
+                since=since,
+                until=until,
+                agent_id=agent_id,
+                trace_id=trace_id,
+                after=after,
+                limit=limit,
+            )
+        except StopReceiptError:
+            # Corruption and conflict are already the precise answer. Only an
+            # untyped backend failure needs a name.
+            raise
+        except DatabaseError as error:
+            raise StopReceiptError(
+                "Durable Stop evidence could not be read"
+            ) from error
+
+    async def _read_receipt_page(
+        self,
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        agent_id: str | None,
+        trace_id: str | None,
+        after: int | None,
+        limit: int,
+    ) -> StopReceiptPage:
+        filters = ["receipt.feed_seq IS NOT NULL"]
+        params: list[Any] = []
+        if since is not None:
+            filters.append("receipt.occurred_at >= ?")
+            params.append(
+                database_timestamp_bound_text(self._db, since)
+            )
+        if until is not None:
+            filters.append("receipt.occurred_at < ?")
+            params.append(
+                database_timestamp_bound_text(self._db, until)
+            )
+        if trace_id is not None:
+            filters.append("receipt.trace_id = ?")
+            params.append(trace_id)
+        if agent_id is not None:
+            filters.append(
+                "(receipt.target_agent_id = ? OR EXISTS ("
+                "SELECT 1 FROM stop_receipt_outcomes AS scoped "
+                "WHERE scoped.receipt_id = receipt.receipt_id "
+                "AND scoped.agent_id = ?))"
+            )
+            params.extend((agent_id, agent_id))
+        if after is not None:
+            # Strict keyset successor: a page boundary can neither repeat a
+            # receipt nor skip one.
+            filters.append("receipt.feed_seq > ?")
+            params.append(after)
+
+        # One row over the page so the cursor is emitted only when more
+        # evidence actually exists.
+        params.append(limit + 1)
+        rows = await self._db.fetchall(
+            f"SELECT {_RECEIPT_COLUMNS}, feed_seq FROM stop_receipts AS receipt "
+            f"WHERE {' AND '.join(filters)} "
+            "ORDER BY receipt.feed_seq LIMIT ?",
+            tuple(params),
+        )
+        rows = tuple(rows)
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        receipts = [
+            await self._record_from_row(row) for row in page_rows
+        ]
+        next_key = receipts[-1].feed_seq if has_more and receipts else None
+        return StopReceiptPage(receipts=tuple(receipts), next_key=next_key)
+
+    async def _record_from_row(self, row: Any) -> StopReceiptRecord:
+        """Project one stored receipt WITHOUT its originating request.
+
+        :meth:`_receipt_from_row` exists to prove a retry against the request
+        that produced it. A history reader has no such request, so this path
+        validates the row's own shape and deliberately makes no attempt to
+        de-blind an opaque address.
+        """
+
+        if row is None or len(row) != 14:
+            raise StopReceiptCorruptError(
+                "Stop receipt row has an unexpected shape"
+            )
+        feed_seq = row[13]
+        if (
+            isinstance(feed_seq, bool)
+            or not isinstance(feed_seq, int)
+            or feed_seq < 1
+        ):
+            raise StopReceiptCorruptError("Stop receipt feed sequence is invalid")
+        receipt_id = _required_text(row[0], "receipt_id")
+        scope = _required_text(row[3], "scope")
+        if scope not in {"host", "agent", "turn", "tool_call"}:
+            raise StopReceiptCorruptError("Stop receipt scope is invalid")
+        try:
+            cascade_int = int(row[8])
+        except (TypeError, ValueError) as error:
+            raise StopReceiptCorruptError(
+                "Stop receipt cascade flag is invalid"
+            ) from error
+        if cascade_int not in (0, 1):
+            raise StopReceiptCorruptError("Stop receipt cascade flag is invalid")
+        for field_name, value in (
+            ("target_agent_id", row[6]),
+            ("reason", row[7]),
+            ("span_id", row[11]),
+            ("trace_id", row[12]),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise StopReceiptCorruptError(
+                    f"Stop receipt {field_name} is invalid"
+                )
+        outcome_rows = await self._db.fetchall(
+            f"SELECT {_OUTCOME_COLUMNS} FROM stop_receipt_outcomes "
+            "WHERE receipt_id = ? ORDER BY ordinal",
+            (receipt_id,),
+        )
+        outcomes: list[StopReceiptOutcomeRecord] = []
+        for expected_ordinal, outcome_row in enumerate(outcome_rows):
+            if outcome_row is None or len(outcome_row) != 6:
+                raise StopReceiptCorruptError(
+                    "Stop outcome row has an unexpected shape"
+                )
+            try:
+                ordinal = int(outcome_row[1])
+            except (TypeError, ValueError) as error:
+                raise StopReceiptCorruptError(
+                    "Stop outcome ordinal is invalid"
+                ) from error
+            if ordinal != expected_ordinal:
+                raise StopReceiptCorruptError(
+                    "Stop outcome order is not contiguous"
+                )
+            disposition = _required_text(outcome_row[4], "outcome disposition")
+            if disposition not in {
+                "stopped",
+                "already_complete",
+                "refused",
+                "unreachable",
+            }:
+                raise StopReceiptCorruptError(
+                    "Stop outcome disposition is invalid"
+                )
+            outcomes.append(
+                StopReceiptOutcomeRecord(
+                    ordinal=ordinal,
+                    resolved_target=_required_text(
+                        outcome_row[2], "outcome resolved_target"
+                    ),
+                    agent_id=_required_text(outcome_row[3], "outcome agent_id"),
+                    disposition=disposition,
+                    detail=outcome_row[5],
+                )
+            )
+        if not outcomes:
+            raise StopReceiptCorruptError(
+                "Stop receipt is missing its target outcome"
+            )
+        return StopReceiptRecord(
+            feed_seq=feed_seq,
+            receipt_id=receipt_id,
+            scope=scope,
+            actor_id=_required_text(row[4], "actor_id"),
+            target_agent_id=row[6],
+            reason=row[7],
+            cascade=bool(cascade_int),
+            occurred_at=_required_text(row[9], "occurred_at"),
+            span_id=row[11],
+            trace_id=row[12],
+            outcomes=tuple(outcomes),
+        )
 
     async def claim(
         self,
@@ -369,6 +678,9 @@ class StopReceiptStore:
                         "Stop operation claim is missing"
                     )
 
+                # ``feed_seq`` is deliberately absent: the insert trigger
+                # allocates it under the receipt-feed lock, held from here to
+                # commit, so this receipt's feed position is its commit order.
                 now_sql = database_now_sql(self._db)
                 await self._db.execute(
                     "INSERT INTO stop_receipts ("
@@ -619,12 +931,16 @@ class StopReceiptStore:
             raise StopReceiptConflict(
                 "Stop operation identity was reused for a different request"
             )
+        # An agent-scope ``target_agent_id`` is resolution evidence, not part
+        # of the request (see ``_fingerprint``): a retry replays whatever the
+        # original resolution recorded, including nothing at all.
+        agent_evidence = request.scope is StopScope.AGENT
         recorded = (
             receipt.operation_id,
             receipt.scope,
             receipt.actor_id,
             receipt.requested_target,
-            receipt.target_agent_id,
+            None if agent_evidence else receipt.target_agent_id,
             receipt.reason,
             receipt.cascade,
         )
@@ -633,7 +949,7 @@ class StopReceiptStore:
             request.scope.value,
             request.actor_id,
             request.target,
-            request.target_agent_id,
+            None if agent_evidence else request.target_agent_id,
             request.reason,
             request.cascade,
         )
@@ -695,6 +1011,11 @@ class UnavailableStopReceiptStore:
     ) -> StopReceipt:
         raise StopReceiptError(self._reason)
 
+    async def list_receipts(self, **_kwargs: Any) -> StopReceiptPage:
+        # A history nobody can read is reported as unreadable, never as an
+        # empty history (#3159 R2).
+        raise StopReceiptError(self._reason)
+
 
 __all__ = [
     "StopReceipt",
@@ -702,6 +1023,9 @@ __all__ = [
     "StopReceiptConflict",
     "StopReceiptCorruptError",
     "StopReceiptError",
+    "StopReceiptOutcomeRecord",
+    "StopReceiptPage",
+    "StopReceiptRecord",
     "StopReceiptStore",
     "UnavailableStopReceiptStore",
 ]
