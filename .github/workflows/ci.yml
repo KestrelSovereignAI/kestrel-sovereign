@@ -353,9 +353,17 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
 
       - name: Install dependencies
         run: uv sync
+
+      # jsdom (a devDependency) is required by tests/frontend. The lockfile's
+      # `file:../kestrel-flight` entry is a symlink npm tolerates when the
+      # sibling checkout is absent; no frontend test imports it.
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Run unit tests
         # ``-n auto`` parallelizes across runner cores via pytest-xdist
@@ -407,6 +415,9 @@ jobs:
           node --test
           tests/js/test_voice_playback.mjs
           tests/js/test_voice_playback_worklet.mjs
+
+      - name: Run frontend JavaScript tests
+        run: npm run test:js
 
   # Fail-fast across the parallel tiers.
   #
