@@ -573,7 +573,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/response_audit/hook.py** — Response audit hook - evaluates LLM responses for integrity.
   - `class ResponseAuditHook`
 - **kestrel_sovereign/features/restart_coordinator/__init__.py** — Restart Coordinator Feature (#1512).
-- **kestrel_sovereign/features/restart_coordinator/authority.py** — Durable sovereign and delegated authority for whole-host restarts.
+- **kestrel_sovereign/features/restart_coordinator/authority.py** — Durable authority for whole-host restarts.
   - `class RestartDelegation`; `class RestartAuthorityError`; `def require_restart_request_authority()`; `def issue_restart_delegation()`; `def verify_restart_delegation(evidence, signature)`; `def restart_delegation_allows(delegation)`; `def issue_restart_delegation_revocation()`; `def verify_restart_delegation_revocation(evidence, signature)`; `…`
 - **kestrel_sovereign/features/restart_coordinator/event_store.py** — Durable typed-event store for restart_status events (#1562).
   - `def dedupe_signature(request_id, state)`; `class RestartStatusEvent`; `async def ensure_restart_status_events_table(db)`; `async def record_event(db)`; `async def list_events_for_request(db, request_id)`; `async def list_recent_events_for_history(db)`; `async def list_recent_events_for_agent_context(db)`; `async def latest_event_for_signature(db, dedupe_sig)`
