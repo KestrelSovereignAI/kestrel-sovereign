@@ -95,12 +95,17 @@ class StopRequest:
             raise ValueError(
                 f"{self.scope.value} Stop requires the owning agent identity"
             )
-        if self.scope in {StopScope.HOST, StopScope.AGENT} and (
-            self.target_agent_id is not None
+        if self.scope is StopScope.HOST and self.target_agent_id is not None:
+            raise ValueError("host Stop cannot carry a separate owning agent")
+        if self.scope is StopScope.AGENT and self.target_agent_id is not None and (
+            not isinstance(self.target_agent_id, str)
+            or not self.target_agent_id.strip()
         ):
-            raise ValueError(
-                f"{self.scope.value} Stop cannot carry a separate owning agent"
-            )
+            # #3159 R3: for agent scope this is the DID the authority RESOLVED
+            # ``target`` to, recorded so a receipt can say which agent it
+            # stopped. ``target`` may be a routing name, so the two may differ;
+            # only :class:`CancellationAuthority` sets it, from its inventory.
+            raise ValueError("agent Stop resolved identity must be concrete")
         if self.reason is not None and (
             not isinstance(self.reason, str) or not self.reason.strip()
         ):

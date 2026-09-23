@@ -23,6 +23,14 @@ from kestrel_sovereign.endpoints.agent_helpers import (
     caller_is_sovereign,
     sovereign_actor_id,
 )
+from kestrel_sovereign.endpoints.receipt_feed import (
+    RECEIPT_FEED_SCHEMA_VERSION,
+    bounded_filter_text,
+    decode_cursor,
+    encode_cursor,
+    parse_time_window,
+    resolve_page_size,
+)
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
@@ -296,6 +304,86 @@ async def host_hold_state(request: Request, response: Response):
     }
 
 
+@router.get("/hold/receipts")
+async def host_hold_receipts(
+    request: Request,
+    response: Response,
+    since: str | None = None,
+    until: str | None = None,
+    scope: str | None = None,
+    agent_id: str | None = None,
+    cursor: str | None = None,
+    limit: str | None = None,
+):
+    """Read the append-only Hold history a held agent's card is explained by.
+
+    ``GET /api/host/hold`` answers "what is latched NOW" and forgets
+    everything else: the latch row is blanked on release, so a hold that was
+    resumed survives only here. That makes this route the only place a resume
+    is legible — it is its own ``release`` receipt, linked by
+    ``prior_hold_receipt_id`` to the hold it ended, and it neither rewrites nor
+    erases that hold (#3159 R5).
+
+    Sovereign-only, matching ``POST /api/host/hold``. This deliberately does
+    not widen ``GET /api/host/hold``'s existing exposure; that surface is its
+    own ticket.
+    """
+
+    # Authority first, and every filter as raw text: a typed or constrained
+    # parameter would be validated by FastAPI BEFORE this line (receipt_feed).
+    sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+
+    window_start, window_end = parse_time_window(since, until)
+    scope_filter: HoldScope | None = None
+    if scope is not None:
+        try:
+            scope_filter = HoldScope(scope)
+        except ValueError as error:
+            raise ApiHTTPException(
+                status_code=400,
+                code="receipt_filter_invalid",
+                message="scope must be 'host' or 'agent'.",
+            ) from error
+    agent_filter = bounded_filter_text(
+        agent_id, "agent_id", max_length=MAX_HOLD_TARGET_ID_LENGTH
+    )
+    after = decode_cursor(cursor)
+    page_size = resolve_page_size(limit)
+    if agent_filter is not None:
+        if scope_filter is HoldScope.HOST:
+            raise ApiHTTPException(
+                status_code=400,
+                code="hold_request_invalid",
+                message="The host Hold scope takes no caller-chosen target.",
+            )
+        # Naming an agent means the agent latch, never the host one: a host
+        # hold is not that agent's receipt even though it holds that agent.
+        scope_filter = HoldScope.AGENT
+
+    store = _hold_store(request)
+    try:
+        page = await store.list_receipts(
+            since=window_start,
+            until=window_end,
+            scope=scope_filter,
+            target_id=agent_filter,
+            after=after,
+            limit=page_size,
+        )
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
+        raise _refuse_store_failure(error) from error
+    return {
+        "schema_version": RECEIPT_FEED_SCHEMA_VERSION,
+        "receipts": [
+            {**hold_receipt_payload(entry.receipt), "feed_seq": entry.feed_seq}
+            for entry in page.entries
+        ],
+        "next_cursor": encode_cursor(page.next_key),
+    }
+
+
 @router.post("/hold")
 @hold_admission_rate_limit
 async def set_host_hold(request: Request, response: Response, body: HoldBody):
@@ -346,6 +434,7 @@ async def release_host_hold(
 __all__ = [
     "HoldBody",
     "HoldReleaseBody",
+    "host_hold_receipts",
     "host_hold_state",
     "release_host_hold",
     "router",

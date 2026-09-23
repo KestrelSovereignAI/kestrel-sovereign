@@ -117,16 +117,24 @@ def discover_entrypoint_feature_class_names() -> list[str]:
         return []
 
 
+# Modules that live beside the routers and mount none of their own. The
+# inventory names the files a route family is served FROM; a shared helper
+# listed there would advertise a surface that does not exist.
+ENDPOINT_HELPER_MODULES = frozenset(
+    {
+        "__init__.py",
+        "agent_helpers.py",
+        "closing_streaming_response.py",
+        "receipt_feed.py",
+    }
+)
+
+
 def discover_endpoint_router_files() -> list[str]:
     return sorted(
         path.name
         for path in ENDPOINTS_ROOT.glob("*.py")
-        if path.name
-        not in {
-            "__init__.py",
-            "agent_helpers.py",
-            "closing_streaming_response.py",
-        }
+        if path.name not in ENDPOINT_HELPER_MODULES
     )
 
 

@@ -272,6 +272,7 @@ class CancellationAuthority:
             return replay.outcomes
 
         targets = await self._resolve(request)
+        request = self._with_resolved_agent(request, targets)
         owner = asyncio.create_task(
             self._claim_stop_and_persist(request, targets),
             name="cooperative-stop-operation",
@@ -593,6 +594,28 @@ class CancellationAuthority:
                 detail=detail,
             )
             for target in targets
+        )
+
+    @staticmethod
+    def _with_resolved_agent(
+        request: StopRequest,
+        targets: tuple[_ResolvedStopAddress, ...],
+    ) -> StopRequest:
+        """Record which agent an agent-scope Stop actually reached (#3159 R3).
+
+        ``target`` is whatever address the caller used — a routing name or a
+        DID — and is durably stored only as a blinded digest. The receipt's
+        readable identity is the RESOLVED root's DID, taken from the inventory
+        and never from the caller: a caller-supplied value is discarded, and an
+        address that resolved to nothing records nothing rather than a guess.
+        The root is the first resolved address; cascaded descendants follow it.
+        """
+
+        if request.scope is not StopScope.AGENT:
+            return request
+        return replace(
+            request,
+            target_agent_id=targets[0].agent_id if targets else None,
         )
 
     @staticmethod

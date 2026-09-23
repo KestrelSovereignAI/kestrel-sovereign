@@ -9,6 +9,7 @@ Talon, compute, or training concepts.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar, cast
@@ -17,6 +18,58 @@ from typing import Generic, TypeVar, cast
 _T = TypeVar("_T")
 _ITERATOR_TERMINAL = object()
 _ITERATOR_INTERRUPTED = object()
+
+
+class _ConsumerCloseRecord:
+    """Whether the consumer of one owned iterator closed it early.
+
+    The record belongs to exactly ONE task: the producer task its iterator
+    owns. It is reached through a context variable only because that is how a
+    producer finds its nearest enclosing iterator, but context is inherited by
+    every task the producer spawns, and a disposition is not. A child task — a
+    background cognition turn a streamed turn enqueued, say — shares this very
+    object by reference and would otherwise report the parent's disconnect as
+    its own. So the record names its owner task, and only that task may read
+    it as set.
+    """
+
+    __slots__ = ("closed", "owner")
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.owner: asyncio.Task[None] | None = None
+
+    def closed_for(self, task: asyncio.Task[object] | None) -> bool:
+        return self.closed and task is not None and task is self.owner
+
+
+_CONSUMER_CLOSE: contextvars.ContextVar[_ConsumerCloseRecord | None] = (
+    contextvars.ContextVar("kestrel_owned_iterator_consumer_close", default=None)
+)
+
+
+def owned_consumer_closed() -> bool:
+    """Whether the consumer of the enclosing owned iterator closed it early.
+
+    Read from INSIDE the producer. This is a recorded disposition, set by
+    :meth:`OwnedAsyncIterator.aclose` before it interrupts the producer, so a
+    producer that unwinds with ``CancelledError`` because its reader went away
+    can say so. The exception alone cannot: a cooperative Stop and a host
+    teardown raise that same ``CancelledError`` (#3159). Only the nearest
+    enclosing owned iterator is consulted, and only from that iterator's own
+    producer task: a producer outside any owned iterator, or any task that
+    merely inherited the producer's context, reports ``False``.
+    """
+
+    record = _CONSUMER_CLOSE.get()
+    if record is None:
+        return False
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        # No running loop: nothing here can be an owned producer.
+        return False
+    return record.closed_for(current)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +112,21 @@ class OwnedAsyncIterator(Generic[_T]):
         self._interrupted_by_cleanup = False
         self._cleanup_error: BaseException | None = None
         self._cancellation_watch_started = False
+        self._consumer_close = _ConsumerCloseRecord()
+        # The producer runs in a copy of the constructing context in which
+        # this iterator's close record is bound, so the producer can find
+        # the record of ITS consumer. The record's owner binding below is
+        # what keeps tasks the producer spawns from claiming it.
+        owner_context = contextvars.copy_context()
+        owner_context.run(_CONSUMER_CLOSE.set, self._consumer_close)
         self._owner = asyncio.create_task(
             self._run(),
             name=f"owned_async_iterator:{operation}",
+            context=owner_context,
         )
+        # Bound before the producer can run a single step: ``create_task``
+        # only schedules it, so no read can observe an unowned record.
+        self._consumer_close.owner = self._owner
         self._cancellation_owner = asyncio.create_task(
             self._watch_owner_cancellation(),
             name=f"owned_async_iterator_cancel:{operation}",
@@ -258,6 +322,10 @@ class OwnedAsyncIterator(Generic[_T]):
         if self._closed:
             return
         self._closed = True
+        # Record the disposition BEFORE the producer is interrupted, so the
+        # producer's unwind reads why it was cancelled rather than guessing
+        # from the exception it happens to receive.
+        self._consumer_close.closed = True
         self._stop.set()
         self._continue.set()
         owner_cancelled_by_close = False
