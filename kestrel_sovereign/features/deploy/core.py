@@ -24,14 +24,21 @@ from typing import Any, Dict, Optional
 from kestrel_sovereign.config import load_config
 
 from .models import (
+    ControlPlaneStatus,
     DeployManagerError,
     DeploymentProfile,
     DeploymentSession,
     DeployProviderType,
     DeployStatus,
+    ReadinessCheck,
+    ReadinessStatus,
 )
 from .providers.azure_container import AzureContainerProvider
-from .providers._health import probe_http_health
+from .providers._health import (
+    build_health_url,
+    classify_health_failure,
+    probe_http_health,
+)
 from .providers.base import DeployProvider
 from .providers.cloudrun import CloudRunProvider
 from .persistence import validate_cloudrun_persistence
@@ -311,12 +318,14 @@ class DeployManagerCore:
         service_url: str,
         timeout: Optional[int] = None,
         poll_interval: int = 5,
-    ) -> bool:
+    ) -> ReadinessCheck:
         """
-        Verify health of deployed service with exponential backoff.
+        Run the readiness gate against a deployed service.
 
-        Polls the health endpoint until it responds or timeout is reached.
-        Pattern from gcp_compute/core.py:743-793.
+        Polls the health endpoint with exponential backoff until it answers
+        healthy or the deadline passes. A probe that ran and failed yields
+        ``UNREADY`` with the last observation; ``UNKNOWN`` means no probe
+        ran at all.
 
         Args:
             service_url: Base URL of the service
@@ -324,11 +333,15 @@ class DeployManagerCore:
             poll_interval: Initial poll interval in seconds
 
         Returns:
-            True if healthy, False if timeout
+            ReadinessCheck describing the gate and its outcome
         """
         timeout = self.health_check_timeout if timeout is None else timeout
+        health_url = build_health_url(service_url, self.health_check_path)
+        gate = f"GET {health_url} returns 2xx/3xx within {timeout}s"
         deadline = monotonic() + timeout
         current_interval = poll_interval
+        attempts = 0
+        last: Optional[Dict[str, Any]] = None
 
         logger.info(
             "Verifying health for %s at %s (timeout: %ss)",
@@ -343,6 +356,8 @@ class DeployManagerCore:
                 path=self.health_check_path,
                 timeout=min(10.0, remaining),
             )
+            attempts += 1
+            last = result
             if result["healthy"]:
                 if monotonic() >= deadline:
                     logger.debug(
@@ -352,7 +367,14 @@ class DeployManagerCore:
                 logger.info(
                     "Service is healthy (status: %s)", result["status_code"]
                 )
-                return True
+                return ReadinessCheck(
+                    status=ReadinessStatus.READY,
+                    gate=gate,
+                    health_url=health_url,
+                    timeout_seconds=timeout,
+                    attempts=attempts,
+                    last_status_code=result["status_code"],
+                )
 
             if result["status_code"] is not None:
                 logger.debug(
@@ -368,8 +390,31 @@ class DeployManagerCore:
             await asyncio.sleep(min(current_interval, 30, remaining))
             current_interval *= 1.5
 
-        logger.warning(f"Health check timed out after {timeout}s")
-        return False
+        logger.warning(f"Readiness gate did not pass within {timeout}s")
+        if last is None:
+            return ReadinessCheck(
+                status=ReadinessStatus.UNKNOWN,
+                gate=gate,
+                health_url=health_url,
+                timeout_seconds=timeout,
+                failure="not_probed",
+                detail="the readiness deadline elapsed before any probe ran",
+            )
+        if last["healthy"]:
+            failure = "deadline_exceeded"
+            detail = f"the healthy response arrived after the {timeout}s deadline"
+        else:
+            failure, detail = classify_health_failure(last)
+        return ReadinessCheck(
+            status=ReadinessStatus.UNREADY,
+            gate=gate,
+            health_url=health_url,
+            timeout_seconds=timeout,
+            attempts=attempts,
+            last_status_code=last["status_code"],
+            failure=failure,
+            detail=detail,
+        )
 
     def get_profile(self, profile_name: str) -> DeploymentProfile:
         """
@@ -510,10 +555,15 @@ class DeployManagerCore:
         """
         Deploy an agent to the cloud platform configured by ``profile_name``.
 
-        Returns the same shape DeployFeature historically returned:
-            ``{"success": True, "action": "deploy", "session": {...}}``
-        on success, ``{"success": False, "error": "..."}`` on failure.
+        ``success`` is true only when the control plane created the
+        revision AND it passed the readiness gate. The two are reported
+        separately as ``control_plane_status`` (:class:`ControlPlaneStatus`)
+        and ``readiness_status`` (:class:`ReadinessStatus`), with the gate's
+        observation under ``readiness``. An unready revision is left in
+        place for inspection — this method never rolls back — and the
+        result names its service, revision, and URL alongside ``error``.
         """
+        control_plane = ControlPlaneStatus.NOT_STARTED
         try:
             profile = self.get_profile(profile_name)
 
@@ -576,11 +626,14 @@ class DeployManagerCore:
             logger.info(f"Deploying {image} to {profile.service_name}...")
             session.status = DeployStatus.DEPLOYING
 
+            # Stays FAILED if the provider call raises.
+            control_plane = ControlPlaneStatus.FAILED
             deploy_result = await provider.deploy(
                 image=image,
                 service_name=profile.service_name,
                 profile=profile,
             )
+            control_plane = ControlPlaneStatus.SUCCEEDED
 
             session.status = DeployStatus.ACTIVE
             session.service_url = deploy_result.get("service_url")
@@ -589,16 +642,54 @@ class DeployManagerCore:
 
             if session.service_url:
                 logger.info(f"Verifying health of {session.service_url}...")
-                healthy = await self._verify_health(session.service_url)
-                session.health_status = "healthy" if healthy else "unknown"
+                readiness = await self._verify_health(session.service_url)
+            else:
+                readiness = ReadinessCheck(
+                    status=ReadinessStatus.UNKNOWN,
+                    gate=f"GET <service_url>{self.health_check_path}",
+                    failure="no_service_url",
+                    detail="the provider returned no service URL to probe",
+                )
+            session.health_status = readiness.status.value
 
-            logger.info(f"Deployment complete: {session.service_url}")
-
-            return {
-                "success": True,
+            result: Dict[str, Any] = {
+                "success": readiness.ready,
                 "action": "deploy",
-                "session": session.to_dict(),
+                "control_plane_status": control_plane.value,
+                "readiness_status": readiness.status.value,
+                "service": profile.service_name,
+                "revision": session.revision,
+                "service_url": session.service_url,
+                "operation": deploy_result.get("operation"),
+                "readiness": readiness.to_dict(),
             }
+            warnings = list(deploy_result.get("warnings") or [])
+            if warnings:
+                result["warnings"] = warnings
+
+            if readiness.ready:
+                logger.info(f"Deployment ready: {session.service_url}")
+            else:
+                session.error_message = (
+                    f"readiness gate {readiness.status.value}: {readiness.detail}"
+                )
+                result["error"] = (
+                    f"Revision {session.revision or '(unknown)'} of "
+                    f"{profile.service_name} was created but is not ready: "
+                    f"{readiness.detail}"
+                )
+                result["hint"] = (
+                    "The revision was left in place for inspection; see "
+                    f"`kestrel deploy logs {profile_name}`."
+                )
+                logger.warning(
+                    "Deployment of %s is not ready: %s",
+                    profile.service_name,
+                    readiness.detail,
+                )
+
+            result["session"] = session.to_dict()
+            return result
 
         except DeployManagerError as e:
             # Best-effort session cleanup on failure so a retry can
@@ -610,7 +701,12 @@ class DeployManagerCore:
             except Exception:
                 pass
 
-            return {"success": False, "error": str(e)}
+            return {
+                "success": False,
+                "control_plane_status": control_plane.value,
+                "readiness_status": ReadinessStatus.UNKNOWN.value,
+                "error": str(e),
+            }
 
     async def teardown_profile(self, profile_name: str) -> Dict[str, Any]:
         """Delete a deployed service for ``profile_name``."""

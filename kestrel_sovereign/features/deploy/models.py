@@ -22,6 +22,75 @@ class DeployStatus(Enum):
     TERMINATED = "terminated"
 
 
+class ControlPlaneStatus(Enum):
+    """Outcome of asking the provider to create or update the service.
+
+    This says whether a revision exists, not whether it serves traffic —
+    that is :class:`ReadinessStatus`.
+    """
+
+    NOT_STARTED = "not_started"
+    FAILED = "failed"
+    SUCCEEDED = "succeeded"
+
+
+class ReadinessStatus(Enum):
+    """Outcome of the post-deploy readiness gate.
+
+    ``UNKNOWN`` is reserved for "no readiness observation was possible"
+    (no service URL, the gate never probed, the control plane failed). A
+    probe that ran and failed is ``UNREADY``, never ``UNKNOWN``.
+    """
+
+    READY = "ready"
+    UNREADY = "unready"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ReadinessCheck:
+    """Result of the post-deploy readiness gate.
+
+    Deliberately has no truth value: an object that is always truthy is
+    exactly how a failed probe was once reported as a successful deploy
+    (#2473). Read :attr:`ready` or :attr:`status`.
+    """
+
+    status: ReadinessStatus
+    gate: str
+    health_url: Optional[str] = None
+    timeout_seconds: Optional[float] = None
+    attempts: int = 0
+    last_status_code: Optional[int] = None
+    # A fixed category (``http_status``, ``auth_rejected``,
+    # ``agent_not_initialized``, ``probe_timeout``, ``unreachable``,
+    # ``deadline_exceeded``, ``not_probed``, ``no_service_url``) and a
+    # sanitized one-line description. Raw exception text is never carried.
+    failure: Optional[str] = None
+    detail: Optional[str] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.status is ReadinessStatus.READY
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "ReadinessCheck has no truth value; read .ready or .status"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "gate": self.gate,
+            "health_url": self.health_url,
+            "timeout_seconds": self.timeout_seconds,
+            "attempts": self.attempts,
+            "last_status_code": self.last_status_code,
+            "failure": self.failure,
+            "detail": self.detail,
+        }
+
+
 class DeployProviderType(Enum):
     """Cloud deployment provider types."""
 

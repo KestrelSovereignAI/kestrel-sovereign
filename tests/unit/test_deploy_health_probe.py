@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sovereign.features.deploy.core import DeployManagerCore
+from kestrel_sovereign.features.deploy.models import ReadinessStatus
 from kestrel_sovereign.features.deploy.providers._health import (
     build_health_url,
     probe_http_health,
@@ -80,6 +81,7 @@ async def test_probe_translates_request_error_without_fabricating_timing() -> No
         "status_code": None,
         "response_time": None,
         "error": "Invalid URL",
+        "error_type": "ValueError",
     }
 
 
@@ -108,6 +110,7 @@ async def test_probe_deadline_covers_complete_http_lifecycle(
         "status_code": None,
         "response_time": None,
         "error": "TimeoutError",
+        "error_type": "TimeoutError",
     }
 
 
@@ -168,7 +171,8 @@ async def test_readiness_polling_delegates_custom_path_to_shared_probe() -> None
     )
 
     with patch("kestrel_sovereign.features.deploy.core.probe_http_health", probe):
-        assert await manager._verify_health("https://agent.example/", timeout=5)
+        check = await manager._verify_health("https://agent.example/", timeout=5)
+        assert check.ready
 
     probe.assert_awaited_once()
     assert probe.await_args.args == ("https://agent.example/",)
@@ -201,7 +205,9 @@ async def test_readiness_rejects_a_healthy_response_received_after_deadline() ->
             side_effect=late_success,
         ),
     ):
-        assert not await manager._verify_health("https://agent.example", timeout=5)
+        check = await manager._verify_health("https://agent.example", timeout=5)
+    assert check.status is ReadinessStatus.UNREADY
+    assert check.failure == "deadline_exceeded"
 
 
 async def test_readiness_backoff_cannot_sleep_past_deadline() -> None:
@@ -233,9 +239,10 @@ async def test_readiness_backoff_cannot_sleep_past_deadline() -> None:
         patch("kestrel_sovereign.features.deploy.core.asyncio.sleep", advance_clock),
         patch("kestrel_sovereign.features.deploy.core.probe_http_health", probe),
     ):
-        assert not await manager._verify_health(
+        check = await manager._verify_health(
             "https://agent.example", timeout=2, poll_interval=30
         )
+    assert check.status is ReadinessStatus.UNREADY
 
     assert sleeps == [2.0]
     probe.assert_awaited_once_with("https://agent.example", path="/health", timeout=2.0)

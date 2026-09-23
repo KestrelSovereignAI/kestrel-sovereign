@@ -4,15 +4,23 @@ Unit tests for deploy feature bug fixes (#101).
 Bug 1: azure_resource_group must be populated from profile config.
 Bug 2: Health check must reject 4xx status codes (not treat them as healthy).
 Bug 3: Temp credential file must be cleaned up via explicit cleanup() method.
+#2473: A deploy whose revision fails the readiness gate must not report success.
 """
 
 import os
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 import pytest
 
 from kestrel_sovereign.features.deploy.core import DeployManagerCore
+from kestrel_sovereign.features.deploy.models import (
+    DeployManagerError,
+    ReadinessCheck,
+    ReadinessStatus,
+)
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
 
 
@@ -143,7 +151,9 @@ class TestBug2ReadinessStatusCodes:
                 poll_interval=1,
             )
 
-            assert result is False
+            assert result.status is ReadinessStatus.UNREADY
+            assert result.failure == "http_status"
+            assert result.last_status_code == 404
 
     @pytest.mark.asyncio
     async def test_verify_health_accepts_200(self, sample_config_cloudrun_only):
@@ -164,7 +174,8 @@ class TestBug2ReadinessStatusCodes:
                 poll_interval=1,
             )
 
-            assert result is True
+            assert result.status is ReadinessStatus.READY
+            assert result.ready is True
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +321,264 @@ class TestBug3TempFileCleanup:
 
         # Can't instantiate abstract class directly, but we can check the method exists
         assert hasattr(DeployProvider, "cleanup")
+
+
+# ---------------------------------------------------------------------------
+# #2473: readiness gates deploy success
+# ---------------------------------------------------------------------------
+
+_SERVICE_URL = "https://kestrel-dev-abc.run.app"
+_SECRET_IN_ERROR = "token=sk-live-SECRET-should-not-leak"
+
+
+class _FakeProvider:
+    """Stands in for Cloud Run: the control plane always creates a revision."""
+
+    def __init__(self, operation: str, *, service_url: str | None = _SERVICE_URL):
+        self.operation = operation
+        self.service_url = service_url
+        self.deploy_calls = 0
+        self.teardown_calls = 0
+
+    async def deploy(self, *, image, service_name, profile):
+        self.deploy_calls += 1
+        return {
+            "service_url": self.service_url,
+            "revision": f"{service_name}-00007-abc",
+            "status": "active",
+            "operation": self.operation,
+            "warnings": [],
+        }
+
+    async def teardown(self, service_name):
+        self.teardown_calls += 1
+        return {"status": "deleted"}
+
+
+def _readiness_config() -> dict:
+    return {
+        "manager": {
+            "gcp_project_id": "test-project",
+            "health_check_timeout_seconds": 5,
+            "health_check_path": "/health",
+        },
+        "profiles": {
+            "dev": {
+                "provider": "cloudrun",
+                "service_name": "kestrel-dev",
+                "region": "us-central1",
+                "max_instances": 1,
+                "persistence_mode": "ephemeral_demo",
+                "env_vars": {
+                    "KESTREL_ENV": "development",
+                    "KESTREL_DB_BACKEND": "sqlite",
+                    "KESTREL_DEPLOYMENT_PERSISTENCE": "ephemeral_demo",
+                },
+            },
+        },
+    }
+
+
+def _manager_with(provider: _FakeProvider) -> DeployManagerCore:
+    manager = DeployManagerCore(config=_readiness_config())
+    manager._get_provider = lambda *a, **kw: provider
+    # A failing gate sleeps at most the remaining deadline; keep it short.
+    manager.health_check_timeout = 0.2
+    return manager
+
+
+def _serve(handler):
+    """Route every probe through real httpx using ``handler``."""
+    real_client = httpx.AsyncClient
+
+    def client_factory(*, timeout):
+        return real_client(transport=httpx.MockTransport(handler), timeout=timeout)
+
+    return patch("httpx.AsyncClient", side_effect=client_factory)
+
+
+def _status(code: int, body: dict | None = None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL(f"{_SERVICE_URL}/health")
+        if body is None:
+            return httpx.Response(code, text="")
+        return httpx.Response(code, json=body)
+
+    return handler
+
+
+def _raises(exc_type):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc_type(f"{_SECRET_IN_ERROR} via {request.url}", request=request)
+
+    return handler
+
+
+_UNREADY_CASES = {
+    "http_503": (_status(503), "http_status", 503),
+    "bad_auth_403": (_status(403), "auth_rejected", 403),
+    "bad_auth_401": (_status(401), "auth_rejected", 401),
+    "zero_agent_503": (
+        _status(503, {"status": "degraded", "agent_initialized": False}),
+        "agent_not_initialized",
+        503,
+    ),
+    "zero_agent_200": (
+        _status(200, {"status": "ok", "agent_initialized": False}),
+        "agent_not_initialized",
+        200,
+    ),
+    "timeout": (_raises(httpx.ConnectTimeout), "probe_timeout", None),
+    "unreachable": (_raises(httpx.ConnectError), "unreachable", None),
+}
+
+
+class TestIssue2473ReadinessGatesDeploySuccess:
+    """A created revision is not a successful deploy until it is ready."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["create", "update"])
+    @pytest.mark.parametrize("case", sorted(_UNREADY_CASES))
+    async def test_unready_revision_is_not_success(self, case, operation):
+        handler, failure, status_code = _UNREADY_CASES[case]
+        provider = _FakeProvider(operation)
+        manager = _manager_with(provider)
+
+        with _serve(handler):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        assert result["success"] is False
+        assert result["control_plane_status"] == "succeeded"
+        assert result["readiness_status"] == "unready"
+        assert result["operation"] == operation
+        # The operator can find what was deployed and which gate failed.
+        assert result["service"] == "kestrel-dev"
+        assert result["revision"] == "kestrel-dev-00007-abc"
+        assert result["service_url"] == _SERVICE_URL
+        readiness = result["readiness"]
+        assert readiness["status"] == "unready"
+        assert readiness["failure"] == failure
+        assert readiness["last_status_code"] == status_code
+        assert readiness["attempts"] >= 1
+        assert readiness["health_url"] == f"{_SERVICE_URL}/health"
+        assert f"{_SERVICE_URL}/health" in readiness["gate"]
+        assert "kestrel-dev-00007-abc" in result["error"]
+        assert readiness["detail"] in result["error"]
+        # The session reflects readiness honestly, not "unknown".
+        assert result["session"]["health_status"] == "unready"
+        assert result["session"]["revision"] == "kestrel-dev-00007-abc"
+        # Sanitized: transport exception text never reaches the result.
+        assert "SECRET" not in repr(result)
+        # Not rolled back: the revision is left for inspection.
+        assert provider.teardown_calls == 0
+        assert (await manager.get_session("kestrel-dev")) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["create", "update"])
+    async def test_ready_revision_is_success(self, operation):
+        provider = _FakeProvider(operation)
+        manager = _manager_with(provider)
+
+        with _serve(_status(200, {"status": "ok", "agent_initialized": True})):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        assert result["success"] is True
+        assert result["control_plane_status"] == "succeeded"
+        assert result["readiness_status"] == "ready"
+        assert result["operation"] == operation
+        assert result["readiness"]["failure"] is None
+        assert result["readiness"]["last_status_code"] == 200
+        assert result["session"]["health_status"] == "ready"
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_type_names_the_failure_without_its_message(self):
+        manager = _manager_with(_FakeProvider("create"))
+
+        with _serve(_raises(httpx.ConnectTimeout)):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        assert "ConnectTimeout" in result["readiness"]["detail"]
+        assert "SECRET" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_service_url_is_unknown_and_not_success(self):
+        manager = _manager_with(_FakeProvider("create", service_url=None))
+
+        with patch(
+            "kestrel_sovereign.features.deploy.core.probe_http_health"
+        ) as probe:
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        probe.assert_not_called()
+        assert result["success"] is False
+        assert result["control_plane_status"] == "succeeded"
+        assert result["readiness_status"] == "unknown"
+        assert result["readiness"]["failure"] == "no_service_url"
+
+    @pytest.mark.asyncio
+    async def test_gate_that_never_probed_is_unknown(self):
+        manager = _manager_with(_FakeProvider("create"))
+        manager.health_check_timeout = 0
+
+        with patch(
+            "kestrel_sovereign.features.deploy.core.probe_http_health"
+        ) as probe:
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        probe.assert_not_called()
+        assert result["success"] is False
+        assert result["readiness_status"] == "unknown"
+        assert result["readiness"]["failure"] == "not_probed"
+
+    @pytest.mark.asyncio
+    async def test_control_plane_failure_is_reported_separately(self):
+        provider = _FakeProvider("create")
+
+        async def failing_deploy(**_kwargs):
+            raise DeployManagerError("Deployment failed: quota exceeded")
+
+        provider.deploy = failing_deploy
+        manager = _manager_with(provider)
+
+        result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        assert result["success"] is False
+        assert result["control_plane_status"] == "failed"
+        assert result["readiness_status"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_refusal_before_provider_is_not_a_control_plane_failure(self):
+        manager = _manager_with(_FakeProvider("create"))
+
+        result = await manager.deploy_profile("dev", tag="latest")
+
+        assert result["success"] is False
+        assert result["control_plane_status"] == "not_started"
+
+    @pytest.mark.asyncio
+    async def test_provider_iam_warning_reaches_the_result(self):
+        """The Cloud Run IAM grant is warning-only; an unreachable service it
+        leaves behind is reported as unready with the warning alongside."""
+        provider = _FakeProvider("create")
+        original = provider.deploy
+
+        async def deploy_with_warning(**kwargs):
+            result = await original(**kwargs)
+            result["warnings"] = ["allUsers/run.invoker could not be granted"]
+            return result
+
+        provider.deploy = deploy_with_warning
+        manager = _manager_with(provider)
+
+        with _serve(_status(403)):
+            result = await manager.deploy_profile("dev", tag="v1.2.3")
+
+        assert result["success"] is False
+        assert result["readiness"]["failure"] == "auth_rejected"
+        assert result["warnings"] == ["allUsers/run.invoker could not be granted"]
+
+    def test_readiness_check_has_no_truth_value(self):
+        check = ReadinessCheck(status=ReadinessStatus.UNREADY, gate="g")
+        with pytest.raises(TypeError, match="no truth value"):
+            bool(check)
