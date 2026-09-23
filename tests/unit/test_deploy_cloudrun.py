@@ -127,6 +127,8 @@ class TestCloudRunProviderDeploy:
         assert result["service_url"] == "https://kestrel-dev-abc123.run.app"
         assert result["revision"] == "kestrel-dev-00001-abc"
         assert result["status"] == "active"
+        assert result["operation"] == "create"
+        assert result["warnings"] == []
 
         # Verify create_service was called
         assert mock_client.create_service.called
@@ -232,10 +234,47 @@ class TestCloudRunProviderDeploy:
         assert result["service_url"] == "https://kestrel-dev-xyz789.run.app"
         assert result["revision"] == "kestrel-dev-00002-xyz"
         assert result["status"] == "active"
+        assert result["operation"] == "update"
 
         # Verify update_service was called instead of create
         assert mock_client.update_service.called
         assert not mock_client.create_service.called
+
+    @pytest.mark.asyncio
+    async def test_deploy_surfaces_iam_grant_failure_as_warning(
+        self, mock_services_client, deployment_profile
+    ):
+        """#2473: the IAM grant stays warning-only, but the warning is part
+        of the result instead of only a log line, and carries no exception
+        text."""
+        from google.iam.v1 import policy_pb2
+
+        mock_client = MagicMock()
+        mock_client.get_service.side_effect = NotFound("service absent")
+        mock_result = MagicMock()
+        mock_result.uri = "https://kestrel-dev-abc123.run.app"
+        mock_result.latest_ready_revision = "kestrel-dev-00001-abc"
+        mock_client.create_service.return_value.result.return_value = mock_result
+        mock_client.get_iam_policy.return_value = policy_pb2.Policy()
+        mock_client.set_iam_policy.side_effect = ServiceUnavailable(
+            "iam backend down token=SECRET"
+        )
+
+        provider = CloudRunProvider(project_id="test-project")
+        provider._services_client = mock_client
+
+        result = await provider.deploy(
+            image="gcr.io/test-project/kestrel:v1",
+            service_name="kestrel-dev",
+            profile=deployment_profile,
+        )
+
+        assert result["status"] == "active"
+        assert len(result["warnings"]) == 1
+        warning = result["warnings"][0]
+        assert "run.invoker" in warning
+        assert "ServiceUnavailable" in warning
+        assert "SECRET" not in warning
 
     @pytest.mark.asyncio
     async def test_deploy_does_not_misclassify_lookup_failure_as_absent(

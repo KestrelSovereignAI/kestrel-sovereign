@@ -41,6 +41,17 @@ the CLI is a thin wrapper over `DeployManager` and the build/secrets ports.
 
 Run `uv run kestrel deploy --help` for the full flag set.
 
+A profile deploy succeeds only when the new revision passes the post-deploy
+readiness gate (`GET <service_url>` + `[manager].health_check_path` returning
+2xx/3xx within `health_check_timeout_seconds`, and not reporting
+`agent_initialized: false`). The result reports the two stages separately:
+`control_plane_status` (`succeeded`, `failed`, `not_started`) says whether the
+provider created the revision; `readiness_status` (`ready`, `unready`,
+`unknown`) says whether it serves. A created but unready revision exits 1,
+names the revision, URL, and failed gate, and is left in place for
+inspection — nothing is rolled back automatically. `unknown` means no probe
+could run (for example, the provider returned no URL) and is also a failure.
+
 ## Environment variables
 
 The CLI reads from your shell env (or `.env` if you `set -a && source .env`).

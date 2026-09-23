@@ -50,9 +50,11 @@ Subcommands
     See ``kestrel deploy build --help``.
 
 Each subcommand returns process exit code 0 if the operation reports
-``success=True``, 1 otherwise. Initialization failures (e.g. no
-``GCP_PROJECT_ID``) print a friendly error and return 1; we do not
-propagate the traceback past the CLI boundary.
+``success=True``, 1 otherwise. For ``kestrel deploy <profile>`` that
+means the new revision passed the post-deploy readiness gate; a revision
+the control plane created but that is not ready exits 1. Initialization
+failures (e.g. no ``GCP_PROJECT_ID``) print a friendly error and return 1;
+we do not propagate the traceback past the CLI boundary.
 """
 
 from __future__ import annotations
@@ -382,9 +384,46 @@ def _cmd_deploy_profile(args, profile_name: str) -> int:
     if args.json:
         print(json.dumps(result, indent=2, default=str))
     else:
-        _print_kv(result)
+        _print_deploy_outcome(result)
 
     return 0 if result.get("success") else 1
+
+
+def _print_deploy_outcome(result: Dict[str, Any]) -> None:
+    """Print a deploy headline, then the full result.
+
+    The headline follows ``success``, which the manager sets only when the
+    revision passed the readiness gate. A revision the control plane
+    created but that failed readiness is reported as a failure naming the
+    revision, URL, and gate (#2473) — never as a successful deploy.
+    """
+    session = result.get("session") or {}
+    service = result.get("service") or session.get("service_name") or "(unknown service)"
+    revision = result.get("revision") or session.get("revision") or "(unknown revision)"
+    url = result.get("service_url") or session.get("service_url") or "(no URL)"
+
+    if result.get("success"):
+        print(f"Deployment ready: {service} revision {revision} at {url}")
+    elif result.get("control_plane_status") == "succeeded":
+        readiness = result.get("readiness") or {}
+        print(
+            f"error: deployment NOT ready — revision {revision} of {service} "
+            f"at {url} failed the readiness gate",
+            file=sys.stderr,
+        )
+        print(f"  gate: {readiness.get('gate')}", file=sys.stderr)
+        print(
+            f"  readiness: {result.get('readiness_status')} "
+            f"({readiness.get('failure')}): {readiness.get('detail')}",
+            file=sys.stderr,
+        )
+        print(
+            "  the revision was left in place for inspection",
+            file=sys.stderr,
+        )
+    else:
+        print(f"error: {result.get('error', 'deploy failed')}", file=sys.stderr)
+    _print_kv(result)
 
 
 def _cmd_deploy_status(args) -> int:

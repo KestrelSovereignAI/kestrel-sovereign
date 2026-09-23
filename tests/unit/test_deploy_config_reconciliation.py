@@ -27,7 +27,11 @@ from pathlib import Path
 import pytest
 
 from kestrel_sovereign.features.deploy.manager import DeployManager
-from kestrel_sovereign.features.deploy.models import DeployProviderType
+from kestrel_sovereign.features.deploy.models import (
+    DeployProviderType,
+    ReadinessCheck,
+    ReadinessStatus,
+)
 
 
 # Repo root: tests/unit/<this_file> -> ../../ -> repo root.
@@ -702,7 +706,7 @@ def _install_offline_stubs(manager, monkeypatch) -> _StubProvider:
     monkeypatch.setattr(manager, "_get_provider", lambda *a, **kw: stub)
 
     async def _fake_health(_url, *_args, **_kw):
-        return True
+        return ReadinessCheck(status=ReadinessStatus.READY, gate="stubbed")
 
     monkeypatch.setattr(manager, "_verify_health", _fake_health)
     return stub
