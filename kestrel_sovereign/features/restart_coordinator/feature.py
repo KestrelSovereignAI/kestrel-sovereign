@@ -49,6 +49,8 @@ from .authority import (
     RestartAuthorityError,
     agent_request_bounds_violation,
     agent_request_refusal,
+    agent_update_boundary_violation,
+    is_agent_request_seal,
     require_restart_request_authority,
 )
 from .event_store import (
@@ -89,6 +91,7 @@ from .update_profiles import (
     default_sovereign_repo_path,
     get_update_profile,
     is_valid_target_ref,
+    origin_has_tag,
     repo_is_git_checkout,
 )
 
@@ -2574,6 +2577,11 @@ class RestartCoordinatorFeature(Feature):
                 "reason": "rejected: invalid update target_ref/repo_path",
             }
 
+        if is_agent_request_seal(req):
+            refused = await self._agent_update_boundary_refusal(req)
+            if refused is not None:
+                return refused
+
         update = await self._run_update(req, profile)
         try:
             await record_update_log(
@@ -2619,6 +2627,66 @@ class RestartCoordinatorFeature(Feature):
                 ),
             }
         return None
+
+    async def _agent_update_boundary_refusal(
+        self, req,
+    ) -> dict[str, Any] | None:
+        """Last agent-bounds check before an agent's update profile runs.
+
+        Per-tick verification may reuse a git answer for a few seconds; here,
+        immediately before the profile's ``git fetch``, ``origin/HEAD`` and the
+        local tag namespace are re-read uncached, and origin itself is asked
+        whether a tag shadows the branch (a tag created there since the last
+        fetch is not yet local, and ``fetch origin <name>`` would select it).
+        An exceeded bound is terminal; an origin that cannot be asked leaves
+        the row retryable, exactly like a failed fetch would.
+        """
+
+        def _reject_reason(bound: str, detail: str) -> str:
+            return (
+                "authority denied: agent-requested restart is outside the "
+                f"agent-requestable bound on {bound}: {detail}"
+            )
+
+        exceeded = await asyncio.to_thread(agent_update_boundary_violation, req)
+        if exceeded is None:
+            remote_tag = await asyncio.to_thread(
+                origin_has_tag, req.update_repo_path, req.update_target_ref,
+            )
+            if remote_tag is None:
+                reason = (
+                    "could not ask origin whether a tag shadows branch "
+                    f"{req.update_target_ref!r}; left retryable"
+                )
+                await self._recover_failed_restart_dispatch(
+                    req.id,
+                    reason=reason,
+                    active_status="updating",
+                    authority_context="agent update boundary",
+                    emit_status=False,
+                )
+                return {"request_id": req.id, "reason": reason}
+            if remote_tag:
+                exceeded = (
+                    "target_ref",
+                    (
+                        f"origin has a tag named {req.update_target_ref!r} "
+                        "beside the default branch; git fetch would land on "
+                        "the tag, not the branch"
+                    ),
+                )
+        if exceeded is None:
+            return None
+        reason = _reject_reason(*exceeded)
+        await update_status(
+            self._db, req.id,
+            status="rejected",
+            status_reason=reason,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            expected_current_status="updating",
+            expected_authority_signature=req.authority_signature,
+        )
+        return {"request_id": req.id, "reason": f"rejected: {reason}"}
 
     async def _run_update(self, req, profile) -> Dict[str, Any]:
         """Execute a profile's update steps, capturing each outcome.

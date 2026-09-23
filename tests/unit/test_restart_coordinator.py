@@ -7088,26 +7088,63 @@ def _point_origin_head(checkout, branch):
     update_profiles.clear_checkout_default_branch_cache()
 
 
+_GIT_IDENTITY = (
+    "-c", "user.email=restart-test@example.test",
+    "-c", "user.name=restart-test",
+    "-c", "commit.gpgsign=false",
+    "-c", "tag.gpgsign=false",
+)
+
+
+def _run_git(*args):
+    subprocess.run(["git", *_GIT_IDENTITY, *args], check=True, capture_output=True)
+
+
 def _agent_default_checkout(tmp_path, monkeypatch, *, default_branch="main"):
-    """A real git checkout standing in for this host's Sovereign checkout."""
+    """A real clone of a throwaway bare origin, standing in for this host's
+    Sovereign checkout. ``tmp_path / "seed"`` can push new refs to origin."""
     from kestrel_sovereign.features.restart_coordinator import (
         feature as feature_module,
         update_profiles,
     )
 
+    seed = tmp_path / "seed"
+    origin = tmp_path / "origin.git"
     checkout = tmp_path / "sovereign-default"
-    checkout.mkdir()
-    subprocess.run(
-        ["git", "init", "-q", str(checkout)], check=True, capture_output=True,
+    _run_git("init", "-q", "-b", "main", str(seed))
+    _run_git("-C", str(seed), "commit", "-q", "--allow-empty", "-m", "base")
+    _run_git("init", "-q", "--bare", "-b", "main", str(origin))
+    _run_git(
+        "-C", str(seed), "push", "-q", str(origin),
+        "refs/heads/main:refs/heads/main",
     )
-    if default_branch is not None:
+    _run_git("clone", "-q", str(origin), str(checkout))
+    if default_branch is None:
+        _run_git(
+            "-C", str(checkout), "symbolic-ref", "-d", "refs/remotes/origin/HEAD",
+        )
+    elif default_branch != "main":
         _point_origin_head(checkout, default_branch)
-    else:
-        update_profiles.clear_checkout_default_branch_cache()
+    update_profiles.clear_checkout_default_branch_cache()
     path = str(checkout.resolve())
     monkeypatch.setattr(update_profiles, "default_sovereign_repo_path", lambda: path)
     monkeypatch.setattr(feature_module, "default_sovereign_repo_path", lambda: path)
     return path
+
+
+def _tag_on_origin(tmp_path, name, *, fetch_into_checkout=False):
+    """Push a tag named like the branch to origin (optionally fetch it)."""
+    seed = tmp_path / "seed"
+    _run_git("-C", str(seed), "tag", name)
+    _run_git(
+        "-C", str(seed), "push", "-q", str(tmp_path / "origin.git"),
+        f"refs/tags/{name}:refs/tags/{name}",
+    )
+    if fetch_into_checkout:
+        _run_git(
+            "-C", str(tmp_path / "sovereign-default"),
+            "fetch", "-q", "--tags", "origin",
+        )
 
 
 def _resigned(row, mutate):
@@ -7584,3 +7621,184 @@ async def test_agent_request_retry_reseals_without_sovereign_caller(tmp_path):
 
     spawn.assert_called_once()
     assert (await get_request(backend, request_id)).status == "executing"
+
+
+async def _fake_ok_update(self, req, profile):
+    return {
+        "ok": True,
+        "profile": req.update_profile,
+        "repo_path": req.update_repo_path,
+        "target_ref": req.update_target_ref,
+        "resolved_ref": "abc1234",
+        "steps": [],
+        "migration": {"ran": False, "reason": "additive"},
+        "failed_step": None,
+    }
+
+
+async def _run_agent_update_tick(feat):
+    """One coordinator tick with no caller; the update runner must not run."""
+    feat._run_update = AsyncMock(
+        side_effect=AssertionError("refused agent update reached the runner")
+    )
+    with caller_context_scope(None), patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        await feat.restart_coordinator()
+    feat._run_update.assert_not_awaited()
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_update_boundary_rereads_origin_head_inside_cache_window(
+    tmp_path, monkeypatch,
+):
+    """The cache cannot carry a stale default branch into the update step.
+
+    ``origin/HEAD`` is re-pointed with plain git and the answer cache is NOT
+    cleared, so every cached check still believes ``main``; only the
+    uncached read immediately before the profile runs can refuse.
+    """
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _run_git(
+        "-C", default_repo, "symbolic-ref",
+        "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk",
+    )
+    # Still inside the cache window: the cached verification accepts the row.
+    row = await get_request(backend, request_id)
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    assert "'main'" in row.status_reason and "'trunk'" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_refused_when_a_tag_shadows_the_default_branch(
+    tmp_path, monkeypatch,
+):
+    """``git fetch origin main`` selects a tag named ``main`` over the branch."""
+    _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    feat, backend = await _make_feature(tmp_path)
+
+    with caller_context_scope(None):
+        refused = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+
+    assert refused.status is ToolResultStatus.ERROR
+    assert refused.data["exceeded_bound"] == "target_ref"
+    assert "tag named 'main'" in refused.error
+    assert "sovereign-key caller" in refused.error
+    assert await list_requests(backend) == []
+
+
+@pytest.mark.asyncio
+async def test_seal_refuses_agent_update_when_a_tag_shadows_the_branch(
+    tmp_path, monkeypatch,
+):
+    from kestrel_sovereign.features.restart_coordinator.authority import (
+        RestartAuthorityError,
+    )
+
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    backend = await _backend(tmp_path)
+    with caller_context_scope(None), pytest.raises(Exception) as raised:
+        await insert_request(
+            backend,
+            requested_by_agent="did:test:agent",
+            reason="shadowed",
+            operation="update_then_restart",
+            update_repo_path=default_repo,
+            update_target_ref="main",
+            update_profile="sovereign_local_uv_sync",
+            allow_agent_request=True,
+        )
+    refusal = raised.value
+    if not isinstance(refusal, RestartAuthorityError):
+        refusal = refusal.__cause__
+    assert isinstance(refusal, RestartAuthorityError)
+    assert "bound on target_ref" in str(refusal)
+    assert "tag named 'main'" in str(refusal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fetched", [True, False], ids=["local-tag", "origin-only"])
+async def test_agent_update_boundary_refuses_tag_created_after_sealing(
+    tmp_path, monkeypatch, fetched,
+):
+    """A shadowing tag appearing after the seal is caught before the fetch.
+
+    ``local-tag``: the tag reached the checkout (a previous ``fetch --tags``);
+    the uncached local read catches it inside the cache window.
+    ``origin-only``: the tag exists only on origin, so only asking origin
+    catches it; the profile's own fetch would otherwise land on it.
+    """
+    _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=fetched)
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "rejected"
+    assert "bound on target_ref" in row.status_reason
+    assert "tag named 'main'" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_agent_update_stays_retryable_when_origin_cannot_be_asked(
+    tmp_path, monkeypatch,
+):
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    feat, backend = await _make_feature(tmp_path)
+    with caller_context_scope(None):
+        created = await feat.request_restart(reason="ship", **_AGENT_UPDATE)
+    request_id = created.data["request"]["id"]
+    _run_git(
+        "-C", default_repo, "remote", "set-url", "origin",
+        str(tmp_path / "no-such-origin.git"),
+    )
+
+    await _run_agent_update_tick(feat)
+
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert "could not ask origin" in row.status_reason
+    assert (await verify_restart_authority_at_use(backend, row))[0] is True
+
+
+@pytest.mark.asyncio
+async def test_sovereign_update_is_not_subject_to_agent_tag_bound(
+    tmp_path, monkeypatch,
+):
+    """The profile's behavior for sovereign requests is unchanged."""
+    default_repo = _agent_default_checkout(tmp_path, monkeypatch)
+    _tag_on_origin(tmp_path, "main", fetch_into_checkout=True)
+    feat, backend = await _make_feature(tmp_path)
+
+    created = await feat.request_restart(reason="operator ship", **_AGENT_UPDATE)
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+    with (
+        patch.object(RestartCoordinatorFeature, "_run_update", _fake_ok_update),
+        patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn,
+    ):
+        await feat.restart_coordinator()
+
+    spawn.assert_called_once()
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.update_repo_path == default_repo

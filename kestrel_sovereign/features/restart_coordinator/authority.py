@@ -143,16 +143,19 @@ def agent_request_bounds_violation(
     update_target_ref: str,
     update_profile: str,
     update_allow_migrations: bool,
+    fresh: bool = False,
 ) -> tuple[str, str] | None:
     """Return ``(bound, detail)`` for the first exceeded agent bound, else None.
 
     The agent-requestable bounds (#3339): ``restart_only`` with no update
     fields, or ``update_then_restart`` with a known update profile, the
     default Sovereign checkout, that checkout's default branch (``origin/HEAD``)
-    and no migrations; any policy the coordinator gates. The inputs are the
-    values a durable row stores, so the same predicate serves request-time
-    screening, sealing, and executor re-verification. It never inspects a
-    caller-supplied path: the only filesystem it reads is the default checkout.
+    as a branch no tag shadows, and no migrations; any policy the coordinator
+    gates. The inputs are the values a durable row stores, so the same
+    predicate serves request-time screening, sealing, and executor
+    re-verification. It never inspects a caller-supplied path: the only
+    filesystem it reads is the default checkout. ``fresh=True`` bypasses the
+    short git-answer cache; the update boundary uses it.
     """
 
     if policy not in AGENT_REQUESTABLE_POLICIES:
@@ -175,7 +178,9 @@ def agent_request_bounds_violation(
         return "repo_path", "this host has no default Sovereign checkout"
     if update_repo_path != default_repo:
         return "repo_path", "repo_path is not the default Sovereign checkout"
-    default_branch = update_profiles.checkout_default_branch(default_repo)
+    default_branch = update_profiles.checkout_default_branch(
+        default_repo, fresh=fresh,
+    )
     if not default_branch:
         return "target_ref", (
             "the default Sovereign checkout's default branch is unknown "
@@ -186,7 +191,59 @@ def agent_request_bounds_violation(
             "target_ref must be the default Sovereign checkout's default "
             f"branch {default_branch!r}; got {update_target_ref!r}"
         )
+    # The profile runs ``git fetch origin <name>`` and lands on FETCH_HEAD;
+    # when a tag and a branch share the name, git fetches the TAG. An agent
+    # request is bound to the branch, so a same-named tag refuses it.
+    shadowing_tag = update_profiles.checkout_has_tag(
+        default_repo, default_branch, fresh=fresh,
+    )
+    if shadowing_tag is None:
+        return "target_ref", (
+            "could not read the default Sovereign checkout's tag namespace "
+            f"to confirm no tag shadows branch {default_branch!r}"
+        )
+    if shadowing_tag:
+        return "target_ref", (
+            f"a tag named {default_branch!r} exists beside the default branch; "
+            "git fetch would land on the tag, not the branch"
+        )
     return None
+
+
+def is_agent_request_seal(request: Any) -> bool:
+    """Whether a row's evidence is sealed on the agent-request basis.
+
+    Structural only; callers use it after ``verify_restart_authority``.
+    """
+
+    try:
+        document = json.loads(getattr(request, "authority_evidence", ""))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(document, dict) and (
+        document.get("basis") == AGENT_REQUEST_BASIS
+    )
+
+
+def agent_update_boundary_violation(request: Any) -> tuple[str, str] | None:
+    """Re-check an agent-requested update's bounds with no cached answers.
+
+    For the executor, immediately before the update profile runs: the
+    per-tick verification may reuse a git answer for a few seconds, this
+    re-reads ``origin/HEAD`` and the local tag namespace.
+    """
+
+    return agent_request_bounds_violation(
+        operation=str(getattr(request, "operation", "")),
+        policy=str(getattr(request, "policy", "")),
+        update_repo_path=str(getattr(request, "update_repo_path", "")),
+        update_target_ref=str(getattr(request, "update_target_ref", "")),
+        update_profile=str(getattr(request, "update_profile", "")),
+        update_allow_migrations=bool(
+            getattr(request, "update_allow_migrations", False)
+        ),
+        fresh=True,
+    )
 
 
 def agent_request_refusal(bound: str, detail: str) -> str:
