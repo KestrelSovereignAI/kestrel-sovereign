@@ -100,7 +100,7 @@ def test_health_returns_503_when_agent_missing():
     assert "must-not-leak" not in response.text
 
 
-def test_health_rejects_permanently_self_fenced_invocation_owner():
+def test_health_rejects_self_fenced_invocation_owner():
     """A replica which cannot admit invocations must leave the load balancer."""
 
     from server import app
@@ -136,7 +136,7 @@ def test_health_rejects_permanently_self_fenced_invocation_owner():
 
 
 @pytest.mark.asyncio
-async def test_detailed_health_names_permanently_self_fenced_invocation_owner():
+async def test_detailed_health_names_self_fenced_invocation_owner():
     """Authenticated health consumes the same owner lifecycle invariant."""
 
     from kestrel_sovereign.server import _agent_detailed_health
@@ -161,6 +161,44 @@ async def test_detailed_health_names_permanently_self_fenced_invocation_owner():
             "name": "distributed_invocation_owner",
             "status": "fail",
             "message": "Invocation owner lease was lost; replica is fenced",
+            "duration_ms": 0.0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_names_why_invocation_owner_is_fenced():
+    """A fenced owner reports its cause, not only that it is fenced (#3337)."""
+
+    from kestrel_sovereign.server import _agent_detailed_health
+
+    health_feature = type("HealthFeature", (), {})()
+    health_feature.get_latest = AsyncMock(
+        return_value={"status": "healthy", "checks": []}
+    )
+    reason = (
+        "epoch 1: owner lease renewal was late in the relay; "
+        "re-establishment failed: owner lease store unavailable (OSError)"
+    )
+    agent = SimpleNamespace(
+        features={"HealthFeature": health_feature},
+        _distributed_invocation_registry=SimpleNamespace(
+            owner_lifecycle_status="self_fenced",
+            owner_fence_reason=reason,
+        ),
+    )
+
+    result = await _agent_detailed_health(agent)
+
+    assert result["status"] == "unhealthy"
+    assert result["checks"] == [
+        {
+            "name": "distributed_invocation_owner",
+            "status": "fail",
+            "message": (
+                "Invocation owner lease was lost; replica is fenced "
+                f"({reason})"
+            ),
             "duration_ms": 0.0,
         }
     ]

@@ -432,7 +432,7 @@ def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
 
 
 def _distributed_invocation_owner_status(agent) -> str:
-    """Read the registry's permanent lifecycle state without invoking proxies."""
+    """Read the registry's current lifecycle state without invoking proxies."""
 
     try:
         namespace = vars(agent)
@@ -446,6 +446,17 @@ def _distributed_invocation_owner_status(agent) -> str:
     except Exception:  # pragma: no cover - health must not crash
         return "self_fenced"
     return status if status in {"healthy", "self_fenced"} else "self_fenced"
+
+
+def _distributed_invocation_owner_fence_reason(agent) -> Optional[str]:
+    """The registry's named reason for a fenced owner, when it reports one."""
+
+    try:
+        registry = vars(agent).get("_distributed_invocation_registry")
+        reason = getattr(registry, "owner_fence_reason", None)
+    except Exception:  # pragma: no cover - health must not crash
+        return None
+    return reason if isinstance(reason, str) and reason.strip() else None
 
 
 def _distributed_invocation_owners_healthy(agent, manager) -> bool:
@@ -4796,11 +4807,17 @@ async def _agent_detailed_health(agent) -> dict:
         return result
     merged = dict(result)
     checks = list(merged.get("checks", []))
+    message = "Invocation owner lease was lost; replica is fenced"
+    # Name the cause: a bare "fenced" cannot tell a transient re-acquisition
+    # window from a Stop database that has been unreachable for hours (#3337).
+    reason = _distributed_invocation_owner_fence_reason(agent)
+    if reason is not None:
+        message = f"{message} ({reason})"
     checks.append(
         {
             "name": "distributed_invocation_owner",
             "status": "fail",
-            "message": "Invocation owner lease was lost; replica is fenced",
+            "message": message,
             "duration_ms": 0.0,
         }
     )
