@@ -121,9 +121,30 @@ User → !import-sovereignty <cid>
    - Lookup decryption key in keyring
    - Decrypt shard
    - Parse conversation JSON
-5. Rebuild local SQLite database
+5. Restore into the adapter's bound database (SQLite or PostgreSQL)
 6. Return statistics (messages restored, shards count)
 ```
+
+### Import Destination (#2525)
+`SovereignStorageAdapter.import_agent()` has exactly one destination: the
+`AsyncDatabase` the adapter was constructed with. Continuity verification,
+the append-only `agent_import_log`, the conversation restore, and every
+`AssetRestorer` all act against that bound database, whichever backend it
+is. To import into a different database, construct an adapter bound to it.
+
+The `target_db_path` keyword never selected a destination — it was accepted
+and ignored, so a caller naming database B received a result while the bound
+database A was rewritten. It is deprecated and will be removed in
+kestrel-sovereign 0.55.0 (`TARGET_DB_PATH_REMOVAL_RELEASE`):
+
+* Passing it at all emits a `DeprecationWarning`.
+* Any value other than `None` raises `UnsupportedImportDestinationError`
+  (a `ValueError`) before the package is fetched and before any continuity
+  audit, import-log write, conversation mutation, or asset-restorer call.
+  The refused call is an invalid invocation, not an import attempt, so it
+  appends no `agent_import_log` row. The value is never interpreted as a
+  SQLite path or a PostgreSQL DSN, and never echoed in the error.
+* Migration: omit the keyword and bind the adapter to the intended database.
 
 ### Keyring Encryption Detail
 The keyring uses a **deterministic key** derived from a known constant:
