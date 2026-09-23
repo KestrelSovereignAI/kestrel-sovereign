@@ -1060,7 +1060,18 @@ class DistributedInvocationRegistry:
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease expired before admission"
                     )
-                if key in self._by_local_generation:
+                existing_generation_id = self._by_local_generation.get(key)
+                if existing_generation_id is not None:
+                    existing = self._active.get(existing_generation_id)
+                    if existing is None or existing.owner_id != self._owner_id:
+                        # Admitted under an owner that was fenced and replaced.
+                        # Its durable row is neither renewed nor polled by the
+                        # successor, so nested work under that generation
+                        # would run where a Stop cannot reach it.
+                        raise InvocationSelfFencedError(
+                            "distributed Stop owner lease was lost for this "
+                            "request generation"
+                        )
                     return True
                 generation_id = uuid4().hex
                 admission_started = asyncio.get_running_loop().time()

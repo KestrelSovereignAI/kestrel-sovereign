@@ -895,6 +895,56 @@ async def test_stale_relay_observation_cannot_fence_successor_owner(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fenced_generation_cannot_be_readmitted_by_successor(tmp_path):
+    """Nested work under a fenced generation never runs under its successor."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = await AsyncDatabase.sqlite(str(tmp_path / "fenced-readmission.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:fenced-readmission")
+    try:
+        assert await registry.register(agent, "fenced-turn", 1)
+        fenced_owner_id = registry._owner_id
+        fenced_generation_id = registry._by_local_generation[
+            (id(agent), "fenced-turn", 1)
+        ]
+
+        registry._fail_closed_owner("owner lease renewal was late in the relay")
+        async with registry._registration_lock:
+            await registry._reacquire_owner_lease()
+        assert registry.owner_epoch == 2
+        assert registry._owner_id != fenced_owner_id
+
+        # The fenced generation's cleanup has not run yet: a nested call with
+        # the same request generation must not be admitted under a lease that
+        # nothing renews and no Stop relay polls.
+        with pytest.raises(InvocationSelfFencedError):
+            await registry.register(agent, "fenced-turn", 1)
+        assert fenced_generation_id not in registry._lease_owned_generation_ids()
+        assert registry._active[fenced_generation_id].owner_id == fenced_owner_id
+        assert registry.owner_lifecycle_status == "healthy"
+
+        # Unrelated new work is admitted under the successor.
+        assert await registry.register(agent, "successor-turn", 1)
+        successor_generation_id = registry._by_local_generation[
+            (id(agent), "successor-turn", 1)
+        ]
+        assert registry._lease_owned_generation_ids() == (successor_generation_id,)
+        # A repeat admission under the current owner stays idempotent.
+        assert await registry.register(agent, "successor-turn", 1)
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_abandoned_cleanup_preserves_indeterminate_generation(tmp_path):
     """ABANDONED is uncertainty, never evidence that remote work stopped."""
 
