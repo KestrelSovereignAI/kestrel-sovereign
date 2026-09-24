@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -133,6 +134,78 @@ def test_llm_service_threads_agent_data_dir_through(tmp_path, monkeypatch):
         service = svc_mod.LLMService(agent_data_dir=own_dir)
 
     assert service._usage_db_path == os.path.join(str(own_dir), "llm_usage.db")
+
+
+def test_llm_service_accepts_host_owned_usage_db():
+    """The public constructor, not a private-attribute workaround, must wire it."""
+    from kestrel_sovereign.llm import service as svc_mod
+
+    shared_db = type("HostDB", (), {"backend_type": "postgres"})()
+    with patch.object(svc_mod, "ProviderRegistry") as mock_registry, \
+         patch.object(svc_mod.LLMService, "_load_from_disk_cache"), \
+         patch.object(svc_mod.LLMService, "_init_constitutional_profiles"):
+        mock_registry.return_value.initialize_providers.return_value = []
+        service = svc_mod.LLMService(
+            database_url="postgresql://unused/usage", usage_db=shared_db
+        )
+
+    assert service._usage_db is shared_db
+    assert service._db_initialized
+    assert not service._usage_db_owned
+
+
+@pytest.mark.asyncio
+async def test_two_llm_services_share_host_db_after_failure_and_close(tmp_path):
+    """Real service shutdown and a failed write cannot retire the host DB."""
+    from kestrel_sovereign.llm import service as svc_mod
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    shared_db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+    try:
+        with patch.object(svc_mod, "ProviderRegistry") as mock_registry, \
+             patch.object(svc_mod.LLMService, "_load_from_disk_cache"), \
+             patch.object(svc_mod.LLMService, "_init_constitutional_profiles"):
+            mock_registry.return_value.initialize_providers.return_value = []
+            first = svc_mod.LLMService(usage_db=shared_db)
+            second = svc_mod.LLMService(usage_db=shared_db)
+
+        await first._track_model_usage("model-a", "provider-a", 5)
+        with patch.object(
+            shared_db, "execute", side_effect=RuntimeError("simulated write failure")
+        ):
+            await first._track_model_usage("model-a", "provider-a", 99)
+        await first.close()
+        await second._track_model_usage("model-a", "provider-a", 7)
+
+        row = await shared_db.fetchone(
+            "SELECT use_count, total_tokens FROM model_usage "
+            "WHERE model_id = ? AND provider = ?",
+            ("model-a", "provider-a"),
+        )
+        assert row == (2, 12)
+        assert first._usage_db is shared_db
+        assert second._usage_db is shared_db
+        await second.close()
+    finally:
+        await shared_db.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_usage_db_is_still_owned_and_closed():
+    tracker = _Tracker()
+    tracker._init_usage_tracking(database_url="postgresql://unused/usage")
+    owned_db = AsyncMock()
+    with patch(
+        "kestrel_sovereign.storage.async_database.AsyncDatabase.postgres",
+        new_callable=AsyncMock,
+        return_value=owned_db,
+    ) as make_db:
+        await tracker._ensure_db_initialized()
+    make_db.assert_awaited_once_with("postgresql://unused/usage")
+    await tracker.close_usage_db()
+    owned_db.close.assert_awaited_once()
+    assert tracker._usage_db is None
+    assert not tracker._db_initialized
 
 
 def test_agent_manager_binds_each_agent_to_its_own_data_dir():
