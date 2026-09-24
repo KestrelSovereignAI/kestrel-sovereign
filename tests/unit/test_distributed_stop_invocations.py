@@ -1131,6 +1131,80 @@ async def test_registry_close_abandons_each_owner_epoch_independently(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_registry_close_hung_current_owner_cannot_starve_fenced_owner(
+    tmp_path, monkeypatch
+):
+    """A current-owner abandon that hangs still leaves fenced epochs an attempt.
+
+    Sequential attempts under one deadline let a hang that neither raises nor
+    returns consume the whole budget, so every later owner reached the loop
+    with no time left and was skipped (#3345).
+    """
+
+    from kestrel_sovereign.stop import invocation as invocation_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    monkeypatch.setattr(invocation_module, "_DEFAULT_CLOSE_DRAIN_SECONDS", 0.5)
+    db = await AsyncDatabase.sqlite(str(tmp_path / "hung-abandon.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:hung-abandon")
+    original_abandon_owner = store.abandon_owner
+    try:
+        assert await registry.register(agent, "fenced-turn", 1)
+        fenced_owner_id = registry._owner_id
+        fenced_generation_id = registry._by_local_generation[
+            (id(agent), "fenced-turn", 1)
+        ]
+        registry._fail_closed_owner("owner lease renewal was late in the relay")
+        async with registry._registration_lock:
+            await registry._reacquire_owner_lease()
+        assert await registry.register(agent, "current-turn", 1)
+        current_owner_id = registry._owner_id
+        current_generation_id = registry._by_local_generation[
+            (id(agent), "current-turn", 1)
+        ]
+        assert current_owner_id != fenced_owner_id
+
+        attempted = []
+
+        async def hang_current_owner(owner_id):
+            attempted.append(owner_id)
+            if owner_id == current_owner_id:
+                await asyncio.Event().wait()      # hangs, never raises
+            await original_abandon_owner(owner_id)
+
+        store.abandon_owner = hang_current_owner
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await registry.close()
+        elapsed = loop.time() - started
+
+        assert elapsed < 45, f"close() was not bounded ({elapsed:.1f}s)"
+        assert attempted[0] == current_owner_id
+        assert sorted(attempted) == sorted({current_owner_id, fenced_owner_id})
+        unresolved = await db.fetchall(
+            "SELECT generation_id FROM stop_unresolved_invocations"
+        )
+        assert unresolved == [(fenced_generation_id,)]
+        # The hung owner's row stays active for reap_expired() to retire.
+        active = await db.fetchall(
+            "SELECT generation_id FROM stop_active_invocations"
+        )
+        assert active == [(current_generation_id,)]
+    finally:
+        store.abandon_owner = original_abandon_owner
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
