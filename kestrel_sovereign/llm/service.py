@@ -360,6 +360,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self,
         database_url: Optional[str] = None,
         agent_data_dir: Optional[Any] = None,
+        *,
+        usage_db: Optional['AsyncDatabase'] = None,
     ):
         """Initialize LLM service.
 
@@ -377,6 +379,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                          the process environment cannot name each agent's data
                          root and SQLite usage rows would otherwise all land in
                          one agent's database (#2769).
+            usage_db: Optional host-owned initialized database for model usage.
+                      Takes precedence over ``database_url`` and avoids opening
+                      one connection pool per service in multi-agent hosts.
 
         Reads the process environment; does not load it. ``load_dotenv()`` used
         to be the first statement here, so constructing a service — lazily, on
@@ -454,7 +459,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self.disabled: bool = False
 
         # Database for model usage tracking (uses abstract data layer)
-        self._init_usage_tracking(database_url, agent_data_dir=agent_data_dir)
+        self._init_usage_tracking(
+            database_url, agent_data_dir=agent_data_dir, usage_db=usage_db
+        )
 
         # Constitutional profile service
         self._init_constitutional_profiles()

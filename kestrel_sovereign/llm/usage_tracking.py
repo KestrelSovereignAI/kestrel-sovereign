@@ -40,11 +40,13 @@ class UsageTrackingMixin:
     _usage_db: Optional['AsyncDatabase']
     _db_backend: str
     _db_initialized: bool
+    _usage_db_owned: bool
 
     def _init_usage_tracking(
         self,
         database_url: Optional[str] = None,
         agent_data_dir: Optional[Any] = None,
+        usage_db: Optional['AsyncDatabase'] = None,
     ):
         """Initialize usage tracking state (async initialization done in _ensure_db_initialized).
 
@@ -54,9 +56,20 @@ class UsageTrackingMixin:
             agent_data_dir: The owning agent's data root. This is the strongest
                          signal for where SQLite usage rows belong — see the
                          precedence note in the body.
+            usage_db: Host-owned, initialized database shared with other services.
+                      Its connection lifecycle remains the host's responsibility.
         """
-        self._usage_db = None
-        self._db_initialized = False
+        self._usage_db = usage_db
+        self._usage_db_owned = usage_db is None
+        self._db_initialized = usage_db is not None
+
+        if usage_db is not None:
+            if usage_db.backend_type not in ("postgres", "sqlite"):
+                raise ValueError("usage_db must use a PostgreSQL or SQLite backend")
+            self._db_backend = usage_db.backend_type
+            self._usage_database_url = None
+            logger.info("Model usage tracking configured: shared %s database", self._db_backend)
+            return
         
         # Determine backend and connection info
         self._usage_database_url = (
@@ -579,6 +592,10 @@ class UsageTrackingMixin:
 
     async def close_usage_db(self):
         """Close the usage tracking database connection."""
+        if not getattr(self, "_usage_db_owned", True):
+            # A host can share one database across many LLM services. Closing
+            # any one service must not retire the host's operational pool.
+            return
         if self._usage_db:
             try:
                 await self._usage_db.close()
