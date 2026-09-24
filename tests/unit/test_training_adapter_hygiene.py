@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 import zipfile
@@ -21,48 +22,50 @@ from kestrel_sovereign.features.training.types import (
 )
 
 
-def _runpod_session(*, persistent: bool):
+def _runpod_session():
+    return SimpleNamespace(pod_id="pod-123", backend_base_url="https://pod.example")
+
+
+def _runpod_manager(session):
+    async def never_submits(**_kwargs):
+        await asyncio.Event().wait()
+
     return SimpleNamespace(
-        pod_id="pod-123",
-        profile=SimpleNamespace(
-            persistent_pod_id="${RUNPOD_POD_ID}" if persistent else None,
-        ),
+        _session=None,
+        start_training_pod=AsyncMock(return_value=session),
+        submit_training_job=never_submits,
+        stop_session=AsyncMock(),
+        terminate_session=AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
-async def test_runpod_cleanup_pauses_persistent_pod():
-    manager = SimpleNamespace(
-        _expand_single_env_var=lambda value: "pod-123" if value else None,
-        stop_session=AsyncMock(),
-        terminate_session=AsyncMock(),
-    )
+async def test_runpod_cleanup_stops_the_managers_current_pod():
+    session = _runpod_session()
+    manager = _runpod_manager(session)
+    manager._session = session
     adapter = RunPodTrainingAdapter(manager=manager)
-    adapter._active_jobs["job-1"] = {"session": _runpod_session(persistent=True)}
+    job = await adapter.start_training("companion", b"avatar")
 
-    await adapter.cleanup("job-1")
+    await adapter.cleanup(job.job_id)
 
     manager.stop_session.assert_awaited_once_with()
     manager.terminate_session.assert_not_awaited()
-    assert "job-1" not in adapter._active_jobs
+    assert job.job_id not in adapter._active_jobs
 
 
 @pytest.mark.asyncio
-async def test_runpod_cleanup_terminates_on_demand_pod():
-    session = _runpod_session(persistent=False)
-    manager = SimpleNamespace(
-        _expand_single_env_var=lambda value: "pod-123" if value else None,
-        stop_session=AsyncMock(),
-        terminate_session=AsyncMock(),
-    )
+async def test_runpod_cleanup_terminates_a_pod_the_manager_no_longer_holds():
+    session = _runpod_session()
+    manager = _runpod_manager(session)
     adapter = RunPodTrainingAdapter(manager=manager)
-    adapter._active_jobs["job-2"] = {"session": session}
+    job = await adapter.start_training("companion", b"avatar")
 
-    await adapter.cleanup("job-2")
+    await adapter.cleanup(job.job_id)
 
     manager.stop_session.assert_not_awaited()
     manager.terminate_session.assert_awaited_once_with(session)
-    assert "job-2" not in adapter._active_jobs
+    assert job.job_id not in adapter._active_jobs
 
 
 def test_replicate_training_zip_contains_avatar_bytes():

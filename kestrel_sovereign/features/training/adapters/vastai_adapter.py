@@ -8,13 +8,20 @@ Uses HTTP API endpoints from the shared SimpleTuner Docker image
 (same as RunPod/Vertex AI) for training and generation.
 """
 
-import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
+
+from ._session_training_lifecycle import (
+    ReleaseIntent,
+    SessionLifecycleTimeouts,
+    SessionProviderHooks,
+    SessionTrainingLifecycle,
+    SessionTrainingRecord,
+)
 
 from ..protocol import (
     TrainingProviderError,
@@ -54,15 +61,37 @@ class VastAITrainingAdapter:
     provider_name = "vastai"
     provider_type = ProviderType.SESSION_BASED
 
-    def __init__(self, manager=None):
+    def __init__(
+        self,
+        manager=None,
+        *,
+        lifecycle_timeouts: Optional[SessionLifecycleTimeouts] = None,
+    ):
         """
         Initialize with optional pre-configured manager.
 
         Args:
             manager: VastAIManager instance (lazy loaded if not provided)
+            lifecycle_timeouts: Teardown bounds (defaults from kestrel_config)
         """
         self._manager = manager
-        self._active_jobs: dict[str, dict] = {}  # job_id -> {session, companion_id, ...}
+        self._lifecycle = SessionTrainingLifecycle(
+            SessionProviderHooks(
+                provider_name=self.provider_name,
+                display_name="Vast.ai",
+                acquire_session=self._acquire_session,
+                session_id=lambda session: str(session.instance_id),
+                validate_session=self._validate_session,
+                submit_job=self._submit_job,
+                release_session=self._release_session,
+            ),
+            lifecycle_timeouts,
+        )
+
+    @property
+    def _active_jobs(self) -> dict[str, SessionTrainingRecord]:
+        """Live custody registry: a job stays here until its instance is released."""
+        return self._lifecycle.records
 
     def _get_manager(self):
         """Lazy load the Vast.ai manager.
@@ -112,6 +141,9 @@ class VastAITrainingAdapter:
         2. Wait for SimpleTuner API to be ready
         3. Submit training job via HTTP API
 
+        Steps 2-3 run in a background submission task owned by the shared
+        session lifecycle, so this returns as soon as the instance is up.
+
         Args:
             companion_id: Companion being trained
             avatar_data: Training image bytes
@@ -121,74 +153,16 @@ class VastAITrainingAdapter:
             TrainingJob with session tracking info
         """
         config = config or TrainingConfig()
-        job_id = str(uuid.uuid4())
         trigger_word = config.trigger_word or f"TOK{companion_id[:8]}"
-        now = datetime.now(timezone.utc)
 
         try:
-            manager = self._get_manager()
-
-            # Step 1: Start a session (rent an instance)
-            logger.info(f"Starting Vast.ai training instance for companion {companion_id}")
-            session_result = await manager.start_session(
-                task_profile=config.profile,
-                ttl_seconds=config.ttl_seconds,
-                metadata={"companion_id": companion_id, "job_id": job_id},
-            )
-
-            session = manager._session
-            if session is None:
-                raise TrainingSubmissionError("Failed to get active session")
-
-            if not session.backend_base_url:
-                raise TrainingSubmissionError(
-                    f"Training instance {session.instance_id} started but has no backend URL"
-                )
-
-            logger.info(f"Training instance ready: {session.instance_id}, URL: {session.backend_base_url}")
-
-            # Step 2: Submit training job in background
-            # DON'T wait for model ready here - that blocks the HTTP response
-            # The background task will handle waiting and submission
-
-            # Track this job with PENDING state - training not yet started
-            self._active_jobs[job_id] = {
-                "session": session,
-                "companion_id": companion_id,
-                "trigger_word": trigger_word,
-                "started_at": now,
-                "config": config,
-                "avatar_data": avatar_data,  # Store for background submission
-                "training_job_id": None,  # Will be set when /train is called
-                "state": "pending",  # Model loading, not yet submitted
-            }
-
-            # Launch background task to wait for model and submit training
-            asyncio.create_task(
-                self._submit_training_when_ready(
-                    job_id=job_id,
-                    manager=manager,
-                    session=session,
-                    avatar_data=avatar_data,
-                    companion_id=companion_id,
-                    trigger_word=trigger_word,
-                    config=config,
-                )
-            )
-
-            return TrainingJob(
-                job_id=job_id,
+            record = await self._lifecycle.start(
+                job_id=str(uuid.uuid4()),
                 companion_id=companion_id,
-                provider=self.provider_name,
-                state=TrainingState.PENDING,  # PENDING until model ready
                 trigger_word=trigger_word,
-                created_at=now,
-                started_at=None,  # Not started yet
                 config=config,
-                provider_job_id=None,  # Will be set when submitted
-                provider_session_id=str(session.instance_id),
+                avatar_data=avatar_data,
             )
-
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
@@ -198,54 +172,56 @@ class VastAITrainingAdapter:
             logger.error(f"Vast.ai training submission failed: {e}", exc_info=True)
             raise TrainingSubmissionError(f"Failed to start Vast.ai training: {e}")
 
-    async def _submit_training_when_ready(
-        self,
-        job_id: str,
-        manager,
-        session,
-        avatar_data: bytes,
-        companion_id: str,
-        trigger_word: str,
-        config: TrainingConfig,
-    ) -> None:
-        """
-        Background task: Wait for model to load, then submit training.
+        logger.info(
+            f"Training instance ready: {record.session.instance_id}, "
+            f"URL: {record.session.backend_base_url}"
+        )
+        return self._lifecycle.training_job(record)
 
-        This runs asynchronously so the HTTP endpoint can return immediately.
-        Updates job state from PENDING -> TRAINING when submission succeeds.
-        """
-        try:
-            logger.info(f"[{job_id}] Background: waiting for model ready...")
+    # -- Provider hooks for the shared session lifecycle -------------------
 
-            # Wait for FLUX model to load and submit training
-            training_job_id = await manager.submit_training_job_http(
-                session=session,
-                avatar_data=avatar_data,
-                companion_id=companion_id,
-                trigger_word=trigger_word,
-                steps=config.steps,
-                lora_rank=config.lora_rank,
-                callback_url=config.callback_url,
-                wait_for_ready=True,  # This does the waiting
+    async def _acquire_session(
+        self, job_id: str, companion_id: str, config: TrainingConfig
+    ):
+        """Rent (or reuse) the instance for one job."""
+        manager = self._get_manager()
+        logger.info(f"Starting Vast.ai training instance for companion {companion_id}")
+        await manager.start_session(
+            task_profile=config.profile,
+            ttl_seconds=config.ttl_seconds,
+            metadata={"companion_id": companion_id, "job_id": job_id},
+        )
+        session = manager._session
+        if session is None:
+            raise TrainingSubmissionError("Failed to get active session")
+        return session
+
+    @staticmethod
+    def _validate_session(session) -> None:
+        if not session.backend_base_url:
+            raise TrainingSubmissionError(
+                f"Training instance {session.instance_id} started but has no backend URL"
             )
 
-            # Update job with training_job_id
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["training_job_id"] = training_job_id
-                self._active_jobs[job_id]["state"] = "training"
-                self._active_jobs[job_id]["started_at"] = datetime.now(timezone.utc)
-                logger.info(f"[{job_id}] Training submitted: {training_job_id}")
+    async def _submit_job(self, record: SessionTrainingRecord, avatar_data: bytes) -> str:
+        """Wait for the SimpleTuner API, then POST /train."""
+        config = record.config
+        return await self._get_manager().submit_training_job_http(
+            session=record.session,
+            avatar_data=avatar_data,
+            companion_id=record.companion_id,
+            trigger_word=record.trigger_word,
+            steps=config.steps,
+            lora_rank=config.lora_rank,
+            callback_url=config.callback_url,
+            wait_for_ready=True,
+        )
 
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.error(f"[{job_id}] Background training network error: {e}")
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
-        except Exception as e:
-            logger.error(f"[{job_id}] Background training submission failed: {e}", exc_info=True)
-            if job_id in self._active_jobs:
-                self._active_jobs[job_id]["state"] = "failed"
-                self._active_jobs[job_id]["error"] = str(e)
+    async def _release_session(self, session) -> None:
+        """Destroy the instance; Vast.ai bills hourly, and this also stops its job."""
+        await self._get_manager().terminate_session(session)
+
+    # -- TrainingProvider --------------------------------------------------
 
     async def get_status(self, job_id: str) -> TrainingStatus:
         """
@@ -258,36 +234,22 @@ class VastAITrainingAdapter:
             TrainingStatus with current progress
         """
         try:
-            if job_id not in self._active_jobs:
+            record = self._lifecycle.get(job_id)
+            if record is None:
                 raise TrainingStatusError(f"Unknown job: {job_id}")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            training_job_id = job_info.get("training_job_id")
-            manager = self._get_manager()
-
-            # Check if still waiting for model to load (background submission)
-            if training_job_id is None:
-                job_state = job_info.get("state", "pending")
-                if job_state == "failed":
-                    return TrainingStatus(
-                        job_id=job_id,
-                        state=TrainingState.FAILED,
-                        progress=0.0,
-                        error=job_info.get("error", "Background submission failed"),
-                    )
-                # Still waiting for model to load
-                return TrainingStatus(
-                    job_id=job_id,
-                    state=TrainingState.PREPARING,
-                    progress=0.0,
-                    message="Waiting for FLUX model to load (may take 5-10 min)...",
-                )
+            local = self._lifecycle.local_status(
+                record,
+                preparing_message="Waiting for FLUX model to load (may take 5-10 min)...",
+            )
+            if local is not None:
+                return local
 
             # Poll the training status via HTTP API
+            manager = self._get_manager()
             status_result = await manager.poll_training_status_http(
-                session=session,
-                job_id=training_job_id,
+                session=record.session,
+                job_id=record.provider_job_id,
             )
 
             # Map SimpleTuner status to unified status
@@ -298,8 +260,6 @@ class VastAITrainingAdapter:
             # Map status strings to TrainingState
             if api_status == "completed":
                 state = TrainingState.COMPLETED
-                # Store output path for download
-                job_info["lora_path"] = status_result.get("lora_path")
             elif api_status == "failed":
                 state = TrainingState.FAILED
             elif api_status in ("running", "training"):
@@ -311,17 +271,13 @@ class VastAITrainingAdapter:
             else:
                 state = TrainingState.PENDING
 
-            elapsed = None
-            if job_info.get("started_at"):
-                elapsed = (datetime.now(timezone.utc) - job_info["started_at"]).total_seconds()
-
             return TrainingStatus(
                 job_id=job_id,
                 state=state,
                 progress=progress,
                 message=status_result.get("message"),
                 error=error,
-                elapsed_seconds=elapsed,
+                elapsed_seconds=record.elapsed_seconds(),
                 provider_details=status_result,
             )
 
@@ -348,18 +304,19 @@ class VastAITrainingAdapter:
             LoRA weights as bytes, or None if not ready
         """
         try:
-            if job_id not in self._active_jobs:
+            record = self._lifecycle.get(job_id)
+            if record is None:
                 raise DownloadError(f"Unknown job: {job_id}")
+            training_job_id = record.provider_job_id
+            if training_job_id is None:
+                raise DownloadError(f"Job {job_id} was never submitted to Vast.ai")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            training_job_id = job_info["training_job_id"]
             manager = self._get_manager()
 
             # Download via HTTP API
             logger.info(f"Downloading LoRA weights for job {training_job_id}")
             lora_bytes = await manager.download_lora_http(
-                session=session,
+                session=record.session,
                 job_id=training_job_id,
             )
 
@@ -377,69 +334,43 @@ class VastAITrainingAdapter:
 
     async def cancel(self, job_id: str) -> bool:
         """
-        Cancel a running training job.
+        Cancel a training job and destroy its instance.
 
-        For session-based providers, this terminates the session.
+        Stops the background submission, then terminates the instance (which
+        also stops any job on it). Concurrent and repeated calls share one
+        teardown.
 
         Args:
             job_id: Job to cancel
 
         Returns:
-            True if cancelled successfully
+            True once no instance or task of the job remains; False if the job
+            is unknown or its instance could not be released (custody retained).
         """
-        try:
-            if job_id not in self._active_jobs:
-                return False
-
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Terminate the session (which cancels the job)
-            await manager.terminate_session(session)
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
+        released = await self._lifecycle.release(job_id, ReleaseIntent.CANCEL)
+        if released:
             logger.info(f"Cancelled Vast.ai training job {job_id}")
-            return True
-
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.error(f"Failed to cancel Vast.ai training: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to cancel Vast.ai training: {e}", exc_info=True)
-            return False
+        return released
 
     async def cleanup(self, job_id: str) -> None:
         """
         Clean up resources for a completed job.
 
-        For session-based providers, this terminates the instance to stop
-        billing. Vast.ai bills by the hour so early termination saves money.
+        Terminates the instance to stop billing. Vast.ai bills by the hour so
+        early termination saves money. A failed release keeps the job tracked
+        so it can be retried.
 
         Args:
             job_id: Job to clean up
         """
-        try:
-            if job_id not in self._active_jobs:
-                return
+        if self._lifecycle.get(job_id) is None:
+            return
+        if not await self._lifecycle.release(job_id, ReleaseIntent.CLEANUP):
+            logger.warning(f"Failed to cleanup Vast.ai session for job {job_id}; custody retained")
 
-            job_info = self._active_jobs[job_id]
-            session = job_info["session"]
-            manager = self._get_manager()
-
-            # Terminate the session to stop billing
-            logger.info(f"Terminating Vast.ai instance {session.instance_id} to stop billing")
-            await manager.terminate_session(session)
-
-            # Clean up tracking
-            del self._active_jobs[job_id]
-
-        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            logger.warning(f"Failed to cleanup Vast.ai session: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to cleanup Vast.ai session: {e}", exc_info=True)
+    async def close(self) -> None:
+        """Drain background submissions and release every instance this adapter holds."""
+        await self._lifecycle.close()
 
     async def generate_image(
         self,
@@ -481,11 +412,9 @@ class VastAITrainingAdapter:
             if session is None:
                 logger.info("Getting Vast.ai session for image generation...")
                 # Use existing active session if we have one
-                for job_info in self._active_jobs.values():
-                    if job_info.get("session"):
-                        session = job_info["session"]
-                        logger.info(f"Reusing existing session: {session.instance_id}")
-                        break
+                session = self._lifecycle.any_live_session()
+                if session is not None:
+                    logger.info(f"Reusing existing session: {session.instance_id}")
 
                 if session is None:
                     # Start a new training instance (which has generation capability)
