@@ -17,6 +17,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.api_errors import register_api_error_handlers
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.host_stop import router as host_stop_router
 from kestrel_sovereign.signals.sources import peer_stop
@@ -540,6 +541,7 @@ async def host_app(tmp_path):
     clock = _Clock()
     receipts, circuit = await _stores(db, clock, threshold=1)
     app = FastAPI()
+    register_api_error_handlers(app)
     app.include_router(host_stop_router)
     manager = MagicMock()
     manager.list_agents.return_value = {}
@@ -558,18 +560,71 @@ async def host_app(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_status_shows_open_circuits_to_the_sovereign_only(host_app):
+async def test_circuit_read_shows_open_circuits_to_the_sovereign_only(host_app):
     await _honor(host_app.circuit, host_app.receipts, TARGET_DID, "did:test:a", "h0")
     client = TestClient(host_app.app)
 
+    response = client.get("/api/host/stop/circuit")
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "private, no-store"
+    body = response.json()
+    assert body["threshold"] == 1
+    assert body["window_seconds"] == 60
+    assert [c["target_agent_id"] for c in body["open"]] == [TARGET_DID]
+    opened = body["open"][0]
+    assert opened["admitted_count"] == 1
+    assert opened["window_seconds"] == 60
+    assert opened["opened_at"]
+
+    # Status keeps its own contract; circuits are not a rider on it.
     status = client.get("/api/host/stop/status").json()
-    circuit = status["peer_stop_circuit"]
-    assert circuit["available"] is True
-    assert [c["target_agent_id"] for c in circuit["open"]] == [TARGET_DID]
-    assert circuit["open"][0]["admitted_count"] == 1
+    assert status == {"can_stop": True, "in_flight_count": 0}
 
     host_app.app.state.caller = CallerContext.authenticated("operator@example.test")
-    assert "peer_stop_circuit" not in client.get("/api/host/stop/status").json()
+    denied = client.get("/api/host/stop/circuit")
+    assert denied.status_code == 403
+    assert TARGET_DID not in denied.text
+
+
+@pytest.mark.asyncio
+async def test_an_inventory_failure_never_hides_an_open_circuit(host_app):
+    await _honor(host_app.circuit, host_app.receipts, TARGET_DID, "did:test:a", "h2")
+    host_app.app.state.agent_manager.list_agents.side_effect = RuntimeError(
+        "inventory partition"
+    )
+    client = TestClient(host_app.app)
+
+    status = client.get("/api/host/stop/status")
+    assert status.status_code == 503
+    assert status.json()["error"]["code"] == "host_stop_inventory_unavailable"
+
+    circuit = client.get("/api/host/stop/circuit")
+    assert circuit.status_code == 200, circuit.text
+    assert [c["target_agent_id"] for c in circuit.json()["open"]] == [TARGET_DID]
+
+
+@pytest.mark.asyncio
+async def test_a_breaker_failure_is_its_own_503_and_never_masks_status(host_app):
+    class _BrokenDatabase:
+        async def fetchall(self, *_args, **_kwargs):
+            raise OSError("circuit store unreachable")
+
+    host_app.circuit._db = _BrokenDatabase()
+    client = TestClient(host_app.app)
+
+    circuit = client.get("/api/host/stop/circuit")
+    assert circuit.status_code == 503
+    assert circuit.json()["error"]["code"] == "peer_stop_circuit_unavailable"
+
+    status = client.get("/api/host/stop/status")
+    assert status.status_code == 200, status.text
+    assert status.json() == {"can_stop": True, "in_flight_count": 0}
+
+    # No breaker attached at all is unavailable too, never "none open".
+    host_app.app.state.peer_stop_circuit = None
+    absent = client.get("/api/host/stop/circuit")
+    assert absent.status_code == 503
+    assert absent.json()["error"]["code"] == "peer_stop_circuit_unavailable"
 
 
 @pytest.mark.asyncio
@@ -584,6 +639,7 @@ async def test_reset_door_is_sovereign_only_and_receipted(host_app):
     )
     assert denied.status_code == 403
     assert client.get("/api/host/stop/circuit/events").status_code == 403
+    assert client.get("/api/host/stop/circuit").status_code == 403
 
     host_app.app.state.caller = CallerContext.sovereign(identity="sovereign-key")
     reset = client.post(
@@ -593,7 +649,7 @@ async def test_reset_door_is_sovereign_only_and_receipted(host_app):
     assert reset.status_code == 200, reset.text
     assert reset.json()["event"]["kind"] == "reset"
     assert reset.json()["event"]["actor_id"] == "sovereign-key"
-    assert client.get("/api/host/stop/status").json()["peer_stop_circuit"]["open"] == []
+    assert client.get("/api/host/stop/circuit").json()["open"] == []
     kinds = [
         e["kind"]
         for e in client.get(

@@ -147,9 +147,6 @@ def test_host_stop_status_is_caller_scoped_and_counts_live_agents():
     assert response.json() == {
         "can_stop": True,
         "in_flight_count": 1,
-        # No breaker attached to this app: reported as unavailable, never as
-        # "no circuit is open" (#3170).
-        "peer_stop_circuit": {"available": False, "open": []},
     }
     assert response.headers["cache-control"] == "private, no-store"
     assert response.headers["vary"] == "Authorization, Cookie, X-API-Key"
@@ -174,7 +171,6 @@ def test_host_stop_status_counts_work_owned_by_another_replica():
     assert response.json() == {
         "can_stop": True,
         "in_flight_count": 1,
-        "peer_stop_circuit": {"available": False, "open": []},
     }
     registry.agent_has_unsettled_work.assert_awaited_once_with("did:test:remote")
 

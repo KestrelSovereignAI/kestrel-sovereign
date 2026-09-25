@@ -101,28 +101,6 @@ def _peer_stop_circuit(request: Request) -> PeerStopCircuitStore | None:
     return circuit if isinstance(circuit, PeerStopCircuitStore) else None
 
 
-async def _peer_stop_circuit_status(request: Request) -> dict:
-    """The open peer Stop circuits a sovereign must see (#3170).
-
-    An unreadable breaker is reported as unavailable, never as "no circuit is
-    open": the console would otherwise hide the one warning it exists for.
-    """
-
-    circuit = _peer_stop_circuit(request)
-    if circuit is None:
-        return {"available": False, "open": []}
-    try:
-        open_circuits = await circuit.open_circuits()
-    except PeerStopCircuitError:
-        return {"available": False, "open": []}
-    return {
-        "available": True,
-        "threshold": circuit.policy.threshold,
-        "window_seconds": circuit.policy.window_seconds,
-        "open": [entry.to_dict() for entry in open_circuits],
-    }
-
-
 def _caller_can_stop_host(request: Request) -> bool:
     return caller_is_sovereign(request)
 
@@ -214,16 +192,46 @@ async def host_stop_status(request: Request, response: Response):
             code="host_stop_inventory_unavailable",
             message="Host Stop target inventory is unavailable.",
         ) from error
-    can_stop = _caller_can_stop_host(request)
-    payload = {
-        "can_stop": can_stop,
+    return {
+        "can_stop": _caller_can_stop_host(request),
         "in_flight_count": in_flight_count,
     }
-    if can_stop:
-        # Target DIDs and counts are host control-plane evidence: only the
-        # sovereign, who alone may reset a circuit, is shown them.
-        payload["peer_stop_circuit"] = await _peer_stop_circuit_status(request)
-    return payload
+
+
+@router.get("/stop/circuit")
+async def peer_stop_circuit_state(request: Request, response: Response):
+    """The open peer Stop circuits a sovereign must see (#3170).
+
+    Its own read, not a rider on the Stop All inventory: an inventory failure
+    must not hide an open circuit, and an unreadable breaker must not blank
+    the inventory.  Sovereign-only, because target DIDs and counts are host
+    control-plane evidence and only the sovereign may reset a circuit.  An
+    unreadable breaker answers 503, never an empty "no circuit is open".
+    """
+
+    sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+    circuit = _peer_stop_circuit(request)
+    if circuit is None:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        )
+    try:
+        open_circuits = await circuit.open_circuits()
+    except PeerStopCircuitError as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        ) from error
+    return {
+        "threshold": circuit.policy.threshold,
+        "window_seconds": circuit.policy.window_seconds,
+        "open": [entry.to_dict() for entry in open_circuits],
+    }
 
 
 @router.post("/stop/circuit/reset")
@@ -459,6 +467,7 @@ __all__ = [
     "host_stop_receipts",
     "host_stop_status",
     "peer_stop_circuit_events",
+    "peer_stop_circuit_state",
     "reset_peer_stop_circuit",
     "router",
     "stop_host",

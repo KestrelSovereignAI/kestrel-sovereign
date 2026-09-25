@@ -457,10 +457,16 @@ before any cancellation:
   came through (`peer`, `agent`, `host`).
 - `opened`, `closed` (automatic recovery once the window clears), and `reset`
   transitions are receipted in `stop_circuit_events`. Opening logs one WARNING
-  naming the target. `GET /api/host/stop/status` shows a sovereign caller the
-  open circuits, which the agents banner renders with a Reset action; the reset
-  door is the sovereign-only `POST /api/host/stop/circuit/reset` (`target`,
-  `reason`), and `GET /api/host/stop/circuit/events` reads the history.
+  naming the target. The sovereign-only `GET /api/host/stop/circuit` lists the
+  open circuits (target, `opened_at`, count, window); it is its own read, not a
+  rider on the Stop All inventory, so an inventory failure cannot hide an open
+  circuit and an unreadable breaker answers its own 503
+  `peer_stop_circuit_unavailable` without masking `GET /api/host/stop/status`.
+  The agents banner polls it independently, renders each circuit with a Reset
+  action, and shows "circuit status unavailable" rather than "none open" when
+  the read fails. The reset door is the sovereign-only
+  `POST /api/host/stop/circuit/reset` (`target`, `reason`), and
+  `GET /api/host/stop/circuit/events` reads the history.
 - Nothing latches: the breaker never writes a Hold, and an open circuit closes
   by itself as the window slides past its admissions.
 

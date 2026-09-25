@@ -1,6 +1,8 @@
 // #3170: the agents banner shows open peer Stop circuits and wires the
-// sovereign Reset. The circuits ride the host Stop status read; the component
-// owns the rendering so every embedding of mountAgentListPane receives it.
+// sovereign Reset. The circuits are their own sovereign-only read, polled
+// independently of the Stop All status, so neither read's failure blanks the
+// other; the component owns the rendering so every embedding of
+// mountAgentListPane receives it.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -52,21 +54,45 @@ test.afterEach(() => {
     for (const handle of mounted.splice(0)) handle.destroy();
 });
 
-function mount({ statuses, reset = async () => ({ event: { kind: 'reset' } }), ask }) {
+function httpError(status, message = `HTTP ${status}`) {
+    return Object.assign(new Error(message), { status });
+}
+
+const CLEAR = { threshold: 8, window_seconds: 900, open: [] };
+const STATUS = { can_stop: true, in_flight_count: 1 };
+
+function circuits(...targets) {
+    return { threshold: 8, window_seconds: 900, open: targets.map((t) => openCircuit(t)) };
+}
+
+function sequence(answers) {
+    let reads = 0;
+    const read = async () => {
+        const answer = answers[Math.min(reads, answers.length - 1)];
+        reads += 1;
+        if (answer instanceof Error) throw answer;
+        return answer;
+    };
+    return { read, count: () => reads };
+}
+
+function mount({
+    statuses = [STATUS],
+    circuitReads,
+    reset = async () => ({ event: { kind: 'reset' } }),
+    ask,
+}) {
     const el = document.createElement('div');
     document.body.appendChild(el);
-    let reads = 0;
+    const status = sequence(statuses);
+    const circuit = sequence(circuitReads);
     const resets = [];
     const handle = mountAgentListPane(el, {
         adapter: { mode: 'multi_agent', listAgents: async () => AGENTS },
         isThinking: () => false,
         api: {
-            getHostStopStatus: async () => {
-                const status = statuses[Math.min(reads, statuses.length - 1)];
-                reads += 1;
-                if (status instanceof Error) throw status;
-                return status;
-            },
+            getHostStopStatus: status.read,
+            getPeerStopCircuits: circuit.read,
             stopHost: async () => ({}),
             resetPeerStopCircuit: async (payload) => {
                 resets.push(payload);
@@ -80,24 +106,30 @@ function mount({ statuses, reset = async () => ({ event: { kind: 'reset' } }), a
         storageKey: `a:circuit-${Math.random()}`,
     });
     mounted.push(handle);
-    return { el, handle, resets, reads: () => reads };
+    return {
+        el,
+        handle,
+        resets,
+        statusReads: status.count,
+        circuitReads: circuit.count,
+    };
+}
+
+async function settle() {
+    for (let i = 0; i < 4; i += 1) await tick();
+}
+
+function banner(el) {
+    return el.querySelector('.agent-peer-stop-circuits');
 }
 
 test('an open circuit renders by display name with a Reset action', async () => {
-    const { el, handle } = mount({
-        statuses: [{
-            can_stop: true,
-            in_flight_count: 0,
-            peer_stop_circuit: { available: true, open: [openCircuit('did:agent:kite')] },
-        }],
-    });
-    await tick();
-    await tick();
+    const { el, handle } = mount({ circuitReads: [circuits('did:agent:kite')] });
+    await settle();
 
-    const banner = el.querySelector('.agent-peer-stop-circuits');
-    assert.ok(banner, 'the pane owns the circuit banner');
-    assert.equal(banner.hidden, false);
-    const rows = banner.querySelectorAll('.agent-peer-stop-circuit');
+    assert.ok(banner(el), 'the pane owns the circuit banner');
+    assert.equal(banner(el).hidden, false);
+    const rows = banner(el).querySelectorAll('.agent-peer-stop-circuit');
     assert.equal(rows.length, 1);
     assert.equal(rows[0].dataset.target, 'did:agent:kite');
     assert.match(rows[0].textContent, /peer Stop circuit open: Kite/);
@@ -106,95 +138,91 @@ test('an open circuit renders by display name with a Reset action', async () => 
     assert.equal(el.querySelector('.agent-peer-stop-circuits'), null, 'destroy removes it');
 });
 
-test('no circuit, or a non-sovereign status without circuits, draws nothing', async () => {
-    for (const status of [
-        { can_stop: true, in_flight_count: 0, peer_stop_circuit: { available: true, open: [] } },
-        { can_stop: false, in_flight_count: 0 },
-    ]) {
-        const { el, handle } = mount({ statuses: [status] });
-        await tick();
-        await tick();
-        const banner = el.querySelector('.agent-peer-stop-circuits');
-        assert.equal(banner.hidden, true);
-        assert.equal(banner.querySelectorAll('.agent-peer-stop-circuit').length, 0);
+test('no open circuit, or a caller refused the circuit read, draws nothing', async () => {
+    for (const answer of [CLEAR, httpError(403), httpError(401)]) {
+        const { el, handle } = mount({ circuitReads: [answer] });
+        await settle();
+        assert.equal(banner(el).hidden, true);
+        assert.equal(banner(el).querySelectorAll('.agent-peer-stop-circuit').length, 0);
+        assert.doesNotMatch(banner(el).textContent, /unavailable/);
         handle.destroy();
     }
 });
 
-test('an unreadable breaker is shown as unavailable, never as clear', async () => {
-    const { el, handle } = mount({
-        statuses: [{
-            can_stop: true,
-            in_flight_count: 0,
-            peer_stop_circuit: { available: false, open: [] },
-        }],
+test('an inventory failure never hides an open circuit', async () => {
+    const { el, handle, statusReads } = mount({
+        statuses: [httpError(503, 'Host Stop target inventory is unavailable.')],
+        circuitReads: [circuits('did:agent:kite')],
     });
-    await tick();
-    await tick();
-    const banner = el.querySelector('.agent-peer-stop-circuits');
-    assert.equal(banner.hidden, false);
-    assert.match(banner.textContent, /unavailable/);
+    await settle();
+
+    assert.ok(statusReads() >= 1, 'the Stop All status was read and failed');
+    assert.equal(el.querySelector('.agent-stop-all-btn').disabled, true);
+    assert.equal(banner(el).hidden, false);
+    const rows = banner(el).querySelectorAll('.agent-peer-stop-circuit');
+    assert.equal(rows.length, 1);
+    assert.match(rows[0].textContent, /peer Stop circuit open: Kite/);
     handle.destroy();
 });
 
-test('Reset calls the sovereign door with target and reason, then re-reads status', async () => {
-    const { el, handle, resets, reads } = mount({
-        statuses: [
-            {
-                can_stop: true,
-                in_flight_count: 0,
-                peer_stop_circuit: { available: true, open: [openCircuit('did:agent:emma')] },
-            },
-            {
-                can_stop: true,
-                in_flight_count: 0,
-                peer_stop_circuit: { available: true, open: [] },
-            },
-        ],
+test('an unreadable breaker is shown as unavailable and leaves Stop All intact', async () => {
+    const { el, handle } = mount({
+        statuses: [STATUS],
+        circuitReads: [httpError(503, 'Peer Stop circuit breaker is unavailable.')],
     });
-    await tick();
-    await tick();
-    const before = reads();
+    await settle();
+
+    assert.equal(banner(el).hidden, false);
+    assert.equal(banner(el).querySelectorAll('.agent-peer-stop-circuit').length, 0);
+    assert.match(banner(el).textContent, /circuit status unavailable/);
+    const stopAll = el.querySelector('.agent-stop-all-btn');
+    assert.equal(stopAll.disabled, false, 'Stop All still reads its own status');
+    assert.equal(stopAll.dataset.inFlightCount, '1');
+    handle.destroy();
+});
+
+test('a malformed circuit answer is unavailable, never clear', async () => {
+    const { el, handle } = mount({ circuitReads: [{ threshold: 8 }] });
+    await settle();
+    assert.equal(banner(el).hidden, false);
+    assert.match(banner(el).textContent, /unavailable/);
+    handle.destroy();
+});
+
+test('Reset calls the sovereign door with target and reason, then re-reads circuits', async () => {
+    const { el, handle, resets, circuitReads } = mount({
+        circuitReads: [circuits('did:agent:emma'), CLEAR],
+    });
+    await settle();
+    const before = circuitReads();
 
     el.querySelector('.agent-peer-stop-circuit-reset').click();
-    await tick();
-    await tick();
+    await settle();
 
     assert.deepEqual(resets, [{ target: 'did:agent:emma', reason: 'reviewed the peers' }]);
-    assert.ok(reads() > before, 'status re-read after the reset');
-    assert.equal(el.querySelector('.agent-peer-stop-circuits').hidden, true);
+    assert.ok(circuitReads() > before, 'circuits re-read after the reset');
+    assert.equal(banner(el).hidden, true);
     handle.destroy();
 });
 
 test('a cancelled reason never resets, and a refused reset is shown on its row', async () => {
     const cancelled = mount({
-        statuses: [{
-            can_stop: true,
-            in_flight_count: 0,
-            peer_stop_circuit: { available: true, open: [openCircuit('did:agent:kite')] },
-        }],
+        circuitReads: [circuits('did:agent:kite')],
         ask: () => null,
     });
-    await tick();
-    await tick();
+    await settle();
     cancelled.el.querySelector('.agent-peer-stop-circuit-reset').click();
     await tick();
     assert.equal(cancelled.resets.length, 0, 'no reason, no reset');
     cancelled.handle.destroy();
 
     const refused = mount({
-        statuses: [{
-            can_stop: true,
-            in_flight_count: 0,
-            peer_stop_circuit: { available: true, open: [openCircuit('did:agent:kite')] },
-        }],
+        circuitReads: [circuits('did:agent:kite')],
         reset: async () => { throw new Error('Host control-plane authority is required.'); },
     });
-    await tick();
-    await tick();
+    await settle();
     refused.el.querySelector('.agent-peer-stop-circuit-reset').click();
-    await tick();
-    await tick();
+    await settle();
     const row = refused.el.querySelector('.agent-peer-stop-circuit');
     assert.ok(row, 'the circuit stays visible after a refused reset');
     assert.match(row.textContent, /Reset failed: Host control-plane authority is required/);
@@ -203,23 +231,71 @@ test('a cancelled reason never resets, and a refused reset is shown on its row',
 
 test('a failed re-read of a circuit shown open reports it unknown, never cleared', async () => {
     const { el, handle } = mount({
-        statuses: [
-            {
-                can_stop: true,
-                in_flight_count: 0,
-                peer_stop_circuit: { available: true, open: [openCircuit('did:agent:kite')] },
-            },
-            new Error('status read failed'),
-        ],
+        circuitReads: [circuits('did:agent:kite'), httpError(503)],
     });
-    await tick();
-    await tick();
+    await settle();
+    el.querySelector('.agent-peer-stop-circuit-reset').click();
+    await settle();
+    assert.equal(banner(el).hidden, false);
+    assert.equal(banner(el).querySelectorAll('.agent-peer-stop-circuit').length, 0);
+    assert.match(banner(el).textContent, /unavailable/);
+    handle.destroy();
+});
+
+test('the Stop All status read never carries or clears circuit state', async () => {
+    const { el, handle } = mount({
+        // A stale host still riding circuits on status must not be believed.
+        statuses: [{ ...STATUS, peer_stop_circuit: { available: true, open: [] } }],
+        circuitReads: [circuits('did:agent:kite')],
+    });
+    await settle();
+    assert.equal(banner(el).querySelectorAll('.agent-peer-stop-circuit').length, 1);
+    handle.destroy();
+});
+
+test('a poll in flight across a Reset never repaints the pre-reset answer', async () => {
+    let releaseStale;
+    const stale = new Promise((resolve) => { releaseStale = resolve; });
+    let reads = 0;
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    let resetDone;
+    const resetGate = new Promise((resolve) => { resetDone = resolve; });
+    const handle = mountAgentListPane(el, {
+        adapter: { mode: 'multi_agent', listAgents: async () => AGENTS },
+        isThinking: () => false,
+        api: {
+            getHostStopStatus: async () => STATUS,
+            getPeerStopCircuits: async () => {
+                reads += 1;
+                if (reads === 1) return circuits('did:agent:kite');
+                if (reads === 2) return stale;
+                return CLEAR;
+            },
+            stopHost: async () => ({}),
+            resetPeerStopCircuit: async () => { await resetGate; return {}; },
+        },
+        onPrepareStopAll: () => () => {},
+        askCircuitResetReason: () => 'reviewed the peers',
+        hold: false,
+        stopAllStatusIntervalMs: 60_000,
+        storageKey: `a:circuit-${Math.random()}`,
+    });
+    mounted.push(handle);
+    await settle();
+
     el.querySelector('.agent-peer-stop-circuit-reset').click();
     await tick();
+    // A poll issued while the reset is still in flight.
+    void handle.refreshPeerStopCircuits();
     await tick();
-    const banner = el.querySelector('.agent-peer-stop-circuits');
-    assert.equal(banner.hidden, false);
-    assert.equal(banner.querySelectorAll('.agent-peer-stop-circuit').length, 0);
-    assert.match(banner.textContent, /unavailable/);
+    resetDone();
+    await settle();
+    assert.equal(banner(el).hidden, true, 'the post-reset read is shown');
+
+    releaseStale(circuits('did:agent:kite'));
+    await settle();
+    assert.equal(banner(el).hidden, true, 'the stale pre-reset answer is discarded');
+    assert.equal(reads, 3);
     handle.destroy();
 });
