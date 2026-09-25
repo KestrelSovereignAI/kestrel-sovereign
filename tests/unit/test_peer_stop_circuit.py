@@ -320,6 +320,36 @@ async def test_a_retry_from_an_expired_window_is_counted_again(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_replays_of_finished_operations_are_never_counted(db_backend):
+    """A finished operation's replay stops nothing, so it never counts.
+
+    After a peer Stop's signal event is purged, replaying the same operation
+    reaches the breaker again. The authority would only replay its receipt, so
+    re-admitting it would let replays of long-finished Stops open the circuit
+    and refuse genuine peer Stops.
+    """
+
+    db = AsyncDatabase(db_backend)
+    clock = _Clock()
+    receipts, circuit = await _stores(db, clock, threshold=2, window_seconds=60)
+    target = _target()
+    assert (await _honor(circuit, receipts, target, "did:test:a", "done-1")).honored
+    assert (await _honor(circuit, receipts, target, "did:test:b", "done-2")).honored
+
+    clock.now = T0 + timedelta(seconds=61)
+    for correlation, actor in (("done-1", "did:test:a"), ("done-2", "did:test:b")):
+        replay = await circuit.admit(_peer_request(target, actor, correlation))
+        assert replay.honored is True
+        assert replay.opened is None
+        assert replay.admitted_count == 0
+
+    genuine = await circuit.admit(_peer_request(target, "did:test:c", "fresh"))
+    assert genuine.honored is True
+    assert genuine.admitted_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_the_count_binds_the_verified_actor_and_target(db_backend):
     db = AsyncDatabase(db_backend)
     clock = _Clock()

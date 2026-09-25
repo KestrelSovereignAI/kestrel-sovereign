@@ -281,6 +281,23 @@ class PeerStopCircuitStore:
                 if state.is_open and count < policy.threshold:
                     closed = await self._close(target, state, count, now)
 
+                if await self._has_final_receipt(operation_id):
+                    # The operation already has its final Stop receipt, so the
+                    # authority will only replay it: no work can be stopped.
+                    # A replay is honored so the peer gets that receipt back,
+                    # but it is never admitted or counted -- otherwise replays
+                    # of long-finished operations (after their signal events
+                    # are purged) could open the circuit without stopping
+                    # anything, and refuse genuine peer Stops.
+                    await self._save_state(target, state)
+                    return PeerStopCircuitDecision(
+                        honored=True,
+                        admitted_count=count,
+                        threshold=policy.threshold,
+                        window_seconds=policy.window_seconds,
+                        closed=closed,
+                    )
+
                 existing = await self._db.fetchone(
                     "SELECT 1 FROM stop_circuit_admissions "
                     "WHERE target_agent_id = ? AND operation_id = ?",
@@ -574,6 +591,16 @@ class PeerStopCircuitStore:
 
     def _window_start(self, now: datetime) -> str:
         return self._timestamp(now - timedelta(seconds=self._policy.window_seconds))
+
+    async def _has_final_receipt(self, operation_id: str) -> bool:
+        # The receipt store shares this database and keys operation receipts by
+        # the same opaque digest; a delivery refusal is keyed by its delivery,
+        # so only the operation's own receipt can match (#3169).
+        row = await self._db.fetchone(
+            "SELECT 1 FROM stop_receipts WHERE operation_id = ?",
+            (operation_id,),
+        )
+        return row is not None
 
     async def _admission_is_current(
         self, target: str, operation_id: str, epoch: int, now: datetime
