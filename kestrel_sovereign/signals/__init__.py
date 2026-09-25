@@ -70,6 +70,9 @@ from kestrel_sovereign.signals.durable import (
     DurableSignalStore,
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
+from kestrel_sovereign.signals.in_flight_control import (
+    InFlightControlActionRegistration,
+)
 from kestrel_sovereign.signals.lock_manager import LockHolder, OrderedLockManager
 from kestrel_sovereign.signals.pre_turn_guard import (
     BoundPreTurnGuard,
@@ -121,6 +124,7 @@ __all__ = [
     "Visibility",
     # Runtime
     "DEFAULT_COALESCING_WINDOW",
+    "InFlightControlActionRegistration",
     "DEFAULT_TTL",
     "DurableAdmissionDisposition",
     "DurableAdmissionResult",

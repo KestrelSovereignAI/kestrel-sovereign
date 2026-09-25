@@ -50,6 +50,9 @@ from kestrel_sdk.signals import (
     SourceRegistration,
     Trust,
 )
+from kestrel_sovereign.signals.in_flight_control import (
+    InFlightControlActionRegistration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -556,10 +559,12 @@ class SourceRegistry:
         ownership + self-loop policy, the redaction policy's *flags and
         summarizer* (not merely its class), retention, the four
         constitutional-injection fields, the per-signal prompt-override
-        opt-in (``allow_prompt_override``), and the pre-turn admission guard
-        (``pre_turn_guard``). A re-registration that changes any of them is
-        therefore caught as a MISMATCH instead of being silently accepted as
-        equivalent.
+        opt-in (``allow_prompt_override``), the pre-turn admission guard
+        (``pre_turn_guard``), and whether the source is a typed in-flight
+        control ACTION (:class:`InFlightControlActionRegistration`, which
+        changes durable projection and Hold policy). A re-registration that
+        changes any of them is therefore caught as a MISMATCH instead of being
+        silently accepted as equivalent.
 
         ``allow_prompt_override`` is validated at registration time (only a
         ``bool`` is accepted) yet governs a real dispatch decision — whether a
@@ -627,6 +632,7 @@ class SourceRegistry:
             reg.system_prompt_budget_bytes,
             getattr(reg, "allow_prompt_override", False),
             _callable_identity(getattr(reg, "pre_turn_guard", None)),
+            isinstance(reg, InFlightControlActionRegistration),
         )
 
     @classmethod
@@ -713,6 +719,25 @@ class SourceRegistry:
 
         # Pre-turn admission — kestrel-sovereign#3310.
         SourceRegistry._validate_pre_turn_guard(reg)
+
+        # In-flight control ACTIONs skip the privacy transition lock and Hold
+        # (#3169); keep that exemption to trusted, payload-free ACTIONs.
+        if isinstance(reg, InFlightControlActionRegistration):
+            if reg.allowed_modes != frozenset({SignalMode.ACTION}):
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control registration "
+                    "must allow ACTION mode only."
+                )
+            if reg.trust is not Trust.TRUSTED:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control ACTION must be "
+                    "trusted."
+                )
+            if reg.log_redaction.store_raw_trusted:
+                raise RegistrationError(
+                    f"Source '{reg.name}': an in-flight control ACTION cannot "
+                    "retain raw trusted payloads in the outcome log."
+                )
 
     @staticmethod
     def _validate_pre_turn_guard(reg: SourceRegistration) -> None:

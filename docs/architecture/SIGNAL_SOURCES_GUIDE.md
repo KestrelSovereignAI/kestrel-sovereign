@@ -396,6 +396,73 @@ ping-pong on the SAME source is a loop.
 
 ---
 
+## Peer Stop is an authenticated in-flight ACTION source
+
+`a2a.peer_stop` (#3169) is the andon-cord rail for cooperative peer Stop. Any
+authenticated peer may pull it; it infers no hierarchy, never Holds, and never
+terminates a process. It is deliberately not the operator/local HTTP Stop door
+(`POST /api/agent/stop`, `POST /api/host/stop`): those doors neither build nor
+impersonate this signal, and the A2A transport lane cannot reach them.
+
+Two doors feed it, and both call `dispatch_peer_stop`, which builds a `Signal`
+and awaits `SignalDispatcher.dispatch_signal`. Neither door cancels anything:
+
+- `POST /api/agent/peer/stop` carries the replay-protected hybrid A2A envelope
+  (`a2a_verb=peer_stop`). An unsigned envelope is refused.
+- `AgentManager.stop_host_attested_local_peer` carries the manager's
+  same-process route capability for co-hosted agents.
+
+Identities are routing principals, never payload:
+
+- `Signal.caller` is the verified (or host-attested) sender. It becomes the
+  Stop receipt's `actor_id`.
+- `Signal.target_agent` is the recipient's own DID. The envelope also signs an
+  `a2a_audience`, which the recipient compares with its own identity before
+  dispatch so a signed Stop cannot be forwarded to another agent.
+- The signed payload holds only the intent: `scope`, work target, `reason`,
+  `cascade`, `correlation_id`. Any other key is a grammar error.
+
+Policy decided by the dispatcher, each with a `refused` Stop receipt:
+
+| Dispatcher outcome | Cause | Receipt detail names |
+|---|---|---|
+| `DROPPED_VALIDATION` | `host` or `tool_call` scope, or `cascade: true` (following signed descendants is sovereign-only, #3143) | the specific policy |
+| `DROPPED_CYCLE` | `(target, a2a.peer_stop)` already in the signed causation chain, or depth past the TTL | cycle or depth policy |
+| `DROPPED_RATE_LIMIT` | more than 4 per minute / 20 per hour for this recipient | peer rate limits |
+
+The rate limit is load-bearing: a peer that could stop every new turn without
+limit would have synthesized Hold. The fleet circuit breaker (#3170) owns the
+single `peer_stop_breaker_refusal` seam in the handler.
+
+Idempotency: the durable `source_event_id` and the receipt correlation id are
+both `peer-stop:<sha256(actor, correlation_id)>`, so two peers may reuse a
+correlation id without colliding. A replay is `COALESCED` by the dispatcher and
+answered from the original receipt; it never runs the handler again, never
+fans out again, and never consumes another rate-limit slot. A different request
+reusing the same correlation id is refused as a conflict.
+
+Retry after a lost response: the wire envelope's replay nonce refuses a
+byte-identical resend (403), exactly as for every other A2A action. The
+`stop_peer` sender therefore re-signs the *same* intent, `id`, and `sessionId`
+with a fresh nonce, up to `PEER_STOP_DELIVERY_ATTEMPTS`, and only after an
+unconfirmed delivery (transport error or 503). The recipient answers that
+retry `COALESCED` with the original receipt. Authorization and protocol
+decisions are final and never retried.
+
+The registration is an `InFlightControlActionRegistration`. It acts only on
+work already running, so the dispatcher:
+
+- persists only a fixed durable marker (no payload, caller, or chain) and
+  therefore does not wait on the privacy-transition lock that every running
+  turn holds;
+- does not apply Hold's begin-work disposition, so a held agent still receives
+  Stop for work in flight.
+
+Validation, cycle/TTL, rate limiting, and the `signal_log` audit apply
+unchanged.
+
+---
+
 ## Common patterns
 
 ### Default-deny visibility

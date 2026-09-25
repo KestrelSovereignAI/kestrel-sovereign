@@ -443,3 +443,21 @@ def test_malformed_signature_block_rejected_without_resolver(bad):
     ))
     assert v.ok is False
     assert "malformed" in v.reason
+
+
+def test_audience_is_bound_only_when_present():
+    """#3169: recipient-bound actions sign an audience; other v2 bytes are unchanged."""
+    from kestrel_sovereign.a2a.envelope_signing import (
+        A2A_AUDIENCE_METADATA_KEY,
+        bound_envelope_fields,
+    )
+
+    plain = bound_envelope_fields({"a2a_verb": "send_task"})
+    assert A2A_AUDIENCE_METADATA_KEY not in plain
+    bound = bound_envelope_fields(
+        {"a2a_verb": "peer_stop", A2A_AUDIENCE_METADATA_KEY: "did:test:a"}
+    )
+    assert bound[A2A_AUDIENCE_METADATA_KEY] == "did:test:a"
+    assert bound != bound_envelope_fields(
+        {"a2a_verb": "peer_stop", A2A_AUDIENCE_METADATA_KEY: "did:test:b"}
+    )

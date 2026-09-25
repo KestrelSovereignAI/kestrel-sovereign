@@ -143,6 +143,9 @@ from kestrel_sovereign.signals.durable import (
     DurableSourceBoundary,
     DurableSignalStore,
 )
+from kestrel_sovereign.signals.in_flight_control import (
+    InFlightControlActionRegistration,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.pre_turn_guard import PreTurnRefusal
 from kestrel_sovereign.signals.registry import SourceRegistry
@@ -2821,7 +2824,9 @@ class SignalDispatcher:
             timer.cancel()
 
     def _signal_for_durable_persistence(
-        self, signal: Signal
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
     ) -> _DurableSignalProjection:
         """Return the privacy-safe event projection for the durable ledger.
 
@@ -2835,7 +2840,21 @@ class SignalDispatcher:
         A failure while reading or applying the privacy policy must never
         downgrade into a plaintext durable write, so this boundary fails
         closed by persisting only the marker.
+
+        An in-flight control ACTION always persists only a fixed marker, with
+        no caller and no causation chain: nothing consumes its durable row, a
+        repeated source event id is coalesced rather than re-executed, and the
+        live handler reads the validated in-memory envelope.
         """
+        if isinstance(registration, InFlightControlActionRegistration):
+            return _DurableSignalProjection(
+                signal=replace(
+                    signal,
+                    payload={_DURABLE_PRIVACY_GATED_MARKER: "source_policy"},
+                    caller=None,
+                    causation_chain=[],
+                ),
+            )
         config = resolve_agent_privacy_config(self._agent)
         if config is None:
             return _DurableSignalProjection(signal=signal)
@@ -3375,16 +3394,27 @@ class SignalDispatcher:
             # KestrelAgent provides a task-reentrant lock; lightweight
             # embeddings with no transition machinery intentionally run
             # unguarded through ``optional_transition_lock``.
-            async with optional_transition_lock(
-                _resolve_transition_lock(self._agent)
-            ):
+            #
+            # An in-flight control ACTION (cooperative Stop) is the exception:
+            # every turn holds this same lock for its whole body, so taking it
+            # here would queue a Stop behind the very turn it must stop. Its
+            # projection is a fixed marker with no privacy-dependent content,
+            # so there is nothing a transition could make stale.
+            transition_lock = (
+                None
+                if isinstance(registration, InFlightControlActionRegistration)
+                else _resolve_transition_lock(self._agent)
+            )
+            async with optional_transition_lock(transition_lock):
                 # Normalize the opaque caller once before either the protected
                 # normal-row representation or an elided row's keyed MAC sees
                 # it. This makes caller identity stable across retries and
                 # prevents a user-defined ``__str__`` from entering either
                 # security boundary.
                 signal.caller = self._canonical_caller_identity(signal.caller)
-                durable_projection = self._signal_for_durable_persistence(signal)
+                durable_projection = self._signal_for_durable_persistence(
+                    signal, registration
+                )
                 # Snapshot the normalized payload before the durable commit so
                 # a deepcopy failure cannot leave a committed marker with no
                 # corresponding live handoff.
@@ -3478,7 +3508,9 @@ class SignalDispatcher:
                     "caller_identity_factory": (
                         None
                         if durable_projection.payload_elided
-                        else lambda: self._protect_durable_caller_identity(signal)
+                        else lambda: self._protect_durable_caller_identity(
+                            durable_projection.signal
+                        )
                     ),
                     "before_commit": (
                         install_transient_handoffs
@@ -4649,6 +4681,10 @@ class SignalDispatcher:
     ) -> SignalResult | None:
         """Return the typed, audited Hold disposition for one source unit."""
 
+        if isinstance(registration, InFlightControlActionRegistration):
+            # Hold declines to BEGIN work; an in-flight control action such as
+            # cooperative Stop begins none and must still reach a held agent.
+            return None
         try:
             if not await self._agent_is_held():
                 return None
