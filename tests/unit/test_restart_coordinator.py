@@ -44,6 +44,7 @@ from kestrel_sovereign.features.restart_coordinator.feature import (
     _MAX_NAMED_BUSY_KINDS,
     MAX_IDLE_ONLY_DEFERRAL_SECONDS,
     _describe_background_tasks,
+    _is_infra_background_task,
 )
 from kestrel_sovereign.features.restart_coordinator.store import (
     claim_request_for_execution,
@@ -454,7 +455,15 @@ async def test_fleet_idle_excludes_only_requesters_own_marker(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
+async def test_fleet_blocker_names_sibling_task_kind_and_age_not_its_tail(tmp_path):
+    """#3347: a sibling's blocking tasks are named by KIND with their age.
+
+    "busy (background task(s) in flight)" alone let one agent's permanent
+    task hold every host restart off for two months with nobody able to see
+    what it was. The per-instance tail — where a name carries a peer
+    counterparty, a signal id or a DID — is still withheld from a different
+    tenant's event stream.
+    """
     feat, _ = await _make_feature(tmp_path)
     requester = feat.agent
     sibling = _idle_sibling("did:test:sibling", busy=False)
@@ -464,22 +473,51 @@ async def test_fleet_blocker_does_not_disclose_sibling_task_names(tmp_path):
         await blocked.wait()
 
     task = asyncio.create_task(
-        private_counterparty_sync(), name="private-counterparty-sync"
+        private_counterparty_sync(),
+        name="a2a_question_answered_retry:PrivateCounterparty:task-secret",
     )
+    task._kestrel_started_at = time.monotonic() - 2 * 3600
     sibling._background_tasks = {task}
     requester._cohosted_agents_provider = lambda: [requester, sibling]
     try:
         state = feat._fleet_idle(ignore_request_id="")
         assert state["idle"] is False
-        assert state["blocker"]["count"] is None
-        assert state["blocker"]["summary"] is None
-        assert state["blocker"]["oldest_age_seconds"] is None
-        assert "private-counterparty-sync" not in state["reason"]
-        assert "1 background task" not in state["reason"]
+        assert state["blocker"]["scope"] == "cohosted_agent"
+        assert state["blocker"]["count"] == 1
+        assert state["blocker"]["summary"] == "a2a_question_answered_retry (2h)"
+        assert state["blocker"]["oldest_age_seconds"] >= 2 * 3600
+        assert state["reason"] == (
+            "co-hosted agent did:test:sibling busy (1 background task(s) in "
+            "flight: a2a_question_answered_retry (2h))"
+        )
+        assert "PrivateCounterparty" not in state["reason"]
+        assert "task-secret" not in state["reason"]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_fleet_blocker_labels_a_sibling_by_display_name_and_did(tmp_path):
+    """A real ``KestrelAgent`` has no ``name`` attribute — its display name is
+    ``agent_name`` — so the live reason rendered a bare DID (#3347)."""
+    feat, _ = await _make_feature(tmp_path)
+    requester = feat.agent
+    sibling = SimpleNamespace(
+        did="did:test:meridian",
+        agent_name="Meridian",
+        dispatcher=SimpleNamespace(),
+        _active_request_ids={"r-active"},
+        _background_tasks=set(),
+    )
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+
+    state = feat._fleet_idle(ignore_request_id="")
+
+    assert state["reason"].startswith(
+        "co-hosted agent Meridian (did:test:meridian) busy ("
+    )
 
 
 @pytest.mark.asyncio
@@ -5698,6 +5736,52 @@ def test_unstamped_task_reports_unknown_age_rather_than_guessing():
 
     described = _describe_background_tasks([_Unstamped()], now=1000.0)
     assert "age unknown" in described
+
+
+def test_kinds_only_description_withholds_every_per_instance_tail():
+    """#3347: the co-hosted form names each blocking KIND and its oldest age,
+    oldest first, and never an example name's tail."""
+    described = _describe_background_tasks(
+        [
+            _FakeTask("signal_dispatch:channel.telegram:sig_a", age_seconds=30),
+            _FakeTask("signal_dispatch:peer.Claw:sig_b", age_seconds=7200),
+            _FakeTask("wait_fallback_reconcile", age_seconds=90000),
+        ],
+        now=1000000.0,
+        kinds_only=True,
+    )
+    assert described == "wait_fallback_reconcile (25h), signal_dispatch x2 (2h)"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # WaitFeature (mandatory): permanent ``while True`` driver, #2729.
+        "wait_fallback_reconcile",
+        # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
+        "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
+    ],
+)
+def test_permanent_bookkeeping_daemons_are_infrastructure(name):
+    """#3347: these are in every agent's task set whether or not it has done
+    anything, so counting them made no agent ever idle."""
+    assert _is_infra_background_task(_FakeTask(name)) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "signal_dispatch:channel.telegram:sig_1",
+        "durable_cognition:a2a.task_submitted:sig_1",
+        "durable_terminal:workflow:sig_1",
+        "a2a_submitted:12345678",
+        "post_response_memory_enrichment",
+        # A lookalike must not ride on the heartbeat's exclusion.
+        "durable_signal_owner:did:x",
+    ],
+)
+def test_real_work_is_not_infrastructure(name):
+    assert _is_infra_background_task(_FakeTask(name)) is False
 
 
 @pytest.mark.asyncio

@@ -223,8 +223,8 @@ def _tail(raw: Any) -> str:
 
 
 # Background-task name prefixes for *infrastructure* work that must never
-# hold off an idle restart (#1626). Six shapes all wedged
-# ``idle_agents_only`` forever by being counted as "busy":
+# hold off an idle restart (#1626). Each of these shapes held
+# ``idle_agents_only`` off by being counted as "busy" — most of them forever:
 #   - ``durable_signal_log`` — fire-and-forget log writes that complete in
 #     well under a second but are minted continuously by heartbeats/scheduler
 #     ticks, so one is almost always alive when the idle check runs. Covers
@@ -263,6 +263,28 @@ def _tail(raw: Any) -> str:
 #   - ``isolated-runtime-telemetry:`` — advisory, coalesced telemetry delivery.
 #     It neither admits user work nor owns lifecycle progress, and shutdown
 #     cancels the exact tracked task before restart.
+#   - ``wait_fallback_reconcile`` — the mandatory WaitFeature's permanent
+#     ``while True`` fallback driver for the wait reconciler (#2729). Because
+#     WaitFeature is mandatory, EVERY booted agent carries this task for its
+#     whole lifetime, so from #2729 on no agent was ever idle to this gate:
+#     every ``idle_agents_only`` restart waited out
+#     ``MAX_IDLE_ONLY_DEFERRAL_SECONDS`` and the reason blamed whichever
+#     co-hosted agent the fleet walk reached first (#3347). It stays in the
+#     agent set on purpose — it is feature-owned and must be cancelled on
+#     disable and at shutdown. Excluding it loses nothing a restart could
+#     harm: a reconcile tick is the same bookkeeping the ``wait_reconcile``
+#     cron performs inline (which this gate never saw), signal-mode watches
+#     are durable and re-arm after restart, and any wake a tick enqueues is a
+#     separate ``signal_dispatch:*`` task that still defers.
+#   - ``durable_signal_owner_heartbeat:`` — the durable dispatcher's owner
+#     liveness tick (#2713). A fresh short task every third of the owner
+#     stale window (~40s), forever, so one is often alive when this check
+#     runs — and it can sit on a contended storage write for longer. It stays
+#     tracked because the dispatcher cancels and drains it before closing
+#     storage. Its only work is renewing this process's owner row and
+#     requeueing stale foreign leases, which a restart's own startup recovery
+#     repeats; any cognition it wakes runs as ``durable_cognition:*``, which
+#     still defers.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
 # it was just never read here. New long-lived/bookkeeping daemons must be
@@ -274,6 +296,8 @@ _INFRA_TASK_PREFIXES = (
     "isolated-feature:",
     "isolated-feature-idle:",
     "isolated-runtime-telemetry:",
+    "wait_fallback_reconcile",
+    "durable_signal_owner_heartbeat:",
 )
 
 
@@ -316,7 +340,9 @@ def _format_age(seconds: Optional[float]) -> str:
     return f"{int(seconds // 3600)}h"
 
 
-def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
+def _describe_background_tasks(
+    tasks, now: Optional[float] = None, *, kinds_only: bool = False,
+) -> str:
     """Describe the tasks blocking an idle restart, not just how many (#2665).
 
     A bare count ("2 background tasks in flight") cannot be reconciled against
@@ -333,6 +359,12 @@ def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
       truncated away by the volume of another.
     - Age is what separates "busy" from "wedged", and #2665's symptom was a
       duration symptom. Oldest first puts the likely culprit at the front.
+
+    ``kinds_only`` labels each group by its KIND alone — never an example
+    name — for a co-hosted agent's tasks (#3347). The per-instance tail is
+    where a name carries a signal id, a peer counterparty or a DID; the kind
+    names a code path, not a counterparty. Hiding even that left a sibling's permanent task unidentifiable from
+    outside for two months while it held every restart off.
     """
     now = time.monotonic() if now is None else now
     kinds: Dict[str, Dict[str, Any]] = {}
@@ -363,8 +395,8 @@ def _describe_background_tasks(tasks, now: Optional[float] = None) -> str:
     ordered = sorted(kinds.items(), key=_sort_key)
     shown = ordered[:_MAX_NAMED_BUSY_KINDS]
     parts = []
-    for _kind, entry in shown:
-        label = entry["example"]
+    for kind, entry in shown:
+        label = kind if kinds_only else entry["example"]
         if entry["count"] > 1:
             label = f"{label} x{entry['count']}"
         parts.append(f"{label} ({_format_age(entry['oldest'])})")
@@ -2205,6 +2237,22 @@ class RestartCoordinatorFeature(Feature):
                     continue
         return None
 
+    @staticmethod
+    def _fleet_agent_label(agent: Any) -> str:
+        """Name a fleet member in a deferral reason: display name AND DID.
+
+        ``KestrelAgent`` has no ``name`` attribute — its display name lives in
+        ``agent_name`` / ``_agent_name`` — so reading ``name`` alone rendered
+        every real co-hosted blocker as a bare DID that had to be decoded by
+        hand (#3347). The DID stays: it is the unambiguous identity.
+        """
+        did = str(getattr(agent, "did", "") or "")
+        for attr in ("name", "agent_name", "_agent_name"):
+            name = str(getattr(agent, attr, "") or "")
+            if name and name != did:
+                return f"{name} ({did})" if did else name
+        return did or "?"
+
     def _fleet_idle(self, ignore_request_id: str = "") -> Dict[str, Any]:
         """Idleness across all agents before a whole-host restart (#F235).
 
@@ -2222,20 +2270,22 @@ class RestartCoordinatorFeature(Feature):
             return self._agent_appears_idle(ignore_request_id=ignore_request_id)
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
-            # Name tasks only for OUR agent. This reason is persisted to the
-            # coordinator agent's event store and pushed on its SSE stream, so
-            # enumerating a sibling's tasks would publish that agent's
-            # topology — peer counterparties, active integrations, DIDs — to a
-            # different tenant. On a multi-tenant host that is a disclosure,
-            # and #2665 is a self-diagnosis: nothing here needs sibling task
-            # identity, only that the sibling is busy.
+            # Name individual tasks only for OUR agent. This reason is
+            # persisted to the coordinator agent's event store and pushed on
+            # its SSE stream, so a sibling's full task names would publish
+            # its topology — peer counterparties, signal ids, DIDs live in
+            # the per-instance tail — to a different tenant. A sibling's
+            # background tasks are still described by KIND and age (#3347):
+            # "busy" alone left a permanent task on one agent holding every
+            # host restart off with nobody able to see what it was. A
+            # sibling's request ids and dispatcher load stay hidden.
             state = self._agent_appears_idle(
                 ignore_request_id=excl,
                 agent=other,
                 name_tasks=(other is self.agent),
             )
             if not state["idle"]:
-                name = getattr(other, "name", None) or getattr(other, "did", "?")
+                name = self._fleet_agent_label(other)
                 blocker = dict(state.get("blocker") or {})
                 blocker["scope"] = (
                     "requesting_agent" if other is self.agent
@@ -2268,6 +2318,10 @@ class RestartCoordinatorFeature(Feature):
         must not block the very restart it requested, so it is excluded
         from the active-request count for that specific row (#1561). All
         other active requests still count as busy.
+
+        ``name_tasks`` is False for a co-hosted sibling: its request ids and
+        dispatcher load are withheld, and its background tasks are described
+        by kind and age rather than by full name (#3347).
 
         Optional dispatcher hooks ``in_flight_signals`` /
         ``active_count`` are consulted first if present (gives feature
@@ -2408,28 +2462,23 @@ class RestartCoordinatorFeature(Feature):
                     )
                     if age is not None
                 ]
-                detail = (
-                    f": {_describe_background_tasks(alive)}"
-                    if name_tasks else ""
+                # A co-hosted agent's tasks are described by KIND only; the
+                # requester's own keep their full names (#3347, see
+                # ``_describe_background_tasks``).
+                summary = _describe_background_tasks(
+                    alive, kinds_only=not name_tasks,
                 )
                 return {
                     "idle": False,
                     "reason": (
-                        f"{len(alive)} background task(s) in flight{detail}"
-                        if name_tasks
-                        else "background task(s) in flight"
+                        f"{len(alive)} background task(s) in flight: {summary}"
                     ),
                     "blocker": {
                         "scope": "requesting_agent",
                         "kind": "background_tasks",
-                        "count": len(alive) if name_tasks else None,
-                        "oldest_age_seconds": (
-                            max(ages) if name_tasks and ages else None
-                        ),
-                        "summary": (
-                            _describe_background_tasks(alive)
-                            if name_tasks else None
-                        ),
+                        "count": len(alive),
+                        "oldest_age_seconds": max(ages) if ages else None,
+                        "summary": summary,
                     },
                 }
 
