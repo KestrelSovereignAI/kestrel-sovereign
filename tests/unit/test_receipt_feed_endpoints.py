@@ -41,6 +41,7 @@ from kestrel_sovereign.stop import (
     CooperativeStopTarget,
     StopCleanupRegistry,
     StopDisposition,
+    StopDoor,
     StopOutcome,
     StopReceiptError,
     StopReceiptStore,
@@ -117,6 +118,7 @@ def _authority(store, *targets):
         lambda: targets,
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=store,
+        door=StopDoor.AGENT,
     )
 
 
@@ -538,7 +540,7 @@ async def test_a_pre_fix_row_reads_back_as_not_recorded(db_backend):
     # The pre-fix writer persisted the caller's request unresolved.
     request = _agent_stop(agent, correlation_id=_fresh("op-"), trace_id=trace)
     assert request.target_agent_id is None
-    await store.persist(request, _outcomes(request))
+    await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
 
     page = await store.list_receipts(trace_id=trace, limit=10)
     assert len(page.receipts) == 1
@@ -675,6 +677,7 @@ async def test_a_host_fanout_is_findable_by_the_agent_it_reached(db_backend):
             )
             for agent in (alpha, beta)
         ),
+        door=StopDoor.AGENT,
     )
 
     page = await store.list_receipts(agent_id=beta, limit=10)
@@ -699,7 +702,7 @@ async def test_unreachable_outcomes_are_returned_not_filtered(db_backend):
         target_agent_id=agent,
     )
     await store.persist(
-        request, _outcomes(request, disposition=StopDisposition.UNREACHABLE)
+        request, _outcomes(request, disposition=StopDisposition.UNREACHABLE), door=StopDoor.AGENT
     )
 
     page = await store.list_receipts(agent_id=agent, limit=10)

@@ -46,8 +46,10 @@ from kestrel_sovereign.signals.sources.peer_stop import (
     dispatch_peer_stop,
     encode_peer_stop_intent,
     peer_stop_operation_id,
+    resolve_peer_stop_circuit_policy,
 )
 from kestrel_sovereign.stop import (
+    PeerStopCircuitStore,
     StopCleanupRegistry,
     StopReceiptConflict,
     StopReceiptStore,
@@ -116,6 +118,10 @@ async def rail(tmp_path):
     receipt_db = await AsyncDatabase.sqlite(str(tmp_path / "receipts.db"))
     receipts = StopReceiptStore(receipt_db)
     await receipts.ensure_schema()
+    circuit = PeerStopCircuitStore(
+        receipt_db, policy=resolve_peer_stop_circuit_policy({})
+    )
+    await circuit.ensure_schema()
 
     agent = _Agent()
     registry = SourceRegistry()
@@ -128,13 +134,18 @@ async def rail(tmp_path):
     )
     agent.dispatcher = dispatcher
     attach_stop_evidence(
-        agent, receipt_store=receipts, cleanup_registry=StopCleanupRegistry()
+        agent,
+        receipt_store=receipts,
+        cleanup_registry=StopCleanupRegistry(),
+        circuit=circuit,
     )
     yield SimpleNamespace(
         agent=agent,
         dispatcher=dispatcher,
         backend=backend,
         receipts=receipts,
+        circuit=circuit,
+        receipt_db=receipt_db,
     )
     pending = [task for task in agent.background_tasks if not task.done()]
     if pending:
@@ -1123,10 +1134,14 @@ def test_server_attaches_stop_evidence_with_the_distributed_registry() -> None:
 
     attached: list[object] = []
     receipts = object()
+    circuit = PeerStopCircuitStore(
+        None, policy=resolve_peer_stop_circuit_policy({})
+    )
     state = SimpleNamespace(
         distributed_invocation_registry=SimpleNamespace(attach=attached.append),
         stop_receipt_store=receipts,
         stop_cleanup_registry=None,
+        peer_stop_circuit=circuit,
     )
     agent = _Agent()
 
@@ -1138,6 +1153,22 @@ def test_server_attaches_stop_evidence_with_the_distributed_registry() -> None:
         receipts,
         state.stop_cleanup_registry,
     )
+    assert agent.__dict__[peer_stop._CIRCUIT_ATTRIBUTE] is circuit
+
+
+def test_server_refuses_receipts_without_a_circuit_breaker() -> None:
+    """Receipts without a breaker would honor peer Stops uncounted (#3170)."""
+
+    from kestrel_sovereign.server import _attach_stop_runtime
+
+    state = SimpleNamespace(
+        distributed_invocation_registry=None,
+        stop_receipt_store=object(),
+        stop_cleanup_registry=None,
+        peer_stop_circuit=None,
+    )
+    with pytest.raises(RuntimeError, match="circuit breaker"):
+        _attach_stop_runtime(SimpleNamespace(state=state), _Agent())
 
 
 def test_server_attach_sites_share_one_helper() -> None:

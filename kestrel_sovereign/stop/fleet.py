@@ -13,7 +13,7 @@ from typing import Any
 from kestrel_sovereign.telemetry import current_trace_identity
 
 from .authority import CancellationAuthority, CooperativeStopTarget, StopCleanupRegistry
-from .types import StopDisposition, StopRequest, StopScope
+from .types import StopDisposition, StopDoor, StopRequest, StopScope
 
 DurableWorkReader = Callable[[str], Awaitable[bool]]
 
@@ -58,6 +58,7 @@ async def execute_fleet_stop(
         lambda: frozen,
         cleanup_registry=cleanup_registry,
         receipt_store=receipt_store,
+        door=StopDoor.HOST,
     )
     trace_id, span_id = current_trace_identity()
     request_kwargs: dict[str, object] = {}

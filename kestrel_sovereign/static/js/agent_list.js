@@ -1615,6 +1615,106 @@ export function mountAgentListPane(containerEl, config = {}) {
         body.insertBefore(stopAllResults, listHandle.element);
     }
 
+    // --- Peer Stop circuit breaker (#3170) ---------------------------------
+    // Repeated peer Stop against one agent is Hold through the back door, so
+    // the host stops honoring it past a threshold and tells a human -- here.
+    // The circuits arrive on the same host status read Stop All polls, and
+    // only a sovereign caller is sent them; Reset is that caller's door.
+    const circuitOptIn = stopAllOptIn && typeof api.resetPeerStopCircuit === 'function';
+    const circuitBanner = circuitOptIn ? doc.createElement('div') : null;
+    if (circuitBanner) {
+        circuitBanner.className = 'agent-peer-stop-circuits';
+        circuitBanner.setAttribute('role', 'status');
+        circuitBanner.setAttribute('aria-live', 'polite');
+        circuitBanner.hidden = true;
+        body.insertBefore(circuitBanner, listHandle.element);
+    }
+    const askCircuitResetReason = makeReasonAsker(config.askCircuitResetReason);
+    const circuitResetsPending = new Set();
+    const circuitResetErrors = new Map();
+    let peerStopCircuit = null;
+
+    function renderPeerStopCircuits() {
+        if (!circuitBanner) return;
+        circuitBanner.textContent = '';
+        const state = peerStopCircuit;
+        if (!state || typeof state !== 'object') {
+            circuitBanner.hidden = true;
+            return;
+        }
+        if (state.available !== true) {
+            // An unreadable breaker is not a clear one.
+            const line = doc.createElement('p');
+            line.className = 'agent-peer-stop-circuit-unavailable';
+            line.textContent = 'Peer Stop circuit state is unavailable';
+            circuitBanner.appendChild(line);
+            circuitBanner.hidden = false;
+            return;
+        }
+        const open = Array.isArray(state.open)
+            ? state.open.filter((entry) => entry && typeof entry.target_agent_id === 'string'
+                && entry.target_agent_id)
+            : [];
+        circuitBanner.hidden = open.length === 0;
+        for (const entry of open) {
+            const target = entry.target_agent_id;
+            const name = displayIdentity([target]);
+            const row = doc.createElement('div');
+            row.className = 'agent-peer-stop-circuit';
+            row.dataset.target = target;
+            const label = doc.createElement('span');
+            label.className = 'agent-peer-stop-circuit-label';
+            label.textContent = `peer Stop circuit open: ${name}`;
+            const count = Number.isSafeInteger(entry.admitted_count) ? entry.admitted_count : null;
+            const windowSeconds = Number.isSafeInteger(entry.window_seconds) ? entry.window_seconds : null;
+            if (count !== null && windowSeconds !== null) {
+                label.title = `${count} honored peer Stops within ${windowSeconds}s; further peer Stops are refused`;
+            }
+            const reset = doc.createElement('button');
+            reset.type = 'button';
+            reset.className = 'agent-peer-stop-circuit-reset';
+            reset.textContent = 'Reset';
+            reset.title = `Reset the peer Stop circuit for ${name}`;
+            reset.disabled = circuitResetsPending.has(target);
+            reset.addEventListener('click', () => { void resetPeerStopCircuit(target, name); });
+            row.appendChild(label);
+            row.appendChild(reset);
+            const error = circuitResetErrors.get(target);
+            if (error) {
+                const failure = doc.createElement('span');
+                failure.className = 'agent-peer-stop-circuit-error';
+                failure.textContent = error;
+                row.appendChild(failure);
+            }
+            circuitBanner.appendChild(row);
+        }
+    }
+
+    async function resetPeerStopCircuit(target, name) {
+        if (!circuitOptIn || destroyed || circuitResetsPending.has(target)) return;
+        const reason = askCircuitResetReason(
+            `Reset the peer Stop circuit for ${name}? Peers will be able to stop it again. Reason:`,
+            'Reviewed the repeated peer Stops',
+        );
+        if (reason === null) return;
+        circuitResetsPending.add(target);
+        circuitResetErrors.delete(target);
+        renderPeerStopCircuits();
+        try {
+            await api.resetPeerStopCircuit({ target, reason });
+        } catch (error) {
+            circuitResetErrors.set(
+                target,
+                `Reset failed: ${(error && error.message) || 'request refused'}`,
+            );
+        } finally {
+            circuitResetsPending.delete(target);
+        }
+        if (destroyed) return;
+        renderPeerStopCircuits();
+        await refreshStopAllState();
+    }
+
     let stopAllStatusSeq = 0;
     let stopAllStatusPromise = null;
     let stopAllStatus = { loaded: false, canStop: false, inFlightCount: 0 };
@@ -1665,6 +1765,9 @@ export function mountAgentListPane(containerEl, config = {}) {
                     canStop: status && status.can_stop === true,
                     inFlightCount: validCount ? rawCount : 0,
                 };
+                peerStopCircuit = status && status.peer_stop_circuit
+                    ? status.peer_stop_circuit
+                    : null;
             } catch (_) {
                 if (seq !== stopAllStatusSeq) return false;
                 // Status is an authority and inventory gate. A failed read must not
@@ -2740,6 +2843,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (builtNewBtn && newBtn) newBtn.remove();
         if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
         if (stopAllResults && stopAllResults.parentNode) stopAllResults.remove();
+        if (circuitBanner && circuitBanner.parentNode) circuitBanner.remove();
         // The fleet Hold surface is always built by this mount, never adopted,
         // so it always leaves with it — a leaked kebab keeps a dead menu
         // callback alive over a list handle that has already been destroyed.

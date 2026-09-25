@@ -27,8 +27,10 @@ from kestrel_sovereign.signals.sources.peer_stop import (
     encode_peer_stop_intent,
     peer_stop_delivery_id,
     peer_stop_operation_id,
+    resolve_peer_stop_circuit_policy,
 )
 from kestrel_sovereign.stop import (
+    PeerStopCircuitStore,
     StopCleanupRegistry,
     StopDisposition,
     StopOutcome,
@@ -704,7 +706,14 @@ async def test_manager_host_attestation_dispatches_signal_with_live_sender_chain
     )
     receipts = SimpleNamespace(bind_operation=AsyncMock(return_value=None))
     attach_stop_evidence(
-        recipient, receipt_store=receipts, cleanup_registry=StopCleanupRegistry()
+        recipient,
+        receipt_store=receipts,
+        cleanup_registry=StopCleanupRegistry(),
+        # The mocked dispatcher never runs the handler, so the breaker is
+        # never consulted; attaching one is still mandatory.
+        circuit=PeerStopCircuitStore(
+            None, policy=resolve_peer_stop_circuit_policy({})
+        ),
     )
     payload = _payload(
         metadata={

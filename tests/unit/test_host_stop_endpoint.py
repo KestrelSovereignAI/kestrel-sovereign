@@ -23,7 +23,7 @@ class _ReceiptStore:
             self.on_load()
         return None
 
-    async def persist(self, request, outcomes):
+    async def persist(self, request, outcomes, **_kwargs):
         receipt_id = f"receipt-{request.correlation_id}"
         receipted = tuple(
             replace(outcome, receipt_id=receipt_id) for outcome in outcomes
@@ -144,7 +144,13 @@ def test_host_stop_status_is_caller_scoped_and_counts_live_agents():
     response = TestClient(app).get("/api/host/stop/status")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"can_stop": True, "in_flight_count": 1}
+    assert response.json() == {
+        "can_stop": True,
+        "in_flight_count": 1,
+        # No breaker attached to this app: reported as unavailable, never as
+        # "no circuit is open" (#3170).
+        "peer_stop_circuit": {"available": False, "open": []},
+    }
     assert response.headers["cache-control"] == "private, no-store"
     assert response.headers["vary"] == "Authorization, Cookie, X-API-Key"
     manager.list_agents.assert_called_once_with()

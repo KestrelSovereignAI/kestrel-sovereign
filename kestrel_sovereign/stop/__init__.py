@@ -8,6 +8,15 @@ from .authority import (
     CooperativeStopTarget,
     StopCleanupRegistry,
 )
+from .circuit import (
+    PeerStopCircuit,
+    PeerStopCircuitDecision,
+    PeerStopCircuitError,
+    PeerStopCircuitEvent,
+    PeerStopCircuitEventKind,
+    PeerStopCircuitPolicy,
+    PeerStopCircuitStore,
+)
 from .fleet import execute_fleet_stop, fleet_in_flight_count
 from .invocation import (
     DistributedInvocationRegistry,
@@ -31,6 +40,7 @@ from .types import (
     AuthoritativeStopDescendant,
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
+    StopDoor,
     StopOutcome,
     StopRequest,
     StopScope,
@@ -44,8 +54,16 @@ __all__ = [
     "DistributedInvocationRegistry",
     "DistributedInvocationStore",
     "DistributedStopTicket",
+    "PeerStopCircuit",
+    "PeerStopCircuitDecision",
+    "PeerStopCircuitError",
+    "PeerStopCircuitEvent",
+    "PeerStopCircuitEventKind",
+    "PeerStopCircuitPolicy",
+    "PeerStopCircuitStore",
     "StopCleanupRegistry",
     "StopDisposition",
+    "StopDoor",
     "StopLegacyRegistrationsError",
     "StopOperationClaim",
     "StopOutcome",

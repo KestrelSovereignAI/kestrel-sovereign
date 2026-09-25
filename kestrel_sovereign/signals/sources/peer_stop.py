@@ -50,6 +50,14 @@ The response names the one record its outcomes are: ``receipt_kind`` is
 ``operation`` (keyed by the operation id) or ``delivery`` (keyed by
 ``peer-stop-delivery:<signal id>``), and ``stop_correlation_id`` is that key.
 
+The fleet circuit breaker (#3170) decides at :func:`peer_stop_breaker_refusal`,
+inside the handler, after dispatcher policy and before any cancellation: once
+the honored peer Stops against this agent reach
+``PEER_STOP_CIRCUIT_THRESHOLD`` within ``PEER_STOP_CIRCUIT_WINDOW_SECONDS``,
+a further peer Stop is refused with a ``refused`` receipt under its operation id
+whose detail is ``peer_stop_circuit_open``.  See
+:mod:`kestrel_sovereign.stop.circuit`.
+
 Retry contract: a byte-identical signed resend is refused by the envelope's
 replay nonce.  A sender whose response was lost re-signs the same intent and
 correlation id with a fresh nonce (``PEER_STOP_DELIVERY_ATTEMPTS``).
@@ -59,6 +67,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -85,8 +94,11 @@ from kestrel_sovereign.signals.in_flight_control import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
+    PeerStopCircuitPolicy,
+    PeerStopCircuitStore,
     StopCleanupRegistry,
     StopDisposition,
+    StopDoor,
     StopOutcome,
     StopReceiptConflict,
     StopRequest,
@@ -111,6 +123,19 @@ MAX_PEER_STOP_REASON_CHARS = 1024
 # the same intent and correlation id with a fresh replay nonce; the recipient's
 # Stop receipt answers a duplicate with the original outcome.
 PEER_STOP_DELIVERY_ATTEMPTS = 3
+# The fleet circuit breaker (#3170): honored peer Stops against ONE agent, from
+# any peers, tolerated within a sliding window before further peer Stops are
+# refused.  Conservative on purpose -- one peer alone may reach it inside the
+# per-source rate limit, because the andon cord is for stopping a mistake, and
+# an agent stopped this often by its peers is being held, not corrected.
+# Hosts tune both with the environment variables below.
+PEER_STOP_CIRCUIT_THRESHOLD = 8
+PEER_STOP_CIRCUIT_WINDOW_SECONDS = 900
+PEER_STOP_CIRCUIT_THRESHOLD_ENV = "KESTREL_PEER_STOP_CIRCUIT_THRESHOLD"
+PEER_STOP_CIRCUIT_WINDOW_ENV = "KESTREL_PEER_STOP_CIRCUIT_WINDOW_SECONDS"
+# Receipt details for a breaker refusal; the first is the design's stable name.
+PEER_STOP_CIRCUIT_OPEN = "peer_stop_circuit_open"
+PEER_STOP_CIRCUIT_UNAVAILABLE = "peer_stop_circuit_unavailable"
 
 _OPERATION_ID_DOMAIN = b"kestrel:a2a.peer_stop:operation:v1\x00"
 _OPERATION_ID_PREFIX = "peer-stop:"
@@ -125,6 +150,7 @@ _DELIVERY_DISPOSITIONS = frozenset(
 )
 _RECEIPT_STORE_ATTRIBUTE = "_stop_receipt_store"
 _CLEANUP_REGISTRY_ATTRIBUTE = "_stop_cleanup_registry"
+_CIRCUIT_ATTRIBUTE = "_peer_stop_circuit"
 
 
 class PeerStopIntentError(ValueError):
@@ -458,18 +484,52 @@ def build_peer_stop_signal(
 # ---------------------------------------------------------------------------
 
 
+def resolve_peer_stop_circuit_policy(
+    environ: Mapping[str, str] | None = None,
+) -> PeerStopCircuitPolicy:
+    """The host's circuit policy: module defaults, environment overrides.
+
+    A malformed override fails the host's Stop evidence startup rather than
+    silently falling back to a default nobody chose.
+    """
+
+    environ = os.environ if environ is None else environ
+    values = {}
+    for name, env_name, default in (
+        ("threshold", PEER_STOP_CIRCUIT_THRESHOLD_ENV, PEER_STOP_CIRCUIT_THRESHOLD),
+        (
+            "window_seconds",
+            PEER_STOP_CIRCUIT_WINDOW_ENV,
+            PEER_STOP_CIRCUIT_WINDOW_SECONDS,
+        ),
+    ):
+        raw = environ.get(env_name)
+        if raw is None or not raw.strip():
+            values[name] = default
+            continue
+        try:
+            values[name] = int(raw.strip())
+        except ValueError as error:
+            raise ValueError(f"{env_name} must be a positive integer") from error
+    return PeerStopCircuitPolicy(**values)
+
+
 def attach_stop_evidence(
     agent: object,
     *,
     receipt_store: object,
     cleanup_registry: StopCleanupRegistry,
+    circuit: PeerStopCircuitStore,
 ) -> None:
     """Give an agent's peer Stop handler the host's Stop evidence services."""
 
     if not isinstance(cleanup_registry, StopCleanupRegistry):
         raise TypeError("cleanup_registry must be a StopCleanupRegistry")
+    if not isinstance(circuit, PeerStopCircuitStore):
+        raise TypeError("circuit must be the host's PeerStopCircuitStore")
     agent.__dict__[_RECEIPT_STORE_ATTRIBUTE] = receipt_store
     agent.__dict__[_CLEANUP_REGISTRY_ATTRIBUTE] = cleanup_registry
+    agent.__dict__[_CIRCUIT_ATTRIBUTE] = circuit
 
 
 def _stop_evidence(agent: object) -> tuple[object, StopCleanupRegistry]:
@@ -487,16 +547,28 @@ def _stop_evidence(agent: object) -> tuple[object, StopCleanupRegistry]:
     return receipt_store, registry
 
 
-def peer_stop_breaker_refusal(agent: object, request: StopRequest) -> str | None:
+async def peer_stop_breaker_refusal(
+    agent: object, request: StopRequest
+) -> str | None:
     """Decide whether this peer Stop is honored; ``None`` honors it.
 
     This is the single seam the fleet circuit breaker (#3170) owns: peer
     Stops past its threshold cease to be honored and a human is notified,
-    because repeated Stop would otherwise synthesize Hold.  Until #3170
-    lands every peer Stop that survived dispatcher policy is honored.
+    because repeated Stop would otherwise synthesize Hold.  ``request`` is
+    built from the dispatcher's verified principals, so the count binds the
+    authenticated actor and this agent's own DID.  Without a durable circuit
+    the breaker cannot count, and an uncounted peer Stop is exactly the back
+    door it exists to close: it refuses rather than honoring blind.
     """
 
-    return None
+    circuit = getattr(agent, "__dict__", {}).get(_CIRCUIT_ATTRIBUTE)
+    if not isinstance(circuit, PeerStopCircuitStore):
+        return PEER_STOP_CIRCUIT_UNAVAILABLE
+    try:
+        decision = await circuit.admit(request)
+    except Exception:  # noqa: BLE001 - durable evidence boundary
+        return PEER_STOP_CIRCUIT_UNAVAILABLE
+    return None if decision.honored else PEER_STOP_CIRCUIT_OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +608,7 @@ def build_peer_stop_registration(
             span_id=span_id,
         )
         receipt_store, cleanup_registry = _stop_evidence(agent)
-        breaker_refusal = peer_stop_breaker_refusal(agent, request)
+        breaker_refusal = await peer_stop_breaker_refusal(agent, request)
         if breaker_refusal is not None:
             outcomes = await _persist_single_outcome(
                 receipt_store,
@@ -566,6 +638,7 @@ def build_peer_stop_registration(
             inventory,
             cleanup_registry=cleanup_registry,
             receipt_store=receipt_store,
+            door=StopDoor.PEER,
         )
         outcomes = await authority.stop(request)
         return [outcome.to_dict() for outcome in outcomes]
@@ -916,7 +989,9 @@ async def _persist_single_outcome(
 
     outcome = _outcome(request, target_agent_id, disposition, detail)
     try:
-        receipt = await receipt_store.persist(request, (outcome,))
+        receipt = await receipt_store.persist(
+            request, (outcome,), door=StopDoor.PEER
+        )
     except StopReceiptConflict:
         return (
             _outcome(
@@ -978,6 +1053,12 @@ def _peer_stop_redaction(payload: dict) -> str:
 __all__ = [
     "MAX_PEER_STOP_REASON_CHARS",
     "PEER_STOP_A2A_VERB",
+    "PEER_STOP_CIRCUIT_OPEN",
+    "PEER_STOP_CIRCUIT_THRESHOLD",
+    "PEER_STOP_CIRCUIT_THRESHOLD_ENV",
+    "PEER_STOP_CIRCUIT_UNAVAILABLE",
+    "PEER_STOP_CIRCUIT_WINDOW_ENV",
+    "PEER_STOP_CIRCUIT_WINDOW_SECONDS",
     "PEER_STOP_DELIVERY_ATTEMPTS",
     "PEER_STOP_RATE_LIMIT_BURST",
     "PEER_STOP_RATE_LIMIT_PER_HOUR",
@@ -1000,4 +1081,5 @@ __all__ = [
     "peer_stop_policy_refusal",
     "peer_stop_request",
     "peer_stop_target_identity",
+    "resolve_peer_stop_circuit_policy",
 ]

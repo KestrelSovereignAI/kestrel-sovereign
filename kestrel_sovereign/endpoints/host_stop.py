@@ -27,12 +27,19 @@ from kestrel_sovereign.rate_limit import (
 from kestrel_sovereign.stop import (
     MAX_STOP_CORRELATION_ID_BYTES,
     CooperativeStopTarget,
+    PeerStopCircuitError,
+    PeerStopCircuitStore,
     StopCleanupRegistry,
     StopReceiptError,
     StopReceiptRecord,
     UnavailableStopReceiptStore,
     execute_fleet_stop,
     fleet_in_flight_count,
+)
+from kestrel_sovereign.stop.circuit import (
+    MAX_CIRCUIT_EVENT_PAGE,
+    MAX_CIRCUIT_REASON_LENGTH,
+    MAX_CIRCUIT_TARGET_LENGTH,
 )
 from kestrel_sovereign.stop.runtime_target import build_runtime_stop_target
 
@@ -71,6 +78,49 @@ class HostStopBody(BaseModel):
         if len(encoded) > MAX_STOP_CORRELATION_ID_BYTES:
             raise ValueError("correlation_id exceeds its UTF-8 byte limit")
         return value
+
+
+class PeerStopCircuitResetBody(BaseModel):
+    """Sovereign reset of one target's peer Stop circuit (#3170)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: Annotated[str, Field(min_length=1, max_length=MAX_CIRCUIT_TARGET_LENGTH)]
+    reason: Annotated[str, Field(min_length=1, max_length=MAX_CIRCUIT_REASON_LENGTH)]
+
+    @field_validator("target", "reason")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must contain non-whitespace text")
+        return value
+
+
+def _peer_stop_circuit(request: Request) -> PeerStopCircuitStore | None:
+    circuit = getattr(request.app.state, "peer_stop_circuit", None)
+    return circuit if isinstance(circuit, PeerStopCircuitStore) else None
+
+
+async def _peer_stop_circuit_status(request: Request) -> dict:
+    """The open peer Stop circuits a sovereign must see (#3170).
+
+    An unreadable breaker is reported as unavailable, never as "no circuit is
+    open": the console would otherwise hide the one warning it exists for.
+    """
+
+    circuit = _peer_stop_circuit(request)
+    if circuit is None:
+        return {"available": False, "open": []}
+    try:
+        open_circuits = await circuit.open_circuits()
+    except PeerStopCircuitError:
+        return {"available": False, "open": []}
+    return {
+        "available": True,
+        "threshold": circuit.policy.threshold,
+        "window_seconds": circuit.policy.window_seconds,
+        "open": [entry.to_dict() for entry in open_circuits],
+    }
 
 
 def _caller_can_stop_host(request: Request) -> bool:
@@ -164,10 +214,87 @@ async def host_stop_status(request: Request, response: Response):
             code="host_stop_inventory_unavailable",
             message="Host Stop target inventory is unavailable.",
         ) from error
-    return {
-        "can_stop": _caller_can_stop_host(request),
+    can_stop = _caller_can_stop_host(request)
+    payload = {
+        "can_stop": can_stop,
         "in_flight_count": in_flight_count,
     }
+    if can_stop:
+        # Target DIDs and counts are host control-plane evidence: only the
+        # sovereign, who alone may reset a circuit, is shown them.
+        payload["peer_stop_circuit"] = await _peer_stop_circuit_status(request)
+    return payload
+
+
+@router.post("/stop/circuit/reset")
+async def reset_peer_stop_circuit(
+    request: Request,
+    response: Response,
+    body: PeerStopCircuitResetBody,
+):
+    """Close one target's peer Stop circuit and discard its count.
+
+    Sovereign-only and receipted: the ``reset`` event names the actor and the
+    reason.  It never touches operator Stop, and it neither sets nor releases
+    a Hold.
+    """
+
+    actor_id = sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    circuit = _peer_stop_circuit(request)
+    if circuit is None:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        )
+    try:
+        event = await circuit.reset(
+            body.target, actor_id=actor_id, reason=body.reason
+        )
+    except PeerStopCircuitError as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        ) from error
+    return {"event": event.to_dict()}
+
+
+@router.get("/stop/circuit/events")
+async def peer_stop_circuit_events(
+    request: Request,
+    response: Response,
+    target: str | None = None,
+    limit: str | None = None,
+):
+    """Receipted peer Stop circuit transitions, newest first; sovereign-only."""
+
+    sovereign_actor_id(request)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie, X-API-Key"
+    target_filter = bounded_filter_text(
+        target, "target", max_length=MAX_CIRCUIT_TARGET_LENGTH
+    )
+    page_size = min(resolve_page_size(limit), MAX_CIRCUIT_EVENT_PAGE)
+    circuit = _peer_stop_circuit(request)
+    if circuit is None:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        )
+    try:
+        events = await circuit.list_events(
+            target_agent_id=target_filter, limit=page_size
+        )
+    except PeerStopCircuitError as error:
+        raise ApiHTTPException(
+            status_code=503,
+            code="peer_stop_circuit_unavailable",
+            message="Peer Stop circuit breaker is unavailable.",
+        ) from error
+    return {"events": [event.to_dict() for event in events]}
 
 
 @router.post("/stop")
@@ -236,6 +363,7 @@ def _stop_receipt_payload(record: StopReceiptRecord) -> dict:
         "feed_seq": record.feed_seq,
         "receipt_id": record.receipt_id,
         "scope": record.scope,
+        "door": record.door,
         "actor_id": record.actor_id,
         "target_agent_id": disclosable_identity(record.target_agent_id),
         "reason": record.reason,
@@ -327,8 +455,11 @@ async def host_stop_receipts(
 
 __all__ = [
     "HostStopBody",
+    "PeerStopCircuitResetBody",
     "host_stop_receipts",
     "host_stop_status",
+    "peer_stop_circuit_events",
+    "reset_peer_stop_circuit",
     "router",
     "stop_host",
 ]

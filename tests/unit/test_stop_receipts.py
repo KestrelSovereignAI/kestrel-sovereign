@@ -18,10 +18,11 @@ from kestrel_sovereign.stop import (
     DistributedStopTicket,
     StopCleanupRegistry,
     StopDisposition,
+    StopDoor,
     StopOutcome,
+    StopReceipt,
     StopReceiptConflict,
     StopReceiptCorruptError,
-    StopReceipt,
     StopReceiptStore,
     StopRequest,
     StopScope,
@@ -40,7 +41,7 @@ class _EndpointReplayStore:
         assert request == self.request
         return self.receipt
 
-    async def persist(self, request, outcomes):
+    async def persist(self, request, outcomes, **_kwargs):
         receipt_id = f"receipt-{request.correlation_id}"
         self.request = request
         self.receipt = StopReceipt(
@@ -114,7 +115,7 @@ async def test_receipt_store_roundtrips_exact_evidence_on_available_backends(
         trace_id="0123456789abcdef0123456789abcdef",
     )
 
-    receipt = await store.persist(request, _outcomes(request))
+    receipt = await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
     replay = await store.load(request)
 
     assert replay == receipt
@@ -150,7 +151,7 @@ async def test_operation_binding_is_first_sight_on_available_backends(db_backend
         await store.claim(changed)
 
     claim = await store.claim(first)
-    receipt = await store.persist(first, _outcomes(first), claim_id=claim.claim_id)
+    receipt = await store.persist(first, _outcomes(first), claim_id=claim.claim_id, door=StopDoor.AGENT)
     assert await store.load(first) == receipt
     # Only the fingerprint is stored, under the blinded operation identity.
     rows = await db.fetchall(
@@ -177,10 +178,11 @@ async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path):
             target="turn-unreachable",
             turn_id="turn-unreachable",
         )
-        await store.persist(acknowledged, _outcomes(acknowledged))
+        await store.persist(acknowledged, _outcomes(acknowledged), door=StopDoor.AGENT)
         await store.persist(
             unreachable,
             _outcomes(unreachable, StopDisposition.UNREACHABLE),
+            door=StopDoor.AGENT,
         )
 
         assert await store.has_acknowledged_turn_stop(
@@ -224,6 +226,7 @@ async def test_opaque_stop_identities_are_blinded_in_claims_and_receipts(tmp_pat
             request,
             _outcomes(request),
             claim_id=claim.claim_id,
+            door=StopDoor.AGENT,
         )
         header = await db.fetchone(
             "SELECT operation_id, requested_target, turn_id "
@@ -273,7 +276,7 @@ async def test_public_turn_receipt_blinds_remapped_private_request_id(tmp_path):
             resolved_target=private_request_id,
         )
 
-        receipt = await store.persist(request, (outcome,))
+        receipt = await store.persist(request, (outcome,), door=StopDoor.AGENT)
         rows = await db.fetchall(
             "SELECT resolved_target, agent_id FROM stop_receipt_outcomes "
             "WHERE receipt_id = ?",
@@ -297,7 +300,7 @@ async def test_receipt_survives_sqlite_connection_restart(tmp_path):
     first = StopReceiptStore(first_db)
     await first.ensure_schema()
     request = _request()
-    written = await first.persist(request, _outcomes(request))
+    written = await first.persist(request, _outcomes(request), door=StopDoor.AGENT)
     await first_db.close()
 
     second_db = await AsyncDatabase.sqlite(str(path))
@@ -348,6 +351,7 @@ async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=first_store,
         descendant_resolver=resolve,
+        door=StopDoor.AGENT,
     )
     written = await first_authority.stop(request)
     assert [outcome.resolved_target for outcome in written] == [
@@ -380,6 +384,7 @@ async def test_cascade_persists_one_ordered_outcome_per_target_across_restart(
             cleanup_registry=StopCleanupRegistry(),
             receipt_store=second_store,
             descendant_resolver=descendants,
+            door=StopDoor.AGENT,
         ).stop(request)
 
         assert replay == written
@@ -398,11 +403,12 @@ async def test_exact_replay_preserves_original_durable_outcome(tmp_path):
         store = StopReceiptStore(db)
         await store.ensure_schema()
         request = _request()
-        original = await store.persist(request, _outcomes(request))
+        original = await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
 
         replay = await store.persist(
             request,
             _outcomes(request, StopDisposition.ALREADY_COMPLETE),
+            door=StopDoor.AGENT,
         )
 
         assert replay == original
@@ -415,12 +421,13 @@ async def test_exact_replay_preserves_original_durable_outcome(tmp_path):
 async def test_exact_replay_does_not_depend_on_changed_live_inventory():
     request = _request()
     store = _EndpointReplayStore()
-    receipt = await store.persist(request, _outcomes(request))
+    receipt = await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
     inventory = MagicMock(side_effect=AssertionError("inventory is no longer live"))
     authority = CancellationAuthority(
         inventory,
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=store,
+        door=StopDoor.AGENT,
     )
 
     replay = await authority.stop(request)
@@ -442,7 +449,7 @@ async def test_exact_retry_preserves_first_transport_trace_evidence(tmp_path):
             span_id="1111111111111111",
             trace_id="11111111111111111111111111111111",
         )
-        written = await store.persist(first, _outcomes(first))
+        written = await store.persist(first, _outcomes(first), door=StopDoor.AGENT)
         retry = _request(
             correlation_id=first.correlation_id,
             span_id="2222222222222222",
@@ -481,13 +488,14 @@ async def test_request_id_retry_replays_after_inferred_turn_index_is_gone(tmp_pa
             turn_id="turn-visible-while-live",
             target_is_turn_id=False,
         )
-        written = await store.persist(first, _outcomes(first))
+        written = await store.persist(first, _outcomes(first), door=StopDoor.AGENT)
         retry = replace(first, turn_id=None)
 
         loaded = await store.load(retry)
         replayed = await store.persist(
             retry,
             _outcomes(retry, StopDisposition.ALREADY_COMPLETE),
+            door=StopDoor.AGENT,
         )
 
         assert loaded is not None
@@ -509,7 +517,7 @@ async def test_operation_reuse_for_different_request_fails_closed(tmp_path):
         await store.ensure_schema()
         operation = f"stop-{uuid4()}"
         first = _request(correlation_id=operation)
-        await store.persist(first, _outcomes(first))
+        await store.persist(first, _outcomes(first), door=StopDoor.AGENT)
         conflicting = _request(
             correlation_id=operation,
             reason="different operation",
@@ -543,7 +551,7 @@ async def test_request_fingerprint_cannot_bless_a_corrupt_receipt_header(tmp_pat
         store = StopReceiptStore(db)
         await store.ensure_schema()
         request = _request()
-        receipt = await store.persist(request, _outcomes(request))
+        receipt = await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
         await db.execute(
             "UPDATE stop_receipts SET actor_id = ? WHERE receipt_id = ?",
             ("did:test:forged", receipt.receipt_id),
@@ -702,8 +710,8 @@ async def test_concurrent_exact_writers_return_one_receipt(tmp_path):
         await first.ensure_schema()
         request = _request()
         one, two = await asyncio.gather(
-            first.persist(request, _outcomes(request)),
-            second.persist(request, _outcomes(request)),
+            first.persist(request, _outcomes(request), door=StopDoor.AGENT),
+            second.persist(request, _outcomes(request), door=StopDoor.AGENT),
         )
 
         assert one.receipt_id == two.receipt_id
@@ -750,7 +758,7 @@ async def test_partial_host_fanout_persists_every_exact_target_outcome(tmp_path)
             )
         )
 
-        written = await store.persist(request, outcomes)
+        written = await store.persist(request, outcomes, door=StopDoor.AGENT)
         replay = await store.load(request)
 
         assert replay == written
@@ -789,7 +797,7 @@ async def test_host_receipt_rejects_empty_ambiguous_fanout(tmp_path):
         )
 
         with pytest.raises(ValueError, match="at least one target outcome"):
-            await store.persist(request, ())
+            await store.persist(request, (), door=StopDoor.AGENT)
     finally:
         await db.close()
 
@@ -846,7 +854,7 @@ class _FailingStore:
             raise RuntimeError("store unavailable")
         return None
 
-    async def persist(self, _request, _outcomes):
+    async def persist(self, _request, _outcomes, **_kwargs):
         if self.fail_persist:
             raise RuntimeError("write unavailable")
         raise AssertionError("test store expected to fail")
@@ -867,6 +875,7 @@ async def test_unreadable_receipt_store_prevents_cancellation():
         ),
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=_FailingStore(fail_load=True),
+        door=StopDoor.AGENT,
     )
 
     outcomes = await authority.stop(request)
@@ -903,6 +912,7 @@ async def test_failed_receipt_write_never_reports_unwitnessed_stop(
         ),
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=_FailingStore(fail_persist=True),
+        door=StopDoor.AGENT,
     )
 
     outcomes = await authority.stop(request)
@@ -946,6 +956,7 @@ async def test_operation_claim_precedes_concurrent_target_side_effect(tmp_path):
                 ),
                 cleanup_registry=StopCleanupRegistry(),
                 receipt_store=store,
+                door=StopDoor.AGENT,
             )
 
         first = asyncio.create_task(authority().stop(request))
@@ -992,6 +1003,7 @@ async def test_cancelled_caller_cannot_split_effect_from_receipt(tmp_path):
             ),
             cleanup_registry=StopCleanupRegistry(),
             receipt_store=store,
+            door=StopDoor.AGENT,
         )
         operation = asyncio.create_task(authority.stop(request))
         await started.wait()
@@ -1050,6 +1062,7 @@ async def test_cancelled_caller_cannot_split_claim_from_effect(tmp_path):
                 ),
                 cleanup_registry=StopCleanupRegistry(),
                 receipt_store=DelayedClaimStore(),
+                door=StopDoor.AGENT,
             )
 
         operation = asyncio.create_task(authority().stop(request))
@@ -1086,7 +1099,7 @@ async def test_acknowledged_stop_preserves_whitespace_only_request_id(tmp_path):
         correlation_id="opaque-stop-operation",
     )
     try:
-        await store.persist(request, _outcomes(request))
+        await store.persist(request, _outcomes(request), door=StopDoor.AGENT)
         assert await store.has_acknowledged_turn_stop(
             "did:test:opaque-agent", " "
         )
@@ -1523,7 +1536,7 @@ def test_live_endpoint_bounds_durable_admissions_per_authenticated_caller():
         async def load(self, _request):
             return None
 
-        async def persist(self, request, outcomes):
+        async def persist(self, request, outcomes, **_kwargs):
             receipt_id = f"receipt-{request.correlation_id}"
             return StopReceipt(
                 receipt_id=receipt_id,

@@ -23,6 +23,7 @@ from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
     StopDisposition,
+    StopDoor,
     StopOutcome,
     StopReceiptStore,
     StopRequest,
@@ -1743,6 +1744,7 @@ async def test_public_turn_receipt_does_not_fence_same_named_request_id(tmp_path
                     correlation_id=request.correlation_id,
                 ),
             ),
+            door=StopDoor.AGENT,
         )
 
         assert await store.register(
@@ -2002,6 +2004,7 @@ async def test_acknowledged_receipt_fences_direct_non_http_invocation(tmp_path):
                 correlation_id=request.correlation_id,
             ),
         ),
+        door=StopDoor.AGENT,
     )
     agent = _ReplicaAgent("did:test:shared-agent")
     replica_a.attach(agent)

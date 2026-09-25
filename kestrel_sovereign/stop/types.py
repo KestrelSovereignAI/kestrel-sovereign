@@ -25,6 +25,23 @@ class StopScope(str, Enum):
     TOOL_CALL = "tool_call"
 
 
+class StopDoor(str, Enum):
+    """Which door a durable Stop receipt was written through (#3170).
+
+    Provenance, not authority: it records how a Stop reached the
+    :class:`~kestrel_sovereign.stop.CancellationAuthority` so the fleet
+    circuit breaker can tell a peer's Stop from the operator's.
+
+    * ``peer`` -- the ``a2a.peer_stop`` signal rail (#3169);
+    * ``agent`` -- the operator/local ``POST /api/agent/stop`` door;
+    * ``host`` -- the sovereign ``POST /api/host/stop`` fan-out.
+    """
+
+    PEER = "peer"
+    AGENT = "agent"
+    HOST = "host"
+
+
 class StopDisposition(str, Enum):
     """One resolved target's truthful terminal Stop result."""
 
