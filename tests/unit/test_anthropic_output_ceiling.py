@@ -441,7 +441,62 @@ async def test_tool_stream_cut_drops_the_incomplete_trailing_tool_call():
     assert [tc.id for tc in final.tool_calls] == ["call_1"]
     assert final.tool_calls[0].arguments == {"path": "a.py"}
     assert final.content == NOTICE
-    assert [i.id for i in items if isinstance(i, ToolCallStarted)] == ["call_1", "call_2"]
+    # The cut call is never announced: only the whole one gets a marker.
+    assert [i.id for i in items if isinstance(i, ToolCallStarted)] == ["call_1"]
+
+
+def _prose_then_cut_tool_events(prose: str) -> List[Any]:
+    return [
+        _ev("content_block_start", index=0, content_block=SimpleNamespace(type="text")),
+        _ev("content_block_delta", index=0, delta=SimpleNamespace(type="text_delta", text=prose)),
+        _ev("content_block_stop", index=0),
+        _ev("content_block_start", index=1, content_block=SimpleNamespace(
+            type="tool_use", id="call_cut", name="shell")),
+        _ev("content_block_delta", index=1, delta=SimpleNamespace(
+            type="input_json_delta", partial_json='{"command": "rm -rf /tmp/wo')),
+        _ev("content_block_stop", index=1),
+        _ev("message_delta", delta=SimpleNamespace(stop_reason="max_tokens"),
+            usage=SimpleNamespace(output_tokens=128_000)),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_prose_then_cut_tool_never_signals_the_dropped_call():
+    """prose → tool_use start → max_tokens cut: no ToolCallStarted is
+    yielded for a call that is then dropped, and what streamed equals the
+    terminal response (prose + notice), with no tool calls."""
+    items = await _collect(AnthropicAdapter().get_streaming_response_with_tools(
+        client=_streaming_client(_prose_then_cut_tool_events("Let me check the repo.")),
+        model="claude-opus-5", messages=USER,
+        tools=[{"type": "function", "function": {"name": "shell"}}],
+    ))
+    assert not any(isinstance(i, ToolCallStarted) for i in items)
+    streamed = "".join(i for i in items if isinstance(i, str))
+    final = items[-1]
+    assert streamed == f"Let me check the repo.\n\n{NOTICE}"
+    assert final.content == streamed
+    assert final.tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_whole_trailing_tool_call_is_still_announced():
+    """The held marker is released when the stream ends on tool_use — a
+    finished call is announced, after the prose, before the terminal
+    response."""
+    events = _prose_then_cut_tool_events("Let me check the repo.")
+    events[4] = _ev("content_block_delta", index=1, delta=SimpleNamespace(
+        type="input_json_delta", partial_json='{"command": "ls"}'))
+    events[6] = _ev("message_delta", delta=SimpleNamespace(stop_reason="tool_use"),
+                    usage=SimpleNamespace(output_tokens=20))
+    items = await _collect(AnthropicAdapter().get_streaming_response_with_tools(
+        client=_streaming_client(events), model="claude-opus-5", messages=USER,
+        tools=[{"type": "function", "function": {"name": "shell"}}],
+    ))
+    kinds = [type(i).__name__ for i in items]
+    assert kinds == ["str", "ToolCallStarted", "LLMResponse"]
+    assert items[1].id == "call_cut"
+    assert [tc.id for tc in items[-1].tool_calls] == ["call_cut"]
+    assert items[-1].content == "Let me check the repo."
 
 
 @pytest.mark.asyncio
@@ -607,3 +662,106 @@ async def test_real_sdk_finished_response_is_untouched():
     )
     assert response.content == "Done."
     assert response_stop_reason(response) == "end_turn"
+
+
+# ---------------------------------------------------------------------------
+# End to end through the agent's streaming turn: live == persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streamed_turn_cut_on_a_tool_call_persists_what_was_shown():
+    """prose → tool_use start → max_tokens cut, driven through the real
+    ``StreamingMixin`` turn with the real adapter's output. The client sees
+    the prose and the notice with no revise signal for the dropped call,
+    and the persisted assistant row is exactly that text."""
+    from contextlib import asynccontextmanager
+
+    from kestrel_sovereign.agent.streaming import (
+        StreamingMixin,
+        _parse_stream_sentinels,
+    )
+
+    @asynccontextmanager
+    async def _passthrough():
+        yield
+
+    persisted: List[Dict[str, Any]] = []
+    privacy_agent = MagicMock()
+    privacy_agent.add_conversation = AsyncMock(
+        side_effect=lambda role, content, **kw: persisted.append(
+            {"role": role, "content": content, **kw}
+        )
+    )
+    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
+    privacy_agent.privacy_mode.name = "normal"
+    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
+
+    agent = MagicMock()
+    agent.privacy_agent = privacy_agent
+    agent.features = {}
+    agent.did = "test-did"
+    agent.extension = None
+    agent._cached_features_prompt = ""
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    agent.emit_event = AsyncMock()
+    agent._maybe_audit = AsyncMock()
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
+    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
+    agent.hooks_manager = None
+    agent.operator_signal_producer = None
+    agent._get_governing_constitution = AsyncMock(return_value="")
+    agent.check_solvency = AsyncMock(return_value="claude-opus-5")
+    agent._build_all_tools = MagicMock(return_value=[])
+    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
+    agent.user_prompt_template = MagicMock()
+    agent.user_prompt_template.format.return_value = "rendered prompt"
+    context_result = MagicMock()
+    context_result.system_prompt = "system"
+    context_result.dynamic_user_context = "ctx"
+    context_result.messages = []
+    context_result.semantic_recall_dependencies = ()
+    agent.context_manager = MagicMock()
+    agent.context_manager.build_context = AsyncMock(return_value=context_result)
+    agent.observability_store = MagicMock()
+    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
+    agent.observability_store.log_tool_response = AsyncMock()
+    agent.observability_store.log_metric = AsyncMock()
+    agent._emit_revising_event = AsyncMock()
+
+    adapter = AnthropicAdapter()
+
+    async def stream_with_tool_detection(**_kwargs):
+        async for item in adapter.get_streaming_response_with_tools(
+            client=_streaming_client(_prose_then_cut_tool_events("Let me check the repo.")),
+            model="claude-opus-5", messages=USER,
+            tools=[{"type": "function", "function": {"name": "shell"}}],
+        ):
+            yield item
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream_with_tool_detection
+    agent._handle_orchestrator_response_streaming = MagicMock(
+        side_effect=AssertionError("a dropped tool call must not be dispatched"),
+    )
+    for name in (
+        "process_input_streaming",
+        "_process_input_streaming_traced_locked",
+        "_persist_assistant_turn_safely",
+    ):
+        setattr(agent, name, getattr(StreamingMixin, name).__get__(agent))
+
+    live = [chunk async for chunk in agent.process_input_streaming(
+        "answer the design questions", session_id="sess-1",
+    )]
+
+    wire = "".join(c for c in live if isinstance(c, str))
+    assert "\x1eKESTREL:REVISE:" not in wire
+    agent._emit_revising_event.assert_not_awaited()
+    shown = _parse_stream_sentinels(wire)[0]
+    assert shown == f"Let me check the repo.\n\n{NOTICE}"
+
+    rows = [row for row in persisted if row["role"] == "assistant"]
+    assert len(rows) == 1
+    assert rows[0]["content"] == shown

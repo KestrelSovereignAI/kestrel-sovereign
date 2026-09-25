@@ -1553,6 +1553,7 @@ class AnthropicAdapter(LLMAdapter):
             stop_reason = None
             last_block_index: Optional[int] = None
             last_block_type: Optional[str] = None
+            pending_tool_marker: Optional[ToolCallStarted] = None
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
@@ -1616,6 +1617,12 @@ class AnthropicAdapter(LLMAdapter):
                         if hasattr(event, 'content_block'):
                             block = event.content_block
                             block_index = getattr(event, 'index', 0)
+                            # A new block means the previous one ended
+                            # whole — a max_tokens cut can only fall in the
+                            # LAST block — so its held marker is now true.
+                            if pending_tool_marker is not None:
+                                yield pending_tool_marker
+                                pending_tool_marker = None
                             last_block_index = block_index
                             last_block_type = block.type
 
@@ -1628,7 +1635,7 @@ class AnthropicAdapter(LLMAdapter):
                                 }
                                 current_tool_block_index = block_index
 
-                                # Emit the SDK 0.7.0 ToolCallStarted marker.
+                                # The SDK 0.7.0 ToolCallStarted marker.
                                 # Anthropic populates both ``id`` and ``name``
                                 # at content_block_start, so we surface them
                                 # in the marker — the constitutional honesty
@@ -1639,7 +1646,17 @@ class AnthropicAdapter(LLMAdapter):
                                 # care about user-visible tool calls only
                                 # can filter by name (the framework knows
                                 # the structured-output sentinel name).
-                                yield ToolCallStarted(
+                                #
+                                # #3300: held until the block is known to be
+                                # whole — the next block starting, or the
+                                # stream ending on anything but max_tokens.
+                                # A call cut at max_tokens is dropped below;
+                                # announcing it first would tell consumers a
+                                # tool call is coming that never arrives.
+                                # Nothing visible streams while a tool
+                                # block's arguments do, so holding the marker
+                                # moves no prose across it.
+                                pending_tool_marker = ToolCallStarted(
                                     index=block_index,
                                     id=block.id,
                                     name=block.name,
@@ -1685,6 +1702,15 @@ class AnthropicAdapter(LLMAdapter):
                 if isinstance(item, str):
                     text_content += item
                 yield item
+
+            # #3300: a marker still held belongs to the LAST block. It is
+            # announced unless max_tokens cut that block — then the call is
+            # dropped just below and never announced.
+            if (
+                pending_tool_marker is not None
+                and stop_reason != _MAX_TOKENS_STOP_REASON
+            ):
+                yield pending_tool_marker
 
             # #3300: a max_tokens stop cut the last block the stream opened.
             # When that block is a tool call its arguments are incomplete, so
