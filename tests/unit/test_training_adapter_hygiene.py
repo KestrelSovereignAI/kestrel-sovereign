@@ -36,6 +36,9 @@ def _runpod_manager(session):
     async def never_submits(**_kwargs):
         await asyncio.Event().wait()
 
+    # The pod as RunPod reports it after the release: the adapter reads it back.
+    released_state = "EXITED" if session.profile.persistent_pod_id else "TERMINATED"
+
     return SimpleNamespace(
         _session=None,
         _lock=asyncio.Lock(),
@@ -47,6 +50,9 @@ def _runpod_manager(session):
         provider=SimpleNamespace(
             stop_pod=Mock(return_value={"id": session.pod_id}),
             terminate_pod=Mock(return_value=None),
+            get_status=Mock(
+                return_value={"id": session.pod_id, "desiredStatus": released_state}
+            ),
         ),
     )
 
@@ -64,6 +70,7 @@ async def test_runpod_cleanup_pauses_the_managers_current_persistent_pod():
     manager.stop_session.assert_awaited_once_with()
     manager.terminate_session.assert_not_awaited()
     manager.provider.terminate_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
     assert job.job_id not in adapter._active_jobs
 
 
@@ -81,6 +88,7 @@ async def test_runpod_cleanup_pauses_a_persistent_pod_the_manager_no_longer_hold
     manager.terminate_session.assert_not_awaited()
     manager.provider.stop_pod.assert_called_once_with("pod-123")
     manager.provider.terminate_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
     assert job.job_id not in adapter._active_jobs
 
 
@@ -96,6 +104,7 @@ async def test_runpod_cleanup_terminates_on_demand_pod():
 
     manager.provider.terminate_pod.assert_called_once_with("pod-123")
     manager.provider.stop_pod.assert_not_called()
+    manager.provider.get_status.assert_called_once_with("pod-123")
     manager.stop_session.assert_not_awaited()
     manager.terminate_session.assert_not_awaited()
     assert manager._session is None

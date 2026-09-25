@@ -55,6 +55,7 @@ from kestrel_sovereign.features.training.protocol import (
 from kestrel_sovereign.features.training.types import TrainingConfig, TrainingState
 
 
+_UNSET = object()
 _FAST = SessionLifecycleTimeouts(submission_drain=0.5, release=0.5, close=2.0)
 _ids = itertools.count(1)
 _remotes: list[FakeRemote] = []
@@ -227,21 +228,74 @@ async def _swallowing_terminate(remote: FakeRemote, session) -> None:
         logging.getLogger(__name__).exception("terminate failed (swallowed)")
 
 
+class FakeRunPodNotFound(Exception):
+    """kestrel-cloud-runpod's ``RunPodAPIError`` for a pod that no longer exists."""
+
+    status_code = 404
+
+
+class FakeManagedNotFound(Exception):
+    """``ManagedRunPodProvider``'s ``raise_for_status()`` error: the 404 is on its response."""
+
+    def __init__(self, pod_id):
+        super().__init__(f"404 Client Error for pod {pod_id}")
+        self.response = SimpleNamespace(status_code=404)
+
+
 class FakeRunPodProvider:
-    """``DirectRunPodProvider``: raw SDK calls that raise on failure."""
+    """``DirectRunPodProvider``: raw SDK calls that raise on an HTTP error.
+
+    Like the real provider, a successful action reports the target state
+    whether or not the pod reached it; only ``get_status`` observes the pod.
+    """
 
     def __init__(self, remote: FakeRemote):
         self.remote = remote
         self.pod_calls: list[tuple[str, str]] = []  # ("stop"|"terminate", pod id)
+        self.pod_states: dict[str, str] = {}  # observed status once acted on
+        # The action returns without the pod changing state.
+        self.action_takes_effect = True
+        # Overrides the action's return value (e.g. an error payload, or None).
+        self.action_response: object = _UNSET
+        # A terminated pod is gone: ``get_status`` answers 404.
+        self.terminated_pods_vanish = False
+        # Pods deleted out of band: every call about them raises this error.
+        self.vanished: dict[str, Exception] = {}
+        # ``get_status`` fails with this error (e.g. an outage).
+        self.status_error: Exception | None = None
+
+    def vanish(self, pod_id: str, error: Exception) -> None:
+        self.remote.session_where(pod_id=pod_id).state = "deleted"
+        self.vanished[pod_id] = error
+
+    def _act(self, action: str, pod_id: str, state: str, response: dict):
+        self.pod_calls.append((action, pod_id))
+        if pod_id in self.vanished:
+            raise self.vanished[pod_id]
+        if self.action_takes_effect:
+            self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
+            self.pod_states[pod_id] = state
+        return response if self.action_response is _UNSET else self.action_response
 
     def stop_pod(self, pod_id):
-        self.pod_calls.append(("stop", pod_id))
-        self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
-        return {"id": pod_id, "desiredStatus": "EXITED"}
+        return self._act("stop", pod_id, "EXITED", {"id": pod_id, "status": "EXITED"})
 
     def terminate_pod(self, pod_id):
-        self.pod_calls.append(("terminate", pod_id))
-        self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
+        return self._act(
+            "terminate", pod_id, "TERMINATED", {"id": pod_id, "status": "TERMINATED"}
+        )
+
+    def get_status(self, pod_id):
+        if self.status_error is not None:
+            raise self.status_error
+        if pod_id in self.vanished:
+            raise self.vanished[pod_id]
+        state = self.pod_states.get(pod_id)
+        if state == "TERMINATED" and self.terminated_pods_vanish:
+            raise FakeRunPodNotFound(f"pod {pod_id} not found")
+        if self.remote.session_where(pod_id=pod_id).state == "running":
+            state = "RUNNING"
+        return {"id": pod_id, "desiredStatus": state}
 
 
 class FakeManagedRunPodProvider:
@@ -255,6 +309,10 @@ class FakeManagedRunPodProvider:
         self.pod_calls.append(("stop", pod_id))
         self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
         return {"id": pod_id, "desiredStatus": "EXITED"}
+
+    def get_status(self, pod_id):
+        running = self.remote.session_where(pod_id=pod_id).state == "running"
+        return {"id": pod_id, "desiredStatus": "RUNNING" if running else "EXITED"}
 
 
 class FakeRunPodManager:
@@ -285,9 +343,13 @@ class FakeRunPodManager:
         return await self.remote.cancel_job(session, job_id)
 
     async def stop_session(self):
-        # Like the real manager: forget the pod, then let a failed stop raise.
-        session, self._session = self._session, None
+        # Like the real (v2) manager: a failed stop raises and the manager
+        # keeps the pod; only a stop that returns makes it forget it.
+        session = self._session
         await asyncio.to_thread(self.provider.stop_pod, session.pod_id)
+        async with self._lock:
+            if self._session is session:
+                self._session = None
 
     async def terminate_session(self, session):
         await _swallowing_terminate(self.remote, session)
@@ -1188,6 +1250,197 @@ async def test_runpod_failed_terminate_keeps_the_managers_session(loop_errors):
     remote.release_error = None
     assert await adapter.cancel(job.job_id) is True
     assert manager._session is None
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def _start_runpod_release(monkeypatch, release_kind: str):
+    """A RunPod job whose release is a terminate or one of the two pause paths."""
+    if release_kind == "terminate":
+        remote = FakeRemote()
+    else:
+        monkeypatch.setenv("TEST_RUNPOD_PERSISTENT_POD", "pod-persistent")
+        remote = FakeRemote(persistent_pod_id="${TEST_RUNPOD_PERSISTENT_POD}")
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter, "companion-1")
+    others = []
+    if release_kind == "pause_other":
+        # Not the manager's current pod: the pause goes to provider.stop_pod.
+        others.append(await _start(adapter, "companion-2"))
+    return remote, adapter, manager, job, others
+
+
+@pytest.mark.parametrize("release", ["cancel", "cleanup"])
+@pytest.mark.parametrize(
+    "action_response",
+    [{"errors": [{"message": "pod action rejected"}]}, None],
+    ids=["error-payload", "none"],
+)
+@pytest.mark.parametrize("release_kind", ["terminate", "pause_current", "pause_other"])
+async def test_runpod_release_is_confirmed_by_the_observed_pod_state(
+    release_kind, action_response, release, monkeypatch, loop_errors
+):
+    """A stop/terminate call that returns is not proof the pod stopped billing.
+
+    The provider answers with an error payload (or nothing) without raising,
+    and the pod stays RUNNING. The release must fail and keep custody, so a
+    later release can retry.
+    """
+
+    remote, adapter, manager, job, others = await _start_runpod_release(
+        monkeypatch, release_kind
+    )
+    record = adapter._active_jobs[job.job_id]
+    manager.provider.action_takes_effect = False
+    manager.provider.action_response = action_response
+
+    if release == "cancel":
+        assert await adapter.cancel(job.job_id) is False
+    else:
+        await adapter.cleanup(job.job_id)
+
+    action = "terminate" if release_kind == "terminate" else "stop"
+    assert manager.provider.pod_calls == [(action, record.session.pod_id)]
+    assert adapter._active_jobs[job.job_id] is record
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert "did not confirm" in record.error
+    assert record.session.state == "running"
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.RELEASE_FAILED
+    assert not status.state.is_terminal()
+    if release_kind == "terminate":
+        assert manager._session is record.session  # not handed on as destroyed
+
+    manager.provider.action_takes_effect = True
+    manager.provider.action_response = _UNSET
+    assert await adapter.cancel(job.job_id) is True
+    assert job.job_id not in adapter._active_jobs
+    for other in others:
+        await adapter.cancel(other.job_id)
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_stopped_on_demand_pod_is_not_a_terminate(loop_errors):
+    """A terminate that leaves the pod EXITED still bills its disk: keep custody."""
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter)
+    record = adapter._active_jobs[job.job_id]
+    # Stopped, not terminated: no GPU billing, but the pod and its disk remain.
+    record.session.state = "released"
+    manager.provider.pod_states[record.session.pod_id] = "EXITED"
+    manager.provider.action_takes_effect = False
+
+    assert await adapter.cancel(job.job_id) is False
+
+    assert manager.provider.pod_calls == [("terminate", record.session.pod_id)]
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert "'EXITED'" in record.error
+    assert adapter._active_jobs[job.job_id] is record
+
+    manager.provider.action_takes_effect = True
+    assert await adapter.cancel(job.job_id) is True
+    assert manager.provider.get_status(record.session.pod_id)["desiredStatus"] == (
+        "TERMINATED"
+    )
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_release_without_a_status_read_is_retained(loop_errors):
+    """A provider that cannot read the pod back cannot prove the release."""
+
+    class _NoStatusProvider(FakeRunPodProvider):
+        get_status = None
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter)
+    record = adapter._active_jobs[job.job_id]
+    direct_provider = manager.provider
+    manager.provider = _NoStatusProvider(remote)
+
+    assert await adapter.cancel(job.job_id) is False
+
+    assert "cannot confirm pod" in record.error
+    assert adapter._active_jobs[job.job_id] is record
+    manager.provider = direct_provider
+    assert await adapter.cancel(job.job_id) is True
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_pod_that_no_longer_exists_is_released(loop_errors):
+    """A terminated pod RunPod answers 404 for, on read-back or on a retry."""
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
+    manager.provider.terminated_pods_vanish = True
+    first = await _start(adapter, "companion-1")
+    assert await adapter.cancel(first.job_id) is True
+
+    # A retry whose earlier terminate took effect: the action itself 404s.
+    second = await _start(adapter, "companion-2")
+    session = adapter._active_jobs[second.job_id].session
+    session.state = "released"
+    manager.provider.pod_states[session.pod_id] = "TERMINATED"
+
+    def _gone(_pod_id):
+        raise FakeRunPodNotFound(_pod_id)
+
+    manager.provider.terminate_pod = _gone
+    assert await adapter.cancel(second.job_id) is True
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize(
+    "not_found", [FakeRunPodNotFound, FakeManagedNotFound], ids=["direct", "managed"]
+)
+@pytest.mark.parametrize("release_kind", ["terminate", "pause_current", "pause_other"])
+async def test_runpod_pod_deleted_out_of_band_is_released(
+    release_kind, not_found, monkeypatch, loop_errors
+):
+    """A pod RunPod no longer knows cannot bill; the release must not stick.
+
+    Every call about the pod 404s, including the manager's ``stop_session``
+    for its current persistent pod (which then keeps holding it).
+    """
+
+    remote, adapter, manager, job, others = await _start_runpod_release(
+        monkeypatch, release_kind
+    )
+    session = adapter._active_jobs[job.job_id].session
+    manager.provider.vanish(session.pod_id, not_found(session.pod_id))
+
+    assert await adapter.cancel(job.job_id) is True
+
+    assert job.job_id not in adapter._active_jobs
+    assert manager._session is not session
+    for other in others:
+        await adapter.cancel(other.job_id)
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize("release_kind", ["terminate", "pause_current", "pause_other"])
+async def test_runpod_release_whose_read_back_fails_is_retained(
+    release_kind, monkeypatch, loop_errors
+):
+    """Only a 404 proves the pod is gone; any other read-back failure keeps custody."""
+
+    remote, adapter, manager, job, others = await _start_runpod_release(
+        monkeypatch, release_kind
+    )
+    record = adapter._active_jobs[job.job_id]
+    manager.provider.status_error = RuntimeError("RunPod API unavailable")
+
+    assert await adapter.cancel(job.job_id) is False
+
+    assert adapter._active_jobs[job.job_id] is record
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert "RunPod API unavailable" in record.error
+
+    manager.provider.status_error = None
+    assert await adapter.cancel(job.job_id) is True
+    for other in others:
+        await adapter.cancel(other.job_id)
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 

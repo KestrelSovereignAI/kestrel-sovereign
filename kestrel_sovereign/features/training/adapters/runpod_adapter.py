@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -55,6 +56,67 @@ from kestrel_sovereign.kestrel_config.constants import (
 from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
+
+# Observed pod states that prove a release. A stopped (EXITED) pod no longer
+# bills for its GPU, which is all a pause promises; a terminated one no longer
+# exists at all.
+_PAUSED_POD_STATES = frozenset({"EXITED", "STOPPED", "TERMINATED"})
+_TERMINATED_POD_STATES = frozenset({"TERMINATED"})
+
+
+def _is_pod_not_found(error: Exception) -> bool:
+    """Whether a RunPod call failed because the pod no longer exists.
+
+    ``RunPodAPIError`` carries the HTTP status itself; the managed provider's
+    ``raise_for_status()`` errors carry it on their response.
+    """
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    return status_code == 404
+
+
+async def _pod_action(action: Awaitable[object], pod_id: str) -> None:
+    """Await a stop/terminate; a pod already gone is left for confirmation."""
+    try:
+        await action
+    except Exception as error:
+        if not _is_pod_not_found(error):
+            raise
+        logger.info(f"RunPod pod {pod_id} no longer exists")
+
+
+async def _confirm_pod_state(
+    manager, pod_id: str, accepted: frozenset[str], outcome: str
+) -> None:
+    """Read the pod back and raise unless it is in an ``accepted`` state.
+
+    A pod RunPod no longer knows (404) is released. Anything else - an error
+    payload, an empty response, or a pod still RUNNING - raises, so the job
+    stays in custody and a later release retries.
+    """
+    get_status = getattr(manager.provider, "get_status", None)
+    if get_status is None:
+        raise TrainingProviderError(
+            f"{type(manager.provider).__name__} cannot confirm pod {pod_id} was "
+            f"{outcome}; it is retained until a release succeeds",
+            provider="runpod",
+        )
+    try:
+        observed = await asyncio.to_thread(get_status, pod_id)
+    except Exception as error:
+        if _is_pod_not_found(error):
+            return
+        raise
+    status = None
+    if isinstance(observed, Mapping):
+        status = observed.get("status") or observed.get("desiredStatus")
+    if not isinstance(status, str) or status.upper() not in accepted:
+        raise TrainingProviderError(
+            f"RunPod did not confirm pod {pod_id} was {outcome}: observed "
+            f"{observed!r}; it is retained until a release succeeds",
+            provider="runpod",
+        )
 
 
 class RunPodTrainingAdapter:
@@ -249,14 +311,19 @@ class RunPodTrainingAdapter:
         )
 
     async def _release_session(self, session) -> None:
-        """Release exactly this job's pod, raising unless RunPod accepted it.
+        """Release exactly this job's pod, raising unless RunPod confirms it.
 
         A persistent pod (the profile's ``persistent_pod_id`` resolves at
         release time) is paused so it can be resumed; every other pod is
-        terminated. Both act on this pod's identity through provider calls
-        that raise on failure: the manager's ``terminate_session`` and
-        ``terminate_pod`` log a failed call and return (and only stop, never
-        terminate), which cannot prove the pod stopped billing.
+        terminated. Both act on this pod's identity rather than through the
+        manager's ``terminate_session``/``terminate_pod``, which log a failed
+        call and return (and only stop, never terminate).
+
+        A provider call that returns is not proof either: kestrel-cloud-runpod's
+        ``DirectRunPodProvider.terminate_pod``/``stop_pod`` raise on an HTTP
+        error but report ``TERMINATED``/``EXITED`` for an empty 204 response
+        without observing the pod. The release therefore reads the pod back
+        and succeeds only on the confirmed state (see ``_confirm_pod_state``).
         """
         manager = self._get_manager()
         persistent_pod_id = manager._expand_single_env_var(
@@ -273,9 +340,14 @@ class RunPodTrainingAdapter:
         # manager holds, so it is only used when that is this job's pod (it
         # also records GPU metering and lets a provider failure propagate).
         if manager._session is session:
-            await manager.stop_session()
+            await _pod_action(manager.stop_session(), session.pod_id)
         else:
-            await asyncio.to_thread(manager.provider.stop_pod, session.pod_id)
+            await _pod_action(
+                asyncio.to_thread(manager.provider.stop_pod, session.pod_id),
+                session.pod_id,
+            )
+        await _confirm_pod_state(manager, session.pod_id, _PAUSED_POD_STATES, "paused")
+        await RunPodTrainingAdapter._forget_session(manager, session)
         logger.info(f"Paused persistent RunPod pod {session.pod_id}")
 
     @staticmethod
@@ -287,12 +359,22 @@ class RunPodTrainingAdapter:
                 f"{session.pod_id}; it is retained until a release succeeds",
                 provider="runpod",
             )
-        await asyncio.to_thread(terminate_pod, session.pod_id)
-        # The manager must not hand a destroyed pod to its next caller.
+        await _pod_action(
+            asyncio.to_thread(terminate_pod, session.pod_id), session.pod_id
+        )
+        # A stopped pod still bills for its disk, so only TERMINATED releases it.
+        await _confirm_pod_state(
+            manager, session.pod_id, _TERMINATED_POD_STATES, "terminated"
+        )
+        await RunPodTrainingAdapter._forget_session(manager, session)
+        logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _forget_session(manager, session) -> None:
+        """The manager must not hand a released pod to its next caller."""
         async with manager._lock:
             if manager._session is session:
                 manager._session = None
-        logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
 
     # -- TrainingProvider --------------------------------------------------
 
