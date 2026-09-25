@@ -171,7 +171,11 @@ def test_host_stop_status_counts_work_owned_by_another_replica():
     response = TestClient(app).get("/api/host/stop/status")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"can_stop": True, "in_flight_count": 1}
+    assert response.json() == {
+        "can_stop": True,
+        "in_flight_count": 1,
+        "peer_stop_circuit": {"available": False, "open": []},
+    }
     registry.agent_has_unsettled_work.assert_awaited_once_with("did:test:remote")
 
 

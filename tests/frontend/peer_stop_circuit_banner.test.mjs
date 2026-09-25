@@ -45,6 +45,13 @@ function openCircuit(target, count = 8) {
     };
 }
 
+// A failing assertion skips its test's destroy(); without this the pane's
+// status interval keeps the runner alive until the file times out.
+const mounted = [];
+test.afterEach(() => {
+    for (const handle of mounted.splice(0)) handle.destroy();
+});
+
 function mount({ statuses, reset = async () => ({ event: { kind: 'reset' } }), ask }) {
     const el = document.createElement('div');
     document.body.appendChild(el);
@@ -72,6 +79,7 @@ function mount({ statuses, reset = async () => ({ event: { kind: 'reset' } }), a
         stopAllStatusIntervalMs: 60_000,
         storageKey: `a:circuit-${Math.random()}`,
     });
+    mounted.push(handle);
     return { el, handle, resets, reads: () => reads };
 }
 
@@ -191,4 +199,27 @@ test('a cancelled reason never resets, and a refused reset is shown on its row',
     assert.ok(row, 'the circuit stays visible after a refused reset');
     assert.match(row.textContent, /Reset failed: Host control-plane authority is required/);
     refused.handle.destroy();
+});
+
+test('a failed re-read of a circuit shown open reports it unknown, never cleared', async () => {
+    const { el, handle } = mount({
+        statuses: [
+            {
+                can_stop: true,
+                in_flight_count: 0,
+                peer_stop_circuit: { available: true, open: [openCircuit('did:agent:kite')] },
+            },
+            new Error('status read failed'),
+        ],
+    });
+    await tick();
+    await tick();
+    el.querySelector('.agent-peer-stop-circuit-reset').click();
+    await tick();
+    await tick();
+    const banner = el.querySelector('.agent-peer-stop-circuits');
+    assert.equal(banner.hidden, false);
+    assert.equal(banner.querySelectorAll('.agent-peer-stop-circuit').length, 0);
+    assert.match(banner.textContent, /unavailable/);
+    handle.destroy();
 });

@@ -1774,8 +1774,12 @@ export function mountAgentListPane(containerEl, config = {}) {
                 // fall back to browser-local cards or expose a knowingly doomed
                 // control to an unauthorized caller.
                 stopAllStatus = { loaded: true, canStop: false, inFlightCount: 0 };
+                // A circuit this caller was shown cannot be read now: that is
+                // "unknown", never "cleared" and never the stale open list.
+                if (peerStopCircuit) peerStopCircuit = { available: false, open: [] };
             }
             renderStopAllState();
+            renderPeerStopCircuits();
             return stopAllStatus.canStop;
         })();
         stopAllStatusPromise = request;

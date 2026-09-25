@@ -35,6 +35,7 @@ from kestrel_sovereign.signals.sources.peer_stop import (
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
+    PeerStopCircuitError,
     PeerStopCircuitEventKind,
     PeerStopCircuitPolicy,
     PeerStopCircuitStore,
@@ -271,6 +272,53 @@ async def test_a_retry_of_one_operation_is_counted_once(db_backend):
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
+async def test_a_retry_from_before_a_reset_faces_the_reopened_circuit(db_backend):
+    db = AsyncDatabase(db_backend)
+    clock = _Clock()
+    receipts, circuit = await _stores(db, clock, threshold=1)
+    target = _target()
+    # Admitted, then interrupted before any receipt: the rail retries it.
+    interrupted = _peer_request(target, "did:test:a", "interrupted")
+    assert (await circuit.admit(interrupted)).honored
+
+    await circuit.reset(target, actor_id="sovereign-key", reason="checked")
+    assert (await _honor(circuit, receipts, target, "did:test:b", "reopen")).opened
+
+    retry = await circuit.admit(interrupted)
+    assert retry.honored is False
+    assert retry.admitted_count == 1
+    # Refusal leaves the stale admission out of the current count.
+    assert (await circuit.admit(interrupted)).honored is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_a_retry_from_an_expired_window_is_counted_again(db_backend):
+    db = AsyncDatabase(db_backend)
+    clock = _Clock()
+    receipts, circuit = await _stores(db, clock, threshold=2, window_seconds=60)
+    target = _target()
+    interrupted = _peer_request(target, "did:test:a", "slid")
+    stale = _peer_request(target, "did:test:c", "stale")
+    assert (await circuit.admit(interrupted)).honored
+    assert (await circuit.admit(stale)).honored
+
+    clock.now = T0 + timedelta(seconds=61)
+    # Below the threshold the retry is honored and re-admitted into this
+    # window, so it counts toward the circuit rather than riding for free.
+    retry = await circuit.admit(interrupted)
+    assert retry.honored is True
+    assert retry.admitted_count == 1
+    assert (await _honor(circuit, receipts, target, "did:test:b", "next")).opened
+
+    # With the circuit open, a slid-out retry is refused like any new Stop.
+    refused = await circuit.admit(stale)
+    assert refused.honored is False
+    assert refused.admitted_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
 async def test_the_count_binds_the_verified_actor_and_target(db_backend):
     db = AsyncDatabase(db_backend)
     clock = _Clock()
@@ -430,6 +478,31 @@ async def test_operator_stops_are_never_counted(rail):
 
 
 @pytest.mark.asyncio
+async def test_spoofed_payload_principals_never_reach_the_count(rail):
+    _small_circuit(rail, threshold=5)
+    own = peer_stop.peer_stop_target_identity(rail.agent)
+    for spoof in (
+        _intent(correlation_id="spoof-actor", actor_id="did:test:someone-else"),
+        _intent(correlation_id="spoof-target", target="did:test:another-agent"),
+        _intent(correlation_id="spoof-agent", target_agent_id="did:test:another-agent"),
+    ):
+        with pytest.raises(peer_stop.PeerStopIntentError):
+            await dispatch_peer_stop(rail.agent, actor_id="did:test:verified", intent=spoof)
+    assert await rail.receipt_db.fetchall(
+        "SELECT target_agent_id FROM stop_circuit_admissions", ()
+    ) == []
+
+    rail.agent._active_request_ids.add("turn-spoof")
+    await dispatch_peer_stop(
+        rail.agent, actor_id="did:test:verified", intent=_intent(correlation_id="real")
+    )
+    rows = await rail.receipt_db.fetchall(
+        "SELECT target_agent_id, actor_id FROM stop_circuit_admissions", ()
+    )
+    assert [tuple(row) for row in rows] == [(own, "did:test:verified")]
+
+
+@pytest.mark.asyncio
 async def test_breaker_without_a_durable_circuit_refuses_rather_than_honors():
     agent = SimpleNamespace()
     request = _peer_request(TARGET_DID, "did:test:peer", "none")
@@ -441,7 +514,7 @@ async def test_breaker_failure_refuses_rather_than_honors(rail):
     circuit = _small_circuit(rail, threshold=5)
 
     async def broken(_request):
-        raise RuntimeError("database gone")
+        raise PeerStopCircuitError("database gone")
 
     circuit.admit = broken
     request = _peer_request(TARGET_DID, "did:test:peer", "broken")
@@ -537,9 +610,11 @@ def test_policy_defaults_and_environment_overrides() -> None:
         {PEER_STOP_CIRCUIT_THRESHOLD_ENV: "3", PEER_STOP_CIRCUIT_WINDOW_ENV: "60"}
     )
     assert (tuned.threshold, tuned.window_seconds) == (3, 60)
-    for bad in ("0", "-1", "many"):
-        with pytest.raises(ValueError):
-            resolve_peer_stop_circuit_policy({PEER_STOP_CIRCUIT_THRESHOLD_ENV: bad})
+    for env_name in (PEER_STOP_CIRCUIT_THRESHOLD_ENV, PEER_STOP_CIRCUIT_WINDOW_ENV):
+        # Set but empty is malformed: it must not silently select the default.
+        for bad in ("0", "-1", "many", "", "   "):
+            with pytest.raises(ValueError, match=env_name):
+                resolve_peer_stop_circuit_policy({env_name: bad})
 
 
 def _production_sources() -> dict[str, str]:

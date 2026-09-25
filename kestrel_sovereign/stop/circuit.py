@@ -254,8 +254,11 @@ class PeerStopCircuitStore:
     async def admit(self, request: StopRequest) -> PeerStopCircuitDecision:
         """Honor or refuse one peer Stop operation, durably and atomically.
 
-        An operation already admitted is honored again without being counted
-        twice: a retry of an interrupted Stop is the same Stop.
+        An operation already admitted in the current epoch's window is honored
+        again without being counted twice: a retry of an interrupted Stop is
+        the same Stop.  An older admission (before a reset, or slid out of the
+        window) is no longer counted, so its retry faces the current threshold
+        like any new Stop and, if honored, is re-admitted into this window.
         """
 
         if not isinstance(request, StopRequest):
@@ -283,7 +286,11 @@ class PeerStopCircuitStore:
                     "WHERE target_agent_id = ? AND operation_id = ?",
                     (target, operation_id),
                 )
-                if existing is not None:
+                if existing is not None and await self._admission_is_current(
+                    target, operation_id, state.epoch, now
+                ):
+                    # Already counted in this epoch's window: the retry is the
+                    # same Stop, honored without being counted twice.
                     await self._save_state(target, state)
                     return PeerStopCircuitDecision(
                         honored=True,
@@ -307,18 +314,36 @@ class PeerStopCircuitStore:
                         closed=closed,
                     )
                 else:
-                    await self._db.execute(
-                        "INSERT INTO stop_circuit_admissions ("
-                        "target_agent_id, operation_id, epoch, actor_id, "
-                        "admitted_at) VALUES (?, ?, ?, ?, ?)",
-                        (
-                            target,
-                            operation_id,
-                            state.epoch,
-                            actor_id,
-                            self._timestamp(now),
-                        ),
-                    )
+                    if existing is None:
+                        await self._db.execute(
+                            "INSERT INTO stop_circuit_admissions ("
+                            "target_agent_id, operation_id, epoch, actor_id, "
+                            "admitted_at) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                target,
+                                operation_id,
+                                state.epoch,
+                                actor_id,
+                                self._timestamp(now),
+                            ),
+                        )
+                    else:
+                        # An admission from an earlier epoch or outside the
+                        # window no longer counts, so it confers nothing: the
+                        # retry faced the current threshold above and, being
+                        # honored, is re-admitted into the current window.
+                        await self._db.execute(
+                            "UPDATE stop_circuit_admissions SET epoch = ?, "
+                            "actor_id = ?, admitted_at = ? "
+                            "WHERE target_agent_id = ? AND operation_id = ?",
+                            (
+                                state.epoch,
+                                actor_id,
+                                self._timestamp(now),
+                                target,
+                                operation_id,
+                            ),
+                        )
                     count += 1
                     if count >= policy.threshold and not state.is_open:
                         opened = await self._open(target, state, count, now)
@@ -547,6 +572,27 @@ class PeerStopCircuitStore:
         )
         state.exists = True
 
+    def _window_start(self, now: datetime) -> str:
+        return self._timestamp(now - timedelta(seconds=self._policy.window_seconds))
+
+    async def _admission_is_current(
+        self, target: str, operation_id: str, epoch: int, now: datetime
+    ) -> bool:
+        """Whether an operation's admission sits in this epoch's window.
+
+        Only such an admission is part of the count ``admit`` just compared
+        with the threshold.  An older one -- before a reset, or slid out of
+        the window -- must not let its retry bypass a circuit opened since.
+        """
+
+        row = await self._db.fetchone(
+            "SELECT 1 FROM stop_circuit_admissions "
+            "WHERE target_agent_id = ? AND operation_id = ? "
+            "AND epoch = ? AND admitted_at > ?",
+            (target, operation_id, epoch, self._window_start(now)),
+        )
+        return row is not None
+
     async def _count(self, target: str, epoch: int, now: datetime) -> int:
         """Honored peer Stops against ``target`` inside the sliding window.
 
@@ -554,9 +600,7 @@ class PeerStopCircuitStore:
         stopped nothing; a Stop still in flight counts.
         """
 
-        window_start = self._timestamp(
-            now - timedelta(seconds=self._policy.window_seconds)
-        )
+        window_start = self._window_start(now)
         value = await self._db.fetchval(
             "SELECT COUNT(*) FROM stop_circuit_admissions AS admission "
             "WHERE admission.target_agent_id = ? "

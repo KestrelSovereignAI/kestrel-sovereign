@@ -94,6 +94,7 @@ from kestrel_sovereign.signals.in_flight_control import (
 )
 from kestrel_sovereign.stop import (
     CancellationAuthority,
+    PeerStopCircuitError,
     PeerStopCircuitPolicy,
     PeerStopCircuitStore,
     StopCleanupRegistry,
@@ -504,13 +505,19 @@ def resolve_peer_stop_circuit_policy(
         ),
     ):
         raw = environ.get(env_name)
-        if raw is None or not raw.strip():
+        if raw is None:
             values[name] = default
             continue
+        if not raw.strip():
+            # Set but empty is a malformed override, not an absent one.
+            raise ValueError(f"{env_name} must be a positive integer")
         try:
-            values[name] = int(raw.strip())
+            value = int(raw.strip())
         except ValueError as error:
             raise ValueError(f"{env_name} must be a positive integer") from error
+        if value < 1:
+            raise ValueError(f"{env_name} must be a positive integer")
+        values[name] = value
     return PeerStopCircuitPolicy(**values)
 
 
@@ -566,7 +573,7 @@ async def peer_stop_breaker_refusal(
         return PEER_STOP_CIRCUIT_UNAVAILABLE
     try:
         decision = await circuit.admit(request)
-    except Exception:  # noqa: BLE001 - durable evidence boundary
+    except PeerStopCircuitError:
         return PEER_STOP_CIRCUIT_UNAVAILABLE
     return None if decision.honored else PEER_STOP_CIRCUIT_OPEN
 
