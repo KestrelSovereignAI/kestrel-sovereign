@@ -62,7 +62,12 @@ from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
     SURFACE_UNSURFACED_STATES,
 )
-from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
+from kestrel_sovereign.storage.async_wait_signal_store import (
+    DEFERRED_RATE_LIMITED,
+    MAX_ATTEMPTS_EXCEEDED,
+    WaitSignalState,
+    WaitSignalStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,12 @@ logger = logging.getLogger(__name__)
 # not produce unbounded LLM turns (mirrors talon_monitor's cap). After this
 # many attempts, lock the transition and surface a synthetic
 # ``max_attempts_exceeded`` delivery status for operator review.
+#
+# The cap is for a signal the dispatcher will always reject. A wake whose
+# cognition failed because the model provider named its own retry time is not
+# that: it is parked until the provider's time and its attempt is refunded
+# (#3302), so a two-hour rate limit cannot burn ten one-minute retries and
+# lock the wake away before the route comes back.
 MAX_DELIVERY_ATTEMPTS = 10
 
 # Dispatcher result statuses that mean the wake was ACCEPTED and its turn ran
@@ -213,6 +224,9 @@ class WaitReconciler:
         signals_hard_failed = 0
         # soft_fail = retriable (rate_limit/quiet_hours/failed/raised/lost).
         signals_soft_failed = 0
+        # deferred = cognition failed on a provider-advised wait; parked until
+        # the provider's retry time with its attempt refunded (#3302).
+        signals_deferred = 0
         signals_enqueued = 0
         signals_skipped_no_dispatcher = 0
         scanned = 0
@@ -327,6 +341,34 @@ class WaitReconciler:
                     "delivery_status": status_value,
                     "delivery_error": delivery_error or "",
                 })
+            elif (
+                retry_at := self._cognition_retry_at(
+                    dispatcher, getattr(handle_obj, "signal_id", None)
+                )
+            ) is not None and target:
+                # The wake's cognition could not run because every model route
+                # declined a wait the provider itself dated (#3302). Retrying
+                # before then cannot succeed, and it is not the dispatcher
+                # rejecting the signal, so it must not spend the retry cap:
+                # park the wake until the provider's time, refund the attempt.
+                await store.record_deferral(
+                    kind, handle,
+                    target=target,
+                    retry_at=retry_at,
+                    delivery_error=delivery_error,
+                    attempt_at=now,
+                )
+                signals_deferred += 1
+                logger.info(
+                    "wait_reconcile: %s:%s cognition declined a provider-advised "
+                    "wait; parked until %s without spending a delivery attempt",
+                    kind, handle, retry_at.isoformat(timespec="seconds"),
+                )
+                transitions.append({
+                    "kind": kind, "handle": handle, "outcome": target,
+                    "delivery_status": DEFERRED_RATE_LIMITED,
+                    "deferred_until": retry_at.isoformat(timespec="seconds"),
+                })
             else:
                 # Soft fail (rate_limit/quiet_hours/failed/dispatcher_raised).
                 # Don't set signaled_outcome — next tick re-detects and
@@ -360,6 +402,7 @@ class WaitReconciler:
             "signals_hard_failed": 0,
             "signals_soft_failed": 0,
             "signals_skipped_no_dispatcher": 0,
+            "signals_parked": 0,
         }
         # (kind, handle) processed this tick so a handle that is BOTH
         # monitorable-active AND explicitly watched isn't polled/emitted twice.
@@ -409,6 +452,7 @@ class WaitReconciler:
         signals_hard_failed += counters["signals_hard_failed"]
         signals_soft_failed += counters["signals_soft_failed"]
         signals_skipped_no_dispatcher += counters["signals_skipped_no_dispatcher"]
+        signals_parked = counters["signals_parked"]
 
         parts = [
             f"persisted={signals_persisted}",
@@ -431,6 +475,10 @@ class WaitReconciler:
             parts.append(f"hard_failed={signals_hard_failed}")
         if signals_soft_failed:
             parts.append(f"soft_failed={signals_soft_failed}")
+        if signals_deferred:
+            parts.append(f"deferred={signals_deferred}")
+        if signals_parked:
+            parts.append(f"parked={signals_parked}")
         if signals_skipped_no_dispatcher:
             parts.append(
                 f"skipped_no_dispatcher={signals_skipped_no_dispatcher}"
@@ -460,6 +508,10 @@ class WaitReconciler:
                 "signals_enqueued": signals_enqueued,
                 "signals_hard_failed": signals_hard_failed,
                 "signals_soft_failed": signals_soft_failed,
+                # Harvested this tick as a provider-advised deferral (#3302),
+                # and still parked awaiting the provider's retry time.
+                "signals_deferred": signals_deferred,
+                "signals_parked": signals_parked,
                 "signals_skipped_no_dispatcher": signals_skipped_no_dispatcher,
                 "pending_deliveries": len(self._pending_signal_tasks),
                 "transitions": transitions,
@@ -467,6 +519,42 @@ class WaitReconciler:
         )
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cognition_retry_at(
+        dispatcher: Any, signal_id: Optional[str]
+    ) -> Optional[datetime]:
+        """The provider-advised retry time the dispatcher recorded for this
+        wake's failed cognition, or ``None`` (#3302).
+
+        Only the dispatcher's own record counts: it is set when the turn failed
+        because every model route declined a dated wait. A dispatcher without
+        the ledger, or with no record, means the failure was ordinary and the
+        attempt stays spent — no guessing from the error text.
+        """
+        lookup = getattr(dispatcher, "cognition_retry_at", None)
+        if not callable(lookup) or not signal_id:
+            return None
+        try:
+            retry_at = lookup(signal_id)
+        except Exception as exc:  # a broken ledger is not advice
+            logger.debug(
+                "cognition_retry_at(%r) raised on the dispatcher: %s",
+                signal_id, exc,
+            )
+            return None
+        if not isinstance(retry_at, datetime):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return retry_at
+
+    async def undelivered_wakes(self, limit: int = 50) -> List[WaitSignalState]:
+        """Wakes that have not reached the agent and will not soon (#3302):
+        those locked as ``max_attempts_exceeded`` and those parked until a
+        provider-advised retry time. See ``WaitSignalStore.list_undelivered``.
+        """
+        return await self._store.list_undelivered(limit=limit)
 
     @staticmethod
     def _resolve_visibility(
@@ -573,6 +661,13 @@ class WaitReconciler:
         if (kind, handle) in self._pending_signal_tasks:
             return
 
+        # Parked until a provider-advised retry time (#3302): nothing emitted
+        # before then can run, so leave the wake — and its attempts — alone.
+        deferred_until = state.deferred_until_utc() if state else None
+        if deferred_until is not None and deferred_until > datetime.now(timezone.utc):
+            counters["signals_parked"] += 1
+            return
+
         # Attempts belong to a TRANSITION, not to a handle (#3105). A provider
         # that corrects a terminal state — talon's supported
         # ``finished_unknown -> failed`` — starts a NEW transition, and its
@@ -591,14 +686,24 @@ class WaitReconciler:
             # delivery status for operator review.
             await store.record_delivery(
                 kind, handle,
-                delivery_status="max_attempts_exceeded",
+                delivery_status=MAX_ATTEMPTS_EXCEEDED,
+                # Keep the last real failure: it is the only account of why
+                # the wake never landed, and ``wait_status`` reports it.
+                delivery_error=state.last_delivery_error if state else None,
                 signaled_outcome=signaled_token,
                 attempt_at=datetime.now(timezone.utc),
             )
             counters["signals_hard_failed"] += 1
+            logger.warning(
+                "wait_reconcile: %s:%s locked after %d delivery attempts "
+                "without reaching the agent (last error: %s); listed by "
+                "wait_status",
+                kind, handle, attempts_so_far,
+                (state.last_delivery_error if state else None) or "none",
+            )
             transitions.append({
                 "kind": kind, "handle": handle, "outcome": status.outcome.value,
-                "delivery_status": "max_attempts_exceeded",
+                "delivery_status": MAX_ATTEMPTS_EXCEEDED,
                 "delivery_attempts": attempts_so_far,
             })
             return
@@ -738,6 +843,12 @@ class WaitReconciler:
         """
         source = getattr(provider, "signal", None) or "wait.complete"
         prior_status = getattr(prior_state, "last_delivery_status", None)
+        # A wake parked on a provider-advised wait (#3302) re-emits with its
+        # refunded attempt number, so ``attempts > 1`` alone no longer says
+        # "this is not the first try": a first attempt deferred for two hours
+        # is exactly the late wake #3105 exists to label.
+        deferrals = int(getattr(prior_state, "delivery_deferrals", 0) or 0)
+        retried = attempts > 1 or deferrals > 0
         # ``last_attempt_started_at``, not ``last_delivery_attempt_at``: the
         # latter is rewritten by Phase 0's harvest, so it answers "when did the
         # reconciler last look" rather than "when was the previous dispatch
@@ -766,10 +877,14 @@ class WaitReconciler:
             "delivery_max_attempts": MAX_DELIVERY_ATTEMPTS,
             # Empty on a first attempt; on a retry, how the PREVIOUS dispatch
             # of this same transition ended and when it was tried.
-            "delivery_previous_status": str(prior_status or "") if attempts > 1 else "",
+            "delivery_previous_status": str(prior_status or "") if retried else "",
             "delivery_previous_attempt_at": (
-                str(prior_at or "") if attempts > 1 else ""
+                str(prior_at or "") if retried else ""
             ),
+            # How many times this wake was parked until a provider-advised
+            # retry time before this dispatch (#3302). Those do not count
+            # toward ``delivery_attempt``.
+            "delivery_deferrals": deferrals,
         }
         target_agent = (
             getattr(self._agent, "did", None)
@@ -793,8 +908,11 @@ class WaitReconciler:
             # against the prior failed attempt (talon_monitor codex round 1
             # P1). Application-level dedup via last_signaled_outcome still
             # prevents redundant emits across ticks.
+            # A deferral refunds its attempt, so the re-emit reuses the
+            # attempt number; the deferral count keeps its key unique.
             dedupe_key=(
                 f"{kind}:{handle}:{self._signaled_token(status)}:attempt-{attempts}"
+                + (f":deferral-{deferrals}" if deferrals else "")
             ),
         )
 
@@ -821,6 +939,16 @@ def _get_reconciler(agent: Any) -> "WaitReconciler":
         reconciler = WaitReconciler(agent)
         agent._wait_reconciler = reconciler
     return reconciler
+
+
+async def list_undelivered_wakes(agent: Any, limit: int = 50) -> List[WaitSignalState]:
+    """The agent's wakes that are locked after the retry cap or parked until
+    a provider-advised retry time (#3302), most recently updated first.
+
+    The read behind the ``wait_status`` tool; builds the singleton reconciler
+    if needed but never runs a tick.
+    """
+    return await _get_reconciler(agent).undelivered_wakes(limit=limit)
 
 
 async def _provider_owns_handle(provider: Any, handle: str) -> Optional[bool]:

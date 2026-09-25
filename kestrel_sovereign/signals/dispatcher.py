@@ -115,6 +115,7 @@ from kestrel_sdk.signals import (
 
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.hold import HoldStateError, HoldTurnRefusal
+from kestrel_sovereign.llm.retry import advised_wait_exceeding_budget
 from kestrel_sovereign.security.encryption import (
     DecryptionError,
     MasterKeyNotConfiguredError,
@@ -723,6 +724,9 @@ class SignalDispatcher:
     # a small window is sufficient; bounding it keeps a long-lived host from
     # accumulating one entry per signal forever.
     _MAX_SURFACE_RECORDS = 512
+    # Cap on retained per-signal provider-advised retry times (#3302). Same
+    # consumer and cadence as the surface ledger above.
+    _MAX_DECLINED_WAIT_RECORDS = 512
 
     def __init__(
         self,
@@ -864,6 +868,14 @@ class SignalDispatcher:
         # its own outcome writers before returning, so the record for a signal
         # is always present by the time its handle resolves.
         self._surface_records: "OrderedDict[str, SignalSurfaceRecord]" = OrderedDict()
+        # When a COGNITION turn failed because every route declined a
+        # provider-advised wait, the time the provider named, per signal
+        # (#3302). ``SignalResult.error`` is a string, so without this the
+        # wait reconciler could only see "failed" and would spend its bounded
+        # delivery attempts inside a window the provider had already said
+        # would last hours. In-memory and bounded for the same reasons as the
+        # surface ledger: a record lost to a restart reads as "no advice".
+        self._declined_wait_records: "OrderedDict[str, datetime]" = OrderedDict()
         # This task owns teardown, rather than whichever public caller first
         # requested it.  Callers await it through ``shield`` so cancellation
         # of an agent's bounded shutdown wrapper cannot abandon a committed
@@ -5065,6 +5077,9 @@ class SignalDispatcher:
                 signal.id,
                 signal.source,
             )
+            declined = advised_wait_exceeding_budget(e)
+            if declined is not None:
+                self._record_declined_wait(signal.id, declined.retry_at)
             return self._fail(
                 signal,
                 start,
@@ -6359,6 +6374,28 @@ class SignalDispatcher:
         records[signal_id] = record
         while len(records) > self._MAX_SURFACE_RECORDS:
             records.popitem(last=False)
+
+    def _record_declined_wait(self, signal_id: str, retry_at: datetime) -> None:
+        """Remember the provider-advised retry time for one failed signal."""
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        records = self._declined_wait_records
+        records.pop(signal_id, None)
+        records[signal_id] = retry_at
+        while len(records) > self._MAX_DECLINED_WAIT_RECORDS:
+            records.popitem(last=False)
+
+    def cognition_retry_at(self, signal_id: str) -> Optional[datetime]:
+        """When a retry of ``signal_id``'s cognition can first succeed, if known.
+
+        Set only when the signal's COGNITION turn failed because every model
+        route declined a provider-advised wait (a rate limit that named its
+        own reset time, #3127). The value is the provider's number, as an
+        aware UTC datetime. ``None`` means the failure carried no such advice
+        — or the record did not survive a restart — and the caller must treat
+        the failure as ordinary, never as a rate limit (#3302).
+        """
+        return self._declined_wait_records.get(signal_id)
 
     def surface_record(self, signal_id: str) -> Optional["SignalSurfaceRecord"]:
         """What the UI side-channel emit did for ``signal_id``, if observed.
