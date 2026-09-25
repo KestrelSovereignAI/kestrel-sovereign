@@ -21,6 +21,7 @@ Usage:
     caps = TrainingProviderFactory.get_capabilities("replicate")
 """
 
+import asyncio
 import logging
 import os
 from typing import Dict, List, Optional
@@ -508,6 +509,37 @@ class TrainingProviderFactory:
         except Exception as e:
             logger.error(f"Failed to create provider {name}: {e}")
             return None
+
+    @classmethod
+    async def close_providers(cls) -> None:
+        """Close every cached provider that owns background work or sessions.
+
+        Session-based adapters drain their submission tasks and release their
+        billable sessions here. Providers close concurrently; one that closed
+        cleanly leaves the cache, while one that failed stays cached so the
+        custody it still holds remains reachable. The first failure is raised
+        after every close has settled; the rest are logged.
+        """
+        closable = [
+            (name, provider)
+            for name, provider in cls._instances.items()
+            if callable(getattr(provider, "close", None))
+        ]
+        if not closable:
+            return
+        results = await asyncio.gather(
+            *(provider.close() for _name, provider in closable),
+            return_exceptions=True,
+        )
+        failures: List[BaseException] = []
+        for (name, provider), result in zip(closable, results):
+            if isinstance(result, BaseException):
+                logger.error(f"Failed to close training provider {name}: {result}")
+                failures.append(result)
+            elif cls._instances.get(name) is provider:
+                del cls._instances[name]
+        if failures:
+            raise failures[0]
 
     @classmethod
     def clear_cache(cls) -> None:
