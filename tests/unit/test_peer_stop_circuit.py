@@ -409,17 +409,19 @@ async def test_two_peers_at_threshold_minus_one_cannot_both_be_honored(db_backen
 # ---------------------------------------------------------------------------
 
 
-def _small_circuit(rail, threshold: int) -> PeerStopCircuitStore:
+def _small_circuit(harness, threshold: int) -> PeerStopCircuitStore:
     circuit = PeerStopCircuitStore(
-        rail.receipt_db,
+        harness.receipt_db,
         policy=PeerStopCircuitPolicy(threshold=threshold, window_seconds=900),
     )
-    rail.agent.__dict__[peer_stop._CIRCUIT_ATTRIBUTE] = circuit
+    harness.agent.__dict__[peer_stop._CIRCUIT_ATTRIBUTE] = circuit
     return circuit
 
 
 @pytest.mark.asyncio
-async def test_open_circuit_refuses_peers_fleet_wide_with_an_operation_receipt(rail):
+async def test_open_circuit_refuses_peers_fleet_wide_with_an_operation_receipt(
+    rail,  # noqa: F811 - the imported fixture
+):
     _small_circuit(rail, threshold=2)
     for i, peer in enumerate(("did:test:peer-a", "did:test:peer-b")):
         rail.agent._active_request_ids.add(f"turn-{i}")
@@ -445,7 +447,9 @@ async def test_open_circuit_refuses_peers_fleet_wide_with_an_operation_receipt(r
 
 
 @pytest.mark.asyncio
-async def test_operator_stops_are_never_counted(rail):
+async def test_operator_stops_are_never_counted(
+    rail,  # noqa: F811 - the imported fixture
+):
     circuit = _small_circuit(rail, threshold=1)
     target = peer_stop.peer_stop_target_identity(rail.agent)
 
@@ -478,7 +482,9 @@ async def test_operator_stops_are_never_counted(rail):
 
 
 @pytest.mark.asyncio
-async def test_spoofed_payload_principals_never_reach_the_count(rail):
+async def test_spoofed_payload_principals_never_reach_the_count(
+    rail,  # noqa: F811 - the imported fixture
+):
     _small_circuit(rail, threshold=5)
     own = peer_stop.peer_stop_target_identity(rail.agent)
     for spoof in (
@@ -510,7 +516,9 @@ async def test_breaker_without_a_durable_circuit_refuses_rather_than_honors():
 
 
 @pytest.mark.asyncio
-async def test_breaker_failure_refuses_rather_than_honors(rail):
+async def test_breaker_failure_refuses_rather_than_honors(
+    rail,  # noqa: F811 - the imported fixture
+):
     circuit = _small_circuit(rail, threshold=5)
 
     async def broken(_request):
