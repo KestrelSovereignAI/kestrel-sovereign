@@ -538,7 +538,7 @@ def render_inventory_json(inventory: Inventory) -> str:
 
 
 def replace_generated_inventory(existing: str, generated: str) -> str:
-    """Splice *generated* into *existing* between the region markers.
+    r"""Splice *generated* into *existing* between the region markers.
 
     Idempotent by construction (#3116): the separators around the region
     are rebuilt from scratch on every run rather than added to whatever

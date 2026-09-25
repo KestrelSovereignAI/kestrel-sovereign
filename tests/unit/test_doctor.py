@@ -12,6 +12,7 @@ from kestrel_sovereign.doctor import (
     diagnose,
     format_report,
 )
+from kestrel_sovereign.hold import HoldAuthority
 from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
@@ -3493,6 +3494,7 @@ async def test_sqlite_doctor_rejects_missing_hold_history_anchor(
     context = await build_host_context(db_path=str(host_db))
     assert context.hold_store is not None, context.backend_error
     await context.hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:operator:sovereign",

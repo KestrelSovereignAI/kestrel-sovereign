@@ -159,11 +159,24 @@ _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS = (
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
 )
+# The twelve v1 evidence fields. Every receipt-set reader that can run
+# before ``_ensure_schema_transaction`` (bootstrap, publication recovery,
+# history anchors, the readiness snapshots) selects exactly these, because an
+# un-migrated database has no ``authority`` column yet. That projection stays
+# sound after the migration: a receipt whose recorded authority is the v1
+# authority digests to its v1 digest, and any other authority is framed into
+# the digest, so a v1-projection reader of such a row fails closed on the
+# content witness rather than silently reading it as sovereign.
 _RECEIPT_COLUMNS = (
     "receipt_id, operation_id, action, disposition, scope, target_id, reason, "
     "actor_id, occurred_at, expected_hold_receipt_id, prior_hold_receipt_id, "
     "resulting_hold_receipt_id"
 )
+# Every reader that surfaces a receipt after the schema transaction reads the
+# recorded authority too.
+_RECEIPT_AUTHORITY_COLUMNS = f"{_RECEIPT_COLUMNS}, authority"
+_RECEIPT_AUTHORITY_COLUMN_DEFINITION = "authority TEXT NOT NULL DEFAULT 'sovereign'"
+_V1_RECEIPT_WIDTH = 12
 
 
 class HoldScope(str, Enum):
@@ -182,6 +195,19 @@ class HoldDisposition(str, Enum):
     APPLIED = "applied"
     ALREADY_IN_STATE = "already_in_state"
     REFUSED_STALE = "refused_stale"
+
+
+class HoldAuthority(str, Enum):
+    """The authority under which a Hold receipt's actor acted.
+
+    Recorded by the door that performed the mutation, never inferred from the
+    shape of the actor string. The sovereign host door is the only writer
+    today; every receipt written before this column existed was written by it,
+    which is why the v1 backfill is ``sovereign``. A new door (the #3168
+    mandate door) adds its own member and records it explicitly.
+    """
+
+    SOVEREIGN = "sovereign"
 
 
 class HoldStateError(RuntimeError):
@@ -1008,6 +1034,7 @@ class HoldReceipt:
     expected_hold_receipt_id: str
     prior_hold_receipt_id: str
     resulting_hold_receipt_id: str
+    authority: HoldAuthority
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1106,7 @@ def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
         "expected_hold_receipt_id": receipt.expected_hold_receipt_id,
         "prior_hold_receipt_id": receipt.prior_hold_receipt_id,
         "resulting_hold_receipt_id": receipt.resulting_hold_receipt_id,
+        "authority": receipt.authority.value,
     }
 
 
@@ -1360,6 +1388,14 @@ def _required_text(value: object, field: str) -> str:
     return value.strip()
 
 
+def _required_authority(value: object) -> HoldAuthority:
+    """Require the door to name its authority; never infer or default it."""
+
+    if not isinstance(value, HoldAuthority):
+        raise TypeError("Hold authority must be a HoldAuthority recorded by its door")
+    return value
+
+
 def _coerce_scope(value: HoldScope | str) -> HoldScope:
     if isinstance(value, HoldScope):
         return value
@@ -1458,18 +1494,28 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
 def _feed_entry_from_row(row: Any) -> HoldFeedEntry:
     """Split a feed row into its paging key and its validated receipt."""
 
-    if row is None or len(row) != 13:
+    width = _V1_RECEIPT_WIDTH + 1
+    if row is None or len(row) != width + 1:
         raise HoldCorruptStateError("hold feed row has an unexpected shape")
-    feed_seq = row[12]
+    feed_seq = row[width]
     if isinstance(feed_seq, bool) or not isinstance(feed_seq, int) or feed_seq < 1:
         raise HoldCorruptStateError("hold receipt feed sequence is invalid")
     return HoldFeedEntry(
-        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:12])
+        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:width])
     )
 
 
 def _receipt_from_row(row: Any) -> HoldReceipt:
-    if row is None or len(row) != 12:
+    """Validate one receipt row.
+
+    A row is either the v1 projection (``_RECEIPT_COLUMNS``) or that
+    projection plus its recorded ``authority``. A v1 projection carries no
+    authority of its own; it is interpreted as the v1 authority, which is what
+    the schema backfill records for every row written before the column
+    existed. A reader that needs the recorded value must select it.
+    """
+
+    if row is None or len(row) not in (_V1_RECEIPT_WIDTH, _V1_RECEIPT_WIDTH + 1):
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
     if any(value is None for value in row):
         # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null,
@@ -1492,6 +1538,11 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
             expected_hold_receipt_id=str(row[9] or ""),
             prior_hold_receipt_id=str(row[10] or ""),
             resulting_hold_receipt_id=str(row[11] or ""),
+            authority=(
+                HoldAuthority(str(row[12]))
+                if len(row) > _V1_RECEIPT_WIDTH
+                else HoldAuthority.SOVEREIGN
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise HoldCorruptStateError("hold receipt has invalid typed fields") from exc
@@ -1551,11 +1602,20 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
 
 
 def _receipt_content_digest(row: Any) -> str:
-    """Hash every typed receipt field with unambiguous length framing."""
+    """Hash every typed receipt field with unambiguous length framing.
 
-    _receipt_from_row(row)
+    The recorded authority is framed in after the v1 fields only when it is
+    not the v1 authority. Every witness written before the column existed
+    therefore still matches its (backfilled) row, while any other authority —
+    and any in-place rewrite of it in either direction — changes the digest.
+    """
+
+    receipt = _receipt_from_row(row)
+    values = list(tuple(row)[:_V1_RECEIPT_WIDTH])
+    if receipt.authority is not HoldAuthority.SOVEREIGN:
+        values.append(receipt.authority.value)
     digest = hashlib.sha256()
-    for value in row:
+    for value in values:
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -3673,12 +3733,25 @@ class HoldStore:
                 "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
                 "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
                 "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}, "
                 "CHECK (action IN ('hold', 'release')), "
                 "CHECK (disposition IN "
                 "('applied', 'already_in_state', 'refused_stale')), "
                 "CHECK (scope IN ('host', 'agent')), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
+            # Additive: a receipt written before this column existed was
+            # written by the sovereign host door, the only door there was, so
+            # the default IS its recorded authority. It is equally the
+            # authority of a row an older binary appends during a rolling
+            # upgrade, since that binary has no other door. The default is
+            # outside the digest by construction (see
+            # ``_receipt_content_digest``), so no witness changes.
+            if not await self._db.column_exists("hold_receipts", "authority"):
+                await self._db.execute(
+                    "ALTER TABLE hold_receipts ADD COLUMN "
+                    f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}"
+                )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
@@ -4040,8 +4113,14 @@ class HoldStore:
         target_id: Optional[str] = None,
         after: Optional[int] = None,
         limit: int,
+        newest_first: bool = False,
     ) -> HoldReceiptPage:
-        """Read one bounded page of Hold history, oldest first.
+        """Read one bounded page of Hold history, oldest first by default.
+
+        ``newest_first`` reverses the order, and ``after`` then names the
+        cursor the page continues BELOW. A bounded newest-first page is the
+        most recent suffix of that history, so a receipt on the page is
+        followed on the page by every receipt committed after it.
 
         Pages on ``feed_seq``, which the table's insert trigger allocates for
         every receipt write under the exclusive history lock (or SQLite's
@@ -4081,6 +4160,8 @@ class HoldStore:
             not isinstance(target_id, str) or not target_id.strip()
         ):
             raise ValueError("Hold receipt target filter must be a concrete id")
+        if not isinstance(newest_first, bool):
+            raise TypeError("Hold receipt page order must be a bool")
 
         try:
             async with self._evidence_protocol():
@@ -4094,6 +4175,7 @@ class HoldStore:
                         target_id=target_id,
                         after=after,
                         limit=limit,
+                        newest_first=newest_first,
                     )
         except Exception as exc:
             # Corruption stays corruption: it is a HoldStateError subclass and
@@ -4122,6 +4204,7 @@ class HoldStore:
         target_id: Optional[str],
         after: Optional[int],
         limit: int,
+        newest_first: bool = False,
     ) -> tuple[Any, ...]:
         filters = ["feed_seq IS NOT NULL"]
         params: list[Any] = []
@@ -4144,16 +4227,16 @@ class HoldStore:
         if after is not None:
             # Strict keyset successor: a page boundary can neither repeat a
             # receipt nor skip one.
-            filters.append("feed_seq > ?")
+            filters.append("feed_seq < ?" if newest_first else "feed_seq > ?")
             params.append(after)
         # One row beyond the page so a cursor is issued only when more history
         # actually exists.
         params.append(limit + 1)
         return tuple(
             await self._db.fetchall(
-                f"SELECT {_RECEIPT_COLUMNS}, feed_seq FROM hold_receipts "
+                f"SELECT {_RECEIPT_AUTHORITY_COLUMNS}, feed_seq FROM hold_receipts "
                 f"WHERE {' AND '.join(filters)} "
-                "ORDER BY feed_seq LIMIT ?",
+                f"ORDER BY feed_seq {'DESC' if newest_first else 'ASC'} LIMIT ?",
                 tuple(params),
             )
         )
@@ -4279,7 +4362,8 @@ class HoldStore:
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
         rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE operation_id = ?",
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE operation_id = ?",
             (operation_id,),
         )
         if len(rows) > 1:
@@ -4319,7 +4403,8 @@ class HoldStore:
 
     async def _read_receipt_by_id(self, receipt_id: str) -> Any:
         return await self._db.fetchone(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE receipt_id = ?",
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE receipt_id = ?",
             (receipt_id,),
         )
 
@@ -4342,7 +4427,7 @@ class HoldStore:
         """
 
         receipt_rows = tuple(await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
             "WHERE scope = ? AND target_id = ?",
             (scope.value, target_id),
         ))
@@ -4360,7 +4445,7 @@ class HoldStore:
         ))
         referenced: dict[str, HoldReceipt] = {}
         if latch is not None and not any(
-            len(row) == 12 and row[0] == latch.hold_receipt_id
+            len(row) == _V1_RECEIPT_WIDTH + 1 and row[0] == latch.hold_receipt_id
             for row in receipt_rows
         ):
             referenced_row = await self._read_receipt_by_id(latch.hold_receipt_id)
@@ -4397,6 +4482,16 @@ class HoldStore:
             validate_global_history=validate_global_history,
         )
 
+    async def _latch_authority(self, latch: HoldState) -> HoldAuthority:
+        """The recorded authority of a latch's (already validated) receipt."""
+
+        row = await self._read_receipt_by_id(latch.hold_receipt_id)
+        if row is None:
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        return _receipt_from_row(row).authority
+
     @staticmethod
     def _assert_replay(
         receipt: HoldReceipt,
@@ -4407,6 +4502,7 @@ class HoldStore:
         reason: str,
         actor_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
     ) -> None:
         supplied = (
             action,
@@ -4415,6 +4511,7 @@ class HoldStore:
             reason,
             actor_id,
             expected_hold_receipt_id,
+            authority,
         )
         recorded = (
             receipt.action,
@@ -4423,6 +4520,7 @@ class HoldStore:
             receipt.reason,
             receipt.actor_id,
             receipt.expected_hold_receipt_id,
+            receipt.authority,
         )
         if supplied != recorded:
             raise HoldIdempotencyConflict(
@@ -4442,6 +4540,7 @@ class HoldStore:
         expected_hold_receipt_id: str,
         prior_hold_receipt_id: str,
         resulting_hold_receipt_id: str,
+        authority: HoldAuthority,
         receipt_id: Optional[str] = None,
     ) -> HoldReceipt:
         receipt_id = receipt_id or str(uuid4())
@@ -4454,8 +4553,8 @@ class HoldStore:
             "INSERT INTO hold_receipts ("
             "receipt_id, operation_id, action, disposition, scope, target_id, "
             "reason, actor_id, occurred_at, expected_hold_receipt_id, "
-            "prior_hold_receipt_id, resulting_hold_receipt_id"
-            f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
+            "prior_hold_receipt_id, resulting_hold_receipt_id, authority"
+            f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?, ?)",
             (
                 receipt_id,
                 operation_id,
@@ -4468,6 +4567,7 @@ class HoldStore:
                 expected_hold_receipt_id,
                 prior_hold_receipt_id,
                 resulting_hold_receipt_id,
+                authority.value,
             ),
         )
         receipt_row = await self._read_receipt_by_operation(operation_id)
@@ -4503,9 +4603,14 @@ class HoldStore:
         actor_id: str,
         reason: str,
         operation_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
-        """Set or replace one latch and append an immutable receipt."""
+        """Set or replace one latch and append an immutable receipt.
+
+        ``authority`` is required: the door that resolved the caller's
+        authority records it, so a reader never infers it from ``actor_id``.
+        """
 
         try:
             async with self._evidence_protocol():
@@ -4514,6 +4619,7 @@ class HoldStore:
                     actor_id=actor_id,
                     reason=reason,
                     operation_id=operation_id,
+                    authority=authority,
                     target_id=target_id,
                 )
         except Exception as exc:
@@ -4532,6 +4638,7 @@ class HoldStore:
         actor_id: str,
         reason: str,
         operation_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
@@ -4539,6 +4646,7 @@ class HoldStore:
         actor = _required_text(actor_id, "actor_id")
         why = _required_text(reason, "reason")
         operation = _required_text(operation_id, "operation_id")
+        recorded_authority = _required_authority(authority)
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -4567,10 +4675,22 @@ class HoldStore:
                     reason=why,
                     actor_id=actor,
                     expected_hold_receipt_id="",
+                    authority=recorded_authority,
                 )
                 return HoldMutation(receipt=replay, current=prior)
 
-            if prior is not None and prior.actor_id == actor and prior.reason == why:
+            # A prior latch set by the same actor for the same reason under a
+            # different authority is not the same latch: re-apply it so the
+            # current authority receipt names what the caller acted under.
+            prior_authority = (
+                await self._latch_authority(prior) if prior is not None else None
+            )
+            if (
+                prior is not None
+                and prior.actor_id == actor
+                and prior.reason == why
+                and prior_authority is recorded_authority
+            ):
                 receipt = await self._insert_receipt(
                     operation_id=operation,
                     action=HoldAction.HOLD,
@@ -4582,6 +4702,7 @@ class HoldStore:
                     expected_hold_receipt_id="",
                     prior_hold_receipt_id=prior.hold_receipt_id,
                     resulting_hold_receipt_id=prior.hold_receipt_id,
+                    authority=recorded_authority,
                 )
                 current = prior
             else:
@@ -4597,6 +4718,7 @@ class HoldStore:
                     expected_hold_receipt_id="",
                     prior_hold_receipt_id=(prior.hold_receipt_id if prior else ""),
                     resulting_hold_receipt_id=receipt_id,
+                    authority=recorded_authority,
                     receipt_id=receipt_id,
                 )
                 await self._db.execute(
@@ -4631,6 +4753,7 @@ class HoldStore:
         reason: str,
         operation_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         """Release exactly the observed latch, refusing a stale release."""
@@ -4643,6 +4766,7 @@ class HoldStore:
                     reason=reason,
                     operation_id=operation_id,
                     expected_hold_receipt_id=expected_hold_receipt_id,
+                    authority=authority,
                     target_id=target_id,
                 )
         except Exception as exc:
@@ -4659,6 +4783,7 @@ class HoldStore:
         reason: str,
         operation_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
@@ -4669,6 +4794,7 @@ class HoldStore:
         expected = _required_text(
             expected_hold_receipt_id, "expected_hold_receipt_id"
         )
+        recorded_authority = _required_authority(authority)
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -4697,6 +4823,7 @@ class HoldStore:
                     reason=why,
                     actor_id=actor,
                     expected_hold_receipt_id=expected,
+                    authority=recorded_authority,
                 )
                 return HoldMutation(receipt=replay, current=prior)
 
@@ -4724,6 +4851,7 @@ class HoldStore:
                 expected_hold_receipt_id=expected,
                 prior_hold_receipt_id=prior_receipt_id,
                 resulting_hold_receipt_id=resulting_receipt_id,
+                authority=recorded_authority,
             )
             if disposition is HoldDisposition.APPLIED:
                 await self._db.execute(
@@ -4862,6 +4990,43 @@ class HoldStore:
                 raise domain_error from exc
             raise
 
+    async def get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        """Read one receipt by its receipt id, under the same proof as above.
+
+        A latch names its authority receipt by receipt id, not by the
+        operation id that created it; this is how a reader learns the
+        recorded authority behind a current latch.
+        """
+
+        try:
+            async with self._evidence_protocol():
+                return await self._get_receipt_by_id(receipt_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            # As in ``list_receipts``: a reader is promised a typed "history is
+            # unreadable", never a raw backend error.
+            if isinstance(exc, DatabaseError):
+                raise HoldStateError("Hold receipt could not be read") from exc
+            raise
+
+    async def _get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        identity = _required_text(receipt_id, "receipt_id")
+        async with self._db.transaction():
+            await self._lock_read_history()
+            row = await self._read_receipt_by_id(identity)
+            if row is None:
+                await self._assert_global_history_intact()
+                return None
+            operation = _receipt_from_row(row).operation_id
+            receipt = await self._validated_receipt_locked(operation)
+            if receipt is None or receipt.receipt_id != identity:
+                raise HoldCorruptStateError(
+                    "Hold operation witness does not match receipt identity"
+                )
+            return receipt
+
     async def _get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         """Read one receipt only after proving its target authority graph."""
 
@@ -4871,21 +5036,28 @@ class HoldStore:
             # Lock it before the first witness query; otherwise READ COMMITTED
             # can stitch together rows from opposite sides of a writer commit.
             await self._lock_read_history()
-            row = await self._validate_operation_witness(operation)
-            if row is None:
-                await self._assert_global_history_intact()
-                return None
-            receipt = _receipt_from_row(row)
-            targets = ((receipt.scope, receipt.target_id),)
-            await self._lock_read_targets(targets, history_locked=True)
-            await self._assert_host_latch_shape()
-            latch = _latch_from_row(
-                await self._read_latch_row(receipt.scope, receipt.target_id)
-            )
-            await self._validate_latch_projection(
-                latch, receipt.scope, receipt.target_id
-            )
-            return receipt
+            return await self._validated_receipt_locked(operation)
+
+    async def _validated_receipt_locked(
+        self, operation: str
+    ) -> Optional[HoldReceipt]:
+        """Prove one receipt's graph; the caller holds the read-history lock."""
+
+        row = await self._validate_operation_witness(operation)
+        if row is None:
+            await self._assert_global_history_intact()
+            return None
+        receipt = _receipt_from_row(row)
+        targets = ((receipt.scope, receipt.target_id),)
+        await self._lock_read_targets(targets, history_locked=True)
+        await self._assert_host_latch_shape()
+        latch = _latch_from_row(
+            await self._read_latch_row(receipt.scope, receipt.target_id)
+        )
+        await self._validate_latch_projection(
+            latch, receipt.scope, receipt.target_id
+        )
+        return receipt
 
 
 def _sqlite_backend_custody_artifacts(database: Path) -> tuple[Path, ...]:

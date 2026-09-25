@@ -35,7 +35,7 @@ from kestrel_sovereign.endpoints.receipt_feed import (
     disclosable_identity,
     resolve_page_size,
 )
-from kestrel_sovereign.hold import HoldScope, HoldStore
+from kestrel_sovereign.hold import HoldAuthority, HoldScope, HoldStore
 from kestrel_sovereign.stop import (
     CancellationAuthority,
     CooperativeStopTarget,
@@ -799,6 +799,7 @@ async def test_a_stalled_clock_cannot_sort_a_later_hold_behind_a_cursor(
     _freeze_database_clock(monkeypatch, "sqlite")
 
     await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=f"{ALPHA}-0",
         actor_id=OPERATOR,
@@ -809,6 +810,7 @@ async def test_a_stalled_clock_cannot_sort_a_later_hold_behind_a_cursor(
     assert len(seen) == 1
     for index in range(1, 6):
         await hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=f"{ALPHA}-{index}",
             actor_id=OPERATOR,
@@ -1180,6 +1182,7 @@ async def test_a_sub_millisecond_window_bounds_hold_receipts_exactly(
 ):
     _pin_sqlite_clock(monkeypatch, _SUB_MS_STORED)
     held = await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1300,6 +1303,7 @@ async def test_the_last_storable_tick_is_a_usable_bound_on_real_sqlite_stores(
         await stop_store.ensure_schema()
         await _record_agent_stop(stop_store, ALPHA, "op-latest-bound")
         await hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=ALPHA,
             actor_id=OPERATOR,
@@ -1344,6 +1348,7 @@ async def test_a_resume_is_its_own_receipt_and_does_not_erase_the_hold(
     """
 
     held = await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1351,6 +1356,7 @@ async def test_a_resume_is_its_own_receipt_and_does_not_erase_the_hold(
         operation_id="op-hold",
     )
     released = await hold_store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1392,6 +1398,7 @@ async def test_a_pre_sequence_hold_database_upgrades_with_its_evidence_intact(
         await store.ensure_schema()
         for index in range(3):
             await store.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope=HoldScope.AGENT,
                 target_id=f"{ALPHA}-{index}",
                 actor_id=OPERATOR,
@@ -1417,6 +1424,7 @@ async def test_a_pre_sequence_hold_database_upgrades_with_its_evidence_intact(
         assert [e.feed_seq for e in page.entries] == [1, 2, 3]
         # And a new append continues the sequence.
         await upgraded.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=BETA,
             actor_id=OPERATOR,
@@ -1436,6 +1444,7 @@ async def test_refused_and_already_in_state_are_real_operator_acts(hold_store):
     """R5. They are returned, not filtered: somebody really did ask."""
 
     held = await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1445,6 +1454,7 @@ async def test_refused_and_already_in_state_are_real_operator_acts(hold_store):
     # Same actor, same reason: the latch is already exactly what was asked
     # for, so the act is recorded as already-in-state rather than re-applied.
     await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1452,6 +1462,7 @@ async def test_refused_and_already_in_state_are_real_operator_acts(hold_store):
         operation_id="op-hold-again",
     )
     await hold_store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1473,6 +1484,7 @@ async def test_refused_and_already_in_state_are_real_operator_acts(hold_store):
 async def test_hold_history_pages_in_a_total_order(hold_store):
     for index in range(4):
         await hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=f"{ALPHA}-{index}",
             actor_id=OPERATOR,
@@ -1497,12 +1509,14 @@ async def test_hold_history_pages_in_a_total_order(hold_store):
 @pytest.mark.asyncio
 async def test_hold_history_filters_by_scope_and_target(hold_store):
     await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.HOST,
         actor_id=OPERATOR,
         reason="fleet freeze",
         operation_id="op-host",
     )
     await hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id=ALPHA,
         actor_id=OPERATOR,
@@ -1575,6 +1589,7 @@ async def test_the_hold_route_versions_its_payload(tmp_path):
         store = HoldStore(db)
         await store.ensure_schema()
         held = await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=ALPHA,
             actor_id=OPERATOR,
@@ -1582,6 +1597,7 @@ async def test_the_hold_route_versions_its_payload(tmp_path):
             operation_id="op-hold",
         )
         await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=ALPHA,
             actor_id=OPERATOR,

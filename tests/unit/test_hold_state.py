@@ -18,6 +18,7 @@ import pytest
 
 from kestrel_sovereign.hold import (
     HoldAction,
+    HoldAuthority,
     HoldDisposition,
     HoldIdempotencyConflict,
     HoldReceipt,
@@ -427,12 +428,14 @@ async def test_absent_hold_table_accepts_occupied_repair_index_name(tmp_path):
 async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
     _db, store = hold_db
     host = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.HOST,
         actor_id="did:sovereign:operator",
         reason="fleet investigation",
         operation_id="hold-host-1",
     )
     agent = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.AGENT,
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -447,6 +450,7 @@ async def test_host_and_agent_holds_compose_and_release_independently(hold_db):
     assert effective.agent == agent.current
 
     released = await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=HoldScope.HOST,
         actor_id="did:sovereign:operator",
         reason="fleet cleared",
@@ -493,6 +497,7 @@ async def test_state_and_receipts_survive_database_restart(tmp_path):
     first = HoldStore(first_db)
     await first.ensure_schema()
     mutation = await first.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:durable",
         actor_id="did:sovereign:operator",
@@ -526,6 +531,7 @@ async def test_sqlite_custody_survives_complete_data_root_relocation(tmp_path):
     context = await build_host_context(db_path=str(original_db))
     assert context.hold_store is not None, context.backend_error
     mutation = await context.hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:relocated",
         actor_id="did:operator:sovereign",
@@ -762,6 +768,7 @@ async def test_surviving_hold_authority_fails_closed_after_projection_loss(
 ):
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -788,6 +795,7 @@ async def test_surviving_hold_authority_fails_closed_after_projection_loss(
             await store.get_effective("did:agent:kite")
         elif operation == "set":
             await store.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:operator",
@@ -796,6 +804,7 @@ async def test_surviving_hold_authority_fails_closed_after_projection_loss(
             )
         else:
             await store.release_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:operator",
@@ -811,6 +820,7 @@ async def test_cyclic_applied_hold_history_fails_closed_when_projection_is_unhel
 ):
     db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -818,6 +828,7 @@ async def test_cyclic_applied_hold_history_fails_closed_when_projection_is_unhel
         operation_id="cycle-first",
     )
     second = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -846,6 +857,7 @@ async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:closed-history",
         actor_id="did:sovereign:operator",
@@ -853,6 +865,7 @@ async def test_inactive_revision_rejects_deleted_closed_receipt_chain(hold_db):
         operation_id="closed-history-hold",
     )
     await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:closed-history",
         actor_id="did:sovereign:operator",
@@ -878,6 +891,7 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
 
     db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:non-applied-loss",
         actor_id="did:sovereign:operator",
@@ -885,6 +899,7 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
         operation_id="first-applied",
     )
     duplicate = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:non-applied-loss",
         actor_id="did:sovereign:operator",
@@ -893,6 +908,7 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
     )
     assert duplicate.receipt.disposition is HoldDisposition.ALREADY_IN_STATE
     replacement = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:non-applied-loss",
         actor_id="did:sovereign:operator",
@@ -907,6 +923,7 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
 
     with pytest.raises(HoldCorruptStateError, match="receipt-count"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:non-applied-loss",
             actor_id="did:sovereign:operator",
@@ -924,6 +941,7 @@ async def test_deleted_non_applied_receipt_cannot_reapply_old_operation(hold_db)
 async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db):
     db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -931,6 +949,7 @@ async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db)
         operation_id="rewind-first",
     )
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -953,6 +972,7 @@ async def test_release_rejects_latch_rewound_to_consumed_hold_authority(hold_db)
 
     with pytest.raises(HoldCorruptStateError, match="terminal authority"):
         await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -973,6 +993,7 @@ async def test_host_context_reads_hold_store_from_control_database_at_boot(tmp_p
         assert first.hold_store is not None
         assert first.hold_store._history_anchor_path == hold_history_anchor_path(path)
         held = await first.hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:boot-held",
             actor_id="did:sovereign:operator",
@@ -1008,6 +1029,7 @@ async def test_boot_validates_global_history_once_for_all_targets(
     _db, store = hold_db
     for index in range(3):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id=f"did:agent:boot-{index}",
             actor_id="did:sovereign:operator",
@@ -1261,6 +1283,7 @@ async def test_host_context_refuses_sqlite_to_postgres_hold_backend_switch(
     try:
         assert first.hold_store is not None, first.backend_error
         mutation = await first.hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="host",
             actor_id="did:sovereign:operator",
             reason="must not disappear during backend selection",
@@ -1410,6 +1433,7 @@ async def test_postgres_claim_refuses_surviving_sqlite_custody_evidence(
     first = await build_host_context(db_path=str(database))
     assert first.hold_store is not None, first.backend_error
     await first.hold_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="host",
         actor_id="did:sovereign:operator",
         reason="surviving SQLite evidence remains authoritative",
@@ -2052,6 +2076,7 @@ async def test_cancel_during_failed_host_bootstrap_cleanup_propagates(
 async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:receipt-history",
         actor_id="did:sovereign:operator",
@@ -2059,6 +2084,7 @@ async def test_receipt_lookup_rejects_missing_authority_history(hold_db):
         operation_id="receipt-authority-hold",
     )
     released = await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:receipt-history",
         actor_id="did:sovereign:operator",
@@ -2086,6 +2112,7 @@ async def test_non_applied_receipt_rejects_missing_referenced_authority(
 
     db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:non-applied-history",
         actor_id="did:sovereign:operator",
@@ -2094,6 +2121,7 @@ async def test_non_applied_receipt_rejects_missing_referenced_authority(
     )
     if disposition == "already_in_state":
         non_applied = await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:non-applied-history",
             actor_id="did:sovereign:operator",
@@ -2102,6 +2130,7 @@ async def test_non_applied_receipt_rejects_missing_referenced_authority(
         )
     else:
         second = await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:non-applied-history",
             actor_id="did:sovereign:operator",
@@ -2109,6 +2138,7 @@ async def test_non_applied_receipt_rejects_missing_referenced_authority(
             operation_id="refused-stale-second",
         )
         non_applied = await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:non-applied-history",
             actor_id="did:sovereign:operator",
@@ -2137,6 +2167,7 @@ async def test_non_applied_receipt_rejects_missing_referenced_authority(
 async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:one",
         actor_id="did:sovereign:operator",
@@ -2144,6 +2175,7 @@ async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
         operation_id="same-operation",
     )
     replay = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:one",
         actor_id="did:sovereign:operator",
@@ -2155,6 +2187,7 @@ async def test_operation_replay_is_exact_and_conflicting_reuse_fails(hold_db):
 
     with pytest.raises(HoldIdempotencyConflict):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:two",
             actor_id="did:sovereign:operator",
@@ -2305,6 +2338,7 @@ async def test_fractional_latch_revision_fails_closed(hold_db):
 
     db, store = hold_db
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:fractional-revision",
         actor_id="did:sovereign:operator",
@@ -2359,6 +2393,7 @@ async def test_fractional_latch_active_flag_fails_closed(tmp_path):
 async def test_repeated_semantic_hold_is_receipted_without_replacing_latch(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -2366,6 +2401,7 @@ async def test_repeated_semantic_hold_is_receipted_without_replacing_latch(hold_
         operation_id="hold-once",
     )
     second = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -2383,6 +2419,7 @@ async def test_repeated_semantic_hold_is_receipted_without_replacing_latch(hold_
 async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:mutated-receipt",
         actor_id="did:sovereign:operator",
@@ -2390,6 +2427,7 @@ async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
         operation_id="immutable-hold-operation",
     )
     await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:mutated-receipt",
         actor_id="did:sovereign:operator",
@@ -2404,6 +2442,7 @@ async def test_mutated_receipt_content_cannot_reopen_an_operation_id(hold_db):
 
     with pytest.raises(HoldCorruptStateError, match="content witness"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:mutated-receipt",
             actor_id="did:sovereign:operator",
@@ -2420,6 +2459,7 @@ async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
 
     db, store = hold_db
     original = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:original-operation-owner",
         actor_id="did:sovereign:operator",
@@ -2433,6 +2473,7 @@ async def test_deleted_receipt_operation_id_cannot_be_rebound_to_other_target(
 
     with pytest.raises(HoldCorruptStateError, match="missing receipt"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:attempted-new-owner",
             actor_id="did:sovereign:operator",
@@ -2455,6 +2496,7 @@ async def test_orphaned_operation_witness_fails_closed_on_read_and_restart(hold_
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:orphaned-operation",
         actor_id="did:sovereign:operator",
@@ -2505,6 +2547,7 @@ async def test_every_global_read_rejects_receipt_missing_operation_witness(hold_
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:missing-operation-witness",
         actor_id="did:sovereign:operator",
@@ -2530,6 +2573,7 @@ async def test_every_global_read_rejects_duplicate_operation_witness(hold_db):
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:duplicate-operation-witness",
         actor_id="did:sovereign:operator",
@@ -2580,6 +2624,7 @@ async def test_boot_discovers_target_retained_only_by_content_and_count_witnesse
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:witness-only-target",
         actor_id="did:sovereign:operator",
@@ -2612,6 +2657,7 @@ async def test_completed_witness_migration_never_reblesses_missing_evidence(
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:backfill",
         actor_id="did:sovereign:operator",
@@ -2655,6 +2701,7 @@ async def test_initialized_store_rejects_deleted_witness_migration_marker(hold_d
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:deleted-migration-marker",
         actor_id="did:sovereign:operator",
@@ -2691,6 +2738,7 @@ async def test_external_history_anchor_rejects_wholesale_active_target_erasure(
 
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:wholesale-erasure",
         actor_id="did:sovereign:operator",
@@ -2727,6 +2775,7 @@ async def test_external_history_anchor_rejects_wholesale_active_target_erasure(
             await store.get_effective(held.receipt.target_id)
         else:
             await store.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id=held.receipt.target_id,
                 actor_id="did:sovereign:operator",
@@ -2739,6 +2788,7 @@ async def test_external_history_anchor_rejects_wholesale_active_target_erasure(
 async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     _db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:one",
@@ -2746,6 +2796,7 @@ async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
         operation_id="hold-first",
     )
     second = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:two",
@@ -2754,6 +2805,7 @@ async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
     )
 
     stale = await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:one",
@@ -2770,6 +2822,7 @@ async def test_stale_release_cannot_clear_a_replaced_hold(hold_db):
 async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:kite",
         actor_id="did:sovereign:operator",
@@ -2783,6 +2836,7 @@ async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
 
     with pytest.raises(HoldCorruptStateError, match="missing authority receipt"):
         await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -2810,6 +2864,7 @@ async def test_release_rejects_latch_with_missing_authority_receipt(hold_db):
 async def test_release_rejects_latch_bound_to_another_targets_receipt(hold_db):
     db, store = hold_db
     first = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:first",
         actor_id="did:sovereign:operator",
@@ -2817,6 +2872,7 @@ async def test_release_rejects_latch_bound_to_another_targets_receipt(hold_db):
         operation_id="hold-first-target",
     )
     other = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:other",
         actor_id="did:sovereign:operator",
@@ -2831,6 +2887,7 @@ async def test_release_rejects_latch_bound_to_another_targets_receipt(hold_db):
 
     with pytest.raises(HoldCorruptStateError, match="does not match"):
         await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:first",
             actor_id="did:sovereign:operator",
@@ -2864,6 +2921,7 @@ async def test_mutation_locks_host_shape_only_for_host_scope(
     monkeypatch.setattr(store, "_assert_host_latch_shape", inspect_shape)
 
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope=scope,
         target_id=target_id,
         actor_id="did:sovereign:operator",
@@ -2886,6 +2944,7 @@ async def test_receipt_and_latch_roll_back_as_one_unit(hold_db, monkeypatch):
     monkeypatch.setattr(store, "_insert_receipt", fail_after_receipt)
     with pytest.raises(Exception, match="injected crash"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -2913,6 +2972,7 @@ async def test_failed_sqlite_mutation_does_not_publish_rolled_back_anchor(
     monkeypatch.setattr(store, "_stage_history_candidate", fail_after_staging)
     with pytest.raises(Exception, match="after anchor staging"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:rolled-back-anchor",
             actor_id="did:sovereign:operator",
@@ -2933,6 +2993,7 @@ async def test_failed_sqlite_release_removes_known_rolled_back_candidate(
 
     _db, store = hold_db
     applied = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:failed-release",
         actor_id="did:sovereign:operator",
@@ -2948,6 +3009,7 @@ async def test_failed_sqlite_release_removes_known_rolled_back_candidate(
     monkeypatch.setattr(store, "_stage_history_candidate", fail_after_staging)
     with pytest.raises(Exception, match="release failure after anchor staging"):
         await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:failed-release",
             actor_id="did:sovereign:operator",
@@ -2978,6 +3040,7 @@ async def test_committed_sqlite_mutation_recovers_interrupted_anchor_promotion(
     monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
     with pytest.raises(RuntimeError, match="before anchor promotion"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:committed-candidate",
             actor_id="did:sovereign:operator",
@@ -3013,6 +3076,7 @@ async def test_stale_candidate_cannot_replace_a_newer_stable_anchor(
     monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
     with pytest.raises(RuntimeError, match="before first promotion"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:stale-candidate",
             actor_id="did:sovereign:operator",
@@ -3027,6 +3091,7 @@ async def test_stale_candidate_cannot_replace_a_newer_stable_anchor(
     store = HoldStore(db)
     await store.ensure_schema()
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:stale-candidate",
         actor_id="did:sovereign:operator",
@@ -3078,6 +3143,7 @@ async def test_sqlite_staged_evidence_rejects_ambiguous_primary_restore(
     monkeypatch.setattr(store, "_finish_history_publication", interrupt_promotion)
     with pytest.raises(RuntimeError, match="after primary commit"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:ambiguous-publication",
             actor_id="did:sovereign:operator",
@@ -3157,6 +3223,7 @@ async def test_postgres_external_candidate_recovers_committed_mutation(
     monkeypatch.setattr(store, "_complete_history_publication", interrupt_promotion)
     with pytest.raises(RuntimeError, match="after primary commit"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:pg-publication",
             actor_id="did:sovereign:operator",
@@ -3251,6 +3318,7 @@ async def test_postgres_rollback_candidate_cleanup_survives_repeated_cancellatio
     )
     mutation = asyncio.create_task(
         store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:cancelled-publication",
             actor_id="did:sovereign:operator",
@@ -3312,6 +3380,7 @@ async def test_sqlite_reader_waits_for_database_and_anchor_publication(
     monkeypatch.setattr(writer, "_prepare_history_publication", pause_after_staging)
     mutation = asyncio.create_task(
         writer.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:serialized-reader",
             actor_id="did:sovereign:operator",
@@ -3427,6 +3496,7 @@ async def test_existing_foreign_host_receipt_fails_closed_on_every_state_path(
         await store.get_effective("did:agent:kite")
     with pytest.raises(HoldCorruptStateError, match="foreign target"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -3444,6 +3514,7 @@ async def test_state_read_validates_projection_inside_one_locked_snapshot(
 ):
     db, store = hold_db
     held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:snapshot",
         actor_id="did:sovereign:operator",
@@ -4788,6 +4859,7 @@ def test_authority_graph_walk_is_linear_in_number_of_receipts():
             expected_hold_receipt_id="",
             prior_hold_receipt_id=previous,
             resulting_hold_receipt_id=receipt_id,
+            authority=HoldAuthority.SOVEREIGN,
         )
         authorities[receipt_id] = receipt
         if previous:
@@ -4830,6 +4902,7 @@ async def test_upgraded_foreign_host_row_fails_closed_for_reads_and_mutation(
             await store.get_effective("did:agent:kite")
         with pytest.raises(HoldCorruptStateError, match="foreign target"):
             await store.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:operator",
@@ -4851,6 +4924,7 @@ async def test_external_initialization_witness_rejects_total_hold_schema_loss(
     first = HoldStore(first_db)
     await first.ensure_schema()
     await first.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:held-before-loss",
         actor_id="did:sovereign:operator",
@@ -4895,6 +4969,7 @@ async def test_external_history_anchor_rejects_empty_initialized_backup_restore(
     held_store = HoldStore(held_db)
     await held_store.ensure_schema()
     await held_store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:rolled-back",
         actor_id="did:sovereign:operator",
@@ -4932,6 +5007,7 @@ async def test_custody_head_rejects_synchronized_sqlite_family_rollback(
     held = HoldStore(held_db)
     await held.ensure_schema()
     mutation = await held.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="host",
         actor_id="did:sovereign:operator",
         reason="must survive a synchronized family restore",
@@ -4974,6 +5050,7 @@ async def test_sqlite_recovers_anchor_published_before_custody_head(
     )
     with pytest.raises(RuntimeError, match="before custody head"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="host",
             actor_id="did:sovereign:operator",
             reason="committed before external publication completed",
@@ -5238,6 +5315,7 @@ async def test_bootstrap_intent_cannot_reanchor_different_receipt_history(tmp_pa
     store = HoldStore(db)
     await store.ensure_schema()
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="host",
         actor_id="did:sovereign:operator",
         reason="survives evidence restore",
@@ -5274,6 +5352,7 @@ async def test_stale_bootstrap_intent_cannot_replace_a_newer_stable_anchor(
     store = HoldStore(db)
     await store.ensure_schema()
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:stale-bootstrap",
         actor_id="did:sovereign:operator",
@@ -5288,6 +5367,7 @@ async def test_stale_bootstrap_intent_cannot_replace_a_newer_stable_anchor(
     store = HoldStore(db)
     await store.ensure_schema()
     await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
         scope="agent",
         target_id="did:agent:stale-bootstrap",
         actor_id="did:sovereign:operator",
@@ -5387,6 +5467,7 @@ async def test_legacy_latch_without_unique_key_is_repaired_before_ready(tmp_path
     try:
         await store.ensure_schema()
         mutation = await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:keyless-legacy",
             actor_id="did:sovereign:operator",
@@ -5554,6 +5635,7 @@ async def test_malformed_applied_hold_replay_fails_closed(
 
     with pytest.raises(HoldCorruptStateError, match="receipt invariant"):
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -5636,6 +5718,7 @@ async def test_mutations_preserve_typed_corrupt_state_error(
     with pytest.raises(HoldCorruptStateError, match="active flag"):
         if operation == "set":
             await store.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:operator",
@@ -5644,6 +5727,7 @@ async def test_mutations_preserve_typed_corrupt_state_error(
             )
         else:
             await store.release_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:operator",
@@ -5669,6 +5753,7 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
     try:
         results = await asyncio.gather(
             one.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:one",
@@ -5676,6 +5761,7 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
                 operation_id="race-one",
             ),
             two.set_hold(
+                authority=HoldAuthority.SOVEREIGN,
                 scope="agent",
                 target_id="did:agent:kite",
                 actor_id="did:sovereign:two",
@@ -5689,6 +5775,7 @@ async def test_two_sqlite_workers_serialize_replacement_and_stale_release(tmp_pa
         loser = next(item for item in results if item.receipt != winner.receipt)
 
         stale = await two.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:kite",
             actor_id="did:sovereign:operator",
@@ -5794,6 +5881,7 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
     release_operation = f"release-{suffix}"
     try:
         held = await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id=target,
             actor_id="did:sovereign:operator",
@@ -5801,6 +5889,7 @@ async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
             operation_id=hold_operation,
         )
         released = await store.release_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id=target,
             actor_id="did:sovereign:operator",
@@ -6093,6 +6182,7 @@ async def test_host_boot_adopts_unused_schema_left_without_evidence(
             database
         )
         mutation = await context.hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="agent",
             target_id="did:agent:after-adoption",
             actor_id="did:sovereign:operator",

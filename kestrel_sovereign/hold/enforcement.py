@@ -355,15 +355,21 @@ def _hold_scoped_agent_did(agent: Any) -> str:
         ) from error
 
 
-async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:
-    """Read the effective Hold snapshot for an explicitly bound runtime."""
+def bound_hold_store(agent: Any) -> Any:
+    """Return the Hold store the trusted runtime bound to ``agent``, if any."""
 
     # Use the instance namespace so proxy objects cannot fabricate a binding
     # through ``__getattr__`` and accidentally activate this authority seam.
     try:
-        store = vars(agent).get("_hold_store")
+        return vars(agent).get("_hold_store")
     except TypeError:
-        store = None
+        return None
+
+
+async def get_effective_hold_state(agent: Any) -> EffectiveHoldState | None:
+    """Read the effective Hold snapshot for an explicitly bound runtime."""
+
+    store = bound_hold_store(agent)
     if store is None:
         return None
 
