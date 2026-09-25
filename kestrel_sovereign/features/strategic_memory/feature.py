@@ -36,7 +36,7 @@ from kestrel_sovereign.features.enum_coerce import normalize_choice as _normaliz
 from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
 from .blocker_reconcile import AMBIGUOUS_REPO, check_blockers, configured_repos
 from .decision_index import decision_entries, project_decisions
-from .issue_selection import pick_top_issue
+from .issue_selection import describe_exclusion, pick_top_issue
 from .ledger import (
     BLOCKERS_KEY,
     LEDGER_FILENAME,
@@ -1728,9 +1728,19 @@ class StrategicMemoryFeature(Feature):
                 },
             )
 
-        selection: Dict[str, int] = {}
+        selection: Dict[str, Any] = {}
         issue = await pick_top_issue(self._strategy_data_view(), selection)
         workflow_name = self._dispatch_workflow_name()
+        # Candidates passed over because a pull request already works them
+        # (#3317). Every outcome carries them: "skipped #3310 -- PR #3311
+        # open" is what an orchestrator reading the run needs, not a silence.
+        skipped = list(selection.get("open_pr_exclusions") or [])
+        skipped_text = (
+            "\n**Skipped:**\n"
+            + "\n".join(f"- {describe_exclusion(entry)}" for entry in skipped)
+            if skipped
+            else ""
+        )
         checked = selection.get("blockers_checked", 0)
         if not issue and checked and selection.get("blockers_unreadable") == checked:
             # Every blocker it tried to confirm came back unreadable. Before
@@ -1745,6 +1755,7 @@ class StrategicMemoryFeature(Feature):
                     + f"\nCould not confirm any of {checked} blocker issue(s) with "
                     "GitHub -- every read was unreadable. Nothing was dispatched; "
                     "this is not the same as having nothing to do."
+                    + skipped_text
                 ),
                 error="GitHub could not confirm any blocker issue",
                 data={
@@ -1752,6 +1763,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": None,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "BLOCKERS_UNCONFIRMED",
                     "blockers_checked": checked,
                 },
@@ -1762,12 +1774,14 @@ class StrategicMemoryFeature(Feature):
                     "## Signal Dispatch"
                     + (" (suggest)" if mode == "suggest" else "")
                     + "\nNo actionable issue found."
+                    + skipped_text
                 ),
                 data={
                     "mode": mode,
                     "issue": None,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                 },
             )
 
@@ -1780,6 +1794,7 @@ class StrategicMemoryFeature(Feature):
                 f"**Context:** {issue.get('context', 'N/A')}\n\n"
                 f"Execute mode will request the contributed `{workflow_name}` "
                 "workflow; no work was started by this preview."
+                + skipped_text
             )
             return ToolResult.ok(
                 confirmation=body,
@@ -1788,6 +1803,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": issue,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "body": body,
                 },
             )
@@ -1804,6 +1820,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": issue,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "DISPATCH_CAPABILITY_UNAVAILABLE",
                 },
             )
@@ -1819,6 +1836,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": issue,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "GOVERNED_DISPATCH_UNAVAILABLE",
                 },
             )
@@ -1852,6 +1870,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": issue,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "WORKFLOW_RUNNER_UNAVAILABLE",
                 },
             )
@@ -1869,6 +1888,7 @@ class StrategicMemoryFeature(Feature):
                     "issue": issue,
                     "workflow": workflow_name,
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "WORKFLOW_RUNNER_FAILED",
                 },
             )
@@ -1898,6 +1918,7 @@ class StrategicMemoryFeature(Feature):
                     "workflow": workflow_name,
                     "capability_owner": getattr(registration, "owner", ""),
                     "dispatched": False,
+                    "skipped": skipped,
                     "reason_code": "WORKFLOW_RUN_REJECTED",
                     "runner_result": runner_payload,
                 },
@@ -1909,6 +1930,7 @@ class StrategicMemoryFeature(Feature):
             f"Dispatch workflow '{workflow_name}' accepted "
             f"{issue['repo']}#{issue['issue_number']}"
             + (f" as run {run_id}." if run_id else ".")
+            + skipped_text
         )
         return ToolResult.ok(
             confirmation=body,
@@ -1919,6 +1941,7 @@ class StrategicMemoryFeature(Feature):
                 "workflow_run_id": run_id,
                 "capability_owner": getattr(registration, "owner", ""),
                 "dispatched": True,
+                "skipped": skipped,
                 "runner_result": runner_payload,
             },
         )
