@@ -349,7 +349,6 @@ class TestUsageTrackingIntegration:
     async def test_track_model_usage_receives_tokens(self):
         """Verify _track_model_usage is called with non-zero token count."""
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.llm.adapter import LLMResponse
 
         # Create service and mock the tracking method
         service = LLMService()
@@ -398,7 +397,6 @@ class TestUsageTrackingIntegration:
     async def test_track_model_usage_with_model_override(self):
         """Verify get_response_with_model also tracks tokens."""
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.llm.adapter import LLMResponse
 
         service = LLMService()
         tracked_calls = []
