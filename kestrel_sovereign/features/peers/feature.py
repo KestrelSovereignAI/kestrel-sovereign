@@ -888,6 +888,7 @@ class PeersFeature(Feature):
             MAX_PEER_STOP_REASON_CHARS,
             PEER_STOP_A2A_VERB,
             encode_peer_stop_intent,
+            peer_stop_delivery_id,
         )
         from kestrel_sovereign.a2a.envelope_signing import (
             A2A_AUDIENCE_METADATA_KEY,
@@ -1063,10 +1064,17 @@ class PeersFeature(Feature):
         receipt_signal_id = signal_receipt.get("signal_id")
         receipt_status_value = signal_receipt.get("status")
         receipt_detail = signal_receipt.get("detail")
+        receipt_kind = response.get("receipt_kind")
         if (
             not isinstance(receipt_signal_id, str)
-            or not receipt_signal_id
-            or not isinstance(receipt_status_value, str)
+            or not receipt_signal_id.strip()
+            or receipt_kind not in {"operation", "delivery"}
+            # Only a delivery can be refused before any dispatcher decision.
+            or not (
+                isinstance(receipt_status_value, str)
+                or (receipt_status_value is None and receipt_kind == "delivery")
+            )
+            or "status" not in signal_receipt
             or "detail" not in signal_receipt
             or (receipt_detail is not None and not isinstance(receipt_detail, str))
         ):
@@ -1074,13 +1082,14 @@ class PeersFeature(Feature):
                 "Peer returned a malformed Stop receipt",
                 data={"stopped": False, "recipient": recipient},
             )
-        try:
-            Status(receipt_status_value)
-        except ValueError:
-            return ToolResult.failed(
-                "Peer returned a malformed Stop receipt",
-                data={"stopped": False, "recipient": recipient},
-            )
+        if receipt_status_value is not None:
+            try:
+                Status(receipt_status_value)
+            except ValueError:
+                return ToolResult.failed(
+                    "Peer returned a malformed Stop receipt",
+                    data={"stopped": False, "recipient": recipient},
+                )
         try:
             outcomes = [StopOutcome.from_dict(item) for item in raw_outcomes]
         except (KeyError, TypeError, ValueError):
@@ -1089,10 +1098,27 @@ class PeersFeature(Feature):
                 data={"stopped": False, "recipient": recipient},
             )
         stop_correlation_id = response.get("stop_correlation_id")
+        # The response names the one record its outcomes are (#3169): the
+        # Stop *operation*'s receipt (the handler's effect, or its replay), or
+        # a decision about this *delivery* alone (cycle/depth, rate limit,
+        # validation, identity reuse).  A delivery record is keyed by the
+        # signal it answers and can never report an effect.
+        delivery_correlation_id = peer_stop_delivery_id(receipt_signal_id)
+        if receipt_kind == "delivery":
+            record_matches = stop_correlation_id == delivery_correlation_id and all(
+                outcome.disposition
+                in {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
+                for outcome in outcomes
+            )
+        else:
+            record_matches = (
+                isinstance(stop_correlation_id, str)
+                and bool(stop_correlation_id.strip())
+                and stop_correlation_id != delivery_correlation_id
+            )
         if (
             response.get("correlation_id") != correlation_id
-            or not isinstance(stop_correlation_id, str)
-            or not stop_correlation_id
+            or not record_matches
             or len(outcomes) != 1
             or any(
                 outcome.agent_id != peer.agent_id
@@ -1114,8 +1140,9 @@ class PeersFeature(Feature):
 
         response["recipient"] = recipient
         response["recipient_agent_id"] = peer.agent_id
-        # A COALESCED retry is answered from the original receipt, so the
-        # outcomes, not the dispatcher status, say what happened.
+        # A retry is answered from the original receipt (or completes an
+        # interrupted Stop), so the outcomes, not the dispatcher status, say
+        # what happened.
         response["stopped"] = any(
             outcome.disposition is StopDisposition.STOPPED
             for outcome in outcomes

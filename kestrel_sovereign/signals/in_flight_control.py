@@ -15,7 +15,9 @@ would defeat it:
 * **Hold.** Hold declines to *begin* work (#3163).  Stop acts on work that is
   already running and needs no new turn, so a held agent must still receive it.
 * **Durable replay.** The marker is the complete durable projection; nothing
-  consumes it.  A repeated source event id is coalesced, never re-executed.
+  consumes it.  The dispatcher coalesces a repeated source event id and never
+  re-executes it; whether the action itself completed is the source's own
+  durable evidence to decide (peer Stop consults its Stop receipt).
 
 Everything else — validation, causation cycle and depth TTL, per-source rate
 limiting, the ``signal_log`` outcome audit — applies unchanged.

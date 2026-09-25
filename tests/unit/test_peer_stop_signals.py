@@ -47,7 +47,12 @@ from kestrel_sovereign.signals.sources.peer_stop import (
     encode_peer_stop_intent,
     peer_stop_operation_id,
 )
-from kestrel_sovereign.stop import StopCleanupRegistry, StopReceiptStore
+from kestrel_sovereign.stop import (
+    StopCleanupRegistry,
+    StopReceiptConflict,
+    StopReceiptStore,
+)
+from kestrel_sovereign.stop.receipt import StopOperationClaim
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
@@ -141,6 +146,17 @@ async def rail(tmp_path):
 async def _receipts(rail) -> list:
     page = await rail.receipts.list_receipts(limit=100)
     return list(page.receipts)
+
+
+async def _operation_receipt(rail, actor_id, correlation_id, **intent_fields):
+    """The receipt under one peer Stop's *operation* id, or ``None``."""
+
+    request = peer_stop.peer_stop_request(
+        target_agent_id=peer_stop.peer_stop_target_identity(rail.agent),
+        actor_id=actor_id,
+        intent=_intent(correlation_id=correlation_id, **intent_fields),
+    )
+    return await rail.receipts.load(request)
 
 
 # ---------------------------------------------------------------------------
@@ -494,13 +510,35 @@ async def test_rate_limit_is_shared_across_peers_and_outlives_a_retry(rail) -> N
         rail.agent, actor_id="did:test:late-peer", intent=_intent(correlation_id="x")
     )
     assert refused["signal_receipt"]["status"] == Status.DROPPED_RATE_LIMIT.value
-    # The refused request's retry is a replay of its refusal, not a new
-    # admission that could slip under a refilled budget.
+    [refusal] = refused["stop_outcomes"]
+    assert refusal["disposition"] == "refused"
+    assert "rate limits" in refusal["detail"]
+    # The refusal is the delivery's, receipted under its signal id; it never
+    # decides the operation.  A retry is therefore rate-limited again as its
+    # own delivery (a slot per attempt, so retrying cannot amplify) rather
+    # than replaying a refusal that would outlive the budget.
+    assert refusal["correlation_id"] == (
+        f"peer-stop-delivery:{refused['signal_receipt']['signal_id']}"
+    )
+    operation_id = peer_stop_operation_id("did:test:late-peer", "x")
+    assert await _operation_receipt(rail, "did:test:late-peer", "x") is None
     retry = await dispatch_peer_stop(
         rail.agent, actor_id="did:test:late-peer", intent=_intent(correlation_id="x")
     )
-    assert retry["signal_receipt"]["status"] == Status.COALESCED.value
-    assert retry["stop_outcomes"] == refused["stop_outcomes"]
+    assert retry["signal_receipt"]["status"] == Status.DROPPED_RATE_LIMIT.value
+    assert retry["stop_outcomes"][0]["disposition"] == "refused"
+    assert retry["stop_outcomes"][0]["correlation_id"] != refusal["correlation_id"]
+
+    # Once the budget refills, the same operation is admitted and executes.
+    cancelled_before = list(rail.agent.cancelled)
+    rail.agent._active_request_ids.add("req-live")
+    rail.dispatcher._rate = type(rail.dispatcher._rate)()
+    admitted = await dispatch_peer_stop(
+        rail.agent, actor_id="did:test:late-peer", intent=_intent(correlation_id="x")
+    )
+    assert admitted["stop_outcomes"][0]["disposition"] == "stopped"
+    assert admitted["stop_outcomes"][0]["correlation_id"] == operation_id
+    assert rail.agent.cancelled[len(cancelled_before):] == ["req-live"]
 
 
 @pytest.mark.asyncio
@@ -520,6 +558,275 @@ async def test_replay_is_idempotent_and_does_not_fan_out_again(rail) -> None:
     assert len(await _receipts(rail)) == 1
 
 
+async def _interrupt_after_source_event_commit(
+    rail, monkeypatch, correlation_id, **intent_fields
+):
+    """Cancel one peer Stop after its durable source event committed.
+
+    Everything past the commit (Hold, rate limit, locks, the handler) is
+    replaced by a hang, then the dispatch is cancelled: the process-loss
+    boundary where the dedup record exists but no Stop receipt does.
+    """
+
+    committed = asyncio.Event()
+    original = rail.dispatcher._route_after_durable_persistence
+
+    async def hang(signal, registration, start):
+        if signal.source != SOURCE_NAME:
+            return await original(signal, registration, start)
+        committed.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(rail.dispatcher, "_route_after_durable_persistence", hang)
+    first = asyncio.create_task(
+        dispatch_peer_stop(
+            rail.agent,
+            actor_id=PEER_DID,
+            intent=_intent(correlation_id=correlation_id, **intent_fields),
+        )
+    )
+    await asyncio.wait_for(committed.wait(), timeout=5)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    monkeypatch.setattr(rail.dispatcher, "_route_after_durable_persistence", original)
+    assert await _receipts(rail) == []
+    assert rail.agent.cancelled == []
+
+
+@pytest.mark.asyncio
+async def test_retry_completes_a_stop_interrupted_after_its_event_committed(
+    rail, monkeypatch
+) -> None:
+    """The receipt, not the dedup record, decides whether a Stop happened."""
+
+    rail.agent._active_request_ids.add("req-live")
+    await _interrupt_after_source_event_commit(rail, monkeypatch, "interrupted")
+
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="interrupted")
+    )
+
+    assert retry["signal_receipt"]["status"] == Status.OK.value
+    assert retry["stop_outcomes"][0]["disposition"] == "stopped"
+    assert rail.agent.cancelled == ["req-live"]
+    [receipt] = await _receipts(rail)
+    assert receipt.actor_id == PEER_DID
+
+    # Once the outcome is durable, a further retry is a pure replay.
+    rail.agent._active_request_ids.add("req-second")
+    replay = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="interrupted")
+    )
+    assert replay["signal_receipt"]["status"] == Status.COALESCED.value
+    assert replay["stop_outcomes"] == retry["stop_outcomes"]
+    assert rail.agent.cancelled == ["req-live"]
+    assert len(await _receipts(rail)) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovering_an_interrupted_stop_is_still_rate_limited(
+    rail, monkeypatch
+) -> None:
+    rail.agent._active_request_ids.add("req-live")
+    await _interrupt_after_source_event_commit(rail, monkeypatch, "late")
+    for index in range(PEER_STOP_RATE_LIMIT_BURST):
+        await dispatch_peer_stop(
+            rail.agent,
+            actor_id=PEER_DID,
+            intent=_intent(correlation_id=f"budget-{index}"),
+        )
+    cancelled_before = list(rail.agent.cancelled)
+
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="late")
+    )
+
+    assert retry["signal_receipt"]["status"] == Status.DROPPED_RATE_LIMIT.value
+    [refusal] = retry["stop_outcomes"]
+    assert refusal["disposition"] == "refused"
+    assert "rate limits" in refusal["detail"]
+    assert rail.agent.cancelled == cancelled_before
+    # The unadmitted retry is receipted under its own delivery id, never the
+    # operation id, so it cannot strand the Stop: once the budget frees (for
+    # example after the restart that interrupted it), a later retry completes
+    # the operation.
+    late_id = peer_stop_operation_id(PEER_DID, "late")
+    assert len(await _receipts(rail)) == PEER_STOP_RATE_LIMIT_BURST + 1
+    assert await _operation_receipt(rail, PEER_DID, "late") is None
+    assert refusal["correlation_id"] == (
+        f"peer-stop-delivery:{retry['signal_receipt']['signal_id']}"
+    )
+    # The response names the record it wrote: this delivery.
+    assert retry["receipt_kind"] == "delivery"
+    assert retry["stop_correlation_id"] == refusal["correlation_id"]
+    rail.dispatcher._rate = type(rail.dispatcher._rate)()
+    rail.agent._active_request_ids.add("req-after-restart")
+    completed = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="late")
+    )
+    assert completed["stop_correlation_id"] == late_id
+    assert completed["receipt_kind"] == "operation"
+    assert completed["recorded"] is True
+    assert completed["stop_outcomes"][0]["disposition"] == "stopped"
+    assert rail.agent.cancelled == [*cancelled_before, "req-after-restart"]
+    assert len(await _receipts(rail)) == PEER_STOP_RATE_LIMIT_BURST + 2
+
+
+@pytest.mark.asyncio
+async def test_unadmitted_retry_cannot_preempt_an_admitted_first_attempt(
+    rail, monkeypatch
+) -> None:
+    """A rate-limited retry must not write the outcome of an admitted attempt.
+
+    The first delivery passes the rate limit and is paused before it claims
+    the Stop operation.  The budget is then filled and the same operation is
+    retried: the retry is refused re-admission and must leave the operation's
+    receipt to the delivery that was admitted.
+    """
+
+    rail.agent._active_request_ids.add("req-live")
+    operation_id = peer_stop_operation_id(PEER_DID, "race")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_claim = rail.receipts.claim
+
+    async def gated_claim(request):
+        if request.correlation_id == operation_id and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await original_claim(request)
+
+    monkeypatch.setattr(rail.receipts, "claim", gated_claim)
+    first = asyncio.create_task(
+        dispatch_peer_stop(
+            rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="race")
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        for index in range(PEER_STOP_RATE_LIMIT_BURST - 1):
+            await dispatch_peer_stop(
+                rail.agent,
+                actor_id=PEER_DID,
+                # Turn scope at an absent turn: consumes the budget, stops
+                # nothing.
+                intent=_intent(
+                    correlation_id=f"fill-{index}",
+                    scope="turn",
+                    target=f"absent-turn-{index}",
+                ),
+            )
+        assert rail.agent.cancelled == []
+        retry = await dispatch_peer_stop(
+            rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="race")
+        )
+    finally:
+        release.set()
+    original = await asyncio.wait_for(first, timeout=5)
+
+    assert original["signal_receipt"]["status"] == Status.OK.value
+    assert original["stop_outcomes"][0]["disposition"] == "stopped"
+    assert rail.agent.cancelled == ["req-live"]
+    assert retry["signal_receipt"]["status"] == Status.DROPPED_RATE_LIMIT.value
+    [refusal] = retry["stop_outcomes"]
+    assert refusal["disposition"] == "refused"
+    assert "rate limits" in refusal["detail"]
+    # Exactly one receipt for the operation, and it is the admitted outcome;
+    # the refused retry is receipted separately under its own delivery.
+    replay = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="race")
+    )
+    assert replay["signal_receipt"]["status"] == Status.COALESCED.value
+    assert replay["stop_outcomes"] == original["stop_outcomes"]
+    receipts = await _receipts(rail)
+    assert len(receipts) == PEER_STOP_RATE_LIMIT_BURST + 1
+    operation_receipt = await _operation_receipt(rail, PEER_DID, "race")
+    assert [o.disposition.value for o in operation_receipt.outcomes] == ["stopped"]
+    # The delivery refusal is on the sovereign read surface with its actor
+    # and the refusal named, beside -- not instead of -- the operation.
+    refused_rows = [
+        receipt
+        for receipt in receipts
+        if [o.disposition for o in receipt.outcomes] == ["refused"]
+    ]
+    assert len(refused_rows) == 1
+    assert refused_rows[0].actor_id == PEER_DID
+    assert "rate limits" in refused_rows[0].outcomes[0].detail
+
+
+@pytest.mark.asyncio
+async def test_retry_against_a_stranded_claim_is_an_honest_in_progress_refusal(
+    rail, monkeypatch
+) -> None:
+    """A claim whose owner died is surfaced, not reinterpreted (#3356).
+
+    Recovering a stranded operation claim is #3356's.  Until then the peer
+    rail answers a retry with the typed "already in progress" refusal and
+    writes nothing under the operation id that could pretend to decide it.
+    """
+
+    rail.agent._active_request_ids.add("req-live")
+    await _interrupt_after_source_event_commit(rail, monkeypatch, "stranded")
+    operation = peer_stop.peer_stop_request(
+        target_agent_id=peer_stop.peer_stop_target_identity(rail.agent),
+        actor_id=PEER_DID,
+        intent=_intent(correlation_id="stranded"),
+    )
+    assert await rail.receipts.claim(operation) is not None  # owner then dies
+
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="stranded")
+    )
+
+    [outcome] = retry["stop_outcomes"]
+    assert outcome["disposition"] == "refused"
+    assert "already in progress" in outcome["detail"]
+    assert rail.agent.cancelled == []
+    assert await _operation_receipt(rail, PEER_DID, "stranded") is None
+
+
+@pytest.mark.asyncio
+async def test_retry_during_a_running_first_attempt_does_not_stop_twice(
+    rail, monkeypatch
+) -> None:
+    rail.agent._active_request_ids.add("req-live")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_cancel = rail.agent.cancel_current_request
+
+    def slow_cancel(request_id=None, **kwargs):
+        entered.set()
+        return original_cancel(request_id, **kwargs)
+
+    original_wait = rail.agent.wait_for_request_completion
+
+    async def gated_wait(request_id, **kwargs):
+        await release.wait()
+        return await original_wait(request_id, **kwargs)
+
+    monkeypatch.setattr(rail.agent, "cancel_current_request", slow_cancel)
+    monkeypatch.setattr(rail.agent, "wait_for_request_completion", gated_wait)
+
+    first = asyncio.create_task(
+        dispatch_peer_stop(
+            rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="busy")
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="busy")
+    )
+    release.set()
+    original = await first
+
+    assert retry["stop_outcomes"][0]["disposition"] == "refused"
+    assert "in progress" in retry["stop_outcomes"][0]["detail"]
+    assert original["stop_outcomes"][0]["disposition"] == "stopped"
+    assert rail.agent.cancelled == ["req-live"]
+    assert len(await _receipts(rail)) == 1
+
+
 @pytest.mark.asyncio
 async def test_reused_correlation_for_a_different_request_is_refused(rail) -> None:
     await dispatch_peer_stop(
@@ -532,6 +839,97 @@ async def test_reused_correlation_for_a_different_request_is_refused(rail) -> No
     )
     assert changed["stop_outcomes"][0]["disposition"] == "refused"
     assert "reused" in changed["stop_outcomes"][0]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_changed_intent_cannot_take_over_an_interrupted_operation(
+    rail, monkeypatch
+) -> None:
+    """An operation identity binds its intent at first sight.
+
+    The first request targets a turn and is interrupted after its source
+    event committed, before it claimed the operation.  A second request
+    reusing the correlation id for the whole agent is refused as identity
+    reuse -- before dispatch, under its own delivery -- and never claims the
+    operation; only the first intent can complete it.
+    """
+
+    rail.agent._active_request_ids.add("req-live")
+    turn_intent = {"scope": "turn", "target": "turn-absent"}
+    await _interrupt_after_source_event_commit(
+        rail, monkeypatch, "taken", **turn_intent
+    )
+    dispatched: list[object] = []
+    original_dispatch = rail.dispatcher.dispatch_signal
+
+    async def counting_dispatch(signal, **kwargs):
+        dispatched.append(signal)
+        return await original_dispatch(signal, **kwargs)
+
+    monkeypatch.setattr(rail.dispatcher, "dispatch_signal", counting_dispatch)
+
+    changed = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="taken")
+    )
+
+    assert dispatched == []
+    assert changed["receipt_kind"] == "delivery"
+    assert changed["signal_receipt"]["status"] is None
+    [refusal] = changed["stop_outcomes"]
+    assert refusal["disposition"] == "refused"
+    assert "reused for a different request" in refusal["detail"]
+    assert refusal["correlation_id"] == changed["stop_correlation_id"]
+    assert changed["stop_correlation_id"] == (
+        f"peer-stop-delivery:{changed['signal_receipt']['signal_id']}"
+    )
+    assert rail.agent.cancelled == []
+    assert await _operation_receipt(rail, PEER_DID, "taken") is None
+    # The refusal is on the sovereign read surface under the verified actor.
+    [refused_row] = await _receipts(rail)
+    assert refused_row.actor_id == PEER_DID
+    assert "reused" in refused_row.outcomes[0].detail
+
+    # The first intent still completes its own operation, and only that.
+    retry = await dispatch_peer_stop(
+        rail.agent,
+        actor_id=PEER_DID,
+        intent=_intent(correlation_id="taken", **turn_intent),
+    )
+    assert retry["receipt_kind"] == "operation"
+    assert retry["stop_correlation_id"] == peer_stop_operation_id(PEER_DID, "taken")
+    assert retry["stop_outcomes"][0]["scope"] == "turn"
+    assert rail.agent.cancelled == []
+    operation = await _operation_receipt(
+        rail, PEER_DID, "taken", **turn_intent
+    )
+    assert operation is not None and operation.scope == "turn"
+
+
+@pytest.mark.asyncio
+async def test_receipt_store_refuses_to_claim_an_operation_bound_elsewhere(
+    rail,
+) -> None:
+    """The binding is honored by the claim itself, not only by the door."""
+
+    target = peer_stop.peer_stop_target_identity(rail.agent)
+    first = peer_stop.peer_stop_request(
+        target_agent_id=target,
+        actor_id=PEER_DID,
+        intent=_intent(correlation_id="bound", scope="turn", target="turn-1"),
+    )
+    changed = peer_stop.peer_stop_request(
+        target_agent_id=target,
+        actor_id=PEER_DID,
+        intent=_intent(correlation_id="bound"),
+    )
+    await rail.receipts.bind_operation(first)
+    await rail.receipts.bind_operation(first)  # idempotent for its own intent
+
+    with pytest.raises(StopReceiptConflict):
+        await rail.receipts.bind_operation(changed)
+    with pytest.raises(StopReceiptConflict):
+        await rail.receipts.claim(changed)
+    assert isinstance(await rail.receipts.claim(first), StopOperationClaim)
 
 
 @pytest.mark.asyncio

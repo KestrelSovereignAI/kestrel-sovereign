@@ -24,6 +24,35 @@ is recorded as a ``refused`` receipt naming the refusal, not dropped silently.
 A peer never cascades (#3143): following signed descendants is the
 sovereign's authority.  A ``cascade: true`` intent is refused by validation
 with a receipt, never silently downgraded.
+
+Exactly one durable record decides an operation's fate: the Stop receipt keyed
+by the operation id, written only by the handler that executes (or definitively
+refuses) that operation under the receipt store's claim.  The dispatcher's
+durable source event commits before the handler runs, so a ``COALESCED``
+duplicate is answered from that receipt when one exists and otherwise
+re-admitted through the dispatcher as a new source unit.  Delivery-level
+decisions -- cycle/depth, rate limit, validation, dispatch failure -- belong to
+the *delivery*: their receipt (``refused``, or ``unreachable`` for a dispatch
+failure) is keyed by the delivery's signal id (``peer-stop-delivery:<signal
+id>``), never by the operation id, so a refused
+retry can never pre-empt an admitted attempt of the same operation.  A stranded
+operation claim (the claim holder died) is answered with the typed "already in
+progress" refusal; recovering it is #3356.
+
+An operation identity binds its intent at first sight: before its first
+dispatch, the request's fingerprint is bound to the operation id in the Stop
+receipt store (``bind_operation``).  A later delivery under the same identity
+that names a different intent is refused as an identity-reuse conflict before
+dispatch, and the receipt store refuses to claim the operation for it, so an
+interrupted first attempt can only ever be completed by its own intent.
+
+The response names the one record its outcomes are: ``receipt_kind`` is
+``operation`` (keyed by the operation id) or ``delivery`` (keyed by
+``peer-stop-delivery:<signal id>``), and ``stop_correlation_id`` is that key.
+
+Retry contract: a byte-identical signed resend is refused by the envelope's
+replay nonce.  A sender whose response was lost re-signs the same intent and
+correlation id with a fresh nonce (``PEER_STOP_DELIVERY_ATTEMPTS``).
 """
 
 from __future__ import annotations
@@ -31,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from kestrel_sdk.signals import (
@@ -79,14 +109,19 @@ PEER_STOP_RETENTION_DAYS = 14
 MAX_PEER_STOP_REASON_CHARS = 1024
 # Deliveries of one peer Stop whose response was lost.  Each attempt re-signs
 # the same intent and correlation id with a fresh replay nonce; the recipient's
-# durable source event answers a duplicate with the original receipt.
+# Stop receipt answers a duplicate with the original outcome.
 PEER_STOP_DELIVERY_ATTEMPTS = 3
 
 _OPERATION_ID_DOMAIN = b"kestrel:a2a.peer_stop:operation:v1\x00"
 _OPERATION_ID_PREFIX = "peer-stop:"
+_DELIVERY_ID_PREFIX = "peer-stop-delivery:"
 _INTENT_KEYS = frozenset({"scope", "target", "reason", "cascade", "correlation_id"})
 _REFUSED_STATUSES = frozenset(
     {Status.DROPPED_CYCLE, Status.DROPPED_RATE_LIMIT, Status.DROPPED_VALIDATION}
+)
+# A delivery-keyed record never reports an effect.
+_DELIVERY_DISPOSITIONS = frozenset(
+    {StopDisposition.REFUSED, StopDisposition.UNREACHABLE}
 )
 _RECEIPT_STORE_ATTRIBUTE = "_stop_receipt_store"
 _CLEANUP_REGISTRY_ATTRIBUTE = "_stop_cleanup_registry"
@@ -301,13 +336,21 @@ def peer_stop_audience(metadata: Mapping[str, Any]) -> str:
 
 
 def peer_stop_target_identity(agent: object) -> str:
-    """The recipient's own stable Stop address, or fail closed."""
+    """The recipient's own stable Stop address, or fail closed.
 
-    for attribute in ("did", "agent_id"):
-        candidate = getattr(agent, attribute, None)
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate
-    raise ValueError("peer Stop requires a stable target identity")
+    The same guarded DID the turn-start Hold latch and the A2A task routes
+    scope to, so a peer Stop addresses exactly the identity those read.
+    """
+
+    from kestrel_sovereign.features.storage_access import (
+        AgentIdentityUnavailable,
+        resolve_scoped_agent_did,
+    )
+
+    try:
+        return resolve_scoped_agent_did(agent)
+    except AgentIdentityUnavailable as error:
+        raise ValueError("peer Stop requires a stable target identity") from error
 
 
 def peer_stop_operation_id(actor_id: str, correlation_id: str) -> str:
@@ -358,6 +401,33 @@ def peer_stop_request(
         trace_id=trace_id,
         span_id=span_id,
     )
+
+
+def peer_stop_delivery_id(signal_id: str) -> str:
+    """The receipt correlation id of one peer Stop *delivery*.
+
+    The recipient keys a dispatcher decision (cycle/depth, rate limit,
+    validation, dispatch failure) by this id, and the sender validates a
+    delivery-keyed outcome against the ``signal_receipt.signal_id`` it was
+    answered with.  One function, so the two ends cannot drift.
+    """
+
+    if not isinstance(signal_id, str) or not signal_id.strip():
+        raise ValueError("peer Stop delivery requires its dispatcher signal id")
+    return f"{_DELIVERY_ID_PREFIX}{signal_id}"
+
+
+def peer_stop_delivery_request(request: StopRequest, signal_id: str) -> StopRequest:
+    """The Stop request that receipts one *delivery's* dispatcher decision.
+
+    Cycle/depth, rate limit, validation, and dispatch failure are decisions
+    about a delivery, not about the Stop operation it carries.  Keying their
+    receipt by the delivery's signal id keeps them visible in the receipt
+    history without ever deciding the operation's fate: that belongs only to
+    the receipt the handler writes under :func:`peer_stop_operation_id`.
+    """
+
+    return replace(request, correlation_id=peer_stop_delivery_id(signal_id))
 
 
 def build_peer_stop_signal(
@@ -559,18 +629,139 @@ async def dispatch_peer_stop(
         actor_id=actor_id,
         intent=parsed,
     )
+    receipt_store, _registry = _stop_evidence(agent)
+    # Bind the operation identity to this intent before the dispatcher can
+    # commit its source event.  A later delivery under the same identity that
+    # names a different intent is refused here and never re-admitted, so an
+    # interrupted first attempt can only be completed by its own intent.
+    try:
+        await receipt_store.bind_operation(request)
+    except StopReceiptConflict:
+        refusal = (
+            "Peer Stop correlation id was reused for a different request; "
+            "it was not dispatched"
+        )
+        return _peer_stop_response(
+            parsed,
+            request,
+            signal_id=signal.id,
+            status=None,
+            detail=refusal,
+            outcomes=await _persist_single_outcome(
+                receipt_store,
+                peer_stop_delivery_request(request, signal.id),
+                target_agent_id=signal.target_agent,
+                disposition=StopDisposition.REFUSED,
+                detail=refusal,
+            ),
+        )
+    except Exception:  # noqa: BLE001 - durable evidence boundary
+        unavailable = (
+            "Stop receipt storage is unavailable; peer Stop was not dispatched"
+        )
+        return _peer_stop_response(
+            parsed,
+            request,
+            signal_id=signal.id,
+            status=None,
+            detail=unavailable,
+            outcomes=(
+                _outcome(
+                    peer_stop_delivery_request(request, signal.id),
+                    signal.target_agent,
+                    # As the Stop authority's receipt preflight: no
+                    # durable evidence, so cancellation is not attempted.
+                    StopDisposition.REFUSED,
+                    unavailable,
+                ),
+            ),
+        )
     result = await dispatcher.dispatch_signal(
         signal,
         source_event_id=request.correlation_id,
     )
-    outcomes = await _outcomes_for_result(agent, result, request, parsed)
+    if result.status is Status.COALESCED:
+        replayed = await _replayed_outcomes(
+            receipt_store,
+            request,
+            peer_stop_delivery_request(request, result.signal_id),
+        )
+        if replayed is not None:
+            outcomes = replayed
+        else:
+            # The Stop receipt, not the durable source event, decides whether
+            # this Stop happened.  An accepted event without a receipt means
+            # the first attempt was interrupted before its outcome became
+            # durable -- or is still running and has not yet claimed the
+            # operation.  Re-admit it through the full dispatcher policy (a
+            # fresh source unit consumes a rate-limit slot like any other
+            # execution).  The handler's receipt claim serializes an admitted
+            # recovery against a first attempt that is still running, and a
+            # refused re-admission is receipted under its own delivery id.
+            result = await dispatcher.dispatch_signal(
+                build_peer_stop_signal(
+                    agent=agent,
+                    actor_id=actor_id,
+                    intent=parsed,
+                    causation_chain=causation_chain,
+                )
+            )
+            outcomes = await _outcomes_for_result(agent, result, request, parsed)
+    else:
+        outcomes = await _outcomes_for_result(agent, result, request, parsed)
+    return _peer_stop_response(
+        parsed,
+        request,
+        signal_id=result.signal_id,
+        status=result.status,
+        detail=_dispatcher_outcome_detail(result.status, parsed),
+        outcomes=outcomes,
+    )
+
+
+def _peer_stop_response(
+    intent: Mapping[str, Any],
+    request: StopRequest,
+    *,
+    signal_id: str,
+    status: Status | None,
+    detail: str | None,
+    outcomes: tuple[StopOutcome, ...],
+) -> dict[str, Any]:
+    """The peer response, naming the one durable record its outcomes are.
+
+    ``receipt_kind`` is ``operation`` when the outcomes are the Stop
+    operation's own receipt (the handler's effect or its replay), keyed by
+    :func:`peer_stop_operation_id`; it is ``delivery`` when they record a
+    decision about this delivery alone, keyed by
+    :func:`peer_stop_delivery_id`.  ``stop_correlation_id`` is that record's
+    key, so a sender matches each kind by the identity actually written.
+    A ``None`` status means the delivery was refused before any dispatcher
+    decision.
+    """
+
+    delivery_id = peer_stop_delivery_id(signal_id)
+    keys = {outcome.correlation_id for outcome in outcomes}
+    if keys == {request.correlation_id} and status is not None:
+        receipt_kind, record_id = "operation", request.correlation_id
+    elif keys == {delivery_id} and all(
+        outcome.disposition in _DELIVERY_DISPOSITIONS for outcome in outcomes
+    ):
+        receipt_kind, record_id = "delivery", delivery_id
+    else:
+        raise ValueError("peer Stop outcomes do not name one durable record")
     return {
-        "correlation_id": parsed["correlation_id"],
-        "stop_correlation_id": request.correlation_id,
+        "correlation_id": intent["correlation_id"],
+        "receipt_kind": receipt_kind,
+        "stop_correlation_id": record_id,
+        # False when the outcomes are an answer nothing durable holds (the
+        # evidence store refused or was unreachable, or the operation is
+        # still claimed elsewhere).
+        "recorded": all(outcome.receipt_id is not None for outcome in outcomes),
         "signal_receipt": {
-            "signal_id": result.signal_id,
-            "status": result.status.value,
-            "detail": _dispatcher_outcome_detail(result.status, parsed),
+            "signal_id": signal_id,
+            "status": None if status is None else status.value,
+            "detail": detail,
         },
         "stop_outcomes": [outcome.to_dict() for outcome in outcomes],
     }
@@ -582,18 +773,27 @@ async def _outcomes_for_result(
     request: StopRequest,
     intent: Mapping[str, Any],
 ) -> tuple[StopOutcome, ...]:
-    """Map every dispatcher terminal state to honest, receipted outcomes."""
+    """Map every dispatcher terminal state to honest, receipted outcomes.
+
+    Only the handler writes the operation's receipt.  Every outcome decided
+    here, outside the handler, is a decision about this *delivery* and is
+    receipted under :func:`peer_stop_delivery_request`: another delivery of
+    the same operation may be admitted and not yet holding its claim, and a
+    receipt under the operation id would be replayed to it and suppress its
+    cancellation.
+    """
 
     target_agent_id = request.target_agent_id or peer_stop_target_identity(agent)
     receipt_store, _registry = _stop_evidence(agent)
     status = result.status
+    delivery_request = peer_stop_delivery_request(request, result.signal_id)
 
     if status is Status.OK:
         raw = result.action_result
         if not isinstance(raw, list) or not raw:
             return await _persist_single_outcome(
                 receipt_store,
-                request,
+                delivery_request,
                 target_agent_id=target_agent_id,
                 disposition=StopDisposition.UNREACHABLE,
                 detail="Peer Stop handler returned no typed outcomes",
@@ -610,34 +810,14 @@ async def _outcomes_for_result(
         return outcomes
 
     if status is Status.COALESCED:
-        # A replay of an accepted source event. Answer with the original
-        # receipt; never execute the Stop a second time.
-        try:
-            replay = await receipt_store.load(request)
-        except StopReceiptConflict:
-            return (
-                _outcome(
-                    request,
-                    target_agent_id,
-                    StopDisposition.REFUSED,
-                    "Peer Stop correlation id was reused for a different request",
-                ),
-            )
-        except Exception:  # noqa: BLE001 - durable evidence boundary
-            return (
-                _outcome(
-                    request,
-                    target_agent_id,
-                    StopDisposition.UNREACHABLE,
-                    "Stop receipt storage is unavailable; the original "
-                    "outcome could not be read",
-                ),
-            )
-        if isinstance(replay, StopReceipt):
-            return replay.outcomes
+        replayed = await _replayed_outcomes(
+            receipt_store, request, delivery_request
+        )
+        if replayed is not None:
+            return replayed
         return (
             _outcome(
-                request,
+                delivery_request,
                 target_agent_id,
                 StopDisposition.UNREACHABLE,
                 "A duplicate of this peer Stop is still in progress; its "
@@ -652,11 +832,59 @@ async def _outcomes_for_result(
     )
     return await _persist_single_outcome(
         receipt_store,
-        request,
+        delivery_request,
         target_agent_id=target_agent_id,
         disposition=disposition,
         detail=_dispatcher_outcome_detail(status, intent),
     )
+
+
+async def _replayed_outcomes(
+    receipt_store: Any,
+    request: StopRequest,
+    delivery_request: StopRequest,
+) -> tuple[StopOutcome, ...] | None:
+    """The durable answer to a duplicate peer Stop, or ``None`` if unrecorded.
+
+    A conflicting or unreadable receipt is itself a final answer for this
+    delivery: neither may be treated as "not yet stopped" and executed again.
+    Neither is the operation's record, so both are keyed by the delivery.
+    """
+
+    target_agent_id = request.target_agent_id or request.target or "unresolved"
+    try:
+        replay = await receipt_store.load(request)
+    except StopReceiptConflict:
+        return (
+            _outcome(
+                delivery_request,
+                target_agent_id,
+                StopDisposition.REFUSED,
+                "Peer Stop correlation id was reused for a different request",
+            ),
+        )
+    except Exception:  # noqa: BLE001 - durable evidence boundary
+        return (
+            _outcome(
+                delivery_request,
+                target_agent_id,
+                StopDisposition.UNREACHABLE,
+                "Stop receipt storage is unavailable; the original "
+                "outcome could not be read",
+            ),
+        )
+    if replay is None:
+        return None
+    if not isinstance(replay, StopReceipt):
+        return (
+            _outcome(
+                delivery_request,
+                target_agent_id,
+                StopDisposition.UNREACHABLE,
+                "Stop receipt storage returned invalid evidence",
+            ),
+        )
+    return replay.outcomes
 
 
 def _outcome(
@@ -766,6 +994,8 @@ __all__ = [
     "parse_peer_stop_intent",
     "peer_stop_audience",
     "peer_stop_breaker_refusal",
+    "peer_stop_delivery_id",
+    "peer_stop_delivery_request",
     "peer_stop_operation_id",
     "peer_stop_policy_refusal",
     "peer_stop_request",

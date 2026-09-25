@@ -436,18 +436,67 @@ single `peer_stop_breaker_refusal` seam in the handler.
 
 Idempotency: the durable `source_event_id` and the receipt correlation id are
 both `peer-stop:<sha256(actor, correlation_id)>`, so two peers may reuse a
-correlation id without colliding. A replay is `COALESCED` by the dispatcher and
-answered from the original receipt; it never runs the handler again, never
-fans out again, and never consumes another rate-limit slot. A different request
-reusing the same correlation id is refused as a conflict.
+correlation id without colliding. A different request reusing the same
+correlation id is refused as a conflict.
+
+Exactly one durable record decides a Stop operation's fate: **the Stop
+receipt keyed by the operation id**, written only by the handler that executes
+(or definitively refuses) that operation under the receipt store's claim. The
+dispatcher commits the source event before the handler runs, so the event
+alone cannot prove a Stop happened. A duplicate that the dispatcher answers
+`COALESCED` therefore resolves through the receipt store:
+
+- a receipt exists: it is replayed. The handler does not run again, nothing
+  fans out again, and no rate-limit slot is consumed;
+- no receipt exists (the first attempt was interrupted between the event
+  commit and its receipt, or is still running): the Stop is re-admitted as a
+  *new* source unit through `dispatch_signal`, so validation, cycle/TTL, and
+  the rate limit all apply to it again. The receipt store's operation claim
+  serializes it against a first attempt that is still running, which answers
+  the retry `refused` ("already in progress") rather than stopping twice.
+
+Delivery-level decisions — cycle/depth, rate limit, validation, dispatch
+failure — belong to the **delivery**, not the operation. Their receipt
+(`refused`, or `unreachable` for a dispatch failure) is keyed by the delivery's signal id (`peer-stop-delivery:<signal
+id>`), so it still appears in `GET /api/host/stop/receipts` with the actor and
+the refusal named, but it never pre-empts the operation: a retry refused by the
+rate limit cannot suppress an admitted first attempt that has not yet claimed,
+and once the budget refills a later retry can still complete an interrupted
+Stop. A signal dedup record likewise only coalesces and does rate-limit
+accounting; it never decides that a Stop happened.
+
+The response names the one record its outcomes are. `receipt_kind` is
+`operation` (the handler's receipt, or its replay) or `delivery` (a decision
+about this delivery alone), and `stop_correlation_id` is that record's key;
+`recorded` says whether anything durable holds it. The sender (`stop_peer`)
+matches each kind by its own identity: an operation record by the named key, a
+delivery record only when it is `peer_stop_delivery_id(signal_receipt.signal_id)`
+and `refused` or `unreachable`. A delivery record for another signal, or one
+claiming an effect, is rejected as a mismatched receipt; a real dispatcher
+refusal reaches the caller typed, with its detail.
+
+An operation identity binds its intent at first sight. Before the first
+dispatch, `StopReceiptStore.bind_operation` records the request fingerprint
+under the operation id (only the fingerprint; the id is blinded like every
+other Stop identity). A later delivery under the same identity naming a
+different intent — changed scope, target, or reason — is refused as identity
+reuse *before dispatch* (`signal_receipt.status` is `null`), receipted under
+its own delivery id, and never re-admitted; `claim()` independently refuses to
+claim an operation bound to another request. So a first attempt interrupted
+between its source event and its claim can be completed only by its own
+intent.
+
+A claim whose owner died before writing its receipt is not recovered here
+(#3356): a retry against it is answered with the typed "already in progress"
+refusal and writes nothing under the operation id.
 
 Retry after a lost response: the wire envelope's replay nonce refuses a
 byte-identical resend (403), exactly as for every other A2A action. The
 `stop_peer` sender therefore re-signs the *same* intent, `id`, and `sessionId`
 with a fresh nonce, up to `PEER_STOP_DELIVERY_ATTEMPTS`, and only after an
 unconfirmed delivery (transport error or 503). The recipient answers that
-retry `COALESCED` with the original receipt. Authorization and protocol
-decisions are final and never retried.
+retry from the original receipt, or completes the interrupted Stop as above.
+Authorization and protocol decisions are final and never retried.
 
 The registration is an `InFlightControlActionRegistration`. It acts only on
 work already running, so the dispatcher:

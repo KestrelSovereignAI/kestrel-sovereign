@@ -1609,6 +1609,56 @@ def _peer_stop_body(
     }
 
 
+class _PeerStopEvidence:
+    """In-memory Stop evidence: binds operations and receipts outcomes."""
+
+    def __init__(self) -> None:
+        self.bound: list = []
+        self.receipts: list = []
+
+    async def bind_operation(self, request) -> None:
+        self.bound.append(request)
+
+    async def load(self, _request):
+        return None
+
+    async def persist(self, request, outcomes, **_kwargs):
+        from dataclasses import replace
+
+        from kestrel_sovereign.stop.receipt import StopReceipt
+
+        receipt_id = f"receipt-{len(self.receipts) + 1}"
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="0" * 64,
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-09-25T00:00:00Z",
+            turn_id=None,
+            span_id=None,
+            trace_id=None,
+            outcomes=tuple(replace(o, receipt_id=receipt_id) for o in outcomes),
+        )
+        self.receipts.append(receipt)
+        return receipt
+
+
+def _attach_peer_stop_evidence(agent) -> _PeerStopEvidence:
+    from kestrel_sovereign.signals.sources.peer_stop import attach_stop_evidence
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    evidence = _PeerStopEvidence()
+    attach_stop_evidence(
+        agent, receipt_store=evidence, cleanup_registry=StopCleanupRegistry()
+    )
+    return evidence
+
+
 def _peer_stop_ok(agent_did, signal):
     from kestrel_sdk.signals import SignalMode, SignalResult, Status
     from kestrel_sovereign.signals.sources.peer_stop import peer_stop_operation_id
@@ -1660,6 +1710,7 @@ def test_signed_peer_stop_dispatches_with_verified_envelope_principals(
         return _peer_stop_ok(agent.did, signal)
 
     agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock(side_effect=dispatch))
+    evidence = _attach_peer_stop_evidence(agent)
     _attach(app_with_send, agent)
 
     with TestClient(app_with_send) as client:
@@ -1668,6 +1719,10 @@ def test_signed_peer_stop_dispatches_with_verified_envelope_principals(
     assert response.status_code == 200
     body = response.json()
     assert body["signal_receipt"]["status"] == "ok"
+    assert body["receipt_kind"] == "operation"
+    # The operation is bound under the verified sender before dispatch.
+    [bound] = evidence.bound
+    assert bound.actor_id == _SENDER_DID
     assert body["correlation_id"] == _PEER_STOP_CORRELATION
     assert body["stop_outcomes"][0]["disposition"] == "stopped"
     agent.dispatcher.dispatch_signal.assert_awaited_once()
@@ -1694,6 +1749,7 @@ def test_signed_peer_stop_cascade_reaches_the_dispatcher_for_a_receipted_refusal
         )
 
     agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock(side_effect=dispatch))
+    evidence = _attach_peer_stop_evidence(agent)
     _attach(app_with_send, agent)
 
     with TestClient(app_with_send) as client:
@@ -1702,9 +1758,15 @@ def test_signed_peer_stop_cascade_reaches_the_dispatcher_for_a_receipted_refusal
         )
 
     assert response.status_code == 200
-    [outcome] = response.json()["stop_outcomes"]
+    body = response.json()
+    [outcome] = body["stop_outcomes"]
     assert outcome["disposition"] == "refused"
     assert "cascade" in outcome["detail"]
+    # A delivery refusal, receipted under the verified sender.
+    assert body["receipt_kind"] == "delivery"
+    [receipt] = evidence.receipts
+    assert receipt.actor_id == _SENDER_DID
+    assert receipt.operation_id == body["stop_correlation_id"]
 
 
 def test_signed_peer_stop_rejects_envelope_forwarded_to_another_recipient(

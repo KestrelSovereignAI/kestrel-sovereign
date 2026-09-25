@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from kestrel_sdk.signals import SignalMode, SignalResult, Status
+from kestrel_sdk.signals import CausationFrame, SignalMode, SignalResult, Status
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features.peers.directory import (
@@ -19,10 +19,21 @@ from kestrel_sovereign.features.peers.directory import (
 from kestrel_sovereign.features.peers.feature import PeersFeature
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.signals.sources.peer_stop import (
+    PEER_STOP_RATE_LIMIT_BURST,
+    SOURCE_NAME,
+    attach_stop_evidence,
+    decode_peer_stop_intent,
+    dispatch_peer_stop,
     encode_peer_stop_intent,
+    peer_stop_delivery_id,
     peer_stop_operation_id,
 )
-from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+from kestrel_sovereign.stop import (
+    StopCleanupRegistry,
+    StopDisposition,
+    StopOutcome,
+    StopScope,
+)
 # The real dispatcher + receipt-store rail, shared as the ``rail`` fixture.
 from tests.unit.test_peer_stop_signals import rail  # noqa: F401
 
@@ -76,6 +87,7 @@ def _response(payload: dict, outcomes: list[dict], *, status: str = "ok") -> dic
 
     return {
         "correlation_id": payload["id"],
+        "receipt_kind": "operation",
         "stop_correlation_id": outcomes[0]["correlation_id"] if outcomes else "",
         "signal_receipt": {"signal_id": "peer-signal", "status": status, "detail": None},
         "stop_outcomes": outcomes,
@@ -277,13 +289,14 @@ async def test_peer_tool_converts_unexpected_router_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_peer_tool_reports_refused_outcome_as_failure() -> None:
+    # A handler-decided refusal is keyed by the Stop operation.
     async def stop_peer(_requester, peer, payload):
         outcome = _outcome(
             peer_stop_operation_id("did:test:sender", payload["id"]),
             agent_id=peer.agent_id,
             disposition=StopDisposition.REFUSED,
         )
-        return _response(payload, [outcome.to_dict()], status="dropped_rate_limit")
+        return _response(payload, [outcome.to_dict()])
 
     feature, _peer = _feature_with_stop_router(stop_peer=stop_peer)
 
@@ -294,6 +307,215 @@ async def test_peer_tool_reports_refused_outcome_as_failure() -> None:
     assert result.data["stopped"] is False
 
 
+def _delivery_response(payload: dict, outcome: StopOutcome, *, signal_id: str) -> dict:
+    """A dispatcher refusal, in ``dispatch_peer_stop``'s response shape.
+
+    The response names the record its outcome is, as the recipient does;
+    the sender must still bind that record to the signal that answered.
+    """
+
+    return {
+        "correlation_id": payload["id"],
+        "receipt_kind": "delivery",
+        "stop_correlation_id": outcome.correlation_id,
+        "signal_receipt": {
+            "signal_id": signal_id,
+            "status": "dropped_rate_limit",
+            "detail": "Peer Stop was refused by peer rate limits",
+        },
+        "stop_outcomes": [outcome.to_dict()],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome_signal", "disposition"),
+    [
+        # Bound to a different delivery than the one that answered.
+        ("other-signal", StopDisposition.REFUSED),
+        # A delivery-keyed outcome is a dispatcher decision; never an effect.
+        ("peer-signal", StopDisposition.STOPPED),
+        ("peer-signal", StopDisposition.ALREADY_COMPLETE),
+    ],
+)
+async def test_peer_tool_binds_a_delivery_outcome_to_its_signal_and_a_refusal(
+    outcome_signal, disposition
+) -> None:
+    async def stop_peer(_requester, peer, payload):
+        outcome = _outcome(
+            peer_stop_delivery_id(outcome_signal),
+            agent_id=peer.agent_id,
+            disposition=disposition,
+        )
+        return _delivery_response(payload, outcome, signal_id="peer-signal")
+
+    feature, _peer = _feature_with_stop_router(stop_peer=stop_peer)
+
+    result = await feature.stop_peer("Recipient")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "Peer Stop receipt did not match the routed peer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mislabel",
+    [
+        # A delivery record named by the operation id.
+        "delivery_named_as_operation",
+        # An operation record whose key is really the delivery's.
+        "operation_named_by_delivery",
+    ],
+)
+async def test_peer_tool_matches_each_record_kind_by_its_own_identity(
+    mislabel,
+) -> None:
+    async def stop_peer(_requester, peer, payload):
+        delivery = _outcome(
+            peer_stop_delivery_id("peer-signal"),
+            agent_id=peer.agent_id,
+            disposition=StopDisposition.REFUSED,
+        )
+        response = _delivery_response(payload, delivery, signal_id="peer-signal")
+        if mislabel == "delivery_named_as_operation":
+            response["stop_correlation_id"] = peer_stop_operation_id(
+                "did:test:sender", payload["id"]
+            )
+        else:
+            response["receipt_kind"] = "operation"
+        return response
+
+    feature, _peer = _feature_with_stop_router(stop_peer=stop_peer)
+
+    result = await feature.stop_peer("Recipient")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "Peer Stop receipt did not match the routed peer"
+
+
+@pytest.mark.asyncio
+async def test_peer_tool_accepts_a_delivery_refused_before_dispatch() -> None:
+    """Identity reuse is refused before any dispatcher decision (status None)."""
+
+    async def stop_peer(_requester, peer, payload):
+        refusal = _outcome(
+            peer_stop_delivery_id("never-dispatched"),
+            agent_id=peer.agent_id,
+            disposition=StopDisposition.REFUSED,
+        )
+        response = _delivery_response(
+            payload, refusal, signal_id="never-dispatched"
+        )
+        response["signal_receipt"]["status"] = None
+        return response
+
+    feature, _peer = _feature_with_stop_router(stop_peer=stop_peer)
+
+    result = await feature.stop_peer("Recipient")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "Peer Stop was refused or could not be confirmed"
+    assert result.data["receipt_kind"] == "delivery"
+
+
+def _loop_frame(agent_id: str) -> CausationFrame:
+    return CausationFrame(
+        agent_id=agent_id,
+        source=SOURCE_NAME,
+        signal_id="earlier",
+        turn_id=None,
+        depth=1,
+        emitted_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refusal", "status", "detail"),
+    [
+        ("rate_limit", "dropped_rate_limit", "Peer Stop was refused by peer rate limits"),
+        (
+            "cycle",
+            "dropped_cycle",
+            "Peer Stop was refused by causation cycle or depth policy",
+        ),
+    ],
+)
+async def test_peer_tool_surfaces_a_real_dispatcher_refusal(
+    rail,  # noqa: F811 - the imported fixture
+    refusal,
+    status,
+    detail,
+) -> None:
+    """A refusal the recipient's real dispatcher decided reaches the caller typed."""
+
+    recipient = rail.agent
+    recipient._active_request_ids.add("req-live")
+    if refusal == "rate_limit":
+        for index in range(PEER_STOP_RATE_LIMIT_BURST):
+            await dispatch_peer_stop(
+                recipient,
+                actor_id=f"did:test:other-peer-{index}",
+                intent={
+                    "scope": "agent",
+                    "target": None,
+                    "reason": "fill the budget",
+                    "cascade": False,
+                    "correlation_id": f"fill-{index}",
+                },
+            )
+        recipient.cancelled.clear()
+        recipient._active_request_ids.add("req-live")
+    chain = [_loop_frame(recipient.did)] if refusal == "cycle" else ()
+
+    async def stop_peer(_requester, _peer, payload):
+        assert payload["metadata"]["a2a_audience"] == recipient.did
+        intent = decode_peer_stop_intent(payload["message"]["parts"][0]["text"])
+        return await dispatch_peer_stop(
+            recipient,
+            actor_id="did:test:sender",
+            intent=intent,
+            causation_chain=chain,
+        )
+
+    feature, _peer = _feature_with_stop_router(stop_peer=stop_peer)
+    feature._resolve_automatic_peer = AsyncMock(
+        return_value=(
+            SimpleNamespace(stop_peer=stop_peer),
+            PeerRequester("did:test:sender", object()),
+            PeerIdentity(
+                agent_id=recipient.did,
+                slug="recipient",
+                routing_key="recipient-route",
+                name="Recipient",
+            ),
+        )
+    )
+
+    result = await feature.stop_peer("Recipient")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "Peer Stop was refused or could not be confirmed"
+    assert result.data["stopped"] is False
+    assert result.data["signal_receipt"]["status"] == status
+    assert result.data["signal_receipt"]["detail"] == detail
+    [outcome] = result.data["stop_outcomes"]
+    assert outcome["disposition"] == "refused"
+    assert outcome["detail"] == detail
+    assert outcome["correlation_id"] == peer_stop_delivery_id(
+        result.data["signal_receipt"]["signal_id"]
+    )
+    assert recipient.cancelled == []
+    # The refusal is receipted under the verified sender, visible in history.
+    [refusal_receipt] = [
+        receipt
+        for receipt in (await rail.receipts.list_receipts(limit=20)).receipts
+        if receipt.actor_id == "did:test:sender"
+    ]
+    assert [o.disposition for o in refusal_receipt.outcomes] == ["refused"]
+    assert refusal_receipt.outcomes[0].detail == detail
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "receipt",
@@ -302,6 +524,8 @@ async def test_peer_tool_reports_refused_outcome_as_failure() -> None:
         {"signal_id": "signal", "status": "unknown", "detail": None},
         {"signal_id": "", "status": "ok", "detail": None},
         {"signal_id": "signal", "status": "ok", "detail": {"raw": "error"}},
+        # Only a delivery may lack a dispatcher decision.
+        {"signal_id": "signal", "status": None, "detail": None},
     ],
 )
 async def test_peer_tool_rejects_malformed_signal_receipt(receipt) -> None:
@@ -478,6 +702,10 @@ async def test_manager_host_attestation_dispatches_signal_with_live_sender_chain
     recipient.dispatcher = SimpleNamespace(
         dispatch_signal=AsyncMock(side_effect=dispatch)
     )
+    receipts = SimpleNamespace(bind_operation=AsyncMock(return_value=None))
+    attach_stop_evidence(
+        recipient, receipt_store=receipts, cleanup_registry=StopCleanupRegistry()
+    )
     payload = _payload(
         metadata={
             "sender": "did:test:forged",
@@ -505,6 +733,9 @@ async def test_manager_host_attestation_dispatches_signal_with_live_sender_chain
 
     assert response["signal_receipt"]["status"] == "ok"
     recipient.dispatcher.dispatch_signal.assert_awaited_once()
+    # The operation was bound under the attested sender before dispatch.
+    [bound] = receipts.bind_operation.await_args.args
+    assert bound.actor_id == sender.did
     recipient_router.authorize_inbound_sender.assert_awaited_once_with(
         recipient_requester,
         sender.did,

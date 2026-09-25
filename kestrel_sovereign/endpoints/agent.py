@@ -3424,10 +3424,11 @@ async def stop_from_peer(request: Request):
 
     Retry contract: a byte-identical resend is refused (403) by the envelope
     replay nonce like any other A2A action.  A sender whose response was lost
-    re-signs the same intent, ``id`` and ``sessionId`` with a fresh nonce; the
-    dispatcher's durable source event, keyed on (verified sender, correlation
-    id), answers it ``COALESCED`` with the original Stop receipt and never
-    executes the Stop again.
+    re-signs the same intent, ``id`` and ``sessionId`` with a fresh nonce.
+    Keyed on (verified sender, correlation id), that retry returns the
+    original Stop receipt without executing the Stop again, or — when the
+    first attempt was interrupted before its receipt was durable — completes
+    it through the dispatcher exactly once.
     """
 
     from kestrel_sovereign.a2a.local_submission import (
