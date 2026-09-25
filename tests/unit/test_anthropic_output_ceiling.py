@@ -508,17 +508,38 @@ def _wire_events(text: str, *, stop_reason: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _sdk_http_library():
+    """The HTTP library the installed Anthropic SDK is built on.
+
+    The 0.x SDK is built on ``httpx``; 1.x moved to ``httpx2`` and rejects an
+    ``httpx`` client. The SDK's own ``DefaultAsyncHttpxClient`` subclasses
+    whichever one it uses, so its base class names the library — the test
+    serves its fake HTTP through that library on either SDK major version.
+    """
+    import importlib
+
+    import anthropic
+
+    for base in anthropic.DefaultAsyncHttpxClient.__mro__:
+        root = base.__module__.split(".")[0]
+        if root in ("httpx", "httpx2"):
+            return importlib.import_module(root)
+    raise AssertionError(
+        "anthropic.DefaultAsyncHttpxClient is not built on httpx or httpx2"
+    )
+
+
 def _real_sdk_client(stop_reason: str, text: str = "Question 1: yes"):
     """A real ``anthropic.AsyncAnthropic`` whose HTTP is served locally: the
     Models API record for claude-opus-5, and a streamed message."""
     import json
 
     import anthropic
-    import httpx
 
-    requests: List[httpx.Request] = []
+    httpx = _sdk_http_library()
+    requests: List[Any] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request):
         requests.append(request)
         if request.method == "GET" and request.url.path == "/v1/models/claude-opus-5":
             return httpx.Response(200, json={
@@ -537,7 +558,9 @@ def _real_sdk_client(stop_reason: str, text: str = "Question 1: yes"):
 
     client = anthropic.AsyncAnthropic(
         api_key="test-key",
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=anthropic.DefaultAsyncHttpxClient(
+            transport=httpx.MockTransport(handler),
+        ),
         max_retries=0,
     )
     return client, requests
