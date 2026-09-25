@@ -28,18 +28,16 @@ _DOOR_COLUMN = (
     "door",
     "TEXT CHECK (door IS NULL OR door IN ('peer', 'agent', 'host'))",
 )
-# Pre-#3170 rows carry no door. Host scope is only ever written by the host
-# fan-out; a DID actor on an agent/turn receipt is the verified envelope
-# sender the peer rail records (#3169), while the operator doors record an
-# API-key, OAuth, JWT, or ``local-operator:`` identity. The backfill is
+# Pre-#3170 rows carry no door. Only host scope proves its door: the host
+# fan-out is its sole writer. An agent/turn row cannot be attributed -- the
+# operator door records the caller's identity as its actor, and a caller may
+# itself be a DID, so the actor's shape says nothing about which door ran.
+# Those rows stay NULL and read back as "door not recorded". The backfill is
 # provenance for display only: the circuit breaker counts its own admissions,
 # never a backfilled row.
 _DOOR_BACKFILL = (
-    "UPDATE stop_receipts SET door = CASE "
-    "WHEN scope = 'host' THEN 'host' "
-    "WHEN actor_id LIKE 'did:%' THEN 'peer' "
-    "ELSE 'agent' END "
-    "WHERE door IS NULL",
+    "UPDATE stop_receipts SET door = 'host' "
+    "WHERE door IS NULL AND scope = 'host'",
     (),
 )
 _RECEIPT_COLUMNS = (

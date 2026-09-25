@@ -693,35 +693,46 @@ def test_only_the_peer_rail_admits_and_nothing_here_holds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_receipts_gain_a_backfilled_door(tmp_path):
+async def test_legacy_agent_receipts_keep_an_unrecorded_door(tmp_path):
+    """A pre-#3170 agent/turn receipt's door cannot be proven, so none is guessed.
+
+    The operator door records the caller's identity as its actor and a caller
+    may itself be a DID: a ``did:`` actor is no evidence the peer rail ran.
+    """
+
     db = await AsyncDatabase.sqlite(str(tmp_path / "legacy.db"))
     try:
         receipts = StopReceiptStore(db)
         await receipts.ensure_schema()
-        request = StopRequest(
-            StopScope.AGENT, "did:test:peer", target="did:test:t", cascade=False
-        )
-        await receipts.persist(
-            request,
-            (
-                StopOutcome(
-                    scope=request.scope,
-                    requested_target=request.target,
-                    resolved_target=request.target,
-                    agent_id=request.target,
-                    disposition=StopDisposition.STOPPED,
-                    correlation_id=request.correlation_id,
+        for target in ("did:test:t1", "did:test:t2"):
+            request = StopRequest(
+                StopScope.AGENT, "did:test:peer", target=target, cascade=False
+            )
+            await receipts.persist(
+                request,
+                (
+                    StopOutcome(
+                        scope=request.scope,
+                        requested_target=request.target,
+                        resolved_target=request.target,
+                        agent_id=request.target,
+                        disposition=StopDisposition.STOPPED,
+                        correlation_id=request.correlation_id,
+                    ),
                 ),
-            ),
-            door=StopDoor.PEER,
-        )
-        # Rebuild the pre-#3170 shape: drop the column, keep the row.
+                door=StopDoor.PEER,
+            )
+        # Rebuild the pre-#3170 shape: drop the column, keep the rows. One
+        # operator Stop by an API key, one by a caller whose identity is a DID.
         await db.execute("ALTER TABLE stop_receipts DROP COLUMN door")
         await db.execute(
-            "UPDATE stop_receipts SET actor_id = 'api_key', scope = 'agent'"
+            "UPDATE stop_receipts SET actor_id = CASE feed_seq "
+            "WHEN (SELECT MIN(feed_seq) FROM stop_receipts) THEN 'api_key' "
+            "ELSE 'did:test:operator-caller' END"
         )
         await receipts.ensure_schema()
-        (record,) = (await receipts.list_receipts(limit=10)).receipts
-        assert record.door == "agent"
+        records = (await receipts.list_receipts(limit=10)).receipts
+        assert sorted(r.actor_id for r in records) == ["api_key", "did:test:operator-caller"]
+        assert [r.door for r in records] == [None, None]
     finally:
         await db.close()
