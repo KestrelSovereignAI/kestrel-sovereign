@@ -2784,7 +2784,13 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
         # heartbeat requeues its lease, exactly as it would after two minutes.
         dispatcher_b._runtime_owner_stale_after = timedelta(0)
         await dispatcher_b._heartbeat_runtime_owner()
-        for _ in range(300):
+        # Wait on the outcome, not on a fixed number of 10ms polls: under
+        # ``-n auto`` load the requeued delivery legitimately sat in ``retry``
+        # past three seconds (#3276). The deadline stays well inside the 60s
+        # per-test timeout, and a passing run still exits on the first
+        # acknowledged read.
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
             deliveries = await dispatcher_b.list_durable_deliveries(
                 consumer_id=SUBMITTED_CONSUMER
             )
