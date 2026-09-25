@@ -661,13 +661,6 @@ class WaitReconciler:
         if (kind, handle) in self._pending_signal_tasks:
             return
 
-        # Parked until a provider-advised retry time (#3302): nothing emitted
-        # before then can run, so leave the wake — and its attempts — alone.
-        deferred_until = state.deferred_until_utc() if state else None
-        if deferred_until is not None and deferred_until > datetime.now(timezone.utc):
-            counters["signals_parked"] += 1
-            return
-
         # Attempts belong to a TRANSITION, not to a handle (#3105). A provider
         # that corrects a terminal state — talon's supported
         # ``finished_unknown -> failed`` — starts a NEW transition, and its
@@ -678,6 +671,19 @@ class WaitReconciler:
         same_transition = bool(
             state and state.attempts_signaled_target == signaled_token
         )
+
+        # Parked until a provider-advised retry time (#3302): nothing emitted
+        # before then can run, so leave the wake — and its attempts — alone.
+        # The park belongs to the transition it was recorded for, like the
+        # attempts above (#3364): a corrected terminal state is a new wake and
+        # is not held behind the old one's ``retry_at``.
+        deferred_until = (
+            state.deferred_until_utc() if (state and same_transition) else None
+        )
+        if deferred_until is not None and deferred_until > datetime.now(timezone.utc):
+            counters["signals_parked"] += 1
+            return
+
         attempts_so_far = (
             state.last_delivery_attempts if (state and same_transition) else 0
         )
