@@ -40,6 +40,7 @@ from .image_utils import process_images
 from .output_ceiling import (
     OutputCeilingUnknownError,
     attach_stop_reason,
+    context_window_notice,
     join_output_ceiling_notice,
     output_ceiling_notice,
     output_ceiling_notice_chunk,
@@ -127,6 +128,20 @@ async def _anthropic_final_message(client, api_params):
 
 #: Anthropic's ``stop_reason`` for a response cut at ``max_tokens``.
 _MAX_TOKENS_STOP_REASON = "max_tokens"
+
+#: Anthropic's ``stop_reason`` for a response cut because input plus output
+#: filled the model's context window. On Claude 4.5 and newer models the API
+#: accepts a ``max_tokens`` larger than the room the prompt leaves and stops
+#: here instead of rejecting the request; earlier models need
+#: :data:`_CONTEXT_WINDOW_EXCEEDED_BETA` for the same behaviour.
+_CONTEXT_WINDOW_EXCEEDED_STOP_REASON = "model_context_window_exceeded"
+_CONTEXT_WINDOW_EXCEEDED_BETA = "model-context-window-exceeded-2025-08-26"
+
+#: Stop reasons that cut generation inside its last content block.
+_CUT_STOP_REASONS = frozenset({
+    _MAX_TOKENS_STOP_REASON,
+    _CONTEXT_WINDOW_EXCEEDED_STOP_REASON,
+})
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +467,16 @@ class AnthropicAdapter(LLMAdapter):
             return None
         ceiling = await self._model_output_ceiling(client, model, cancel_token)
         api_params["max_tokens"] = ceiling
+        # The model's full ceiling can exceed the room a long prompt leaves in
+        # the context window. Claude 4.5+ accepts that and stops with
+        # ``model_context_window_exceeded`` when the window fills; earlier
+        # models opt in with this beta (without it they reject the request).
+        # The provider enforces the real bound itself, from the real token
+        # count, so no input size is estimated here. Not sent on the
+        # Claude-Code-shaped plan route: that endpoint is shaped exactly like
+        # Claude Code's requests, which do not carry this beta.
+        if not self._uses_claude_code_identity():
+            _ensure_anthropic_beta_header(api_params, _CONTEXT_WINDOW_EXCEEDED_BETA)
         return ceiling
 
     @staticmethod
@@ -468,6 +493,14 @@ class AnthropicAdapter(LLMAdapter):
         its responses keep their text untouched (``stop_reason`` still says
         where they stopped).
         """
+        if stop_reason == _CONTEXT_WINDOW_EXCEEDED_STOP_REASON:
+            # Never a budget anyone chose: the conversation filled the window.
+            logger.warning(
+                "Anthropic response for %s filled the model's context window "
+                "(stop_reason=%s); the response is incomplete",
+                model, stop_reason,
+            )
+            return context_window_notice(stop_reason=stop_reason)
         if stop_reason != _MAX_TOKENS_STOP_REASON:
             return None
         if model_ceiling is None:
@@ -1237,22 +1270,22 @@ class AnthropicAdapter(LLMAdapter):
             )
 
             # #3300: the provider's own verdict on whether the response is
-            # finished. A ``max_tokens`` stop means generation was cut inside
-            # its LAST content block; when that block is a tool call, its
+            # finished. A ``max_tokens`` or ``model_context_window_exceeded``
+            # stop means generation was cut inside its LAST content block; when that block is a tool call, its
             # arguments are incomplete and it must not be handed on as a call
             # to execute.
             stop_reason = getattr(response, 'stop_reason', None)
             blocks = list(response.content)
             cut_block = (
                 blocks[-1]
-                if stop_reason == _MAX_TOKENS_STOP_REASON and blocks
+                if stop_reason in _CUT_STOP_REASONS and blocks
                 and blocks[-1].type == "tool_use"
                 else None
             )
             if cut_block is not None:
                 logger.warning(
-                    "Dropping tool call %s from an Anthropic response cut at "
-                    "max_tokens: its arguments are incomplete", cut_block.name,
+                    "Dropping tool call %s from an Anthropic response cut by "
+                    "%s: its arguments are incomplete", cut_block.name, stop_reason,
                 )
 
             # Parse response
@@ -1704,26 +1737,27 @@ class AnthropicAdapter(LLMAdapter):
                 yield item
 
             # #3300: a marker still held belongs to the LAST block. It is
-            # announced unless max_tokens cut that block — then the call is
+            # announced unless a cut stop reason cut that block — then the call is
             # dropped just below and never announced.
             if (
                 pending_tool_marker is not None
-                and stop_reason != _MAX_TOKENS_STOP_REASON
+                and stop_reason not in _CUT_STOP_REASONS
             ):
                 yield pending_tool_marker
 
-            # #3300: a max_tokens stop cut the last block the stream opened.
-            # When that block is a tool call its arguments are incomplete, so
+            # #3300: a cut stop (max_tokens, or the context window filling)
+            # falls in the last block the stream opened. When that block is a tool call its arguments are incomplete, so
             # it is not handed on as a call to execute.
             if (
-                stop_reason == _MAX_TOKENS_STOP_REASON
+                stop_reason in _CUT_STOP_REASONS
                 and last_block_type == 'tool_use'
                 and last_block_index in tool_calls_accumulator
             ):
                 cut_call = tool_calls_accumulator.pop(last_block_index)
                 logger.warning(
-                    "Dropping tool call %s from an Anthropic stream cut at "
-                    "max_tokens: its arguments are incomplete", cut_call["name"],
+                    "Dropping tool call %s from an Anthropic stream cut by "
+                    "%s: its arguments are incomplete", cut_call["name"],
+                    stop_reason,
                 )
 
             # Assemble any tool calls collected during the stream.

@@ -32,6 +32,7 @@ from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.output_ceiling import (
     OutputCeilingUnknownError,
+    context_window_notice,
     output_ceiling_notice,
     response_stop_reason,
 )
@@ -240,6 +241,91 @@ def test_model_info_carries_the_reported_output_limit():
     assert anthropic_model_info({"id": "x", "max_tokens": 8192}).output_limit == 8192
     assert anthropic_model_info({"id": "x"}).output_limit is None
     assert ModelInfo.from_dict(info.to_dict()).output_limit == 128_000
+
+
+# ---------------------------------------------------------------------------
+# The context window: the provider bounds a full-ceiling request itself
+# ---------------------------------------------------------------------------
+
+CONTEXT_BETA = "model-context-window-exceeded-2025-08-26"
+
+
+def _betas(sent: Dict[str, Any]) -> List[str]:
+    return (sent.get("extra_headers") or {}).get("anthropic-beta", "").split(",")
+
+
+@pytest.mark.asyncio
+async def test_full_ceiling_request_opts_into_context_window_stop_on_api_route():
+    """The model's full output ceiling can exceed the room a long prompt
+    leaves. The provider's documented answer is to accept the request and
+    stop with ``model_context_window_exceeded`` (default on Claude 4.5+, this
+    beta on earlier models) — no client-side estimate of the input."""
+    client = anthropic_client(_message([_text("ok")], stop_reason="end_turn"))
+    await AnthropicAdapter().get_response(
+        client=client, model="claude-opus-5", messages=USER,
+    )
+    assert CONTEXT_BETA in _betas(client.messages.stream.call_args.kwargs)
+
+
+@pytest.mark.asyncio
+async def test_plan_route_keeps_claude_code_request_shape():
+    """The plan route is shaped exactly like Claude Code's requests, which do
+    not carry the context-window beta; it is not added there."""
+    client = anthropic_client(_message([_text("ok")], stop_reason="end_turn"))
+    adapter = ClaudeMaxAdapter()
+    adapter._ensure_fresh_oauth_token = AsyncMock()
+    await adapter.get_response(client=client, model="claude-opus-5", messages=USER)
+    assert CONTEXT_BETA not in _betas(client.messages.stream.call_args.kwargs)
+
+
+@pytest.mark.asyncio
+async def test_callers_budget_does_not_add_the_context_window_beta():
+    client = anthropic_client(_message([_text("ok")], stop_reason="end_turn"))
+    await AnthropicAdapter().get_response(
+        client=client, model="claude-opus-5", messages=USER, max_tokens=300,
+    )
+    assert CONTEXT_BETA not in _betas(client.messages.stream.call_args.kwargs)
+
+
+CONTEXT_NOTICE = context_window_notice(stop_reason="model_context_window_exceeded")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [{}, {"max_tokens": 300}])
+async def test_non_streaming_context_window_stop_is_marked_incomplete(budget):
+    """A context-window stop is never a budget anyone chose, so it is marked
+    whether or not the caller set max_tokens; a trailing tool call it cut is
+    dropped."""
+    client = anthropic_client(_message(
+        [_text("Partial answer"), _tool_use("call_1", "shell", {"command": "ls -"})],
+        stop_reason="model_context_window_exceeded",
+    ))
+    response = await AnthropicAdapter().get_response(
+        client=client, model="claude-opus-5", messages=USER,
+        tools=[{"type": "function", "function": {"name": "shell"}}], **budget,
+    )
+    assert response.content == f"Partial answer\n\n{CONTEXT_NOTICE}"
+    assert response.tool_calls is None
+    assert response_stop_reason(response) == "model_context_window_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_streaming_context_window_stop_is_marked_and_cut_call_unannounced():
+    events = _prose_then_cut_tool_events("Let me check the repo.")
+    events[6] = _ev(
+        "message_delta",
+        delta=SimpleNamespace(stop_reason="model_context_window_exceeded"),
+        usage=SimpleNamespace(output_tokens=900),
+    )
+    items = await _collect(AnthropicAdapter().get_streaming_response_with_tools(
+        client=_streaming_client(events), model="claude-opus-5", messages=USER,
+        tools=[{"type": "function", "function": {"name": "shell"}}],
+    ))
+    assert not any(isinstance(i, ToolCallStarted) for i in items)
+    streamed = "".join(i for i in items if isinstance(i, str))
+    assert streamed == f"Let me check the repo.\n\n{CONTEXT_NOTICE}"
+    assert items[-1].content == streamed
+    assert items[-1].tool_calls is None
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +723,7 @@ async def test_real_sdk_non_streaming_request_at_full_ceiling_is_accepted():
 
     sent = json.loads(requests[-1].content)
     assert sent["max_tokens"] == 128_000
+    assert CONTEXT_BETA in requests[-1].headers["anthropic-beta"].split(",")
     assert response.content == f"Question 1: yes\n\n{NOTICE}"
     assert response_stop_reason(response) == "max_tokens"
     assert response.output_tokens == 128_000

@@ -78,6 +78,16 @@ def output_ceiling_notice(*, ceiling: int, stop_reason: str) -> str:
     )
 
 
+def context_window_notice(*, stop_reason: str) -> str:
+    """The host-authored line marking a response cut because the whole
+    conversation filled the model's context window."""
+    return (
+        f"[Context window full: the model stopped because this conversation "
+        f"reached its context window (stop_reason={stop_reason}). This "
+        f"response is incomplete.]"
+    )
+
+
 def output_ceiling_notice_chunk(notice: str, *, follows_text: bool) -> str:
     """``notice`` as the chunk that ends a stream: its own paragraph when it
     follows text already sent."""
@@ -96,6 +106,7 @@ __all__ = [
     "STOP_REASON_ATTR",
     "OutputCeilingUnknownError",
     "attach_stop_reason",
+    "context_window_notice",
     "join_output_ceiling_notice",
     "output_ceiling_notice",
     "output_ceiling_notice_chunk",
