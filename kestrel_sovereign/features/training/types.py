@@ -25,6 +25,12 @@ class TrainingState(Enum):
         PENDING -> PROVISIONING -> PREPARING -> TRAINING -> COMPLETED
                                                          -> FAILED
                                                          -> CANCELLED
+
+    Session-based providers report two further non-terminal states while a
+    job's billable session is being torn down: RELEASING (teardown in
+    progress) and RELEASE_FAILED (the provider did not confirm the release;
+    the session may still be billing and the release is retried). A job in
+    either state has not stopped, so it is never reported as CANCELLED.
     """
     PENDING = "pending"              # Job created, waiting to start
     PROVISIONING = "provisioning"    # Instance/resources being allocated
@@ -33,6 +39,8 @@ class TrainingState(Enum):
     COMPLETED = "completed"          # Successfully finished
     FAILED = "failed"                # Error occurred
     CANCELLED = "cancelled"          # User cancelled
+    RELEASING = "releasing"          # Session teardown in progress
+    RELEASE_FAILED = "release_failed"  # Session release unconfirmed; retried
 
     @classmethod
     def from_vertex_state(cls, state: str) -> "TrainingState":

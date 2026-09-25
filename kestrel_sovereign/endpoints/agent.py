@@ -3410,6 +3410,107 @@ async def send_task(request: Request):
     return task.model_dump()
 
 
+@router.post("/peer/stop")
+@limiter.limit("120/minute")
+async def stop_from_peer(request: Request):
+    """Dispatch one signed peer andon-cord request through signal policy.
+
+    This is not the operator ``POST /stop`` door. The shared transport key
+    admits the connection, while the ordinary replay-protected A2A hybrid
+    envelope proves and authorizes the peer principal. Only then is the
+    ``a2a.peer_stop`` signal built and handed to the dispatcher, which decides
+    cycle, depth, durable replay, and rate-limit outcomes (#3169). This route
+    never cancels anything itself.
+
+    Retry contract: a byte-identical resend is refused (403) by the envelope
+    replay nonce like any other A2A action.  A sender whose response was lost
+    re-signs the same intent, ``id`` and ``sessionId`` with a fresh nonce.
+    Keyed on (verified sender, correlation id), that retry returns the
+    original Stop receipt without executing the Stop again, or — when the
+    first attempt was interrupted before its receipt was durable — completes
+    it through the dispatcher exactly once.
+    """
+
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
+    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
+    from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+    from kestrel_sovereign.signals.sources.peer_stop import (
+        PeerStopIntentError,
+        decode_peer_stop_action_envelope,
+        dispatch_peer_stop,
+        peer_stop_audience,
+        peer_stop_target_identity,
+    )
+
+    agent = get_agent(request)
+    dispatcher = getattr(agent, "dispatcher", None)
+    if dispatcher is None or not callable(
+        getattr(dispatcher, "dispatch_signal", None)
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Peer Stop signal dispatcher is unavailable",
+        )
+
+    body = await _parse_json_body(request)
+    try:
+        intent, correlation_id, session_id, metadata = (
+            decode_peer_stop_action_envelope(body)
+        )
+    except PeerStopIntentError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if HOST_ATTESTED_LOCAL_SUBMISSION_METADATA in metadata:
+        raise HTTPException(
+            status_code=400,
+            detail="host-attested local A2A provenance is not accepted over the wire",
+        )
+    message_text = body["message"]["parts"][0]["text"]
+    try:
+        params = TaskSendParams(
+            id=correlation_id,
+            sessionId=session_id,
+            message=Message(role="user", parts=[TextPart(text=message_text)]),
+            metadata=metadata,
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid peer Stop action: {error}",
+        ) from error
+
+    async def _dispatch(authorized_sender_id: str):
+        if (
+            not isinstance(authorized_sender_id, str)
+            or not authorized_sender_id.strip()
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Peer Stop requires an authenticated agent",
+            )
+        if peer_stop_audience(metadata) != peer_stop_target_identity(agent):
+            raise HTTPException(
+                status_code=403,
+                detail="Peer Stop signed audience does not match this recipient",
+            )
+        return await dispatch_peer_stop(
+            agent,
+            actor_id=authorized_sender_id,
+            intent=intent,
+            causation_chain=_deserialize_chain(params.metadata),
+        )
+
+    return await _create_verified_a2a_task(
+        agent,
+        params,
+        params.message.parts,
+        [],
+        [],
+        commit=_dispatch,
+    )
+
+
 async def _parse_a2a_principal_action(
     request: Request,
     *,

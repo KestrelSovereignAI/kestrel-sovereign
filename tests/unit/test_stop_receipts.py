@@ -130,6 +130,40 @@ async def test_receipt_store_roundtrips_exact_evidence_on_available_backends(
 
 
 @pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_operation_binding_is_first_sight_on_available_backends(db_backend):
+    """``bind_operation`` fixes an operation's request; claim honors it (#3169)."""
+
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    db = AsyncDatabase(db_backend)
+    store = StopReceiptStore(db)
+    await store.ensure_schema()
+    first = _request()
+    changed = replace(first, reason="a different request")
+
+    await store.bind_operation(first)
+    await store.bind_operation(first)
+    with pytest.raises(StopReceiptConflict):
+        await store.bind_operation(changed)
+    with pytest.raises(StopReceiptConflict):
+        await store.claim(changed)
+
+    claim = await store.claim(first)
+    receipt = await store.persist(first, _outcomes(first), claim_id=claim.claim_id)
+    assert await store.load(first) == receipt
+    # Only the fingerprint is stored, under the blinded operation identity.
+    rows = await db.fetchall(
+        "SELECT operation_id, request_fingerprint FROM stop_operation_bindings "
+        "WHERE operation_id = ?",
+        (opaque_stop_identifier("operation", first.correlation_id),),
+    )
+    assert len(rows) == 1
+    assert first.correlation_id not in rows[0][0]
+    assert rows[0][1] == receipt.request_fingerprint
+
+
+@pytest.mark.asyncio
 async def test_acknowledged_turn_stop_is_queryable_by_durable_target(tmp_path):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 

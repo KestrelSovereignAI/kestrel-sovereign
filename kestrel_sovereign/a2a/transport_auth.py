@@ -30,7 +30,7 @@ _SOVEREIGN_API_KEY_ENV = "KESTREL_API_KEY"
 
 _ROUTED_A2A_PATH = re.compile(
     r"^(?:/api/agents/[^/]+)?/api/agent/"
-    r"(?:invoke|tasks/send|tasks/.+/(?:read|cancel|subscribe))$"
+    r"(?:invoke|peer/stop|tasks/send|tasks/.+/(?:read|cancel|subscribe))$"
 )
 
 

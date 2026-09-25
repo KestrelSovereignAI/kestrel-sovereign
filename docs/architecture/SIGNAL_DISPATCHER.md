@@ -578,6 +578,14 @@ The dispatcher pipeline:
 8. **Release locks** in reverse acquisition order.
 9. **Log** the routed outcome per the source's redaction policy.
 
+An `InFlightControlActionRegistration` (today only `a2a.peer_stop`, #3169)
+is an ACTION that acts on work already running. Step 3 persists only a fixed
+marker for it (no payload, caller, or chain) without taking the privacy
+transition lock every running turn holds, and Hold's begin-work disposition
+does not apply to it. Validation, cycle/TTL, durable deduplication, and rate
+limiting are unchanged. See the peer Stop section of
+[`SIGNAL_SOURCES_GUIDE.md`](./SIGNAL_SOURCES_GUIDE.md).
+
 The dispatcher lives as a sibling component the agent holds a reference to. Easier to test than another mixin.
 
 ## Logging & Privacy (`signal_log`)
