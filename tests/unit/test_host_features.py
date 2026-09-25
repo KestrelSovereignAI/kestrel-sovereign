@@ -20,6 +20,7 @@ from kestrel_sdk.features.host_base import HostFeature
 from kestrel_sdk.features.ui import UIContributions
 
 from kestrel_sovereign import host_features as hf
+from kestrel_sovereign.hold import HoldAuthority
 from kestrel_sovereign.host_features.context import (
     FLEET_TENANT_ID,
     FleetSessionFactory,
@@ -950,6 +951,7 @@ async def test_host_context_refuses_silent_rebootstrap_after_sqlite_custody_loss
     try:
         assert first.hold_store is not None, first.backend_error
         mutation = await first.hold_store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope="host",
             actor_id="did:sovereign:operator",
             reason="must survive custody loss",

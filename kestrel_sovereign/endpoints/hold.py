@@ -38,6 +38,7 @@ from kestrel_sovereign.features.storage_access import (
 from kestrel_sovereign.hold import (
     HOST_HOLD_TARGET,
     EffectiveHoldState,
+    HoldAuthority,
     HoldCorruptStateError,
     HoldIdempotencyConflict,
     HoldMutation,
@@ -401,6 +402,9 @@ async def set_host_hold(request: Request, response: Response, body: HoldBody):
             actor_id=actor_id,
             reason=body.reason,
             operation_id=body.operation_id,
+            # ``sovereign_actor_id`` refused every other caller above, so the
+            # authority this door acted under is a fact, recorded as one.
+            authority=HoldAuthority.SOVEREIGN,
         )
     except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
@@ -425,6 +429,7 @@ async def release_host_hold(
             reason=body.reason,
             operation_id=body.operation_id,
             expected_hold_receipt_id=body.expected_hold_receipt_id,
+            authority=HoldAuthority.SOVEREIGN,
         )
     except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error

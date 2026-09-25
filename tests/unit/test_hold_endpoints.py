@@ -22,6 +22,7 @@ from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.hold import router
 from kestrel_sovereign.hold import (
     HoldAction,
+    HoldAuthority,
     HoldCorruptStateError,
     HoldDisposition,
     HoldIdempotencyConflict,
@@ -65,6 +66,7 @@ def _receipt(action, disposition, scope, target, **overrides):
         "expected_hold_receipt_id": "",
         "prior_hold_receipt_id": "",
         "resulting_hold_receipt_id": "receipt-new",
+        "authority": HoldAuthority.SOVEREIGN,
     }
     fields.update(overrides)
     return HoldReceipt(**fields)
@@ -106,7 +108,9 @@ class _Store:
             )
         )
 
-    async def set_hold(self, *, scope, actor_id, reason, operation_id, target_id=None):
+    async def set_hold(
+        self, *, scope, actor_id, reason, operation_id, authority, target_id=None
+    ):
         self.set_calls.append(
             {
                 "scope": scope,
@@ -114,6 +118,7 @@ class _Store:
                 "actor_id": actor_id,
                 "reason": reason,
                 "operation_id": operation_id,
+                "authority": authority,
             }
         )
         if self.set_error is not None:
@@ -133,7 +138,15 @@ class _Store:
         )
 
     async def release_hold(
-        self, *, scope, actor_id, reason, operation_id, expected_hold_receipt_id, target_id=None
+        self,
+        *,
+        scope,
+        actor_id,
+        reason,
+        operation_id,
+        expected_hold_receipt_id,
+        authority,
+        target_id=None,
     ):
         self.release_calls.append(
             {
@@ -143,6 +156,7 @@ class _Store:
                 "reason": reason,
                 "operation_id": operation_id,
                 "expected_hold_receipt_id": expected_hold_receipt_id,
+                "authority": authority,
             }
         )
         if self.release_error is not None:
@@ -267,12 +281,14 @@ async def test_one_snapshot_is_measured_against_the_real_store(tmp_path, monkeyp
     await store.ensure_schema()
     try:
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.HOST,
             actor_id="sovereign-key",
             reason="fleet freeze",
             operation_id="op-host",
         )
         await store.set_hold(
+            authority=HoldAuthority.SOVEREIGN,
             scope=HoldScope.AGENT,
             target_id=ALPHA,
             actor_id="sovereign-key",
@@ -436,6 +452,9 @@ def test_hold_latches_the_agents_did_and_names_the_sovereign_actor():
             "actor_id": "sovereign-key",
             "reason": "runaway loop",
             "operation_id": "op-1",
+            # The door records the authority it resolved; no reader infers it
+            # from the actor string.
+            "authority": HoldAuthority.SOVEREIGN,
         }
     ]
     body = response.json()
@@ -494,6 +513,7 @@ def test_release_carries_the_receipt_the_caller_saw_and_reports_a_stale_refusal(
 
     assert response.status_code == 200, response.text
     assert store.release_calls[0]["expected_hold_receipt_id"] == "agent-7"
+    assert store.release_calls[0]["authority"] is HoldAuthority.SOVEREIGN
     body = response.json()
     # A hold replaced since the caller last looked is refused, not released.
     assert body["receipt"]["disposition"] == "refused_stale"

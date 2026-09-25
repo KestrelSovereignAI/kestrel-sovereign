@@ -62,6 +62,7 @@ from kestrel_sovereign.hold.state import (
     _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS,
     _POSTGRES_HOLD_METADATA_UPSERT_PROBE_SQL,
     _hold_duplicate_conflict_key_sql,
+    _snapshot_history_anchor_format,
 )
 from kestrel_sovereign.identity.protected_export import (
     audit_legacy_identity_exports,
@@ -351,12 +352,6 @@ _POSTGRES_HOLD_SCHEMA_SQL = (
     "('hold_latches', 'hold_receipts', 'hold_receipt_witnesses', "
     "'hold_receipt_content_witnesses', 'hold_operation_witnesses', "
     "'hold_schema_migrations') ORDER BY table_name"
-)
-_POSTGRES_HOLD_RECEIPTS_SQL = (
-    "SELECT receipt_id, operation_id, action, disposition, scope, target_id, "
-    "reason, actor_id, occurred_at, expected_hold_receipt_id, "
-    "prior_hold_receipt_id, resulting_hold_receipt_id "
-    "FROM hold_receipts ORDER BY receipt_id"
 )
 _POSTGRES_HOLD_LATCHES_SQL = (
     "SELECT scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, "
@@ -851,10 +846,20 @@ def _read_postgres_hold_primary_state(
             )
         )
 
+    # Migrations first: the receipt projection follows the recorded anchor
+    # format exactly as the runtime snapshot reads it, so a migrated
+    # database's receipts include their recorded authority.
+    migration_rows = read_table(
+        "hold_schema_migrations",
+        _POSTGRES_HOLD_MIGRATIONS_SQL,
+    )
     return HoldDatabaseSnapshot(
         existing_tables=frozenset(tables),
         latch_rows=read_table("hold_latches", _POSTGRES_HOLD_LATCHES_SQL),
-        receipt_rows=read_table("hold_receipts", _POSTGRES_HOLD_RECEIPTS_SQL),
+        receipt_rows=read_table(
+            "hold_receipts",
+            _snapshot_history_anchor_format(migration_rows).receipt_history_sql,
+        ),
         receipt_count_witness_rows=read_table(
             "hold_receipt_witnesses",
             _POSTGRES_HOLD_RECEIPT_COUNTS_SQL,
@@ -867,10 +872,7 @@ def _read_postgres_hold_primary_state(
             "hold_operation_witnesses",
             _POSTGRES_HOLD_OPERATION_WITNESSES_SQL,
         ),
-        migration_rows=read_table(
-            "hold_schema_migrations",
-            _POSTGRES_HOLD_MIGRATIONS_SQL,
-        ),
+        migration_rows=migration_rows,
         resolvable_conflict_keys=frozenset(conflict_keys),
         occupied_schema_names=frozenset(occupied_names),
         duplicate_conflict_keys=frozenset(duplicate_keys),

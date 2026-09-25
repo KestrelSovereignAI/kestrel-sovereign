@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Mapping, Optional
+from typing import Any, Awaitable, Iterable, Mapping, Optional
 from uuid import UUID, uuid4
 
 try:  # pragma: no cover - exercised on Kestrel's POSIX deployment targets
@@ -58,8 +58,11 @@ _WITNESS_BACKFILL = "hold_state_witness_ledgers_v1"
 _INITIALIZATION_WITNESS_PAYLOAD = b"kestrel-hold-state-initialized-v1\n"
 _SQLITE_CUSTODY_MARKER_HEADER = b"kestrel-hold-sqlite-custody-v2\n"
 _BOOTSTRAP_INTENT_PAYLOAD = b"kestrel-hold-bootstrap-pending-v1\n"
-_HISTORY_ANCHOR_HEADER = b"kestrel-hold-history-v1\n"
 _HISTORY_ANCHOR_MAX_BYTES = 256
+# Recorded in ``hold_schema_migrations`` by the one transaction that adds and
+# backfills ``hold_receipts.authority``; its presence is what says the
+# database's whole-history anchor uses the v2 projection.
+_HISTORY_ANCHOR_V2_MIGRATION = "hold_history_anchor_v2"
 _SQLITE_CUSTODY_MARKER_MAX_BYTES = (
     len(_SQLITE_CUSTODY_MARKER_HEADER) + 65 + _HISTORY_ANCHOR_MAX_BYTES
 )
@@ -159,11 +162,111 @@ _POSTGRES_HOLD_METADATA_UPSERT_PROBE_PARAMS = (
 _LATCH_COLUMNS = (
     "scope, target_id, active, hold_receipt_id, reason, actor_id, set_at, revision"
 )
+# The twelve v1 evidence fields: the whole receipt before ``authority``
+# existed, and still the projection of an un-migrated database.
 _RECEIPT_COLUMNS = (
     "receipt_id, operation_id, action, disposition, scope, target_id, reason, "
     "actor_id, occurred_at, expected_hold_receipt_id, prior_hold_receipt_id, "
     "resulting_hold_receipt_id"
 )
+# The complete receipt once the schema transaction has added ``authority``.
+# Every reader that surfaces a receipt after that transaction selects it, and
+# so does every whole-history reader of a migrated database: the recorded
+# authority is receipt content, and the anchor and snapshot must cover it.
+_RECEIPT_AUTHORITY_COLUMNS = f"{_RECEIPT_COLUMNS}, authority"
+_RECEIPT_AUTHORITY_COLUMN_DEFINITION = "authority TEXT NOT NULL DEFAULT 'sovereign'"
+_V1_RECEIPT_WIDTH = 12
+# The value the migration backfills: every receipt written before the column
+# existed was written by the sovereign host door, the only door there was.
+_BACKFILLED_AUTHORITY = "sovereign"
+
+
+class _HistoryAnchorFormat(Enum):
+    """The receipt projection a whole-history anchor digests.
+
+    The format is part of the anchor payload (its header line), so an anchor
+    can never be compared against a history read under another projection
+    without that difference being visible.
+    """
+
+    # The twelve v1 fields. Written by every release before ``authority``.
+    V1 = b"kestrel-hold-history-v1\n"
+    # The v1 fields plus the recorded authority of every receipt.
+    V2 = b"kestrel-hold-history-v2\n"
+
+    @property
+    def header(self) -> bytes:
+        return self.value
+
+    @property
+    def receipt_width(self) -> int:
+        if self is _HistoryAnchorFormat.V1:
+            return _V1_RECEIPT_WIDTH
+        return _V1_RECEIPT_WIDTH + 1
+
+    @property
+    def receipt_history_sql(self) -> str:
+        columns = (
+            _RECEIPT_COLUMNS
+            if self is _HistoryAnchorFormat.V1
+            else _RECEIPT_AUTHORITY_COLUMNS
+        )
+        return f"SELECT {columns} FROM hold_receipts ORDER BY receipt_id"
+
+
+def _history_anchor_format_for(
+    migration_names: Iterable[object],
+) -> _HistoryAnchorFormat:
+    """The anchor format a database's recorded migrations commit it to."""
+
+    if _HISTORY_ANCHOR_V2_MIGRATION in set(migration_names):
+        return _HistoryAnchorFormat.V2
+    return _HistoryAnchorFormat.V1
+
+
+def _snapshot_history_anchor_format(
+    migration_rows: Iterable[Any],
+) -> _HistoryAnchorFormat:
+    return _history_anchor_format_for(
+        row[0] for row in migration_rows if len(row) == 1
+    )
+
+
+def _payload_history_anchor_format(payload: bytes) -> _HistoryAnchorFormat:
+    """The format a (validated) anchor payload declares in its header."""
+
+    for anchor_format in _HistoryAnchorFormat:
+        if payload.startswith(anchor_format.header):
+            return anchor_format
+    raise HoldCorruptStateError("Hold history anchor has invalid durable evidence")
+
+
+def _v1_projection_of(rows: Iterable[Any]) -> Optional[tuple[Any, ...]]:
+    """Project migrated rows back to v1, or ``None`` if v1 never covered them.
+
+    Only a receipt whose recorded authority is the backfilled value is one a
+    v1 anchor could have described; anything else is outside that anchor.
+    """
+
+    projected: list[Any] = []
+    for row in rows:
+        if len(row) != _V1_RECEIPT_WIDTH + 1:
+            raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+        if _receipt_from_row(row).authority is not HoldAuthority.SOVEREIGN:
+            return None
+        projected.append(tuple(row)[:_V1_RECEIPT_WIDTH])
+    return tuple(projected)
+
+
+def _backfilled_projection_of(rows: Iterable[Any]) -> tuple[Any, ...]:
+    """The rows an un-migrated history becomes once ``authority`` backfills."""
+
+    projected: list[Any] = []
+    for row in rows:
+        if len(row) != _V1_RECEIPT_WIDTH:
+            raise HoldCorruptStateError("hold receipt row has an unexpected shape")
+        projected.append((*tuple(row), _BACKFILLED_AUTHORITY))
+    return tuple(projected)
 
 
 class HoldScope(str, Enum):
@@ -182,6 +285,19 @@ class HoldDisposition(str, Enum):
     APPLIED = "applied"
     ALREADY_IN_STATE = "already_in_state"
     REFUSED_STALE = "refused_stale"
+
+
+class HoldAuthority(str, Enum):
+    """The authority under which a Hold receipt's actor acted.
+
+    Recorded by the door that performed the mutation, never inferred from the
+    shape of the actor string. The sovereign host door is the only writer
+    today; every receipt written before this column existed was written by it,
+    which is why the v1 backfill is ``sovereign``. A new door (the #3168
+    mandate door) adds its own member and records it explicitly.
+    """
+
+    SOVEREIGN = "sovereign"
 
 
 class HoldStateError(RuntimeError):
@@ -1008,6 +1124,7 @@ class HoldReceipt:
     expected_hold_receipt_id: str
     prior_hold_receipt_id: str
     resulting_hold_receipt_id: str
+    authority: HoldAuthority
 
 
 @dataclass(frozen=True)
@@ -1079,6 +1196,7 @@ def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
         "expected_hold_receipt_id": receipt.expected_hold_receipt_id,
         "prior_hold_receipt_id": receipt.prior_hold_receipt_id,
         "resulting_hold_receipt_id": receipt.resulting_hold_receipt_id,
+        "authority": receipt.authority.value,
     }
 
 
@@ -1288,7 +1406,7 @@ def _unused_schema_refusal(
     Boot already treats a database with no Hold tables and no external
     evidence as a first bootstrap. Tables that exist but never recorded
     anything carry the same facts: no latch, receipt, or witness row, only the
-    marker a schema transaction writes, and no SQLite custody marker proving
+    markers a schema transaction writes, and no SQLite custody marker proving
     an earlier initialization. Adopting them grants nothing that dropping
     those empty tables would not, so returning ``None`` is safe. Any recorded
     row, the custody marker, or a migration this code does not know means Hold
@@ -1309,7 +1427,9 @@ def _unused_schema_refusal(
     if occupied:
         return ", ".join(occupied)
     unknown = sorted(
-        repr(name) for name in migration_names if name != _WITNESS_BACKFILL
+        repr(name)
+        for name in migration_names
+        if name not in (_WITNESS_BACKFILL, _HISTORY_ANCHOR_V2_MIGRATION)
     )
     if unknown:
         return "hold_schema_migrations records unknown migration " + ", ".join(
@@ -1358,6 +1478,14 @@ def _required_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _required_authority(value: object) -> HoldAuthority:
+    """Require the door to name its authority; never infer or default it."""
+
+    if not isinstance(value, HoldAuthority):
+        raise TypeError("Hold authority must be a HoldAuthority recorded by its door")
+    return value
 
 
 def _coerce_scope(value: HoldScope | str) -> HoldScope:
@@ -1458,18 +1586,29 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
 def _feed_entry_from_row(row: Any) -> HoldFeedEntry:
     """Split a feed row into its paging key and its validated receipt."""
 
-    if row is None or len(row) != 13:
+    width = _V1_RECEIPT_WIDTH + 1
+    if row is None or len(row) != width + 1:
         raise HoldCorruptStateError("hold feed row has an unexpected shape")
-    feed_seq = row[12]
+    feed_seq = row[width]
     if isinstance(feed_seq, bool) or not isinstance(feed_seq, int) or feed_seq < 1:
         raise HoldCorruptStateError("hold receipt feed sequence is invalid")
     return HoldFeedEntry(
-        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:12])
+        feed_seq=feed_seq, receipt=_receipt_from_row(tuple(row)[:width])
     )
 
 
 def _receipt_from_row(row: Any) -> HoldReceipt:
-    if row is None or len(row) != 12:
+    """Validate one receipt row.
+
+    A row is either the v1 projection (``_RECEIPT_COLUMNS``) or that
+    projection plus its recorded ``authority``. A v1 projection carries no
+    authority of its own; it is interpreted as the v1 authority, which is what
+    the schema backfill records for every row written before the column
+    existed, and is sound only for a database that has not yet migrated:
+    every reader of a migrated database selects the recorded value.
+    """
+
+    if row is None or len(row) not in (_V1_RECEIPT_WIDTH, _V1_RECEIPT_WIDTH + 1):
         raise HoldCorruptStateError("hold receipt row has an unexpected shape")
     if any(value is None for value in row):
         # SQLite does not implicitly make a non-INTEGER PRIMARY KEY non-null,
@@ -1492,6 +1631,11 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
             expected_hold_receipt_id=str(row[9] or ""),
             prior_hold_receipt_id=str(row[10] or ""),
             resulting_hold_receipt_id=str(row[11] or ""),
+            authority=(
+                HoldAuthority(str(row[12]))
+                if len(row) > _V1_RECEIPT_WIDTH
+                else HoldAuthority.SOVEREIGN
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise HoldCorruptStateError("hold receipt has invalid typed fields") from exc
@@ -1551,11 +1695,20 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
 
 
 def _receipt_content_digest(row: Any) -> str:
-    """Hash every typed receipt field with unambiguous length framing."""
+    """Hash every typed receipt field with unambiguous length framing.
 
-    _receipt_from_row(row)
+    The recorded authority is framed in after the v1 fields only when it is
+    not the v1 authority. Every witness written before the column existed
+    therefore still matches its (backfilled) row, while any other authority —
+    and any in-place rewrite of it in either direction — changes the digest.
+    """
+
+    receipt = _receipt_from_row(row)
+    values = list(tuple(row)[:_V1_RECEIPT_WIDTH])
+    if receipt.authority is not HoldAuthority.SOVEREIGN:
+        values.append(receipt.authority.value)
     digest = hashlib.sha256()
-    for value in row:
+    for value in values:
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -1772,6 +1925,14 @@ def validate_hold_database_snapshot(
     if not migration_complete:
         raise HoldCorruptStateError(
             "initialized Hold schema is missing its required witness migration marker"
+        )
+    # A migrated database's receipt includes its recorded authority; a
+    # snapshot that omits it would validate every authority as sovereign.
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    if any(len(row) != anchor_format.receipt_width for row in snapshot.receipt_rows):
+        raise HoldCorruptStateError(
+            "Hold receipt snapshot does not carry the columns its anchor "
+            "format covers"
         )
 
     targets: set[tuple[HoldScope, str]] = {
@@ -2107,15 +2268,22 @@ def validate_hold_readiness_snapshot(
         unused_schema_refusal=unused_schema_refusal,
     )
     receipt_rows = snapshot.receipt_rows
-    current = HoldStore._history_anchor_payload_from_rows(receipt_rows)
-    if bootstrap_history is not None and bootstrap_history != current:
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    current = HoldStore._history_anchor_payload_from_rows(
+        receipt_rows, anchor_format=anchor_format
+    )
+    if bootstrap_history is not None and not HoldStore._history_payload_describes(
+        bootstrap_history, receipt_rows, anchor_format=anchor_format
+    ):
         raise HoldCorruptStateError(
             "Hold bootstrap intent does not match receipt history"
         )
     if (
         bootstrap_history is not None
         and anchored is not None
-        and anchored != bootstrap_history
+        and not HoldStore._history_payload_describes(
+            anchored, receipt_rows, anchor_format=anchor_format
+        )
     ):
         raise HoldCorruptStateError(
             "Hold bootstrap intent conflicts with the stable history anchor"
@@ -2140,9 +2308,10 @@ def validate_hold_readiness_snapshot(
         if current == candidate:
             if anchored != candidate and (
                 anchored is None
-                or not HoldStore._is_immediate_history_predecessor(
+                or not HoldStore._is_history_predecessor(
                     anchored,
                     receipt_rows,
+                    anchor_format=anchor_format,
                 )
             ):
                 raise HoldCorruptStateError(
@@ -2151,10 +2320,14 @@ def validate_hold_readiness_snapshot(
                 )
             effective_anchor = candidate
         elif anchored is not None and current == anchored:
-            raise HoldCorruptStateError(
-                "ambiguous staged Hold history publication matches the stable "
-                "anchor; refusing to discard possible committed evidence"
-            )
+            if not HoldStore._is_uncommitted_anchor_format_migration(
+                candidate, receipt_rows, anchor_format=anchor_format
+            ):
+                raise HoldCorruptStateError(
+                    "ambiguous staged Hold history publication matches the "
+                    "stable anchor; refusing to discard possible committed "
+                    "evidence"
+                )
         else:
             raise HoldCorruptStateError(
                 "interrupted Hold history publication matches neither durable state"
@@ -3008,19 +3181,43 @@ class HoldStore:
                 "could not persist PostgreSQL Hold initialization witness"
             )
 
+    async def _history_anchor_format(self) -> _HistoryAnchorFormat:
+        """The anchor format this database's recorded migrations commit it to.
+
+        ``hold_schema_migrations`` is part of every schema a stable anchor can
+        describe; the only pre-schema reader is ``_bootstrap_history``.
+        """
+
+        migrated = await self._db.fetchall(
+            "SELECT name FROM hold_schema_migrations WHERE name = ?",
+            (_HISTORY_ANCHOR_V2_MIGRATION,),
+        )
+        return _history_anchor_format_for(row[0] for row in migrated)
+
+    async def _current_history(
+        self,
+    ) -> tuple[_HistoryAnchorFormat, tuple[Any, ...]]:
+        """Read the complete receipt set under this database's anchor format."""
+
+        anchor_format = await self._history_anchor_format()
+        rows = tuple(await self._db.fetchall(anchor_format.receipt_history_sql))
+        return anchor_format, rows
+
     async def _current_history_anchor_payload(self) -> bytes:
         """Hash the complete immutable receipt set in a stable global order."""
 
-        rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
+        anchor_format, rows = await self._current_history()
+        return self._history_anchor_payload_from_rows(
+            rows, anchor_format=anchor_format
         )
-        return self._history_anchor_payload_from_rows(rows)
 
     @classmethod
     def _is_immediate_history_predecessor(
         cls,
         predecessor: bytes,
         current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
     ) -> bool:
         """Whether ``predecessor`` is exactly ``current_rows`` minus one receipt.
 
@@ -3029,10 +3226,13 @@ class HoldStore:
         receipt was appended is preferable to trusting only the monotonically
         increasing receipt count: two divergent histories can have the same
         count. This proof prevents a restored primary/candidate pair from
-        replacing a newer stable external head.
+        replacing a newer stable external head. A mutation never changes the
+        anchor format, so a predecessor in another format is not one.
         """
 
         predecessor = cls._validate_history_anchor_payload(predecessor)
+        if _payload_history_anchor_format(predecessor) is not anchor_format:
+            return False
         parts = predecessor.splitlines()
         if int(parts[1]) != len(current_rows) - 1:
             return False
@@ -3042,38 +3242,168 @@ class HoldStore:
                     row
                     for position, row in enumerate(current_rows)
                     if position != omitted
-                )
+                ),
+                anchor_format=anchor_format,
             )
             == predecessor
             for omitted in range(len(current_rows))
         )
 
-    @staticmethod
-    def _history_anchor_payload_from_rows(rows: list[Any] | tuple[Any, ...]) -> bytes:
-        """Build the canonical receipt head, including the empty history."""
+    @classmethod
+    def _history_payload_describes(
+        cls,
+        payload: bytes,
+        rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``payload`` describes exactly this history in either format.
 
+        ``rows`` were read under ``anchor_format``. A payload in the other
+        format is compared with the same history under the projection the
+        v2 migration moves between: an un-migrated history with its backfilled
+        authority, or a migrated one whose every authority is still the
+        backfilled value. This is for recognizing the anchor-format migration
+        itself; a stable anchor is always compared in its database's format.
+        """
+
+        payload = cls._validate_history_anchor_payload(payload)
+        payload_format = _payload_history_anchor_format(payload)
+        if payload_format is anchor_format:
+            projected: Optional[tuple[Any, ...]] = tuple(rows)
+        elif payload_format is _HistoryAnchorFormat.V1:
+            projected = _v1_projection_of(rows)
+        else:
+            projected = _backfilled_projection_of(rows)
+        return projected is not None and payload == (
+            cls._history_anchor_payload_from_rows(
+                projected, anchor_format=payload_format
+            )
+        )
+
+    @classmethod
+    def _is_anchor_format_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``predecessor`` is this migrated history's v1 anchor.
+
+        The v2 migration re-anchors an unchanged history under the v2
+        projection. Its stable anchor until publication is therefore the v1
+        anchor of exactly the same receipts, every one with the backfilled
+        authority.
+        """
+
+        predecessor = cls._validate_history_anchor_payload(predecessor)
+        return (
+            anchor_format is _HistoryAnchorFormat.V2
+            and _payload_history_anchor_format(predecessor)
+            is _HistoryAnchorFormat.V1
+            and cls._history_payload_describes(
+                predecessor, current_rows, anchor_format=anchor_format
+            )
+        )
+
+    @classmethod
+    def _is_history_predecessor(
+        cls,
+        predecessor: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether a staged head may replace ``predecessor`` as the stable one."""
+
+        return cls._is_immediate_history_predecessor(
+            predecessor, current_rows, anchor_format=anchor_format
+        ) or cls._is_anchor_format_predecessor(
+            predecessor, current_rows, anchor_format=anchor_format
+        )
+
+    @classmethod
+    def _is_uncommitted_anchor_format_migration(
+        cls,
+        candidate: bytes,
+        current_rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bool:
+        """Whether ``candidate`` is the v2 re-anchor of this un-migrated history.
+
+        The migration stages that candidate before its database transaction
+        commits. Finding it beside a database that is still v1 and still
+        matches its stable anchor means either the transaction never committed
+        or the primary was restored to exactly the same receipts. Neither loses
+        Hold evidence, so unlike an ordinary mutation candidate it is safe to
+        discard and migrate again; refusing would wedge boot on an interrupted
+        upgrade.
+        """
+
+        candidate = cls._validate_history_anchor_payload(candidate)
+        return (
+            anchor_format is _HistoryAnchorFormat.V1
+            and _payload_history_anchor_format(candidate)
+            is _HistoryAnchorFormat.V2
+            and cls._history_payload_describes(
+                candidate, current_rows, anchor_format=anchor_format
+            )
+        )
+
+    @staticmethod
+    def _history_anchor_payload_from_rows(
+        rows: list[Any] | tuple[Any, ...],
+        *,
+        anchor_format: _HistoryAnchorFormat,
+    ) -> bytes:
+        """Build the canonical receipt head, including the empty history.
+
+        Every row must carry exactly the columns ``anchor_format`` covers: a
+        v2 anchor built from rows missing ``authority`` would silently describe
+        every receipt as sovereign. V2 frames each receipt's recorded authority
+        explicitly, including the backfilled one.
+        """
+
+        if any(len(row) != anchor_format.receipt_width for row in rows):
+            raise HoldCorruptStateError(
+                "Hold receipt history does not carry the columns its anchor "
+                "format covers"
+            )
         digest = hashlib.sha256()
-        digest.update(_HISTORY_ANCHOR_HEADER)
+        digest.update(anchor_format.header)
         for row in rows:
             receipt = _receipt_from_row(row)
-            for value in (receipt.receipt_id, _receipt_content_digest(row)):
+            values = [receipt.receipt_id, _receipt_content_digest(row)]
+            if anchor_format is _HistoryAnchorFormat.V2:
+                values.append(receipt.authority.value)
+            for value in values:
                 encoded = value.encode("utf-8")
                 digest.update(len(encoded).to_bytes(8, "big"))
                 digest.update(encoded)
         return (
-            _HISTORY_ANCHOR_HEADER
+            anchor_format.header
             + str(len(rows)).encode("ascii")
             + b"\n"
             + digest.hexdigest().encode("ascii")
             + b"\n"
         )
 
-    async def _bootstrap_history_anchor(self, existing: set[str]) -> bytes:
-        """Read the receipt head a pending bootstrap is authorized to migrate."""
+    async def _bootstrap_history(
+        self, existing: set[str]
+    ) -> tuple[_HistoryAnchorFormat, tuple[Any, ...]]:
+        """Read the receipt history a pending bootstrap is authorized to migrate."""
 
         if "hold_receipts" not in existing:
-            return self._history_anchor_payload_from_rows([])
-        return await self._current_history_anchor_payload()
+            return _HistoryAnchorFormat.V1, ()
+        if "hold_schema_migrations" not in existing:
+            return _HistoryAnchorFormat.V1, tuple(
+                await self._db.fetchall(
+                    _HistoryAnchorFormat.V1.receipt_history_sql
+                )
+            )
+        return await self._current_history()
 
     async def _read_history_anchor(self) -> bytes | None:
         """Read the receipt-history head from custody outside Hold tables."""
@@ -3103,7 +3433,11 @@ class HoldStore:
         parts = payload.splitlines()
         if (
             len(parts) != 3
-            or parts[0] != _HISTORY_ANCHOR_HEADER.rstrip(b"\n")
+            or parts[0]
+            not in {
+                anchor_format.header.rstrip(b"\n")
+                for anchor_format in _HistoryAnchorFormat
+            }
             or not parts[1].isdigit()
             or str(int(parts[1])).encode("ascii") != parts[1]
             or len(parts[2]) != 64
@@ -3181,20 +3515,28 @@ class HoldStore:
         followed by a primary restore, so it must fail closed. An ordinary
         in-process transaction failure removes its own candidate before the
         primary rollback through ``_primary_mutation_transaction``.
+
+        The v2 anchor-format migration uses the same protocol. Its candidate
+        re-anchors an unchanged history, so its stable predecessor is the v1
+        anchor of the same receipts, and a candidate found beside a database
+        that never committed the migration is discarded rather than refused
+        (see ``_is_uncommitted_anchor_format_migration``).
         """
 
         candidate = await self._read_external_history_candidate()
         if candidate is None:
             return
-        current_rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
+        anchor_format, current_rows = await self._current_history()
+        current = self._history_anchor_payload_from_rows(
+            current_rows, anchor_format=anchor_format
         )
-        current = self._history_anchor_payload_from_rows(current_rows)
         stable = await self._read_history_anchor()
         if current == candidate:
             if stable != candidate and (
                 stable is None
-                or not self._is_immediate_history_predecessor(stable, current_rows)
+                or not self._is_history_predecessor(
+                    stable, current_rows, anchor_format=anchor_format
+                )
             ):
                 raise HoldCorruptStateError(
                     "staged Hold history publication conflicts with the stable "
@@ -3217,9 +3559,10 @@ class HoldStore:
                         marker_valid = marker_history == stable
                     else:
                         marker_valid = marker_history == candidate or (
-                            self._is_immediate_history_predecessor(
+                            self._is_history_predecessor(
                                 marker_history,
                                 current_rows,
+                                anchor_format=anchor_format,
                             )
                         )
                     if not marker_valid:
@@ -3241,6 +3584,11 @@ class HoldStore:
             await self._remove_external_history_candidate()
             return
         if stable is not None and current == stable:
+            if self._is_uncommitted_anchor_format_migration(
+                candidate, current_rows, anchor_format=anchor_format
+            ):
+                await self._remove_external_history_candidate()
+                return
             raise HoldCorruptStateError(
                 "ambiguous staged Hold history publication matches the stable "
                 "anchor; refusing to discard possible committed evidence"
@@ -3441,6 +3789,11 @@ class HoldStore:
                 return ()
             return tuple(await self._db.fetchall(sql))
 
+        # Migrations first: they decide which receipt projection is complete.
+        migration_rows = await rows(
+            "hold_schema_migrations",
+            "SELECT name FROM hold_schema_migrations ORDER BY name",
+        )
         return HoldDatabaseSnapshot(
             existing_tables=existing,
             latch_rows=await rows(
@@ -3450,7 +3803,9 @@ class HoldStore:
             ),
             receipt_rows=await rows(
                 "hold_receipts",
-                f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id",
+                _snapshot_history_anchor_format(
+                    migration_rows
+                ).receipt_history_sql,
             ),
             receipt_count_witness_rows=await rows(
                 "hold_receipt_witnesses",
@@ -3467,10 +3822,7 @@ class HoldStore:
                 "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
                 "ORDER BY operation_id",
             ),
-            migration_rows=await rows(
-                "hold_schema_migrations",
-                "SELECT name FROM hold_schema_migrations ORDER BY name",
-            ),
+            migration_rows=migration_rows,
         )
 
     async def ensure_schema(self) -> None:
@@ -3551,10 +3903,15 @@ class HoldStore:
             bootstrap_pending=bootstrap_history is not None,
             unused_schema_refusal=unused_schema_refusal,
         )
-        current_bootstrap_history = await self._bootstrap_history_anchor(existing)
-        if (
-            bootstrap_history is not None
-            and bootstrap_history != current_bootstrap_history
+        bootstrap_format, bootstrap_rows = await self._bootstrap_history(existing)
+        current_bootstrap_history = self._history_anchor_payload_from_rows(
+            bootstrap_rows, anchor_format=bootstrap_format
+        )
+        # The bootstrap migration never changes receipts but may move the
+        # anchor format, so an intent (or an anchor published before its
+        # witness) matches the same history in either format.
+        if bootstrap_history is not None and not self._history_payload_describes(
+            bootstrap_history, bootstrap_rows, anchor_format=bootstrap_format
         ):
             raise HoldCorruptStateError(
                 "Hold bootstrap intent does not match receipt history"
@@ -3562,7 +3919,9 @@ class HoldStore:
         if (
             bootstrap_history is not None
             and anchored is not None
-            and anchored != bootstrap_history
+            and not self._history_payload_describes(
+                anchored, bootstrap_rows, anchor_format=bootstrap_format
+            )
         ):
             raise HoldCorruptStateError(
                 "Hold bootstrap intent conflicts with the stable history anchor"
@@ -3582,7 +3941,24 @@ class HoldStore:
                     + ", ".join(missing)
                 )
             await self._recover_history_publication()
-            await self._ensure_schema_transaction(initialized=True)
+            publication = await self._ensure_schema_transaction(initialized=True)
+            if publication is not None:
+                if (
+                    self._custody_marker_path is not None
+                    and custody_marker is None
+                    and bootstrap_history is not None
+                ):
+                    # A first bootstrap stopped after its witness and before
+                    # its custody marker. Publish the head it would have
+                    # written, the stable anchor the migration just verified,
+                    # so the re-anchor promotes from it like any other head.
+                    stable = await self._read_history_anchor()
+                    if stable is None:
+                        raise HoldCorruptStateError(
+                            "Hold history anchor is missing"
+                        )
+                    self._write_sqlite_custody_marker(stable)
+                await self._complete_history_publication(publication)
             await self._assert_history_anchor_intact()
             if self._custody_marker_path is not None:
                 if custody_marker is None and bootstrap_history is not None:
@@ -3609,7 +3985,9 @@ class HoldStore:
         await self._ensure_schema_transaction(initialized=False)
         # The database transaction has committed while the cross-process lock
         # still excludes readers and peer initializers. Publish both pieces of
-        # evidence, then retire the recovery authority last.
+        # evidence, then retire the recovery authority last. The committed
+        # history is the intent's history, but the transaction moved it to
+        # the v2 anchor format, so every head published from here is re-read.
         await self._write_history_anchor()
         await self._write_initialization_witness()
         if adopting_unused_schema:
@@ -3624,15 +4002,23 @@ class HoldStore:
                 "first bootstrap",
                 self._custody_control_path,
             )
-        self._write_sqlite_custody_marker(current_bootstrap_history)
+        if self._custody_marker_path is not None:
+            self._write_sqlite_custody_marker(
+                await self._current_history_anchor_payload()
+            )
         await self._remove_external_bootstrap_intent()
 
     async def _ensure_schema_transaction(
         self,
         *,
         initialized: bool,
-    ) -> None:
-        """Create both Hold tables as one serialized schema unit."""
+    ) -> bytes | None:
+        """Create both Hold tables as one serialized schema unit.
+
+        Returns the history head this transaction staged for publication, or
+        ``None``. Only the v2 anchor-format migration of an initialized store
+        stages one; the caller publishes it once the transaction commits.
+        """
 
         async with self._db.migration_lock(_SCHEMA_LOCK):
             if initialized:
@@ -3673,19 +4059,32 @@ class HoldStore:
                 "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
                 "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
                 "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '', "
+                f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}, "
                 "CHECK (action IN ('hold', 'release')), "
                 "CHECK (disposition IN "
                 "('applied', 'already_in_state', 'refused_stale')), "
                 "CHECK (scope IN ('host', 'agent')), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
+            # Additive: a receipt written before this column existed was
+            # written by the sovereign host door, the only door there was, so
+            # the default IS its recorded authority. The default is outside the
+            # per-receipt content digest by construction (see
+            # ``_receipt_content_digest``), so no content witness changes; the
+            # whole-history anchor does change, and is re-anchored by
+            # ``_migrate_history_anchor_format`` in this same transaction.
+            if not await self._db.column_exists("hold_receipts", "authority"):
+                await self._db.execute(
+                    "ALTER TABLE hold_receipts ADD COLUMN "
+                    f"{_RECEIPT_AUTHORITY_COLUMN_DEFINITION}"
+                )
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_hold_receipts_target "
                 "ON hold_receipts(scope, target_id, occurred_at, receipt_id)"
             )
             # The commit-ordered key the sovereign receipt feed pages on
             # (#3159 R2/R6). ``feed_seq`` is outside every content digest and
-            # witness, which cover exactly ``_RECEIPT_COLUMNS``, so numbering a
+            # witness, which cover the receipt columns only, so numbering a
             # pre-existing row changes no evidence. The exclusive history lock
             # is the one every receipt writer holds until commit, so numbering
             # cannot collide with a concurrent append from another process.
@@ -3787,7 +4186,9 @@ class HoldStore:
             )
             if migration_complete is not None:
                 await self._assert_completed_witness_migration_intact()
-                return
+                return await self._migrate_history_anchor_format(
+                    initialized=initialized
+                )
             if initialized:
                 raise HoldCorruptStateError(
                     "initialized Hold schema is missing its required witness "
@@ -3856,6 +4257,64 @@ class HoldStore:
                 "ON CONFLICT (name) DO NOTHING",
                 (_WITNESS_BACKFILL,),
             )
+            return await self._migrate_history_anchor_format(
+                initialized=initialized
+            )
+
+    async def _migrate_history_anchor_format(
+        self,
+        *,
+        initialized: bool,
+    ) -> bytes | None:
+        """Move the whole-history anchor to the v2 projection, exactly once.
+
+        Runs inside the schema transaction that added and backfilled
+        ``authority``, so the database records the new format atomically with
+        the column. An initialized store already has a stable v1 anchor: it is
+        verified against the unchanged history first, so re-anchoring can
+        never bless a history the v1 anchor did not describe, and the v2 head
+        is then staged exactly like a mutation's, for the caller to publish
+        after commit. An uninitialized store has no stable anchor yet; its
+        bootstrap publishes the committed v2 head directly.
+        """
+
+        migrated = await self._db.fetchone(
+            "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+            (_HISTORY_ANCHOR_V2_MIGRATION,),
+        )
+        if migrated is not None:
+            return None
+        rows = tuple(
+            await self._db.fetchall(_HistoryAnchorFormat.V2.receipt_history_sql)
+        )
+        legacy_rows = _v1_projection_of(rows)
+        if legacy_rows is None:
+            raise HoldCorruptStateError(
+                "Hold receipt history records an authority its v1 history "
+                "anchor never covered"
+            )
+        if initialized:
+            stable = await self._read_history_anchor()
+            if stable is None:
+                raise HoldCorruptStateError("Hold history anchor is missing")
+            if stable != self._history_anchor_payload_from_rows(
+                legacy_rows, anchor_format=_HistoryAnchorFormat.V1
+            ):
+                raise HoldCorruptStateError(
+                    "Hold history anchor does not match receipt history"
+                )
+        await self._db.execute(
+            "INSERT INTO hold_schema_migrations (name) VALUES (?) "
+            "ON CONFLICT (name) DO NOTHING",
+            (_HISTORY_ANCHOR_V2_MIGRATION,),
+        )
+        if not initialized:
+            return None
+        payload = self._history_anchor_payload_from_rows(
+            rows, anchor_format=_HistoryAnchorFormat.V2
+        )
+        await self._stage_external_history_candidate(payload)
+        return payload
 
     async def _assert_completed_witness_migration_intact(self) -> None:
         """Fail closed if a completed migration later loses any witness."""
@@ -4040,8 +4499,14 @@ class HoldStore:
         target_id: Optional[str] = None,
         after: Optional[int] = None,
         limit: int,
+        newest_first: bool = False,
     ) -> HoldReceiptPage:
-        """Read one bounded page of Hold history, oldest first.
+        """Read one bounded page of Hold history, oldest first by default.
+
+        ``newest_first`` reverses the order, and ``after`` then names the
+        cursor the page continues BELOW. A bounded newest-first page is the
+        most recent suffix of that history, so a receipt on the page is
+        followed on the page by every receipt committed after it.
 
         Pages on ``feed_seq``, which the table's insert trigger allocates for
         every receipt write under the exclusive history lock (or SQLite's
@@ -4081,6 +4546,8 @@ class HoldStore:
             not isinstance(target_id, str) or not target_id.strip()
         ):
             raise ValueError("Hold receipt target filter must be a concrete id")
+        if not isinstance(newest_first, bool):
+            raise TypeError("Hold receipt page order must be a bool")
 
         try:
             async with self._evidence_protocol():
@@ -4094,6 +4561,7 @@ class HoldStore:
                         target_id=target_id,
                         after=after,
                         limit=limit,
+                        newest_first=newest_first,
                     )
         except Exception as exc:
             # Corruption stays corruption: it is a HoldStateError subclass and
@@ -4122,6 +4590,7 @@ class HoldStore:
         target_id: Optional[str],
         after: Optional[int],
         limit: int,
+        newest_first: bool = False,
     ) -> tuple[Any, ...]:
         filters = ["feed_seq IS NOT NULL"]
         params: list[Any] = []
@@ -4144,16 +4613,16 @@ class HoldStore:
         if after is not None:
             # Strict keyset successor: a page boundary can neither repeat a
             # receipt nor skip one.
-            filters.append("feed_seq > ?")
+            filters.append("feed_seq < ?" if newest_first else "feed_seq > ?")
             params.append(after)
         # One row beyond the page so a cursor is issued only when more history
         # actually exists.
         params.append(limit + 1)
         return tuple(
             await self._db.fetchall(
-                f"SELECT {_RECEIPT_COLUMNS}, feed_seq FROM hold_receipts "
+                f"SELECT {_RECEIPT_AUTHORITY_COLUMNS}, feed_seq FROM hold_receipts "
                 f"WHERE {' AND '.join(filters)} "
-                "ORDER BY feed_seq LIMIT ?",
+                f"ORDER BY feed_seq {'DESC' if newest_first else 'ASC'} LIMIT ?",
                 tuple(params),
             )
         )
@@ -4279,7 +4748,8 @@ class HoldStore:
 
     async def _read_receipt_by_operation(self, operation_id: str) -> Any:
         rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE operation_id = ?",
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE operation_id = ?",
             (operation_id,),
         )
         if len(rows) > 1:
@@ -4319,7 +4789,8 @@ class HoldStore:
 
     async def _read_receipt_by_id(self, receipt_id: str) -> Any:
         return await self._db.fetchone(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts WHERE receipt_id = ?",
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
+            "WHERE receipt_id = ?",
             (receipt_id,),
         )
 
@@ -4342,7 +4813,7 @@ class HoldStore:
         """
 
         receipt_rows = tuple(await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts "
+            f"SELECT {_RECEIPT_AUTHORITY_COLUMNS} FROM hold_receipts "
             "WHERE scope = ? AND target_id = ?",
             (scope.value, target_id),
         ))
@@ -4360,7 +4831,7 @@ class HoldStore:
         ))
         referenced: dict[str, HoldReceipt] = {}
         if latch is not None and not any(
-            len(row) == 12 and row[0] == latch.hold_receipt_id
+            len(row) == _V1_RECEIPT_WIDTH + 1 and row[0] == latch.hold_receipt_id
             for row in receipt_rows
         ):
             referenced_row = await self._read_receipt_by_id(latch.hold_receipt_id)
@@ -4397,6 +4868,16 @@ class HoldStore:
             validate_global_history=validate_global_history,
         )
 
+    async def _latch_authority(self, latch: HoldState) -> HoldAuthority:
+        """The recorded authority of a latch's (already validated) receipt."""
+
+        row = await self._read_receipt_by_id(latch.hold_receipt_id)
+        if row is None:
+            raise HoldCorruptStateError(
+                "active hold latch references a missing authority receipt"
+            )
+        return _receipt_from_row(row).authority
+
     @staticmethod
     def _assert_replay(
         receipt: HoldReceipt,
@@ -4407,6 +4888,7 @@ class HoldStore:
         reason: str,
         actor_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
     ) -> None:
         supplied = (
             action,
@@ -4415,6 +4897,7 @@ class HoldStore:
             reason,
             actor_id,
             expected_hold_receipt_id,
+            authority,
         )
         recorded = (
             receipt.action,
@@ -4423,6 +4906,7 @@ class HoldStore:
             receipt.reason,
             receipt.actor_id,
             receipt.expected_hold_receipt_id,
+            receipt.authority,
         )
         if supplied != recorded:
             raise HoldIdempotencyConflict(
@@ -4442,6 +4926,7 @@ class HoldStore:
         expected_hold_receipt_id: str,
         prior_hold_receipt_id: str,
         resulting_hold_receipt_id: str,
+        authority: HoldAuthority,
         receipt_id: Optional[str] = None,
     ) -> HoldReceipt:
         receipt_id = receipt_id or str(uuid4())
@@ -4454,8 +4939,8 @@ class HoldStore:
             "INSERT INTO hold_receipts ("
             "receipt_id, operation_id, action, disposition, scope, target_id, "
             "reason, actor_id, occurred_at, expected_hold_receipt_id, "
-            "prior_hold_receipt_id, resulting_hold_receipt_id"
-            f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
+            "prior_hold_receipt_id, resulting_hold_receipt_id, authority"
+            f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?, ?)",
             (
                 receipt_id,
                 operation_id,
@@ -4468,6 +4953,7 @@ class HoldStore:
                 expected_hold_receipt_id,
                 prior_hold_receipt_id,
                 resulting_hold_receipt_id,
+                authority.value,
             ),
         )
         receipt_row = await self._read_receipt_by_operation(operation_id)
@@ -4503,9 +4989,14 @@ class HoldStore:
         actor_id: str,
         reason: str,
         operation_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
-        """Set or replace one latch and append an immutable receipt."""
+        """Set or replace one latch and append an immutable receipt.
+
+        ``authority`` is required: the door that resolved the caller's
+        authority records it, so a reader never infers it from ``actor_id``.
+        """
 
         try:
             async with self._evidence_protocol():
@@ -4514,6 +5005,7 @@ class HoldStore:
                     actor_id=actor_id,
                     reason=reason,
                     operation_id=operation_id,
+                    authority=authority,
                     target_id=target_id,
                 )
         except Exception as exc:
@@ -4532,6 +5024,7 @@ class HoldStore:
         actor_id: str,
         reason: str,
         operation_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
@@ -4539,6 +5032,7 @@ class HoldStore:
         actor = _required_text(actor_id, "actor_id")
         why = _required_text(reason, "reason")
         operation = _required_text(operation_id, "operation_id")
+        recorded_authority = _required_authority(authority)
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -4567,10 +5061,22 @@ class HoldStore:
                     reason=why,
                     actor_id=actor,
                     expected_hold_receipt_id="",
+                    authority=recorded_authority,
                 )
                 return HoldMutation(receipt=replay, current=prior)
 
-            if prior is not None and prior.actor_id == actor and prior.reason == why:
+            # A prior latch set by the same actor for the same reason under a
+            # different authority is not the same latch: re-apply it so the
+            # current authority receipt names what the caller acted under.
+            prior_authority = (
+                await self._latch_authority(prior) if prior is not None else None
+            )
+            if (
+                prior is not None
+                and prior.actor_id == actor
+                and prior.reason == why
+                and prior_authority is recorded_authority
+            ):
                 receipt = await self._insert_receipt(
                     operation_id=operation,
                     action=HoldAction.HOLD,
@@ -4582,6 +5088,7 @@ class HoldStore:
                     expected_hold_receipt_id="",
                     prior_hold_receipt_id=prior.hold_receipt_id,
                     resulting_hold_receipt_id=prior.hold_receipt_id,
+                    authority=recorded_authority,
                 )
                 current = prior
             else:
@@ -4597,6 +5104,7 @@ class HoldStore:
                     expected_hold_receipt_id="",
                     prior_hold_receipt_id=(prior.hold_receipt_id if prior else ""),
                     resulting_hold_receipt_id=receipt_id,
+                    authority=recorded_authority,
                     receipt_id=receipt_id,
                 )
                 await self._db.execute(
@@ -4631,6 +5139,7 @@ class HoldStore:
         reason: str,
         operation_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         """Release exactly the observed latch, refusing a stale release."""
@@ -4643,6 +5152,7 @@ class HoldStore:
                     reason=reason,
                     operation_id=operation_id,
                     expected_hold_receipt_id=expected_hold_receipt_id,
+                    authority=authority,
                     target_id=target_id,
                 )
         except Exception as exc:
@@ -4659,6 +5169,7 @@ class HoldStore:
         reason: str,
         operation_id: str,
         expected_hold_receipt_id: str,
+        authority: HoldAuthority,
         target_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
@@ -4669,6 +5180,7 @@ class HoldStore:
         expected = _required_text(
             expected_hold_receipt_id, "expected_hold_receipt_id"
         )
+        recorded_authority = _required_authority(authority)
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -4697,6 +5209,7 @@ class HoldStore:
                     reason=why,
                     actor_id=actor,
                     expected_hold_receipt_id=expected,
+                    authority=recorded_authority,
                 )
                 return HoldMutation(receipt=replay, current=prior)
 
@@ -4724,6 +5237,7 @@ class HoldStore:
                 expected_hold_receipt_id=expected,
                 prior_hold_receipt_id=prior_receipt_id,
                 resulting_hold_receipt_id=resulting_receipt_id,
+                authority=recorded_authority,
             )
             if disposition is HoldDisposition.APPLIED:
                 await self._db.execute(
@@ -4862,6 +5376,43 @@ class HoldStore:
                 raise domain_error from exc
             raise
 
+    async def get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        """Read one receipt by its receipt id, under the same proof as above.
+
+        A latch names its authority receipt by receipt id, not by the
+        operation id that created it; this is how a reader learns the
+        recorded authority behind a current latch.
+        """
+
+        try:
+            async with self._evidence_protocol():
+                return await self._get_receipt_by_id(receipt_id)
+        except Exception as exc:
+            domain_error = _domain_error_from_chain(exc)
+            if domain_error is not None:
+                raise domain_error from exc
+            # As in ``list_receipts``: a reader is promised a typed "history is
+            # unreadable", never a raw backend error.
+            if isinstance(exc, DatabaseError):
+                raise HoldStateError("Hold receipt could not be read") from exc
+            raise
+
+    async def _get_receipt_by_id(self, receipt_id: str) -> Optional[HoldReceipt]:
+        identity = _required_text(receipt_id, "receipt_id")
+        async with self._db.transaction():
+            await self._lock_read_history()
+            row = await self._read_receipt_by_id(identity)
+            if row is None:
+                await self._assert_global_history_intact()
+                return None
+            operation = _receipt_from_row(row).operation_id
+            receipt = await self._validated_receipt_locked(operation)
+            if receipt is None or receipt.receipt_id != identity:
+                raise HoldCorruptStateError(
+                    "Hold operation witness does not match receipt identity"
+                )
+            return receipt
+
     async def _get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         """Read one receipt only after proving its target authority graph."""
 
@@ -4871,21 +5422,28 @@ class HoldStore:
             # Lock it before the first witness query; otherwise READ COMMITTED
             # can stitch together rows from opposite sides of a writer commit.
             await self._lock_read_history()
-            row = await self._validate_operation_witness(operation)
-            if row is None:
-                await self._assert_global_history_intact()
-                return None
-            receipt = _receipt_from_row(row)
-            targets = ((receipt.scope, receipt.target_id),)
-            await self._lock_read_targets(targets, history_locked=True)
-            await self._assert_host_latch_shape()
-            latch = _latch_from_row(
-                await self._read_latch_row(receipt.scope, receipt.target_id)
-            )
-            await self._validate_latch_projection(
-                latch, receipt.scope, receipt.target_id
-            )
-            return receipt
+            return await self._validated_receipt_locked(operation)
+
+    async def _validated_receipt_locked(
+        self, operation: str
+    ) -> Optional[HoldReceipt]:
+        """Prove one receipt's graph; the caller holds the read-history lock."""
+
+        row = await self._validate_operation_witness(operation)
+        if row is None:
+            await self._assert_global_history_intact()
+            return None
+        receipt = _receipt_from_row(row)
+        targets = ((receipt.scope, receipt.target_id),)
+        await self._lock_read_targets(targets, history_locked=True)
+        await self._assert_host_latch_shape()
+        latch = _latch_from_row(
+            await self._read_latch_row(receipt.scope, receipt.target_id)
+        )
+        await self._validate_latch_projection(
+            latch, receipt.scope, receipt.target_id
+        )
+        return receipt
 
 
 def _sqlite_backend_custody_artifacts(database: Path) -> tuple[Path, ...]:
@@ -5478,6 +6036,11 @@ def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapsho
         if duplicate is not None:
             duplicate_keys.add(key)
 
+    # Migrations first: they decide which receipt projection is complete.
+    migration_rows = rows(
+        "hold_schema_migrations",
+        "SELECT name FROM hold_schema_migrations ORDER BY name",
+    )
     return HoldDatabaseSnapshot(
         existing_tables=existing,
         latch_rows=rows(
@@ -5486,7 +6049,7 @@ def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapsho
         ),
         receipt_rows=rows(
             "hold_receipts",
-            f"SELECT {_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id",
+            _snapshot_history_anchor_format(migration_rows).receipt_history_sql,
         ),
         receipt_count_witness_rows=rows(
             "hold_receipt_witnesses",
@@ -5503,10 +6066,7 @@ def _sqlite_hold_snapshot(connection: sqlite3.Connection) -> HoldDatabaseSnapsho
             "SELECT operation_id, receipt_id FROM hold_operation_witnesses "
             "ORDER BY operation_id",
         ),
-        migration_rows=rows(
-            "hold_schema_migrations",
-            "SELECT name FROM hold_schema_migrations ORDER BY name",
-        ),
+        migration_rows=migration_rows,
         resolvable_conflict_keys=frozenset(conflict_keys),
         occupied_schema_names=occupied_names,
         duplicate_conflict_keys=frozenset(duplicate_keys),
@@ -5553,7 +6113,10 @@ def _validate_sqlite_custody_readiness(
     if not initialized or marker_payload is None:
         return
     marker_history = _sqlite_custody_marker_history(database, marker_payload)
-    current = HoldStore._history_anchor_payload_from_rows(snapshot.receipt_rows)
+    anchor_format = _snapshot_history_anchor_format(snapshot.migration_rows)
+    current = HoldStore._history_anchor_payload_from_rows(
+        snapshot.receipt_rows, anchor_format=anchor_format
+    )
     anchored = (
         None
         if history_anchor is None
@@ -5569,9 +6132,10 @@ def _validate_sqlite_custody_readiness(
             marker_valid = marker_history == anchored
         else:
             marker_valid = marker_history == candidate or (
-                HoldStore._is_immediate_history_predecessor(
+                HoldStore._is_history_predecessor(
                     marker_history,
                     snapshot.receipt_rows,
+                    anchor_format=anchor_format,
                 )
             )
     else:
