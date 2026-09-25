@@ -22,7 +22,8 @@ import logging
 import time
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.waits.reconciler import register_wait_watch
+from kestrel_sovereign.storage.async_wait_signal_store import MAX_ATTEMPTS_EXCEEDED
+from kestrel_sovereign.waits.reconciler import list_undelivered_wakes, register_wait_watch
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -35,6 +36,11 @@ class WaitFeature(Feature):
     # Conservative ceiling on a single bounded (no-target) sleep. A pause
     # longer than this should be a scheduled/cron resume, not a held turn.
     _MAX_WAIT_SECONDS = 1800
+
+    # Most undelivered wakes ``wait_status`` lists in one call, and the most
+    # characters of a wake's last error it repeats.
+    _MAX_STATUS_WAKES = 50
+    _STATUS_ERROR_CHARS = 300
 
     # Fallback reconcile driver cadence (#2729). The scheduler's
     # ``wait_reconcile`` cron is the PRIMARY driver at 60s; this loop only
@@ -289,4 +295,96 @@ class WaitFeature(Feature):
                 "elapsed_seconds": elapsed,
                 "reason": reason,
             },
+        )
+
+    @tool(
+        name="wait_status",
+        description=(
+            "List completion wakes that have NOT reached you. Two kinds:\n"
+            "• locked — the wake for a finished job/task/watch failed "
+            "delivery too many times and was locked as "
+            "`max_attempts_exceeded`; it will never be re-sent, so this is "
+            "the only place you will learn that the work ended;\n"
+            "• deferred — the wake is parked until the model provider's "
+            "advised rate-limit reset and will be re-sent then.\n"
+            "Check this at the start of a turn when you are waiting on async "
+            "work (e.g. a Talon job) that should have finished by now."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!wait-status",
+    )
+    async def wait_status(self, limit: int = 20) -> ToolResult:
+        """
+        List wakes locked after their retry cap and wakes parked until a
+        provider-advised retry time (#3302).
+
+        Args:
+            limit: Most wakes to list, most recently updated first.
+        """
+        if self.agent is None or getattr(self.agent, "wait_registry", None) is None:
+            return ToolResult.failed(
+                "wait engine unavailable: no wait_registry on the agent"
+            )
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
+        if limit < 1 or limit > self._MAX_STATUS_WAKES:
+            return ToolResult.failed(
+                f"limit must be between 1 and {self._MAX_STATUS_WAKES}, got {limit}"
+            )
+
+        rows = await list_undelivered_wakes(self.agent, limit=limit)
+        locked = []
+        deferred = []
+        for row in rows:
+            error = row.last_delivery_error or ""
+            if len(error) > self._STATUS_ERROR_CHARS:
+                error = error[: self._STATUS_ERROR_CHARS] + "…"
+            entry = {
+                "ref": f"{row.kind}:{row.handle}",
+                "transition": row.attempts_signaled_target
+                or row.last_signaled_outcome
+                or "",
+                "delivery_status": row.last_delivery_status or "",
+                "delivery_attempts": row.last_delivery_attempts,
+                "delivery_deferrals": row.delivery_deferrals,
+                "last_attempt_started_at": row.last_attempt_started_at or "",
+                "last_error": error,
+            }
+            if row.last_delivery_status == MAX_ATTEMPTS_EXCEEDED:
+                locked.append(entry)
+            else:
+                entry["deferred_until"] = row.delivery_deferred_until or ""
+                deferred.append(entry)
+
+        if not rows:
+            confirmation = "No undelivered wakes: nothing locked or deferred."
+        else:
+            lines = []
+            if locked:
+                lines.append(
+                    f"{len(locked)} wake(s) LOCKED after the retry cap — "
+                    "never delivered, will not be re-sent:"
+                )
+                lines.extend(
+                    f"  • {e['ref']} ({e['transition']}), "
+                    f"{e['delivery_attempts']} attempt(s)"
+                    + (f"; last error: {e['last_error']}" if e["last_error"] else "")
+                    for e in locked
+                )
+            if deferred:
+                lines.append(
+                    f"{len(deferred)} wake(s) DEFERRED until a provider-advised "
+                    "retry time:"
+                )
+                lines.extend(
+                    f"  • {e['ref']} ({e['transition']}) until "
+                    f"{e['deferred_until']} UTC"
+                    for e in deferred
+                )
+            confirmation = "\n".join(lines)
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={"locked": locked, "deferred": deferred},
         )

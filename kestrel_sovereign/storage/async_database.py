@@ -785,6 +785,12 @@ CREATE TABLE IF NOT EXISTS wait_signal_state (
     -- rewritten at harvest time, so it answers "when did we last look", not
     -- "when did we try" — a difference measured at 41 minutes live.
     last_attempt_started_at TIMESTAMP,
+    -- A wake whose cognition could not run because the model provider named
+    -- its own retry time (#3302) is parked until then instead of spending
+    -- delivery attempts inside that window. NULL when nothing is parked.
+    delivery_deferred_until TIMESTAMP,
+    -- How many times this transition's wake was parked that way.
+    delivery_deferrals INTEGER NOT NULL DEFAULT 0,
     pending_signal_id TEXT,
     pending_signaled_target TEXT,
     pending_signal_enqueued_at TIMESTAMP,
@@ -1425,6 +1431,15 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "wait_signal_state", "last_attempt_started_at", "TIMESTAMP"
+        )
+        # Provider-advised deferral (#3302), same reasoning again. Legacy rows
+        # read as "nothing parked, never deferred", which is true of them.
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_deferred_until", "TIMESTAMP"
+        )
+        await self._migrate_add_column(
+            "wait_signal_state", "delivery_deferrals",
+            "INTEGER NOT NULL DEFAULT 0",
         )
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
