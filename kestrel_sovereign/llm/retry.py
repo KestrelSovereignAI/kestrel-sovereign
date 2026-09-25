@@ -46,11 +46,13 @@ ADVISED_WAIT_HORIZON_SECONDS = 7 * 24 * 60 * 60
 # PLAN-LIMIT budget — deliberately much tighter than the throttle budget.
 #
 # The throttle budget sleeps 127-134s across its 8 attempts. The orchestrator
-# wraps the whole provider call in `asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS)`
-# = 180s (orchestrator_engine.py:94,3081,3093), and that watchdog is NOT lifted
-# for a cloud route (`effective_request_timeout` returns None unless EVERY
-# candidate is local, service.py:2158). Spending 131s of a 180s turn on sleep
-# leaves under 50s for the HTTP round-trips AND the streamed generation, so a
+# wraps the provider call in an `asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS)`
+# = 180s inactivity watchdog (orchestrator_engine.py), and that watchdog is NOT
+# lifted for a cloud route (`effective_request_timeout` returns None unless
+# EVERY candidate is local, service.py). It re-arms on every streamed item
+# (#3300), but retry sleeps happen before the first item, so they spend the
+# same 180s window. Spending 131s of it on sleep leaves under 50s for the HTTP
+# round-trips up to the first streamed item, so a
 # window that cleared on attempt 7 or 8 — exactly the case patience exists for —
 # would be killed by the watchdog and reported as `timeout after 180s`. That is
 # worse than the hard failure this retry replaces: it converts a diagnosable

@@ -94,12 +94,13 @@ MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 # warning naming the model that failed to resolve — never as a silent default.
 _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 
-# Per-LLM-call timeout for the orchestrator's multi-iteration tool loop.
+# Inactivity watchdog for the orchestrator's multi-iteration tool loop.
 # Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
 # (anthropic 429 backoff, network blip, frozen provider queue) surfaces
 # as a visible "❌ failed: timeout" marker instead of silent dead air.
-# A turn can run multiple iterations; the timeout applies PER iteration,
-# not to the whole turn — long but progressing turns aren't killed.
+# It fires after this many seconds WITHOUT a stream item (#3300) — re-armed
+# on every item — so a long but progressing response is never killed, and
+# it applies PER iteration, so a long multi-iteration turn isn't either.
 ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
     os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
 )
@@ -3252,8 +3253,17 @@ class OrchestratorEngineMixin:
                     _call_timeout = _route_timeout
             except Exception:
                 pass
+            # #3300: the watchdog measures INACTIVITY, not total elapsed time.
+            # Its job is hang detection — "silent dead air" from a stuck
+            # upstream — and it now re-arms on every item the stream yields,
+            # so a response that is still arriving is never cut off however
+            # long it runs (output is bounded by the model's own ceiling, not
+            # a 4,096-token literal, so a legitimate answer can take minutes),
+            # while a stream that goes silent for ``_call_timeout`` seconds —
+            # including before its first item — still trips it.
+            _watchdog_loop = asyncio.get_running_loop()
             try:
-                async with asyncio.timeout(_call_timeout):
+                async with asyncio.timeout(_call_timeout) as _watchdog:
                     async for item in self.llm_service.stream_with_tool_detection(
                         messages=messages,
                         tools=all_tools or None,
@@ -3272,6 +3282,7 @@ class OrchestratorEngineMixin:
                             if request_id else None
                         ),
                     ):
+                        _watchdog.reschedule(_watchdog_loop.time() + _call_timeout)
                         if _cancelled():
                             break
                         if isinstance(item, str):

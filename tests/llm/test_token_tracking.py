@@ -16,6 +16,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from tests.utils.anthropic_client import anthropic_client
 
 
 # =============================================================================
@@ -107,8 +108,7 @@ class TestAnthropicTokenExtraction:
         mock_response.usage = mock_usage
         mock_response.stop_reason = "end_turn"
 
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_client = anthropic_client(mock_response)
 
         response = await adapter.get_response(
             client=mock_client,
@@ -349,7 +349,6 @@ class TestUsageTrackingIntegration:
     async def test_track_model_usage_receives_tokens(self):
         """Verify _track_model_usage is called with non-zero token count."""
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.llm.adapter import LLMResponse
 
         # Create service and mock the tracking method
         service = LLMService()
@@ -398,7 +397,6 @@ class TestUsageTrackingIntegration:
     async def test_track_model_usage_with_model_override(self):
         """Verify get_response_with_model also tracks tokens."""
         from kestrel_sovereign.llm.service import LLMService
-        from kestrel_sovereign.llm.adapter import LLMResponse
 
         service = LLMService()
         tracked_calls = []

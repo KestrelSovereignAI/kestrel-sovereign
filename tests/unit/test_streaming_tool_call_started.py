@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kestrel_sdk.llm import LLMResponse, ToolCall, ToolCallStarted
+from tests.utils.anthropic_client import models_api
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,7 @@ def _drive(adapter, events) -> List[Any]:
     fake_stream = _FakeAnthropicStream(events)
     fake_messages = MagicMock()
     fake_messages.stream = MagicMock(return_value=fake_stream)
-    fake_client = SimpleNamespace(messages=fake_messages)
+    fake_client = SimpleNamespace(messages=fake_messages, models=models_api())
 
     items: List[Any] = []
 

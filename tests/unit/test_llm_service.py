@@ -488,6 +488,40 @@ class TestCoreGeneration:
         assert payload["structured_output"] is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("stop_reason", ["max_tokens", None])
+    async def test_usage_telemetry_carries_the_provider_stop_reason(
+        self, llm_service, mock_adapter, caplog, stop_reason,
+    ):
+        """#3300 — a response cut at its output ceiling is otherwise
+        indistinguishable from a finished one in telemetry. The stop reason an
+        adapter attached rides on both the ``llm.usage`` line and the durable
+        ``llm_calls`` row metadata; a response with none records none."""
+        import json as _json
+        from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
+
+        mock_adapter.get_response = AsyncMock(return_value=attach_stop_reason(
+            LLMResponse(content="partial", input_tokens=3, output_tokens=128000),
+            stop_reason,
+        ))
+        llm_service._track_model_usage = AsyncMock()
+        store = AsyncMock()
+        llm_service.set_observability_store(store)
+
+        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            await llm_service.get_response(
+                system_prompt="system", user_prompt="a long answer please",
+            )
+
+        usage_lines = [r for r in caplog.records if r.message.startswith("llm.usage: ")]
+        payload = _json.loads(usage_lines[-1].message.removeprefix("llm.usage: "))
+        assert payload["stop_reason"] == stop_reason
+        row_metadata = store.log_llm_call.await_args.kwargs["metadata"]
+        if stop_reason is None:
+            assert "stop_reason" not in row_metadata
+        else:
+            assert row_metadata["stop_reason"] == stop_reason
+
+    @pytest.mark.asyncio
     async def test_get_response_provider_fallback(self, llm_service, mock_adapter):
         """Test provider fallback when first provider fails."""
         # First call fails, second succeeds

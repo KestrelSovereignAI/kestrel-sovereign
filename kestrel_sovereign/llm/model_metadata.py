@@ -47,19 +47,29 @@ class ModelInfo(_SDKModelInfo):
 
     underlying_provider: Optional[str] = None
 
+    #: The largest ``max_tokens`` the provider accepts for this model — its
+    #: output ceiling, as the provider itself reports it (Anthropic's Models
+    #: API ``max_tokens``). ``None`` when the provider does not say. It sits
+    #: beside ``context_limit`` (the input window) because the two are the
+    #: same kind of fact, and lives on this framework subclass, like
+    #: ``underlying_provider``, until the SDK dataclass carries it (#3300).
+    output_limit: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
         data["underlying_provider"] = self.underlying_provider
+        data["output_limit"] = self.output_limit
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelInfo":
         # Reuse the SDK round-trip for the shared fields, then layer the
-        # framework-only field on top. ``super().from_dict`` returns a
+        # framework-only fields on top. ``super().from_dict`` returns a
         # ``cls`` instance (classmethod), so the base fields land correctly
-        # and only ``underlying_provider`` needs to be applied here.
+        # and only the fields this subclass adds need to be applied here.
         model = super().from_dict(data)
         model.underlying_provider = data.get("underlying_provider")
+        model.output_limit = data.get("output_limit")
         return model
 
 

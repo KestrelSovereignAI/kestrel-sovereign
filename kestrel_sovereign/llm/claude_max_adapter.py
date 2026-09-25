@@ -58,6 +58,7 @@ class ClaudeMaxAdapter(AnthropicAdapter):
         await self._ensure_fresh_oauth_token(client)
         page = await client.models.list()
         models = [anthropic_model_info(model) for model in page.data]
+        self._learn_output_ceilings(models)
         logger.info("Anthropic OAuth returned %d models", len(models))
         return models
 
