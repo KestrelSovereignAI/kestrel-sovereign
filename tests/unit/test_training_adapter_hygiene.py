@@ -22,8 +22,14 @@ from kestrel_sovereign.features.training.types import (
 )
 
 
-def _runpod_session():
-    return SimpleNamespace(pod_id="pod-123", backend_base_url="https://pod.example")
+def _runpod_session(*, persistent: bool):
+    return SimpleNamespace(
+        pod_id="pod-123",
+        backend_base_url="https://pod.example",
+        profile=SimpleNamespace(
+            persistent_pod_id="${RUNPOD_POD_ID}" if persistent else None,
+        ),
+    )
 
 
 def _runpod_manager(session):
@@ -32,17 +38,22 @@ def _runpod_manager(session):
 
     return SimpleNamespace(
         _session=None,
+        _lock=asyncio.Lock(),
+        _expand_single_env_var=lambda value: "pod-123" if value else None,
         start_training_pod=AsyncMock(return_value=session),
         submit_training_job=never_submits,
         stop_session=AsyncMock(),
         terminate_session=AsyncMock(),
-        provider=SimpleNamespace(stop_pod=Mock(return_value={"id": session.pod_id})),
+        provider=SimpleNamespace(
+            stop_pod=Mock(return_value={"id": session.pod_id}),
+            terminate_pod=Mock(return_value=None),
+        ),
     )
 
 
 @pytest.mark.asyncio
-async def test_runpod_cleanup_stops_the_managers_current_pod():
-    session = _runpod_session()
+async def test_runpod_cleanup_pauses_the_managers_current_persistent_pod():
+    session = _runpod_session(persistent=True)
     manager = _runpod_manager(session)
     manager._session = session
     adapter = RunPodTrainingAdapter(manager=manager)
@@ -52,12 +63,13 @@ async def test_runpod_cleanup_stops_the_managers_current_pod():
 
     manager.stop_session.assert_awaited_once_with()
     manager.terminate_session.assert_not_awaited()
+    manager.provider.terminate_pod.assert_not_called()
     assert job.job_id not in adapter._active_jobs
 
 
 @pytest.mark.asyncio
-async def test_runpod_cleanup_stops_a_pod_the_manager_no_longer_holds():
-    session = _runpod_session()
+async def test_runpod_cleanup_pauses_a_persistent_pod_the_manager_no_longer_holds():
+    session = _runpod_session(persistent=True)
     manager = _runpod_manager(session)
     adapter = RunPodTrainingAdapter(manager=manager)
     job = await adapter.start_training("companion", b"avatar")
@@ -68,6 +80,25 @@ async def test_runpod_cleanup_stops_a_pod_the_manager_no_longer_holds():
     # terminate_session swallows stop failures, so the provider stop is used.
     manager.terminate_session.assert_not_awaited()
     manager.provider.stop_pod.assert_called_once_with("pod-123")
+    manager.provider.terminate_pod.assert_not_called()
+    assert job.job_id not in adapter._active_jobs
+
+
+@pytest.mark.asyncio
+async def test_runpod_cleanup_terminates_on_demand_pod():
+    session = _runpod_session(persistent=False)
+    manager = _runpod_manager(session)
+    manager._session = session
+    adapter = RunPodTrainingAdapter(manager=manager)
+    job = await adapter.start_training("companion", b"avatar")
+
+    await adapter.cleanup(job.job_id)
+
+    manager.provider.terminate_pod.assert_called_once_with("pod-123")
+    manager.provider.stop_pod.assert_not_called()
+    manager.stop_session.assert_not_awaited()
+    manager.terminate_session.assert_not_awaited()
+    assert manager._session is None
     assert job.job_id not in adapter._active_jobs
 
 

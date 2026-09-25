@@ -49,6 +49,8 @@ Ownership contract
   caller cancellation) is released at once. If that release fails, the
   session is registered as an orphan job in ``RELEASE_FAILED`` under the
   rejected job's ID, so ``close()`` retries it instead of forgetting it.
+* Released jobs are remembered for status and idempotent release only up to
+  :data:`RELEASED_JOB_HISTORY_LIMIT`; older ones become unknown jobs.
 * ``close()`` refuses new work, cancels in-flight session acquisitions,
   releases every job — including orphans registered while it drains — and
   waits for all of it within one deadline.
@@ -70,6 +72,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -93,6 +96,14 @@ from ..types import TrainingConfig, TrainingJob, TrainingState, TrainingStatus
 logger = logging.getLogger(__name__)
 
 SessionT = TypeVar("SessionT")
+
+RELEASED_JOB_HISTORY_LIMIT = 256
+"""How many released jobs keep answering status and idempotent release.
+
+A released job holds nothing billable, so remembering it is only a courtesy
+to late status and release callers; the oldest are forgotten past this bound
+so a long-lived adapter's memory does not grow with every job it ran.
+"""
 
 
 class SessionJobPhase(enum.Enum):
@@ -354,12 +365,20 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         self,
         hooks: SessionProviderHooks[SessionT],
         timeouts: SessionLifecycleTimeouts | None = None,
+        *,
+        released_history_limit: int = RELEASED_JOB_HISTORY_LIMIT,
     ) -> None:
+        if released_history_limit < 1:
+            raise ValueError("released_history_limit must be at least 1")
         self._hooks = hooks
         self._timeouts = timeouts or SessionLifecycleTimeouts()
         self._records: dict[str, SessionTrainingRecord[SessionT]] = {}
-        # Released records answer status (CANCELLED) and idempotent release.
-        self._released: dict[str, SessionTrainingRecord[SessionT]] = {}
+        # The most recently released records, oldest first. They answer status
+        # (CANCELLED) and idempotent release until evicted by the bound.
+        self._released: OrderedDict[str, SessionTrainingRecord[SessionT]] = (
+            OrderedDict()
+        )
+        self._released_history_limit = released_history_limit
         self._openings: set[asyncio.Task[SessionTrainingRecord[SessionT]]] = set()
         self._closed = False
 
@@ -824,8 +843,9 @@ class SessionTrainingLifecycle(Generic[SessionT]):
     async def release(self, job_id: str, intent: ReleaseIntent) -> bool:
         """Release one job's session; ``True`` once nothing of it remains.
 
-        Idempotent: a job this lifecycle already released reports ``True``;
-        an unknown job reports ``False``.
+        Idempotent: a job this lifecycle recently released reports ``True``;
+        an unknown job, or one released so long ago that it was forgotten
+        (:data:`RELEASED_JOB_HISTORY_LIMIT`), reports ``False``.
         """
 
         record = self._records.get(job_id)
@@ -906,7 +926,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 return False
             record.transition(SessionJobPhase.RELEASED)
             self._records.pop(record.job_id, None)
-            self._released[record.job_id] = record
+            self._remember_released(record)
             logger.info(
                 "[%s] %s released session %s (%s)",
                 record.job_id,
@@ -924,6 +944,11 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                     error=f"release interrupted: {error!r}",
                 )
             raise
+
+    def _remember_released(self, record: SessionTrainingRecord[SessionT]) -> None:
+        self._released[record.job_id] = record
+        while len(self._released) > self._released_history_limit:
+            self._released.popitem(last=False)
 
     async def _await_compensation(
         self, record: SessionTrainingRecord[SessionT]

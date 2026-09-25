@@ -249,21 +249,50 @@ class RunPodTrainingAdapter:
         )
 
     async def _release_session(self, session) -> None:
-        """Stop exactly this job's pod, raising unless RunPod accepted the stop.
+        """Release exactly this job's pod, raising unless RunPod accepted it.
 
-        ``stop_session()`` takes no session argument: it stops whatever pod
-        the manager currently holds, so it is only used when that is this
-        job's pod (it also records GPU metering and lets a provider failure
-        propagate). Any other pod is stopped by identity through the provider
-        call itself: the manager's ``terminate_session``/``terminate_pod`` log
-        a failed stop and return, which cannot prove the pod stopped billing.
+        A persistent pod (the profile's ``persistent_pod_id`` resolves at
+        release time) is paused so it can be resumed; every other pod is
+        terminated. Both act on this pod's identity through provider calls
+        that raise on failure: the manager's ``terminate_session`` and
+        ``terminate_pod`` log a failed call and return (and only stop, never
+        terminate), which cannot prove the pod stopped billing.
         """
         manager = self._get_manager()
-        if getattr(manager, "_session", None) is session:
+        persistent_pod_id = manager._expand_single_env_var(
+            session.profile.persistent_pod_id
+        )
+        if persistent_pod_id is not None:
+            await self._pause_pod(manager, session)
+        else:
+            await self._terminate_pod(manager, session)
+
+    @staticmethod
+    async def _pause_pod(manager, session) -> None:
+        # stop_session() takes no session argument: it stops whatever pod the
+        # manager holds, so it is only used when that is this job's pod (it
+        # also records GPU metering and lets a provider failure propagate).
+        if manager._session is session:
             await manager.stop_session()
         else:
             await asyncio.to_thread(manager.provider.stop_pod, session.pod_id)
-            logger.info(f"Stopped RunPod pod {session.pod_id}")
+        logger.info(f"Paused persistent RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _terminate_pod(manager, session) -> None:
+        terminate_pod = getattr(manager.provider, "terminate_pod", None)
+        if terminate_pod is None:
+            raise TrainingProviderError(
+                f"{type(manager.provider).__name__} cannot terminate on-demand pod "
+                f"{session.pod_id}; it is retained until a release succeeds",
+                provider="runpod",
+            )
+        await asyncio.to_thread(terminate_pod, session.pod_id)
+        # The manager must not hand a destroyed pod to its next caller.
+        async with manager._lock:
+            if manager._session is session:
+                manager._session = None
+        logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
 
     # -- TrainingProvider --------------------------------------------------
 
@@ -383,7 +412,9 @@ class RunPodTrainingAdapter:
         Cancel a training job and release its pod.
 
         Stops the background submission, cancels a published RunPod job, then
-        stops the pod. Concurrent and repeated calls share one teardown.
+        releases the pod: a persistent pod is paused (it can be resumed), an
+        on-demand pod is terminated. Concurrent and repeated calls share one
+        teardown.
 
         Args:
             job_id: Job to cancel
@@ -401,8 +432,9 @@ class RunPodTrainingAdapter:
         """
         Clean up resources for a completed job.
 
-        Stops the job's pod (a persistent pod is paused, cost-free while
-        paused). A failed release keeps the job tracked so it can be retried.
+        Releases the job's pod: a persistent pod is paused (cost-free while
+        paused), an on-demand pod is terminated. A failed release keeps the
+        job tracked so it can be retried.
 
         IMPORTANT: Always call this after download_weights() to stop billing!
 
@@ -618,7 +650,7 @@ class RunPodTrainingAdapter:
 
         A job the pod accepted whose response was lost to the cancellation
         (the POST /train was in flight) has no ID to cancel here; it keeps
-        running on the retained pod until cleanup() stops the pod.
+        running on the retained pod until cleanup() releases the pod.
 
         Args:
             job_id: Job ID to cancel
@@ -630,7 +662,7 @@ class RunPodTrainingAdapter:
             SubmissionStopIncomplete: The submission did not stop in time (a
                 job it still gets accepted is cancelled when it lands) or the
                 RunPod job could not be cancelled. The job was not stopped;
-                retry, or call cleanup() to stop the pod.
+                retry, or call cleanup() to release the pod.
         """
         record = await self._lifecycle.stop_submission(job_id, reason="Cancelled")
         if record.session_released:

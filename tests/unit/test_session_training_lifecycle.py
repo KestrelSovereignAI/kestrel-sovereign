@@ -14,6 +14,8 @@ import asyncio
 import gc
 import itertools
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -23,12 +25,15 @@ import pytest
 from google.api_core.exceptions import NotFound
 
 from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+    RELEASED_JOB_HISTORY_LIMIT,
     TERMINAL_PHASES,
     IllegalSessionJobTransition,
     ReleaseIntent,
     SessionJobPhase,
     SessionLifecycleTimeouts,
+    SessionProviderHooks,
     SessionReleaseError,
+    SessionTrainingLifecycle,
     SessionTrainingRecord,
     phase_status,
 )
@@ -92,6 +97,8 @@ class FakeRemote:
     upload_gate: asyncio.Event | None = None
     upload_started: asyncio.Event = field(default_factory=asyncio.Event)
     backend_base_url: str | None = "https://backend.example"
+    # A RunPod profile's raw ``persistent_pod_id`` (None: on-demand pods).
+    persistent_pod_id: str | None = None
     loop: asyncio.AbstractEventLoop = field(default_factory=asyncio.get_running_loop)
 
     def __post_init__(self) -> None:
@@ -108,7 +115,7 @@ class FakeRemote:
             zone="us-central1-a",
             backend_base_url=self.backend_base_url,
             state="running",
-            profile=SimpleNamespace(persistent_pod_id=None),
+            profile=SimpleNamespace(persistent_pod_id=self.persistent_pod_id),
         )
         self.sessions.append(session)
         return session
@@ -221,10 +228,31 @@ async def _swallowing_terminate(remote: FakeRemote, session) -> None:
 
 
 class FakeRunPodProvider:
+    """``DirectRunPodProvider``: raw SDK calls that raise on failure."""
+
     def __init__(self, remote: FakeRemote):
         self.remote = remote
+        self.pod_calls: list[tuple[str, str]] = []  # ("stop"|"terminate", pod id)
 
     def stop_pod(self, pod_id):
+        self.pod_calls.append(("stop", pod_id))
+        self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
+        return {"id": pod_id, "desiredStatus": "EXITED"}
+
+    def terminate_pod(self, pod_id):
+        self.pod_calls.append(("terminate", pod_id))
+        self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
+
+
+class FakeManagedRunPodProvider:
+    """``ManagedRunPodProvider``: it can stop a pod but has no terminate call."""
+
+    def __init__(self, remote: FakeRemote):
+        self.remote = remote
+        self.pod_calls: list[tuple[str, str]] = []
+
+    def stop_pod(self, pod_id):
+        self.pod_calls.append(("stop", pod_id))
         self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
         return {"id": pod_id, "desiredStatus": "EXITED"}
 
@@ -234,6 +262,17 @@ class FakeRunPodManager:
         self.remote = remote
         self.provider = FakeRunPodProvider(remote)
         self._session = None
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _expand_single_env_var(value):
+        """The real manager's runtime ``${VAR}`` expansion; empty expands to None."""
+        if not value or "${" not in value:
+            return value
+        expanded = re.sub(
+            r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), ""), value
+        )
+        return expanded or None
 
     async def start_training_pod(self, companion_id):
         self._session = await self.remote.acquire()
@@ -248,7 +287,7 @@ class FakeRunPodManager:
     async def stop_session(self):
         # Like the real manager: forget the pod, then let a failed stop raise.
         session, self._session = self._session, None
-        await self.remote.release(session)
+        await asyncio.to_thread(self.provider.stop_pod, session.pod_id)
 
     async def terminate_session(self, session):
         await _swallowing_terminate(self.remote, session)
@@ -1046,6 +1085,112 @@ async def test_runpod_stops_its_own_pod_not_the_managers_current_one(loop_errors
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
+@pytest.mark.parametrize("release", ["cancel", "cleanup"])
+async def test_runpod_on_demand_pod_is_terminated_never_stopped(release, loop_errors):
+    """An on-demand pod is destroyed on release; a stopped one keeps billing storage."""
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter)
+    pod_id = adapter._active_jobs[job.job_id].session.pod_id
+    assert manager._session is adapter._active_jobs[job.job_id].session
+
+    if release == "cancel":
+        assert await adapter.cancel(job.job_id) is True
+    else:
+        await adapter.cleanup(job.job_id)
+
+    assert manager.provider.pod_calls == [("terminate", pod_id)]
+    assert manager._session is None  # the manager cannot reuse a destroyed pod
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize("release", ["cancel", "cleanup"])
+@pytest.mark.parametrize("managers_current", [True, False])
+async def test_runpod_persistent_pod_is_paused_never_terminated(
+    release, managers_current, monkeypatch, loop_errors
+):
+    """A persistent pod is only paused; terminating it destroys the configured pod."""
+
+    monkeypatch.setenv("TEST_RUNPOD_PERSISTENT_POD", "pod-persistent")
+    remote = FakeRemote(persistent_pod_id="${TEST_RUNPOD_PERSISTENT_POD}")
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter, "companion-1")
+    pod_id = adapter._active_jobs[job.job_id].session.pod_id
+    if not managers_current:
+        other = await _start(adapter, "companion-2")
+        other_pod_id = adapter._active_jobs[other.job_id].session.pod_id
+
+    if release == "cancel":
+        assert await adapter.cancel(job.job_id) is True
+    else:
+        await adapter.cleanup(job.job_id)
+
+    assert manager.provider.pod_calls == [("stop", pod_id)]
+    if managers_current:
+        assert manager._session is None
+    else:
+        assert manager._session.pod_id == other_pod_id  # the other pod is untouched
+        await adapter.cancel(other.job_id)
+        assert ("terminate", other_pod_id) not in manager.provider.pod_calls
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_persistent_pod_setting_that_expands_empty_is_on_demand(
+    monkeypatch, loop_errors
+):
+    monkeypatch.delenv("TEST_RUNPOD_PERSISTENT_POD", raising=False)
+    remote = FakeRemote(persistent_pod_id="${TEST_RUNPOD_PERSISTENT_POD}")
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter)
+    pod_id = adapter._active_jobs[job.job_id].session.pod_id
+
+    await adapter.cleanup(job.job_id)
+
+    assert manager.provider.pod_calls == [("terminate", pod_id)]
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_on_demand_pod_without_a_terminate_call_is_retained(loop_errors):
+    """Stopping instead of terminating is not a release; custody must stay."""
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
+    direct_provider = manager.provider
+    manager.provider = FakeManagedRunPodProvider(remote)
+    job = await _start(adapter)
+    record = adapter._active_jobs[job.job_id]
+
+    assert await adapter.cancel(job.job_id) is False
+
+    assert manager.provider.pod_calls == []
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert "cannot terminate on-demand pod" in record.error
+    assert record.session.state == "running"
+    assert manager._session is record.session
+
+    manager.provider = direct_provider
+    assert await adapter.cancel(job.job_id) is True
+    assert direct_provider.pod_calls == [("terminate", record.session.pod_id)]
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_failed_terminate_keeps_the_managers_session(loop_errors):
+    remote = FakeRemote(release_error=RuntimeError("podTerminate rejected"))
+    adapter, manager = _build("runpod", remote)
+    job = await _start(adapter)
+    record = adapter._active_jobs[job.job_id]
+
+    assert await adapter.cancel(job.job_id) is False
+
+    assert "podTerminate rejected" in record.error
+    assert manager._session is record.session
+    remote.release_error = None
+    assert await adapter.cancel(job.job_id) is True
+    assert manager._session is None
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
 async def test_runpod_cancel_training_keeps_pod_and_stops_submission(loop_errors):
     remote = FakeRemote()
     adapter, _ = _build("runpod", remote)
@@ -1232,3 +1377,46 @@ async def test_runpod_stop_on_a_failed_release_reports_a_failed_job_cancel(loop_
     remote.cancel_job_error = None
     assert await adapter.cancel(job.job_id) is True
     await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+# ----------------------------------------------------------------------
+# Released-job history is bounded
+# ----------------------------------------------------------------------
+
+
+async def test_released_job_history_is_bounded(provider, loop_errors):
+    remote = FakeRemote()
+    adapter, _ = _build(provider, remote)
+    adapter._lifecycle._released_history_limit = 2
+    jobs = [await _start(adapter, f"companion-{n}") for n in range(3)]
+
+    for job in jobs:
+        assert await adapter.cancel(job.job_id) is True
+
+    assert list(adapter._lifecycle._released) == [jobs[1].job_id, jobs[2].job_id]
+    # The oldest released job is forgotten: unknown, not re-released.
+    with pytest.raises(TrainingStatusError, match="Unknown job"):
+        await adapter.get_status(jobs[0].job_id)
+    assert await adapter.cancel(jobs[0].job_id) is False
+    # The remembered ones still answer, idempotently.
+    assert (await adapter.get_status(jobs[2].job_id)).state is TrainingState.CANCELLED
+    assert await adapter.cancel(jobs[2].job_id) is True
+    assert remote.release_calls == 3
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+def test_released_job_history_has_a_default_bound():
+    lifecycle = SessionTrainingLifecycle(
+        SessionProviderHooks(
+            provider_name="fake",
+            display_name="Fake",
+            acquire_session=None,
+            session_id=str,
+            submit_job=None,
+            release_session=None,
+        )
+    )
+    assert lifecycle._released_history_limit == RELEASED_JOB_HISTORY_LIMIT
+    with pytest.raises(ValueError, match="at least 1"):
+        SessionTrainingLifecycle(lifecycle._hooks, released_history_limit=0)
+
