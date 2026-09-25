@@ -2102,6 +2102,11 @@ def _attach_stop_runtime(app: FastAPI, agent) -> None:
     receipt_store = getattr(app.state, "stop_receipt_store", None)
     if receipt_store is None:
         return
+    circuit = getattr(app.state, "peer_stop_circuit", None)
+    if circuit is None:
+        # Receipts without a circuit would honor peer Stops uncounted -- the
+        # back door #3170 closes. The two open together or not at all.
+        raise RuntimeError("peer Stop circuit breaker is not initialized")
     cleanup_registry = getattr(app.state, "stop_cleanup_registry", None)
     if cleanup_registry is None:
         cleanup_registry = StopCleanupRegistry()
@@ -2110,6 +2115,7 @@ def _attach_stop_runtime(app: FastAPI, agent) -> None:
         agent,
         receipt_store=receipt_store,
         cleanup_registry=cleanup_registry,
+        circuit=circuit,
     )
 
 
@@ -2119,6 +2125,7 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
     app.state.stop_receipt_store = None
     app.state.stop_receipt_db = None
     app.state.stop_receipt_store_error = ""
+    app.state.peer_stop_circuit = None
     app.state.distributed_invocation_registry = None
     db = None
     distributed_stop = None
@@ -2128,9 +2135,13 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
             validate_sqlite_family_private,
         )
         from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.signals.sources.peer_stop import (
+            resolve_peer_stop_circuit_policy,
+        )
         from kestrel_sovereign.stop import (
             DistributedInvocationRegistry,
             DistributedInvocationStore,
+            PeerStopCircuitStore,
             StopReceiptStore,
         )
 
@@ -2155,12 +2166,17 @@ async def _initialize_stop_receipts(app: FastAPI) -> None:
             validate_sqlite_family_private(path)
         store = StopReceiptStore(db)
         await store.ensure_schema()
+        circuit = PeerStopCircuitStore(
+            db, policy=resolve_peer_stop_circuit_policy()
+        )
+        await circuit.ensure_schema()
         invocation_store = DistributedInvocationStore(db)
         await invocation_store.ensure_schema()
         distributed_stop = DistributedInvocationRegistry(invocation_store)
         distributed_stop.start()
         app.state.stop_receipt_db = db
         app.state.stop_receipt_store = store
+        app.state.peer_stop_circuit = circuit
         app.state.distributed_invocation_registry = distributed_stop
     except (Exception, asyncio.CancelledError) as error:
         cleanup_cancelled = isinstance(error, asyncio.CancelledError)
@@ -2223,6 +2239,7 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
         await registry.close()
     db = getattr(app.state, "stop_receipt_db", None)
     app.state.stop_receipt_store = None
+    app.state.peer_stop_circuit = None
     app.state.stop_receipt_db = None
     if db is not None:
         await db.close()

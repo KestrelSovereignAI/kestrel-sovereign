@@ -1649,12 +1649,22 @@ class _PeerStopEvidence:
 
 
 def _attach_peer_stop_evidence(agent) -> _PeerStopEvidence:
-    from kestrel_sovereign.signals.sources.peer_stop import attach_stop_evidence
-    from kestrel_sovereign.stop import StopCleanupRegistry
+    from kestrel_sovereign.signals.sources.peer_stop import (
+        attach_stop_evidence,
+        resolve_peer_stop_circuit_policy,
+    )
+    from kestrel_sovereign.stop import PeerStopCircuitStore, StopCleanupRegistry
 
     evidence = _PeerStopEvidence()
     attach_stop_evidence(
-        agent, receipt_store=evidence, cleanup_registry=StopCleanupRegistry()
+        agent,
+        receipt_store=evidence,
+        cleanup_registry=StopCleanupRegistry(),
+        # These tests mock the dispatcher, so the handler (and its breaker)
+        # never runs; attaching a circuit is still mandatory.
+        circuit=PeerStopCircuitStore(
+            None, policy=resolve_peer_stop_circuit_policy({})
+        ),
     )
     return evidence
 

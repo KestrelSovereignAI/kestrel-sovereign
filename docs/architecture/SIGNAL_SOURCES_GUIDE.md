@@ -431,8 +431,44 @@ Policy decided by the dispatcher, each with a `refused` Stop receipt:
 | `DROPPED_RATE_LIMIT` | more than 4 per minute / 20 per hour for this recipient | peer rate limits |
 
 The rate limit is load-bearing: a peer that could stop every new turn without
-limit would have synthesized Hold. The fleet circuit breaker (#3170) owns the
-single `peer_stop_breaker_refusal` seam in the handler.
+limit would have synthesized Hold. It bounds one peer; the **fleet circuit
+breaker** (#3170) bounds all of them. It decides at the single
+`peer_stop_breaker_refusal` seam in the handler, after dispatcher policy and
+before any cancellation:
+
+- Once the honored peer Stops against one agent, from any peers, reach
+  `PEER_STOP_CIRCUIT_THRESHOLD` (default 8) inside a sliding
+  `PEER_STOP_CIRCUIT_WINDOW_SECONDS` (default 900), the circuit for that agent
+  is open. Hosts tune both with `KESTREL_PEER_STOP_CIRCUIT_THRESHOLD` and
+  `KESTREL_PEER_STOP_CIRCUIT_WINDOW_SECONDS`; a malformed value fails startup.
+- A peer Stop against an open circuit is refused with an operation-keyed
+  `refused` receipt whose detail is `peer_stop_circuit_open`. A breaker that
+  cannot read or write its state refuses with `peer_stop_circuit_unavailable`
+  rather than honoring an uncounted Stop.
+- Counting is a durable admission written in the same transaction that counted
+  the window, under a per-target lock (PostgreSQL advisory lock; SQLite
+  `BEGIN IMMEDIATE`), so concurrent peers at `N - 1` cannot both be honored and
+  a restart does not reset the count. The Stop receipt decides finality: an
+  admission whose receipt stopped nothing (`already_complete`, `refused`)
+  stops counting; one still in flight counts. Actor and target are the signal
+  principals, never payload.
+- Operator and local sovereign Stops (`/api/agent/stop`, `/api/host/stop`) are
+  never counted and never refused. Every Stop receipt records the `door` it
+  came through (`peer`, `agent`, `host`).
+- `opened`, `closed` (automatic recovery once the window clears), and `reset`
+  transitions are receipted in `stop_circuit_events`. Opening logs one WARNING
+  naming the target. The sovereign-only `GET /api/host/stop/circuit` lists the
+  open circuits (target, `opened_at`, count, window); it is its own read, not a
+  rider on the Stop All inventory, so an inventory failure cannot hide an open
+  circuit and an unreadable breaker answers its own 503
+  `peer_stop_circuit_unavailable` without masking `GET /api/host/stop/status`.
+  The agents banner polls it independently, renders each circuit with a Reset
+  action, and shows "circuit status unavailable" rather than "none open" when
+  the read fails. The reset door is the sovereign-only
+  `POST /api/host/stop/circuit/reset` (`target`, `reason`), and
+  `GET /api/host/stop/circuit/events` reads the history.
+- Nothing latches: the breaker never writes a Hold, and an open circuit closes
+  by itself as the window slides past its admissions.
 
 Idempotency: the durable `source_event_id` and the receipt correlation id are
 both `peer-stop:<sha256(actor, correlation_id)>`, so two peers may reuse a

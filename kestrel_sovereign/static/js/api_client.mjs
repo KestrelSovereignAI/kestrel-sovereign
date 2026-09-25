@@ -1420,6 +1420,20 @@ export function createApiClient({
         getHostStopStatus: () => client.requestHost('/api/host/stop/status', {
             cache: 'no-store',
         }),
+        // Sovereign-only read of the open peer Stop circuits (#3170). Its own
+        // door, not a rider on the Stop All status: an inventory failure must
+        // not hide an open circuit, nor an unreadable breaker the inventory.
+        getPeerStopCircuits: () => client.requestHost('/api/host/stop/circuit', {
+            cache: 'no-store',
+        }),
+        // Sovereign-only reset of one agent's peer Stop circuit breaker
+        // (#3170). Receipted server-side with the caller and reason; it never
+        // stops, holds, or releases anything.
+        resetPeerStopCircuit: (payload = {}) => client.requestHost('/api/host/stop/circuit/reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {}),
+        }),
         // Hold is durable STATE, so its door is separate from Stop's (#3164).
         // The three calls below never cancel work and never take the selected
         // agent prefix: the host owns the latch table and names every agent it

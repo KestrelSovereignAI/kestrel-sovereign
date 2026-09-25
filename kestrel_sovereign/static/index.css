@@ -518,6 +518,43 @@ nav {
     margin-top: 0.25rem;
     padding-left: 1rem;
 }
+/* Peer Stop circuit breaker (#3170): an agent its peers have stopped too
+   often. Warning-toned and persistent while open, with the sovereign Reset. */
+.agent-peer-stop-circuits {
+    border-bottom: 1px solid var(--border-color);
+    color: var(--warning, #b45309);
+    font-size: 0.75rem;
+    padding: 0.5rem 0.75rem;
+}
+.agent-peer-stop-circuits p {
+    margin: 0;
+}
+.agent-peer-stop-circuit {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+.agent-peer-stop-circuit + .agent-peer-stop-circuit {
+    margin-top: 0.25rem;
+}
+.agent-peer-stop-circuit-reset {
+    background: transparent;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+}
+.agent-peer-stop-circuit-reset:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+.agent-peer-stop-circuit-error {
+    color: var(--error, #dc2626);
+    flex-basis: 100%;
+}
 
 /* The card and fleet kebabs are PRIMARY controls, not hover-reveal row
    actions. The shared `.kebab-btn` primitive defaults to `opacity: 0` and is

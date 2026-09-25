@@ -20,6 +20,7 @@ from .receipt import StopOperationClaim, StopReceipt, StopReceiptConflict
 from .types import (
     AuthoritativeStopDescendant,
     StopDisposition,
+    StopDoor,
     StopOutcome,
     StopRequest,
     StopScope,
@@ -216,6 +217,7 @@ class CancellationAuthority:
         *,
         cleanup_registry: StopCleanupRegistry,
         receipt_store: Any,
+        door: StopDoor,
         descendant_resolver: DescendantResolver | None = None,
         unloaded_agent_stop: UnloadedAgentStop | None = None,
         target_timeout_seconds: float = DEFAULT_STOP_TARGET_TIMEOUT_SECONDS,
@@ -228,6 +230,9 @@ class CancellationAuthority:
             getattr(receipt_store, "persist", None)
         ):
             raise TypeError("receipt_store must provide load and persist")
+        if not isinstance(door, StopDoor):
+            raise TypeError("door must name the StopDoor this authority serves")
+        self._door = door
         self._target_inventory = target_inventory
         self._cleanup_registry = cleanup_registry
         self._receipt_store = receipt_store
@@ -387,11 +392,14 @@ class CancellationAuthority:
 
         try:
             if claim_id is None:
-                receipt = await self._receipt_store.persist(request, outcomes)
+                receipt = await self._receipt_store.persist(
+                    request, outcomes, door=self._door
+                )
             else:
                 receipt = await self._receipt_store.persist(
                     request,
                     outcomes,
+                    door=self._door,
                     claim_id=claim_id,
                 )
             if not isinstance(receipt, StopReceipt):

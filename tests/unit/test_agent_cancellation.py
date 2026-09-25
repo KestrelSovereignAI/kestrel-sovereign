@@ -29,7 +29,7 @@ class _MemoryStopReceiptStore:
             raise StopReceiptConflict("conflicting replay")
         return receipt
 
-    async def persist(self, request, outcomes):
+    async def persist(self, request, outcomes, **_kwargs):
         from kestrel_sovereign.stop import StopReceipt, StopScope
 
         replay = await self.load(request)

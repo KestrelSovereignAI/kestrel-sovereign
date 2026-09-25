@@ -23,10 +23,11 @@ from kestrel_sovereign.stop import (
     CooperativeStopTarget,
     StopCleanupRegistry,
     StopDisposition,
+    StopDoor,
     StopOutcome,
-    StopRequest,
     StopReceipt,
     StopReceiptConflict,
+    StopRequest,
     StopScope,
 )
 
@@ -44,7 +45,7 @@ class _MemoryReceiptStore:
             raise StopReceiptConflict("conflicting replay")
         return receipt
 
-    async def persist(self, request, outcomes):
+    async def persist(self, request, outcomes, **_kwargs):
         replay = await self.load(request)
         if replay is not None:
             return replay
@@ -87,6 +88,7 @@ def _authority(target_inventory, **kwargs) -> CancellationAuthority:
         cleanup_registry=StopCleanupRegistry(),
         receipt_store=kwargs.pop("receipt_store", _MemoryReceiptStore()),
         **kwargs,
+        door=StopDoor.AGENT,
     )
 
 
@@ -525,6 +527,7 @@ async def test_stop_deadline_detaches_target_that_suppresses_cancellation() -> N
         cleanup_registry=cleanup_registry,
         receipt_store=_MemoryReceiptStore(),
         target_timeout_seconds=0.01,
+        door=StopDoor.AGENT,
     )
 
     outcomes = await asyncio.wait_for(

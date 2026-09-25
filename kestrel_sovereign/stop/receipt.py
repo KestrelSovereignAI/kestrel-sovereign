@@ -17,9 +17,29 @@ from kestrel_sovereign.storage.database_clock import (
 from kestrel_sovereign.storage.db.interface import DatabaseError
 from kestrel_sovereign.storage.feed_sequence import ensure_feed_sequence
 
-from .types import StopOutcome, StopRequest, StopScope
+from .types import StopDoor, StopOutcome, StopRequest, StopScope
 
 _SCHEMA_LOCK = "stop_receipts_v1"
+_DOOR_VALUES = frozenset(door.value for door in StopDoor)
+# Additive (#3170): which door wrote a receipt. Nullable so an older binary
+# that never names it keeps appending during a rolling upgrade; such a row
+# reads back as "door not recorded", never as a guessed door.
+_DOOR_COLUMN = (
+    "door",
+    "TEXT CHECK (door IS NULL OR door IN ('peer', 'agent', 'host'))",
+)
+# Pre-#3170 rows carry no door. Only host scope proves its door: the host
+# fan-out is its sole writer. An agent/turn row cannot be attributed -- the
+# operator door records the caller's identity as its actor, and a caller may
+# itself be a DID, so the actor's shape says nothing about which door ran.
+# Those rows stay NULL and read back as "door not recorded". The backfill is
+# provenance for display only: the circuit breaker counts its own admissions,
+# never a backfilled row.
+_DOOR_BACKFILL = (
+    "UPDATE stop_receipts SET door = 'host' "
+    "WHERE door IS NULL AND scope = 'host'",
+    (),
+)
 _RECEIPT_COLUMNS = (
     "receipt_id, operation_id, request_fingerprint, scope, actor_id, "
     "requested_target, target_agent_id, reason, cascade, occurred_at, "
@@ -86,6 +106,7 @@ class StopReceiptRecord:
     feed_seq: int
     receipt_id: str
     scope: str
+    door: str | None
     actor_id: str
     target_agent_id: str | None
     reason: str | None
@@ -283,6 +304,11 @@ class StopReceiptStore:
                 table="stop_receipts",
                 lock_key=_RECEIPT_FEED_LOCK_KEY,
             )
+        await self._db.migrate_columns_once(
+            "stop_receipts",
+            (_DOOR_COLUMN,),
+            {"door": _DOOR_BACKFILL},
+        )
 
     async def _lock_operation(self, operation_id: str) -> None:
         if getattr(self._db, "backend_type", "") != "postgres":
@@ -523,7 +549,8 @@ class StopReceiptStore:
         # evidence actually exists.
         params.append(limit + 1)
         rows = await self._db.fetchall(
-            f"SELECT {_RECEIPT_COLUMNS}, feed_seq FROM stop_receipts AS receipt "
+            f"SELECT {_RECEIPT_COLUMNS}, feed_seq, door "
+            "FROM stop_receipts AS receipt "
             f"WHERE {' AND '.join(filters)} "
             "ORDER BY receipt.feed_seq LIMIT ?",
             tuple(params),
@@ -546,11 +573,14 @@ class StopReceiptStore:
         de-blind an opaque address.
         """
 
-        if row is None or len(row) != 14:
+        if row is None or len(row) != 15:
             raise StopReceiptCorruptError(
                 "Stop receipt row has an unexpected shape"
             )
         feed_seq = row[13]
+        door = row[14]
+        if door is not None and door not in _DOOR_VALUES:
+            raise StopReceiptCorruptError("Stop receipt door is invalid")
         if (
             isinstance(feed_seq, bool)
             or not isinstance(feed_seq, int)
@@ -631,6 +661,7 @@ class StopReceiptStore:
             feed_seq=feed_seq,
             receipt_id=receipt_id,
             scope=scope,
+            door=door,
             actor_id=_required_text(row[4], "actor_id"),
             target_agent_id=row[6],
             reason=row[7],
@@ -714,10 +745,18 @@ class StopReceiptStore:
         request: StopRequest,
         outcomes: tuple[StopOutcome, ...],
         *,
+        door: StopDoor,
         claim_id: str | None = None,
     ) -> StopReceipt:
-        """Atomically append one request and its ordered per-target outcomes."""
+        """Atomically append one request and its ordered per-target outcomes.
 
+        ``door`` is required: every writer names the door its Stop arrived
+        through, so the fleet circuit breaker (#3170) can never mistake an
+        operator's Stop for a peer's.
+        """
+
+        if not isinstance(door, StopDoor):
+            raise TypeError("Stop receipt door must be a StopDoor")
         self._validate_outcomes(request, outcomes)
         fingerprint = _fingerprint(request)
         stored_operation_id = _identifier_digest(
@@ -770,8 +809,8 @@ class StopReceiptStore:
                     "INSERT INTO stop_receipts ("
                     "receipt_id, operation_id, request_fingerprint, scope, "
                     "actor_id, requested_target, target_agent_id, reason, "
-                    "cascade, occurred_at, turn_id, span_id, trace_id"
-                    f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?)",
+                    "cascade, occurred_at, turn_id, span_id, trace_id, door"
+                    f") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, {now_sql}, ?, ?, ?, ?)",
                     (
                         receipt_id,
                         stored_operation_id,
@@ -791,6 +830,7 @@ class StopReceiptStore:
                         ),
                         request.span_id,
                         request.trace_id,
+                        door.value,
                     ),
                 )
                 for ordinal, outcome in enumerate(outcomes):

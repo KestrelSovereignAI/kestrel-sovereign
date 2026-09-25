@@ -67,6 +67,7 @@ from kestrel_sovereign.stop import (
     MAX_STOP_CORRELATION_ID_BYTES,
     StopDisposition,
     StopCleanupRegistry,
+    StopDoor,
     StopRequest,
     StopScope,
     UnavailableStopReceiptStore,
@@ -1384,6 +1385,7 @@ async def stop_agent_request(request: Request):
                 getattr(request.app.state, "stop_receipt_store", None)
                 or UnavailableStopReceiptStore()
             ),
+            door=StopDoor.AGENT,
             descendant_resolver=resolve_descendants,
             unloaded_agent_stop=stop_unloaded_descendant,
         )

@@ -1379,7 +1379,11 @@ export function mountAgentList(containerEl, config = {}) {
  *                        browser-work fence returning an optional settlement
  *                        callback invoked with (response, error, correlationId).
  *   - confirmStopAll(message) — host confirmation override (defaults to confirm).
- *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence.
+ *   - stopAllStatusIntervalMs — authoritative host-status refresh cadence;
+ *                        the peer Stop circuit read polls on its own timer at
+ *                        the same cadence.
+ *   - askCircuitResetReason(message, default) — reason prompt for a circuit
+ *                        Reset (defaults to window.prompt).
  *   - stopAllReason / fleetHoldReason — wording carried on the fleet requests.
  *   - fleetHoldConfirmTimeoutMs — how long a fleet gesture waits for the
  *                        confirming latch read that draws its fan-out before
@@ -1515,6 +1519,9 @@ export function mountAgentListPane(containerEl, config = {}) {
     let stopAllPending = false;
     let refreshStopAllState = async () => false;
     let invalidateStopAllState = () => {};
+    // The circuit banner names agents through the loaded list, so a list load
+    // repaints it; assigned once the banner exists.
+    let repaintPeerStopCircuits = () => {};
     // The banner's own view of the host latch table. It is never composed here:
     // every field arrives from the inner list's republication of what the host
     // said (`onHoldState`). Until the host answers, the banner knows nothing —
@@ -1544,6 +1551,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         onLoaded: (items, meta) => {
             loadedItems = Array.isArray(items) ? items : [];
             listEverLoaded = true;
+            repaintPeerStopCircuits();
             if (!stopAllPending && !containerEl[AGENT_LIST_STOP_ALL_OPERATION]) {
                 void refreshStopAllState();
             }
@@ -1613,6 +1621,154 @@ export function mountAgentListPane(containerEl, config = {}) {
         stopAllResults.setAttribute('aria-live', 'polite');
         stopAllResults.hidden = true;
         body.insertBefore(stopAllResults, listHandle.element);
+    }
+
+    // --- Peer Stop circuit breaker (#3170) ---------------------------------
+    // Repeated peer Stop against one agent is Hold through the back door, so
+    // the host stops honoring it past a threshold and tells a human -- here.
+    // The circuits are their own sovereign-only read, polled independently of
+    // the Stop All status: an inventory failure must not hide an open circuit,
+    // and an unreadable breaker must not blank Stop All. Reset is the
+    // sovereign's door. The banner is part of the fleet Stop controls, so it
+    // shares their opt-in -- configuration only, never a read's outcome.
+    const circuitOptIn = stopAllOptIn
+        && typeof api.getPeerStopCircuits === 'function'
+        && typeof api.resetPeerStopCircuit === 'function';
+    const circuitBanner = circuitOptIn ? doc.createElement('div') : null;
+    if (circuitBanner) {
+        circuitBanner.className = 'agent-peer-stop-circuits';
+        circuitBanner.setAttribute('role', 'status');
+        circuitBanner.setAttribute('aria-live', 'polite');
+        circuitBanner.hidden = true;
+        body.insertBefore(circuitBanner, listHandle.element);
+    }
+    const askCircuitResetReason = makeReasonAsker(config.askCircuitResetReason);
+    const circuitResetsPending = new Set();
+    const circuitResetErrors = new Map();
+    // null: not this caller's to see (or not read yet). Otherwise the last
+    // answer of the circuit read: `{ available: true, open }` or
+    // `{ available: false }`.
+    let peerStopCircuit = null;
+    let peerStopCircuitSeq = 0;
+    let peerStopCircuitPromise = null;
+
+    function renderPeerStopCircuits() {
+        if (!circuitBanner) return;
+        circuitBanner.textContent = '';
+        const state = peerStopCircuit;
+        if (!state || typeof state !== 'object') {
+            circuitBanner.hidden = true;
+            return;
+        }
+        if (state.available !== true) {
+            // An unreadable breaker is not a clear one.
+            const line = doc.createElement('p');
+            line.className = 'agent-peer-stop-circuit-unavailable';
+            line.textContent = 'Peer Stop circuit status unavailable';
+            circuitBanner.appendChild(line);
+            circuitBanner.hidden = false;
+            return;
+        }
+        const open = Array.isArray(state.open)
+            ? state.open.filter((entry) => entry && typeof entry.target_agent_id === 'string'
+                && entry.target_agent_id)
+            : [];
+        circuitBanner.hidden = open.length === 0;
+        for (const entry of open) {
+            const target = entry.target_agent_id;
+            const name = displayIdentity([target]);
+            const row = doc.createElement('div');
+            row.className = 'agent-peer-stop-circuit';
+            row.dataset.target = target;
+            const label = doc.createElement('span');
+            label.className = 'agent-peer-stop-circuit-label';
+            label.textContent = `peer Stop circuit open: ${name}`;
+            const count = Number.isSafeInteger(entry.admitted_count) ? entry.admitted_count : null;
+            const windowSeconds = Number.isSafeInteger(entry.window_seconds) ? entry.window_seconds : null;
+            if (count !== null && windowSeconds !== null) {
+                label.title = `${count} honored peer Stops within ${windowSeconds}s; further peer Stops are refused`;
+            }
+            const reset = doc.createElement('button');
+            reset.type = 'button';
+            reset.className = 'agent-peer-stop-circuit-reset';
+            reset.textContent = 'Reset';
+            reset.title = `Reset the peer Stop circuit for ${name}`;
+            reset.disabled = circuitResetsPending.has(target);
+            reset.addEventListener('click', () => { void resetPeerStopCircuit(target, name); });
+            row.appendChild(label);
+            row.appendChild(reset);
+            const error = circuitResetErrors.get(target);
+            if (error) {
+                const failure = doc.createElement('span');
+                failure.className = 'agent-peer-stop-circuit-error';
+                failure.textContent = error;
+                row.appendChild(failure);
+            }
+            circuitBanner.appendChild(row);
+        }
+    }
+
+    async function resetPeerStopCircuit(target, name) {
+        if (!circuitOptIn || destroyed || circuitResetsPending.has(target)) return;
+        const reason = askCircuitResetReason(
+            `Reset the peer Stop circuit for ${name}? Peers will be able to stop it again. Reason:`,
+            'Reviewed the repeated peer Stops',
+        );
+        if (reason === null) return;
+        circuitResetsPending.add(target);
+        circuitResetErrors.delete(target);
+        renderPeerStopCircuits();
+        try {
+            await api.resetPeerStopCircuit({ target, reason });
+        } catch (error) {
+            circuitResetErrors.set(
+                target,
+                `Reset failed: ${(error && error.message) || 'request refused'}`,
+            );
+        } finally {
+            circuitResetsPending.delete(target);
+        }
+        if (destroyed) return;
+        renderPeerStopCircuits();
+        // A poll already in flight was issued before the reset; its answer may
+        // not paint over the fresh read below.
+        peerStopCircuitSeq++;
+        peerStopCircuitPromise = null;
+        await refreshPeerStopCircuits();
+    }
+    repaintPeerStopCircuits = renderPeerStopCircuits;
+
+    // An authority refusal means this caller is not shown circuits at all.
+    // Every other failure leaves the circuits unknown -- "unavailable", never
+    // "none open" and never the stale open list.
+    function circuitReadRefused(error) {
+        const status = error && error.status;
+        return status === 401 || status === 403;
+    }
+
+    async function refreshPeerStopCircuits() {
+        if (!circuitOptIn || destroyed) return;
+        if (peerStopCircuitPromise) return peerStopCircuitPromise;
+        const request = (async () => {
+            const seq = ++peerStopCircuitSeq;
+            try {
+                const state = await api.getPeerStopCircuits();
+                if (destroyed || seq !== peerStopCircuitSeq) return;
+                peerStopCircuit = state && Array.isArray(state.open)
+                    ? { available: true, open: state.open }
+                    : { available: false };
+            } catch (error) {
+                if (destroyed || seq !== peerStopCircuitSeq) return;
+                peerStopCircuit = circuitReadRefused(error) ? null : { available: false };
+            }
+            renderPeerStopCircuits();
+        })();
+        peerStopCircuitPromise = request;
+        try {
+            await request;
+        } finally {
+            if (peerStopCircuitPromise === request) peerStopCircuitPromise = null;
+        }
     }
 
     let stopAllStatusSeq = 0;
@@ -1904,6 +2060,14 @@ export function mountAgentListPane(containerEl, config = {}) {
         : null;
     renderStopAllState();
     void refreshStopAllState();
+    // Same cadence, separate timer and separate read: neither lane's failure
+    // or in-flight operation fences the other.
+    const circuitInterval = circuitOptIn && typeof setIntervalFn === 'function'
+        ? setIntervalFn.call(doc.defaultView, () => {
+            void refreshPeerStopCircuits();
+        }, statusIntervalMs)
+        : null;
+    void refreshPeerStopCircuits();
 
     // --- Fleet Hold: the banner latch surface (#3165) ----------------------
     // Hold is a LATCH, so the banner's job is different from Stop All's: Stop
@@ -2722,6 +2886,9 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (statusInterval !== null && typeof clearIntervalFn === 'function') {
             clearIntervalFn.call(doc.defaultView, statusInterval);
         }
+        if (circuitInterval !== null && typeof clearIntervalFn === 'function') {
+            clearIntervalFn.call(doc.defaultView, circuitInterval);
+        }
         // Settle every confirming-read leash this mount still holds, rather
         // than cancel it: a retired gesture must still reach its `finally` to
         // hand the fence back to the current owner, and cancelling the timer
@@ -2740,6 +2907,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         if (builtNewBtn && newBtn) newBtn.remove();
         if (builtStopAllBtn && stopAllBtn) stopAllBtn.remove();
         if (stopAllResults && stopAllResults.parentNode) stopAllResults.remove();
+        if (circuitBanner && circuitBanner.parentNode) circuitBanner.remove();
         // The fleet Hold surface is always built by this mount, never adopted,
         // so it always leaves with it — a leaked kebab keeps a dead menu
         // callback alive over a list handle that has already been destroyed.
@@ -2775,6 +2943,7 @@ export function mountAgentListPane(containerEl, config = {}) {
         close,
         toggle,
         refreshStopAllState,
+        refreshPeerStopCircuits,
         get collapsed() { return isCollapsed(); },
         destroy,
     };

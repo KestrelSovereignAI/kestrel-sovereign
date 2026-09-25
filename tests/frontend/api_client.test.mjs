@@ -851,6 +851,28 @@ test('getHostStopStatus reads caller-scoped host authority and live inventory', 
     assert.equal(result.in_flight_count, 2);
 });
 
+test('getPeerStopCircuits reads the circuit door, never the Stop All status', async () => {
+    const fetchFn = createFetchQueue(jsonResponse(200, {
+        threshold: 8,
+        window_seconds: 900,
+        open: [],
+    }));
+    const { client } = createClient({
+        fetchFn,
+        sessionInitial: { kestrel_api_key: 'machine-key' },
+    });
+    await client.init();
+    client.setHostAgent('claw');
+
+    const result = await client.getPeerStopCircuits();
+
+    assert.equal(fetchFn.calls.length, 1);
+    assert.equal(fetchFn.calls[0].url, '/api/host/stop/circuit');
+    assert.equal(fetchFn.calls[0].options.method, undefined);
+    assert.equal(fetchFn.calls[0].options.cache, 'no-store');
+    assert.deepEqual(result.open, []);
+});
+
 test('buildAgentUrl maps notification SSE paths through selected host agents', () => {
     const { client } = createClient({ fetchFn: createFetchQueue() });
 
