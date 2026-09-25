@@ -39,6 +39,12 @@ Ownership contract
   "Succeeded" means the provider hook returned without raising, so each
   ``release_session`` hook must prove the provider stopped billing — it may
   not route through a provider helper that logs a failure and returns.
+* Reported status never runs ahead of verified provider state.
+  :func:`phase_status` maps every phase explicitly (an unlisted one fails
+  loudly). Terminal states come only from :data:`TERMINAL_PHASES`, and
+  ``CANCELLED`` only from ``RELEASED``. ``RELEASING`` and ``RELEASE_FAILED``
+  report the non-terminal ``TrainingState.RELEASING``/``RELEASE_FAILED``, and a
+  status query on a ``RELEASE_FAILED`` job retries its release.
 * A session acquired for a job that is then rejected (validation, close, or
   caller cancellation) is released at once. If that release fails, the
   session is registered as an orphan job in ``RELEASE_FAILED`` under the
@@ -67,7 +73,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, assert_never
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
@@ -221,6 +227,111 @@ class SessionProviderHooks(Generic[SessionT]):
     ) = None
 
 
+TERMINAL_PHASES: frozenset[SessionJobPhase] = frozenset(
+    {SessionJobPhase.FAILED, SessionJobPhase.RELEASED}
+)
+"""Phases whose stop is verified, and so the only ones reported as terminal.
+
+``FAILED``: the submission task has ended and no provider job is running on
+our behalf (none was published, or its cancellation succeeded); the session
+is still held until ``cleanup()``. ``RELEASED``: the provider confirmed the
+session release.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class StatusLookup(Generic[SessionT]):
+    """Result of a local status lookup: exactly one field is set.
+
+    ``status`` answers the caller without the provider; ``poll`` is the record
+    whose provider job must be polled for its status.
+    """
+
+    status: TrainingStatus | None
+    poll: SessionTrainingRecord[SessionT] | None
+
+
+def phase_status(
+    record: SessionTrainingRecord[Any],
+    *,
+    provider_name: str,
+    session_id: str,
+    preparing_message: str,
+) -> TrainingStatus | None:
+    """Map a job's local phase to its reported status (``None``: poll the provider).
+
+    Every :class:`SessionJobPhase` is listed; an unlisted one fails loudly
+    rather than falling through to some other state. Terminal states come only
+    from :data:`TERMINAL_PHASES`, and ``CANCELLED`` only from ``RELEASED``: a
+    job whose session release is in flight or failed has not stopped billing.
+    """
+
+    phase = record.phase
+    match phase:
+        case SessionJobPhase.SUBMITTING:
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.PREPARING,
+                progress=0.0,
+                message=preparing_message,
+            )
+        case SessionJobPhase.TRAINING:
+            return None
+        case SessionJobPhase.STOPPING:
+            if record.provider_job_id is not None:
+                # A provider job whose cancellation has not succeeded: ask the
+                # provider rather than report a stop that did not happen.
+                return None
+            # Not stopped yet: the submission may still get a job accepted.
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.PREPARING,
+                progress=0.0,
+                message="Stop requested; waiting for the background submission "
+                "to stop",
+            )
+        case SessionJobPhase.FAILED:
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.FAILED,
+                progress=0.0,
+                error=record.error or "Background submission failed",
+            )
+        case SessionJobPhase.RELEASING:
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.RELEASING,
+                progress=0.0,
+                message=f"Releasing provider session {session_id}",
+                error=record.error,
+            )
+        case SessionJobPhase.RELEASE_FAILED:
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.RELEASE_FAILED,
+                progress=0.0,
+                message=f"Provider session {session_id} may still be billing; "
+                "retrying its release",
+                error=record.error or f"release of session {session_id} failed",
+            )
+        case SessionJobPhase.RELEASED:
+            if record.release_intent is ReleaseIntent.CLEANUP:
+                raise TrainingStatusError(
+                    f"Job {record.job_id} was cleaned up; provider status is "
+                    "no longer available",
+                    provider=provider_name,
+                )
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.CANCELLED,
+                progress=0.0,
+                message=f"Provider session {session_id} released",
+                error=record.error,
+            )
+        case _:
+            assert_never(phase)
+
+
 def _observe_outcome(task: asyncio.Task[Any]) -> None:
     """Retrieve an owned task's outcome so no exception goes unobserved."""
 
@@ -247,7 +358,8 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         self._hooks = hooks
         self._timeouts = timeouts or SessionLifecycleTimeouts()
         self._records: dict[str, SessionTrainingRecord[SessionT]] = {}
-        self._released_job_ids: set[str] = set()
+        # Released records answer status (CANCELLED) and idempotent release.
+        self._released: dict[str, SessionTrainingRecord[SessionT]] = {}
         self._openings: set[asyncio.Task[SessionTrainingRecord[SessionT]]] = set()
         self._closed = False
 
@@ -287,56 +399,43 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         )
 
     def local_status(
-        self,
-        record: SessionTrainingRecord[SessionT],
-        *,
-        preparing_message: str,
-    ) -> TrainingStatus | None:
-        """Status answerable without the provider, or ``None`` to poll it."""
+        self, job_id: str, *, preparing_message: str
+    ) -> StatusLookup[SessionT]:
+        """Answer a job's status locally, or name the record to poll the provider for.
 
-        phase = record.phase
-        if phase is SessionJobPhase.TRAINING:
-            return None
-        if phase is SessionJobPhase.STOPPING and record.provider_job_id is not None:
-            # A provider job whose cancellation has not succeeded: ask the
-            # provider rather than report a stop that did not happen.
-            return None
-        if phase is SessionJobPhase.SUBMITTING:
-            return TrainingStatus(
-                job_id=record.job_id,
-                state=TrainingState.PREPARING,
-                progress=0.0,
-                message=preparing_message,
-            )
-        if phase is SessionJobPhase.STOPPING:
-            # Not cancelled yet: the submission may still get a job accepted.
-            return TrainingStatus(
-                job_id=record.job_id,
-                state=TrainingState.PREPARING,
-                progress=0.0,
-                message="Stop requested; waiting for the background submission "
-                "to stop",
-            )
-        if phase is SessionJobPhase.FAILED:
-            return TrainingStatus(
-                job_id=record.job_id,
-                state=TrainingState.FAILED,
-                progress=0.0,
-                error=record.error or "Background submission failed",
-            )
-        if record.release_intent is ReleaseIntent.CLEANUP:
+        The phase-to-status mapping is :func:`phase_status`. A job in
+        ``RELEASE_FAILED`` also has its release retried here, so a billing
+        session is not left for ``close()`` alone to stop.
+        """
+
+        record = self._records.get(job_id) or self._released.get(job_id)
+        if record is None:
             raise TrainingStatusError(
-                f"Job {record.job_id} is being cleaned up; provider status is "
-                "no longer available",
-                provider=self._hooks.provider_name,
+                f"Unknown job: {job_id}", provider=self._hooks.provider_name
             )
-        return TrainingStatus(
-            job_id=record.job_id,
-            state=TrainingState.CANCELLED,
-            progress=0.0,
-            message="Releasing provider session",
-            error=record.error,
+        status = phase_status(
+            record,
+            provider_name=self._hooks.provider_name,
+            session_id=self._hooks.session_id(record.session),
+            preparing_message=preparing_message,
         )
+        if record.phase is SessionJobPhase.RELEASE_FAILED:
+            self._retry_release(record)
+        if status is None:
+            return StatusLookup(status=None, poll=record)
+        return StatusLookup(status=status, poll=None)
+
+    def _retry_release(self, record: SessionTrainingRecord[SessionT]) -> None:
+        """Start another owned release attempt for a job whose release failed."""
+
+        logger.warning(
+            "[%s] %s retrying the release of session %s after: %s",
+            record.job_id,
+            self._hooks.display_name,
+            self._hooks.session_id(record.session),
+            record.error,
+        )
+        self._ensure_release(record, record.release_intent or ReleaseIntent.CANCEL)
 
     # ------------------------------------------------------------------
     # Start
@@ -731,7 +830,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
 
         record = self._records.get(job_id)
         if record is None:
-            return job_id in self._released_job_ids
+            return job_id in self._released
         outcome = await await_owned_task(self._ensure_release(record, intent))
         return self._release_result(outcome, job_id)
 
@@ -807,7 +906,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 return False
             record.transition(SessionJobPhase.RELEASED)
             self._records.pop(record.job_id, None)
-            self._released_job_ids.add(record.job_id)
+            self._released[record.job_id] = record
             logger.info(
                 "[%s] %s released session %s (%s)",
                 record.job_id,

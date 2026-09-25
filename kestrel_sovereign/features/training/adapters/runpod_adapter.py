@@ -280,16 +280,13 @@ class RunPodTrainingAdapter:
             TrainingStatus with current progress
         """
         try:
-            record = self._lifecycle.get(job_id)
-            if record is None:
-                raise TrainingStatusError(f"Unknown job: {job_id}")
-
-            local = self._lifecycle.local_status(
-                record,
+            lookup = self._lifecycle.local_status(
+                job_id,
                 preparing_message="Waiting for FLUX model to load (may take 5-10 min)...",
             )
-            if local is not None:
-                return local
+            if lookup.poll is None:
+                return lookup.status
+            record = lookup.poll
 
             # Poll the training status via manager
             manager = self._get_manager()

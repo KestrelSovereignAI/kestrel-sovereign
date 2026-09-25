@@ -15,6 +15,7 @@ import gc
 import itertools
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -22,10 +23,14 @@ import pytest
 from google.api_core.exceptions import NotFound
 
 from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+    TERMINAL_PHASES,
     IllegalSessionJobTransition,
+    ReleaseIntent,
     SessionJobPhase,
     SessionLifecycleTimeouts,
     SessionReleaseError,
+    SessionTrainingRecord,
+    phase_status,
 )
 from kestrel_sovereign.features.training.adapters.gcp_compute_adapter import (
     GCPComputeTrainingAdapter,
@@ -359,17 +364,26 @@ def provider(request):
 
 @pytest.fixture(autouse=True)
 async def _unstick_remotes():
-    """Free any submission that ignores cancellation once a test ends.
+    """Open every barrier a test left closed once it ends.
 
-    A failing assertion would otherwise leave that task alive, and the event
-    loop's teardown would wait on it forever instead of reporting the failure.
+    A failing assertion would otherwise leave a submission, acquisition, or
+    release blocked on its barrier, and the event loop's teardown would wait
+    on it forever instead of reporting the failure.
     """
 
     yield
     while _remotes:
         remote = _remotes.pop()
-        if remote.ignore_cancel_until is not None:
-            remote.ignore_cancel_until.set()
+        for gate in (
+            remote.ignore_cancel_until,
+            remote.acquire_gate,
+            remote.response_gate,
+            remote.release_gate,
+            remote.upload_gate,
+        ):
+            if gate is not None:
+                gate.set()
+        remote.submit_gate.set()
     await _settle()
 
 
@@ -582,10 +596,47 @@ async def test_session_release_failure_retains_custody_until_retry(provider, loo
     assert record.error.startswith("session release failed")
     if provider != "vastai":  # the Vast.ai SDK swallows the underlying error
         assert "provider API down" in record.error
-    assert (await adapter.get_status(job.job_id)).state is TrainingState.CANCELLED
+
+    # The session may still be billing: never a terminal (let alone CANCELLED)
+    # status, or a caller polling for completion would stop watching it.
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.RELEASE_FAILED
+    assert not status.state.is_terminal()
+    session_id = adapter._lifecycle._hooks.session_id(record.session)
+    assert session_id in status.message
+    # That status query retried the release; it failed again, so custody stays.
+    assert await record.release_task is False
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert remote.running_sessions() == [record.session]
+    assert not (await adapter.get_status(job.job_id)).state.is_terminal()
+    await record.release_task
 
     remote.release_error = None
     assert await adapter.cancel(job.job_id) is True
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.CANCELLED  # only now: release verified
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_status_query_retries_a_failed_release(provider, loop_errors):
+    """A failed release is retried on the next status query, not only at close()."""
+
+    remote = FakeRemote(release_error=RuntimeError("provider API down"))
+    adapter, _ = _build(provider, remote)
+    job = await _start(adapter)
+    await remote.submit_started.wait()
+    assert await adapter.cancel(job.job_id) is False
+    record = adapter._active_jobs[job.job_id]
+    calls_before = remote.release_calls
+
+    remote.release_error = None
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.RELEASE_FAILED  # the last verified outcome
+    assert record.phase is SessionJobPhase.RELEASING
+    assert await record.release_task is True
+
+    assert remote.release_calls == calls_before + 1
+    assert (await adapter.get_status(job.job_id)).state is TrainingState.CANCELLED
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
@@ -878,19 +929,103 @@ async def test_illegal_transition_is_rejected(provider, loop_errors):
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
-async def test_status_of_job_being_cleaned_up_is_unavailable(provider, loop_errors):
+@pytest.mark.parametrize("intent", ["cancel", "cleanup"])
+async def test_status_of_job_being_released_is_not_terminal(
+    provider, intent, loop_errors
+):
     remote = FakeRemote(release_gate=asyncio.Event())
     adapter, _ = _build(provider, remote)
     job = await _start(adapter)
-    cleanup = asyncio.create_task(adapter.cleanup(job.job_id))
+    release = asyncio.create_task(getattr(adapter, intent)(job.job_id))
     await remote.release_started.wait()
 
-    with pytest.raises(TrainingStatusError, match="being cleaned up"):
-        await adapter.get_status(job.job_id)
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.RELEASING
+    assert not status.state.is_terminal()
 
     remote.release_gate.set()
-    await cleanup
+    await release
+    if intent == "cleanup":
+        with pytest.raises(TrainingStatusError, match="was cleaned up"):
+            await adapter.get_status(job.job_id)
+    else:
+        assert (await adapter.get_status(job.job_id)).state is TrainingState.CANCELLED
     await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+def _record_in(phase: SessionJobPhase, **fields) -> SessionTrainingRecord:
+    now = datetime.now(timezone.utc)
+    record = SessionTrainingRecord(
+        job_id="job-1",
+        companion_id="companion-1",
+        trigger_word="TOK",
+        config=TrainingConfig(),
+        session=SimpleNamespace(),
+        created_at=now,
+        started_at=now,
+    )
+    record.phase = phase
+    for name, value in fields.items():
+        setattr(record, name, value)
+    return record
+
+
+def _phase_variants(phase: SessionJobPhase) -> list[dict]:
+    """Every record shape a phase can be reported from."""
+
+    return [
+        {"release_intent": intent, "provider_job_id": provider_job_id, "error": error}
+        for intent in (None, *ReleaseIntent)
+        for provider_job_id in (None, "remote-1")
+        for error in (None, "boom")
+    ]
+
+
+@pytest.mark.parametrize("phase", list(SessionJobPhase), ids=lambda phase: phase.value)
+def test_every_phase_maps_to_a_status_no_further_ahead_than_verified(phase):
+    """The guard against reported state running ahead of provider state.
+
+    Parametrised over every phase, so a phase added without a mapping fails
+    here (``phase_status`` ends in ``assert_never``) instead of falling
+    through to some other state.
+    """
+
+    for fields in _phase_variants(phase):
+        record = _record_in(phase, **fields)
+        try:
+            status = phase_status(
+                record,
+                provider_name="fake",
+                session_id="session-1",
+                preparing_message="preparing",
+            )
+        except TrainingStatusError:
+            # Only a cleaned-up job has no status left to report.
+            assert phase is SessionJobPhase.RELEASED
+            assert fields["release_intent"] is ReleaseIntent.CLEANUP
+            continue
+        if status is None:
+            # Polling the provider: only while a provider job may be running.
+            assert phase in (SessionJobPhase.TRAINING, SessionJobPhase.STOPPING)
+            assert phase is SessionJobPhase.TRAINING or fields["provider_job_id"]
+            continue
+        assert status.job_id == record.job_id
+        if status.state.is_terminal():
+            assert phase in TERMINAL_PHASES, (phase, status.state)
+        if status.state is TrainingState.CANCELLED:
+            assert phase is SessionJobPhase.RELEASED
+        if phase in (SessionJobPhase.RELEASING, SessionJobPhase.RELEASE_FAILED):
+            assert not status.state.is_terminal()
+            assert "session-1" in status.message
+        if phase is SessionJobPhase.RELEASE_FAILED:
+            assert status.state is TrainingState.RELEASE_FAILED
+            assert status.error
+
+
+def test_terminal_phases_are_the_verified_ones():
+    assert TERMINAL_PHASES == {SessionJobPhase.FAILED, SessionJobPhase.RELEASED}
+    assert not TrainingState.RELEASING.is_terminal()
+    assert not TrainingState.RELEASE_FAILED.is_terminal()
 
 
 async def test_runpod_stops_its_own_pod_not_the_managers_current_one(loop_errors):
