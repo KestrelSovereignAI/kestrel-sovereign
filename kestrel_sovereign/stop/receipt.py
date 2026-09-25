@@ -264,6 +264,12 @@ class StopReceiptStore:
                 "claimed_at TEXT NOT NULL)"
             )
             await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS stop_operation_bindings ("
+                "operation_id TEXT NOT NULL PRIMARY KEY, "
+                "request_fingerprint TEXT NOT NULL, "
+                "bound_at TEXT NOT NULL)"
+            )
+            await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_stop_receipts_target "
                 "ON stop_receipts(scope, requested_target, occurred_at, receipt_id)"
             )
@@ -326,6 +332,73 @@ class StopReceiptStore:
         expected = _fingerprint(request)
         self._assert_request_matches_receipt(request, receipt, expected)
         return receipt
+
+    async def bind_operation(self, request: StopRequest) -> None:
+        """Bind an operation identity to its request at first sight.
+
+        A door that commits other durable evidence of an operation before the
+        operation is claimed -- peer Stop's signal source event -- binds the
+        request first.  Every later sight of the same identity must then name
+        the same request: a different one raises :class:`StopReceiptConflict`
+        here and in :meth:`claim`, so an interrupted first attempt can only be
+        completed by its own intent, never taken over by a changed one.  Only
+        the request fingerprint is stored.
+        """
+
+        fingerprint = _fingerprint(request)
+        stored_operation_id = _identifier_digest(
+            "operation", request.correlation_id
+        )
+        try:
+            async with self._db.transaction(immediate=True):
+                await self._lock_operation(request.correlation_id)
+                for table in ("stop_receipts", "stop_operation_claims"):
+                    row = await self._db.fetchone(
+                        f"SELECT request_fingerprint FROM {table} "
+                        "WHERE operation_id = ?",
+                        (stored_operation_id,),
+                    )
+                    if row is not None and row[0] != fingerprint:
+                        raise StopReceiptConflict(
+                            "Stop operation identity was reused for a "
+                            "different request"
+                        )
+                if await self._binding_matches(stored_operation_id, fingerprint):
+                    return
+                now_sql = database_now_sql(self._db)
+                await self._db.execute(
+                    "INSERT INTO stop_operation_bindings ("
+                    "operation_id, request_fingerprint, bound_at"
+                    f") VALUES (?, ?, {now_sql})",
+                    (stored_operation_id, fingerprint),
+                )
+        except Exception as error:
+            domain = self._domain_error(error)
+            if domain is not None:
+                raise domain from error
+            raise
+
+    async def _binding_matches(
+        self, stored_operation_id: str, fingerprint: str
+    ) -> bool:
+        """``True`` if bound to this request, ``False`` if unbound.
+
+        A binding to a different request is a conflict, raised here so that
+        every writer under the operation identity honors the first sight.
+        """
+
+        row = await self._db.fetchone(
+            "SELECT request_fingerprint FROM stop_operation_bindings "
+            "WHERE operation_id = ?",
+            (stored_operation_id,),
+        )
+        if row is None:
+            return False
+        if row[0] != fingerprint:
+            raise StopReceiptConflict(
+                "Stop operation identity is bound to a different request"
+            )
+        return True
 
     async def has_acknowledged_turn_stop(
         self,
@@ -585,46 +658,56 @@ class StopReceiptStore:
             "operation", request.correlation_id
         )
         claim_id = str(uuid4())
-        async with self._db.transaction(immediate=True):
-            await self._lock_operation(request.correlation_id)
-            replay_row = await self._db.fetchone(
-                f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
-                "WHERE operation_id = ?",
-                (stored_operation_id,),
-            )
-            if replay_row is not None:
-                replay = await self._receipt_from_row(
-                    replay_row, request=request
+        try:
+            async with self._db.transaction(immediate=True):
+                await self._lock_operation(request.correlation_id)
+                replay_row = await self._db.fetchone(
+                    f"SELECT {_RECEIPT_COLUMNS} FROM stop_receipts "
+                    "WHERE operation_id = ?",
+                    (stored_operation_id,),
                 )
-                self._assert_request_matches_receipt(
-                    request, replay, fingerprint
-                )
-                return replay
-
-            claim_row = await self._db.fetchone(
-                "SELECT request_fingerprint, claim_id "
-                "FROM stop_operation_claims WHERE operation_id = ?",
-                (stored_operation_id,),
-            )
-            if claim_row is not None:
-                if claim_row[0] != fingerprint:
-                    raise StopReceiptConflict(
-                        "Stop operation identity was reused for a different request"
+                if replay_row is not None:
+                    replay = await self._receipt_from_row(
+                        replay_row, request=request
                     )
-                return None
+                    self._assert_request_matches_receipt(
+                        request, replay, fingerprint
+                    )
+                    return replay
 
-            now_sql = database_now_sql(self._db)
-            await self._db.execute(
-                "INSERT INTO stop_operation_claims ("
-                "operation_id, request_fingerprint, claim_id, claimed_at"
-                f") VALUES (?, ?, ?, {now_sql})",
-                (stored_operation_id, fingerprint, claim_id),
-            )
-            return StopOperationClaim(
-                operation_id=request.correlation_id,
-                request_fingerprint=fingerprint,
-                claim_id=claim_id,
-            )
+                await self._binding_matches(stored_operation_id, fingerprint)
+                claim_row = await self._db.fetchone(
+                    "SELECT request_fingerprint, claim_id "
+                    "FROM stop_operation_claims WHERE operation_id = ?",
+                    (stored_operation_id,),
+                )
+                if claim_row is not None:
+                    if claim_row[0] != fingerprint:
+                        raise StopReceiptConflict(
+                            "Stop operation identity was reused for a different request"
+                        )
+                    return None
+
+                now_sql = database_now_sql(self._db)
+                await self._db.execute(
+                    "INSERT INTO stop_operation_claims ("
+                    "operation_id, request_fingerprint, claim_id, claimed_at"
+                    f") VALUES (?, ?, ?, {now_sql})",
+                    (stored_operation_id, fingerprint, claim_id),
+                )
+                return StopOperationClaim(
+                    operation_id=request.correlation_id,
+                    request_fingerprint=fingerprint,
+                    claim_id=claim_id,
+                )
+        except Exception as error:
+            # The transaction wrapper re-raises as a backend error; a typed
+            # conflict must stay typed so callers do not read it as an
+            # unavailable store.
+            domain = self._domain_error(error)
+            if domain is not None:
+                raise domain from error
+            raise
 
     async def persist(
         self,
@@ -658,6 +741,7 @@ class StopReceiptStore:
                     )
                     return replay
 
+                await self._binding_matches(stored_operation_id, fingerprint)
                 claim_row = await self._db.fetchone(
                     "SELECT request_fingerprint, claim_id "
                     "FROM stop_operation_claims WHERE operation_id = ?",
@@ -1001,6 +1085,9 @@ class UnavailableStopReceiptStore:
         self._reason = reason
 
     async def load(self, _request: StopRequest) -> None:
+        raise StopReceiptError(self._reason)
+
+    async def bind_operation(self, _request: StopRequest) -> None:
         raise StopReceiptError(self._reason)
 
     async def persist(

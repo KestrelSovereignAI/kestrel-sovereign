@@ -1494,6 +1494,7 @@ def _hosted_peer_directory_context(
         if not callable(refresh):
             return None, None
         local_cancel = None
+        local_stop = None
         local_get = None
         local_subscribe = None
         if manager is not None:
@@ -1503,6 +1504,14 @@ def _hosted_peer_directory_context(
                     requester=requester,
                     peer=peer,
                     task_id=task_id,
+                    payload=payload,
+                )
+
+            async def local_stop(requester, peer, payload):
+                return await manager.stop_host_attested_local_peer(
+                    sender=agent,
+                    requester=requester,
+                    peer=peer,
                     payload=payload,
                 )
 
@@ -1526,6 +1535,7 @@ def _hosted_peer_directory_context(
             host_url=host_url,
             transport_key=ensure_a2a_transport_key(),
             local_cancel=local_cancel,
+            local_stop=local_stop,
             local_get=local_get,
             local_subscribe=local_subscribe,
         )
@@ -1798,11 +1808,7 @@ async def _onboard_host_registered_agent(
         router=peer_router,
         requester=peer_requester,
     )
-    distributed_stop = getattr(
-        app.state, "distributed_invocation_registry", None
-    )
-    if distributed_stop is not None:
-        distributed_stop.attach(agent)
+    _attach_stop_runtime(app, agent)
     _mount_feature_ui_assets(app, agents=(agent,))
     _mount_feature_routers(app, agents=(agent,))
     owned_route_ids.update(
@@ -2077,6 +2083,34 @@ async def _shutdown_single_agent(agent: KestrelAgent) -> None:
     cancelled = await await_agent_shutdown_completion(agent) or cancelled
     if cancelled:
         raise asyncio.CancelledError()
+
+
+def _attach_stop_runtime(app: FastAPI, agent) -> None:
+    """Bind the host's Stop services to one agent before it accepts work.
+
+    The distributed registry lets cooperative cancellation reach turns owned
+    by other replicas; the receipt store and cleanup registry let the agent's
+    ``a2a.peer_stop`` handler record every peer Stop durably (#3169).
+    """
+
+    from kestrel_sovereign.signals.sources.peer_stop import attach_stop_evidence
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    distributed_stop = getattr(app.state, "distributed_invocation_registry", None)
+    if distributed_stop is not None:
+        distributed_stop.attach(agent)
+    receipt_store = getattr(app.state, "stop_receipt_store", None)
+    if receipt_store is None:
+        return
+    cleanup_registry = getattr(app.state, "stop_cleanup_registry", None)
+    if cleanup_registry is None:
+        cleanup_registry = StopCleanupRegistry()
+        app.state.stop_cleanup_registry = cleanup_registry
+    attach_stop_evidence(
+        agent,
+        receipt_store=receipt_store,
+        cleanup_registry=cleanup_registry,
+    )
 
 
 async def _initialize_stop_receipts(app: FastAPI) -> None:
@@ -3385,7 +3419,7 @@ async def _lifespan_startup(app: FastAPI):
                 if callable(set_pre_initialize):
                     set_pre_initialize(
                         manager,
-                        lambda _name, agent: distributed_stop.attach(agent),
+                        lambda _name, agent: _attach_stop_runtime(app, agent),
                     )
             # Seed the database-global scheduler provenance and every local
             # DID's durable protocol row before concurrent agent
@@ -3540,11 +3574,7 @@ async def _lifespan_startup(app: FastAPI):
                 host_context_publication_gate
             )
             app.state.agent.defer_agent_readiness_to_host()
-            distributed_stop = getattr(
-                app.state, "distributed_invocation_registry", None
-            )
-            if distributed_stop is not None:
-                distributed_stop.attach(app.state.agent)
+            _attach_stop_runtime(app, app.state.agent)
 
             # Lifecycle hardening: provider availability (#377) is verified
             # inside KestrelAgent.initialize so every boot path — including

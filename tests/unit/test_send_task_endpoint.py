@@ -1564,3 +1564,308 @@ def test_transport_only_process_rejects_unsigned_without_feature_policy(
 
     assert resp.status_code == 403
     agent.task_manager.create_task.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Peer Stop wire door (#3169)
+# ---------------------------------------------------------------------------
+
+_PEER_STOP_CORRELATION = "peer-stop-signed-action"
+
+
+def _peer_stop_body(
+    sign=None,
+    *,
+    cascade=False,
+    audience="did:test:recipient",
+):
+    from kestrel_sovereign.signals.sources.peer_stop import encode_peer_stop_intent
+
+    session_id = "peer-stop-signed-session"
+    message = encode_peer_stop_intent(
+        scope="agent",
+        target=None,
+        reason="andon cord",
+        cascade=cascade,
+        correlation_id=_PEER_STOP_CORRELATION,
+    )
+    metadata = {
+        "sender": _SENDER_DID,
+        "a2a_verb": "peer_stop",
+        "a2a_audience": audience,
+    }
+    if sign is not None:
+        metadata["signature"] = sign(
+            [message],
+            task_id=_PEER_STOP_CORRELATION,
+            session_id=session_id,
+            metadata=metadata,
+        )
+    return {
+        "id": _PEER_STOP_CORRELATION,
+        "sessionId": session_id,
+        "message": {"role": "user", "parts": [{"type": "text", "text": message}]},
+        "metadata": metadata,
+    }
+
+
+class _PeerStopEvidence:
+    """In-memory Stop evidence: binds operations and receipts outcomes."""
+
+    def __init__(self) -> None:
+        self.bound: list = []
+        self.receipts: list = []
+
+    async def bind_operation(self, request) -> None:
+        self.bound.append(request)
+
+    async def load(self, _request):
+        return None
+
+    async def persist(self, request, outcomes, **_kwargs):
+        from dataclasses import replace
+
+        from kestrel_sovereign.stop.receipt import StopReceipt
+
+        receipt_id = f"receipt-{len(self.receipts) + 1}"
+        receipt = StopReceipt(
+            receipt_id=receipt_id,
+            operation_id=request.correlation_id,
+            request_fingerprint="0" * 64,
+            scope=request.scope.value,
+            actor_id=request.actor_id,
+            requested_target=request.target,
+            target_agent_id=request.target_agent_id,
+            reason=request.reason,
+            cascade=request.cascade,
+            occurred_at="2026-09-25T00:00:00Z",
+            turn_id=None,
+            span_id=None,
+            trace_id=None,
+            outcomes=tuple(replace(o, receipt_id=receipt_id) for o in outcomes),
+        )
+        self.receipts.append(receipt)
+        return receipt
+
+
+def _attach_peer_stop_evidence(agent) -> _PeerStopEvidence:
+    from kestrel_sovereign.signals.sources.peer_stop import attach_stop_evidence
+    from kestrel_sovereign.stop import StopCleanupRegistry
+
+    evidence = _PeerStopEvidence()
+    attach_stop_evidence(
+        agent, receipt_store=evidence, cleanup_registry=StopCleanupRegistry()
+    )
+    return evidence
+
+
+def _peer_stop_ok(agent_did, signal):
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+    from kestrel_sovereign.signals.sources.peer_stop import peer_stop_operation_id
+    from kestrel_sovereign.stop import StopDisposition, StopOutcome, StopScope
+
+    outcome = StopOutcome(
+        scope=StopScope.AGENT,
+        requested_target=agent_did,
+        resolved_target=agent_did,
+        agent_id=agent_did,
+        disposition=StopDisposition.STOPPED,
+        correlation_id=peer_stop_operation_id(
+            signal.caller, signal.payload["correlation_id"]
+        ),
+        receipt_id="receipt-1",
+    )
+    return SignalResult(
+        signal_id=signal.id,
+        status=Status.OK,
+        mode=SignalMode.ACTION,
+        duration_ms=1,
+        action_result=[outcome.to_dict()],
+    )
+
+
+def test_signed_peer_stop_dispatches_with_verified_envelope_principals(
+    app_with_send,
+):
+    from kestrel_sovereign.signals.sources.peer_stop import peer_stop_operation_id
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+
+    async def dispatch(signal, *, source_event_id=None):
+        assert signal.source == "a2a.peer_stop"
+        assert signal.caller == _SENDER_DID
+        assert signal.target_agent == agent.did
+        assert set(signal.payload) == {
+            "scope",
+            "target",
+            "reason",
+            "cascade",
+            "correlation_id",
+        }
+        assert source_event_id == peer_stop_operation_id(
+            _SENDER_DID, _PEER_STOP_CORRELATION
+        )
+        return _peer_stop_ok(agent.did, signal)
+
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock(side_effect=dispatch))
+    evidence = _attach_peer_stop_evidence(agent)
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=_peer_stop_body(sign))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["signal_receipt"]["status"] == "ok"
+    assert body["receipt_kind"] == "operation"
+    # The operation is bound under the verified sender before dispatch.
+    [bound] = evidence.bound
+    assert bound.actor_id == _SENDER_DID
+    assert body["correlation_id"] == _PEER_STOP_CORRELATION
+    assert body["stop_outcomes"][0]["disposition"] == "stopped"
+    agent.dispatcher.dispatch_signal.assert_awaited_once()
+    agent.task_manager.create_task.assert_not_awaited()
+
+
+def test_signed_peer_stop_cascade_reaches_the_dispatcher_for_a_receipted_refusal(
+    app_with_send,
+):
+    from kestrel_sdk.signals import SignalMode, SignalResult, Status
+
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+
+    async def dispatch(signal, *, source_event_id=None):
+        assert signal.payload["cascade"] is True
+        return SignalResult(
+            signal_id=signal.id,
+            status=Status.DROPPED_VALIDATION,
+            mode=SignalMode.ACTION,
+            duration_ms=1,
+            error="Schema rejected payload",
+        )
+
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock(side_effect=dispatch))
+    evidence = _attach_peer_stop_evidence(agent)
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post(
+            "/api/agent/peer/stop", json=_peer_stop_body(sign, cascade=True)
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    [outcome] = body["stop_outcomes"]
+    assert outcome["disposition"] == "refused"
+    assert "cascade" in outcome["detail"]
+    # A delivery refusal, receipted under the verified sender.
+    assert body["receipt_kind"] == "delivery"
+    [receipt] = evidence.receipts
+    assert receipt.actor_id == _SENDER_DID
+    assert receipt.operation_id == body["stop_correlation_id"]
+
+
+def test_signed_peer_stop_rejects_envelope_forwarded_to_another_recipient(
+    app_with_send,
+):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign, audience="did:test:intended-recipient")
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_peer_stop_audience_is_signed(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    # Signed for another recipient, then relabelled for this one.
+    body = _peer_stop_body(sign, audience="did:test:intended-recipient")
+    body["metadata"]["a2a_audience"] = agent.did
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_unsigned_peer_stop_is_not_legacy_task_compatibility(app_with_send):
+    agent = _stub_agent()
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=_peer_stop_body())
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_peer_stop_signature_binds_exact_intent(app_with_send):
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    body = _peer_stop_body(sign)
+    body["message"]["parts"][0]["text"] = body["message"]["parts"][0][
+        "text"
+    ].replace("andon cord", "tampered intent")
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 403
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_peer_stop_rejects_payload_actor(app_with_send):
+    import json as _json
+
+    agent = _stub_agent()
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    body = _peer_stop_body()
+    intent = _json.loads(body["message"]["parts"][0]["text"])
+    intent["actor_id"] = "did:test:forged"
+    body["message"]["parts"][0]["text"] = _json.dumps(
+        intent, sort_keys=True, separators=(",", ":")
+    )
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 400
+    agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+
+def test_peer_stop_rejects_host_attested_provenance_over_the_wire(app_with_send):
+    from kestrel_sovereign.a2a.local_submission import (
+        HOST_ATTESTED_LOCAL_SUBMISSION_METADATA,
+    )
+
+    agent = _stub_agent()
+    agent.dispatcher = SimpleNamespace(dispatch_signal=AsyncMock())
+    _attach(app_with_send, agent)
+    body = _peer_stop_body()
+    body["metadata"][HOST_ATTESTED_LOCAL_SUBMISSION_METADATA] = {"sender": "x"}
+
+    with TestClient(app_with_send) as client:
+        response = client.post("/api/agent/peer/stop", json=body)
+
+    assert response.status_code == 400
+    agent.dispatcher.dispatch_signal.assert_not_awaited()

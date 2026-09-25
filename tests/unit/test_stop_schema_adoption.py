@@ -284,6 +284,7 @@ async def test_adoption_has_sqlite_postgres_parity(db_backend):
         "stop_receipt_outcomes",
         "stop_receipts",
         "stop_operation_claims",
+        "stop_operation_bindings",
     ):
         await db.execute(f"DROP TABLE IF EXISTS {table}")
     await db.execute(LEGACY_ACTIVE_DDL)
