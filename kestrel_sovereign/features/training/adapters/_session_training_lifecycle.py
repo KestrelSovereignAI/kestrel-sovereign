@@ -23,6 +23,16 @@ Ownership contract
   compensated with provider job cancellation (where the provider has one)
   before the session itself is terminated. A job accepted remotely whose ID
   never reached us is still stopped by terminating the session it runs on.
+* ``stop_submission`` (provider-side cancel that keeps the session) reports a
+  stop only once the submission task is terminal and any published provider
+  job was cancelled. Until then the job stays ``STOPPING`` and the stop
+  raises. A task that outlives the drain bound and then gets a job accepted
+  cancels the provider job itself, because the caller already asked for it
+  to stop. A provider job whose cancellation failed keeps the job
+  ``STOPPING``, so its status is polled from the provider rather than read as
+  stopped, and a retried stop or any release cancels it again.
+* Provider job cancellation runs as one shared task per job, so a stop, a
+  late acceptance, and a release never cancel the same provider job twice.
 * A job leaves the registry only after its session release succeeded and its
   submission task terminated. Anything else leaves it in
   ``RELEASE_FAILED``: custody stays visible and the release can be retried.
@@ -83,6 +93,7 @@ class SessionJobPhase(enum.Enum):
     """Where one session-backed training job is in its local lifecycle."""
 
     SUBMITTING = "submitting"  # background readiness/upload/submission running
+    STOPPING = "stopping"  # stop requested; task or provider job not yet stopped
     TRAINING = "training"  # provider job ID published
     FAILED = "failed"  # submission failed or job cancelled; session still held
     RELEASING = "releasing"  # the one release task is tearing the job down
@@ -92,10 +103,18 @@ class SessionJobPhase(enum.Enum):
 
 _LEGAL_TRANSITIONS: dict[SessionJobPhase, frozenset[SessionJobPhase]] = {
     SessionJobPhase.SUBMITTING: frozenset(
-        {SessionJobPhase.TRAINING, SessionJobPhase.FAILED, SessionJobPhase.RELEASING}
+        {
+            SessionJobPhase.TRAINING,
+            SessionJobPhase.STOPPING,
+            SessionJobPhase.FAILED,
+            SessionJobPhase.RELEASING,
+        }
+    ),
+    SessionJobPhase.STOPPING: frozenset(
+        {SessionJobPhase.FAILED, SessionJobPhase.RELEASING}
     ),
     SessionJobPhase.TRAINING: frozenset(
-        {SessionJobPhase.FAILED, SessionJobPhase.RELEASING}
+        {SessionJobPhase.STOPPING, SessionJobPhase.FAILED, SessionJobPhase.RELEASING}
     ),
     SessionJobPhase.FAILED: frozenset({SessionJobPhase.RELEASING}),
     SessionJobPhase.RELEASING: frozenset(
@@ -116,6 +135,10 @@ class ReleaseIntent(enum.Enum):
 
 class IllegalSessionJobTransition(RuntimeError):
     """A lifecycle transition outside the legal-transition table."""
+
+
+class SubmissionStopIncomplete(TrainingProviderError):
+    """A submission stop could not be completed; the job was not stopped."""
 
 
 class SessionReleaseError(TrainingProviderError):
@@ -149,11 +172,15 @@ class SessionTrainingRecord(Generic[SessionT]):
     phase: SessionJobPhase = SessionJobPhase.SUBMITTING
     provider_job_id: str | None = None
     error: str | None = None
+    stop_reason: str | None = None
     compensation_error: str | None = None
+    provider_cancel_result: object | None = None
     release_intent: ReleaseIntent | None = None
     provider_job_cancelled: bool = False
     session_released: bool = False
+    drain_timed_out: bool = False
     submission_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    compensation_task: asyncio.Task[None] | None = field(default=None, repr=False)
     release_task: asyncio.Task[bool] | None = field(default=None, repr=False)
 
     def transition(self, target: SessionJobPhase, *, error: str | None = None) -> None:
@@ -270,12 +297,25 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         phase = record.phase
         if phase is SessionJobPhase.TRAINING:
             return None
+        if phase is SessionJobPhase.STOPPING and record.provider_job_id is not None:
+            # A provider job whose cancellation has not succeeded: ask the
+            # provider rather than report a stop that did not happen.
+            return None
         if phase is SessionJobPhase.SUBMITTING:
             return TrainingStatus(
                 job_id=record.job_id,
                 state=TrainingState.PREPARING,
                 progress=0.0,
                 message=preparing_message,
+            )
+        if phase is SessionJobPhase.STOPPING:
+            # Not cancelled yet: the submission may still get a job accepted.
+            return TrainingStatus(
+                job_id=record.job_id,
+                state=TrainingState.PREPARING,
+                progress=0.0,
+                message="Stop requested; waiting for the background submission "
+                "to stop",
             )
         if phase is SessionJobPhase.FAILED:
             return TrainingStatus(
@@ -500,6 +540,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             provider_job_id = await self._hooks.submit_job(record, avatar_data)
         except asyncio.CancelledError:
             logger.info("[%s] %s submission cancelled", record.job_id, name)
+            self._settle_stopping(record)
             raise
         except Exception as error:
             logger.error(
@@ -511,21 +552,52 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             )
             if record.phase is SessionJobPhase.SUBMITTING:
                 record.transition(SessionJobPhase.FAILED, error=str(error))
+            self._settle_stopping(record)
             return
         # No await between the provider's return and publication: whatever
         # interrupts this task next, the ID is already on the record.
-        self._publish_provider_job(record, provider_job_id)
+        if self._publish_provider_job(record, provider_job_id):
+            # Accepted after a stop was requested and no release owns the job:
+            # nobody else will cancel it, and the caller asked for it to stop.
+            # The stop is not settled until that cancellation has finished.
+            try:
+                await self._await_compensation(record)
+            finally:
+                self._settle_stopping(record)
+
+    @staticmethod
+    def _settle_stopping(record: SessionTrainingRecord[SessionT]) -> None:
+        """A requested stop is complete once the submission task ends."""
+
+        if record.phase is not SessionJobPhase.STOPPING:
+            return
+        if (
+            record.provider_job_id is not None
+            and not record.provider_job_cancelled
+            and not record.session_released
+        ):
+            return  # the provider job still runs: the stop is not complete
+        record.transition(SessionJobPhase.FAILED, error=record.stop_reason)
 
     def _publish_provider_job(
         self, record: SessionTrainingRecord[SessionT], provider_job_id: str
-    ) -> None:
+    ) -> bool:
+        """Put the provider's job ID on the record.
+
+        Returns ``True`` for a late acceptance that the submission task itself
+        must compensate: a stop was requested and no release owns the job. A
+        release (``RELEASING``/``RELEASE_FAILED``) cancels a published ID
+        itself after draining this task, or terminates the session it runs on.
+        """
+
         if not provider_job_id:
             if record.phase is SessionJobPhase.SUBMITTING:
                 record.transition(
                     SessionJobPhase.FAILED,
                     error="Provider accepted the submission without a job ID",
                 )
-            return
+            self._settle_stopping(record)
+            return False
         record.provider_job_id = provider_job_id
         if record.phase is SessionJobPhase.SUBMITTING:
             record.started_at = datetime.now(timezone.utc)
@@ -536,15 +608,19 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 self._hooks.display_name,
                 provider_job_id,
             )
-            return
+            return False
+        phase = record.phase
+        # FAILED is only set once this task has ended, so only STOPPING applies.
+        self_compensate = phase is SessionJobPhase.STOPPING
         logger.warning(
             "[%s] %s accepted job %s after the job left SUBMITTING (%s); the "
             "ID is retained for compensating cancellation",
             record.job_id,
             self._hooks.display_name,
             provider_job_id,
-            record.phase.value,
+            phase.value,
         )
+        return self_compensate
 
     async def _drain_submission(self, record: SessionTrainingRecord[SessionT]) -> bool:
         """Cancel the submission task and wait for it; ``True`` once terminal."""
@@ -552,12 +628,17 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         task = record.submission_task
         if task is None or task.done():
             return True
-        if not task.cancelling():
+        # Re-request cancellation once a drain has timed out: a task that
+        # swallowed the earlier request would otherwise never be asked again.
+        # Otherwise one pending request is enough; extra ones only interrupt
+        # the task's own cancellation cleanup.
+        if not task.cancelling() or record.drain_timed_out:
             task.cancel()
         done, _pending = await asyncio.wait(
             {task}, timeout=self._timeouts.submission_drain
         )
         if not done:
+            record.drain_timed_out = True
             logger.error(
                 "[%s] %s submission task did not stop within %.1fs",
                 record.job_id,
@@ -570,12 +651,25 @@ class SessionTrainingLifecycle(Generic[SessionT]):
     async def stop_submission(
         self, job_id: str, *, reason: str
     ) -> SessionTrainingRecord[SessionT]:
-        """Stop local submission but keep the session (provider-side cancel).
+        """Stop local submission and the provider job, but keep the session.
 
-        The job becomes ``FAILED`` with ``reason``; a provider ID that was
-        published before or during the stop is retained on the record.
+        Returns once the submission task is terminal: the job is then
+        ``FAILED`` with ``reason``, and a provider job ID published before or
+        during the stop has been cancelled on the provider (its response is
+        ``provider_cancel_result``).
+
+        Raises :class:`SubmissionStopIncomplete` if the submission task did not
+        stop within the drain bound — the job stays ``STOPPING`` and, should
+        that task still get a job accepted, it cancels the provider job — or
+        if the provider job could not be cancelled. Either way the job was not
+        stopped, and the stop may be retried.
         """
 
+        if self._hooks.cancel_provider_job is None:
+            raise TypeError(
+                f"{self._hooks.display_name} has no provider job cancellation; "
+                "stop_submission is unavailable"
+            )
         record = self._records.get(job_id)
         if record is None:
             raise TrainingStatusError(
@@ -593,9 +687,35 @@ class SessionTrainingLifecycle(Generic[SessionT]):
     async def _stop_submission(
         self, record: SessionTrainingRecord[SessionT], reason: str
     ) -> SessionTrainingRecord[SessionT]:
-        await self._drain_submission(record)
+        name = self._hooks.display_name
         if record.phase in (SessionJobPhase.SUBMITTING, SessionJobPhase.TRAINING):
-            record.transition(SessionJobPhase.FAILED, error=reason)
+            # Not failed until the task has ended and the provider job stopped.
+            record.stop_reason = reason
+            record.transition(SessionJobPhase.STOPPING)
+        if not await self._drain_submission(record):
+            raise SubmissionStopIncomplete(
+                f"{name} submission for job {record.job_id} did not stop within "
+                f"{self._timeouts.submission_drain:.1f}s; the job was not "
+                "stopped. A provider job it still gets accepted is cancelled when "
+                "it lands; retry the stop, or release the session with cleanup()",
+                provider=self._hooks.provider_name,
+            )
+        await self._await_compensation(record)
+        self._settle_stopping(record)
+        if (
+            record.provider_job_id is not None
+            and not record.provider_job_cancelled
+            and not record.session_released
+        ):
+            # Whatever the phase (a release may be in flight or have failed),
+            # the provider job still runs on a held session: not stopped.
+            raise SubmissionStopIncomplete(
+                f"{name} could not cancel provider job {record.provider_job_id} "
+                f"of job {record.job_id}: {record.compensation_error}; the job "
+                "was not stopped. Retry the stop, or release the session with "
+                "cleanup()",
+                provider=self._hooks.provider_name,
+            )
         return record
 
     # ------------------------------------------------------------------
@@ -658,7 +778,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         name = self._hooks.display_name
         try:
             drained = await self._drain_submission(record)
-            await self._compensate_provider_job(record)
+            await self._await_compensation(record)
             if not record.session_released:
                 try:
                     await self._bounded(self._hooks.release_session(record.session))
@@ -706,28 +826,66 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 )
             raise
 
-    async def _compensate_provider_job(
+    async def _await_compensation(
         self, record: SessionTrainingRecord[SessionT]
     ) -> None:
-        """Best-effort provider job cancellation; secondary to session release."""
+        """Cancel the published provider job through the job's one shared task.
 
-        cancel = self._hooks.cancel_provider_job
-        provider_job_id = record.provider_job_id
-        if cancel is None or provider_job_id is None or record.provider_job_cancelled:
-            return
+        The outcome lands on the record (``provider_job_cancelled`` or
+        ``compensation_error``) rather than being raised: for a release it is
+        secondary to session termination, and a stop inspects it itself. The
+        task is shielded, so an interrupted waiter never abandons it.
+        """
+
+        task = self._ensure_compensation(record)
+        if task is not None:
+            await asyncio.shield(task)
+
+    def _ensure_compensation(
+        self, record: SessionTrainingRecord[SessionT]
+    ) -> asyncio.Task[None] | None:
+        """Join the job's in-flight provider cancellation, or start one if due."""
+
+        task = record.compensation_task
+        if task is not None and not task.done():
+            return task
+        if (
+            self._hooks.cancel_provider_job is None
+            or record.provider_job_id is None
+            or record.provider_job_cancelled
+            or record.session_released  # terminating it already stopped the job
+        ):
+            return None
+        task = asyncio.create_task(
+            self._run_compensation(
+                record, self._hooks.cancel_provider_job, record.provider_job_id
+            ),
+            name=f"{self._hooks.provider_name}-training-job-cancel:{record.job_id}",
+        )
+        task.add_done_callback(_observe_outcome)
+        record.compensation_task = task
+        return task
+
+    async def _run_compensation(
+        self,
+        record: SessionTrainingRecord[SessionT],
+        cancel: Callable[[SessionTrainingRecord[SessionT], str], Awaitable[object]],
+        provider_job_id: str,
+    ) -> None:
         try:
-            await self._bounded(cancel(record, provider_job_id))
+            result = await self._bounded(cancel(record, provider_job_id))
         except Exception as error:
             record.compensation_error = str(error)
             logger.warning(
-                "[%s] %s could not cancel provider job %s; terminating its "
-                "session instead: %s",
+                "[%s] %s could not cancel provider job %s: %s",
                 record.job_id,
                 self._hooks.display_name,
                 provider_job_id,
                 error,
             )
             return
+        record.provider_cancel_result = result
+        record.compensation_error = None
         record.provider_job_cancelled = True
 
     async def _bounded(self, operation: Awaitable[Any]) -> Any:

@@ -38,6 +38,7 @@ from kestrel_sovereign.features.training.adapters.vastai_adapter import (
 )
 from kestrel_sovereign.features.training.factory import TrainingProviderFactory
 from kestrel_sovereign.features.training.protocol import (
+    TrainingProviderError,
     TrainingStatusError,
     TrainingSubmissionError,
 )
@@ -46,6 +47,7 @@ from kestrel_sovereign.features.training.types import TrainingConfig, TrainingSt
 
 _FAST = SessionLifecycleTimeouts(submission_drain=0.5, release=0.5, close=2.0)
 _ids = itertools.count(1)
+_remotes: list[FakeRemote] = []
 
 
 @dataclass
@@ -66,6 +68,10 @@ class FakeRemote:
     return_despite_cancel: bool = False
     # The submission ignores cancellation until this gate opens.
     ignore_cancel_until: asyncio.Event | None = None
+    # Once that gate opens, the stuck submission completes and returns an ID.
+    accept_after_ignored_cancel: bool = False
+    # The submission swallows the first cancellation, then honours the next.
+    swallow_first_cancel: bool = False
     acquire_gate: asyncio.Event | None = None
     acquire_started: asyncio.Event = field(default_factory=asyncio.Event)
     acquired: asyncio.Event = field(default_factory=asyncio.Event)
@@ -82,6 +88,9 @@ class FakeRemote:
     upload_started: asyncio.Event = field(default_factory=asyncio.Event)
     backend_base_url: str | None = "https://backend.example"
     loop: asyncio.AbstractEventLoop = field(default_factory=asyncio.get_running_loop)
+
+    def __post_init__(self) -> None:
+        _remotes.append(self)
 
     # -- remote side -----------------------------------------------------
 
@@ -149,13 +158,16 @@ class FakeRemote:
         try:
             await self.submit_gate.wait()  # readiness / upload
         except asyncio.CancelledError:
+            if self.swallow_first_cancel:
+                await asyncio.Event().wait()  # only a second cancel ends this
             while self.ignore_cancel_until is not None:
                 try:
                     await self.ignore_cancel_until.wait()
                     break
                 except asyncio.CancelledError:
                     continue  # a stuck task ignores every cancellation
-            raise
+            if not self.accept_after_ignored_cancel:
+                raise
         if self.submit_error is not None:
             raise self.submit_error
         job_id = self.accept_job(session)
@@ -343,6 +355,22 @@ _PROVIDERS = {
 @pytest.fixture(params=sorted(_PROVIDERS))
 def provider(request):
     return request.param
+
+
+@pytest.fixture(autouse=True)
+async def _unstick_remotes():
+    """Free any submission that ignores cancellation once a test ends.
+
+    A failing assertion would otherwise leave that task alive, and the event
+    loop's teardown would wait on it forever instead of reporting the failure.
+    """
+
+    yield
+    while _remotes:
+        remote = _remotes.pop()
+        if remote.ignore_cancel_until is not None:
+            remote.ignore_cancel_until.set()
+    await _settle()
 
 
 @pytest.fixture
@@ -900,4 +928,172 @@ async def test_runpod_cancel_training_keeps_pod_and_stops_submission(loop_errors
     assert status.state is TrainingState.FAILED
 
     await adapter.cleanup(job.job_id)
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_cancel_training_waits_for_a_stuck_submission(loop_errors):
+    """A submission that outlives the drain bound must not read as stopped.
+
+    The task ignores cancellation past ``submission_drain`` and then gets a
+    job accepted. ``cancel_training()`` may not report success while that
+    task is live, and the late-published ID must be cancelled on the
+    provider, because the caller already asked for the job to stop.
+    """
+
+    remote = FakeRemote(
+        ignore_cancel_until=asyncio.Event(), accept_after_ignored_cancel=True
+    )
+    timeouts = SessionLifecycleTimeouts(submission_drain=0.05, release=0.5, close=2.0)
+    adapter, _ = _build("runpod", remote, timeouts)
+    job = await _start(adapter)
+    await remote.submit_started.wait()
+
+    with pytest.raises(TrainingProviderError, match="did not stop"):
+        await adapter.cancel_training(job.job_id)
+    record = adapter._active_jobs[job.job_id]
+    assert not record.submission_task.done()
+    assert record.phase is SessionJobPhase.STOPPING
+    status = await adapter.get_status(job.job_id)
+    assert status.state not in (TrainingState.CANCELLED, TrainingState.FAILED)
+
+    remote.ignore_cancel_until.set()  # the stuck task now lands a remote job
+    await remote.accepted.wait()
+    # Not settled until the provider cancel issued for the late ID finishes.
+    assert record.phase is SessionJobPhase.STOPPING
+    await record.submission_task
+    (provider_job_id,) = remote.jobs
+    assert record.provider_job_id == provider_job_id
+    assert remote.cancel_job_calls == [provider_job_id]
+    assert remote.jobs[provider_job_id]["state"] == "cancelled"
+    assert record.phase is SessionJobPhase.FAILED
+    assert record.session.state == "running"  # cancel_training keeps the pod
+
+    # A retried stop is now complete and does not cancel the job twice.
+    result = await adapter.cancel_training(job.job_id)
+    assert result == {"status": "cancelled"}
+    assert remote.cancel_job_calls == [provider_job_id]
+
+    await adapter.cleanup(job.job_id)
+    assert remote.cancel_job_calls == [provider_job_id]
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_late_acceptance_whose_cancel_fails_is_reported(loop_errors):
+    remote = FakeRemote(
+        ignore_cancel_until=asyncio.Event(),
+        accept_after_ignored_cancel=True,
+        cancel_job_error=RuntimeError("/cancel returned 500"),
+    )
+    timeouts = SessionLifecycleTimeouts(submission_drain=0.05, release=0.5, close=2.0)
+    adapter, _ = _build("runpod", remote, timeouts)
+    job = await _start(adapter)
+    await remote.submit_started.wait()
+    with pytest.raises(TrainingProviderError, match="did not stop"):
+        await adapter.cancel_training(job.job_id)
+    record = adapter._active_jobs[job.job_id]
+
+    remote.ignore_cancel_until.set()
+    await record.submission_task
+    (provider_job_id,) = remote.jobs
+    assert record.compensation_error == "/cancel returned 500"
+    # Not reported as stopped: the job's status comes from the provider.
+    assert record.phase is SessionJobPhase.STOPPING
+    assert (await adapter.get_status(job.job_id)).state is TrainingState.TRAINING
+
+    # The pod-releasing cleanup retries the cancel, then stops the pod.
+    remote.cancel_job_error = None
+    await adapter.cleanup(job.job_id)
+    assert remote.cancel_job_calls == [provider_job_id, provider_job_id]
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_cancel_training_reports_a_failed_provider_cancel(loop_errors):
+    remote = FakeRemote(cancel_job_error=RuntimeError("/cancel returned 500"))
+    adapter, _ = _build("runpod", remote)
+    job = await _start(adapter)
+    remote.submit_gate.set()
+    await _settle()
+    record = adapter._active_jobs[job.job_id]
+    provider_job_id = record.provider_job_id
+
+    with pytest.raises(TrainingProviderError, match="/cancel returned 500"):
+        await adapter.cancel_training(job.job_id)
+    assert remote.jobs[provider_job_id]["state"] == "running"
+    assert record.phase is SessionJobPhase.STOPPING
+    assert (await adapter.get_status(job.job_id)).state is TrainingState.TRAINING
+
+    remote.cancel_job_error = None
+    assert await adapter.cancel_training(job.job_id) == {"status": "cancelled"}
+    assert remote.cancel_job_calls == [provider_job_id, provider_job_id]
+
+    await adapter.cleanup(job.job_id)
+    assert remote.cancel_job_calls == [provider_job_id, provider_job_id]
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_retried_stop_recancels_a_submission_that_swallowed_one(loop_errors):
+    remote = FakeRemote(swallow_first_cancel=True)
+    timeouts = SessionLifecycleTimeouts(submission_drain=0.05, release=0.5, close=2.0)
+    adapter, _ = _build("runpod", remote, timeouts)
+    job = await _start(adapter)
+    await remote.submit_started.wait()
+
+    with pytest.raises(TrainingProviderError, match="did not stop"):
+        await adapter.cancel_training(job.job_id)
+    record = adapter._active_jobs[job.job_id]
+    assert record.phase is SessionJobPhase.STOPPING
+
+    result = await adapter.cancel_training(job.job_id)
+
+    assert result["message"] == "Job cancelled before submission"
+    assert record.submission_task.cancelled()
+    assert record.phase is SessionJobPhase.FAILED
+    assert remote.jobs == {}
+    await adapter.cleanup(job.job_id)
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_release_after_a_released_pod_sends_no_job_cancel(loop_errors):
+    """A pod already stopped cannot run the job; do not call its /cancel."""
+
+    remote = FakeRemote(
+        ignore_cancel_until=asyncio.Event(), accept_after_ignored_cancel=True
+    )
+    timeouts = SessionLifecycleTimeouts(submission_drain=0.05, release=0.5, close=2.0)
+    adapter, _ = _build("runpod", remote, timeouts)
+    job = await _start(adapter)
+    await remote.submit_started.wait()
+    assert await adapter.cancel(job.job_id) is False  # pod stopped, task stuck
+    record = adapter._active_jobs[job.job_id]
+    assert record.session_released
+
+    remote.ignore_cancel_until.set()  # the stuck task now publishes an ID
+    await asyncio.wait({record.submission_task})
+    assert record.provider_job_id is not None
+
+    assert await adapter.cancel(job.job_id) is True
+    assert remote.cancel_job_calls == []
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_runpod_stop_on_a_failed_release_reports_a_failed_job_cancel(loop_errors):
+    remote = FakeRemote(
+        release_error=RuntimeError("stop_pod returned 500"),
+        cancel_job_error=RuntimeError("/cancel returned 500"),
+    )
+    adapter, _ = _build("runpod", remote)
+    job = await _start(adapter)
+    remote.submit_gate.set()
+    await _settle()
+    record = adapter._active_jobs[job.job_id]
+    await adapter.cleanup(job.job_id)
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert not record.session_released
+
+    with pytest.raises(TrainingProviderError, match="/cancel returned 500"):
+        await adapter.cancel_training(job.job_id)
+
+    remote.release_error = None
+    remote.cancel_job_error = None
+    assert await adapter.cancel(job.job_id) is True
     await _assert_no_orphans(adapter, remote, loop_errors)

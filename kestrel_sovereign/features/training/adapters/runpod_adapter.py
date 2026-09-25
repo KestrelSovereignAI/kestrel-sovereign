@@ -613,25 +613,34 @@ class RunPodTrainingAdapter:
         """
         Cancel a training job on the pod while keeping the pod.
 
-        Stops the background submission first, so a submission cannot land
-        after this returns. The job becomes FAILED; call cleanup() to release
-        the pod. The pod's /cancel may not stop the actual training process;
-        for stuck jobs, use clear_training_lock().
+        Stops the background submission first and returns only once it has
+        stopped, cancelling on the pod any RunPod job it got accepted. The job
+        becomes FAILED; call cleanup() to release the pod. The pod's /cancel
+        may not stop the actual training process; for stuck jobs, use
+        clear_training_lock().
+
+        A job the pod accepted whose response was lost to the cancellation
+        (the POST /train was in flight) has no ID to cancel here; it keeps
+        running on the retained pod until cleanup() stops the pod.
 
         Args:
             job_id: Job ID to cancel
 
         Returns:
             Cancellation result
+
+        Raises:
+            SubmissionStopIncomplete: The submission did not stop in time (a
+                job it still gets accepted is cancelled when it lands) or the
+                RunPod job could not be cancelled. The job was not stopped;
+                retry, or call cleanup() to stop the pod.
         """
         record = await self._lifecycle.stop_submission(job_id, reason="Cancelled")
         if record.session_released:
             return {"status": "cancelled", "message": "Job pod already released"}
         if record.provider_job_id is None:
             return {"status": "cancelled", "message": "Job cancelled before submission"}
-
-        manager = self._get_manager()
-        return await manager.cancel_training_job(record.session, record.provider_job_id)
+        return record.provider_cancel_result
 
     async def clear_training_lock(self, session=None) -> dict:
         """
