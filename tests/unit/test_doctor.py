@@ -13,6 +13,7 @@ from kestrel_sovereign.doctor import (
     format_report,
 )
 from kestrel_sovereign.hold import HoldAuthority
+from kestrel_sovereign.hold.state import _HistoryAnchorFormat
 from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     HostConfig,
@@ -3101,7 +3102,8 @@ def test_postgres_doctor_rejects_primary_receipt_history_rollback(
         "receipt-two",
     )
     newer_anchor = HoldStore._history_anchor_payload_from_rows(
-        (first_receipt, second_receipt)
+        (first_receipt, second_receipt),
+        anchor_format=_HistoryAnchorFormat.V1,
     ).decode("ascii")
 
     def _rolled_back_primary(dsn, sql, params=(), **kwargs):
@@ -3189,7 +3191,9 @@ def test_postgres_doctor_rejects_protocol_changed_during_snapshot(
             migration_rows=(("hold_state_witness_ledgers_v1",),),
         ),
     )
-    empty_anchor = HoldStore._history_anchor_payload_from_rows(()).decode("ascii")
+    empty_anchor = HoldStore._history_anchor_payload_from_rows(
+        (), anchor_format=_HistoryAnchorFormat.V1
+    ).decode("ascii")
     protocol_reads = iter(
         (
             [],
@@ -3257,7 +3261,9 @@ def test_postgres_doctor_rejects_missing_hold_content_witness(
         "",
         "receipt-one",
     )
-    anchor = HoldStore._history_anchor_payload_from_rows((receipt,)).decode("ascii")
+    anchor = HoldStore._history_anchor_payload_from_rows(
+        (receipt,), anchor_format=_HistoryAnchorFormat.V1
+    ).decode("ascii")
     monkeypatch.setattr(
         doctor,
         "_read_postgres_cluster_identity",
@@ -3293,7 +3299,7 @@ def test_postgres_doctor_rejects_missing_hold_content_witness(
             return [(table,) for table in sorted(_HOLD_SCHEMA_TABLES)]
         return {
             doctor._POSTGRES_HOLD_LATCHES_SQL: [latch],
-            doctor._POSTGRES_HOLD_RECEIPTS_SQL: [receipt],
+            _HistoryAnchorFormat.V1.receipt_history_sql: [receipt],
             doctor._POSTGRES_HOLD_RECEIPT_COUNTS_SQL: [
                 ("agent", "did:agent:kite", 1)
             ],
@@ -3959,7 +3965,9 @@ async def test_sqlite_doctor_accepts_recoverable_absent_database_bootstrap(
     lock = Path(f"{history}.lock")
     bootstrap.write_bytes(
         _BOOTSTRAP_INTENT_PAYLOAD
-        + HoldStore._history_anchor_payload_from_rows(())
+        + HoldStore._history_anchor_payload_from_rows(
+            (), anchor_format=_HistoryAnchorFormat.V1
+        )
     )
     if lock_present:
         lock.write_bytes(b"\0")

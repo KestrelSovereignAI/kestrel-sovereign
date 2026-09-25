@@ -31,6 +31,7 @@ from kestrel_sovereign.hold.state import (
     _POSTGRES_EVIDENCE_LOCK,
     _WITNESS_BACKFILL,
     HoldCorruptStateError,
+    _HistoryAnchorFormat,
     HoldDatabaseSnapshot,
     PostgresHoldCustodySnapshot,
     _latch_from_row,
@@ -89,6 +90,14 @@ async def _create_legacy_hold_tables(db) -> None:
         "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
         "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
         "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '')"
+    )
+
+
+async def _create_hold_schema_migrations(db) -> None:
+    """Add the migration ledger an anchored (un-migrated v1) schema carries."""
+
+    await db.execute(
+        "CREATE TABLE hold_schema_migrations (name TEXT NOT NULL PRIMARY KEY)"
     )
 
 
@@ -1735,6 +1744,7 @@ async def test_postgres_initialization_witness_uses_durable_runtime_metadata(
         restarted = HoldStore(primary, evidence_db=evidence_store)
         assert await restarted._read_initialization_witness() is True
         await _create_legacy_hold_tables(db)
+        await _create_hold_schema_migrations(db)
         await first._write_history_anchor()
         assert await restarted._read_history_anchor() == (
             await first._current_history_anchor_payload()
@@ -5104,6 +5114,7 @@ async def test_postgres_external_anchor_rejects_primary_snapshot_rollback(
     evidence_facade = _PostgresFacade(evidence)
     primary = await AsyncDatabase.sqlite(str(primary_path))
     await _create_legacy_hold_tables(primary)
+    await _create_hold_schema_migrations(primary)
     empty = HoldStore(_PostgresFacade(primary), evidence_db=evidence_facade)
     await empty._write_history_anchor()
     await empty._write_initialization_witness()
@@ -5326,7 +5337,9 @@ async def test_bootstrap_intent_cannot_reanchor_different_receipt_history(tmp_pa
     store._initialization_witness_path.unlink()
     store._history_anchor_path.unlink()
     store._write_bootstrap_intent(
-        store._history_anchor_payload_from_rows([])
+        store._history_anchor_payload_from_rows(
+            [], anchor_format=_HistoryAnchorFormat.V2
+        )
     )
 
     try:
@@ -5823,9 +5836,11 @@ def test_postgres_file_evidence_publishes_without_sqlite_custody_marker(tmp_path
         SimpleNamespace(backend_type="postgres"),
         tmp_path,
     )
-    stable = store._history_anchor_payload_from_rows([])
+    stable = store._history_anchor_payload_from_rows(
+        [], anchor_format=_HistoryAnchorFormat.V2
+    )
     next_payload = (
-        b"kestrel-hold-history-v1\n1\n"
+        b"kestrel-hold-history-v2\n1\n"
         + (b"1" * 64)
         + b"\n"
     )
@@ -5854,7 +5869,10 @@ async def test_postgres_file_evidence_recovers_without_sqlite_custody_marker(
         SimpleNamespace(backend_type="postgres"),
         tmp_path,
     )
-    payload = store._history_anchor_payload_from_rows([])
+    # No migration rows and no receipts: an empty, un-migrated history.
+    payload = store._history_anchor_payload_from_rows(
+        [], anchor_format=_HistoryAnchorFormat.V1
+    )
     store._write_file_evidence(
         store._history_anchor_path,
         payload,

@@ -36,6 +36,7 @@ from kestrel_sovereign.hold import (
 from kestrel_sovereign.hold import introspection as introspection_module
 from kestrel_sovereign.hold.state import _receipt_content_digest, _receipt_from_row
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.hold_history_v1 import rewind_to_v1_history_anchor
 
 SELF = "did:web:agents.example:kite"
 PEER = "did:web:agents.example:peer"
@@ -736,35 +737,10 @@ async def test_legacy_receipts_backfill_to_sovereign_with_witnesses_intact(tmp_p
         await _hold(
             store, scope=HoldScope.AGENT, target_id=SELF, reason="r", operation_id="a"
         )
-        # Rewind the table to its pre-authority shape, preserving every row,
-        # witness, anchor, and custody marker exactly as an older binary left
-        # them. (A table rebuild, because SQLite's DROP COLUMN crashes on this
-        # triggered table; the old table's indexes and feed trigger go with
-        # it and are re-established by the upgrade, as on any schema check.)
-        await db.execute(
-            "CREATE TABLE hold_receipts_v1 ("
-            "receipt_id TEXT NOT NULL PRIMARY KEY, "
-            "operation_id TEXT NOT NULL UNIQUE, action TEXT NOT NULL, "
-            "disposition TEXT NOT NULL, scope TEXT NOT NULL, "
-            "target_id TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', "
-            "actor_id TEXT NOT NULL, occurred_at TEXT NOT NULL, "
-            "expected_hold_receipt_id TEXT NOT NULL DEFAULT '', "
-            "prior_hold_receipt_id TEXT NOT NULL DEFAULT '', "
-            "resulting_hold_receipt_id TEXT NOT NULL DEFAULT '', "
-            "feed_seq BIGINT)"
-        )
-        columns = (
-            "receipt_id, operation_id, action, disposition, scope, target_id, "
-            "reason, actor_id, occurred_at, expected_hold_receipt_id, "
-            "prior_hold_receipt_id, resulting_hold_receipt_id, feed_seq"
-        )
-        await db.execute(
-            f"INSERT INTO hold_receipts_v1 ({columns}) "
-            f"SELECT {columns} FROM hold_receipts"
-        )
-        await db.execute("DROP TABLE hold_receipts")
-        await db.execute("ALTER TABLE hold_receipts_v1 RENAME TO hold_receipts")
-        assert not await db.column_exists("hold_receipts", "authority")
+        # Rewind to what an older binary left: no ``authority`` column, no
+        # v2 anchor-format marker, and a v1 history anchor and custody
+        # marker, with every row and witness preserved exactly.
+        await rewind_to_v1_history_anchor(db, store)
 
         upgraded = HoldStore(db)
         await upgraded.ensure_schema()
