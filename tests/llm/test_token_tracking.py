@@ -16,6 +16,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from tests.utils.anthropic_client import anthropic_client
 
 
 # =============================================================================
@@ -107,8 +108,7 @@ class TestAnthropicTokenExtraction:
         mock_response.usage = mock_usage
         mock_response.stop_reason = "end_turn"
 
-        mock_client = MagicMock()
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        mock_client = anthropic_client(mock_response)
 
         response = await adapter.get_response(
             client=mock_client,

@@ -6,7 +6,7 @@ Also verifies ``ClaudeMaxAdapter`` inherits the behavior unchanged.
 """
 
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -20,6 +20,7 @@ from kestrel_sovereign.llm.anthropic_adapter import (
     _tools_with_final_cache_marker,
 )
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
+from tests.utils.anthropic_client import anthropic_client
 
 
 # ---------------------------------------------------------------------------
@@ -405,11 +406,10 @@ def test_apply_cache_control_empty_system_string_no_array_upgrade():
 
 async def _call_anthropic_and_capture(messages: List[Dict[str, Any]]) -> Dict:
     """Run AnthropicAdapter.get_response with a mocked SDK client and
-    return the kwargs sent to messages.create.
+    return the kwargs sent to messages.stream.
     """
-    fake_client = MagicMock()
-    fake_client.messages.create = AsyncMock(
-        return_value=MagicMock(
+    fake_client = anthropic_client(
+        MagicMock(
             content=[MagicMock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MagicMock(input_tokens=10, output_tokens=1),
@@ -421,12 +421,12 @@ async def _call_anthropic_and_capture(messages: List[Dict[str, Any]]) -> Dict:
         model="claude-sonnet-4-5-20250929",
         messages=messages,
     )
-    return fake_client.messages.create.call_args.kwargs
+    return fake_client.messages.stream.call_args.kwargs
 
 
 @pytest.mark.asyncio
 async def test_get_response_sends_cacheable_system_block():
-    """End to end: the kwargs messages.create receives have the system
+    """End to end: the kwargs messages.stream receives have the system
     parameter in cache-block form with the cache_control marker.
     """
     messages = [
@@ -491,9 +491,8 @@ async def test_get_response_first_turn_only_marks_system():
 
 
 async def _call_claude_max_and_capture(messages):
-    fake_client = MagicMock()
-    fake_client.messages.create = AsyncMock(
-        return_value=MagicMock(
+    fake_client = anthropic_client(
+        MagicMock(
             content=[MagicMock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MagicMock(input_tokens=10, output_tokens=1),
@@ -505,7 +504,7 @@ async def _call_claude_max_and_capture(messages):
         model="claude-sonnet-4-5-20250929",
         messages=messages,
     )
-    return fake_client.messages.create.call_args.kwargs
+    return fake_client.messages.stream.call_args.kwargs
 
 
 @pytest.mark.asyncio

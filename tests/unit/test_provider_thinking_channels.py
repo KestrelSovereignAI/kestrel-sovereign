@@ -6,6 +6,7 @@ from kestrel_sovereign.llm.adapter import ThinkingDelta
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 import kestrel_sovereign.llm.ollama_adapter as ollama_module
+from tests.utils.anthropic_client import models_api
 
 
 class _AsyncStream:
@@ -41,7 +42,8 @@ async def test_anthropic_streaming_emits_thinking_delta():
         _anthropic_event("text_delta", text="4"),
     ])
     client = SimpleNamespace(
-        messages=SimpleNamespace(stream=lambda **kwargs: stream)
+        messages=SimpleNamespace(stream=lambda **kwargs: stream),
+        models=models_api(),
     )
 
     items = []
@@ -66,7 +68,8 @@ async def test_anthropic_streaming_splits_think_tags():
         _anthropic_event("text_delta", text="ANTHROPIC_OK"),
     ])
     client = SimpleNamespace(
-        messages=SimpleNamespace(stream=lambda **kwargs: stream)
+        messages=SimpleNamespace(stream=lambda **kwargs: stream),
+        models=models_api(),
     )
 
     items = []

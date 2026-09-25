@@ -7,7 +7,7 @@ the identity string). These tests pin that shaping and prove it applies ONLY
 to the OAuth route, never the metered API-key route.
 """
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -27,12 +27,12 @@ from kestrel_sovereign.llm.anthropic_oauth import (
     parse_credentials,
     refresh_anthropic_token,
 )
+from tests.utils.anthropic_client import anthropic_client
 
 
 async def _capture(adapter: AnthropicAdapter, messages: List[Dict[str, Any]], **kw) -> Dict:
-    fake_client = MagicMock()
-    fake_client.messages.create = AsyncMock(
-        return_value=MagicMock(
+    fake_client = anthropic_client(
+        MagicMock(
             content=[MagicMock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MagicMock(input_tokens=10, output_tokens=1),
@@ -41,7 +41,7 @@ async def _capture(adapter: AnthropicAdapter, messages: List[Dict[str, Any]], **
     await adapter.get_response(
         client=fake_client, model="claude-sonnet-4-5-20250929", messages=messages, **kw
     )
-    return fake_client.messages.create.call_args.kwargs
+    return fake_client.messages.stream.call_args.kwargs
 
 
 # ---------------------------------------------------------------------------

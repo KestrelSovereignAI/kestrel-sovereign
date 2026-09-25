@@ -24,6 +24,7 @@ import pytest
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+from tests.utils.anthropic_client import anthropic_client
 
 
 # ---------------------------------------------------------------------------
@@ -124,10 +125,9 @@ async def _run_openai_and_capture(messages: List[Dict[str, Any]]) -> Dict[str, A
 async def _run_anthropic_and_capture(
     messages: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Drive the Anthropic adapter; return kwargs sent to `messages.create`."""
-    fake_client = MagicMock()
-    fake_client.messages.create = AsyncMock(
-        return_value=MagicMock(
+    """Drive the Anthropic adapter; return kwargs sent to `messages.stream`."""
+    fake_client = anthropic_client(
+        MagicMock(
             content=[MagicMock(type="text", text="ok")],
             stop_reason="end_turn",
             usage=MagicMock(input_tokens=10, output_tokens=1),
@@ -140,7 +140,7 @@ async def _run_anthropic_and_capture(
         model="claude-sonnet-4-5-20250929",
         messages=messages,
     )
-    captured = fake_client.messages.create.call_args.kwargs
+    captured = fake_client.messages.stream.call_args.kwargs
     return captured
 
 

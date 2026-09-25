@@ -45,6 +45,7 @@ from .error_handling import (
 )
 from .openai_adapter import OpenAIAdapter
 from .adapter import LLMResponse, messages_for, response_usage_available
+from .output_ceiling import response_stop_reason
 from .model_discovery import ModelDiscoveryMixin
 from .mandate import ModelMandateMixin
 from .usage_tracking import UsageTrackingMixin
@@ -3626,6 +3627,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             record_metadata.setdefault("provider_reported_cost_usd", cost)
         if not usage_available:
             record_metadata.setdefault("usage_available", False)
+        # #3300: why the provider stopped. ``max_tokens`` marks a response cut
+        # at its output ceiling, which is otherwise indistinguishable from a
+        # finished one in telemetry — the durable ``llm_calls`` row and the
+        # ``llm.usage`` line both carry it so a monitor can find those calls.
+        stop_reason = response_stop_reason(response)
+        if stop_reason is not None:
+            record_metadata.setdefault("stop_reason", stop_reason)
 
         usage_tracker_ready = (
             hasattr(self, "_db_initialized")
@@ -4049,6 +4057,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "structured_output": structured_output,
                 "cost": cost,
                 "usage_available": usage_available,
+                "stop_reason": record_metadata.get("stop_reason"),
                 "session_id": context.session_id,
                 "correlation_id": context.correlation_id,
             }

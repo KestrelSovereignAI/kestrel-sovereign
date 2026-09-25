@@ -37,6 +37,13 @@ from kestrel_sdk.llm import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
+from .output_ceiling import (
+    OutputCeilingUnknownError,
+    attach_stop_reason,
+    join_output_ceiling_notice,
+    output_ceiling_notice,
+    output_ceiling_notice_chunk,
+)
 from contextlib import asynccontextmanager
 
 from .retry import with_retry
@@ -63,6 +70,7 @@ def anthropic_model_info(model_data: Any) -> ModelInfo:
         category=ModelCategory.CHAT,
         created_at=created_at,
         context_limit=get("max_input_tokens"),
+        output_limit=get("max_tokens"),
         supports_vision=True,
         supports_tools=True,
         supports_streaming=True,
@@ -91,6 +99,34 @@ async def _anthropic_stream_with_retry(client, api_params):
         yield stream
     finally:
         await stream_cm.__aexit__(None, None, None)
+
+
+async def _anthropic_final_message(client, api_params):
+    """One complete (non-incremental) Anthropic response, carried over a stream.
+
+    ``max_tokens`` is the model's own output ceiling (#3300) — 128,000 on
+    current Opus models — and the Anthropic SDK refuses a non-streaming
+    ``messages.create`` whose ``max_tokens`` implies a response that may run
+    past ten minutes ("Streaming is required for operations that may take
+    longer than 10 minutes"). Reading the response off a stream and awaiting
+    ``get_final_message()`` is the SDK's own answer: the same ``Message`` the
+    non-streaming call returns, over a connection that stays live while it is
+    generated.
+
+    The whole request is retried on transient errors, exactly as the
+    ``with_retry(client.messages.create, ...)`` it replaces was: nothing has
+    been shown to anyone until the final message exists, so a retry cannot
+    duplicate visible output.
+    """
+    async def _once():
+        async with client.messages.stream(**api_params) as stream:
+            return await stream.get_final_message()
+
+    return await with_retry(_once)
+
+
+#: Anthropic's ``stop_reason`` for a response cut at ``max_tokens``.
+_MAX_TOKENS_STOP_REASON = "max_tokens"
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +368,120 @@ class AnthropicAdapter(LLMAdapter):
     # message_delta — both before the terminal LLMResponse — so a mid-stream
     # abort can still flush partial usage via the service's usage_sink (#1684).
     supports_partial_usage_flush: bool = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Output ceilings the provider reported, keyed by wire model id
+        # (#3300). Filled by model discovery (``list_models``) and, for a
+        # model discovery has not described, by one Models API lookup on
+        # first use. Per adapter instance, so each route asks with its own
+        # credentials.
+        self._output_ceilings: Dict[str, int] = {}
+
+    # ---- Output ceiling (#3300) --------------------------------------------
+
+    @staticmethod
+    def _reported_output_limit(info: ModelInfo) -> Optional[int]:
+        """``info.output_limit`` when it is a real ceiling, else ``None``."""
+        limit = info.output_limit
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            return limit
+        return None
+
+    def _learn_output_ceilings(self, models: List[ModelInfo]) -> None:
+        """Remember the output ceiling each discovered model reports."""
+        for info in models:
+            limit = self._reported_output_limit(info)
+            if limit is not None:
+                self._output_ceilings[info.id] = limit
+
+    async def _model_output_ceiling(
+        self,
+        client: Any,
+        model: str,
+        cancel_token: Optional[CancelToken] = None,
+    ) -> int:
+        """The largest ``max_tokens`` Anthropic accepts for ``model``.
+
+        Anthropic's Messages API requires ``max_tokens``; the value the model
+        can actually use is what its Models API record reports as
+        ``max_tokens``. Ask for the model's full ceiling rather than a
+        framework number: a smaller literal silently cut every turn (#3300).
+        Raises :class:`OutputCeilingUnknownError` when the provider does not
+        report one — a guess is never sent.
+        """
+        wire_model = self._resolve_wire_model_id(model)
+        known = self._output_ceilings.get(wire_model)
+        if known is not None:
+            return known
+        record = await await_or_cancelled(
+            with_retry(client.models.retrieve, wire_model),
+            cancel_token,
+        )
+        limit = self._reported_output_limit(anthropic_model_info(record))
+        if limit is None:
+            raise OutputCeilingUnknownError(wire_model, provider="Anthropic")
+        # Keyed by the id that was asked for: an alias may come back as a
+        # dated snapshot id, and the next request will ask by the alias.
+        self._output_ceilings[wire_model] = limit
+        return limit
+
+    async def _apply_output_ceiling(
+        self,
+        client: Any,
+        model: str,
+        api_params: Dict[str, Any],
+        call_kwargs: Dict[str, Any],
+        cancel_token: Optional[CancelToken] = None,
+    ) -> Optional[int]:
+        """Set ``api_params["max_tokens"]``; return the model's ceiling if used.
+
+        A ``max_tokens`` the caller chose — the ``max_tokens`` kwarg, or a raw
+        request option already merged into ``api_params`` (which wins, as it
+        always has) — is sent as given, and ``None`` is returned: a cut at a
+        budget the caller picked is the caller's to read from ``stop_reason``.
+        Otherwise the model's own ceiling is sent and returned, so the caller
+        of this helper can tell a response that exhausted the model's whole
+        output from one that stopped at a smaller, deliberate budget.
+        """
+        if "max_tokens" in api_params:
+            return None
+        requested = call_kwargs.get("max_tokens")
+        if requested is not None:
+            api_params["max_tokens"] = requested
+            return None
+        ceiling = await self._model_output_ceiling(client, model, cancel_token)
+        api_params["max_tokens"] = ceiling
+        return ceiling
+
+    @staticmethod
+    def _output_ceiling_notice(
+        model: str,
+        stop_reason: Optional[str],
+        model_ceiling: Optional[int],
+    ) -> Optional[str]:
+        """The notice for a response cut at the model's own ceiling, else None.
+
+        Only a cut at the model's full ceiling earns the notice: that response
+        could not have been finished at all, and presenting it as an answer is
+        the #3300 defect. A caller-chosen budget is the caller's contract, and
+        its responses keep their text untouched (``stop_reason`` still says
+        where they stopped).
+        """
+        if stop_reason != _MAX_TOKENS_STOP_REASON:
+            return None
+        if model_ceiling is None:
+            logger.info(
+                "Anthropic response for %s stopped at the caller's max_tokens "
+                "budget (stop_reason=%s)", model, stop_reason,
+            )
+            return None
+        logger.warning(
+            "Anthropic response for %s reached the model's output ceiling of "
+            "%d tokens (stop_reason=%s); the response is incomplete",
+            model, model_ceiling, stop_reason,
+        )
+        return output_ceiling_notice(ceiling=model_ceiling, stop_reason=stop_reason)
 
     def provider_capabilities(self) -> ProviderCapabilities:
         # Data-plane features that hit api.anthropic.com directly — the
@@ -1033,7 +1183,6 @@ class AnthropicAdapter(LLMAdapter):
             api_params = {
                 "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
-                "max_tokens": kwargs.get("max_tokens", 4096),
             }
 
             if combined_system:
@@ -1078,17 +1227,41 @@ class AnthropicAdapter(LLMAdapter):
             # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
             api_params = self._apply_oauth_request_shaping(api_params)
             await self._ensure_fresh_oauth_token(client)
+            model_ceiling = await self._apply_output_ceiling(
+                client, model, api_params, kwargs, cancel_token,
+            )
 
             response = await await_or_cancelled(
-                with_retry(client.messages.create, **api_params),
+                _anthropic_final_message(client, api_params),
                 cancel_token,
             )
+
+            # #3300: the provider's own verdict on whether the response is
+            # finished. A ``max_tokens`` stop means generation was cut inside
+            # its LAST content block; when that block is a tool call, its
+            # arguments are incomplete and it must not be handed on as a call
+            # to execute.
+            stop_reason = getattr(response, 'stop_reason', None)
+            blocks = list(response.content)
+            cut_block = (
+                blocks[-1]
+                if stop_reason == _MAX_TOKENS_STOP_REASON and blocks
+                and blocks[-1].type == "tool_use"
+                else None
+            )
+            if cut_block is not None:
+                logger.warning(
+                    "Dropping tool call %s from an Anthropic response cut at "
+                    "max_tokens: its arguments are incomplete", cut_block.name,
+                )
 
             # Parse response
             content = None
             parsed_tool_calls = None
 
-            for block in response.content:
+            for block in blocks:
+                if block is cut_block:
+                    continue
                 if block.type == "text":
                     content = block.text
                 elif block.type == "tool_use":
@@ -1125,7 +1298,11 @@ class AnthropicAdapter(LLMAdapter):
                 if input_tokens is not None and output_tokens is not None:
                     total_tokens = input_tokens + output_tokens
 
-            return LLMResponse(
+            notice = self._output_ceiling_notice(model, stop_reason, model_ceiling)
+            if notice is not None:
+                content = join_output_ceiling_notice(content, notice)
+
+            return attach_stop_reason(LLMResponse(
                 content=content,
                 tool_calls=parsed_tool_calls,
                 raw=response,
@@ -1134,7 +1311,7 @@ class AnthropicAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), stop_reason)
 
         except Exception as e:
             logger.error(
@@ -1185,7 +1362,6 @@ class AnthropicAdapter(LLMAdapter):
             api_params = {
                 "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
-                "max_tokens": kwargs.get("max_tokens", 4096),
             }
 
             if combined_system:
@@ -1206,7 +1382,12 @@ class AnthropicAdapter(LLMAdapter):
             # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
             api_params = self._apply_oauth_request_shaping(api_params)
             await self._ensure_fresh_oauth_token(client)
+            model_ceiling = await self._apply_output_ceiling(
+                client, model, api_params, kwargs, cancel_token,
+            )
             splitter = ThinkingContentSplitter(provider="anthropic")
+            stop_reason = None
+            text_yielded = False
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
                 stream_iter = stream.__aiter__()
@@ -1218,6 +1399,13 @@ class AnthropicAdapter(LLMAdapter):
                     except StopAsyncIteration:
                         break
                     event_type = getattr(event, 'type', None)
+                    if event_type == 'message_delta':
+                        # #3300: the terminal stop_reason rides on the
+                        # message_delta's ``delta``.
+                        stop_reason = getattr(
+                            getattr(event, 'delta', None), 'stop_reason', None,
+                        ) or stop_reason
+                        continue
                     if event_type != 'content_block_delta' or not hasattr(event, 'delta'):
                         logger.debug("Ignoring unsupported Anthropic stream event: %s", event_type)
                         continue
@@ -1227,6 +1415,9 @@ class AnthropicAdapter(LLMAdapter):
                         text = getattr(delta, 'text', '')
                         if text:
                             for item in splitter.feed(text):
+                                text_yielded = text_yielded or (
+                                    isinstance(item, str) and bool(item)
+                                )
                                 yield item
                     elif delta_type == 'thinking_delta':
                         thinking = getattr(delta, 'thinking', None)
@@ -1237,7 +1428,14 @@ class AnthropicAdapter(LLMAdapter):
                     elif delta_type:
                         logger.debug("Ignoring unsupported Anthropic delta type: %s", delta_type)
                 for item in splitter.flush():
+                    text_yielded = text_yielded or (isinstance(item, str) and bool(item))
                     yield item
+
+            # #3300: the streamed text is already on screen, so a cut at the
+            # model's ceiling is marked by a final chunk rather than hidden.
+            notice = self._output_ceiling_notice(model, stop_reason, model_ceiling)
+            if notice is not None:
+                yield output_ceiling_notice_chunk(notice, follows_text=text_yielded)
 
         except Exception as e:
             logger.error(
@@ -1302,7 +1500,6 @@ class AnthropicAdapter(LLMAdapter):
             api_params = {
                 "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
-                "max_tokens": kwargs.get("max_tokens", 4096),
             }
 
             if combined_system:
@@ -1335,6 +1532,9 @@ class AnthropicAdapter(LLMAdapter):
             # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
             api_params = self._apply_oauth_request_shaping(api_params)
             await self._ensure_fresh_oauth_token(client)
+            model_ceiling = await self._apply_output_ceiling(
+                client, model, api_params, kwargs, cancel_token,
+            )
 
             logger.info(f"Starting Anthropic stream with tools for model: {model}")
 
@@ -1348,6 +1548,11 @@ class AnthropicAdapter(LLMAdapter):
             output_tokens = None
             cache_creation_input_tokens = None
             cache_read_input_tokens = None
+            # #3300: the terminal stop_reason, and the last content block the
+            # stream opened — a ``max_tokens`` stop cuts that block short.
+            stop_reason = None
+            last_block_index: Optional[int] = None
+            last_block_type: Optional[str] = None
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with _anthropic_stream_with_retry(client, api_params) as stream:
@@ -1399,12 +1604,20 @@ class AnthropicAdapter(LLMAdapter):
                             output_tokens = getattr(event.usage, 'output_tokens', None)
                             if usage_sink is not None and output_tokens is not None:
                                 usage_sink["output_tokens"] = output_tokens
+                        # #3300: Anthropic reports why generation ended on the
+                        # message_delta's ``delta`` — the only in-stream
+                        # evidence that the output was cut at max_tokens.
+                        stop_reason = getattr(
+                            getattr(event, 'delta', None), 'stop_reason', None,
+                        ) or stop_reason
 
                     # Content block start - marks beginning of text or tool_use block
                     elif event_type == 'content_block_start':
                         if hasattr(event, 'content_block'):
                             block = event.content_block
                             block_index = getattr(event, 'index', 0)
+                            last_block_index = block_index
+                            last_block_type = block.type
 
                             if block.type == 'tool_use':
                                 # Start accumulating a new tool call
@@ -1473,6 +1686,20 @@ class AnthropicAdapter(LLMAdapter):
                     text_content += item
                 yield item
 
+            # #3300: a max_tokens stop cut the last block the stream opened.
+            # When that block is a tool call its arguments are incomplete, so
+            # it is not handed on as a call to execute.
+            if (
+                stop_reason == _MAX_TOKENS_STOP_REASON
+                and last_block_type == 'tool_use'
+                and last_block_index in tool_calls_accumulator
+            ):
+                cut_call = tool_calls_accumulator.pop(last_block_index)
+                logger.warning(
+                    "Dropping tool call %s from an Anthropic stream cut at "
+                    "max_tokens: its arguments are incomplete", cut_call["name"],
+                )
+
             # Assemble any tool calls collected during the stream.
             parsed_tool_calls = None
             if tool_calls_accumulator:
@@ -1516,6 +1743,17 @@ class AnthropicAdapter(LLMAdapter):
             if structured_output_tool_name and text_content and not parsed_tool_calls:
                 yield text_content
 
+            # #3300: the text has already streamed, so a cut at the model's
+            # own ceiling is marked by a final chunk — and carried on the
+            # terminal response's content, which mirrors what was shown.
+            notice = self._output_ceiling_notice(model, stop_reason, model_ceiling)
+            if notice is not None:
+                notice_chunk = output_ceiling_notice_chunk(
+                    notice, follows_text=bool(text_content),
+                )
+                text_content += notice_chunk
+                yield notice_chunk
+
             # Always emit a terminal LLMResponse carrying token usage, even for
             # text-only / structured turns. The service layer meters streamed
             # turns from this terminal response; previously it was emitted ONLY
@@ -1524,7 +1762,7 @@ class AnthropicAdapter(LLMAdapter):
             # dropped their token usage entirely, a silent billing undercount.
             # Consumers read this only for tool_calls / usage; visible content
             # was already streamed as chunks.
-            yield LLMResponse(
+            yield attach_stop_reason(LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
                 raw=None,
@@ -1533,7 +1771,7 @@ class AnthropicAdapter(LLMAdapter):
                 total_tokens=total_tokens,
                 cache_creation_input_tokens=cache_creation_input_tokens,
                 cache_read_input_tokens=cache_read_input_tokens,
-            )
+            ), stop_reason)
 
         except Exception as e:
             logger.error(
@@ -1623,6 +1861,7 @@ class AnthropicAdapter(LLMAdapter):
             for model_data in data.get("data", []):
                 # Keep API-key and OAuth discovery metadata identical.
                 models.append(anthropic_model_info(model_data))
+            self._learn_output_ceilings(models)
 
             logger.info(f"Anthropic returned {len(models)} models")
             return models
