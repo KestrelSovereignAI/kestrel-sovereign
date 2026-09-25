@@ -62,6 +62,8 @@ logger = logging.getLogger(__name__)
 # exists at all.
 _PAUSED_POD_STATES = frozenset({"EXITED", "STOPPED", "TERMINATED"})
 _TERMINATED_POD_STATES = frozenset({"TERMINATED"})
+# Read-back marker for a pod RunPod answers 404 for: it no longer exists.
+_POD_GONE = "GONE"
 
 
 def _is_pod_not_found(error: Exception) -> bool:
@@ -86,14 +88,12 @@ async def _pod_action(action: Awaitable[object], pod_id: str) -> None:
         logger.info(f"RunPod pod {pod_id} no longer exists")
 
 
-async def _confirm_pod_state(
-    manager, pod_id: str, accepted: frozenset[str], outcome: str
-) -> None:
-    """Read the pod back and raise unless it is in an ``accepted`` state.
+async def _read_pod_status(
+    manager, pod_id: str, outcome: str
+) -> tuple[object, str | None]:
+    """Read the pod back: ``(observed, STATUS)``, with ``STATUS`` ``"GONE"`` on 404.
 
-    A pod RunPod no longer knows (404) is released. Anything else - an error
-    payload, an empty response, or a pod still RUNNING - raises, so the job
-    stays in custody and a later release retries.
+    Raises if the provider cannot be asked or the read fails for another reason.
     """
     get_status = getattr(manager.provider, "get_status", None)
     if get_status is None:
@@ -106,12 +106,27 @@ async def _confirm_pod_state(
         observed = await asyncio.to_thread(get_status, pod_id)
     except Exception as error:
         if _is_pod_not_found(error):
-            return
+            return None, _POD_GONE
         raise
     status = None
     if isinstance(observed, Mapping):
         status = observed.get("status") or observed.get("desiredStatus")
-    if not isinstance(status, str) or status.upper() not in accepted:
+    return observed, status.upper() if isinstance(status, str) else None
+
+
+async def _confirm_pod_state(
+    manager, pod_id: str, accepted: frozenset[str], outcome: str
+) -> None:
+    """Read the pod back and raise unless it is in an ``accepted`` state.
+
+    A pod RunPod no longer knows (404) is released. Anything else - an error
+    payload, an empty response, or a pod still RUNNING - raises, so the job
+    stays in custody and a later release retries.
+    """
+    observed, status = await _read_pod_status(manager, pod_id, outcome)
+    if status == _POD_GONE:
+        return
+    if status not in accepted:
         raise TrainingProviderError(
             f"RunPod did not confirm pod {pod_id} was {outcome}: observed "
             f"{observed!r}; it is retained until a release succeeds",
@@ -324,6 +339,8 @@ class RunPodTrainingAdapter:
         error but report ``TERMINATED``/``EXITED`` for an empty 204 response
         without observing the pod. The release therefore reads the pod back
         and succeeds only on the confirmed state (see ``_confirm_pod_state``).
+        A provider with no terminate call gets the pod stopped and the release
+        still raises (see ``_stop_unterminable_pod``).
         """
         manager = self._get_manager()
         persistent_pod_id = manager._expand_single_env_var(
@@ -336,6 +353,12 @@ class RunPodTrainingAdapter:
 
     @staticmethod
     async def _pause_pod(manager, session) -> None:
+        await RunPodTrainingAdapter._stop_pod(manager, session)
+        logger.info(f"Paused persistent RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _stop_pod(manager, session) -> None:
+        """Stop this job's pod and confirm it no longer bills for its GPU."""
         # stop_session() takes no session argument: it stops whatever pod the
         # manager holds, so it is only used when that is this job's pod (it
         # also records GPU metering and lets a provider failure propagate).
@@ -348,17 +371,44 @@ class RunPodTrainingAdapter:
             )
         await _confirm_pod_state(manager, session.pod_id, _PAUSED_POD_STATES, "paused")
         await RunPodTrainingAdapter._forget_session(manager, session)
-        logger.info(f"Paused persistent RunPod pod {session.pod_id}")
+
+    @staticmethod
+    async def _stop_unterminable_pod(manager, session) -> None:
+        """Stop an on-demand pod the provider cannot terminate, then raise.
+
+        ``ManagedRunPodProvider`` has ``stop_pod`` but no ``terminate_pod``.
+        Stopping ends GPU billing, but the stopped pod's disk still bills, so
+        the release is only partial: it raises and the job stays
+        ``RELEASE_FAILED`` with its pod ID until the pod is terminated. A pod
+        already stopped by an earlier attempt is not stopped again, and one
+        RunPod no longer knows (404) is fully released.
+        """
+        _, status = await _read_pod_status(manager, session.pod_id, "stopped")
+        if status == _POD_GONE:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+            logger.info(f"On-demand RunPod pod {session.pod_id} no longer exists")
+            return
+        if status in _TERMINATED_POD_STATES:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+            logger.info(f"Terminated on-demand RunPod pod {session.pod_id}")
+            return
+        if status not in _PAUSED_POD_STATES:
+            await RunPodTrainingAdapter._stop_pod(manager, session)
+        else:
+            await RunPodTrainingAdapter._forget_session(manager, session)
+        raise TrainingProviderError(
+            f"{type(manager.provider).__name__} cannot terminate on-demand pod "
+            f"{session.pod_id}: it was stopped (GPU billing ended) but its disk "
+            "still bills; it is retained until it is terminated",
+            provider="runpod",
+        )
 
     @staticmethod
     async def _terminate_pod(manager, session) -> None:
         terminate_pod = getattr(manager.provider, "terminate_pod", None)
         if terminate_pod is None:
-            raise TrainingProviderError(
-                f"{type(manager.provider).__name__} cannot terminate on-demand pod "
-                f"{session.pod_id}; it is retained until a release succeeds",
-                provider="runpod",
-            )
+            await RunPodTrainingAdapter._stop_unterminable_pod(manager, session)
+            return
         await _pod_action(
             asyncio.to_thread(terminate_pod, session.pod_id), session.pod_id
         )

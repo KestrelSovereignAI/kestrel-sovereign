@@ -304,13 +304,23 @@ class FakeManagedRunPodProvider:
     def __init__(self, remote: FakeRemote):
         self.remote = remote
         self.pod_calls: list[tuple[str, str]] = []
+        # Pods deleted out of band: every call about them 404s.
+        self.vanished: set[str] = set()
+
+    def vanish(self, pod_id: str) -> None:
+        self.remote.session_where(pod_id=pod_id).state = "deleted"
+        self.vanished.add(pod_id)
 
     def stop_pod(self, pod_id):
         self.pod_calls.append(("stop", pod_id))
+        if pod_id in self.vanished:
+            raise FakeManagedNotFound(pod_id)
         self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
         return {"id": pod_id, "desiredStatus": "EXITED"}
 
     def get_status(self, pod_id):
+        if pod_id in self.vanished:
+            raise FakeManagedNotFound(pod_id)
         running = self.remote.session_where(pod_id=pod_id).state == "running"
         return {"id": pod_id, "desiredStatus": "RUNNING" if running else "EXITED"}
 
@@ -1213,27 +1223,90 @@ async def test_runpod_persistent_pod_setting_that_expands_empty_is_on_demand(
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
-async def test_runpod_on_demand_pod_without_a_terminate_call_is_retained(loop_errors):
-    """Stopping instead of terminating is not a release; custody must stay."""
+@pytest.mark.parametrize("release", ["cancel", "cleanup", "close"])
+@pytest.mark.parametrize("managers_current", [True, False])
+async def test_runpod_on_demand_pod_the_provider_cannot_terminate_is_stopped_and_retained(
+    release, managers_current, loop_errors
+):
+    """``ManagedRunPodProvider`` has no ``terminate_pod``: never do nothing.
+
+    The pod is stopped (GPU billing ends) and confirmed stopped, but its disk
+    still bills, so the release is partial: the job stays ``RELEASE_FAILED``
+    with its pod ID. A retry does not stop the stopped pod again.
+    """
 
     remote = FakeRemote()
     adapter, manager = _build("runpod", remote)
     direct_provider = manager.provider
+    managed_provider = FakeManagedRunPodProvider(remote)
+    manager.provider = managed_provider
+    job = await _start(adapter, "companion-1")
+    record = adapter._active_jobs[job.job_id]
+    pod_id = record.session.pod_id
+    others = []
+    if not managers_current:
+        others.append(await _start(adapter, "companion-2"))
+
+    if release == "cancel":
+        assert await adapter.cancel(job.job_id) is False
+    elif release == "cleanup":
+        await adapter.cleanup(job.job_id)
+    else:
+        for other in others:  # only this job's partial release should remain
+            manager.provider = direct_provider
+            assert await adapter.cancel(other.job_id) is True
+            manager.provider = managed_provider
+        others = []
+        with pytest.raises(SessionReleaseError) as close_error:
+            await adapter.close()
+        assert close_error.value.retained_job_ids == [job.job_id]
+
+    assert managed_provider.pod_calls == [("stop", pod_id)]
+    assert record.session.state == "released"  # stopped: no GPU billing
+    assert adapter._active_jobs[job.job_id] is record
+    assert record.session.pod_id == pod_id
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert "cannot terminate on-demand pod" in record.error
+    assert "disk still bills" in record.error
+    assert manager._session is not record.session  # never resumed as live
+    status = await adapter.get_status(job.job_id)
+    assert status.state is TrainingState.RELEASE_FAILED
+    assert not status.state.is_terminal()
+    await asyncio.wait({record.release_task})  # the status query's retry
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert managed_provider.pod_calls == [("stop", pod_id)]  # retry: no re-stop
+    assert loop_errors == []
+
+    manager.provider = direct_provider
+    if release == "close":
+        await adapter.close()
+    else:
+        assert await adapter.cancel(job.job_id) is True
+    assert direct_provider.pod_calls[-1] == ("terminate", pod_id)
+    for other in others:
+        assert await adapter.cancel(other.job_id) is True
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize("stopped_first", [False, True])
+async def test_runpod_unterminable_pod_that_no_longer_exists_is_released(
+    stopped_first, loop_errors
+):
+    """A pod the managed provider answers 404 for is gone, not partially released."""
+
+    remote = FakeRemote()
+    adapter, manager = _build("runpod", remote)
     manager.provider = FakeManagedRunPodProvider(remote)
     job = await _start(adapter)
     record = adapter._active_jobs[job.job_id]
+    if stopped_first:
+        assert await adapter.cancel(job.job_id) is False
+    manager.provider.vanish(record.session.pod_id)
 
-    assert await adapter.cancel(job.job_id) is False
-
-    assert manager.provider.pod_calls == []
-    assert record.phase is SessionJobPhase.RELEASE_FAILED
-    assert "cannot terminate on-demand pod" in record.error
-    assert record.session.state == "running"
-    assert manager._session is record.session
-
-    manager.provider = direct_provider
     assert await adapter.cancel(job.job_id) is True
-    assert direct_provider.pod_calls == [("terminate", record.session.pod_id)]
+
+    assert job.job_id not in adapter._active_jobs
+    assert manager._session is None
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
