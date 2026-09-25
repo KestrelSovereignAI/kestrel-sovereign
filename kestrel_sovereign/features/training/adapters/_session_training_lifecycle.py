@@ -26,8 +26,16 @@ Ownership contract
 * A job leaves the registry only after its session release succeeded and its
   submission task terminated. Anything else leaves it in
   ``RELEASE_FAILED``: custody stays visible and the release can be retried.
+  "Succeeded" means the provider hook returned without raising, so each
+  ``release_session`` hook must prove the provider stopped billing — it may
+  not route through a provider helper that logs a failure and returns.
+* A session acquired for a job that is then rejected (validation, close, or
+  caller cancellation) is released at once. If that release fails, the
+  session is registered as an orphan job in ``RELEASE_FAILED`` under the
+  rejected job's ID, so ``close()`` retries it instead of forgetting it.
 * ``close()`` refuses new work, cancels in-flight session acquisitions,
-  releases every job, and waits for all of it within one deadline.
+  releases every job — including orphans registered while it drains — and
+  waits for all of it within one deadline.
 
 Error precedence
 ----------------
@@ -168,7 +176,8 @@ class SessionProviderHooks(Generic[SessionT]):
     ``acquire_session`` starts or resumes the billable session and returns it
     (``None`` if none could be obtained). ``submit_job`` performs readiness,
     upload, and submission and returns the provider job ID. ``release_session``
-    terminates or pauses one specific session and must raise when it cannot.
+    terminates or pauses one specific session and must raise unless the
+    provider confirmed it: returning normally drops custody of the session.
     ``cancel_provider_job`` is the optional compensating cancellation for a
     published provider job ID; providers without one rely on session release.
     """
@@ -377,7 +386,14 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 # (caller or close()): nobody will own this job.
                 raise asyncio.CancelledError()
         except BaseException as error:
-            await self._release_unregistered(session, job_id, error)
+            await self._release_unregistered(
+                session,
+                job_id=job_id,
+                companion_id=companion_id,
+                trigger_word=trigger_word,
+                config=config,
+                cause=error,
+            )
             raise
 
         now = datetime.now(timezone.utc)
@@ -400,9 +416,20 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         return record
 
     async def _release_unregistered(
-        self, session: SessionT, job_id: str, cause: BaseException
+        self,
+        session: SessionT,
+        *,
+        job_id: str,
+        companion_id: str,
+        trigger_word: str,
+        config: TrainingConfig,
+        cause: BaseException,
     ) -> None:
-        """Terminate a session no job will own; the original error still wins."""
+        """Terminate a session no caller will own; the original error still wins.
+
+        A failed release does not drop the session: it is retained as an
+        orphan job in ``RELEASE_FAILED`` so ``close()`` retries it.
+        """
 
         release = asyncio.create_task(
             self._bounded(self._hooks.release_session(session)),
@@ -410,17 +437,55 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         )
         outcome = await await_owned_task(release)
         if outcome.error is not None:
-            logger.error(
-                "%s session %s for rejected job %s could not be released "
-                "(it may still be billing): %s",
-                self._hooks.display_name,
-                self._hooks.session_id(session),
-                job_id,
-                outcome.error,
+            self._retain_orphan(
+                session,
+                job_id=job_id,
+                companion_id=companion_id,
+                trigger_word=trigger_word,
+                config=config,
+                error=outcome.error,
             )
-            cause.add_note(f"session release also failed: {outcome.error}")
+            cause.add_note(
+                f"{self._hooks.display_name} session "
+                f"{self._hooks.session_id(session)} release also failed "
+                f"({outcome.error!r}); retained as job {job_id} for retry"
+            )
         if outcome.cancellation is not None:
             raise outcome.cancellation from cause
+
+    def _retain_orphan(
+        self,
+        session: SessionT,
+        *,
+        job_id: str,
+        companion_id: str,
+        trigger_word: str,
+        config: TrainingConfig,
+        error: BaseException,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        intent = ReleaseIntent.CLOSE if self._closed else ReleaseIntent.CANCEL
+        self._records[job_id] = SessionTrainingRecord(
+            job_id=job_id,
+            companion_id=companion_id,
+            trigger_word=trigger_word,
+            config=config,
+            session=session,
+            created_at=now,
+            started_at=now,
+            phase=SessionJobPhase.RELEASE_FAILED,
+            error=f"rejected session release failed: {error!r}",
+            release_intent=intent,
+        )
+        logger.error(
+            "%s session %s for rejected job %s could not be released (it may "
+            "still be billing); custody retained for retry: %s",
+            self._hooks.display_name,
+            self._hooks.session_id(session),
+            job_id,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
     # ------------------------------------------------------------------
     # Submission
@@ -691,16 +756,25 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         )
 
     async def _close_owned(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeouts.close
         openings = list(self._openings)
         for opening in openings:
             opening.cancel()
-        releases: list[asyncio.Task[Any]] = [
-            self._ensure_release(record, ReleaseIntent.CLOSE)
-            for record in list(self._records.values())
-        ]
-        pending: set[asyncio.Task[Any]] = set(openings) | set(releases)
-        if pending:
-            _done, pending = await asyncio.wait(pending, timeout=self._timeouts.close)
+        scheduled: set[str] = set()
+        pending: set[asyncio.Task[Any]] = set(openings) | self._schedule_close_releases(
+            scheduled
+        )
+        while pending:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            # A rejected acquisition whose release failed registers an orphan
+            # while we drain; it must be released by this close, not forgotten.
+            pending |= self._schedule_close_releases(scheduled)
         retained = sorted(self._records)
         if pending:
             logger.error(
@@ -716,3 +790,14 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 provider=self._hooks.provider_name,
                 retained_job_ids=retained,
             )
+
+    def _schedule_close_releases(self, scheduled: set[str]) -> set[asyncio.Task[Any]]:
+        """Start (or join) the release of every job this close has not yet claimed."""
+
+        releases: set[asyncio.Task[Any]] = set()
+        for record in list(self._records.values()):
+            if record.job_id in scheduled:
+                continue
+            scheduled.add(record.job_id)
+            releases.add(self._ensure_release(record, ReleaseIntent.CLOSE))
+        return releases

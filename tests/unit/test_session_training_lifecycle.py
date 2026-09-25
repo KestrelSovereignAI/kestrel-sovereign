@@ -17,7 +17,9 @@ import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from google.api_core.exceptions import NotFound
 
 from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
     IllegalSessionJobTransition,
@@ -71,12 +73,15 @@ class FakeRemote:
     release_gate: asyncio.Event | None = None
     release_started: asyncio.Event = field(default_factory=asyncio.Event)
     release_error: Exception | None = None
+    # How many upcoming releases fail with ``release_error`` (None: all of them).
+    release_failures: int | None = None
     release_calls: int = 0
     cancel_job_calls: list = field(default_factory=list)
     cancel_job_error: Exception | None = None
     upload_gate: asyncio.Event | None = None
     upload_started: asyncio.Event = field(default_factory=asyncio.Event)
     backend_base_url: str | None = "https://backend.example"
+    loop: asyncio.AbstractEventLoop = field(default_factory=asyncio.get_running_loop)
 
     # -- remote side -----------------------------------------------------
 
@@ -86,6 +91,7 @@ class FakeRemote:
             pod_id=f"pod-{number}",
             instance_id=number,
             instance_name=f"instance-{number}",
+            zone="us-central1-a",
             backend_base_url=self.backend_base_url,
             state="running",
             profile=SimpleNamespace(persistent_pod_id=None),
@@ -97,6 +103,14 @@ class FakeRemote:
         job_id = f"remote-{next(_ids)}"
         self.jobs[job_id] = {"session": session, "state": "running"}
         return job_id
+
+    def session_where(self, **identity):
+        (session,) = [
+            s
+            for s in self.sessions
+            if all(getattr(s, key) == value for key, value in identity.items())
+        ]
+        return session
 
     def running_sessions(self) -> list:
         return [s for s in self.sessions if s.state == "running"]
@@ -161,9 +175,17 @@ class FakeRemote:
         self.release_started.set()
         if self.release_gate is not None:
             await self.release_gate.wait()
-        if self.release_error is not None:
+        if self.release_error is not None and self.release_failures != 0:
+            if self.release_failures is not None:
+                self.release_failures -= 1
             raise self.release_error
         session.state = "released"
+
+    def release_from_thread(self, session) -> None:
+        """A blocking provider SDK call, run by the adapter in a worker thread."""
+        asyncio.run_coroutine_threadsafe(self.release(session), self.loop).result(
+            timeout=10
+        )
 
     async def cancel_job(self, session, job_id):
         self.cancel_job_calls.append(job_id)
@@ -173,9 +195,27 @@ class FakeRemote:
         return {"status": "cancelled"}
 
 
+async def _swallowing_terminate(remote: FakeRemote, session) -> None:
+    """The real managers' ``terminate_session``: a failure is logged, not raised."""
+    try:
+        await remote.release(session)
+    except Exception:
+        logging.getLogger(__name__).exception("terminate failed (swallowed)")
+
+
+class FakeRunPodProvider:
+    def __init__(self, remote: FakeRemote):
+        self.remote = remote
+
+    def stop_pod(self, pod_id):
+        self.remote.release_from_thread(self.remote.session_where(pod_id=pod_id))
+        return {"id": pod_id, "desiredStatus": "EXITED"}
+
+
 class FakeRunPodManager:
     def __init__(self, remote: FakeRemote):
         self.remote = remote
+        self.provider = FakeRunPodProvider(remote)
         self._session = None
 
     async def start_training_pod(self, companion_id):
@@ -189,20 +229,51 @@ class FakeRunPodManager:
         return await self.remote.cancel_job(session, job_id)
 
     async def stop_session(self):
+        # Like the real manager: forget the pod, then let a failed stop raise.
         session, self._session = self._session, None
         await self.remote.release(session)
 
     async def terminate_session(self, session):
-        await self.remote.release(session)
+        await _swallowing_terminate(self.remote, session)
 
     async def poll_training_status(self, *, session, job_id):
         return {"status": "running", "progress": 0.5}
 
 
+class FakeVastSDK:
+    server_url = "https://vast.example"
+
+
 class FakeVastManager:
+    api_key = "vast-test-key"
+
     def __init__(self, remote: FakeRemote):
         self.remote = remote
+        self._sdk = FakeVastSDK()
         self._session = None
+        # A 200 reply that does not destroy the instance (None: destroy it).
+        self.destroy_reply: dict | None = None
+        self.transport = httpx.MockTransport(self._vast_api)
+
+    def _get_sdk(self):
+        return self._sdk
+
+    async def _vast_api(self, request: httpx.Request) -> httpx.Response:
+        """The Vast.ai REST API the adapter destroys instances through."""
+        assert request.method == "DELETE"
+        assert str(request.url).startswith("https://vast.example/api/v0/instances/")
+        assert request.headers["Authorization"] == f"Bearer {self.api_key}"
+        instance_id = int(request.url.path.rstrip("/").rsplit("/", 1)[1])
+        session = self.remote.session_where(instance_id=instance_id)
+        if session.state != "running":
+            return httpx.Response(404, json={"success": False, "error": "not_found"})
+        if self.destroy_reply is not None:
+            return httpx.Response(200, json=self.destroy_reply)
+        try:
+            await self.remote.release(session)
+        except Exception as error:
+            return httpx.Response(500, json={"success": False, "msg": str(error)})
+        return httpx.Response(200, json={"success": True})
 
     async def start_session(self, **_kwargs):
         self._session = await self.remote.acquire()
@@ -211,18 +282,37 @@ class FakeVastManager:
         return await self.remote.submit(session)
 
     async def terminate_session(self, session):
-        await self.remote.release(session)
+        await _swallowing_terminate(self.remote, session)
 
     async def poll_training_status_http(self, *, session, job_id):
         return {"status": "running", "progress": 0.5}
 
 
+class FakeGCPInstancesClient:
+    def __init__(self, remote: FakeRemote):
+        self.remote = remote
+
+    def delete(self, *, project, zone, instance):
+        if self.remote.session_where(instance_name=instance).state != "running":
+            raise NotFound(f"instance {instance} not found")
+        return SimpleNamespace(name=f"delete:{instance}")
+
+
 class FakeGCPManager:
     disk_config: dict = {}
+    project_id = "kestrel-test"
 
     def __init__(self, remote: FakeRemote):
         self.remote = remote
+        self._client = FakeGCPInstancesClient(remote)
         self._session = None
+
+    def _get_instances_client(self):
+        return self._client
+
+    async def _wait_for_operation(self, operation_name, zone):
+        instance = operation_name.removeprefix("delete:")
+        await self.remote.release(self.remote.session_where(instance_name=instance))
 
     async def start_session(self, **_kwargs):
         self._session = await self.remote.acquire()
@@ -237,7 +327,7 @@ class FakeGCPManager:
         return await self.remote.submit(session)
 
     async def terminate_session(self, session):
-        await self.remote.release(session)
+        await _swallowing_terminate(self.remote, session)
 
     async def poll_training_status(self, *, session, job_id):
         return {"status": "running", "progress": 0.5}
@@ -270,7 +360,8 @@ async def loop_errors():
 def _build(provider: str, remote: FakeRemote, timeouts=_FAST):
     adapter_cls, manager_cls = _PROVIDERS[provider]
     manager = manager_cls(remote)
-    return adapter_cls(manager=manager, lifecycle_timeouts=timeouts), manager
+    extra = {"http_transport": manager.transport} if provider == "vastai" else {}
+    return adapter_cls(manager=manager, lifecycle_timeouts=timeouts, **extra), manager
 
 
 async def _settle() -> None:
@@ -460,11 +551,74 @@ async def test_session_release_failure_retains_custody_until_retry(provider, loo
     assert await adapter.cancel(job.job_id) is False
     record = adapter._active_jobs[job.job_id]
     assert record.phase is SessionJobPhase.RELEASE_FAILED
-    assert "provider API down" in record.error
+    assert record.error.startswith("session release failed")
+    if provider != "vastai":  # the Vast.ai SDK swallows the underlying error
+        assert "provider API down" in record.error
     assert (await adapter.get_status(job.job_id)).state is TrainingState.CANCELLED
 
     remote.release_error = None
     assert await adapter.cancel(job.job_id) is True
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_release_is_verified_not_inferred_from_a_swallowing_manager(
+    provider, loop_errors
+):
+    """The managers' ``terminate_session`` logs a failed stop and returns.
+
+    Releasing through it would report success while the instance keeps
+    billing. Custody may only drop once the provider itself confirmed the
+    stop, so a failure must fail the cancel and keep the job. Two jobs make
+    the cancelled one not the manager's current session, which is exactly
+    where a swallowing terminate path would otherwise be taken.
+    """
+
+    remote = FakeRemote()
+    adapter, _ = _build(provider, remote)
+    first = await _start(adapter, "companion-1")
+    await _start(adapter, "companion-2")
+    first_session = adapter._active_jobs[first.job_id].session
+    remote.release_error = RuntimeError("provider refused the stop")
+
+    assert await adapter.cancel(first.job_id) is False
+
+    assert first_session.state == "running"
+    record = adapter._active_jobs[first.job_id]
+    assert record.phase is SessionJobPhase.RELEASE_FAILED
+    assert not record.session_released
+
+    remote.release_error = None
+    await adapter.close()
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_vast_unconfirmed_destroy_is_a_release_failure(loop_errors):
+    remote = FakeRemote()
+    adapter, manager = _build("vastai", remote)
+    job = await _start(adapter)
+    manager.destroy_reply = {"success": False, "msg": "busy"}
+
+    assert await adapter.cancel(job.job_id) is False
+    record = adapter._active_jobs[job.job_id]
+    assert "did not confirm" in record.error
+    assert record.session.state == "running"
+
+    manager.destroy_reply = None
+    assert await adapter.cancel(job.job_id) is True
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize("provider_name", ["gcp_compute", "vastai"])
+async def test_instance_already_deleted_counts_as_released(provider_name, loop_errors):
+    remote = FakeRemote()
+    adapter, manager = _build(provider_name, remote)
+    job = await _start(adapter)
+    session = adapter._active_jobs[job.job_id].session
+    session.state = "released"  # an earlier delete completed out of band
+
+    assert await adapter.cancel(job.job_id) is True
+    assert remote.release_calls == 0
+    assert manager._session is None
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 
@@ -524,6 +678,61 @@ async def test_session_rejected_after_acquisition_is_released(provider_name, loo
         await _start(adapter)
 
     assert remote.release_calls == 1
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+@pytest.mark.parametrize("provider_name", ["runpod", "vastai"])
+async def test_rejected_session_whose_release_fails_is_retained_for_close(
+    provider_name, loop_errors
+):
+    remote = FakeRemote(
+        backend_base_url=None, release_error=RuntimeError("provider API down")
+    )
+    adapter, _ = _build(provider_name, remote)
+
+    with pytest.raises(TrainingSubmissionError, match="no backend URL") as raised:
+        await _start(adapter)
+
+    (orphan_id,) = adapter._active_jobs
+    assert any(orphan_id in note for note in raised.value.__notes__)
+    orphan = adapter._active_jobs[orphan_id]
+    assert orphan.phase is SessionJobPhase.RELEASE_FAILED
+    assert orphan.session.state == "running"
+
+    with pytest.raises(SessionReleaseError) as close_error:
+        await adapter.close()
+    assert close_error.value.retained_job_ids == [orphan_id]
+    assert remote.release_calls == 2  # close() re-attempted the orphan
+
+    remote.release_error = None
+    await adapter.close()
+    await _assert_no_orphans(adapter, remote, loop_errors)
+
+
+async def test_close_releases_an_orphan_registered_while_it_drains(provider, loop_errors):
+    """close() cancels an acquisition that returns a session anyway.
+
+    Its immediate release fails, so the session is registered as an orphan
+    after close() began; the same close must release it rather than exit
+    with it still billing.
+    """
+
+    remote = FakeRemote(
+        acquire_gate=asyncio.Event(),
+        acquire_returns_despite_cancel=True,
+        release_error=RuntimeError("transient provider error"),
+        release_failures=1,
+    )
+    adapter, _ = _build(provider, remote)
+    starter = asyncio.create_task(_start(adapter))
+    await remote.acquire_started.wait()
+
+    await adapter.close()
+
+    with pytest.raises(TrainingSubmissionError, match="closed"):
+        await starter
+    assert len(remote.sessions) == 1
+    assert remote.release_calls == 2
     await _assert_no_orphans(adapter, remote, loop_errors)
 
 

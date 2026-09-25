@@ -6,6 +6,7 @@ protocol. This is a session-based provider that requires instance lifecycle
 management.
 """
 
+import asyncio
 import logging
 import os
 import shlex
@@ -38,6 +39,15 @@ from ..types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_not_found(error: Exception) -> bool:
+    """Whether a Compute Engine call failed because the resource is gone."""
+    try:
+        from google.api_core.exceptions import NotFound
+    except ImportError:
+        return False
+    return isinstance(error, NotFound)
 
 
 class GCPComputeTrainingAdapter:
@@ -226,8 +236,33 @@ class GCPComputeTrainingAdapter:
         )
 
     async def _release_session(self, session) -> None:
-        """Delete the instance, which also stops any training job on it."""
-        await self._get_manager().terminate_session(session)
+        """Delete the instance, which also stops any training job on it.
+
+        Raises unless the delete operation completed without error. The
+        manager's ``terminate_session`` logs a failed delete and returns, so it
+        cannot prove the instance stopped billing; the delete is issued and
+        awaited here instead. An instance that no longer exists (a retry after
+        an earlier delete completed) counts as released.
+        """
+        manager = self._get_manager()
+        client = manager._get_instances_client()
+        try:
+            operation = await asyncio.to_thread(
+                client.delete,
+                project=manager.project_id,
+                zone=session.zone,
+                instance=session.instance_name,
+            )
+        except Exception as error:
+            if not _is_not_found(error):
+                raise
+            logger.info(f"GCP instance {session.instance_name} is already deleted")
+        else:
+            await manager._wait_for_operation(operation.name, session.zone)
+            logger.info(f"Deleted GCP instance {session.instance_name}")
+        current = getattr(manager, "_session", None)
+        if current is not None and current.instance_name == session.instance_name:
+            manager._session = None
 
     # -- TrainingProvider --------------------------------------------------
 

@@ -41,6 +41,7 @@ from ..types import (
     TrainingState,
     TrainingStatus,
 )
+from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
 from kestrel_sovereign.kestrel_config.defaults import get_lighthouse_gateway_url
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class VastAITrainingAdapter:
         manager=None,
         *,
         lifecycle_timeouts: Optional[SessionLifecycleTimeouts] = None,
+        http_transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         """
         Initialize with optional pre-configured manager.
@@ -73,8 +75,11 @@ class VastAITrainingAdapter:
         Args:
             manager: VastAIManager instance (lazy loaded if not provided)
             lifecycle_timeouts: Teardown bounds (defaults from kestrel_config)
+            http_transport: Transport for direct Vast.ai API calls (default:
+                the network)
         """
         self._manager = manager
+        self._http_transport = http_transport
         self._lifecycle = SessionTrainingLifecycle(
             SessionProviderHooks(
                 provider_name=self.provider_name,
@@ -218,8 +223,42 @@ class VastAITrainingAdapter:
         )
 
     async def _release_session(self, session) -> None:
-        """Destroy the instance; Vast.ai bills hourly, and this also stops its job."""
-        await self._get_manager().terminate_session(session)
+        """Destroy the instance; Vast.ai bills hourly, and this also stops its job.
+
+        Raises unless Vast.ai confirms the destroy. Neither the SDK nor the
+        manager can prove it: the SDK's ``destroy_instance`` swallows request
+        errors and discards the response, and the manager's
+        ``terminate_session`` logs a failure and returns. The destroy is
+        therefore issued against the Vast.ai API directly (at the SDK's
+        configured server) and its response checked. An instance the API no
+        longer knows (a retry after an earlier destroy completed) counts as
+        released.
+        """
+        manager = self._get_manager()
+        server_url = manager._get_sdk().server_url.rstrip("/")
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT_DEFAULT, transport=self._http_transport
+        ) as client:
+            response = await client.request(
+                "DELETE",
+                f"{server_url}/api/v0/instances/{session.instance_id}/",
+                headers={"Authorization": f"Bearer {manager.api_key}"},
+                json={},
+            )
+        if response.status_code == 404:
+            logger.info(f"Vast.ai instance {session.instance_id} is already destroyed")
+        else:
+            response.raise_for_status()
+            result = response.json()
+            if not (isinstance(result, dict) and result.get("success") is True):
+                raise TrainingProviderError(
+                    f"Vast.ai did not confirm destroying instance "
+                    f"{session.instance_id}: {result!r}",
+                    provider=self.provider_name,
+                )
+            logger.info(f"Destroyed Vast.ai instance {session.instance_id}")
+        if getattr(manager, "_session", None) is session:
+            manager._session = None
 
     # -- TrainingProvider --------------------------------------------------
 

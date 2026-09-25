@@ -249,17 +249,21 @@ class RunPodTrainingAdapter:
         )
 
     async def _release_session(self, session) -> None:
-        """Stop exactly this job's pod.
+        """Stop exactly this job's pod, raising unless RunPod accepted the stop.
 
         ``stop_session()`` takes no session argument: it stops whatever pod
-        the manager currently holds. It is only correct when that is this
-        job's pod; any other pod is stopped by identity.
+        the manager currently holds, so it is only used when that is this
+        job's pod (it also records GPU metering and lets a provider failure
+        propagate). Any other pod is stopped by identity through the provider
+        call itself: the manager's ``terminate_session``/``terminate_pod`` log
+        a failed stop and return, which cannot prove the pod stopped billing.
         """
         manager = self._get_manager()
         if getattr(manager, "_session", None) is session:
             await manager.stop_session()
         else:
-            await manager.terminate_session(session)
+            await asyncio.to_thread(manager.provider.stop_pod, session.pod_id)
+            logger.info(f"Stopped RunPod pod {session.pod_id}")
 
     # -- TrainingProvider --------------------------------------------------
 

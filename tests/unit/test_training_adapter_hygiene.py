@@ -5,7 +5,7 @@ import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -36,6 +36,7 @@ def _runpod_manager(session):
         submit_training_job=never_submits,
         stop_session=AsyncMock(),
         terminate_session=AsyncMock(),
+        provider=SimpleNamespace(stop_pod=Mock(return_value={"id": session.pod_id})),
     )
 
 
@@ -55,7 +56,7 @@ async def test_runpod_cleanup_stops_the_managers_current_pod():
 
 
 @pytest.mark.asyncio
-async def test_runpod_cleanup_terminates_a_pod_the_manager_no_longer_holds():
+async def test_runpod_cleanup_stops_a_pod_the_manager_no_longer_holds():
     session = _runpod_session()
     manager = _runpod_manager(session)
     adapter = RunPodTrainingAdapter(manager=manager)
@@ -64,7 +65,9 @@ async def test_runpod_cleanup_terminates_a_pod_the_manager_no_longer_holds():
     await adapter.cleanup(job.job_id)
 
     manager.stop_session.assert_not_awaited()
-    manager.terminate_session.assert_awaited_once_with(session)
+    # terminate_session swallows stop failures, so the provider stop is used.
+    manager.terminate_session.assert_not_awaited()
+    manager.provider.stop_pod.assert_called_once_with("pod-123")
     assert job.job_id not in adapter._active_jobs
 
 
