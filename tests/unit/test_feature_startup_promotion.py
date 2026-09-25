@@ -1,6 +1,11 @@
+import importlib
 from unittest.mock import MagicMock
 
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
+from kestrel_sovereign.features import (
+    discover_feature_modules,
+    find_feature_class,
+)
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.memory.feature import MemoryFeature
 from kestrel_sovereign.features.model.feature import ModelAgent
@@ -12,6 +17,7 @@ from kestrel_sovereign.features.strategic_memory.feature import (
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.features.todo.feature import TodoFeature
+from kestrel_sovereign.features.wait.feature import WaitFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -70,15 +76,19 @@ def test_startup_promotion_stays_under_budget():
     and force LRU eviction of other promoted-but-not-pinned features.
     Emma's reshape demanded this assertion."""
     agent = MagicMock()
-    promoted_classes = (
-        SaveFeature, StrategicMemoryFeature,
-        SpawnFeature, TaskFeature, PeersFeature, TodoFeature,
-    )
-    total = 0
-    for cls in promoted_classes:
-        feat = cls(agent)
-        assert feat.promote_tools_on_startup is True
-        total += _tool_count(cls, agent)
+    # Derive the promoted set from bundled discovery rather than a
+    # hand-kept list: a list here drifted (it omitted WaitFeature), so the
+    # guardrail passed while a real agent evicted model_agent (#3302).
+    promoted_classes = []
+    for module_path in discover_feature_modules():
+        cls = find_feature_class(importlib.import_module(module_path))
+        if cls is not None and cls(agent).promote_tools_on_startup:
+            promoted_classes.append(cls)
+    assert {
+        SaveFeature, StrategicMemoryFeature, SpawnFeature,
+        TaskFeature, PeersFeature, TodoFeature, WaitFeature,
+    } <= set(promoted_classes)
+    total = sum(_tool_count(cls, agent) for cls in promoted_classes)
 
     common_exploration = _tool_count(ModelAgent, agent) + _tool_count(MemoryFeature, agent)
 

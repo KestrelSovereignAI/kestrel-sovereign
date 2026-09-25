@@ -17,11 +17,13 @@ from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 class ToolRegistryMixin:
     """Mixin providing dynamic tool loading and management for KestrelAgent."""
 
-    # Startup-promoted operational features currently pin 44 tools
-    # (Task, Todo, Peers, Save, Spawn, StrategicMemory). Keep enough
+    # Startup-promoted operational features currently pin 50 tools
+    # (Task, Todo, Peers, Save, Spawn, StrategicMemory, Wait). Keep enough
     # headroom for the common model_agent + memory_feature exploration
-    # path without immediately evicting the first explored feature.
-    MAX_DIRECT_TOOLS = 80
+    # path (31 tools) without immediately evicting the first explored
+    # feature. ``test_startup_promotion_stays_under_budget`` derives the
+    # promoted set from discovery and fails when this is outgrown.
+    MAX_DIRECT_TOOLS = 88
 
     # OpenAI (and most providers) cap function names at 64 chars matching
     # ``^[a-zA-Z0-9_-]+$``. A single over-length name rejects the entire tool
