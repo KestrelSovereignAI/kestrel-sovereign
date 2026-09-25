@@ -103,12 +103,19 @@ class _FinishedJob:
     kind = "example"
     signal = "wait.complete"
 
+    def __init__(self):
+        # The native terminal state; a test may correct it (talon's
+        # ``finished_unknown -> failed``) to start a new transition.
+        self.native_status = "failed"
+
     async def active_handles(self):
         return ["job-1"]
 
     async def poll(self, handle):
         return WaitStatus(
-            Outcome.FAILED, "job failed", data={"job_id": handle, "status": "failed"}
+            Outcome.FAILED,
+            "job failed",
+            data={"job_id": handle, "status": self.native_status},
         )
 
 
@@ -138,7 +145,8 @@ async def rig(tmp_path, sqlite_database_factory):
 
     dispatcher.enqueue_signal = _capture
     waits = WaitRegistry()
-    waits.register(_FinishedJob())
+    job = _FinishedJob()
+    waits.register(job)
     host = SimpleNamespace(
         did=agent.did,
         agent_id=agent.did,
@@ -156,6 +164,7 @@ async def rig(tmp_path, sqlite_database_factory):
         host=host,
         db=db,
         emitted=emitted,
+        job=job,
     )
 
     pending = [t for t in agent.background_tasks if not t.done()]
@@ -307,6 +316,71 @@ async def test_parked_wake_is_redelivered_after_the_reset_and_says_it_is_late(ri
     assert row.last_signaled_outcome == "failed:failed", "delivered and locked"
     assert row.last_delivery_status.startswith("ok_")
     assert row.delivery_deferred_until is None
+    assert rig.agent.turns == 2
+
+
+async def _park_finished_unknown(r) -> datetime:
+    """Park transition A (``finished_unknown``) behind a long advised wait."""
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=9203)
+    r.job.native_status = "finished_unknown"
+    r.agent.failure = _all_routes_declined(retry_at)
+    await _tick(r)
+    await _tick(r)
+    row = await _row(r)
+    assert row.attempts_signaled_target == "failed:finished_unknown"
+    assert row.deferred_until_utc() == retry_at
+    return retry_at
+
+
+@pytest.mark.asyncio
+async def test_a_corrected_transition_is_not_held_behind_the_parked_one(rig):
+    """#3364: the park is scoped to the transition it was recorded for. A
+    provider correcting its terminal state before A's ``retry_at`` starts a
+    new transition, and that wake is emitted now, not hours later."""
+    await _park_finished_unknown(rig)
+
+    rig.job.native_status = "failed"
+    rig.agent.failure = None
+    tick = await _tick(rig)
+
+    assert tick.data["signals_parked"] == 0, "B is not A's parked wake"
+    assert tick.data["signals_enqueued"] == 1
+    corrected = rig.emitted[-1]
+    assert corrected.payload["status"] == "failed"
+    assert corrected.payload["delivery_attempt"] == 1
+    assert corrected.payload["delivery_deferrals"] == 0, (
+        "A's deferral is not B's history"
+    )
+
+    await _tick(rig)
+    row = await _row(rig)
+    assert row.last_signaled_outcome == "failed:failed", "B was delivered"
+    assert row.delivery_deferred_until is None
+    assert rig.agent.turns == 2
+
+
+@pytest.mark.asyncio
+async def test_a_corrected_transition_is_parked_against_its_own_retry_time(rig):
+    """If B's own turn is declined too, B is parked until the time the
+    provider named for B — not A's timestamp."""
+    a_retry_at = await _park_finished_unknown(rig)
+
+    b_retry_at = a_retry_at + timedelta(seconds=600)
+    rig.job.native_status = "failed"
+    rig.agent.failure = _all_routes_declined(b_retry_at)
+    emitted = await _tick(rig)
+    assert emitted.data["signals_enqueued"] == 1
+    await _tick(rig)
+
+    row = await _row(rig)
+    assert row.attempts_signaled_target == "failed:failed"
+    assert row.last_delivery_status == DEFERRED_RATE_LIMITED
+    assert row.deferred_until_utc() == b_retry_at
+    assert row.delivery_deferrals == 1, "B's deferral count starts afresh"
+    assert row.last_delivery_attempts == 0
+    parked = await _tick(rig)
+    assert parked.data["signals_parked"] == 1
+    assert parked.data["signals_enqueued"] == 0
     assert rig.agent.turns == 2
 
 
