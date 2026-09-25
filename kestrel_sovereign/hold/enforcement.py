@@ -25,6 +25,7 @@ from .state import (
     HoldState,
     HoldStateError,
     hold_latch_payload,
+    hold_mandate_payloads,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,12 +158,14 @@ class HoldTurnRefusal(RuntimeError):
         self.effective_state = effective_state
         self.host_hold = effective_state.host
         self.agent_hold = effective_state.agent
+        self.mandate_holds = effective_state.mandates
         self.metadata = {
             "code": self.code,
             "disposition": HeldWorkDisposition.REFUSED.value,
             "agent_id": agent_id,
             "host_hold": effective_state.host,
             "agent_hold": effective_state.agent,
+            "mandate_holds": effective_state.mandates,
         }
         super().__init__(f"Agent {agent_id!r} is held and cannot begin a turn")
 
@@ -182,6 +185,7 @@ class HoldTurnRefusal(RuntimeError):
             "agent_id": self.agent_id,
             "host_hold": self._latch_payload(self.host_hold),
             "agent_hold": self._latch_payload(self.agent_hold),
+            "mandate_holds": hold_mandate_payloads(self.effective_state),
         }
 
     def wire_json(self) -> str:

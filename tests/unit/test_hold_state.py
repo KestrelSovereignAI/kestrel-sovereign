@@ -2301,8 +2301,15 @@ async def test_legacy_duplicate_operation_ids_fail_closed(tmp_path):
     try:
         # Model an out-of-band constraint loss after the migration proved and
         # published a usable schema. Runtime validation remains a second line
-        # of defence rather than relying on the repaired index forever.
+        # of defence rather than relying on the repaired index forever. The
+        # v3 migration rebuilt the table with an inline UNIQUE (#3168), so the
+        # loss is a table without it, not only a dropped named index.
         await db.execute("DROP INDEX idx_hold_receipts_operation_id_unique")
+        await db.execute(
+            "CREATE TABLE hold_receipts_loose AS SELECT * FROM hold_receipts"
+        )
+        await db.execute("DROP TABLE hold_receipts")
+        await db.execute("ALTER TABLE hold_receipts_loose RENAME TO hold_receipts")
         for suffix in ("one", "two"):
             receipt_id = f"duplicate-operation-receipt-{suffix}"
             target_id = f"did:agent:{suffix}"

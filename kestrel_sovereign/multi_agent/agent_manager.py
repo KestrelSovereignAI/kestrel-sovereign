@@ -26,7 +26,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Awaitable, Callable, List, Mapping, Optional
+from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.identity.local_anchor import (
@@ -13327,11 +13327,33 @@ class AgentManager:
 
         if not isinstance(parent_did, str) or not parent_did:
             return []
+        async with self.authoritative_descendant_lease(parent_did) as descendants:
+            return list(descendants)
+
+    @asynccontextmanager
+    async def authoritative_descendant_lease(
+        self,
+        parent_did: str,
+    ) -> AsyncIterator[tuple[AuthoritativeStopDescendant, ...]]:
+        """Yield ``parent_did``'s signed descendants while the lease is held.
+
+        The one descendant query (the one Stop's cascade reads), kept open so
+        a caller can authorize and commit under the same topology execution
+        lease that spawn, terminate, and mandate withdrawal serialize on: no
+        such mutation can land between "is my descendant" and the caller's
+        write (#3168). The lease is not reentrant against a queued writer, so
+        the body must not call back into another lease-taking query.
+        """
+
+        if not isinstance(parent_did, str) or not parent_did:
+            raise ValueError("a descendant query needs a concrete parent DID")
         async with self.a2a_execution_lease():
             live_relations = await self._verified_spawn_relations_under_lease()
-            return await self._authoritative_stop_descendants_under_lease(
-                parent_did,
-                live_relations,
+            yield tuple(
+                await self._authoritative_stop_descendants_under_lease(
+                    parent_did,
+                    live_relations,
+                )
             )
 
     async def _authoritative_stop_descendants_under_lease(

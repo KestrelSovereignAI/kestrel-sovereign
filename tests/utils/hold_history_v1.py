@@ -87,7 +87,10 @@ async def rewind_to_v1_history_anchor(db: Any, store: Any) -> bytes:
     migration adds is taken away.
     """
 
-    from kestrel_sovereign.hold.state import _HISTORY_ANCHOR_V2_MIGRATION
+    from kestrel_sovereign.hold.state import (
+        _HISTORY_ANCHOR_V2_MIGRATION,
+        _HISTORY_ANCHOR_V3_MIGRATION,
+    )
 
     rows = await v1_receipt_rows(db)
     if getattr(db, "backend_type", "") == "postgres":
@@ -116,10 +119,100 @@ async def rewind_to_v1_history_anchor(db: Any, store: Any) -> bytes:
         await db.execute("DROP TABLE hold_receipts")
         await db.execute("ALTER TABLE hold_receipts_v1 RENAME TO hold_receipts")
     await db.execute(
-        "DELETE FROM hold_schema_migrations WHERE name = ?",
-        (_HISTORY_ANCHOR_V2_MIGRATION,),
+        "DELETE FROM hold_schema_migrations WHERE name IN (?, ?)",
+        (_HISTORY_ANCHOR_V2_MIGRATION, _HISTORY_ANCHOR_V3_MIGRATION),
     )
     assert not await db.column_exists("hold_receipts", "authority")
     anchor = v1_history_anchor(rows)
+    await publish_history_head(store, anchor)
+    return anchor
+
+
+V2_HISTORY_ANCHOR_HEADER = b"kestrel-hold-history-v2\n"
+V2_RECEIPT_COLUMNS = f"{V1_RECEIPT_COLUMNS}, authority"
+_WIDENED_SCOPE_CHECK = "CHECK (scope IN ('host', 'agent', 'mandate'))"
+_NARROW_SCOPE_CHECK = "CHECK (scope IN ('host', 'agent'))"
+_SCOPED_TABLES = (
+    "hold_latches",
+    "hold_receipts",
+    "hold_receipt_witnesses",
+    "hold_receipt_content_witnesses",
+)
+
+
+def v2_history_anchor(rows: Iterable[Any]) -> bytes:
+    """The whole-history anchor a v2 release (#3166) wrote for these rows.
+
+    Pinned independently of the runtime for the same reason as the v1 copy.
+    """
+
+    rows = tuple(rows)
+    digest = hashlib.sha256()
+    digest.update(V2_HISTORY_ANCHOR_HEADER)
+    for row in rows:
+        assert len(row) == 13, "a v2 anchor covers the v1 fields plus authority"
+        content = list(row[:12])
+        if row[12] != "sovereign":
+            content.append(row[12])
+        for value in (row[0], _framed_digest(content), row[12]):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return (
+        V2_HISTORY_ANCHOR_HEADER
+        + str(len(rows)).encode("ascii")
+        + b"\n"
+        + digest.hexdigest().encode("ascii")
+        + b"\n"
+    )
+
+
+async def rewind_to_v2_history_anchor(db: Any, store: Any) -> bytes:
+    """Put ``db`` into the shape a v2 release (#3166) left; return the anchor.
+
+    The scope CHECK is narrowed back to host/agent on every scoped table, the
+    v3 marker is removed, and every external head is the v2 anchor of the
+    same receipts. Every receipt, witness, and latch is preserved exactly.
+    """
+
+    from kestrel_sovereign.hold.state import _HISTORY_ANCHOR_V3_MIGRATION
+
+    rows = tuple(
+        await db.fetchall(
+            f"SELECT {V2_RECEIPT_COLUMNS} FROM hold_receipts ORDER BY receipt_id"
+        )
+    )
+    for table in _SCOPED_TABLES:
+        if getattr(db, "backend_type", "") == "postgres":
+            constraints = await db.fetchall(
+                "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = to_regclass(?) AND contype = 'c'",
+                (table,),
+            )
+            for name, definition in constraints:
+                if "'mandate'" in str(definition):
+                    await db.execute(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"')
+            await db.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {table}_scope_check "
+                f"{_NARROW_SCOPE_CHECK}"
+            )
+        else:
+            [row] = await db.fetchall(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            )
+            ddl = " ".join(row[0].split())
+            assert _WIDENED_SCOPE_CHECK in ddl
+            narrowed = ddl.replace(_WIDENED_SCOPE_CHECK, _NARROW_SCOPE_CHECK)
+            prefix = f"CREATE TABLE {table} ("
+            assert narrowed.startswith(prefix)
+            await db.rebuild_sqlite_table(
+                table, "CREATE TABLE {table} (" + narrowed[len(prefix):]
+            )
+    await db.execute(
+        "DELETE FROM hold_schema_migrations WHERE name = ?",
+        (_HISTORY_ANCHOR_V3_MIGRATION,),
+    )
+    anchor = v2_history_anchor(rows)
     await publish_history_head(store, anchor)
     return anchor

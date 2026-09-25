@@ -92,13 +92,14 @@ function latch({ scope = 'agent', target = EMMA, receipt = 'receipt-1', reason =
 
 // A stand-in for the host Hold door. `state` is the authoritative reply; every
 // mutation is recorded verbatim so a test can assert the exact wire request.
-function holdApi({ canHold = true, hostHold = null, agentHold = null, failRead = false } = {}) {
+function holdApi({ canHold = true, hostHold = null, agentHold = null, mandateHolds = [], failRead = false } = {}) {
     const calls = { read: 0, set: [], release: [] };
     const api = {
         setHostAgent() {},
         calls,
         hostHold,
         agentHold,
+        mandateHolds,
         failRead,
         canHold,
         setHostHoldResult: null,
@@ -109,6 +110,7 @@ function holdApi({ canHold = true, hostHold = null, agentHold = null, failRead =
             const sources = [];
             if (api.hostHold) sources.push('host');
             if (api.agentHold) sources.push('agent');
+            if (api.mandateHolds.length) sources.push('mandate');
             return {
                 can_hold: api.canHold,
                 host_hold: api.hostHold,
@@ -117,6 +119,7 @@ function holdApi({ canHold = true, hostHold = null, agentHold = null, failRead =
                     held: sources.length > 0,
                     sources,
                     agent_hold: api.agentHold,
+                    mandate_holds: api.mandateHolds,
                 }],
             };
         },
@@ -993,4 +996,23 @@ test('the kebab primitive builds in the document it is given, and still defaults
     } finally {
         other.window.close();
     }
+});
+
+test('an ancestor mandate hold renders as held, names its holder, and offers no card Resume', async () => {
+    const PARENT = 'did:agent:parent';
+    const mandate = { ...latch({ scope: 'mandate', receipt: 'mandate-1', reason: 'parent paused me', actor: PARENT }), holder_id: PARENT };
+    const api = holdApi({ mandateHolds: [mandate] });
+    const { el } = mountInto({ api });
+    await tick();
+    await tick();
+
+    const badge = el.querySelector('.agent-hold-badge');
+    assert.equal(badge.hidden, false, 'a mandate latch alone holds the agent');
+    assert.equal(badge.dataset.holdSources, 'mandate');
+    assert.equal(el.querySelector('.agent-hold-badge-label').textContent, 'Held by ancestor');
+    assert.equal(el.querySelector('.agent-hold-badge-actor').textContent, PARENT);
+    assert.equal(el.querySelector('.agent-hold-badge-reason').textContent, 'parent paused me');
+    // The card's Resume releases only the sovereign's agent latch; a mandate
+    // latch is released by its holder or through the host door by holder.
+    assert.equal(el.querySelector('.agent-resume-btn').hidden, true);
 });

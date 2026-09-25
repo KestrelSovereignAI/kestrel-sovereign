@@ -9,6 +9,10 @@ separate door for a deliberately different type. A console gesture that means
 The store owns idempotency (``operation_id``) and the release compare-and-set
 (``expected_hold_receipt_id``); this module resolves authority and the target,
 and projects the store's typed result onto the wire.
+
+A ``mandate`` latch is set only by an ancestor through the spawn feature's
+descendant-Hold door (#3168). This door never sets one, but the sovereign
+releases any latch, so it releases a mandate latch named by its holder.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from kestrel_sovereign.hold import (
     HoldState,
     HoldStateError,
     hold_latch_payload,
+    hold_mandate_payloads,
     hold_receipt_payload,
     require_context_hold_store,
 )
@@ -80,8 +85,11 @@ class HoldBody(BaseModel):
     operation_id: Annotated[
         str, Field(min_length=1, max_length=MAX_HOLD_OPERATION_ID_LENGTH)
     ]
+    holder_id: Annotated[
+        str | None, Field(min_length=1, max_length=MAX_HOLD_TARGET_ID_LENGTH)
+    ] = None
 
-    @field_validator("target_id", "reason", "operation_id")
+    @field_validator("target_id", "reason", "operation_id", "holder_id")
     @classmethod
     def validate_text(cls, value: str | None, info) -> str | None:
         return _non_blank(value, info.field_name)
@@ -183,6 +191,15 @@ def _resolve_target(request: Request, scope: HoldScope, target_id: str | None) -
     faults rather than sorted, at the wire, into "probably the caller's".
     """
 
+    if scope is HoldScope.MANDATE:
+        raise ApiHTTPException(
+            status_code=400,
+            code="hold_request_invalid",
+            message=(
+                "A mandate Hold is set only by the holding ancestor; the "
+                "sovereign holds an agent with the agent scope."
+            ),
+        )
     if scope is HoldScope.HOST:
         # The host scope has exactly one latch, so there is nothing to name.
         if target_id not in (None, HOST_HOLD_TARGET):
@@ -205,6 +222,53 @@ def _resolve_target(request: Request, scope: HoldScope, target_id: str | None) -
             message="No agent with that identity is hosted here.",
         )
     return target_id
+
+
+def _refuse_holder_outside_mandate(scope: HoldScope, holder_id: str | None) -> None:
+    if holder_id is not None and scope is not HoldScope.MANDATE:
+        raise ApiHTTPException(
+            status_code=400,
+            code="hold_request_invalid",
+            message="Only a mandate Hold names a holder.",
+        )
+
+
+async def _resolve_mandate_release(
+    store: Any, target_id: str | None, holder_id: str | None
+) -> tuple[str, str]:
+    """Bind a sovereign mandate release to a latch that exists.
+
+    Not to the live inventory: a mandate latch outlives its holder's mandate
+    and may outlive the target's hosting, and the sovereign must still be able
+    to release it. The release itself remains a compare-and-set on the
+    observed receipt, so this read only decides between 404 and the store.
+    """
+
+    if target_id is None or holder_id is None:
+        raise ApiHTTPException(
+            status_code=400,
+            code="hold_target_required",
+            message="A mandate Hold release names both the target and its holder.",
+        )
+    try:
+        latch = await store.get_hold(
+            HoldScope.MANDATE, target_id, holder_id=holder_id
+        )
+    except ValueError as error:
+        raise ApiHTTPException(
+            status_code=400,
+            code="hold_request_invalid",
+            message="That target and holder cannot name a mandate Hold.",
+        ) from error
+    except _EXPECTED_HOLD_STORE_FAILURES as error:
+        raise _refuse_store_failure(error) from error
+    if latch is None:
+        raise ApiHTTPException(
+            status_code=404,
+            code="hold_latch_unknown",
+            message="No mandate Hold by that holder is set on that target.",
+        )
+    return target_id, holder_id
 
 
 def _mutation_payload(mutation: HoldMutation) -> dict[str, Any]:
@@ -260,15 +324,31 @@ def _active_latches(
     return {(latch.scope, latch.target_id): latch for latch in snapshot}
 
 
-def _agent_entry(agent_id: str, host: Optional[HoldState], agent: Optional[HoldState]):
+def _mandates_by_subject(
+    snapshot: tuple[HoldState, ...],
+) -> dict[str, tuple[HoldState, ...]]:
+    grouped: dict[str, list[HoldState]] = {}
+    for latch in snapshot:
+        if latch.scope is HoldScope.MANDATE:
+            grouped.setdefault(latch.subject_id, []).append(latch)
+    return {subject: tuple(latches) for subject, latches in grouped.items()}
+
+
+def _agent_entry(
+    agent_id: str,
+    host: Optional[HoldState],
+    agent: Optional[HoldState],
+    mandates: tuple[HoldState, ...] = (),
+):
     # Compose through the runtime dataclass rather than an `or` here: "held"
     # is an authority rule, and the console must not own a second copy of it.
-    effective = EffectiveHoldState(host=host, agent=agent)
+    effective = EffectiveHoldState(host=host, agent=agent, mandates=mandates)
     return {
         "agent_id": agent_id,
         "held": effective.held,
         "sources": [source.value for source in effective.sources],
         "agent_hold": hold_latch_payload(agent),
+        "mandate_holds": hold_mandate_payloads(effective),
     }
 
 
@@ -290,18 +370,33 @@ async def host_hold_state(request: Request, response: Response):
     # own "every active latch from one stable snapshot" read: one protocol
     # entry, one locked history validation, every latch this door projects.
     try:
-        active = _active_latches(await store.read_boot_state())
+        snapshot = await store.read_boot_state()
     except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
+    active = _active_latches(snapshot)
+    mandates = _mandates_by_subject(snapshot)
     host = active.get((HoldScope.HOST, HOST_HOLD_TARGET))
     agents = [
-        _agent_entry(agent_id, host, active.get((HoldScope.AGENT, agent_id)))
+        _agent_entry(
+            agent_id,
+            host,
+            active.get((HoldScope.AGENT, agent_id)),
+            mandates.get(agent_id, ()),
+        )
         for agent_id in targets
     ]
     return {
         "can_hold": caller_is_sovereign(request),
         "host_hold": hold_latch_payload(host),
         "agents": agents,
+        # Every mandate latch, hosted target or not: a latch whose holder's
+        # mandate lapsed, or whose target moved, stays until the sovereign
+        # releases it and must never be invisible while it does (#3168).
+        "mandate_holds": [
+            hold_latch_payload(latch)
+            for latch in snapshot
+            if latch.scope is HoldScope.MANDATE
+        ],
     }
 
 
@@ -345,7 +440,7 @@ async def host_hold_receipts(
             raise ApiHTTPException(
                 status_code=400,
                 code="receipt_filter_invalid",
-                message="scope must be 'host' or 'agent'.",
+                message="scope must be 'host', 'agent' or 'mandate'.",
             ) from error
     agent_filter = bounded_filter_text(
         agent_id, "agent_id", max_length=MAX_HOLD_TARGET_ID_LENGTH
@@ -361,15 +456,19 @@ async def host_hold_receipts(
             )
         # Naming an agent means the agent latch, never the host one: a host
         # hold is not that agent's receipt even though it holds that agent.
-        scope_filter = HoldScope.AGENT
+        # With the mandate scope it means every holder's latch on that agent.
+        if scope_filter is not HoldScope.MANDATE:
+            scope_filter = HoldScope.AGENT
 
+    mandate_subject = scope_filter is HoldScope.MANDATE and agent_filter is not None
     store = _hold_store(request)
     try:
         page = await store.list_receipts(
             since=window_start,
             until=window_end,
             scope=scope_filter,
-            target_id=agent_filter,
+            target_id=None if mandate_subject else agent_filter,
+            subject_id=agent_filter if mandate_subject else None,
             after=after,
             limit=page_size,
         )
@@ -394,6 +493,7 @@ async def set_host_hold(request: Request, response: Response, body: HoldBody):
     # agent from an unknown one, so refusing after it would be a probe.
     actor_id = sovereign_actor_id(request)
     store = _hold_store(request)
+    _refuse_holder_outside_mandate(body.scope, body.holder_id)
     target_id = _resolve_target(request, body.scope, body.target_id)
     try:
         mutation = await store.set_hold(
@@ -420,15 +520,25 @@ async def release_host_hold(
 
     actor_id = sovereign_actor_id(request)
     store = _hold_store(request)
-    target_id = _resolve_target(request, body.scope, body.target_id)
+    _refuse_holder_outside_mandate(body.scope, body.holder_id)
+    holder: dict[str, str] = {}
+    if body.scope is HoldScope.MANDATE:
+        target_id, holder["holder_id"] = await _resolve_mandate_release(
+            store, body.target_id, body.holder_id
+        )
+    else:
+        target_id = _resolve_target(request, body.scope, body.target_id)
     try:
         mutation = await store.release_hold(
             scope=body.scope,
             target_id=target_id,
+            **holder,
             actor_id=actor_id,
             reason=body.reason,
             operation_id=body.operation_id,
             expected_hold_receipt_id=body.expected_hold_receipt_id,
+            # The sovereign releases any latch, a holder's mandate latch
+            # included; the store refuses this authority only for a set.
             authority=HoldAuthority.SOVEREIGN,
         )
     except _EXPECTED_HOLD_STORE_FAILURES as error:

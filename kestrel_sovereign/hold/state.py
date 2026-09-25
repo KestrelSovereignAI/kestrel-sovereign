@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import AsyncExitStack, asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
@@ -63,6 +65,24 @@ _HISTORY_ANCHOR_MAX_BYTES = 256
 # backfills ``hold_receipts.authority``; its presence is what says the
 # database's whole-history anchor uses the v2 projection.
 _HISTORY_ANCHOR_V2_MIGRATION = "hold_history_anchor_v2"
+# Recorded by the one schema transaction that widens every scoped Hold table
+# to admit ``mandate`` latches (#3168) and re-anchors the history under v3.
+# The v3 header is what makes a v2 binary refuse this database outright rather
+# than meet its first mandate row as an unexplained scope.
+_HISTORY_ANCHOR_V3_MIGRATION = "hold_history_anchor_v3"
+_HOLD_SCOPE_CHECK = "scope IN ('host', 'agent', 'mandate')"
+# The one pre-v3 spelling the widening migration replaces.
+_LEGACY_SCOPE_CHECK_PATTERN = re.compile(
+    r"CHECK\s*\(\s*scope\s+IN\s*\(\s*'host'\s*,\s*'agent'\s*\)\s*\)",
+    re.IGNORECASE,
+)
+# Every table keyed by ``(scope, target_id)`` carries the scope CHECK.
+_HOLD_SCOPED_TABLES = (
+    "hold_latches",
+    "hold_receipts",
+    "hold_receipt_witnesses",
+    "hold_receipt_content_witnesses",
+)
 _SQLITE_CUSTODY_MARKER_MAX_BYTES = (
     len(_SQLITE_CUSTODY_MARKER_HEADER) + 65 + _HISTORY_ANCHOR_MAX_BYTES
 )
@@ -193,10 +213,16 @@ class _HistoryAnchorFormat(Enum):
     V1 = b"kestrel-hold-history-v1\n"
     # The v1 fields plus the recorded authority of every receipt.
     V2 = b"kestrel-hold-history-v2\n"
+    # The v2 projection over a schema that admits ``mandate`` latches (#3168).
+    V3 = b"kestrel-hold-history-v3\n"
 
     @property
     def header(self) -> bytes:
         return self.value
+
+    @property
+    def order(self) -> int:
+        return _HISTORY_ANCHOR_FORMAT_ORDER.index(self)
 
     @property
     def receipt_width(self) -> int:
@@ -214,12 +240,26 @@ class _HistoryAnchorFormat(Enum):
         return f"SELECT {columns} FROM hold_receipts ORDER BY receipt_id"
 
 
+_HISTORY_ANCHOR_FORMAT_ORDER = (
+    _HistoryAnchorFormat.V1,
+    _HistoryAnchorFormat.V2,
+    _HistoryAnchorFormat.V3,
+)
+_HISTORY_ANCHOR_MIGRATIONS = (
+    _HISTORY_ANCHOR_V2_MIGRATION,
+    _HISTORY_ANCHOR_V3_MIGRATION,
+)
+
+
 def _history_anchor_format_for(
     migration_names: Iterable[object],
 ) -> _HistoryAnchorFormat:
     """The anchor format a database's recorded migrations commit it to."""
 
-    if _HISTORY_ANCHOR_V2_MIGRATION in set(migration_names):
+    names = set(migration_names)
+    if _HISTORY_ANCHOR_V3_MIGRATION in names:
+        return _HistoryAnchorFormat.V3
+    if _HISTORY_ANCHOR_V2_MIGRATION in names:
         return _HistoryAnchorFormat.V2
     return _HistoryAnchorFormat.V1
 
@@ -270,10 +310,17 @@ def _backfilled_projection_of(rows: Iterable[Any]) -> tuple[Any, ...]:
 
 
 class HoldScope(str, Enum):
-    """The two scopes on which a durable Hold may latch."""
+    """The scopes on which a durable Hold may latch.
+
+    ``host`` and ``agent`` latches are set by the sovereign. A ``mandate``
+    latch is set by one ancestor on one of its signed spawned descendants
+    (#3168); it is keyed by the pair ``(target, holder)`` so two ancestors
+    never share a latch and no holder can reach a latch another authority set.
+    """
 
     HOST = "host"
     AGENT = "agent"
+    MANDATE = "mandate"
 
 
 class HoldAction(str, Enum):
@@ -293,11 +340,13 @@ class HoldAuthority(str, Enum):
     Recorded by the door that performed the mutation, never inferred from the
     shape of the actor string. The sovereign host door is the only writer
     today; every receipt written before this column existed was written by it,
-    which is why the v1 backfill is ``sovereign``. A new door (the #3168
-    mandate door) adds its own member and records it explicitly.
+    which is why the v1 backfill is ``sovereign``. ``mandate`` is recorded by
+    the descendant-Hold door (#3168): the actor is the holder, acting under
+    its verified signed spawn lineage over the target.
     """
 
     SOVEREIGN = "sovereign"
+    MANDATE = "mandate"
 
 
 class HoldStateError(RuntimeError):
@@ -310,6 +359,96 @@ class HoldIdempotencyConflict(HoldStateError):
 
 class HoldCorruptStateError(HoldStateError):
     """Persisted Hold state cannot be interpreted safely."""
+
+
+class HoldAuthorityMismatch(HoldStateError):
+    """A mutation's recorded authority cannot act on the latch it names.
+
+    The store's own backstop for the door rules: only a holder sets its
+    mandate latch, only that holder or the sovereign releases it, and the
+    mandate authority never reaches a host or agent latch.
+    """
+
+
+def mandate_latch_key(target_id: str, holder_id: str) -> str:
+    """The durable latch key of the mandate Hold ``holder_id`` set on ``target_id``.
+
+    Canonical compact JSON of ``[target, holder]``: length-unambiguous, so no
+    identity character can forge a split, and prefix-free on the target, so
+    every mandate latch on one target shares :func:`_mandate_key_prefix`.
+    """
+
+    target = _required_text(target_id, "target_id")
+    holder = _required_text(holder_id, "holder_id")
+    if target == holder:
+        raise ValueError("a mandate Hold cannot target its own holder")
+    return json.dumps([target, holder], ensure_ascii=False, separators=(",", ":"))
+
+
+def _mandate_key_prefix(target_id: str) -> str:
+    encoded = json.dumps([target_id], ensure_ascii=False, separators=(",", ":"))
+    return encoded[:-1] + ","
+
+
+def parse_mandate_latch_key(key: object) -> tuple[str, str]:
+    """Return ``(target, holder)`` of a canonical mandate latch key."""
+
+    if not isinstance(key, str):
+        raise ValueError("mandate Hold key must be text")
+    try:
+        parts = json.loads(key)
+    except ValueError as exc:
+        raise ValueError("mandate Hold key is not canonical") from exc
+    if (
+        not isinstance(parts, list)
+        or len(parts) != 2
+        or not all(isinstance(part, str) for part in parts)
+    ):
+        raise ValueError("mandate Hold key is not canonical")
+    if mandate_latch_key(parts[0], parts[1]) != key:
+        raise ValueError("mandate Hold key is not canonical")
+    return parts[0], parts[1]
+
+
+def _scope_subject(scope: "HoldScope", target_id: str) -> str:
+    if scope is HoldScope.MANDATE:
+        return parse_mandate_latch_key(target_id)[0]
+    return target_id
+
+
+def _scope_holder(scope: "HoldScope", target_id: str) -> Optional[str]:
+    if scope is HoldScope.MANDATE:
+        return parse_mandate_latch_key(target_id)[1]
+    return None
+
+
+def _validate_door_authority(
+    *,
+    action: "HoldAction",
+    scope: "HoldScope",
+    target_id: str,
+    actor_id: str,
+    authority: "HoldAuthority",
+) -> None:
+    """Refuse a mutation whose authority cannot address this latch."""
+
+    if scope is not HoldScope.MANDATE:
+        if authority is not HoldAuthority.SOVEREIGN:
+            raise HoldAuthorityMismatch(
+                "only the sovereign may mutate a host or agent Hold"
+            )
+        return
+    holder = parse_mandate_latch_key(target_id)[1]
+    if authority is HoldAuthority.MANDATE:
+        if actor_id != holder:
+            raise HoldAuthorityMismatch(
+                "a mandate Hold is mutable only by its own holder"
+            )
+        return
+    if action is HoldAction.HOLD:
+        raise HoldAuthorityMismatch(
+            "a mandate Hold is set only by a verified ancestor"
+        )
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1219,13 @@ def _domain_error_from_chain(error: BaseException) -> Optional[HoldStateError]:
 
 @dataclass(frozen=True)
 class HoldState:
+    """One active latch.
+
+    ``target_id`` is the durable latch key. For a mandate latch that key is
+    the ``(target, holder)`` pair; read :attr:`subject_id` and
+    :attr:`holder_id` rather than interpreting it.
+    """
+
     scope: HoldScope
     target_id: str
     reason: str
@@ -1088,17 +1234,38 @@ class HoldState:
     hold_receipt_id: str
     revision: int
 
+    @property
+    def subject_id(self) -> str:
+        """The host marker or agent DID this latch withholds work from."""
+
+        return _scope_subject(self.scope, self.target_id)
+
+    @property
+    def holder_id(self) -> Optional[str]:
+        """The ancestor DID that owns a mandate latch; ``None`` otherwise."""
+
+        return _scope_holder(self.scope, self.target_id)
+
 
 @dataclass(frozen=True)
 class EffectiveHoldState:
-    """Independent latches applying to one agent."""
+    """Independent latches applying to one agent.
+
+    Every latch composes: the agent is held while ANY of them is set, and
+    releasing one never releases another (#3135 decision 10, #3168).
+    """
 
     host: Optional[HoldState]
     agent: Optional[HoldState]
+    mandates: tuple[HoldState, ...] = ()
 
     @property
     def held(self) -> bool:
-        return self.host is not None or self.agent is not None
+        return (
+            self.host is not None
+            or self.agent is not None
+            or bool(self.mandates)
+        )
 
     @property
     def sources(self) -> tuple[HoldScope, ...]:
@@ -1107,6 +1274,8 @@ class EffectiveHoldState:
             sources.append(HoldScope.HOST)
         if self.agent is not None:
             sources.append(HoldScope.AGENT)
+        if self.mandates:
+            sources.append(HoldScope.MANDATE)
         return tuple(sources)
 
 
@@ -1125,6 +1294,14 @@ class HoldReceipt:
     prior_hold_receipt_id: str
     resulting_hold_receipt_id: str
     authority: HoldAuthority
+
+    @property
+    def subject_id(self) -> str:
+        return _scope_subject(self.scope, self.target_id)
+
+    @property
+    def holder_id(self) -> Optional[str]:
+        return _scope_holder(self.scope, self.target_id)
 
 
 @dataclass(frozen=True)
@@ -1169,27 +1346,43 @@ def hold_latch_payload(latch: Optional[HoldState]) -> Optional[dict[str, Any]]:
 
     if latch is None:
         return None
-    return {
+    payload: dict[str, Any] = {
         "scope": latch.scope.value,
-        "target_id": latch.target_id,
+        "target_id": latch.subject_id,
         "reason": latch.reason,
         "actor_id": latch.actor_id,
         "set_at": latch.set_at,
         "hold_receipt_id": latch.hold_receipt_id,
         "revision": latch.revision,
     }
+    if latch.scope is HoldScope.MANDATE:
+        payload["holder_id"] = latch.holder_id
+    return payload
+
+
+def hold_mandate_payloads(
+    effective: "EffectiveHoldState",
+) -> list[dict[str, Any]]:
+    """Wire projection of every mandate latch in one effective snapshot."""
+
+    payloads: list[dict[str, Any]] = []
+    for latch in effective.mandates:
+        payload = hold_latch_payload(latch)
+        if payload is not None:
+            payloads.append(payload)
+    return payloads
 
 
 def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
     """The wire projection of one immutable Hold receipt."""
 
-    return {
+    payload: dict[str, Any] = {
         "receipt_id": receipt.receipt_id,
         "operation_id": receipt.operation_id,
         "action": receipt.action.value,
         "disposition": receipt.disposition.value,
         "scope": receipt.scope.value,
-        "target_id": receipt.target_id,
+        "target_id": receipt.subject_id,
         "reason": receipt.reason,
         "actor_id": receipt.actor_id,
         "occurred_at": receipt.occurred_at,
@@ -1198,6 +1391,9 @@ def hold_receipt_payload(receipt: HoldReceipt) -> dict[str, Any]:
         "resulting_hold_receipt_id": receipt.resulting_hold_receipt_id,
         "authority": receipt.authority.value,
     }
+    if receipt.scope is HoldScope.MANDATE:
+        payload["holder_id"] = receipt.holder_id
+    return payload
 
 
 def hold_initialization_witness_path(control_db_path: str | Path) -> Path:
@@ -1429,7 +1625,7 @@ def _unused_schema_refusal(
     unknown = sorted(
         repr(name)
         for name in migration_names
-        if name not in (_WITNESS_BACKFILL, _HISTORY_ANCHOR_V2_MIGRATION)
+        if name not in (_WITNESS_BACKFILL, *_HISTORY_ANCHOR_MIGRATIONS)
     )
     if unknown:
         return "hold_schema_migrations records unknown migration " + ", ".join(
@@ -1494,15 +1690,44 @@ def _coerce_scope(value: HoldScope | str) -> HoldScope:
     try:
         return HoldScope(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("scope must be 'host' or 'agent'") from exc
+        raise ValueError("scope must be 'host', 'agent' or 'mandate'") from exc
 
 
-def _target(scope: HoldScope, target_id: Optional[str]) -> str:
+def _target(
+    scope: HoldScope,
+    target_id: Optional[str],
+    holder_id: Optional[str] = None,
+) -> str:
+    """Resolve a scope's durable latch key from its caller-facing identities."""
+
+    if scope is HoldScope.MANDATE:
+        if holder_id is None:
+            raise ValueError("a mandate Hold names its holder")
+        return mandate_latch_key(
+            _required_text(target_id, "target_id"),
+            _required_text(holder_id, "holder_id"),
+        )
+    if holder_id is not None:
+        raise ValueError("only a mandate Hold has a holder")
     if scope is HoldScope.HOST:
         if target_id not in (None, "", HOST_HOLD_TARGET):
             raise ValueError("host Hold target is fixed by the host control store")
         return HOST_HOLD_TARGET
     return _required_text(target_id, "target_id")
+
+
+def _assert_scope_key(scope: HoldScope, target_id: str, *, label: str) -> None:
+    """Fail closed on a persisted key its scope cannot interpret."""
+
+    if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
+        raise HoldCorruptStateError(f"{label} has a foreign host identity")
+    if scope is HoldScope.MANDATE:
+        try:
+            parse_mandate_latch_key(target_id)
+        except ValueError as exc:
+            raise HoldCorruptStateError(
+                f"{label} has an invalid mandate identity"
+            ) from exc
 
 
 def _exact_nonnegative_revision(value: object) -> int:
@@ -1562,6 +1787,7 @@ def _latch_from_row(row: Any) -> Optional[HoldState]:
         raise HoldCorruptStateError("hold latch is missing its target identity")
     if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
         raise HoldCorruptStateError("host hold latch has a foreign target")
+    _assert_scope_key(scope, target_id, label="hold latch")
     evidence = (hold_receipt_id, reason, actor_id, set_at)
     if active == 0:
         if any(evidence):
@@ -1652,6 +1878,19 @@ def _receipt_from_row(row: Any) -> HoldReceipt:
     _aware_timestamp(receipt.occurred_at, "receipt")
     if receipt.scope is HoldScope.HOST and receipt.target_id != HOST_HOLD_TARGET:
         raise HoldCorruptStateError("hold receipt invariant is invalid")
+    _assert_scope_key(receipt.scope, receipt.target_id, label="hold receipt")
+    try:
+        _validate_door_authority(
+            action=receipt.action,
+            scope=receipt.scope,
+            target_id=receipt.target_id,
+            actor_id=receipt.actor_id,
+            authority=receipt.authority,
+        )
+    except HoldAuthorityMismatch as exc:
+        raise HoldCorruptStateError(
+            "hold receipt records an authority that cannot act on its latch"
+        ) from exc
 
     prior = receipt.prior_hold_receipt_id
     resulting = receipt.resulting_hold_receipt_id
@@ -1732,8 +1971,7 @@ def _snapshot_target(row: Any, *, label: str) -> tuple[HoldScope, str]:
         raise HoldCorruptStateError(f"{label} is missing its identity")
     if target_id != target_id.strip():
         raise HoldCorruptStateError(f"{label} has a noncanonical identity")
-    if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
-        raise HoldCorruptStateError(f"{label} has a foreign host identity")
+    _assert_scope_key(scope, target_id, label=label)
     return scope, target_id
 
 
@@ -3189,8 +3427,8 @@ class HoldStore:
         """
 
         migrated = await self._db.fetchall(
-            "SELECT name FROM hold_schema_migrations WHERE name = ?",
-            (_HISTORY_ANCHOR_V2_MIGRATION,),
+            "SELECT name FROM hold_schema_migrations WHERE name IN (?, ?)",
+            _HISTORY_ANCHOR_MIGRATIONS,
         )
         return _history_anchor_format_for(row[0] for row in migrated)
 
@@ -3269,7 +3507,9 @@ class HoldStore:
 
         payload = cls._validate_history_anchor_payload(payload)
         payload_format = _payload_history_anchor_format(payload)
-        if payload_format is anchor_format:
+        if payload_format.receipt_width == anchor_format.receipt_width:
+            # Same projection (v2 and v3 differ only in what the schema admits,
+            # which no receipt of an unchanged history can reflect).
             projected: Optional[tuple[Any, ...]] = tuple(rows)
         elif payload_format is _HistoryAnchorFormat.V1:
             projected = _v1_projection_of(rows)
@@ -3289,19 +3529,18 @@ class HoldStore:
         *,
         anchor_format: _HistoryAnchorFormat,
     ) -> bool:
-        """Whether ``predecessor`` is this migrated history's v1 anchor.
+        """Whether ``predecessor`` is this migrated history's earlier anchor.
 
-        The v2 migration re-anchors an unchanged history under the v2
-        projection. Its stable anchor until publication is therefore the v1
-        anchor of exactly the same receipts, every one with the backfilled
-        authority.
+        An anchor-format migration re-anchors an unchanged history under a
+        later format. Its stable anchor until publication is therefore the
+        anchor of exactly the same receipts in an earlier format (for v1,
+        every one with the backfilled authority).
         """
 
         predecessor = cls._validate_history_anchor_payload(predecessor)
         return (
-            anchor_format is _HistoryAnchorFormat.V2
-            and _payload_history_anchor_format(predecessor)
-            is _HistoryAnchorFormat.V1
+            _payload_history_anchor_format(predecessor).order
+            < anchor_format.order
             and cls._history_payload_describes(
                 predecessor, current_rows, anchor_format=anchor_format
             )
@@ -3331,7 +3570,7 @@ class HoldStore:
         *,
         anchor_format: _HistoryAnchorFormat,
     ) -> bool:
-        """Whether ``candidate`` is the v2 re-anchor of this un-migrated history.
+        """Whether ``candidate`` re-anchors this un-migrated history later.
 
         The migration stages that candidate before its database transaction
         commits. Finding it beside a database that is still v1 and still
@@ -3344,9 +3583,7 @@ class HoldStore:
 
         candidate = cls._validate_history_anchor_payload(candidate)
         return (
-            anchor_format is _HistoryAnchorFormat.V1
-            and _payload_history_anchor_format(candidate)
-            is _HistoryAnchorFormat.V2
+            _payload_history_anchor_format(candidate).order > anchor_format.order
             and cls._history_payload_describes(
                 candidate, current_rows, anchor_format=anchor_format
             )
@@ -3376,7 +3613,7 @@ class HoldStore:
         for row in rows:
             receipt = _receipt_from_row(row)
             values = [receipt.receipt_id, _receipt_content_digest(row)]
-            if anchor_format is _HistoryAnchorFormat.V2:
+            if anchor_format is not _HistoryAnchorFormat.V1:
                 values.append(receipt.authority.value)
             for value in values:
                 encoded = value.encode("utf-8")
@@ -4040,7 +4277,7 @@ class HoldStore:
                 "set_at TEXT NOT NULL DEFAULT '', "
                 "revision INTEGER NOT NULL DEFAULT 0, "
                 "PRIMARY KEY (scope, target_id), "
-                "CHECK (scope IN ('host', 'agent')), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
                 "CHECK (scope <> 'host' OR target_id = 'host'), "
                 "CHECK (active IN (0, 1)), "
                 "CHECK (revision >= 0))"
@@ -4063,7 +4300,7 @@ class HoldStore:
                 "CHECK (action IN ('hold', 'release')), "
                 "CHECK (disposition IN "
                 "('applied', 'already_in_state', 'refused_stale')), "
-                "CHECK (scope IN ('host', 'agent')), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
             # Additive: a receipt written before this column existed was
@@ -4098,7 +4335,7 @@ class HoldStore:
                 "target_id TEXT NOT NULL, "
                 "receipt_count INTEGER NOT NULL DEFAULT 0, "
                 "PRIMARY KEY (scope, target_id), "
-                "CHECK (scope IN ('host', 'agent')), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
                 "CHECK (scope <> 'host' OR target_id = 'host'), "
                 "CHECK (receipt_count >= 0))"
             )
@@ -4108,7 +4345,7 @@ class HoldStore:
                 "scope TEXT NOT NULL, "
                 "target_id TEXT NOT NULL, "
                 "receipt_digest TEXT NOT NULL, "
-                "CHECK (scope IN ('host', 'agent')), "
+                f"CHECK ({_HOLD_SCOPE_CHECK}), "
                 "CHECK (scope <> 'host' OR target_id = 'host'))"
             )
             await self._db.execute(
@@ -4180,6 +4417,14 @@ class HoldStore:
                         f"Hold {table} schema cannot resolve its required "
                         f"{conflict_label} conflict key"
                     ) from exc
+            # After every legacy conflict key is proven, so a rebuild copies
+            # rows the widened table accepts and a defect keeps its own name.
+            if await self._widen_scope_checks():
+                # A SQLite rebuild drops the receipt table's feed trigger with
+                # the old table; re-establish it inside this transaction.
+                await ensure_feed_sequence(
+                    self._db, table="hold_receipts", lock_key=_HISTORY_LOCK_KEY
+                )
             migration_complete = await self._db.fetchone(
                 "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
                 (_WITNESS_BACKFILL,),
@@ -4261,57 +4506,142 @@ class HoldStore:
                 initialized=initialized
             )
 
+    async def _widen_scope_checks(self) -> bool:
+        """Admit ``mandate`` wherever a scope CHECK forbids it (#3168).
+
+        Runs once, in the schema transaction that records the v3 anchor
+        migration, and only while that marker is absent. It widens exactly
+        the ``scope IN ('host', 'agent')`` constraint and nothing else: a
+        table created by this release already admits ``mandate``, and a legacy
+        table with no scope CHECK already does too, so neither is touched and
+        every other constraint keeps whatever shape the table had (the
+        runtime validators, not a migration, name a legacy row's defect).
+        PostgreSQL swaps the constraint in place; SQLite has no ``ALTER
+        CONSTRAINT``, so its table is rebuilt from its own DDL with only that
+        clause widened. Returns whether any SQLite table was rebuilt.
+        """
+
+        migrated = await self._db.fetchone(
+            "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
+            (_HISTORY_ANCHOR_V3_MIGRATION,),
+        )
+        if migrated is not None:
+            return False
+        rebuilt = False
+        for table in _HOLD_SCOPED_TABLES:
+            try:
+                if getattr(self._db, "backend_type", "") == "postgres":
+                    await self._widen_postgres_scope_check(table)
+                else:
+                    rebuilt = await self._widen_sqlite_scope_check(table) or rebuilt
+            except HoldStateError:
+                raise
+            except Exception as exc:
+                raise HoldCorruptStateError(
+                    f"Hold {table} schema cannot admit mandate latches"
+                ) from exc
+        return rebuilt
+
+    async def _widen_sqlite_scope_check(self, table: str) -> bool:
+        row = await self._db.fetchone(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+        if row is None or not isinstance(row[0], str):
+            raise HoldCorruptStateError(f"Hold {table} schema is unreadable")
+        ddl = row[0]
+        widened, count = _LEGACY_SCOPE_CHECK_PATTERN.subn(
+            f"CHECK ({_HOLD_SCOPE_CHECK})", ddl
+        )
+        if not count:
+            return False
+        header = re.match(
+            rf'CREATE TABLE\s+(?:"{table}"|{table})\s*\(', widened
+        )
+        if header is None:
+            raise HoldCorruptStateError(f"Hold {table} schema is unreadable")
+        template = (
+            "CREATE TABLE {table} ("
+            + widened[header.end():].replace("{", "{{").replace("}", "}}")
+        )
+        await self._db.rebuild_sqlite_table(table, template)
+        return True
+
+    async def _widen_postgres_scope_check(self, table: str) -> None:
+        rows = await self._db.fetchall(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = to_regclass(?) AND contype = 'c'",
+            (table,),
+        )
+        dropped = False
+        for name, definition in rows:
+            text = str(definition)
+            if "'agent'" in text and "'mandate'" not in text:
+                quoted = '"' + str(name).replace('"', '""') + '"'
+                await self._db.execute(
+                    f"ALTER TABLE {table} DROP CONSTRAINT {quoted}"
+                )
+                dropped = True
+        if dropped:
+            await self._db.execute(
+                f"ALTER TABLE {table} ADD CONSTRAINT {table}_scope_v3_check "
+                f"CHECK ({_HOLD_SCOPE_CHECK})"
+            )
+
     async def _migrate_history_anchor_format(
         self,
         *,
         initialized: bool,
     ) -> bytes | None:
-        """Move the whole-history anchor to the v2 projection, exactly once.
+        """Move the whole-history anchor to the current format, exactly once.
 
         Runs inside the schema transaction that added and backfilled
-        ``authority``, so the database records the new format atomically with
-        the column. An initialized store already has a stable v1 anchor: it is
-        verified against the unchanged history first, so re-anchoring can
-        never bless a history the v1 anchor did not describe, and the v2 head
-        is then staged exactly like a mutation's, for the caller to publish
-        after commit. An uninitialized store has no stable anchor yet; its
-        bootstrap publishes the committed v2 head directly.
+        ``authority`` (v2) and widened the scope CHECK for mandate latches
+        (v3), so the database records the new format atomically with the
+        schema it describes. An initialized store already has a stable anchor
+        in its recorded format: it is verified against the unchanged history
+        first, so re-anchoring can never bless a history the old anchor did
+        not describe, and the v3 head is then staged exactly like a
+        mutation's, for the caller to publish after commit. An uninitialized
+        store has no stable anchor yet; its bootstrap publishes the committed
+        head directly.
         """
 
-        migrated = await self._db.fetchone(
-            "SELECT 1 FROM hold_schema_migrations WHERE name = ?",
-            (_HISTORY_ANCHOR_V2_MIGRATION,),
-        )
-        if migrated is not None:
+        recorded = await self._history_anchor_format()
+        if recorded is _HistoryAnchorFormat.V3:
             return None
         rows = tuple(
-            await self._db.fetchall(_HistoryAnchorFormat.V2.receipt_history_sql)
+            await self._db.fetchall(_HistoryAnchorFormat.V3.receipt_history_sql)
         )
-        legacy_rows = _v1_projection_of(rows)
-        if legacy_rows is None:
-            raise HoldCorruptStateError(
-                "Hold receipt history records an authority its v1 history "
-                "anchor never covered"
-            )
+        if recorded is _HistoryAnchorFormat.V1:
+            recorded_rows = _v1_projection_of(rows)
+            if recorded_rows is None:
+                raise HoldCorruptStateError(
+                    "Hold receipt history records an authority its v1 history "
+                    "anchor never covered"
+                )
+        else:
+            recorded_rows = rows
         if initialized:
             stable = await self._read_history_anchor()
             if stable is None:
                 raise HoldCorruptStateError("Hold history anchor is missing")
             if stable != self._history_anchor_payload_from_rows(
-                legacy_rows, anchor_format=_HistoryAnchorFormat.V1
+                recorded_rows, anchor_format=recorded
             ):
                 raise HoldCorruptStateError(
                     "Hold history anchor does not match receipt history"
                 )
-        await self._db.execute(
-            "INSERT INTO hold_schema_migrations (name) VALUES (?) "
-            "ON CONFLICT (name) DO NOTHING",
-            (_HISTORY_ANCHOR_V2_MIGRATION,),
-        )
+        for name in _HISTORY_ANCHOR_MIGRATIONS:
+            await self._db.execute(
+                "INSERT INTO hold_schema_migrations (name) VALUES (?) "
+                "ON CONFLICT (name) DO NOTHING",
+                (name,),
+            )
         if not initialized:
             return None
         payload = self._history_anchor_payload_from_rows(
-            rows, anchor_format=_HistoryAnchorFormat.V2
+            rows, anchor_format=_HistoryAnchorFormat.V3
         )
         await self._stage_external_history_candidate(payload)
         return payload
@@ -4446,10 +4776,9 @@ class HoldStore:
                     raise HoldCorruptStateError(
                         "Hold boot-state target has a noncanonical identity"
                     )
-                if scope is HoldScope.HOST and target_id != HOST_HOLD_TARGET:
-                    raise HoldCorruptStateError(
-                        "Hold boot-state target has a foreign host identity"
-                    )
+                _assert_scope_key(
+                    scope, target_id, label="Hold boot-state target"
+                )
                 targets.add((scope, target_id))
 
             active: list[HoldState] = []
@@ -4497,11 +4826,16 @@ class HoldStore:
         until: Optional[datetime] = None,
         scope: Optional[HoldScope] = None,
         target_id: Optional[str] = None,
+        subject_id: Optional[str] = None,
         after: Optional[int] = None,
         limit: int,
         newest_first: bool = False,
     ) -> HoldReceiptPage:
         """Read one bounded page of Hold history, oldest first by default.
+
+        ``target_id`` filters on the durable latch key. ``subject_id`` filters
+        on the agent a receipt's latch withholds work from; with scope
+        ``mandate`` it selects every holder's latch on that agent.
 
         ``newest_first`` reverses the order, and ``after`` then names the
         cursor the page continues BELOW. A bounded newest-first page is the
@@ -4546,6 +4880,12 @@ class HoldStore:
             not isinstance(target_id, str) or not target_id.strip()
         ):
             raise ValueError("Hold receipt target filter must be a concrete id")
+        if subject_id is not None and (
+            not isinstance(subject_id, str) or not subject_id.strip()
+        ):
+            raise ValueError("Hold receipt subject filter must be a concrete id")
+        if subject_id is not None and scope is not HoldScope.MANDATE:
+            raise ValueError("Hold receipt subject filter needs the mandate scope")
         if not isinstance(newest_first, bool):
             raise TypeError("Hold receipt page order must be a bool")
 
@@ -4559,6 +4899,7 @@ class HoldStore:
                         until=until,
                         scope=scope,
                         target_id=target_id,
+                        subject_id=subject_id,
                         after=after,
                         limit=limit,
                         newest_first=newest_first,
@@ -4591,6 +4932,7 @@ class HoldStore:
         after: Optional[int],
         limit: int,
         newest_first: bool = False,
+        subject_id: Optional[str] = None,
     ) -> tuple[Any, ...]:
         filters = ["feed_seq IS NOT NULL"]
         params: list[Any] = []
@@ -4610,6 +4952,10 @@ class HoldStore:
         if target_id is not None:
             filters.append("target_id = ?")
             params.append(target_id)
+        if subject_id is not None:
+            prefix = _mandate_key_prefix(subject_id)
+            filters.append("substr(target_id, 1, ?) = ?")
+            params.extend((len(prefix), prefix))
         if after is not None:
             # Strict keyset successor: a page boundary can neither repeat a
             # receipt nor skip one.
@@ -4991,11 +5337,14 @@ class HoldStore:
         operation_id: str,
         authority: HoldAuthority,
         target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> HoldMutation:
         """Set or replace one latch and append an immutable receipt.
 
         ``authority`` is required: the door that resolved the caller's
         authority records it, so a reader never infers it from ``actor_id``.
+        A ``mandate`` latch also names its ``holder_id``; only that holder,
+        acting under ``HoldAuthority.MANDATE``, may set it.
         """
 
         try:
@@ -5007,6 +5356,7 @@ class HoldStore:
                     operation_id=operation_id,
                     authority=authority,
                     target_id=target_id,
+                    holder_id=holder_id,
                 )
         except Exception as exc:
             # AsyncDatabase deliberately wraps transaction-body exceptions.
@@ -5026,13 +5376,21 @@ class HoldStore:
         operation_id: str,
         authority: HoldAuthority,
         target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
-        resolved_target = _target(resolved_scope, target_id)
+        resolved_target = _target(resolved_scope, target_id, holder_id)
         actor = _required_text(actor_id, "actor_id")
         why = _required_text(reason, "reason")
         operation = _required_text(operation_id, "operation_id")
         recorded_authority = _required_authority(authority)
+        _validate_door_authority(
+            action=HoldAction.HOLD,
+            scope=resolved_scope,
+            target_id=resolved_target,
+            actor_id=actor,
+            authority=recorded_authority,
+        )
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -5141,8 +5499,13 @@ class HoldStore:
         expected_hold_receipt_id: str,
         authority: HoldAuthority,
         target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> HoldMutation:
-        """Release exactly the observed latch, refusing a stale release."""
+        """Release exactly the observed latch, refusing a stale release.
+
+        A ``mandate`` latch is released by its own holder (``MANDATE``
+        authority) or by the sovereign; never by another holder.
+        """
 
         try:
             async with self._evidence_protocol():
@@ -5154,6 +5517,7 @@ class HoldStore:
                     expected_hold_receipt_id=expected_hold_receipt_id,
                     authority=authority,
                     target_id=target_id,
+                    holder_id=holder_id,
                 )
         except Exception as exc:
             domain_error = _domain_error_from_chain(exc)
@@ -5171,9 +5535,10 @@ class HoldStore:
         expected_hold_receipt_id: str,
         authority: HoldAuthority,
         target_id: Optional[str] = None,
+        holder_id: Optional[str] = None,
     ) -> HoldMutation:
         resolved_scope = _coerce_scope(scope)
-        resolved_target = _target(resolved_scope, target_id)
+        resolved_target = _target(resolved_scope, target_id, holder_id)
         actor = _required_text(actor_id, "actor_id")
         why = _required_text(reason, "reason")
         operation = _required_text(operation_id, "operation_id")
@@ -5181,6 +5546,13 @@ class HoldStore:
             expected_hold_receipt_id, "expected_hold_receipt_id"
         )
         recorded_authority = _required_authority(authority)
+        _validate_door_authority(
+            action=HoldAction.RELEASE,
+            scope=resolved_scope,
+            target_id=resolved_target,
+            actor_id=actor,
+            authority=recorded_authority,
+        )
 
         publication: bytes | None = None
         async with self._primary_mutation_transaction():
@@ -5256,11 +5628,18 @@ class HoldStore:
         return mutation
 
     async def get_hold(
-        self, scope: HoldScope | str, target_id: Optional[str] = None
+        self,
+        scope: HoldScope | str,
+        target_id: Optional[str] = None,
+        *,
+        holder_id: Optional[str] = None,
     ) -> Optional[HoldState]:
         try:
             async with self._evidence_protocol():
-                return await self._get_hold(scope, target_id)
+                resolved_scope = _coerce_scope(scope)
+                return await self._get_hold(
+                    resolved_scope, _target(resolved_scope, target_id, holder_id)
+                )
         except Exception as exc:
             domain_error = _domain_error_from_chain(exc)
             if domain_error is not None:
@@ -5274,8 +5653,14 @@ class HoldStore:
         *,
         validate_global_history: bool = True,
     ) -> Optional[HoldState]:
+        """Read one latch by its durable key (a mandate key is the pair)."""
+
         resolved_scope = _coerce_scope(scope)
-        resolved_target = _target(resolved_scope, target_id)
+        if resolved_scope is HoldScope.MANDATE:
+            resolved_target = _required_text(target_id, "target_id")
+            parse_mandate_latch_key(resolved_target)
+        else:
+            resolved_target = _target(resolved_scope, target_id)
         targets = ((resolved_scope, resolved_target),)
         async with self._db.transaction():
             await self._lock_read_targets(targets)
@@ -5321,6 +5706,7 @@ class HoldStore:
         async with self._db.transaction():
             await self._lock_read_targets(targets)
             await self._assert_host_latch_shape()
+            mandates = await self._read_subject_mandates_locked(agent)
             rows = await self._db.fetchall(
                 f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
                 "WHERE (scope = ? AND target_id = ?) "
@@ -5364,7 +5750,53 @@ class HoldStore:
                 validate_global_history=False,
             )
             await self._assert_global_history_intact()
-            return EffectiveHoldState(host=host, agent=agent_state)
+            return EffectiveHoldState(
+                host=host, agent=agent_state, mandates=mandates
+            )
+
+    async def _read_subject_mandates_locked(
+        self, subject_id: str
+    ) -> tuple[HoldState, ...]:
+        """Every active mandate latch on ``subject_id``, each proven.
+
+        The caller holds the shared history lock, which every writer takes
+        exclusively first, so the key set cannot change under this read.
+        Each row's key must parse back to ``subject_id``; a prefix collision
+        or a damaged key is corruption, never a silently skipped latch.
+        """
+
+        prefix = _mandate_key_prefix(subject_id)
+        rows = await self._db.fetchall(
+            f"SELECT {_LATCH_COLUMNS} FROM hold_latches "
+            "WHERE scope = ? AND substr(target_id, 1, ?) = ? "
+            "ORDER BY target_id",
+            (HoldScope.MANDATE.value, len(prefix), prefix),
+        )
+        keys = [str(row[1]) for row in rows]
+        if len(set(keys)) != len(keys):
+            raise HoldCorruptStateError("duplicate hold latch key")
+        if keys:
+            await self._lock_read_targets(
+                tuple((HoldScope.MANDATE, key) for key in keys),
+                history_locked=True,
+            )
+        active: list[HoldState] = []
+        for row in rows:
+            latch = _latch_from_row(row)
+            key = str(row[1])
+            if _scope_subject(HoldScope.MANDATE, key) != subject_id:
+                raise HoldCorruptStateError(
+                    "mandate hold query returned a foreign agent"
+                )
+            await self._validate_latch_projection(
+                latch,
+                HoldScope.MANDATE,
+                key,
+                validate_global_history=False,
+            )
+            if latch is not None:
+                active.append(latch)
+        return tuple(active)
 
     async def get_receipt(self, operation_id: str) -> Optional[HoldReceipt]:
         try:

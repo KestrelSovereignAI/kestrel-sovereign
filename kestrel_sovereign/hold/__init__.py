@@ -25,11 +25,17 @@ from .introspection import (
     inspect_self_hold,
     read_self_hold,
 )
+from .mandate import (
+    MandateHoldRefusal,
+    hold_descendant,
+    release_descendant_hold,
+)
 from .state import (
     HOST_HOLD_TARGET,
     EffectiveHoldState,
     HoldAction,
     HoldAuthority,
+    HoldAuthorityMismatch,
     HoldCorruptStateError,
     HoldDisposition,
     HoldFeedEntry,
@@ -42,7 +48,9 @@ from .state import (
     HoldStateError,
     HoldStore,
     hold_latch_payload,
+    hold_mandate_payloads,
     hold_receipt_payload,
+    mandate_latch_key,
 )
 
 __all__ = [
@@ -53,6 +61,7 @@ __all__ = [
     "HeldWorkDisposition",
     "HoldAction",
     "HoldAuthority",
+    "HoldAuthorityMismatch",
     "HoldCorruptStateError",
     "HoldDisposition",
     "HoldEnforcementUnavailableError",
@@ -67,16 +76,21 @@ __all__ = [
     "HoldStore",
     "HoldTurnRefusal",
     "InvalidHoldHistoryCursor",
+    "MandateHoldRefusal",
     "SelfHoldSnapshot",
     "SelfHoldStateUnavailable",
     "build_bound_host_context",
     "close_bound_host_context",
     "get_effective_hold_state",
+    "hold_descendant",
     "hold_latch_payload",
+    "hold_mandate_payloads",
     "hold_receipt_payload",
     "initialize_with_bound_hold_context",
     "inspect_self_hold",
+    "mandate_latch_key",
     "read_self_hold",
+    "release_descendant_hold",
     "require_context_hold_store",
     "require_turn_start_allowed",
     "source_owns_hold_disposition",

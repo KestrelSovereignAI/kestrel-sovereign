@@ -8,7 +8,7 @@ These pin the authority boundary, not only the happy path:
 * the actor role is the RECORDED authority, never a guess from the actor
   string (mutation: classify by DID prefix);
 * the census: every production caller of ``set_hold``/``release_hold`` is the
-  sovereign host door and names its authority.
+  sovereign host door or the mandate descendant door, and names its authority.
 """
 
 from __future__ import annotations
@@ -371,7 +371,17 @@ async def test_an_entry_too_large_for_the_channel_is_withheld_not_cut(
 
 
 @pytest.mark.parametrize(
-    "cursor", ["garbage", "1", "1:2:3", "0:new", "-1:new", "new:1.5", "new:" + "9" * 20]
+    "cursor",
+    [
+        "garbage",
+        "1",
+        "1:2",
+        "1:2:3:4",
+        "0:new:new",
+        "-1:new:new",
+        "new:1.5:new",
+        "new:new:" + "9" * 20,
+    ],
 )
 @pytest.mark.asyncio
 async def test_a_cursor_this_tool_did_not_issue_is_refused(hold_db, cursor):
@@ -398,7 +408,7 @@ async def test_a_forged_cursor_cannot_reach_another_agents_history(hold_db):
     )
 
     # A cursor positioned above every receipt in the store.
-    result = await inspect_self_hold(_Agent(SELF, store), cursor="new:999999")
+    result = await inspect_self_hold(_Agent(SELF, store), cursor="new:999999:end")
 
     assert [r["reason"] for r in result["history"]["receipts"]] == ["mine"]
     assert "peer-only secret reason" not in json.dumps(result)
@@ -429,7 +439,7 @@ async def test_a_peer_hold_is_never_visible_to_the_subject(hold_db):
     result = await inspect_self_hold(_Agent(SELF, store))
 
     assert result["state"] == "not_held"
-    assert result["latches"] == {"host": None, "agent": None}
+    assert result["latches"] == {"host": None, "agent": None, "mandate": []}
     assert result["history"]["receipts"] == []
     assert result["history"]["episodes"] == []
     assert "peer-only secret reason" not in json.dumps(result)
@@ -467,7 +477,9 @@ async def test_a_foreign_receipt_from_the_store_fails_closed(hold_db):
         async def get_receipt_by_id(self, receipt_id):
             return await store.get_receipt_by_id(receipt_id)
 
-        async def list_receipts(self, *, scope, target_id, after, limit, newest_first):
+        async def list_receipts(
+            self, *, scope, after, limit, newest_first, target_id=None, subject_id=None
+        ):
             return await store.list_receipts(
                 scope=scope, after=after, limit=limit, newest_first=newest_first
             )
@@ -808,20 +820,29 @@ def _hold_mutation_calls():
     return calls
 
 
-def test_every_hold_mutation_is_the_sovereign_host_door():
-    """A second door (#3168) fails here until it records its own authority.
+def test_every_hold_mutation_is_a_known_door_recording_its_authority():
+    """Exactly two doors mutate Hold, each recording the authority it acted under.
 
-    Every existing receipt is backfilled as ``sovereign`` because this door
-    was the only writer. That backfill, and every role an agent is told, stays
-    true only while this set is exactly the host door.
+    The sovereign host door (#3159) and the mandate descendant door (#3168).
+    Every existing receipt is backfilled as ``sovereign`` because the host door
+    was once the only writer; the mandate door records ``mandate`` explicitly.
+    A third door fails here until it is named and records its own authority.
     """
 
     calls = _hold_mutation_calls()
-    assert {path for path, _node in calls} == {"kestrel_sovereign/endpoints/hold.py"}
-    assert sorted(node.func.attr for _path, node in calls) == [
-        "release_hold",
-        "set_hold",
-    ]
-    for _path, node in calls:
+    by_door: dict[str, list[tuple[str, str]]] = {}
+    for path, node in calls:
         [authority] = [kw.value for kw in node.keywords if kw.arg == "authority"]
-        assert ast.unparse(authority) == "HoldAuthority.SOVEREIGN"
+        by_door.setdefault(path, []).append(
+            (node.func.attr, ast.unparse(authority))
+        )
+    assert {door: sorted(entries) for door, entries in by_door.items()} == {
+        "kestrel_sovereign/endpoints/hold.py": [
+            ("release_hold", "HoldAuthority.SOVEREIGN"),
+            ("set_hold", "HoldAuthority.SOVEREIGN"),
+        ],
+        "kestrel_sovereign/hold/mandate.py": [
+            ("release_hold", "HoldAuthority.MANDATE"),
+            ("set_hold", "HoldAuthority.MANDATE"),
+        ],
+    }

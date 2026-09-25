@@ -607,7 +607,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `delegate_task` |  | `agent_management` | `child_name`, `task` | 107 | `enabled` |
 | `get_child_result` |  | `agent_management` | `child_name` | 53 | `enabled` |
+| `hold_descendant` |  | `agent_management` | `target_did`, `reason` | 125 | `enabled` |
 | `list_children` |  | `agent_management` |  | 27 | `enabled` |
+| `release_descendant_hold` |  | `agent_management` | `target_did`, `reason` | 87 | `enabled` |
 | `spawn_agent` |  | `agent_management` | `name`, `purpose`, `budget`, `ttl`, `constraints`, `features` | 369 | `enabled` |
 | `terminate_child` |  | `agent_management` | `child_name`, `offboard_runtime` | 118 | `enabled` |
 
