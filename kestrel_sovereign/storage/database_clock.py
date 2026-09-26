@@ -40,6 +40,33 @@ def database_now_sql(db: Any) -> str:
     raise RuntimeError("database statement clock is unavailable for this backend")
 
 
+def database_lease_cutoff_sql(
+    db: Any, lease_seconds: float
+) -> tuple[str, tuple[object, ...]]:
+    """Return ``(sql, params)`` for the instant ``lease_seconds`` ago.
+
+    The expression is rendered in the exact text shape
+    :func:`database_now_sql` writes, so a heartbeat column written by that
+    clock compares against it lexicographically. A heartbeat is live while it
+    is strictly later than this cutoff; expiry is observed with the database
+    clock, never a process clock.
+    """
+
+    backend_type = database_backend_type(db)
+    if backend_type == "postgres":
+        return (
+            "(to_char((clock_timestamp() - (? * INTERVAL '1 second')) "
+            "AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')",
+            (lease_seconds,),
+        )
+    if backend_type == "sqlite":
+        return (
+            "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ?)",
+            (f"-{lease_seconds} seconds",),
+        )
+    raise RuntimeError("database lease clock is unavailable for this backend")
+
+
 def database_timestamp_bound_text(db: Any, value: datetime) -> str:
     """Render one filter bound in the exact text shape this backend's clock writes.
 
@@ -145,6 +172,7 @@ __all__ = [
     "TimestampBoundOutOfRange",
     "database_backend_type",
     "database_clock",
+    "database_lease_cutoff_sql",
     "database_now_sql",
     "database_timestamp_bound_text",
 ]

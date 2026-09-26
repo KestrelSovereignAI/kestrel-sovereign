@@ -29,11 +29,15 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.database_clock import (
-    database_backend_type,
+    database_lease_cutoff_sql,
     database_now_sql,
 )
 
-from .receipt import StopReceiptStore, opaque_stop_identifier
+from .receipt import (
+    STOP_OWNER_LEASE_SECONDS,
+    StopReceiptStore,
+    opaque_stop_identifier,
+)
 from .types import StopDisposition
 
 _SCHEMA_LOCK = "stop_invocations_v1"
@@ -72,7 +76,7 @@ _TURN_ID_DOMAIN = b"kestrel:distributed-stop-turn:v1\0"
 _PUBLIC_TURN_ID_DOMAIN = b"kestrel:distributed-stop-public-turn:v1\0"
 _DEFAULT_POLL_SECONDS = 0.1
 _DEFAULT_WAIT_SECONDS = 4.0
-_DEFAULT_OWNER_LEASE_SECONDS = 2.0
+_DEFAULT_OWNER_LEASE_SECONDS = STOP_OWNER_LEASE_SECONDS
 # Teardown must be bounded. close() runs in the server's shutdown phases, and
 # the completion retry loop only consults ``_closing`` on its EXCEPTION path --
 # a settle that hangs rather than raises never reaches that check, so an
@@ -171,22 +175,6 @@ class _LocalGeneration:
     turn_id: str
     generation: int
     owner_id: str
-
-
-def _lease_cutoff_sql(db: Any, lease_seconds: float) -> tuple[str, tuple[object, ...]]:
-    backend_type = database_backend_type(db)
-    if backend_type == "postgres":
-        return (
-            "(to_char((clock_timestamp() - (? * INTERVAL '1 second')) "
-            "AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00')",
-            (lease_seconds,),
-        )
-    if backend_type == "sqlite":
-        return (
-            "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ?)",
-            (f"-{lease_seconds} seconds",),
-        )
-    raise RuntimeError("distributed Stop lease clock is unavailable")
 
 
 class DistributedInvocationStore:
@@ -748,7 +736,7 @@ class DistributedInvocationStore:
             raise ValueError("distributed Stop owner lease must be positive")
         async with self._db.transaction(immediate=True):
             now_sql = database_now_sql(self._db)
-            cutoff_sql, cutoff_args = _lease_cutoff_sql(
+            cutoff_sql, cutoff_args = database_lease_cutoff_sql(
                 self._db, float(lease_seconds)
             )
             await self._db.execute(
@@ -784,7 +772,7 @@ class DistributedInvocationStore:
         if lease_seconds <= 0:
             raise ValueError("distributed Stop owner lease must be positive")
         placeholders = ", ".join("?" for _ in generation_ids)
-        cutoff_sql, cutoff_args = _lease_cutoff_sql(
+        cutoff_sql, cutoff_args = database_lease_cutoff_sql(
             self._db, float(lease_seconds)
         )
         reaped: list[str] = []
@@ -804,7 +792,7 @@ class DistributedInvocationStore:
                 # heartbeat_at is part of the retirement predicate: a renewal
                 # that won the race makes this a no-op instead of retiring a
                 # live owner from a stale read.
-                cutoff_sql, cutoff_args = _lease_cutoff_sql(
+                cutoff_sql, cutoff_args = database_lease_cutoff_sql(
                     self._db, float(lease_seconds)
                 )
                 now_sql = database_now_sql(self._db)

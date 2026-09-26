@@ -35,9 +35,10 @@ decisions -- cycle/depth, rate limit, validation, dispatch failure -- belong to
 the *delivery*: their receipt (``refused``, or ``unreachable`` for a dispatch
 failure) is keyed by the delivery's signal id (``peer-stop-delivery:<signal
 id>``), never by the operation id, so a refused
-retry can never pre-empt an admitted attempt of the same operation.  A stranded
-operation claim (the claim holder died) is answered with the typed "already in
-progress" refusal; recovering it is #3356.
+retry can never pre-empt an admitted attempt of the same operation.  A retry
+against a live owner's operation claim is answered with the typed "already in
+progress" refusal; a claim whose owner's lease expired is taken over and the
+Stop re-executed (#3356, see :meth:`StopReceiptStore.claim`).
 
 An operation identity binds its intent at first sight: before its first
 dispatch, the request's fingerprint is bound to the operation id in the Stop

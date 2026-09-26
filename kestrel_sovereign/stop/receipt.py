@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
+import math
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from kestrel_sovereign._async_ownership import (
+    await_owned_task,
+    raise_owned_outcome,
+)
 from kestrel_sovereign.agent.invocation import validate_invocation_id
 from kestrel_sovereign.storage.database_clock import (
+    database_lease_cutoff_sql,
     database_now_sql,
     database_timestamp_bound_text,
 )
@@ -20,6 +30,21 @@ from kestrel_sovereign.storage.feed_sequence import ensure_feed_sequence
 from .types import StopDoor, StopOutcome, StopRequest, StopScope
 
 _SCHEMA_LOCK = "stop_receipts_v1"
+# The lease every Stop owner holds on durable shared state: a distributed
+# invocation owner's generations and an operation claim's owner (#3356) alike.
+# Liveness is a heartbeat inside this lease, observed with the database clock.
+STOP_OWNER_LEASE_SECONDS = 2.0
+# A claim owner renews several times per lease, so one late renewal does not
+# let a live owner's claim be taken over.
+_CLAIM_RENEWALS_PER_LEASE = 4
+# Additive (#3356): who holds an operation claim and when it last proved it
+# was alive. Nullable: a claim written before liveness existed has neither, and
+# its writer -- a binary without this code -- cannot still be renewing it, so
+# it reads as expired and a retry may take it over.
+_CLAIM_OWNER_COLUMNS = (
+    ("owner_id", "TEXT"),
+    ("heartbeat_at", "TEXT"),
+)
 _DOOR_VALUES = frozenset(door.value for door in StopDoor)
 # Additive (#3170): which door wrote a receipt. Nullable so an older binary
 # that never names it keeps appending during a rolling upgrade; such a row
@@ -55,6 +80,15 @@ _OPAQUE_ID_DOMAIN = b"kestrel:stop-receipt-opaque-id:v1\0"
 # the schema backfill takes it inside the schema lock, which no writer holds,
 # so the two orders cannot cycle.
 _RECEIPT_FEED_LOCK_KEY = "kestrel:stop:receipt-feed"
+# How long a claim written before owner liveness (#3356) is presumed live. Such
+# a claim has no heartbeat to read, and during a rolling upgrade its writer may
+# still be running. Pre-liveness Stop code bounds its own execution by its wait
+# ceilings (seconds, not minutes), so a claim older than this cannot belong to a
+# Stop still in progress and becomes retakable.
+_LEGACY_CLAIM_GRACE_SECONDS = 300.0
+
+
+logger = logging.getLogger(__name__)
 
 
 class StopReceiptError(RuntimeError):
@@ -71,11 +105,17 @@ class StopReceiptCorruptError(StopReceiptError):
 
 @dataclass(frozen=True, slots=True)
 class StopOperationClaim:
-    """Durable ownership of one operation before cancellation side effects."""
+    """Durable ownership of one operation before cancellation side effects.
+
+    ``taken_over`` is true when this claim replaced one whose owner was proven
+    dead (its lease expired): the Stop is executed again and records what it
+    observes now.
+    """
 
     operation_id: str
     request_fingerprint: str
     claim_id: str
+    taken_over: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,10 +278,36 @@ def _required_opaque_identifier(value: object, field: str) -> str:
 
 
 class StopReceiptStore:
-    """Append-only Stop receipts stored on an ``AsyncDatabase`` backend."""
+    """Append-only Stop receipts stored on an ``AsyncDatabase`` backend.
 
-    def __init__(self, db: Any):
+    ``owner_id`` names this store's process as the owner of the operation
+    claims it takes; each instance draws a fresh one, so a restarted host is a
+    new owner and never inherits a previous boot's claims. ``claim_lease_seconds``
+    is how long a claim stays live without a heartbeat.
+    """
+
+    def __init__(
+        self,
+        db: Any,
+        *,
+        claim_lease_seconds: float = STOP_OWNER_LEASE_SECONDS,
+    ):
+        if (
+            not isinstance(claim_lease_seconds, (int, float))
+            or isinstance(claim_lease_seconds, bool)
+            or not math.isfinite(claim_lease_seconds)
+            or claim_lease_seconds <= 0
+        ):
+            raise ValueError("Stop claim lease must be positive and finite")
         self._db = db
+        self._owner_id = uuid4().hex
+        self._claim_lease_seconds = float(claim_lease_seconds)
+
+    @property
+    def owner_id(self) -> str:
+        """The owner identity this store writes into the claims it takes."""
+
+        return self._owner_id
 
     async def ensure_schema(self) -> None:
         async with self._db.migration_lock(_SCHEMA_LOCK):
@@ -308,6 +374,9 @@ class StopReceiptStore:
             "stop_receipts",
             (_DOOR_COLUMN,),
             {"door": _DOOR_BACKFILL},
+        )
+        await self._db.migrate_columns_once(
+            "stop_operation_claims", _CLAIM_OWNER_COLUMNS
         )
 
     async def _lock_operation(self, operation_id: str) -> None:
@@ -678,10 +747,24 @@ class StopReceiptStore:
     ) -> StopReceipt | StopOperationClaim | None:
         """Claim an operation before effects, replay it, or report in-flight.
 
-        A claim without a receipt is deliberately durable. If an owner dies
-        after performing cancellation but before recording its outcomes, an
-        exact retry must refuse instead of guessing that the effect is safe to
-        repeat.
+        Returns the stored receipt for an exact replay, a new
+        :class:`StopOperationClaim` when this caller now owns the operation,
+        or ``None`` when a LIVE owner holds it ("already in progress").
+
+        A claim is live while its owner's heartbeat is inside the claim lease,
+        read with the database clock. A claim whose owner is proven dead -- its
+        heartbeat expired, or it predates owner liveness -- is taken over
+        (#3356): the retry re-executes the Stop and records what it observes
+        now. That is safe because Stop is idempotent. Cancelling work an
+        earlier owner already cancelled yields ``already_complete``, never a
+        second effect. A durable refusal would instead leave the operation
+        unstoppable and its receipt forever unwritten.
+
+        The takeover is one compare-and-set on the observed claim under the
+        per-operation lock, so concurrent retries against one expired claim
+        yield exactly one new owner. The dead owner cannot come back and
+        write: :meth:`persist` deletes only its own ``claim_id``, which the
+        takeover replaced.
         """
 
         fingerprint = _fingerprint(request)
@@ -712,19 +795,62 @@ class StopReceiptStore:
                     "FROM stop_operation_claims WHERE operation_id = ?",
                     (stored_operation_id,),
                 )
+                now_sql = database_now_sql(self._db)
                 if claim_row is not None:
                     if claim_row[0] != fingerprint:
                         raise StopReceiptConflict(
                             "Stop operation identity was reused for a different request"
                         )
-                    return None
+                    cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+                        self._db, self._claim_lease_seconds
+                    )
+                    # A claim with no heartbeat was written by a binary that
+                    # predates owner liveness. During a rolling upgrade that
+                    # binary may still be executing its Stop, so its claim is
+                    # treated as live until it is older than any Stop that code
+                    # could still be running, and only then retakable.
+                    legacy_sql, legacy_args = database_lease_cutoff_sql(
+                        self._db, _LEGACY_CLAIM_GRACE_SECONDS
+                    )
+                    taken = await self._db.execute(
+                        "UPDATE stop_operation_claims SET claim_id = ?, "
+                        f"owner_id = ?, claimed_at = {now_sql}, "
+                        f"heartbeat_at = {now_sql} "
+                        "WHERE operation_id = ? AND claim_id = ? "
+                        f"AND ((heartbeat_at IS NULL AND claimed_at <= {legacy_sql}) "
+                        f"OR heartbeat_at <= {cutoff_sql})",
+                        (
+                            claim_id,
+                            self._owner_id,
+                            stored_operation_id,
+                            claim_row[1],
+                            *legacy_args,
+                            *cutoff_args,
+                        ),
+                    )
+                    if taken == 0:
+                        return None
+                    if taken != 1:
+                        raise StopReceiptCorruptError(
+                            "Stop operation claim takeover changed multiple rows"
+                        )
+                    logger.warning(
+                        "Stop operation claim taken over from an owner whose "
+                        "lease expired; re-executing the Stop"
+                    )
+                    return StopOperationClaim(
+                        operation_id=request.correlation_id,
+                        request_fingerprint=fingerprint,
+                        claim_id=claim_id,
+                        taken_over=True,
+                    )
 
-                now_sql = database_now_sql(self._db)
                 await self._db.execute(
                     "INSERT INTO stop_operation_claims ("
-                    "operation_id, request_fingerprint, claim_id, claimed_at"
-                    f") VALUES (?, ?, ?, {now_sql})",
-                    (stored_operation_id, fingerprint, claim_id),
+                    "operation_id, request_fingerprint, claim_id, claimed_at, "
+                    "owner_id, heartbeat_at"
+                    f") VALUES (?, ?, ?, {now_sql}, ?, {now_sql})",
+                    (stored_operation_id, fingerprint, claim_id, self._owner_id),
                 )
                 return StopOperationClaim(
                     operation_id=request.correlation_id,
@@ -739,6 +865,107 @@ class StopReceiptStore:
             if domain is not None:
                 raise domain from error
             raise
+
+    async def renew_claim(self, claim: StopOperationClaim) -> bool:
+        """Extend a still-live claim's lease; ``False`` once it is not live.
+
+        Renewal is non-revivable, like an invocation owner's heartbeat: it
+        succeeds only while this owner's heartbeat is still inside the lease.
+        An owner that resumes after its lease expired has lost the claim even
+        if no retry has taken it over yet, and must not make itself look alive
+        again.
+        """
+
+        if not isinstance(claim, StopOperationClaim):
+            raise TypeError("renew_claim requires a StopOperationClaim")
+        stored_operation_id = _identifier_digest(
+            "operation", claim.operation_id
+        )
+        async with self._db.transaction(immediate=True):
+            now_sql = database_now_sql(self._db)
+            cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+                self._db, self._claim_lease_seconds
+            )
+            renewed = await self._db.execute(
+                "UPDATE stop_operation_claims "
+                f"SET heartbeat_at = {now_sql} "
+                "WHERE operation_id = ? AND claim_id = ? AND owner_id = ? "
+                f"AND heartbeat_at > {cutoff_sql}",
+                (
+                    stored_operation_id,
+                    claim.claim_id,
+                    self._owner_id,
+                    *cutoff_args,
+                ),
+            )
+            if renewed == 1:
+                return True
+            if renewed != 0:
+                raise StopReceiptCorruptError(
+                    "Stop operation claim renewal changed multiple rows"
+                )
+            still_claimed = await self._db.fetchone(
+                "SELECT 1 FROM stop_operation_claims WHERE operation_id = ?",
+                (stored_operation_id,),
+            )
+        if still_claimed is not None:
+            # Gone would mean the receipt committed; still claimed means the
+            # lease expired or another owner took the operation over.
+            logger.warning(
+                "Stop operation claim lease was lost before its receipt "
+                "committed; a retry may take the operation over"
+            )
+        return False
+
+    @asynccontextmanager
+    async def hold_claim(
+        self, claim: StopOperationClaim
+    ) -> AsyncIterator[None]:
+        """Keep ``claim`` live while its owner executes the Stop.
+
+        A renewal task heartbeats the claim several times per lease until the
+        block exits, and stops for good once a renewal finds the claim no
+        longer live (expired, taken over, or released by its receipt). Exiting
+        joins that task before returning, even under cancellation, so no
+        renewal outlives its owner and nothing renews a claim after its
+        receipt committed.
+        """
+
+        if not isinstance(claim, StopOperationClaim):
+            raise TypeError("hold_claim requires a StopOperationClaim")
+        released = asyncio.Event()
+        interval = self._claim_lease_seconds / _CLAIM_RENEWALS_PER_LEASE
+
+        async def renew_until_released() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(released.wait(), timeout=interval)
+                    return
+                except TimeoutError:
+                    pass
+                try:
+                    if not await self.renew_claim(claim):
+                        return
+                except Exception:  # a missed heartbeat, not a crash
+                    # Retry on the next tick: renewal is non-revivable, so a
+                    # failure that outlasts the lease ends here as a lost
+                    # claim, which a retry may then take over. The owner keeps
+                    # executing either way; its receipt commit is fenced.
+                    logger.warning(
+                        "Stop operation claim heartbeat failed", exc_info=True
+                    )
+
+        renewal = asyncio.create_task(
+            renew_until_released(), name="stop-operation-claim-lease"
+        )
+        try:
+            yield
+        finally:
+            released.set()
+            raise_owned_outcome(
+                await await_owned_task(renewal),
+                operation="Stop operation claim lease",
+            )
 
     async def persist(
         self,

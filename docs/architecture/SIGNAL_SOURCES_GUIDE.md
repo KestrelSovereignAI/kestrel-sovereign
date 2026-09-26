@@ -522,9 +522,19 @@ claim an operation bound to another request. So a first attempt interrupted
 between its source event and its claim can be completed only by its own
 intent.
 
-A claim whose owner died before writing its receipt is not recovered here
-(#3356): a retry against it is answered with the typed "already in progress"
-refusal and writes nothing under the operation id.
+An operation claim carries its owner's lease (#3356): the claiming process's
+owner id and a heartbeat it renews while the Stop executes. Renewal is
+non-revivable, and liveness is read with the database clock. A retry against
+a claim whose heartbeat is inside the lease is answered with the typed
+"already in progress" refusal and writes nothing under the operation id. A
+claim whose owner is proven dead (its heartbeat expired, or the row predates
+owner liveness and has none) is taken over by the retry in one
+compare-and-set, so concurrent retries yield one new owner. The retaker
+re-executes the Stop and records what it observes now: `stopped` if the dead
+owner never cancelled, `already_complete` if it did. Stop is idempotent, so
+this is never a second effect. The dead owner cannot come back and write: its
+receipt commit must delete its own claim id, which the takeover replaced. This
+applies to every Stop door, not only the peer rail.
 
 Retry after a lost response: the wire envelope's replay nonce refuses a
 byte-identical resend (403), exactly as for every other A2A action. The
