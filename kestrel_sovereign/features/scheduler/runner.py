@@ -330,6 +330,46 @@ class SchedulerFeatureUnavailable(RuntimeError):
         )
 
 
+class SchedulerDispatchNotReady(RuntimeError):
+    """The target agent has not passed its ``post_all_features_loaded`` barrier.
+
+    Until every feature finished cross-feature wiring, a task's owning tool
+    may simply not be registered yet (#2474). Nothing was executed, so the
+    runner neither records a result nor advances the occurrence: the claim
+    stays live and is recovered after its lease expires, which bounds retries
+    to one per lease interval.
+    """
+
+    def __init__(self, agent_id: str, task_name: str) -> None:
+        self.agent_id = agent_id
+        self.task_name = task_name
+        super().__init__(
+            f"agent {agent_id!r} has not finished loading features; "
+            f"deferring scheduled task {task_name!r}"
+        )
+
+
+class ScheduledTaskOwnerUnavailable(RuntimeError):
+    """No loaded feature provides the tool a scheduled task delegates to.
+
+    Raised only after the feature-load barrier, so the owner is not merely
+    late: it is not installed, not allowed for this agent, or failed to load.
+    The runner records an honest ``failed`` row with this actionable text,
+    leaves ``last_run_at`` untouched because no effect ran, and moves a
+    recurring schedule to its next occurrence (one failure per occurrence,
+    never a hot loop).
+    """
+
+    def __init__(self, task_name: str) -> None:
+        self.task_name = task_name
+        super().__init__(
+            f"scheduled task {task_name!r} was not executed: no loaded, enabled "
+            f"feature provides tool {task_name!r} after all features finished "
+            "loading. Install or enable the feature that provides it for this "
+            "agent, or remove the schedule."
+        )
+
+
 class SchedulerAuthorityRevoked(RuntimeError):
     """Scheduler work observed its occurrence after the runner revoked it.
 
@@ -3009,6 +3049,7 @@ class SchedulerRunner:
                     result_text: Optional[str] = None
                     outcome_signal: Optional[float] = None
                     pause_schedule = False
+                    ran = True
                     scope = _SchedulerExecutionScope(execution)
                     token = _current_execution.set(scope)
                     try:
@@ -3068,6 +3109,24 @@ class SchedulerRunner:
                                 task.agent_id,
                             )
                             return
+                        except SchedulerDispatchNotReady as e:
+                            # Same deferral contract as above (#2474): nothing
+                            # ran, so no success row, no last_run_at, no cron
+                            # advance. Lease expiry bounds the retry.
+                            logger.info(
+                                "Deferring scheduler claim %s: %s", execution.id, e
+                            )
+                            return
+                        except ScheduledTaskOwnerUnavailable as e:
+                            status = "failed"
+                            result_text = str(e)
+                            ran = False
+                            logger.error(
+                                "Scheduled task %s (%s) failed: %s",
+                                task.id,
+                                task.task_name,
+                                e,
+                            )
                         except Exception as e:
                             status = "failed"
                             result_text = f"{type(e).__name__}: {e}"
@@ -3099,7 +3158,7 @@ class SchedulerRunner:
                         result_text=result_text,
                         duration_ms=int((time.monotonic() - started) * 1000),
                         outcome_signal=outcome_signal,
-                        ran=True,
+                        ran=ran,
                         pause_schedule=pause_schedule,
                     )
         except asyncio.CancelledError:

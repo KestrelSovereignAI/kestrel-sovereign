@@ -77,6 +77,8 @@ from kestrel_sovereign.features.scheduler.runner import (
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
     SCHEDULER_PROTOCOL_VERSION,
     SCHEDULER_ROLLOUT_STATE_QUIESCING,
+    ScheduledTaskOwnerUnavailable,
+    SchedulerDispatchNotReady,
     SchedulerProtocolVersionIncompatible,
     SchedulerRunner,
     adopt_scheduler_registration_ownership,
@@ -269,15 +271,7 @@ class SchedulerFeature(Feature):
             cron_registrations = build_cron_registrations(
                 tool_lookup=self._lookup_raw_tool_result,
                 reason_codes_lookup=self._declared_reason_codes,
-                builtin_handlers={
-                    "backup_snapshot": self._handle_backup_snapshot,
-                    "trash_retention": self._run_trash_retention,
-                    "github_pr_watch": self._run_github_pr_watch,
-                    "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
-                    "sleep": self._handle_sleep,
-                    "wait_reconcile": self._run_wait_reconcile,
-                    "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
-                },
+                builtin_handlers=self._builtin_cron_handlers(),
             )
             from kestrel_sovereign.signals import RegistrationPolicy
 
@@ -347,6 +341,22 @@ class SchedulerFeature(Feature):
         )
         await self._runner.start(polling=False)
         logger.info("SchedulerFeature initialized; polling awaits agent readiness")
+
+    def _builtin_cron_handlers(self) -> Dict[str, Any]:
+        """Built-in cron tasks this feature executes itself, without a tool.
+
+        Every other ``CRON_TASKS`` entry delegates to a tool some feature
+        registers; see :meth:`_require_scheduled_tool_owner`.
+        """
+        return {
+            "backup_snapshot": self._handle_backup_snapshot,
+            "trash_retention": self._run_trash_retention,
+            "github_pr_watch": self._run_github_pr_watch,
+            "ecosystem_discovery_watch": self._run_ecosystem_discovery_watch,
+            "sleep": self._handle_sleep,
+            "wait_reconcile": self._run_wait_reconcile,
+            "bootstrap_timeout_check": self._run_bootstrap_timeout_check,
+        }
 
     async def on_agent_ready(self, agent) -> None:
         """Arm standalone polling only after every feature finished post-load."""
@@ -839,6 +849,13 @@ class SchedulerFeature(Feature):
             cron_source_name,
         )
 
+        # No tick may execute before the agent's post_all_features_loaded
+        # barrier (#2474): a tool owner that loads later would otherwise be
+        # indistinguishable from a missing one. Only an agent that explicitly
+        # reports the barrier as incomplete is deferred.
+        if getattr(self.agent, "_post_all_features_loaded_complete", None) is False:
+            raise SchedulerDispatchNotReady(self._agent_id, task_name)
+
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is None:
             # Fallback for partially-initialized agents (e.g. legacy
@@ -864,6 +881,12 @@ class SchedulerFeature(Feature):
                 "executing directly", task_name,
             )
             return await self._lookup_and_run_tool_under_hold(task_name, args)
+
+        if task_name not in self._builtin_cron_handlers():
+            # Checked here, outside the dispatcher, so the runner receives the
+            # typed failure and its actionable text rather than the fixed
+            # content-free text the source handler boundary substitutes.
+            self._require_scheduled_tool_owner(task_name)
 
         signal = Signal(
             source=cron_source_name(task_name),
@@ -1213,6 +1236,47 @@ class SchedulerFeature(Feature):
             blocked = await self._training_cycle_semantic_maintenance_gate()
             if blocked is not None:
                 return blocked
+        owner_name, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+            task_name
+        )
+        if agent_tool is not None:
+            return await self._run_tool_hook_gated(owner_name, agent_tool, args)
+
+        # A persisted schedule that names a tool owned by a NOW-disabled feature
+        # must not execute it. Skip benignly rather than raising, so a disable
+        # doesn't spam the execution log with a failure every tick; re-enabling
+        # the feature restores execution on the next tick. Resolution prefers an
+        # enabled owner, and a disabled one is distinguished from a genuinely
+        # unknown task so the operator sees the real reason.
+        if disabled_owner is not None:
+            logger.info(
+                "Scheduler: task %r is owned by disabled feature %r; "
+                "skipping this tick", task_name, disabled_owner,
+            )
+            return (
+                f"skipped: {task_name} owning feature {disabled_owner!r} "
+                "is disabled"
+            )
+
+        # Scheduler ticks run only after the post_all_features_loaded barrier
+        # (#2474), so an unresolvable built-in is not a late-loading owner:
+        # it is missing. Never report that as a (skipped) success.
+        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+
+        if task_name in {name for name, _mode, _res in CRON_TASKS}:
+            raise ScheduledTaskOwnerUnavailable(task_name)
+
+        raise ValueError(f"Unknown task: {task_name}")
+
+    def _resolve_scheduled_tool(
+        self, task_name: str
+    ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
+        """Resolve the tool a scheduled task names, as the executor would.
+
+        Returns ``(owner_name, tool, disabled_owner_name)``: the enabled owner
+        and its tool when one exists (an enabled owner always wins), otherwise
+        the name of a disabled feature exposing the tool, otherwise all None.
+        """
         features = getattr(self.agent, "features", {})
 
         for feature in features.values():
@@ -1220,32 +1284,18 @@ class SchedulerFeature(Feature):
                 continue
             if not self._feature_enabled(feature):
                 # A disabled feature's tools are detached from every other live
-                # surface; the scheduler skips it too (handled benignly below if
-                # the task actually resolves to it).
+                # surface; the scheduler skips it too.
                 continue
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
-                    result = await self._run_tool_hook_gated(
-                        type(feature).__name__, agent_tool, args,
-                    )
-                    return result
+                    return type(feature).__name__, agent_tool, None
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
         for agent_tool in self.get_tools():
             if agent_tool.name == task_name:
-                result = await self._run_tool_hook_gated(
-                    type(self).__name__, agent_tool, args,
-                )
-                return result
+                return type(self).__name__, agent_tool, None
 
-        # A persisted schedule that names a tool owned by a NOW-disabled feature
-        # must not execute it. Skip benignly (like the startup-order race below)
-        # rather than raising, so a disable doesn't spam the execution log with a
-        # failure every tick; re-enabling the feature restores execution on the
-        # next tick. Detected AFTER the enabled-feature search so an enabled
-        # owner always wins, and distinguished from a genuinely-unknown task so
-        # the operator sees the real reason.
         for feature in features.values():
             if not hasattr(feature, "get_tools") or self._feature_enabled(feature):
                 continue
@@ -1254,39 +1304,23 @@ class SchedulerFeature(Feature):
             except Exception:  # noqa: BLE001 - a broken feature can't block others
                 continue
             if any(getattr(t, "name", None) == task_name for t in disabled_tools):
-                feature_name = getattr(feature, "name", type(feature).__name__)
-                logger.info(
-                    "Scheduler: task %r is owned by disabled feature %r; "
-                    "skipping this tick", task_name, feature_name,
-                )
                 return (
-                    f"skipped: {task_name} owning feature {feature_name!r} "
-                    "is disabled"
+                    None,
+                    None,
+                    getattr(feature, "name", type(feature).__name__),
                 )
+        return None, None, None
 
-        # A persisted built-in cron task (e.g. restart_coordinator) can
-        # fire on the first scheduler tick after a restart BEFORE its
-        # owning feature has finished loading and registered the tool —
-        # the runner starts polling in initialize() while feature load
-        # order is not guaranteed (#1796). That is a transient startup-
-        # order race, not a misconfiguration: a later tick (once the
-        # feature is loaded) runs the task normally. Skip it benignly
-        # this tick instead of raising "Unknown task", which would record
-        # a spurious one-time failure in the execution log.
-        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+    def _require_scheduled_tool_owner(self, task_name: str) -> None:
+        """Fail a tool-delegating built-in whose owner is absent, before dispatch.
 
-        if task_name in {name for name, _mode, _res in CRON_TASKS}:
-            logger.info(
-                "Scheduler: built-in cron task %r not yet resolvable "
-                "(owning feature still loading); skipping this tick",
-                task_name,
-            )
-            return (
-                f"skipped: {task_name} owning feature not loaded yet "
-                "(transient startup-order race)"
-            )
-
-        raise ValueError(f"Unknown task: {task_name}")
+        A disabled owner is left to the lookup's benign disabled skip.
+        """
+        _owner, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+            task_name
+        )
+        if agent_tool is None and disabled_owner is None:
+            raise ScheduledTaskOwnerUnavailable(task_name)
 
     def _scheduler_executable_task_names(self) -> set:
         """Return the set of task names the scheduler can actually run.
