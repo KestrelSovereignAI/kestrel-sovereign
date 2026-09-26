@@ -53,6 +53,7 @@ from kestrel_sovereign.signals.dispatcher import (
     SignalLogWriteFailure,
     SignalSurfaceRecord,
 )
+from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     FAILED,
@@ -108,6 +109,7 @@ __all__ = [
     "SignalHandle",
     "SignalMode",
     "SignalResult",
+    "SignalWithDurableCorrelation",
     "SignalWithPromptTemplateOverride",
     "SourceRegistration",
     "SourceRegistrationWithPreTurnGuard",

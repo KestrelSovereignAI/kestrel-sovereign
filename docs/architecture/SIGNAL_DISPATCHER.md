@@ -480,6 +480,71 @@ initial-reservation capabilities cannot recreate work. Re-registration cannot
 change an inactive consumer back to active; a new workflow wait needs a new
 consumer ID.
 
+#### Resuming on a wait handle instead of holding a turn
+
+A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is
+capped at `MAX_HANDLE_WAIT_SECONDS`. Work that must outlive that ceiling — a
+workflow stage waiting on the `talon:<job_id>` its dispatch stage returned —
+parks instead and subscribes to the handle's wake (#3295):
+
+```python
+from kestrel_sovereign.waits.reconciler import register_wait_resume_consumer
+
+resume = await register_wait_resume_consumer(
+    agent, "talon:job-42", consumer_id="workflows:wait:run-42"
+)
+if resume.already_terminal is not None:
+    ...  # finished before the park took effect: act on it now
+```
+
+It validates the ref exactly like `wait(..., mode="signal")`, arms the same
+reconciler watch, and only then registers a durable consumer on the provider's
+wake source (`provider.signal`, else `wait.complete`) with the selector
+`payload.ref=<kind>:<handle>`. The reconciler writes `payload.ref` after
+spreading the provider's poll data, so a provider cannot point one handle's
+completion at another handle's parked work, and kinds sharing
+`wait.complete` never cross.
+
+Selectors match the *stored* event, and ANONYMOUS storage anonymizes it: a
+5-digit run in a handle reads as a ZIP code, so `ci:owner/repo#12345` would be
+stored as `ci:owner/repo#[ZIP_REDACTED]` and never match. The wake is therefore
+a `SignalWithDurableCorrelation` naming `ref` in `durable_correlation_keys`;
+the durable projection keeps those producer-written identifiers verbatim and
+anonymizes everything else. Payload-eliding modes still elide them.
+
+Those modes are therefore refused. Under EPHEMERAL, ISOLATED, or DEIDENTIFIED
+storage every durable wake is persisted as a bare privacy marker, so no stored
+event could satisfy the `payload.ref` selector, and a still-pending handle
+would park work that never resumes. `register_wait_resume_consumer` asks the
+dispatcher (`durable_payload_elided_by()`, which uses the projection's own
+`elides_durable_payloads` definition) before writing anything. If the answer
+is an eliding mode, it raises `DurableResumeUnsupportedError`
+(`reason == "unsupported_in_privacy_mode"`, a `ValueError`). No watch is
+armed, no consumer is registered, and the provider is not polled. The caller
+keeps the non-durable `wait(..., mode="signal")` path. A privacy mode that
+switches to an eliding one *after* registration is not covered by this check.
+
+The watch is armed before the consumer exists, and that order is load-bearing.
+An interruption between the two writes must never leave a durable consumer
+with no watch behind it: for a poll-only provider (Talon, CI) the reconciler
+would never poll that handle again, and the parked work would stall silently.
+A watch without a consumer only wakes the agent through the normal reconciler
+path, and retrying the idempotent registration completes it.
+
+The resume guarantee is the poll it makes *after* the watch and consumer are
+durable, not backfill. If the handle is already terminal, that `WaitStatus` is
+returned as `already_terminal` and the caller acts on it directly: a wake
+committed earlier may be unmatchable (one committed while a payload-eliding
+mode was active holds only a marker), and the reconciler never re-announces a
+transition it already delivered. Otherwise the transition happens after the
+registration and is delivered directly. A matchable earlier wake is also
+backfilled, so the same transition can arrive both ways. A poll that raises
+propagates: the handle's state is unknown, so the caller must not park, and
+re-registering the same `consumer_id` is idempotent. `max_attempts` defaults
+to `0` because the wake is the only thing that resumes the parked work. A
+delivery is a wake, not a verdict: poll the provider for the handle's state on
+every delivery, then deactivate the consumer when the parked work finishes.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a

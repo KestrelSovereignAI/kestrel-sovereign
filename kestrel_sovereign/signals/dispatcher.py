@@ -132,6 +132,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_missing,
     record_echo_verified,
 )
+from kestrel_sovereign.signals.correlation import durable_correlation_values
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     FAILED,
@@ -429,7 +430,9 @@ class _DurableSignalProjection:
     normalized in-memory event to be materialized atomically at dispatch
     time; later registrations and restart backfill must see only the durable
     representation.  Anonymized payloads, conversely, are replayable and so
-    selectors must use that stored projection from the first delivery.
+    selectors must use that stored projection from the first delivery; the
+    keys a ``SignalWithDurableCorrelation`` names are exempt from
+    anonymization so a selector on them still matches.
     """
 
     signal: Signal
@@ -487,6 +490,26 @@ class _DurableCognitionSettlementGuard:
     generation: int
     operation: asyncio.Task[None]
     stop_terminalized: bool = False
+
+
+def elides_durable_payloads(config: Any) -> bool:
+    """True when ``config`` persists only a marker in place of a durable
+    signal payload.
+
+    EPHEMERAL, ISOLATED, and the not-yet-supported DEIDENTIFIED safe-harbor
+    mode all elide it. This is the one definition shared by the durable
+    projection and by durable consumers that must refuse to register a
+    selector no stored event could satisfy (#3295). A config that cannot
+    answer raises; the projection treats that as elision (fail closed).
+    """
+    return any(
+        getattr(config, name)()
+        for name in (
+            "is_ephemeral",
+            "uses_temp_storage",
+            "requires_deidentification",
+        )
+    )
 
 
 def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
@@ -2835,6 +2858,20 @@ class SignalDispatcher:
         if timer is not None:
             timer.cancel()
 
+    def durable_payload_elided_by(self) -> Optional[str]:
+        """The privacy storage mode under which this dispatcher persists only
+        a marker in place of every durable payload, or ``None`` when
+        payloads are persisted (possibly anonymized).
+
+        Uses the same config and :func:`elides_durable_payloads` definition
+        as the durable projection, so a consumer asking whether its selector
+        can ever match gets the projection's own answer (#3295).
+        """
+        config = resolve_agent_privacy_config(self._agent)
+        if config is None or not elides_durable_payloads(config):
+            return None
+        return str(getattr(config, "storage", "restricted"))
+
     def _signal_for_durable_persistence(
         self,
         signal: Signal,
@@ -2871,14 +2908,7 @@ class SignalDispatcher:
         if config is None:
             return _DurableSignalProjection(signal=signal)
         try:
-            if any(
-                getattr(config, name)()
-                for name in (
-                    "is_ephemeral",
-                    "uses_temp_storage",
-                    "requires_deidentification",
-                )
-            ):
+            if elides_durable_payloads(config):
                 return _DurableSignalProjection(
                     signal=replace(
                         signal,
@@ -2895,13 +2925,24 @@ class SignalDispatcher:
                     anonymize_text,
                 )
 
+                # Correlation identifiers the producer wrote itself are
+                # persisted verbatim so a consumer's selector still matches
+                # the stored event (#3295); everything else is anonymized.
+                correlation = durable_correlation_values(signal)
+                payload = self._anonymize_durable_value(
+                    {
+                        key: value
+                        for key, value in signal.payload.items()
+                        if key not in correlation
+                    }
+                    if correlation
+                    else signal.payload,
+                    anonymize_text,
+                )
+                if correlation:
+                    payload.update(correlation)
                 return _DurableSignalProjection(
-                    signal=replace(
-                        signal,
-                        payload=self._anonymize_durable_value(
-                            signal.payload, anonymize_text
-                        ),
-                    ),
+                    signal=replace(signal, payload=payload),
                 )
         except Exception as exc:  # Privacy persistence must fail closed.
             logger.warning(
