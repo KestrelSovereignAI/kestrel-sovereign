@@ -135,6 +135,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
 from kestrel_sovereign.signals.correlation import durable_correlation_values
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
+    EXPIRED_INITIAL_HANDOFF_ERROR,
     FAILED,
     LEASED,
     PENDING,
@@ -858,6 +859,11 @@ class SignalDispatcher:
         # dispatcher scans and drains the persisted consumer itself.
         self._durable_cognition_drainers: dict[str, asyncio.Task[None]] = {}
         self._durable_cognition_drain_timers: dict[str, asyncio.TimerHandle] = {}
+        # A drain requested while one is already running may be answering
+        # rows that drainer's snapshot predates (e.g. a lease recovery that
+        # committed mid-scan). The running drainer restarts once on exit
+        # rather than dropping that request.
+        self._durable_cognition_drain_rerun: set[str] = set()
         self._started_durable_cognition_consumers: set[str] = set()
         # Repeated one-second release probes must not turn one continuous Hold
         # into an unbounded metric stream. Each consumer records one edge and
@@ -919,6 +925,13 @@ class SignalDispatcher:
         # globally unique and every dispatcher owns exactly one agent scope.
         self._transient_durable_handoffs: dict[str, _TransientDurableHandoff] = {}
         self._transient_durable_handoff_timers: dict[str, asyncio.TimerHandle] = {}
+        # delivery_id -> (consumer_id, initial lease token) for first leases
+        # whose raw sidecar expired, or whose transfer failed, before any
+        # worker claimed them. The payload is already gone; only the opaque
+        # capability is kept, so this dispatcher can release the row to
+        # marker-only retry work. Claim recovery never reclaims a live
+        # dispatcher's lease, so nothing else would (#3370).
+        self._expired_initial_handoffs: dict[str, tuple[str, str]] = {}
         # Post-commit reservation repair must outlive the agent-wide
         # best-effort background-task sweep.  A repair created immediately
         # before shutdown may not get a first event-loop turn before that
@@ -1422,7 +1435,9 @@ class SignalDispatcher:
             return
         existing = self._durable_cognition_drainers.get(consumer_id)
         if existing is not None and not existing.done():
+            self._durable_cognition_drain_rerun.add(consumer_id)
             return
+        self._durable_cognition_drain_rerun.discard(consumer_id)
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
@@ -1445,6 +1460,9 @@ class SignalDispatcher:
                     exc_info=exc,
                 )
                 self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
+                return
+            if consumer_id in self._durable_cognition_drain_rerun:
+                self._start_durable_cognition_drain(consumer_id)
 
         task.add_done_callback(complete)
 
@@ -1680,6 +1698,7 @@ class SignalDispatcher:
             self._started_durable_cognition_consumers.discard(consumer_id)
             self._held_durable_cognition_consumers.discard(consumer_id)
             self._held_durable_claim_consumers.discard(consumer_id)
+            self._durable_cognition_drain_rerun.discard(consumer_id)
             timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
             if timer is not None:
                 timer.cancel()
@@ -1828,6 +1847,9 @@ class SignalDispatcher:
                 )
                 return None
             self._discard_expired_transient_durable_handoffs()
+            # Before the claim, so a first lease that expired unclaimed is
+            # claimable as marker-only retry work in this same call (#3370).
+            await self._release_expired_initial_handoffs()
             async with self._pending_cognition_claim_fence(executor_id):
                 delivery = await self._durable_store.claim_delivery(
                     agent_id=self._agent.did,
@@ -1891,8 +1913,10 @@ class SignalDispatcher:
                     if delivery is None:
                         # A reservation can fail only after it was released,
                         # expired, or otherwise became terminal. Retaining raw
-                        # data in that case would violate its lease-bound lifetime.
-                        self._discard_transient_durable_handoff(delivery_id)
+                        # data in that case would violate its lease-bound
+                        # lifetime; an expired first lease is still released
+                        # to marker-only retry work (#3370).
+                        self._retire_initial_handoff(delivery_id)
                         continue
                     handoff.initial_lease_token = None
                     return await self._publish_claimed_durable_delivery_after_hold_race(
@@ -1922,6 +1946,7 @@ class SignalDispatcher:
                 )
                 return None
             self._discard_expired_transient_durable_handoffs()
+            await self._release_expired_initial_handoffs()
             async with self._pending_cognition_claim_fence(executor_id):
                 delivery = await self._durable_store.claim_delivery_for_event(
                     agent_id=self._agent.did,
@@ -1972,7 +1997,8 @@ class SignalDispatcher:
                 if delivery is None:
                     # If the transfer can no longer happen, raw data must not
                     # outlive the reservation capability that protected it.
-                    self._discard_transient_durable_handoff(reserved.delivery_id)
+                    # An expired first lease is still released (#3370).
+                    self._retire_initial_handoff(reserved.delivery_id)
                     return None
                 handoff.initial_lease_token = None
                 return await self._publish_claimed_durable_delivery_after_hold_race(
@@ -2275,6 +2301,7 @@ class SignalDispatcher:
             await self.initialize_durable_delivery()
             purged = await self._durable_store.purge_expired(agent_id=self._agent.did)
             self._discard_expired_transient_durable_handoffs()
+            await self._release_expired_initial_handoffs()
             return purged
 
     async def shutdown_durable_delivery(self) -> bool:
@@ -2359,6 +2386,7 @@ class SignalDispatcher:
         for timer in self._durable_cognition_drain_timers.values():
             timer.cancel()
         self._durable_cognition_drain_timers.clear()
+        self._durable_cognition_drain_rerun.clear()
         self._started_durable_cognition_consumers.clear()
         self._held_durable_cognition_consumers.clear()
         self._held_durable_claim_consumers.clear()
@@ -2468,6 +2496,10 @@ class SignalDispatcher:
                 timer.cancel()
             self._transient_durable_handoff_timers.clear()
             self._transient_durable_handoffs.clear()
+            # Once this owner is marked stopped, ordinary lease recovery
+            # reclaims any first lease it still holds, so the local
+            # capabilities are no longer needed.
+            self._expired_initial_handoffs.clear()
             if self._durable_runtime_owner_registration_started:
                 await self._durable_store.release_initial_reservations(
                     agent_id=self._agent.did,
@@ -2745,6 +2777,11 @@ class SignalDispatcher:
             # so such unactivated reservations eventually become marker-only
             # retry work without another process restart.
             await self._recover_abandoned_initial_reservations()
+            # This runtime's own first leases that expired unclaimed are not
+            # stale-owner work, so the sweep above cannot see them (#3370).
+            # The release wakes each affected started drainer itself.
+            self._discard_expired_transient_durable_handoffs()
+            await self._release_expired_initial_handoffs()
             recovered = await self._recover_abandoned_leases()
             async with self._pending_cognition_admission_lock:
                 for delivery_id, task in tuple(
@@ -2825,7 +2862,64 @@ class SignalDispatcher:
             if handoff.expires_at <= now
         ]
         for delivery_id in expired:
-            self._discard_transient_durable_handoff(delivery_id)
+            self._retire_initial_handoff(delivery_id)
+
+    def _retire_initial_handoff(self, delivery_id: str) -> None:
+        """Drop a handoff whose first lease can no longer be transferred.
+
+        The raw payload is discarded immediately. A still-untransferred
+        initial capability is kept (without payload) for
+        :meth:`_release_expired_initial_handoffs`: that first lease belongs to
+        this live dispatcher, so claim-time recovery will not reclaim it, and
+        dropping the capability alone would leave the delivery leased and
+        unclaimable until the process stopped (#3370).
+        """
+        handoff = self._transient_durable_handoffs.get(delivery_id)
+        if handoff is not None and handoff.initial_lease_token is not None:
+            self._expired_initial_handoffs[delivery_id] = (
+                handoff.consumer_id,
+                handoff.initial_lease_token,
+            )
+        self._discard_transient_durable_handoff(delivery_id)
+
+    async def _release_expired_initial_handoffs(self) -> int:
+        """Return retired first leases to the marker-only retry path.
+
+        The owner/token compare-and-set matches only a row this dispatcher
+        still holds under its initial capability, so a transferred,
+        acknowledged, terminal, or already-released delivery is untouched.
+        A storage error keeps the capability for the next claim or owner
+        heartbeat to retry.
+
+        A released row is new retry work that a durable cognition drainer
+        which already scanned and exited cannot see, so every release wakes
+        its started consumer here rather than relying on each caller to.
+        """
+        released = 0
+        for delivery_id, (consumer_id, token) in tuple(
+            self._expired_initial_handoffs.items()
+        ):
+            try:
+                if await self._durable_store.abandon_initial_reservation(
+                    agent_id=self._agent.did,
+                    consumer_id=consumer_id,
+                    delivery_id=delivery_id,
+                    owner_id=self._durable_delivery_owner,
+                    reservation_token=token,
+                    reason=EXPIRED_INITIAL_HANDOFF_ERROR,
+                ):
+                    released += 1
+                    if consumer_id in self._started_durable_cognition_consumers:
+                        self._start_durable_cognition_drain(consumer_id)
+            except Exception:
+                logger.exception(
+                    "Could not release expired initial durable handoff %s; "
+                    "retrying on the next claim or owner heartbeat",
+                    delivery_id,
+                )
+                continue
+            self._expired_initial_handoffs.pop(delivery_id, None)
+        return released
 
     def _schedule_transient_durable_handoff_expiry(
         self, delivery_id: str, expires_at: datetime
@@ -2850,7 +2944,7 @@ class SignalDispatcher:
         """Remove only the handoff whose currently scheduled deadline fired."""
         handoff = self._transient_durable_handoffs.get(delivery_id)
         if handoff is not None and handoff.expires_at == expires_at:
-            self._discard_transient_durable_handoff(delivery_id)
+            self._retire_initial_handoff(delivery_id)
 
     def _discard_transient_durable_handoff(self, delivery_id: str) -> None:
         self._transient_durable_handoffs.pop(delivery_id, None)

@@ -1252,7 +1252,10 @@ async def register_wait_resume_consumer(
     DEIDENTIFIED, as the dispatcher's ``durable_payload_elided_by`` reports)
     is refused before anything is written: every wake would be stored as a
     bare marker, so the selector could never match and a still-pending
-    handle would park forever.
+    handle would park forever. A switch to such a mode *after* registration
+    does not strand the consumer: the delivery is matched on the live
+    payload, and a claim that arrives after the emitter's first lease expired
+    receives it as marker-only retry work (#3370).
 
     ``max_attempts`` defaults to ``0`` (retain until acknowledged): this wake
     is the only thing that resumes the parked work, so a transient consumer

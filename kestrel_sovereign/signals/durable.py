@@ -54,6 +54,11 @@ TERMINAL_ACKABLE = "terminal_ackable"
 _TERMINAL_STATUSES = frozenset({ACKNOWLEDGED, FAILED, TERMINAL_ACKABLE})
 _CLAIMABLE_STATUSES = frozenset({PENDING, RETRY})
 _DEACTIVATED_CONSUMER_ERROR = "durable consumer deactivated"
+# The emitting dispatcher's first lease on a payload-elided delivery expired
+# (or its transfer failed) before any worker claimed it. The row is released
+# to marker-only retry work rather than left leased to a live owner, which
+# ordinary claim recovery never reclaims (#3370).
+EXPIRED_INITIAL_HANDOFF_ERROR = "initial handoff expired before a worker claimed it"
 _COGNITION_ADMISSION_PENDING = "cognition admission pending"
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
@@ -4340,14 +4345,17 @@ class DurableSignalStore(UnifiedStoreBase):
         owner_id: str,
         reservation_token: str,
         now: Optional[datetime] = None,
+        reason: str = "initial reservation activation unavailable",
     ) -> bool:
         """Release one initial capability whose raw handoff cannot complete.
 
         The owner/token pair identifies both an unactivated reservation and
-        its just-activated first lease.  The latter case is possible only if
-        the activation write committed before its readback failed; no worker
-        can own it yet because the dispatcher still holds its local handoff
-        lock.  Both forms must become marker-only retry work.
+        its activated first lease.  The latter is released when the
+        activation write committed before its readback failed, and when the
+        emitting dispatcher's first lease expired before any worker claimed
+        it (#3370).  No worker can own either: a transfer replaces the token.
+        Both forms must become marker-only retry work; ``reason`` records
+        which one it was.
         """
         self._require_nonempty("agent_id", agent_id)
         self._require_nonempty("consumer_id", consumer_id)
@@ -4361,7 +4369,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 UPDATE {self.DELIVERIES}
                 SET status = ?, lease_owner = NULL, lease_token = NULL,
                     lease_expires_at = NULL, next_attempt_at = ?,
-                    last_error = 'initial reservation activation unavailable',
+                    last_error = ?,
                     updated_at = ?
                 WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
                   AND status IN (?, ?) AND lease_owner = ? AND lease_token = ?
@@ -4369,6 +4377,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 (
                     RETRY,
                     self.to_timestamp_param(now),
+                    reason,
                     self.to_timestamp_param(now),
                     agent_id,
                     consumer_id,

@@ -2043,6 +2043,89 @@ async def test_late_hold_refusal_preserves_durable_retry_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_drain_requested_mid_scan_is_not_lost(tmp_path):
+    """A wake that lands while a drainer scans a stale snapshot still drains.
+
+    The owner heartbeat requeues a dead runtime's lease and asks for a drain.
+    If the running drainer read its candidates before that commit, dropping
+    the request left the recovered row in ``retry`` until an unrelated event
+    arrived (the CI flake in ``test_crash_mid_submission_turn_...``).
+    """
+
+    from kestrel_sovereign.hold import HoldTurnRefusal
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "drain-rerun.db",
+        "did:agent:drain-rerun",
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    agent._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
+    agent.process_input = AsyncMock(
+        side_effect=HoldTurnRefusal(
+            agent_id=agent.did,
+            effective_state=_held_state(agent.did),
+        )
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "drain-rerun"),
+            source_event_id="telegram:update:drain-rerun",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(handle.wait(), timeout=1.0)
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert delivery.status == RETRY
+        agent.process_input = AsyncMock(return_value="resumed")
+
+        # Both reads of the first drain return the snapshot from before the
+        # row became retryable; the second blocks until the wake has landed.
+        real_list = dispatcher.list_durable_deliveries
+        stale_reads = 0
+        in_second_read = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stale_list(*args, **kwargs):
+            nonlocal stale_reads
+            if stale_reads < 2:
+                stale_reads += 1
+                if stale_reads == 2:
+                    in_second_read.set()
+                    await release.wait()
+                return []
+            return await real_list(*args, **kwargs)
+
+        dispatcher.list_durable_deliveries = stale_list
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        await asyncio.wait_for(in_second_read.wait(), timeout=1.0)
+        # The recovery wake arrives while that drainer is still running.
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        release.set()
+
+        for _ in range(200):
+            [delivery] = await real_list(consumer_id=consumer.consumer_id)
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exact_event", [False, True])
 async def test_public_claim_failed_hold_rollback_is_recovered_attempt_neutral(
     tmp_path,
@@ -9210,3 +9293,285 @@ async def test_recovery_drainer_releases_each_delivery_settlement_owner(
         release_second.set()
         await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_b, agent_b)
+
+
+async def _volatile_unclaimed_delivery(tmp_path, name):
+    """One EPHEMERAL delivery whose first lease is still the emitter's."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / f"{name}.db", "did:agent:one")
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    await dispatcher.register_durable_consumer(consumer)
+    result = await dispatcher.dispatch_signal(
+        _signal(agent_id=agent.did, message=f"{name}-secret@example.com"),
+        source_event_id=name,
+    )
+    assert result.status is Status.OK
+    (reserved,) = await dispatcher.list_durable_deliveries()
+    assert reserved.status == LEASED
+    assert reserved.lease_owner == dispatcher._durable_delivery_owner
+    return backend, agent, dispatcher, consumer, reserved
+
+
+def _expire_handoff(dispatcher, delivery_id):
+    handoff = dispatcher._transient_durable_handoffs[delivery_id]
+    handoff.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    return handoff
+
+
+@pytest.mark.asyncio
+async def test_expired_unclaimed_first_lease_is_released_to_marker_retry(tmp_path):
+    """#3370: the emitter's first lease expired before any worker claimed it.
+    Its raw payload must go, but the row must not stay leased to a live owner
+    that claim recovery never reclaims — the next claim receives it as
+    marker-only retry work."""
+    from kestrel_sovereign.signals.durable import EXPIRED_INITIAL_HANDOFF_ERROR
+
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "expired-first-lease"
+    )
+    try:
+        handoff = _expire_handoff(dispatcher, reserved.delivery_id)
+        dispatcher._expire_transient_durable_handoff(
+            reserved.delivery_id, handoff.expires_at
+        )
+        assert reserved.delivery_id not in dispatcher._transient_durable_handoffs
+        assert dispatcher._expired_initial_handoffs == {
+            reserved.delivery_id: (consumer.consumer_id, reserved.lease_token)
+        }
+
+        assert await dispatcher._release_expired_initial_handoffs() == 1
+        (released,) = await dispatcher.list_durable_deliveries()
+        assert released.status == RETRY
+        assert released.lease_owner is None and released.lease_token is None
+        assert released.attempts == 0
+        assert released.last_error == EXPIRED_INITIAL_HANDOFF_ERROR
+        assert dispatcher._expired_initial_handoffs == {}
+
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert claimed.delivery_id == reserved.delivery_id
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_claim_releases_an_expired_first_lease_it_discards(tmp_path):
+    """The claim path itself discards expired sidecars; it must release their
+    rows before claiming, or a late claim returns nothing forever."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "claim-discards-expired"
+    )
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_exact_event_claim_releases_an_expired_first_lease(tmp_path):
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "event-claim-expired"
+    )
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+
+        claimed = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=reserved.event_id,
+            executor_id="late-worker",
+        )
+        assert claimed is not None
+        assert claimed.delivery_id == reserved.delivery_id
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event", (False, True))
+async def test_failed_first_lease_transfer_is_released_on_the_next_claim(
+    tmp_path, monkeypatch, exact_event
+):
+    """The store can see the first lease as expired before this process's
+    sidecar timer does. The refused transfer must still release the row."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, f"failed-transfer-{exact_event}"
+    )
+    store = dispatcher._durable_store
+    real_now = store.now_utc
+
+    async def claim():
+        if exact_event:
+            return await dispatcher.claim_durable_delivery_for_event(
+                consumer_id=consumer.consumer_id,
+                event_id=reserved.event_id,
+                executor_id="late-worker",
+            )
+        return await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+
+    try:
+        monkeypatch.setattr(
+            store, "now_utc", lambda: real_now() + timedelta(hours=1)
+        )
+        assert await claim() is None
+        assert reserved.delivery_id not in dispatcher._transient_durable_handoffs
+        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+        monkeypatch.setattr(store, "now_utc", real_now)
+
+        claimed = await claim()
+        assert claimed is not None
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        monkeypatch.setattr(store, "now_utc", real_now)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_expired_first_lease_release_failure_is_retried(tmp_path, monkeypatch):
+    """A storage error must not drop the only capability that can release the
+    row; the next claim retries it."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "release-failure"
+    )
+    store = dispatcher._durable_store
+    real_abandon = store.abandon_initial_reservation
+
+    async def unavailable(**kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+        monkeypatch.setattr(store, "abandon_initial_reservation", unavailable)
+        assert await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        ) is None
+        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+
+        monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert dispatcher._expired_initial_handoffs == {}
+    finally:
+        monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_transferred_first_lease_is_not_released_when_its_sidecar_expires(
+    tmp_path,
+):
+    """Once a worker holds the lease, the emitter's capability is spent:
+    expiring the payload sidecar must not take the worker's lease away."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "transferred"
+    )
+    try:
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="prompt-worker"
+        )
+        assert claimed is not None
+        handoff = _expire_handoff(dispatcher, claimed.delivery_id)
+        dispatcher._expire_transient_durable_handoff(
+            claimed.delivery_id, handoff.expires_at
+        )
+        assert dispatcher._expired_initial_handoffs == {}
+        assert await dispatcher._release_expired_initial_handoffs() == 0
+
+        (held,) = await dispatcher.list_durable_deliveries()
+        assert held.status == LEASED
+        assert held.lease_owner == "prompt-worker"
+        assert held.lease_token == claimed.lease_token
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ("heartbeat", "retention_purge"))
+async def test_release_of_expired_first_lease_wakes_an_idle_drainer(
+    tmp_path, trigger
+):
+    """#3370: the durable cognition drainer scanned while the first lease was
+    still the emitter's and exited. When the owner heartbeat (or the retention
+    sweep) releases that lease to retry, the delivery must be processed
+    without another event."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / f"release-wakes-{trigger}.db",
+        "did:agent:heartbeat-release-wakes",
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        live = _channel_signal(agent.did, "heartbeat-release")
+        # The retry carries only the privacy marker; recover the envelope the
+        # way sources with an authoritative store do.
+        agent.rehydrate_durable_cognition_signal = (
+            lambda event, *, dispatch_signal: live
+        )
+        result = await dispatcher.dispatch_signal(
+            live, source_event_id="telegram:update:heartbeat-release"
+        )
+        assert result.status is Status.OK
+        (reserved,) = await dispatcher.list_durable_deliveries()
+        assert reserved.status == LEASED
+        assert reserved.lease_owner == dispatcher._durable_delivery_owner
+
+        # The drainer sees no claimable row while the emitter holds it.
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        drainer = dispatcher._durable_cognition_drainers.get(consumer.consumer_id)
+        if drainer is not None:
+            await asyncio.wait_for(drainer, timeout=1.0)
+        assert consumer.consumer_id not in dispatcher._durable_cognition_drainers
+        assert consumer.consumer_id not in dispatcher._durable_cognition_drain_timers
+
+        agent.process_input = AsyncMock(return_value="resumed")
+        _expire_handoff(dispatcher, reserved.delivery_id)
+        if trigger == "heartbeat":
+            await dispatcher._heartbeat_runtime_owner()
+        else:
+            await dispatcher.purge_expired_durable_deliveries()
+
+        for _ in range(200):
+            (delivery,) = await dispatcher.list_durable_deliveries()
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)

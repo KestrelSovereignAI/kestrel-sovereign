@@ -521,8 +521,15 @@ dispatcher (`durable_payload_elided_by()`, which uses the projection's own
 is an eliding mode, it raises `DurableResumeUnsupportedError`
 (`reason == "unsupported_in_privacy_mode"`, a `ValueError`). No watch is
 armed, no consumer is registered, and the provider is not polled. The caller
-keeps the non-durable `wait(..., mode="signal")` path. A privacy mode that
-switches to an eliding one *after* registration is not covered by this check.
+keeps the non-durable `wait(..., mode="signal")` path.
+
+A privacy mode that switches to an eliding one *after* registration (or a
+projection that fails closed with the `projection_error` marker) does not
+strand the consumer. Its delivery is materialized from the live payload when
+the wake commits, so a prompt claim receives the real wake. A claim that
+arrives after the emitter's first lease expired receives the delivery as
+marker-only retry work (#3370, below). Either way the consumer is woken and
+polls the provider, as every delivery requires.
 
 The watch is armed before the consumer exists, and that order is load-bearing.
 An interruption between the two writes must never leave a durable consumer
@@ -606,6 +613,19 @@ reservation. The sidecar is discarded on rollback, acknowledgement, terminal
 failure, lease expiry, and shutdown; after a crash or expired lease, normal
 replay intentionally receives only the persisted marker. Raw payload is never
 written to the durable ledger.
+
+A first lease that expires before any worker claims it belongs to a *live*
+dispatcher, so ordinary claim recovery deliberately never reclaims it. The
+emitting dispatcher therefore keeps that lease's opaque capability (never the
+payload) when it drops the expired sidecar, or when a transfer is refused.
+On the next claim, or its next owner heartbeat, it releases the row to
+`retry` with `last_error` set to `EXPIRED_INITIAL_HANDOFF_ERROR`. Each
+release also wakes that consumer's durable cognition drainer if it has been
+started, because a drainer that scanned while the row was still leased has
+already exited. The
+owner/token compare-and-set leaves a transferred, acknowledged, or terminal
+delivery untouched. Before #3370 the row stayed leased until the process
+stopped, and a late consumer claim silently returned nothing.
 
 Registration and persistence also serialize their handoff at the
 `(agent_id, source)` scope.  Thus an event racing a new workflow subscription
