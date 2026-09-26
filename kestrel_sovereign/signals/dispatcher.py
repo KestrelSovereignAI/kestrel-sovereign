@@ -932,6 +932,10 @@ class SignalDispatcher:
         # marker-only retry work. Claim recovery never reclaims a live
         # dispatcher's lease, so nothing else would (#3370).
         self._expired_initial_handoffs: dict[str, tuple[str, str]] = {}
+        # delivery_ids whose release raised. The store may have committed
+        # the RETRY update before failing, so a later compare-and-set miss
+        # cannot tell "never ours" from "already released by us" (#3372).
+        self._faulted_initial_handoff_releases: set[str] = set()
         # Post-commit reservation repair must outlive the agent-wide
         # best-effort background-task sweep.  A repair created immediately
         # before shutdown may not get a first event-loop turn before that
@@ -2500,6 +2504,7 @@ class SignalDispatcher:
             # reclaims any first lease it still holds, so the local
             # capabilities are no longer needed.
             self._expired_initial_handoffs.clear()
+            self._faulted_initial_handoff_releases.clear()
             if self._durable_runtime_owner_registration_started:
                 await self._durable_store.release_initial_reservations(
                     agent_id=self._agent.did,
@@ -2894,30 +2899,42 @@ class SignalDispatcher:
         A released row is new retry work that a durable cognition drainer
         which already scanned and exited cannot see, so every release wakes
         its started consumer here rather than relying on each caller to.
+
+        A release that raised may still have committed its RETRY update, in
+        which case the retry's compare-and-set finds no row under the token.
+        That miss is then indistinguishable from our own earlier release, so
+        the started consumer is woken conservatively; an idle drainer that
+        finds nothing to claim simply exits (#3372).
         """
         released = 0
         for delivery_id, (consumer_id, token) in tuple(
             self._expired_initial_handoffs.items()
         ):
             try:
-                if await self._durable_store.abandon_initial_reservation(
+                abandoned = await self._durable_store.abandon_initial_reservation(
                     agent_id=self._agent.did,
                     consumer_id=consumer_id,
                     delivery_id=delivery_id,
                     owner_id=self._durable_delivery_owner,
                     reservation_token=token,
                     reason=EXPIRED_INITIAL_HANDOFF_ERROR,
-                ):
-                    released += 1
-                    if consumer_id in self._started_durable_cognition_consumers:
-                        self._start_durable_cognition_drain(consumer_id)
+                )
             except Exception:
+                self._faulted_initial_handoff_releases.add(delivery_id)
                 logger.exception(
                     "Could not release expired initial durable handoff %s; "
                     "retrying on the next claim or owner heartbeat",
                     delivery_id,
                 )
                 continue
+            if abandoned:
+                released += 1
+            previously_faulted = delivery_id in self._faulted_initial_handoff_releases
+            if (
+                abandoned or previously_faulted
+            ) and consumer_id in self._started_durable_cognition_consumers:
+                self._start_durable_cognition_drain(consumer_id)
+            self._faulted_initial_handoff_releases.discard(delivery_id)
             self._expired_initial_handoffs.pop(delivery_id, None)
         return released
 
