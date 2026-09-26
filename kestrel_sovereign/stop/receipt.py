@@ -80,6 +80,12 @@ _OPAQUE_ID_DOMAIN = b"kestrel:stop-receipt-opaque-id:v1\0"
 # the schema backfill takes it inside the schema lock, which no writer holds,
 # so the two orders cannot cycle.
 _RECEIPT_FEED_LOCK_KEY = "kestrel:stop:receipt-feed"
+# How long a claim written before owner liveness (#3356) is presumed live. Such
+# a claim has no heartbeat to read, and during a rolling upgrade its writer may
+# still be running. Pre-liveness Stop code bounds its own execution by its wait
+# ceilings (seconds, not minutes), so a claim older than this cannot belong to a
+# Stop still in progress and becomes retakable.
+_LEGACY_CLAIM_GRACE_SECONDS = 300.0
 
 
 logger = logging.getLogger(__name__)
@@ -798,18 +804,27 @@ class StopReceiptStore:
                     cutoff_sql, cutoff_args = database_lease_cutoff_sql(
                         self._db, self._claim_lease_seconds
                     )
+                    # A claim with no heartbeat was written by a binary that
+                    # predates owner liveness. During a rolling upgrade that
+                    # binary may still be executing its Stop, so its claim is
+                    # treated as live until it is older than any Stop that code
+                    # could still be running, and only then retakable.
+                    legacy_sql, legacy_args = database_lease_cutoff_sql(
+                        self._db, _LEGACY_CLAIM_GRACE_SECONDS
+                    )
                     taken = await self._db.execute(
                         "UPDATE stop_operation_claims SET claim_id = ?, "
                         f"owner_id = ?, claimed_at = {now_sql}, "
                         f"heartbeat_at = {now_sql} "
                         "WHERE operation_id = ? AND claim_id = ? "
-                        "AND (heartbeat_at IS NULL "
+                        f"AND ((heartbeat_at IS NULL AND claimed_at <= {legacy_sql}) "
                         f"OR heartbeat_at <= {cutoff_sql})",
                         (
                             claim_id,
                             self._owner_id,
                             stored_operation_id,
                             claim_row[1],
+                            *legacy_args,
                             *cutoff_args,
                         ),
                     )

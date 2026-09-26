@@ -253,8 +253,13 @@ async def test_concurrent_retries_take_over_an_expired_claim_exactly_once(
 
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_a_claim_written_before_owner_liveness_reads_as_expired(db_backend):
-    """A pre-#3356 row has no owner or heartbeat, so its writer is dead."""
+async def test_a_pre_liveness_claim_is_live_until_its_grace_ends(db_backend):
+    """A pre-#3356 row has no heartbeat to read.
+
+    During a rolling upgrade its writer may still be running its Stop, so a
+    recent heartbeat-less claim is refused as in progress; once it is older
+    than any Stop that code could still be running, it is retakable.
+    """
 
     [retrier] = await _stores(db_backend, 1)
     request = _request()
@@ -265,6 +270,14 @@ async def test_a_claim_written_before_owner_liveness_reads_as_expired(db_backend
         (_operation_id(request),),
     )
 
+    assert await retrier.claim(request) is None
+
+    await retrier._db.execute(
+        "UPDATE stop_operation_claims "
+        "SET claimed_at = '2000-01-01T00:00:00.000000+00:00' "
+        "WHERE operation_id = ?",
+        (_operation_id(request),),
+    )
     taken = await retrier.claim(request)
 
     assert isinstance(taken, StopOperationClaim)
@@ -291,7 +304,8 @@ async def test_legacy_claim_table_gains_owner_columns_and_its_rows_are_retakable
         # Write a claim, then strip it back to the pre-liveness shape.
         claim = await writer.claim(request)
         await db.execute(
-            "UPDATE stop_operation_claims SET owner_id = NULL, heartbeat_at = NULL"
+            "UPDATE stop_operation_claims SET owner_id = NULL, heartbeat_at = NULL, "
+            "claimed_at = '2000-01-01T00:00:00.000000+00:00'"
         )
         columns = {
             row[1] for row in await db.fetchall(
