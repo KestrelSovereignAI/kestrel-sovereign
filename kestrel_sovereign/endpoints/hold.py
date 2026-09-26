@@ -236,12 +236,15 @@ def _refuse_holder_outside_mandate(scope: HoldScope, holder_id: str | None) -> N
 async def _resolve_mandate_release(
     store: Any, target_id: str | None, holder_id: str | None
 ) -> tuple[str, str]:
-    """Bind a sovereign mandate release to a latch that exists.
+    """Validate a sovereign mandate release's latch key; the store decides.
 
-    Not to the live inventory: a mandate latch outlives its holder's mandate
-    and may outlive the target's hosting, and the sovereign must still be able
-    to release it. The release itself remains a compare-and-set on the
-    observed receipt, so this read only decides between 404 and the store.
+    Not bound to the live inventory: a mandate latch outlives its holder's
+    mandate and may outlive the target's hosting, and the sovereign must still
+    be able to release it. Nor bound to the latch still being set: a release
+    that committed but whose response was lost must reach the store on retry
+    so the store replays its receipt by ``operation_id``, and a release of an
+    absent latch is itself a real act the store records. The read below only
+    validates that the target and holder can name a mandate latch.
     """
 
     if target_id is None or holder_id is None:
@@ -251,9 +254,7 @@ async def _resolve_mandate_release(
             message="A mandate Hold release names both the target and its holder.",
         )
     try:
-        latch = await store.get_hold(
-            HoldScope.MANDATE, target_id, holder_id=holder_id
-        )
+        await store.get_hold(HoldScope.MANDATE, target_id, holder_id=holder_id)
     except ValueError as error:
         raise ApiHTTPException(
             status_code=400,
@@ -262,12 +263,6 @@ async def _resolve_mandate_release(
         ) from error
     except _EXPECTED_HOLD_STORE_FAILURES as error:
         raise _refuse_store_failure(error) from error
-    if latch is None:
-        raise ApiHTTPException(
-            status_code=404,
-            code="hold_latch_unknown",
-            message="No mandate Hold by that holder is set on that target.",
-        )
     return target_id, holder_id
 
 

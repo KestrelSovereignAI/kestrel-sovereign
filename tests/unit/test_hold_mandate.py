@@ -926,7 +926,13 @@ async def test_the_host_door_shows_and_releases_mandate_latches(hold_store):
             "expected_hold_receipt_id": held.receipt.receipt_id,
         },
     )
-    assert unknown.status_code == 404
+    # A release naming a holder with no latch reaches the store, which records
+    # it as a real act that applied nothing; the other holder's latch stands.
+    assert unknown.status_code == 200
+    assert unknown.json()["receipt"]["disposition"] != "applied"
+    assert client.get("/api/host/hold").json()["mandate_holds"] == [
+        hold_latch_payload(held.current)
+    ]
 
     released = client.post(
         "/api/host/hold/release",
@@ -945,10 +951,31 @@ async def test_the_host_door_shows_and_releases_mandate_latches(hold_store):
     assert body["receipt"]["holder_id"] == ROOT
     assert body["current"] is None
 
+    # The response was "lost": the exact retry must replay the committed
+    # receipt, not 404 on the now-absent latch.
+    retry = client.post(
+        "/api/host/hold/release",
+        json={
+            "scope": "mandate",
+            "target_id": CHILD,
+            "holder_id": ROOT,
+            "reason": "sovereign resumes",
+            "operation_id": "sov-release",
+            "expected_hold_receipt_id": held.receipt.receipt_id,
+        },
+    )
+    assert retry.status_code == 200
+    assert retry.json()["receipt"]["receipt_id"] == body["receipt"]["receipt_id"]
+
     receipts = client.get(
         "/api/host/hold/receipts", params={"scope": "mandate", "agent_id": CHILD}
     ).json()["receipts"]
-    assert [receipt["action"] for receipt in receipts] == ["hold", "release"]
+    # hold, the wrong-holder release (a real act that applied nothing), and
+    # the sovereign release -- the replayed retry wrote nothing new.
+    assert [receipt["action"] for receipt in receipts] == ["hold", "release", "release"]
+    assert [receipt["holder_id"] for receipt in receipts] == [ROOT, PEER, ROOT]
+    assert receipts[1]["disposition"] != "applied"
+    assert receipts[2]["disposition"] == "applied"
 
 
 @pytest.mark.asyncio
