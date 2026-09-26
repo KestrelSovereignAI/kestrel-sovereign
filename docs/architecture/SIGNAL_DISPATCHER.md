@@ -480,6 +480,33 @@ initial-reservation capabilities cannot recreate work. Re-registration cannot
 change an inactive consumer back to active; a new workflow wait needs a new
 consumer ID.
 
+#### Resuming on a wait handle instead of holding a turn
+
+A held wait (`wait("<kind>:<handle>")`, or any `run_wait_loop` caller) is
+capped at `MAX_HANDLE_WAIT_SECONDS`. Work that must outlive that ceiling — a
+workflow stage waiting on the `talon:<job_id>` its dispatch stage returned —
+parks instead and subscribes to the handle's wake (#3295):
+
+```python
+from kestrel_sovereign.waits.reconciler import register_wait_resume_consumer
+
+await register_wait_resume_consumer(
+    agent, "talon:job-42", consumer_id="workflows:wait:run-42"
+)
+```
+
+It validates the ref exactly like `wait(..., mode="signal")`, arms the same
+reconciler watch, and registers a durable consumer on the provider's wake
+source (`provider.signal`, else `wait.complete`) with the selector
+`payload.ref=<kind>:<handle>`. The reconciler writes `payload.ref` after
+spreading the provider's poll data, so a provider cannot point one handle's
+completion at another handle's parked work, and kinds sharing
+`wait.complete` never cross. A wake committed before the registration is
+backfilled; `max_attempts` defaults to `0` because the wake is the only thing
+that resumes the parked work. A delivery is a wake, not a verdict: poll the
+provider for the handle's state before parking and on every delivery, then
+deactivate the consumer when the parked work finishes.
+
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
 that scope in storage; scope is therefore an authorization boundary for a
