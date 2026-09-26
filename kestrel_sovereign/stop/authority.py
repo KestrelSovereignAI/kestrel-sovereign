@@ -230,6 +230,12 @@ class CancellationAuthority:
             getattr(receipt_store, "persist", None)
         ):
             raise TypeError("receipt_store must provide load and persist")
+        if callable(getattr(receipt_store, "claim", None)) and not callable(
+            getattr(receipt_store, "hold_claim", None)
+        ):
+            # A claim nobody heartbeats reads as a dead owner's and would be
+            # taken over while its Stop is still executing (#3356).
+            raise TypeError("a receipt_store that claims must provide hold_claim")
         if not isinstance(door, StopDoor):
             raise TypeError("door must name the StopDoor this authority serves")
         self._door = door
@@ -298,7 +304,6 @@ class CancellationAuthority:
         entire claim-to-receipt transaction boundary.
         """
 
-        claim_id: str | None = None
         claim_operation = getattr(self._receipt_store, "claim", None)
         if callable(claim_operation):
             try:
@@ -320,6 +325,8 @@ class CancellationAuthority:
             if isinstance(claim, StopReceipt):
                 return claim.outcomes
             if claim is None:
+                # A LIVE owner holds the claim. A dead owner's claim is taken
+                # over by ``claim`` itself and arrives here as a new claim.
                 return self._receipt_preflight_refusal(
                     request,
                     targets,
@@ -331,12 +338,17 @@ class CancellationAuthority:
                     targets,
                     detail="Stop receipt storage returned an invalid operation claim",
                 )
-            claim_id = claim.claim_id
+            async with self._receipt_store.hold_claim(claim):
+                return await self._stop_and_persist(
+                    request,
+                    targets,
+                    claim_id=claim.claim_id,
+                )
 
         return await self._stop_and_persist(
             request,
             targets,
-            claim_id=claim_id,
+            claim_id=None,
         )
 
     async def _stop_and_persist(

@@ -643,6 +643,9 @@ async def test_empty_host_receipt_preflight_returns_authority_refusal(
                 raise RuntimeError("receipt backend unavailable")
             raise AssertionError("claim must not run after load failure")
 
+        def hold_claim(self, _claim):
+            raise AssertionError("no claim is ever granted")
+
         async def persist(self, *_args, **_kwargs):
             raise AssertionError("preflight refusal must not be persisted")
 

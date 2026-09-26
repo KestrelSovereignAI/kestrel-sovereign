@@ -766,25 +766,37 @@ async def test_unadmitted_retry_cannot_preempt_an_admitted_first_attempt(
     assert "rate limits" in refused_rows[0].outcomes[0].detail
 
 
-@pytest.mark.asyncio
-async def test_retry_against_a_stranded_claim_is_an_honest_in_progress_refusal(
-    rail, monkeypatch
-) -> None:
-    """A claim whose owner died is surfaced, not reinterpreted (#3356).
+async def _strand_claim(rail, monkeypatch, correlation_id):
+    """Leave one peer Stop claimed by an owner that then dies (#3356)."""
 
-    Recovering a stranded operation claim is #3356's.  Until then the peer
-    rail answers a retry with the typed "already in progress" refusal and
-    writes nothing under the operation id that could pretend to decide it.
-    """
-
-    rail.agent._active_request_ids.add("req-live")
-    await _interrupt_after_source_event_commit(rail, monkeypatch, "stranded")
+    await _interrupt_after_source_event_commit(rail, monkeypatch, correlation_id)
     operation = peer_stop.peer_stop_request(
         target_agent_id=peer_stop.peer_stop_target_identity(rail.agent),
         actor_id=PEER_DID,
-        intent=_intent(correlation_id="stranded"),
+        intent=_intent(correlation_id=correlation_id),
     )
-    assert await rail.receipts.claim(operation) is not None  # owner then dies
+    claim = await rail.receipts.claim(operation)
+    assert isinstance(claim, StopOperationClaim)
+    return claim
+
+
+async def _expire_claims(rail) -> None:
+    """Age every claim's heartbeat past the lease: its owner is proven dead."""
+
+    await rail.receipt_db.execute(
+        "UPDATE stop_operation_claims SET heartbeat_at = ?",
+        ("2000-01-01T00:00:00.000+00:00",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_against_a_live_owners_claim_is_an_honest_in_progress_refusal(
+    rail, monkeypatch
+) -> None:
+    """A claim whose owner's lease is live is never taken over (#3356)."""
+
+    rail.agent._active_request_ids.add("req-live")
+    await _strand_claim(rail, monkeypatch, "stranded")
 
     retry = await dispatch_peer_stop(
         rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="stranded")
@@ -795,6 +807,50 @@ async def test_retry_against_a_stranded_claim_is_an_honest_in_progress_refusal(
     assert "already in progress" in outcome["detail"]
     assert rail.agent.cancelled == []
     assert await _operation_receipt(rail, PEER_DID, "stranded") is None
+
+
+@pytest.mark.asyncio
+async def test_retry_takes_over_a_claim_whose_owner_died_before_cancel(
+    rail, monkeypatch
+) -> None:
+    """The peer rail inherits claim takeover: the retry stops the work (#3356)."""
+
+    rail.agent._active_request_ids.add("req-live")
+    await _strand_claim(rail, monkeypatch, "stranded")
+    await _expire_claims(rail)
+
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="stranded")
+    )
+
+    [outcome] = retry["stop_outcomes"]
+    assert outcome["disposition"] == "stopped"
+    assert rail.agent.cancelled == ["req-live"]
+    receipt = await _operation_receipt(rail, PEER_DID, "stranded")
+    assert [o.disposition.value for o in receipt.outcomes] == ["stopped"]
+    assert len(await _receipts(rail)) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_dead_owner_cancelled_records_already_complete(
+    rail, monkeypatch
+) -> None:
+    """Owner cancelled, then died before its receipt: no second effect."""
+
+    rail.agent._active_request_ids.add("req-live")
+    await _strand_claim(rail, monkeypatch, "stranded")
+    assert rail.agent.cancel_current_request("req-live")  # the dead owner's effect
+    await _expire_claims(rail)
+
+    retry = await dispatch_peer_stop(
+        rail.agent, actor_id=PEER_DID, intent=_intent(correlation_id="stranded")
+    )
+
+    [outcome] = retry["stop_outcomes"]
+    assert outcome["disposition"] == "already_complete"
+    receipt = await _operation_receipt(rail, PEER_DID, "stranded")
+    assert [o.disposition.value for o in receipt.outcomes] == ["already_complete"]
+    assert len(await _receipts(rail)) == 1
 
 
 @pytest.mark.asyncio

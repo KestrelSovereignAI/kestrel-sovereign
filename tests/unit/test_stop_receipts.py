@@ -1035,6 +1035,7 @@ async def test_cancelled_caller_cannot_split_claim_from_effect(tmp_path):
         class DelayedClaimStore:
             load = durable_store.load
             persist = durable_store.persist
+            hold_claim = durable_store.hold_claim
 
             async def claim(self, request):
                 claim = await durable_store.claim(request)
