@@ -385,6 +385,8 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         "blockers_checked": 2,
         "blockers_unreadable": 2,
         "blockers_talon_owned": 0,
+        "candidates_checked": 0,
+        "candidates_unreadable": 0,
         "open_pr_exclusions": [],
     }
 
@@ -406,6 +408,8 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
         "blockers_checked": 1,
         "blockers_unreadable": 0,
         "blockers_talon_owned": 0,
+        "candidates_checked": 0,
+        "candidates_unreadable": 0,
         "open_pr_exclusions": [],
     }
 
@@ -827,3 +831,105 @@ async def test_the_stalled_threshold_is_configurable(monkeypatch, configured, ex
     await issue_selection.pick_top_issue(data, diagnostics)
 
     assert diagnostics["open_pr_exclusions"][0]["stalled_after_days"] == expected
+
+
+# ---------------------------------------------------------------------------
+# #3367: unreadable linkage in the milestone/backlog passes is counted too
+# ---------------------------------------------------------------------------
+
+_BACKLOG = "/repos/o/r/issues?state=open&per_page=5&sort=updated"
+_MILESTONES = "/repos/o/r/milestones?state=open&per_page=20"
+_MILESTONE_ISSUES = "/repos/o/r/issues?milestone=4&state=open&per_page=10&sort=updated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("502")])
+async def test_unreadable_backlog_linkage_is_counted_not_silent(monkeypatch, failure):
+    """Every backlog candidate withheld because GitHub could not say whether a
+    PR works it. Withholding is right; returning None with nothing counted let
+    signal_dispatch report "No actionable issue found" for an outage."""
+    _stub_github(
+        monkeypatch,
+        {_BACKLOG: [_open(1), _open(2)]},
+        linked_prs={("o/r", 1): failure, ("o/r", 2): failure},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, diagnostics
+    )
+
+    assert picked is None
+    assert diagnostics["candidates_checked"] == 2
+    assert diagnostics["candidates_unreadable"] == 2
+    # The blocker counts are about blockers; there were none.
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unreadable_milestone_linkage_is_counted_once_per_issue(monkeypatch):
+    """A milestone issue that the backlog scan lists again is one candidate,
+    and the cached linkage read is one unreadable read, not two."""
+    _stub_github(
+        monkeypatch,
+        {
+            _MILESTONES: [{"number": 4, "title": "Extraction"}],
+            _MILESTONE_ISSUES: [_open(11)],
+            _BACKLOG: [_open(11)],
+        },
+        linked_prs={("o/r", 11): None},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [{"name": "Extraction", "status": "at_risk", "repos": ["o/r"]}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert diagnostics["candidates_checked"] == 1
+    assert diagnostics["candidates_unreadable"] == 1
+
+
+@pytest.mark.asyncio
+async def test_candidates_with_open_prs_are_checked_but_not_unreadable(monkeypatch):
+    """The control: an open PR is a real answer. A backlog fully in flight is
+    genuinely nothing to do and must not be reported as an outage."""
+    _stub_github(
+        monkeypatch,
+        {_BACKLOG: [_open(1), _open(2)]},
+        linked_prs={
+            ("o/r", 1): [_pr(8, updated_at=_fresh_now())],
+            ("o/r", 2): [_pr(9, updated_at=_fresh_now())],
+        },
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, diagnostics
+    )
+
+    assert picked is None
+    assert diagnostics["candidates_checked"] == 2
+    assert diagnostics["candidates_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_one_unreadable_candidate_among_in_flight_ones_is_counted(monkeypatch):
+    """Two candidates in flight and one GitHub could not answer for: that one
+    is the only reason nothing was picked, so it must be visible."""
+    _stub_github(
+        monkeypatch,
+        {_BACKLOG: [_open(1), _open(2), _open(3)]},
+        linked_prs={
+            ("o/r", 1): [_pr(8, updated_at=_fresh_now())],
+            ("o/r", 2): None,
+            ("o/r", 3): [_pr(9, updated_at=_fresh_now())],
+        },
+    )
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, diagnostics
+    ) is None
+    assert diagnostics["candidates_checked"] == 3
+    assert diagnostics["candidates_unreadable"] == 1

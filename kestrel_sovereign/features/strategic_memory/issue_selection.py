@@ -122,12 +122,20 @@ async def pick_top_issue(
     ``diagnostics["open_pr_exclusions"]`` lists every candidate passed over
     because an open pull request already works it (or GitHub could not say),
     so the dispatch can report what it skipped instead of staying silent.
+
+    ``candidates_checked`` and ``candidates_unreadable`` do the same for the
+    milestone and backlog passes: how many distinct candidates had their PR
+    linkage looked up, and how many of those GitHub could not answer for. A
+    candidate withheld only because its linkage was unreadable was never
+    confirmed busy, so "no actionable issue" is not the answer (#3367).
     """
     if diagnostics is None:
         diagnostics = {}
     diagnostics.setdefault("blockers_checked", 0)
     diagnostics.setdefault("blockers_unreadable", 0)
     diagnostics.setdefault("blockers_talon_owned", 0)
+    diagnostics.setdefault("candidates_checked", 0)
+    diagnostics.setdefault("candidates_unreadable", 0)
     exclusions = diagnostics.setdefault("open_pr_exclusions", [])
     token = get_github_token()
     if not token:
@@ -164,10 +172,25 @@ async def pick_top_issue(
                 )
         return linkage[key]
 
+    # Distinct (repo, number) per milestone/backlog candidate: the same issue
+    # can sit in a milestone and in the backlog scan, and is one candidate.
+    candidates_checked: set = set()
+    candidates_unreadable: set = set()
+
     async def first_free(repo: str, issues: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         for candidate in _ranked_candidates(issues):
-            if await in_flight(repo, candidate["number"]) is None:
+            key = (repo, candidate["number"])
+            exclusion = await in_flight(*key)
+            candidates_checked.add(key)
+            diagnostics["candidates_checked"] = len(candidates_checked)
+            if exclusion is None:
                 return candidate
+            if exclusion["reason"] == EXCLUDED_PR_LINKAGE_UNREADABLE:
+                # Withheld, correctly, but not confirmed busy: counted so an
+                # outage cannot render as an empty backlog (#3367), as the
+                # blocker pass does for its own unreadable reads.
+                candidates_unreadable.add(key)
+                diagnostics["candidates_unreadable"] = len(candidates_unreadable)
         return None
 
     # One GitHub read per DISTINCT (repo, number), not per row: the ledger only
