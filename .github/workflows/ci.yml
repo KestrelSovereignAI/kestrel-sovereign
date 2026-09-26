@@ -107,6 +107,16 @@ jobs:
   # `name:` that differs) makes the old required check never report and blocks
   # every PR until branch protection is edited by hand. Not worth a better
   # label. Four `needs:` references and publish.yml also key on this id.
+  # #2683 re-audited this before touching the name: the repository ruleset
+  # carries no status-check rule, and classic branch protection is not
+  # readable with a repo-scoped token, so absence of a requirement cannot be
+  # proven from here. The id therefore stays; the step names below say what
+  # each check actually validates.
+  #
+  # This job is deliberately NOT a repository-wide ruff/mypy gate. Broad
+  # lint and type enforcement is staged under the structural quality campaign
+  # (#2480), which adds narrow gates as each noisy baseline is paid down. Do
+  # not add an always-red tree-wide lint or type step here.
   lint-and-imports:
     runs-on: ubuntu-latest
     permissions:
