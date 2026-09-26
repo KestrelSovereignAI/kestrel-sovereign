@@ -12,7 +12,8 @@ belongs to a sponsor funding many agents.
 Two primitives:
 
 - ``SponsorKeyStorage`` — per-sponsor master credentials, keyed by the
-  sponsor's DID (``encrypt(sponsor_did, "service-keys", ...)``), mirroring
+  sponsor's DID (``encrypt(sponsor_did, "service-keys", ...)``). A typed
+  facade over the shared ``PrincipalMasterKeyStore``, like
   ``UserMasterKeyStorage``. One master per (sponsor, provider).
 - ``SponsorBeneficiaryStore`` — the sponsor→agent roster ("which sponsor funds
   this agent", "list a sponsor's agents"). A policy builder consults it to set
@@ -29,22 +30,17 @@ child, and the sponsor's own provider-account limit bounds the group.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, TYPE_CHECKING
 
-from kestrel_sovereign.security.agent_encryption import encrypt
-from kestrel_sovereign.security.legacy_decrypt import (
-    decrypt_with_legacy_fallback as decrypt,
+from kestrel_sovereign.security.principal_master_key_store import (
+    MasterKeyRecord,
+    MasterKeyTable,
+    PrincipalMasterKeyScope,
+    PrincipalMasterKeyStore,
 )
-from kestrel_sovereign.security.exceptions import (
-    KeyNotConfiguredError,
-)
-from kestrel_sovereign.security.service_key_storage import KNOWN_PROVIDERS
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -63,6 +59,16 @@ class SponsorKeyInfo:
     created_at: datetime
 
 
+def _sponsor_key_info(record: MasterKeyRecord) -> SponsorKeyInfo:
+    return SponsorKeyInfo(
+        id=record.id,
+        sponsor_did=record.principal,
+        provider_id=record.provider_id,
+        is_active=record.is_active,
+        created_at=record.created_at,
+    )
+
+
 class SponsorKeyStorage:
     """Sponsor-scoped encrypted storage for master credentials.
 
@@ -76,134 +82,44 @@ class SponsorKeyStorage:
     def __init__(self, db: "AsyncDatabase", sponsor_did: str) -> None:
         if not sponsor_did:
             raise ValueError("sponsor_did is required for SponsorKeyStorage")
-        self._db = db
-        self._sponsor_did = sponsor_did
-
-    @staticmethod
-    def _hash_key(api_key: str) -> str:
-        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:32]
-
-    async def _ensure_provider(self, provider_id: str) -> None:
-        provider_info = KNOWN_PROVIDERS.get(provider_id, {"name": provider_id})
-        await self._db.execute(
-            """
-            INSERT OR IGNORE INTO service_providers
-            (id, name, supports_sub_accounts, created_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                provider_id,
-                provider_info["name"],
-                1 if provider_info.get("supports_sub_accounts") else 0,
+        self._store = PrincipalMasterKeyStore(
+            db,
+            PrincipalMasterKeyScope(
+                table=MasterKeyTable.SPONSOR,
+                principal=sponsor_did,
+                encryption_identity=sponsor_did,
+                kind="sponsor",
+                project_info=_sponsor_key_info,
             ),
         )
 
     async def store_key(self, provider_id: str, api_key: str) -> str:
         """Store an encrypted master key for this sponsor (idempotent per
         ``(sponsor_did, provider_id)``). Returns the row id."""
-        await self._ensure_provider(provider_id)
-
-        encrypted_bytes = encrypt(
-            self._sponsor_did,
-            "service-keys",
-            api_key.encode("utf-8"),
-        )
-        encrypted_b64 = base64.b64encode(encrypted_bytes).decode("ascii")
-
-        key_id = str(uuid.uuid4())
-        key_hash = self._hash_key(api_key)
-
-        await self._db.execute(
-            """
-            INSERT OR REPLACE INTO sponsor_master_service_keys
-            (id, master_did, provider_id, encrypted_key, key_hash, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
-            """,
-            (key_id, self._sponsor_did, provider_id, encrypted_b64, key_hash),
-        )
-
-        logger.info(
-            f"Stored sponsor master key for sponsor={self._sponsor_did[:30]}..., "
-            f"provider={provider_id}"
-        )
-        return key_id
+        return await self._store.store_key(provider_id, api_key)
 
     async def get_key(self, provider_id: str) -> str:
         """Get the decrypted sponsor master key for ``provider_id``.
 
-        Raises KeyNotConfiguredError if no active key exists.
+        Raises KeyNotConfiguredError if no active key exists, and
+        DecryptionError if the stored ciphertext cannot be decrypted.
         """
-        rows = await self._db.fetchall(
-            """
-            SELECT encrypted_key FROM sponsor_master_service_keys
-            WHERE master_did = ? AND provider_id = ? AND is_active = 1
-            """,
-            (self._sponsor_did, provider_id),
-        )
-
-        if not rows or not rows[0][0]:
-            raise KeyNotConfiguredError(
-                f"No sponsor master key configured for provider '{provider_id}' "
-                f"and sponsor '{self._sponsor_did[:30]}...'"
-            )
-
-        encrypted_bytes = base64.b64decode(rows[0][0])
-        plaintext_bytes = decrypt(
-            self._sponsor_did,
-            "service-keys",
-            encrypted_bytes,
-        )
-        return plaintext_bytes.decode("utf-8")
+        return await self._store.get_key(provider_id)
 
     async def has_key(self, provider_id: str) -> bool:
         """True iff this sponsor has an active master key for ``provider_id``."""
-        rows = await self._db.fetchall(
-            """
-            SELECT 1 FROM sponsor_master_service_keys
-            WHERE master_did = ? AND provider_id = ? AND is_active = 1
-            """,
-            (self._sponsor_did, provider_id),
-        )
-        return len(rows) > 0
+        return await self._store.has_key(provider_id)
 
     async def list_keys(self) -> List[SponsorKeyInfo]:
-        """List this sponsor's master keys (no secrets exposed)."""
-        rows = await self._db.fetchall(
-            """
-            SELECT id, master_did, provider_id, is_active, created_at
-            FROM sponsor_master_service_keys
-            WHERE master_did = ?
-            ORDER BY created_at DESC
-            """,
-            (self._sponsor_did,),
-        )
-        return [
-            SponsorKeyInfo(
-                id=row[0],
-                sponsor_did=row[1],
-                provider_id=row[2],
-                is_active=bool(row[3]),
-                created_at=datetime.fromisoformat(row[4]) if row[4] else datetime.utcnow(),
-            )
-            for row in rows
-        ]
+        """List this sponsor's master keys (no secrets exposed), newest first."""
+        return await self._store.list_keys()
 
     async def delete_key(self, provider_id: str) -> bool:
-        """Hard-delete this sponsor's master key for ``provider_id``."""
-        if not await self.has_key(provider_id):
-            return False
-        await self._db.execute(
-            """
-            DELETE FROM sponsor_master_service_keys
-            WHERE master_did = ? AND provider_id = ?
-            """,
-            (self._sponsor_did, provider_id),
-        )
-        logger.info(
-            f"Deleted sponsor master key for sponsor={self._sponsor_did[:30]}..., "
-            f"provider={provider_id}"
-        )
-        return True
+        """Hard-delete this sponsor's master key for ``provider_id``.
+
+        Returns True iff an active row was actually removed.
+        """
+        return await self._store.delete_key(provider_id)
 
 
 class SponsorBeneficiaryStore:
