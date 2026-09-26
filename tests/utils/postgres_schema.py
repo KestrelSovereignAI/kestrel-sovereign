@@ -1,29 +1,31 @@
 """Disposable PostgreSQL schemas for tests that need a database of their own.
 
 A PostgreSQL test database outlives the run: locally it is reused between
-runs, and in CI every xdist worker shares one. A test whose store refuses to
-adopt state it did not write (Hold's initialization witness is the example
-that prompted this) passes against a fresh database and fails on the next
-run. Giving such a test its own schema, dropped at teardown, makes it
+runs, and every xdist worker of a run connects to the same one (each in its
+own schema, see ``tests/shared/postgres_worker_isolation.py``). A test whose
+store refuses to adopt state it did not write (Hold's initialization witness
+is the example that prompted this) passes against a fresh database and fails
+on the next run. Giving such a test its own schema, dropped at teardown, makes it
 independent of whatever ran before it.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 
-def postgres_test_url() -> str | None:
+def postgres_test_url(environ: Mapping[str, str] | None = None) -> str | None:
     """The PostgreSQL URL dual-backend tests run against, if any is set."""
 
+    env = os.environ if environ is None else environ
     return (
-        os.environ.get("TEST_POSTGRES_URL")
-        or os.environ.get("KESTREL_DATABASE_URL")
-        or os.environ.get("DATABASE_URL")
+        env.get("TEST_POSTGRES_URL")
+        or env.get("KESTREL_DATABASE_URL")
+        or env.get("DATABASE_URL")
     )
 
 

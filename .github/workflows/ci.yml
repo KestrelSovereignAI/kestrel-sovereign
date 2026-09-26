@@ -458,6 +458,9 @@ jobs:
           # TEST_POSTGRES_URL, not DATABASE_URL: it is the one variable every
           # dual-backend fixture reads, and it is read only by tests, so it
           # cannot move code under test onto PostgreSQL behind its back.
+          # Each xdist worker rewrites it to a schema of its own, so workers
+          # booting the core schema at once cannot race in the catalogs
+          # (#3383, tests/shared/postgres_worker_isolation.py).
           TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
           # Fail, not skip: a PostgreSQL case that skips here is a failure,
           # and a missing URL stops the session before collection. See
