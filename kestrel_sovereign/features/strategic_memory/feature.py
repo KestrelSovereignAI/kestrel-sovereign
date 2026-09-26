@@ -104,6 +104,10 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # Every blocker selection tried to confirm came back unreadable; not
         # the same claim as "nothing is actionable" (#3280).
         "BLOCKERS_UNCONFIRMED",
+        # No candidate was selected and at least one milestone/backlog
+        # candidate was withheld only because GitHub could not say whether an
+        # open PR already works it; not "the backlog is empty" (#3367).
+        "CANDIDATES_UNCONFIRMED",
     }
 )
 # Prefixes that the github-backed sub-modules (backlog_hygiene,
@@ -1742,30 +1746,57 @@ class StrategicMemoryFeature(Feature):
             else ""
         )
         checked = selection.get("blockers_checked", 0)
+        candidates_checked = selection.get("candidates_checked", 0)
+        candidates_unreadable = selection.get("candidates_unreadable", 0)
+        # Each code stays a literal reason_code dict entry: the declared-code
+        # drift test scans the source for those literals (#3184).
+        unconfirmed: Optional[Dict[str, str]] = None
         if not issue and checked and selection.get("blockers_unreadable") == checked:
             # Every blocker it tried to confirm came back unreadable. Before
             # #3280 a qualified blocker was dispatched without asking GitHub,
             # so selection could not fail on a network fault; now it asks, and
             # "nothing is actionable" and "GitHub could not be reached" must
             # not render the same. This is not the first answer, it is no answer.
+            unconfirmed = {
+                "reason_code": "BLOCKERS_UNCONFIRMED",
+                "finding": f"Could not confirm any of {checked} blocker issue(s) "
+                "with GitHub -- every read was unreadable.",
+                "error": "GitHub could not confirm any blocker issue",
+            }
+        elif not issue and candidates_unreadable:
+            # Milestone/backlog candidates withheld because GitHub could not
+            # say whether an open PR already works them. Withholding is right;
+            # reporting the result as an empty backlog is not (#3367). Any one
+            # of them may have been the pick.
+            unconfirmed = {
+                "reason_code": "CANDIDATES_UNCONFIRMED",
+                "finding": f"Could not confirm {candidates_unreadable} of "
+                f"{candidates_checked} milestone/backlog candidate issue(s) "
+                "with GitHub -- their pull-request linkage was unreadable, so "
+                "they were withheld.",
+                "error": "GitHub could not confirm pull-request linkage for "
+                f"{candidates_unreadable} candidate issue(s)",
+            }
+        if unconfirmed is not None:
             return ToolResult.partial(
                 confirmation=(
                     "## Signal Dispatch"
                     + (" (suggest)" if mode == "suggest" else "")
-                    + f"\nCould not confirm any of {checked} blocker issue(s) with "
-                    "GitHub -- every read was unreadable. Nothing was dispatched; "
+                    + f"\n{unconfirmed['finding']} Nothing was dispatched; "
                     "this is not the same as having nothing to do."
                     + skipped_text
                 ),
-                error="GitHub could not confirm any blocker issue",
+                error=unconfirmed["error"],
                 data={
                     "mode": mode,
                     "issue": None,
                     "workflow": workflow_name,
                     "dispatched": False,
                     "skipped": skipped,
-                    "reason_code": "BLOCKERS_UNCONFIRMED",
+                    "reason_code": unconfirmed["reason_code"],
                     "blockers_checked": checked,
+                    "candidates_checked": candidates_checked,
+                    "candidates_unreadable": candidates_unreadable,
                 },
             )
         if not issue:
