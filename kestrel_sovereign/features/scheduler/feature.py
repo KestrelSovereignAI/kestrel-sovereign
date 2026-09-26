@@ -886,7 +886,9 @@ class SchedulerFeature(Feature):
             # Checked here, outside the dispatcher, so the runner receives the
             # typed failure and its actionable text rather than the fixed
             # content-free text the source handler boundary substitutes.
-            self._require_scheduled_tool_owner(task_name)
+            held_skip = await self._require_scheduled_tool_owner(task_name)
+            if held_skip is not None:
+                return held_skip
 
         signal = Signal(
             source=cron_source_name(task_name),
@@ -904,6 +906,18 @@ class SchedulerFeature(Feature):
     ) -> Any:
         """Apply periodic-work Hold semantics to an unregistered tool unit."""
 
+        held_skip = await self._held_skip(task_name)
+        if held_skip is not None:
+            return held_skip
+        return await self._lookup_and_run_tool(task_name, args)
+
+    async def _held_skip(self, task_name: str) -> Optional[str]:
+        """Record and return the periodic-work held skip, or ``None`` if unheld.
+
+        Used where the scheduler decides a unit without the dispatcher, which
+        is otherwise where the Hold disposition is applied.
+        """
+
         from kestrel_sovereign.hold import (
             HeldWorkDisposition,
             get_effective_hold_state,
@@ -912,15 +926,15 @@ class SchedulerFeature(Feature):
         from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 
         effective = await get_effective_hold_state(self.agent)
-        if effective is not None and effective.held:
-            record_held_work_disposition(
-                disposition=HeldWorkDisposition.SKIPPED.value,
-                source=cron_source_name(task_name),
-            )
-            # Match the registered-signal translation so SchedulerRunner
-            # records a benign no-execution receipt, not a failed retry unit.
-            return "skipped: dropped_quiet_hours (hold_skipped)"
-        return await self._lookup_and_run_tool(task_name, args)
+        if effective is None or not effective.held:
+            return None
+        record_held_work_disposition(
+            disposition=HeldWorkDisposition.SKIPPED.value,
+            source=cron_source_name(task_name),
+        )
+        # Match the registered-signal translation so SchedulerRunner
+        # records a benign no-execution receipt, not a failed retry unit.
+        return "skipped: dropped_quiet_hours (hold_skipped)"
 
     @staticmethod
     def _translate_signal_result(result, task_name: str) -> Any:
@@ -1311,16 +1325,25 @@ class SchedulerFeature(Feature):
                 )
         return None, None, None
 
-    def _require_scheduled_tool_owner(self, task_name: str) -> None:
+    async def _require_scheduled_tool_owner(
+        self, task_name: str
+    ) -> Optional[str]:
         """Fail a tool-delegating built-in whose owner is absent, before dispatch.
 
-        A disabled owner is left to the lookup's benign disabled skip.
+        A disabled owner is left to the lookup's benign disabled skip. A held
+        agent returns the held skip instead of failing (#3377): this preflight
+        runs before the dispatcher applies Hold, and no-execution under Hold is
+        a skip, not a failure. ``None`` means dispatch may proceed.
         """
         _owner, agent_tool, disabled_owner = self._resolve_scheduled_tool(
             task_name
         )
         if agent_tool is None and disabled_owner is None:
+            held_skip = await self._held_skip(task_name)
+            if held_skip is not None:
+                return held_skip
             raise ScheduledTaskOwnerUnavailable(task_name)
+        return None
 
     def _scheduler_executable_task_names(self) -> set:
         """Return the set of task names the scheduler can actually run.

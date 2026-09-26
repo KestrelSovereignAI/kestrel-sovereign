@@ -37,6 +37,8 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerDispatchNotReady,
     SchedulerRunner,
 )
+from kestrel_sovereign.hold import HeldWorkDisposition
+from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -2553,6 +2555,129 @@ class TestTaskExecutor:
         with pytest.raises(ScheduledTaskOwnerUnavailable):
             await feature._dispatch_scheduled_task("restart_coordinator", {})
         feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+    @staticmethod
+    def _held_store(agent_did: str):
+        from kestrel_sovereign.hold import (
+            EffectiveHoldState,
+            HoldScope,
+            HoldState,
+        )
+
+        class _HeldStore:
+            async def get_effective(self, _agent_id):
+                return EffectiveHoldState(
+                    host=None,
+                    agent=HoldState(
+                        scope=HoldScope.AGENT,
+                        target_id=agent_did,
+                        reason="operator hold",
+                        actor_id="did:test:operator",
+                        set_at="2026-09-26T00:00:00+00:00",
+                        hold_receipt_id="hold:scheduler-owner",
+                        revision=1,
+                    ),
+                )
+
+        return _HeldStore()
+
+    @pytest.mark.asyncio
+    async def test_absent_owner_while_held_is_a_held_skip(self, feature):
+        """#3377: the owner preflight runs before the dispatcher applies Hold,
+        so a held agent must record the held skip, not an owner failure."""
+        feature.agent.did = "did:test:scheduler-agent"
+        feature.agent._hold_store = self._held_store(feature.agent.did)
+        feature.agent.features = {}
+        feature.agent._post_all_features_loaded_complete = True
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.hold.metrics.record_held_work_disposition"
+        ) as record:
+            result = await feature._dispatch_scheduled_task(
+                "restart_coordinator", {}
+            )
+
+        assert result == "skipped: dropped_quiet_hours (hold_skipped)"
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+        record.assert_called_once_with(
+            disposition=HeldWorkDisposition.SKIPPED.value,
+            source=cron_source_name("restart_coordinator"),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("held", [True, False])
+    async def test_absent_owner_row_under_hold_end_to_end(self, tmp_path, held):
+        """#3377 through the runner: held + absent owner writes no failed row;
+        unheld + absent owner still fails with the owner-unavailable text."""
+        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
+        await raw_db.connect()
+        db = AsyncDatabase(raw_db)
+
+        agent = _make_mock_agent(db)
+        agent.did = "did:test:scheduler-agent"
+        agent.features = {}
+        agent._post_all_features_loaded_complete = True
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.dispatch_signal = AsyncMock()
+        if held:
+            agent._hold_store = self._held_store(agent.did)
+        else:
+            agent._hold_store = None
+
+        sched = SchedulerFeature(agent)
+        sched._db = db
+        sched._agent_id = agent.did
+        runner = SchedulerRunner(db, agent.did, sched._dispatch_scheduled_task)
+
+        try:
+            await runner._ensure_tables()
+            due_at = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            await db.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, agent_id, task_name, cron_expression, args_json,
+                     enabled, next_run_at, created_at,
+                     scheduler_protocol_version)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, 2)
+                """,
+                (
+                    "restart-task",
+                    agent.did,
+                    "restart_coordinator",
+                    "* * * * *",
+                    "{}",
+                    due_at,
+                    due_at,
+                ),
+            )
+
+            await runner._tick()
+
+            rows = await db.fetchall(
+                "SELECT status, result_text FROM task_execution_log "
+                "WHERE task_id = ?",
+                ("restart-task",),
+            )
+            statuses = [row[0] for row in rows]
+            agent.dispatcher.dispatch_signal.assert_not_awaited()
+            if held:
+                assert "failed" not in statuses
+                assert any(
+                    "hold_skipped" in (row[1] or "") for row in rows
+                )
+            else:
+                assert "failed" in statuses
+                assert any(
+                    "restart_coordinator" in (row[1] or "")
+                    and "not executed" in (row[1] or "")
+                    for row in rows
+                )
+        finally:
+            await db.close()
 
     @pytest.mark.asyncio
     async def test_disabled_owner_is_left_to_the_disabled_skip(self, feature):
