@@ -56,6 +56,11 @@ from kestrel_sovereign.host_features.context import (
     close_host_context_resources,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from tests.utils.postgres_schema import (
+    disposable_postgres_schema,
+    postgres_test_url,
+    with_search_path,
+)
 
 
 @pytest.fixture
@@ -5895,71 +5900,58 @@ async def test_postgres_file_evidence_recovers_without_sqlite_custody_marker(
     assert store._custody_control_path is None
 
 
+@pytest.fixture
+async def portable_hold_backend(db_backend):
+    """``db_backend``, with the PostgreSQL leg in a schema of its own.
+
+    The parity store's initialization witness lives in ``tmp_path``, which is
+    new every run, while a PostgreSQL test database is reused between runs and
+    shared by every xdist worker (#3381). In the shared schema the second run
+    finds a Hold schema with no witness and — correctly — refuses to adopt it,
+    so the test passed only against a fresh database. A disposable schema
+    gives each run the empty database the witness protocol requires.
+    """
+
+    if db_backend.backend_type != "postgres":
+        yield db_backend
+        return
+
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+
+    async with disposable_postgres_schema(db_backend, "hold_parity") as schema:
+        backend = PostgresBackend(with_search_path(postgres_test_url(), schema))
+        await backend.connect()
+        try:
+            yield backend
+        finally:
+            await backend.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
-async def test_hold_store_sql_is_backend_portable(db_backend, tmp_path):
-    db, store = _portable_hold_store(db_backend, tmp_path)
+async def test_hold_store_sql_is_backend_portable(portable_hold_backend, tmp_path):
+    _db, store = _portable_hold_store(portable_hold_backend, tmp_path)
     await store.ensure_schema()
-    suffix = uuid4().hex
-    target = f"did:agent:{suffix}"
-    hold_operation = f"hold-{suffix}"
-    release_operation = f"release-{suffix}"
-    try:
-        held = await store.set_hold(
-            authority=HoldAuthority.SOVEREIGN,
-            scope="agent",
-            target_id=target,
-            actor_id="did:sovereign:operator",
-            reason="backend parity",
-            operation_id=hold_operation,
-        )
-        released = await store.release_hold(
-            authority=HoldAuthority.SOVEREIGN,
-            scope="agent",
-            target_id=target,
-            actor_id="did:sovereign:operator",
-            reason="backend parity complete",
-            operation_id=release_operation,
-            expected_hold_receipt_id=held.receipt.receipt_id,
-        )
-        assert released.receipt.disposition is HoldDisposition.APPLIED
-        assert await store.get_hold("agent", target) is None
-    finally:
-        await db.execute(
-            "DELETE FROM hold_operation_witnesses "
-            "WHERE operation_id IN (?, ?)",
-            (hold_operation, release_operation),
-        )
-        await db.execute(
-            "DELETE FROM hold_receipt_content_witnesses WHERE receipt_id IN ("
-            "SELECT receipt_id FROM hold_receipts "
-            "WHERE operation_id IN (?, ?))",
-            (hold_operation, release_operation),
-        )
-        await db.execute(
-            "DELETE FROM hold_receipts WHERE operation_id IN (?, ?)",
-            (hold_operation, release_operation),
-        )
-        await db.execute(
-            "DELETE FROM hold_latches WHERE scope = ? AND target_id = ?",
-            (HoldScope.AGENT.value, target),
-        )
-        await db.execute(
-            "DELETE FROM hold_receipt_witnesses "
-            "WHERE scope = ? AND target_id = ?",
-            (HoldScope.AGENT.value, target),
-        )
-
-    # A reusable PostgreSQL test database must not retain append-only witness
-    # rows after the generated receipt history is removed. Production has no
-    # history-destruction API; this fixture-only cleanup must deliberately
-    # advance the independent anchor to the empty test state.
-    await store._write_history_anchor()
-    if store._custody_marker_path is not None:
-        store._write_sqlite_custody_marker(
-            await store._current_history_anchor_payload()
-        )
-    await store.ensure_schema()
+    target = "did:agent:backend-parity"
+    held = await store.set_hold(
+        authority=HoldAuthority.SOVEREIGN,
+        scope="agent",
+        target_id=target,
+        actor_id="did:sovereign:operator",
+        reason="backend parity",
+        operation_id="hold-backend-parity",
+    )
+    released = await store.release_hold(
+        authority=HoldAuthority.SOVEREIGN,
+        scope="agent",
+        target_id=target,
+        actor_id="did:sovereign:operator",
+        reason="backend parity complete",
+        operation_id="release-backend-parity",
+        expected_hold_receipt_id=held.receipt.receipt_id,
+    )
+    assert released.receipt.disposition is HoldDisposition.APPLIED
+    assert await store.get_hold("agent", target) is None
 
 
 def test_backend_switch_probe_sees_hold_state_still_in_a_hot_wal(tmp_path):

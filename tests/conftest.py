@@ -28,6 +28,11 @@ from tests.shared.pytest_cleanup_plugin import (
     cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
+from tests.shared.postgres_requirement import (
+    check_session as _check_postgres_requirement,
+    fail_skipped_postgres_case as _fail_skipped_postgres_case,
+)
+from tests.utils.postgres_schema import postgres_test_url
 
 # Import feedback bridge for test-to-reflection integration
 from tests.utils.feedback_bridge import (
@@ -127,6 +132,15 @@ def pytest_configure(config):
 
     _cleanup_configure(config)
     _feedback_configure(config)
+    # After .env: a local .env may supply TEST_POSTGRES_URL.
+    _check_postgres_requirement()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Fail, rather than skip, a PostgreSQL case in a job that provides one."""
+    outcome = yield
+    _fail_skipped_postgres_case(item, outcome.get_result())
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -674,11 +688,7 @@ async def db_backend(request, tmp_path):
             pytest.skip("PostgresBackend not available")
             return
 
-        postgres_url = (
-            os.environ.get("TEST_POSTGRES_URL")
-            or os.environ.get("KESTREL_DATABASE_URL")
-            or os.environ.get("DATABASE_URL")
-        )
+        postgres_url = postgres_test_url()
         if not postgres_url:
             pytest.skip(
                 "TEST_POSTGRES_URL, KESTREL_DATABASE_URL, or DATABASE_URL required for PostgreSQL tests.\n"

@@ -10,11 +10,9 @@ protocol as every other history head.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from contextlib import closing
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
 
@@ -44,29 +42,15 @@ from tests.utils.hold_history_v1 import (
     v1_history_anchor,
     v1_receipt_rows,
 )
+from tests.utils.postgres_schema import (
+    disposable_postgres_schema,
+    postgres_test_url,
+    with_search_path,
+)
 
 TARGET_A = "did:agent:anchor-a"
 TARGET_B = "did:agent:anchor-b"
 OPERATOR = "did:sovereign:operator"
-
-
-def _postgres_test_url() -> str | None:
-    return (
-        os.environ.get("TEST_POSTGRES_URL")
-        or os.environ.get("KESTREL_DATABASE_URL")
-        or os.environ.get("DATABASE_URL")
-    )
-
-
-def _with_search_path(url: str, schema: str) -> str:
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-    parts = urlsplit(url)
-    query = [
-        (key, value) for key, value in parse_qsl(parts.query) if key != "search_path"
-    ]
-    query.append(("search_path", schema))
-    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
@@ -90,33 +74,35 @@ async def anchor_backend(request, tmp_path):
             await db.close()
         return
 
-    url = _postgres_test_url()
+    url = postgres_test_url()
     if not url:
         pytest.skip("TEST_POSTGRES_URL required for the PostgreSQL leg")
     try:
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
     except ImportError:
         pytest.skip("PostgresBackend not available")
-    schema = f"hold_anchor_{uuid4().hex}"
     admin = PostgresBackend(url)
     try:
         await admin.connect()
     except Exception as exc:  # pragma: no cover - depends on the environment
         pytest.skip(f"PostgreSQL not available: {exc}")
-    await admin.execute(f'CREATE SCHEMA "{schema}"')
-    backend = PostgresBackend(_with_search_path(url, schema))
     try:
-        await backend.connect()
-        db = AsyncDatabase(backend)
-        witness = tmp_path / "anchor-upgrade.hold-initialized-v1"
-        yield SimpleNamespace(
-            db=db,
-            open_store=lambda: HoldStore(db, initialization_witness_path=witness),
-            sqlite_path=None,
-        )
+        async with disposable_postgres_schema(admin, "hold_anchor") as schema:
+            backend = PostgresBackend(with_search_path(url, schema))
+            try:
+                await backend.connect()
+                db = AsyncDatabase(backend)
+                witness = tmp_path / "anchor-upgrade.hold-initialized-v1"
+                yield SimpleNamespace(
+                    db=db,
+                    open_store=lambda: HoldStore(
+                        db, initialization_witness_path=witness
+                    ),
+                    sqlite_path=None,
+                )
+            finally:
+                await backend.close()
     finally:
-        await backend.close()
-        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
         await admin.close()
 
 
