@@ -343,6 +343,25 @@ jobs:
     permissions:
       contents: read
     needs: lint-and-imports
+    # The unit tier's dual-backend tests run their PostgreSQL case only when
+    # TEST_POSTGRES_URL is set. Without this service all of them skipped and
+    # the tier still reported green: 137 cases, including every PostgreSQL
+    # path #2527's crash lived on (#3381). Same image and major as the
+    # integration tier below, for the same #2958 floor.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: kestrel_user
+          POSTGRES_PASSWORD: kestrel_password
+          POSTGRES_DB: kestrel
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -436,6 +455,14 @@ jobs:
         timeout-minutes: 45
         env:
           KESTREL_AUDIT_MODE: skip
+          # TEST_POSTGRES_URL, not DATABASE_URL: it is the one variable every
+          # dual-backend fixture reads, and it is read only by tests, so it
+          # cannot move code under test onto PostgreSQL behind its back.
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          # Fail, not skip: a PostgreSQL case that skips here is a failure,
+          # and a missing URL stops the session before collection. See
+          # tests/shared/postgres_requirement.py.
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
 
       - name: Run voice playback JavaScript tests
         run: >-
