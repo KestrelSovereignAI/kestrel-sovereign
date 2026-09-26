@@ -1150,6 +1150,30 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
     await _get_reconciler(agent)._store.start_watch(kind, handle)
 
 
+class DurableResumeUnsupportedError(ValueError):
+    """The agent's privacy mode cannot carry a durable resume (#3295).
+
+    EPHEMERAL, ISOLATED, and DEIDENTIFIED storage persist only a marker in
+    place of every durable signal payload, so no stored wake could ever
+    satisfy a ``payload.ref`` selector. A consumer registered anyway would
+    park work that never resumes. Nothing is registered and no watch is
+    armed; the caller keeps the non-durable ``wait(..., mode="signal")``
+    path instead.
+    """
+
+    reason = "unsupported_in_privacy_mode"
+
+    def __init__(self, ref: str, storage: str) -> None:
+        self.ref = ref
+        self.storage = storage
+        super().__init__(
+            f"{self.reason}: durable resume for {ref!r} is refused because "
+            f"privacy storage {storage!r} elides durable signal payloads, so "
+            "no wake could match its selector; use a non-durable signal-mode "
+            "wait instead"
+        )
+
+
 @dataclass(frozen=True)
 class WaitResumeRegistration:
     """What :func:`register_wait_resume_consumer` established.
@@ -1199,8 +1223,9 @@ async def register_wait_resume_consumer(
     more. If the handle is already terminal, that state is returned as
     ``already_terminal`` and the caller must act on it directly: its wake
     may have been committed before this registration in a form the selector
-    cannot match (EPHEMERAL/ISOLATED privacy persists only a marker in place
-    of the payload, and wakes older than ``payload.ref`` never carried it),
+    cannot match (a payload-eliding privacy mode persists only a marker in
+    place of the payload, and wakes older than ``payload.ref`` never carried
+    it),
     and the reconciler never re-announces a transition it already delivered.
     Otherwise the terminal transition happens after the registration, and
     its wake gets a delivery directly. A matchable wake committed earlier
@@ -1223,6 +1248,12 @@ async def register_wait_resume_consumer(
     retry of this call, which is idempotent for the same ``consumer_id``,
     completes the registration.
 
+    A privacy mode that elides durable payloads (EPHEMERAL, ISOLATED,
+    DEIDENTIFIED, as the dispatcher's ``durable_payload_elided_by`` reports)
+    is refused before anything is written: every wake would be stored as a
+    bare marker, so the selector could never match and a still-pending
+    handle would park forever.
+
     ``max_attempts`` defaults to ``0`` (retain until acknowledged): this wake
     is the only thing that resumes the parked work, so a transient consumer
     failure must not convert it into a terminal loss. The watch also wakes
@@ -1234,6 +1265,8 @@ async def register_wait_resume_consumer(
         was already terminal after registering.
 
     Raises:
+        DurableResumeUnsupportedError: when the agent's privacy mode elides
+            durable signal payloads; no watch or consumer was written.
         ValueError: on any :func:`register_wait_watch` validation failure,
             or when the agent has no durable signal dispatcher.
         Exception: whatever the provider's post-registration ``poll``
@@ -1242,14 +1275,17 @@ async def register_wait_resume_consumer(
             re-registering the same ``consumer_id`` is idempotent.
     """
     kind, handle, provider = await _resolve_owned_provider(agent, ref)
-    register = getattr(
-        getattr(agent, "dispatcher", None), "register_durable_consumer", None
-    )
-    if not callable(register):
+    dispatcher = getattr(agent, "dispatcher", None)
+    register = getattr(dispatcher, "register_durable_consumer", None)
+    elided_by = getattr(dispatcher, "durable_payload_elided_by", None)
+    if not callable(register) or not callable(elided_by):
         raise ValueError(
             "durable signal delivery unavailable: the agent's dispatcher "
             "cannot register durable consumers"
         )
+    storage = elided_by()
+    if storage is not None:
+        raise DurableResumeUnsupportedError(f"{kind}:{handle}", storage)
     registration = DurableConsumerRegistration(
         consumer_id=consumer_id,
         source=wake_source(provider),

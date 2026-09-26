@@ -19,6 +19,7 @@ import pytest
 
 from kestrel_sdk.signals import (
     RedactionPolicy,
+    Signal,
     SignalMode,
     SourceRegistration,
     Trust,
@@ -39,6 +40,7 @@ from kestrel_sovereign.signals.sources.wait import (
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.waits.engine import WaitRegistry
 from kestrel_sovereign.waits.reconciler import (
+    DurableResumeUnsupportedError,
     WaitReconciler,
     register_wait_resume_consumer,
     wake_source,
@@ -270,13 +272,15 @@ async def test_wake_committed_before_registration_is_backfilled(rig):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preset", ["ephemeral", "isolated"])
 async def test_elided_wake_before_registration_reports_terminal(rig, preset):
-    """Under a payload-eliding privacy mode the stored wake carries only a
-    marker, so backfill cannot match it and the reconciler has already
-    deduplicated the transition. The registration's post-registration poll
-    is then the only thing that tells the parked work its handle finished."""
+    """A wake committed while a payload-eliding privacy mode was active
+    carries only a marker, so backfill cannot match it and the reconciler
+    has already deduplicated the transition. Once storage persists payloads
+    again, the post-registration poll is the only thing that tells the
+    parked work its handle finished."""
     rig.dispatcher_agent.privacy_config = get_privacy_preset(preset)
     rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
     await rig.tick()
+    rig.dispatcher_agent.privacy_config = get_privacy_preset("normal")
 
     result = await register_wait_resume_consumer(
         rig.agent, "job:42", consumer_id="workflows:wait:run-1"
@@ -503,3 +507,81 @@ async def test_anonymized_wake_before_registration_is_backfilled(rig):
 
     await rig.tick()
     assert await _claim(rig.dispatcher, "workflows:wait:run-6") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["ephemeral", "isolated"])
+async def test_payload_eliding_privacy_mode_refuses_durable_resume(
+    rig, monkeypatch, preset
+):
+    """Under EPHEMERAL/ISOLATED every durable wake is stored as a bare
+    marker, so a ``payload.ref`` selector can never match: a consumer
+    registered for a still-pending handle would park work that never
+    resumes. Registration must refuse before writing a watch or a consumer,
+    and must not poll the provider either."""
+    rig.dispatcher_agent.privacy_config = get_privacy_preset(preset)
+    real_register = rig.dispatcher.register_durable_consumer
+    registered: list = []
+    polled: list = []
+
+    async def recording_register(registration):
+        registered.append(registration)
+        return await real_register(registration)
+
+    async def recording_poll(handle):
+        polled.append(handle)
+        return WaitStatus(Outcome.PENDING, "pending", data={})
+
+    monkeypatch.setattr(
+        rig.dispatcher, "register_durable_consumer", recording_register
+    )
+    monkeypatch.setattr(rig.runs, "poll", recording_poll)
+
+    with pytest.raises(DurableResumeUnsupportedError) as excinfo:
+        await register_wait_resume_consumer(
+            rig.agent, "run:7", consumer_id="workflows:wait:run-7"
+        )
+
+    error = excinfo.value
+    assert isinstance(error, ValueError)
+    assert error.reason == "unsupported_in_privacy_mode"
+    assert error.ref == "run:7"
+    assert error.storage == get_privacy_preset(preset).storage
+    assert "unsupported_in_privacy_mode" in str(error)
+    assert registered == []
+    assert polled == []
+    assert not await _watching(rig.agent, "run", "7")
+    assert await rig.agent._wait_reconciler._store.get("run", "7") is None
+    assert not await rig.dispatcher.has_durable_consumer("workflows:wait:run-7")
+    assert await rig.dispatcher.list_durable_deliveries() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "preset, elided",
+    [
+        ("ephemeral", True),
+        ("isolated", True),
+        ("anonymous", False),
+        ("normal", False),
+        ("public", False),
+    ],
+)
+async def test_resume_refusal_matches_the_durable_projection(rig, preset, elided):
+    """The refusal and the durable projection share one definition, so they
+    cannot disagree about which modes elide the payload."""
+    rig.dispatcher_agent.privacy_config = get_privacy_preset(preset)
+    registration = build_wait_complete_registration()
+    projection = rig.dispatcher._signal_for_durable_persistence(
+        Signal(
+            source=registration.name,
+            kind="inbound",
+            mode=SignalMode.COGNITION,
+            payload={"ref": "run:7"},
+            target_agent=AGENT_DID,
+        ),
+        registration,
+    )
+
+    assert projection.payload_elided is elided
+    assert (rig.dispatcher.durable_payload_elided_by() is not None) is elided

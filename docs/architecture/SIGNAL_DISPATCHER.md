@@ -512,6 +512,18 @@ a `SignalWithDurableCorrelation` naming `ref` in `durable_correlation_keys`;
 the durable projection keeps those producer-written identifiers verbatim and
 anonymizes everything else. Payload-eliding modes still elide them.
 
+Those modes are therefore refused. Under EPHEMERAL, ISOLATED, or DEIDENTIFIED
+storage every durable wake is persisted as a bare privacy marker, so no stored
+event could satisfy the `payload.ref` selector, and a still-pending handle
+would park work that never resumes. `register_wait_resume_consumer` asks the
+dispatcher (`durable_payload_elided_by()`, which uses the projection's own
+`elides_durable_payloads` definition) before writing anything. If the answer
+is an eliding mode, it raises `DurableResumeUnsupportedError`
+(`reason == "unsupported_in_privacy_mode"`, a `ValueError`). No watch is
+armed, no consumer is registered, and the provider is not polled. The caller
+keeps the non-durable `wait(..., mode="signal")` path. A privacy mode that
+switches to an eliding one *after* registration is not covered by this check.
+
 The watch is armed before the consumer exists, and that order is load-bearing.
 An interruption between the two writes must never leave a durable consumer
 with no watch behind it: for a poll-only provider (Talon, CI) the reconciler
@@ -522,8 +534,8 @@ path, and retrying the idempotent registration completes it.
 The resume guarantee is the poll it makes *after* the watch and consumer are
 durable, not backfill. If the handle is already terminal, that `WaitStatus` is
 returned as `already_terminal` and the caller acts on it directly: a wake
-committed earlier may be unmatchable (EPHEMERAL/ISOLATED privacy persists only
-a marker in place of the payload), and the reconciler never re-announces a
+committed earlier may be unmatchable (one committed while a payload-eliding
+mode was active holds only a marker), and the reconciler never re-announces a
 transition it already delivered. Otherwise the transition happens after the
 registration and is delivered directly. A matchable earlier wake is also
 backfilled, so the same transition can arrive both ways. A poll that raises
