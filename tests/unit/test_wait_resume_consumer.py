@@ -585,3 +585,104 @@ async def test_resume_refusal_matches_the_durable_projection(rig, preset, elided
 
     assert projection.payload_elided is elided
     assert (rig.dispatcher.durable_payload_elided_by() is not None) is elided
+
+
+class _UnreadablePrivacyConfig:
+    """A privacy config the durable projection cannot evaluate, so it fails
+    closed and persists only the ``projection_error`` marker."""
+
+    storage = "normal"
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"privacy config unreadable: {name}")
+
+
+def _elide_after_registration(rig, elision):
+    if elision == "projection_error":
+        rig.dispatcher_agent.privacy_config = _UnreadablePrivacyConfig()
+    else:
+        rig.dispatcher_agent.privacy_config = get_privacy_preset(elision)
+
+
+_ELISIONS = ["ephemeral", "isolated", "projection_error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elision", _ELISIONS)
+async def test_elision_after_registration_still_resumes_a_prompt_claim(
+    rig, elision
+):
+    """Registered under payload-preserving storage, then the wake is
+    persisted as a bare marker. Its delivery is still materialized from the
+    live payload, so the parked consumer is resumed with the real wake."""
+    await register_wait_resume_consumer(
+        rig.agent, "job:42", consumer_id="workflows:wait:run-8"
+    )
+    _elide_after_registration(rig, elision)
+    rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
+    await rig.tick()
+
+    delivery = await _claim(rig.dispatcher, "workflows:wait:run-8")
+    assert delivery is not None
+    assert delivery.event.payload["ref"] == "job:42"
+    assert delivery.event.payload["outcome"] == Outcome.DONE.value
+    await _ack(rig.dispatcher, "workflows:wait:run-8", delivery)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elision", _ELISIONS)
+async def test_elision_after_registration_still_resumes_a_late_claim(
+    rig, elision
+):
+    """#3370: under an eliding projection the first lease belongs to the
+    emitting dispatcher. When it expired before the workflow claimed, the
+    delivery stayed leased to a live owner that claim recovery never
+    reclaims, so the consumer was parked forever with no error. The expired
+    lease must come back as marker-only retry work: the consumer is woken,
+    and — a delivery being a wake, not a verdict — polls the provider."""
+    await register_wait_resume_consumer(
+        rig.agent, "job:42", consumer_id="workflows:wait:run-9", lease_seconds=1
+    )
+    _elide_after_registration(rig, elision)
+    rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
+    await rig.tick()
+    await asyncio.sleep(1.2)
+
+    delivery = await _claim(rig.dispatcher, "workflows:wait:run-9")
+    assert delivery is not None
+    assert delivery.event.payload == {"_privacy_gated": _marker(elision)}
+    assert (await rig.jobs.poll("42")).outcome is Outcome.DONE
+    await _ack(rig.dispatcher, "workflows:wait:run-9", delivery)
+    assert await _claim(rig.dispatcher, "workflows:wait:run-9") is None
+
+
+def _marker(elision):
+    if elision == "projection_error":
+        return "projection_error"
+    return get_privacy_preset(elision).storage
+
+
+@pytest.mark.asyncio
+async def test_expired_first_lease_is_visibly_released_without_a_claim(rig):
+    """The owner heartbeat alone returns the expired first lease to retry
+    work, with a reason an operator listing deliveries can read."""
+    from kestrel_sovereign.signals.durable import (
+        EXPIRED_INITIAL_HANDOFF_ERROR,
+        RETRY,
+    )
+
+    await register_wait_resume_consumer(
+        rig.agent, "job:42", consumer_id="workflows:wait:run-10", lease_seconds=1
+    )
+    rig.dispatcher_agent.privacy_config = get_privacy_preset("ephemeral")
+    rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
+    await rig.tick()
+    await asyncio.sleep(1.2)
+
+    await rig.dispatcher._heartbeat_runtime_owner()
+
+    (delivery,) = await rig.dispatcher.list_durable_deliveries()
+    assert delivery.consumer_id == "workflows:wait:run-10"
+    assert delivery.status == RETRY
+    assert delivery.lease_owner is None
+    assert delivery.last_error == EXPIRED_INITIAL_HANDOFF_ERROR

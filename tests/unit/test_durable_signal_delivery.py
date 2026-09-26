@@ -9210,3 +9210,216 @@ async def test_recovery_drainer_releases_each_delivery_settlement_owner(
         release_second.set()
         await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_b, agent_b)
+
+
+async def _volatile_unclaimed_delivery(tmp_path, name):
+    """One EPHEMERAL delivery whose first lease is still the emitter's."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _dispatcher(tmp_path / f"{name}.db", "did:agent:one")
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
+    )
+    await dispatcher.register_durable_consumer(consumer)
+    result = await dispatcher.dispatch_signal(
+        _signal(agent_id=agent.did, message=f"{name}-secret@example.com"),
+        source_event_id=name,
+    )
+    assert result.status is Status.OK
+    (reserved,) = await dispatcher.list_durable_deliveries()
+    assert reserved.status == LEASED
+    assert reserved.lease_owner == dispatcher._durable_delivery_owner
+    return backend, agent, dispatcher, consumer, reserved
+
+
+def _expire_handoff(dispatcher, delivery_id):
+    handoff = dispatcher._transient_durable_handoffs[delivery_id]
+    handoff.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    return handoff
+
+
+@pytest.mark.asyncio
+async def test_expired_unclaimed_first_lease_is_released_to_marker_retry(tmp_path):
+    """#3370: the emitter's first lease expired before any worker claimed it.
+    Its raw payload must go, but the row must not stay leased to a live owner
+    that claim recovery never reclaims — the next claim receives it as
+    marker-only retry work."""
+    from kestrel_sovereign.signals.durable import EXPIRED_INITIAL_HANDOFF_ERROR
+
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "expired-first-lease"
+    )
+    try:
+        handoff = _expire_handoff(dispatcher, reserved.delivery_id)
+        dispatcher._expire_transient_durable_handoff(
+            reserved.delivery_id, handoff.expires_at
+        )
+        assert reserved.delivery_id not in dispatcher._transient_durable_handoffs
+        assert dispatcher._expired_initial_handoffs == {
+            reserved.delivery_id: (consumer.consumer_id, reserved.lease_token)
+        }
+
+        assert await dispatcher._release_expired_initial_handoffs() == 1
+        (released,) = await dispatcher.list_durable_deliveries()
+        assert released.status == RETRY
+        assert released.lease_owner is None and released.lease_token is None
+        assert released.attempts == 0
+        assert released.last_error == EXPIRED_INITIAL_HANDOFF_ERROR
+        assert dispatcher._expired_initial_handoffs == {}
+
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert claimed.delivery_id == reserved.delivery_id
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_claim_releases_an_expired_first_lease_it_discards(tmp_path):
+    """The claim path itself discards expired sidecars; it must release their
+    rows before claiming, or a late claim returns nothing forever."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "claim-discards-expired"
+    )
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_exact_event_claim_releases_an_expired_first_lease(tmp_path):
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "event-claim-expired"
+    )
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+
+        claimed = await dispatcher.claim_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=reserved.event_id,
+            executor_id="late-worker",
+        )
+        assert claimed is not None
+        assert claimed.delivery_id == reserved.delivery_id
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_event", (False, True))
+async def test_failed_first_lease_transfer_is_released_on_the_next_claim(
+    tmp_path, monkeypatch, exact_event
+):
+    """The store can see the first lease as expired before this process's
+    sidecar timer does. The refused transfer must still release the row."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, f"failed-transfer-{exact_event}"
+    )
+    store = dispatcher._durable_store
+    real_now = store.now_utc
+
+    async def claim():
+        if exact_event:
+            return await dispatcher.claim_durable_delivery_for_event(
+                consumer_id=consumer.consumer_id,
+                event_id=reserved.event_id,
+                executor_id="late-worker",
+            )
+        return await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+
+    try:
+        monkeypatch.setattr(
+            store, "now_utc", lambda: real_now() + timedelta(hours=1)
+        )
+        assert await claim() is None
+        assert reserved.delivery_id not in dispatcher._transient_durable_handoffs
+        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+        monkeypatch.setattr(store, "now_utc", real_now)
+
+        claimed = await claim()
+        assert claimed is not None
+        assert claimed.event.payload == {"_privacy_gated": "none"}
+    finally:
+        monkeypatch.setattr(store, "now_utc", real_now)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_expired_first_lease_release_failure_is_retried(tmp_path, monkeypatch):
+    """A storage error must not drop the only capability that can release the
+    row; the next claim retries it."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "release-failure"
+    )
+    store = dispatcher._durable_store
+    real_abandon = store.abandon_initial_reservation
+
+    async def unavailable(**kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    try:
+        _expire_handoff(dispatcher, reserved.delivery_id)
+        monkeypatch.setattr(store, "abandon_initial_reservation", unavailable)
+        assert await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        ) is None
+        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+
+        monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="late-worker"
+        )
+        assert claimed is not None
+        assert dispatcher._expired_initial_handoffs == {}
+    finally:
+        monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_transferred_first_lease_is_not_released_when_its_sidecar_expires(
+    tmp_path,
+):
+    """Once a worker holds the lease, the emitter's capability is spent:
+    expiring the payload sidecar must not take the worker's lease away."""
+    backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
+        tmp_path, "transferred"
+    )
+    try:
+        claimed = await dispatcher.claim_durable_delivery(
+            consumer_id=consumer.consumer_id, executor_id="prompt-worker"
+        )
+        assert claimed is not None
+        handoff = _expire_handoff(dispatcher, claimed.delivery_id)
+        dispatcher._expire_transient_durable_handoff(
+            claimed.delivery_id, handoff.expires_at
+        )
+        assert dispatcher._expired_initial_handoffs == {}
+        assert await dispatcher._release_expired_initial_handoffs() == 0
+
+        (held,) = await dispatcher.list_durable_deliveries()
+        assert held.status == LEASED
+        assert held.lease_owner == "prompt-worker"
+        assert held.lease_token == claimed.lease_token
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
