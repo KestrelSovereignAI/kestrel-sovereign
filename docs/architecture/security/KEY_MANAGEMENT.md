@@ -200,8 +200,18 @@ The `PayerPolicy` foundation introduces two encrypted credential stores under `K
 |---|---|---|---|
 | `ServiceKeyStorage` | Per-agent | `agent_did` | Inside each agent's own DB (`agent_service_keys` table) |
 | `HostKeyStorage` | Per-deployment | literal `"host"` | `<project>/agent_data/host.db` (`host_service_keys` table) |
+| `UserMasterKeyStorage` | Per funding user | user's `master_did` | host DB (`user_master_service_keys` table) |
+| `SponsorKeyStorage` | Per funding sponsor | sponsor's DID | host DB (`sponsor_master_service_keys` table) |
 
-Both use the same SDK `encrypt(identity, "service-keys", plaintext)` contract. Different identity → different HKDF derivation → no possible cross-decryption between an agent's store and the host's store.
+All use the same SDK `encrypt(identity, "service-keys", plaintext)` contract. Different identity → different HKDF derivation → no possible cross-decryption between an agent's store, the host's, and any user's or sponsor's.
+
+The three master-credential stores are thin facades over one shared primitive,
+`kestrel_sovereign.security.principal_master_key_store.PrincipalMasterKeyStore`.
+It owns replacement (a single `ON CONFLICT ... DO UPDATE` upsert on the table's
+real UNIQUE, identical on SQLite and PostgreSQL), deletion (one conditional
+`DELETE` whose affected-row count is the result, so concurrent deletes report
+exactly one success), and timestamp reads (SQLite ISO text and asyncpg native
+`datetime` both go through `storage.timestamps.timestamp_column_value`).
 
 ### Auto-mint flow (HOST_MASTER_PROVISIONED)
 

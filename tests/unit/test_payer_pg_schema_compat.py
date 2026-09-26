@@ -10,6 +10,10 @@ catch (both were hit when running #1646/#1647 against a real Postgres):
    For tables whose UNIQUE/PK is not the first column, the converter must look
    it up in ``known_pks`` or it emits ``ON CONFLICT (<first col>)`` which has no
    matching constraint.
+
+The host / user-master / sponsor master-key tables no longer go through that
+shim: ``PrincipalMasterKeyStore`` writes an explicit ``ON CONFLICT`` upsert,
+covered by ``tests/unit/test_principal_master_key_store.py``.
 """
 from __future__ import annotations
 
@@ -56,25 +60,6 @@ def test_sponsor_beneficiaries_conflict_targets_agent_did():
     )
     # PK is agent_did (not the first column) — re-enroll must conflict on it.
     assert _on_conflict_target(q) == "agent_did"
-
-
-def test_user_master_keys_conflict_targets_master_did_provider():
-    q = (
-        "INSERT OR REPLACE INTO user_master_service_keys "
-        "(id, master_did, provider_id, encrypted_key, key_hash, is_active, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)"
-    )
-    # `id` is a fresh UUID; the real UNIQUE is (master_did, provider_id).
-    assert _on_conflict_target(q) == "master_did, provider_id"
-
-
-def test_sponsor_master_keys_conflict_targets_master_did_provider():
-    q = (
-        "INSERT OR REPLACE INTO sponsor_master_service_keys "
-        "(id, master_did, provider_id, encrypted_key, key_hash, is_active, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)"
-    )
-    assert _on_conflict_target(q) == "master_did, provider_id"
 
 
 def test_user_byok_keys_conflict_targets_agent_provider():

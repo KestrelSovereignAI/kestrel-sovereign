@@ -110,12 +110,10 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
             # graph_nodes: node_id
             # graph_edges: (source_id, target_id, label) composite
             # agent_metadata: (agent_id, key) composite
-            # host_service_keys: provider_id (the actual UNIQUE; `id` is a
-            #   fresh UUID per insert and would never trigger a replace)
-            # user_master / sponsor_master service keys: the real UNIQUE is
-            #   (master_did, provider_id); `id` is a fresh UUID like host's.
+            # (host / user-master / sponsor master keys write an explicit
+            #   ON CONFLICT upsert via PrincipalMasterKeyStore, not this shim.)
             # user_byok service keys: the real UNIQUE is (agent_did,
-            #   provider_id); `id` is a fresh UUID like agent_service_keys.
+            #   provider_id); `id` is a fresh UUID per insert.
             # agent_service_keys: the real UNIQUE is (agent_did, provider_id);
             #   `id` is a fresh UUID per insert, so an approval-gated rotation
             #   (store_key replace=True) must conflict on (agent_did,
@@ -126,11 +124,8 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
                 'graph_nodes': ['node_id'],
                 'graph_edges': ['source_id', 'target_id', 'label'],
                 'agent_metadata': ['agent_id', 'key'],
-                'host_service_keys': ['provider_id'],
                 'agent_service_keys': ['agent_did', 'provider_id'],
                 'user_byok_service_keys': ['agent_did', 'provider_id'],
-                'user_master_service_keys': ['master_did', 'provider_id'],
-                'sponsor_master_service_keys': ['master_did', 'provider_id'],
                 'sponsor_beneficiaries': ['agent_did'],
             }
             pk_columns = known_pks.get(
