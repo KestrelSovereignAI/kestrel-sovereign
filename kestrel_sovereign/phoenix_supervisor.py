@@ -192,8 +192,9 @@ def phoenix_grpc_port() -> int:
 def phoenix_host_data_root() -> Path:
     """Private host-runtime root used for Phoenix when no override is set.
 
-    An explicit ``KESTREL_HOME`` is an operator custody decision and is
-    honoured. Without one, source-checkout discovery is intentionally ignored:
+    An explicit ``KESTREL_HOST_DATA_DIR`` or ``KESTREL_HOME`` is an operator
+    custody decision and is honoured (see ``paths.host_data_dir``). Without
+    one, source-checkout discovery is intentionally ignored:
     trace data belongs under ``~/.kestrel/host-data``, never in a repository
     merely because Kestrel was launched from that repository.
     """

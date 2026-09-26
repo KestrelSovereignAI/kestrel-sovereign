@@ -11,9 +11,13 @@ named by the project's ``.kestrel-host-features.toml`` started (and recorded
 their start failures) against it. CI never notices: the runner's ``HOME`` is
 fresh, so the same code writes a throwaway file.
 
-The autouse fixture below moves those roots into a temporary directory of its
-own, and seeds that directory with a host manifest that starts no host features
-(#3099). Isolating ``KESTREL_HOME`` alone would have *widened* enablement: the
+Every test in the repository already has its host-data root redirected by
+the suite-wide autouse fixture in ``tests/conftest.py`` (#3286), and the session
+fails if any test reaches the real one anyway (see
+``tests/shared/host_runtime_isolation.py``). The autouse fixture below adds the
+rest of the unit tier's isolation inside that same temporary directory, and
+seeds it with a host manifest that starts no host features (#3099).
+Isolating ``KESTREL_HOME`` alone would have *widened* enablement: the
 manifest is read from the resolved project dir, and
 ``instantiate_host_features`` treats a missing one as enable-all, so hiding the
 operator's manifest could start host features they had explicitly disabled.
@@ -58,16 +62,8 @@ from kestrel_sovereign.host_features.storage import (
     HOST_DB_PATH_ENV,
     HOST_FEATURE_DB_FILENAME,
 )
+from tests.shared.host_runtime_isolation import OWNS_HOST_PATHS_MARKER
 from tests.utils.ci_budget import refuse_unbudgeted_timeouts
-
-#: Marker name for tests that own host/home path resolution themselves.
-OWNS_HOST_PATHS_MARKER = "owns_host_paths"
-
-#: Name of the fixture's own temporary root. It is a sibling of each test's
-#: ``tmp_path``, not a child: the fixture writes a host manifest, and a
-#: directory the test owns is the wrong place for the fixture's state — one
-#: test asserts its ``tmp_path`` is empty, and every test is entitled to.
-ISOLATION_DIRNAME = "_kestrel_host_runtime_isolation"
 
 #: The seeded manifest. A *default*, deliberately not a list of slugs: a list
 #: would name today's host features and silently miss tomorrow's, which is the
@@ -86,13 +82,13 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
-    """Point every host-runtime root at a temporary directory of our own.
+def _isolate_unit_host_runtime_paths(_isolate_host_runtime_paths, monkeypatch):
+    """Point every host-runtime root at the test's isolation directory.
 
     ``KESTREL_HOST_DB_PATH`` is the authoritative override for the
-    host-feature database. ``HOME`` and ``KESTREL_HOME`` close the two
-    default branches behind it; ``KESTREL_DB_PATH`` is unnecessary while the
-    explicit host override is set. Thus a code path that ignores the override
+    host-feature database. ``KESTREL_HOST_DATA_DIR`` (set suite-wide),
+    ``KESTREL_HOME``, and ``HOME`` close the default branches behind it;
+    ``KESTREL_DB_PATH`` is unnecessary while the explicit host override is set. Thus a code path that ignores the override
     — or resolves some *other* implicit host-runtime root, such as the Phoenix
     trace store, the host-feature manifest, or the ``~/.kestrel`` project
     fallback — still lands in the temporary directory rather than on the
@@ -104,11 +100,11 @@ def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
     left to its writer — ``prepare_host_database`` even creates its own parent
     ``0700``, the same custody path production takes.
     """
-    if request.node.get_closest_marker(OWNS_HOST_PATHS_MARKER):
+    root = _isolate_host_runtime_paths
+    if root is None:  # the owns_host_paths opt-out
         yield
         return
 
-    root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
     project_home = root / "kestrel-home"
 
     monkeypatch.setenv("HOME", str(root / "home"))
@@ -150,22 +146,6 @@ def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
         yield root
     finally:
         paths.reset_cache()
-
-
-@pytest.fixture
-def host_runtime_isolation_root(_isolate_host_runtime_paths):
-    """The temporary root this test's host-runtime paths were redirected into.
-
-    Requesting it is how a test asserts *where* a resolved path landed without
-    reconstructing the layout from the environment.
-    """
-    if _isolate_host_runtime_paths is None:
-        pytest.fail(
-            f"host-runtime isolation is off under the "
-            f"{OWNS_HOST_PATHS_MARKER!r} opt-out, so there is no isolation "
-            f"root; drop the marker or resolve the path yourself."
-        )
-    return _isolate_host_runtime_paths
 
 
 @pytest.fixture

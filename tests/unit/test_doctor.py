@@ -20,6 +20,7 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
 )
+from kestrel_sovereign.paths import HOST_DATA_DIR_ENV
 from kestrel_sovereign.setup.env_file import write_env
 from kestrel_sovereign.setup.toml_file import write_toml
 
@@ -2542,6 +2543,22 @@ def test_sqlite_hold_path_follows_spawned_agent_data_root(tmp_path):
     ) == tmp_path / "mounted-agent-data" / "host-data" / "host-features.db"
 
 
+def test_sqlite_hold_path_default_follows_spawned_host_data_root(tmp_path):
+    """Doctor resolves ``KESTREL_HOST_DATA_DIR`` as the runtime resolver does."""
+
+    from kestrel_sovereign.doctor import _sqlite_hold_database_path
+
+    child_home = tmp_path / "child-home"
+    assert _sqlite_hold_database_path(
+        {
+            "HOME": str(child_home),
+            "KESTREL_HOME": str(tmp_path / "project-home"),
+            HOST_DATA_DIR_ENV: "~/host-volume",
+        },
+        tmp_path,
+    ) == child_home / "host-volume" / "host-features.db"
+
+
 def test_postgres_doctor_still_validates_mandatory_host_sqlite(
     tmp_path,
     monkeypatch,
@@ -3874,6 +3891,8 @@ def test_sqlite_doctor_checks_launcher_derived_host_path_migration(
 
     assert not report.ready
     assert any("Hold custody evidence" in item for item in report.fail)
+    # The suite-wide host-data redirect is not part of this runtime.
+    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     for key, value in runtime_env.items():
         monkeypatch.setenv(key, value)
     with pytest.raises(HostStorageError, match="Hold custody evidence"):

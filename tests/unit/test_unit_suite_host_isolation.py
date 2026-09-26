@@ -39,7 +39,7 @@ from kestrel_sovereign.host_features.storage import (
     host_database_path,
 )
 
-from tests.unit.conftest import ISOLATION_DIRNAME
+from tests.shared.host_runtime_isolation import ISOLATION_DIRNAME
 
 
 def test_resolved_host_database_is_inside_the_isolation_root(
@@ -200,3 +200,4 @@ def test_the_opt_out_marker_actually_releases_the_override():
     """
     assert ISOLATION_DIRNAME not in os.environ.get(HOST_DB_PATH_ENV, "")
     assert ISOLATION_DIRNAME not in os.environ.get("KESTREL_HOME", "")
+    assert ISOLATION_DIRNAME not in os.environ.get(paths.HOST_DATA_DIR_ENV, "")

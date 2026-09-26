@@ -182,15 +182,24 @@ def spawned_agent_data_key(env: dict, agent_name: str) -> str | None:
     )
 
 
+#: Explicit override for :func:`host_data_dir`, independent of the project home.
+HOST_DATA_DIR_ENV = "KESTREL_HOST_DATA_DIR"
+
+
 def host_data_dir() -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 
-    An explicit ``KESTREL_HOME`` is an operator custody decision and remains
-    authoritative. Without it, host runtime belongs under
-    ``~/.kestrel/host-data`` even when the current directory is a source clone.
-    Resolution has no filesystem side effects; each storage owner must securely
-    create and validate the returned directory before writing.
+    ``KESTREL_HOST_DATA_DIR`` names the root itself, so host runtime can live on
+    its own volume without moving the project home. Otherwise an explicit
+    ``KESTREL_HOME`` is an operator custody decision and remains authoritative.
+    Without either, host runtime belongs under ``~/.kestrel/host-data`` even
+    when the current directory is a source clone. Resolution has no filesystem
+    side effects; each storage owner must securely create and validate the
+    returned directory before writing.
     """
+    explicit_root = os.environ.get(HOST_DATA_DIR_ENV)
+    if explicit_root:
+        return Path(os.path.abspath(Path(explicit_root).expanduser()))
     explicit_home = os.environ.get("KESTREL_HOME")
     base = (
         Path(explicit_home).expanduser()

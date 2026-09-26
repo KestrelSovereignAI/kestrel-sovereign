@@ -28,6 +28,14 @@ from tests.shared.pytest_cleanup_plugin import (
     cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
+from tests.shared.host_runtime_isolation import (
+    ISOLATION_DIRNAME,
+    OWNS_HOST_PATHS_MARKER,
+    SPAWNED_ENV_PIN,
+    HostDataTripwire,
+    real_host_data_roots,
+    redirect_host_data_root,
+)
 
 # Import feedback bridge for test-to-reflection integration
 from tests.utils.feedback_bridge import (
@@ -36,6 +44,10 @@ from tests.utils.feedback_bridge import (
 )
 
 FORCED_EXIT_GRACE_SECONDS = 10.0
+
+#: Resolved at import, before any fixture edits the environment, so these are
+#: the operator's real host-data roots rather than a test's redirected ones.
+_HOST_DATA_TRIPWIRE = HostDataTripwire(real_host_data_roots())
 
 
 @pytest.fixture
@@ -235,6 +247,68 @@ def setup_test_config():
     example = config_dir / "kestrel.toml.example"
     if example.exists():
         target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_host_data_tripwire():
+    """Fail the session if any test reached the real host-data root (#3286).
+
+    Isolation below is a convention; this enforces it. See
+    ``tests/shared/host_runtime_isolation.py`` for what is compared.
+    """
+    _HOST_DATA_TRIPWIRE.arm()
+    yield
+    findings = _HOST_DATA_TRIPWIRE.disarm()
+    if findings:
+        pytest.fail(HostDataTripwire.failure_message(findings), pytrace=False)
+
+
+@pytest.fixture(scope="session")
+def _spawned_env_host_data_pin():
+    """Make the per-test host-data redirect survive a project ``.env`` merge.
+
+    See ``SpawnedEnvPin``: managed children are launched from
+    ``spawned_agent_env``, where the project ``.env`` outranks ``os.environ``.
+    """
+    SPAWNED_ENV_PIN.install()
+    yield SPAWNED_ENV_PIN
+    SPAWNED_ENV_PIN.uninstall()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_runtime_paths(
+    request, tmp_path_factory, monkeypatch, _spawned_env_host_data_pin
+):
+    """Give every test its own host-data root (#3286).
+
+    Without this, a test that enters the real server lifespan resolves the
+    operator's ``~/.kestrel/host-data`` and can read, migrate, or move the live
+    host-feature database. Yields the temporary root, or ``None`` for a test
+    marked ``owns_host_paths``, which redirects the roots itself.
+    """
+    if request.node.get_closest_marker(OWNS_HOST_PATHS_MARKER):
+        yield None
+        return
+
+    root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
+    redirect_host_data_root(root, monkeypatch)
+    yield root
+
+
+@pytest.fixture
+def host_runtime_isolation_root(_isolate_host_runtime_paths):
+    """The temporary root this test's host-runtime paths were redirected into.
+
+    Requesting it is how a test asserts *where* a resolved path landed without
+    reconstructing the layout from the environment.
+    """
+    if _isolate_host_runtime_paths is None:
+        pytest.fail(
+            f"host-runtime isolation is off under the "
+            f"{OWNS_HOST_PATHS_MARKER!r} opt-out, so there is no isolation "
+            f"root; drop the marker or resolve the path yourself."
+        )
+    return _isolate_host_runtime_paths
 
 
 @pytest.fixture(autouse=True)

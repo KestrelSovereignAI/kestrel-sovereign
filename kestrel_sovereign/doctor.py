@@ -76,6 +76,7 @@ from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
+from kestrel_sovereign.paths import HOST_DATA_DIR_ENV
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -893,6 +894,12 @@ def _expand_runtime_user(value: str, env: dict[str, str]) -> Path:
 def _sqlite_default_host_database_path(env: dict[str, str], project_dir: Path) -> Path:
     """Resolve the pre-data-root default host database for this runtime."""
 
+    configured_root = env.get(HOST_DATA_DIR_ENV)
+    if configured_root:
+        root = _expand_runtime_user(configured_root, env)
+        if not root.is_absolute():
+            root = project_dir / root
+        return Path(os.path.abspath(root / "host-features.db"))
     configured_home = env.get("KESTREL_HOME")
     if configured_home:
         base = _expand_runtime_user(configured_home, env)

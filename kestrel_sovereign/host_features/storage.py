@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, MutableMapping, Optional
 
-from kestrel_sovereign.paths import host_data_dir, project_dir
+from kestrel_sovereign.paths import HOST_DATA_DIR_ENV, host_data_dir, project_dir
 from kestrel_sovereign.private_storage import (
     PRIVATE_FILE_MODE,
     PrivateStorageError,
@@ -94,6 +94,12 @@ def _default_host_database_path(
 ) -> Path:
     """Resolve the private default from a described runtime, without mutating it."""
 
+    configured_root = env.get(HOST_DATA_DIR_ENV)
+    if configured_root:
+        return (
+            _runtime_path(configured_root, env, base_dir)
+            / HOST_FEATURE_DB_FILENAME
+        )
     configured_home = env.get("KESTREL_HOME")
     if configured_home:
         root = _runtime_path(configured_home, env, base_dir)
