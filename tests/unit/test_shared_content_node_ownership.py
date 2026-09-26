@@ -74,12 +74,22 @@ ARTIFACT_LABEL = "Signed Constitution Reanchor Artifact"
 REFUSAL = Exception
 
 
-@pytest_asyncio.fixture
-async def db(db_backend):
-    database = AsyncDatabase(db_backend)
+async def _initialized(backend) -> AsyncDatabase:
+    database = AsyncDatabase(backend)
     await database._init_schema()
     database._initialized = True
     return database
+
+
+@pytest_asyncio.fixture
+async def db(db_backend):
+    return await _initialized(db_backend)
+
+
+@pytest_asyncio.fixture
+async def sqlite_db(sqlite_backend):
+    """For an invariant only SQLite has: no PostgreSQL case to skip (#3381)."""
+    return await _initialized(sqlite_backend)
 
 
 @pytest.fixture
@@ -559,7 +569,7 @@ class TestTheSwapDoorDeclinesSharedRows:
         assert "source_path" not in (row[0] or "")
 
     async def test_sqlite_swap_reads_nothing_before_it_writes(
-        self, db, artifact_bytes
+        self, sqlite_db, artifact_bytes
     ):
         """Pins the regression that ended the duplicated-rules design.
 
@@ -574,9 +584,7 @@ class TestTheSwapDoorDeclinesSharedRows:
         scoped row lock before the conditional UPDATE; its lock ordering is
         covered by the real-backend CAS reservation test.
         """
-        if db.backend_type != "sqlite":
-            pytest.skip("This deferred-snapshot invariant is SQLite-specific")
-
+        db = sqlite_db
         node_id = await _take_possession(db, AGENT_A, artifact_bytes, "a.json")
         graph = _graph(db, AGENT_A)
         await graph.add_node(GraphNode(node_id, "episode", "A Tuesday", {"n": 1}))
