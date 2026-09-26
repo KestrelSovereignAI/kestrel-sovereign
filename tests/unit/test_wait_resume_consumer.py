@@ -25,6 +25,7 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sdk.tools import Outcome, WaitStatus
 
+from kestrel_sovereign.privacy import get_privacy_preset
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -156,7 +157,12 @@ async def rig(tmp_path, sqlite_database_factory):
             await asyncio.gather(*pending, return_exceptions=True)
 
     yield SimpleNamespace(
-        agent=agent, dispatcher=dispatcher, jobs=jobs, runs=runs, tick=tick
+        agent=agent,
+        dispatcher_agent=inner,
+        dispatcher=dispatcher,
+        jobs=jobs,
+        runs=runs,
+        tick=tick,
     )
     pending = [task for task in inner.tasks if not task.done()]
     if pending:
@@ -172,10 +178,12 @@ async def _claim(dispatcher, consumer_id):
 
 @pytest.mark.asyncio
 async def test_registration_targets_the_providers_own_wake(rig):
-    registration = await register_wait_resume_consumer(
+    result = await register_wait_resume_consumer(
         rig.agent, "job:42", consumer_id="workflows:wait:run-1"
     )
+    registration = result.registration
 
+    assert result.already_terminal is None
     assert registration.source == wake_source(rig.jobs) == JOB_SOURCE
     assert registration.agent_id == AGENT_DID
     assert registration.correlation_selector == "payload.ref=job:42"
@@ -233,27 +241,78 @@ async def test_poll_data_cannot_redirect_the_wake(rig):
 @pytest.mark.asyncio
 async def test_wake_committed_before_registration_is_backfilled(rig):
     """The dispatch stage returns before the verify stage parks; a job that
-    finishes in between must still resume the parked stage."""
-    rig.jobs.set("42", Outcome.DONE)
+    finishes in between must still resume the parked stage — reported by the
+    registration itself and, under normal storage, delivered exactly once."""
+    rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
     await rig.tick()
 
-    await register_wait_resume_consumer(
+    result = await register_wait_resume_consumer(
         rig.agent, "job:42", consumer_id="workflows:wait:run-1"
     )
 
+    assert result.already_terminal is not None
+    assert result.already_terminal.outcome is Outcome.DONE
     delivery = await _claim(rig.dispatcher, "workflows:wait:run-1")
     assert delivery is not None
     assert delivery.event.payload["ref"] == "job:42"
+    assert await rig.dispatcher.ack_durable_delivery(
+        consumer_id="workflows:wait:run-1",
+        delivery_id=delivery.delivery_id,
+        lease_token=delivery.lease_token,
+    )
+
+    await rig.tick()
+    assert await _claim(rig.dispatcher, "workflows:wait:run-1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["ephemeral", "isolated"])
+async def test_elided_wake_before_registration_reports_terminal(rig, preset):
+    """Under a payload-eliding privacy mode the stored wake carries only a
+    marker, so backfill cannot match it and the reconciler has already
+    deduplicated the transition. The registration's post-registration poll
+    is then the only thing that tells the parked work its handle finished."""
+    rig.dispatcher_agent.privacy_config = get_privacy_preset(preset)
+    rig.jobs.set("42", Outcome.DONE, {"status": "complete"})
+    await rig.tick()
+
+    result = await register_wait_resume_consumer(
+        rig.agent, "job:42", consumer_id="workflows:wait:run-1"
+    )
+
+    await rig.tick()
+    assert await _claim(rig.dispatcher, "workflows:wait:run-1") is None
+    assert result.already_terminal is not None
+    assert result.already_terminal.outcome is Outcome.DONE
+    assert result.already_terminal.data == {"status": "complete"}
+
+
+@pytest.mark.asyncio
+async def test_post_registration_poll_failure_is_not_reported_as_running(
+    rig, monkeypatch
+):
+    """A poll that raises after registering leaves the handle's state
+    unknown; it must surface rather than read as "still running"."""
+
+    async def broken_poll(handle):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(rig.jobs, "poll", broken_poll)
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await register_wait_resume_consumer(
+            rig.agent, "job:42", consumer_id="workflows:wait:run-1"
+        )
 
 
 @pytest.mark.asyncio
 async def test_poll_only_provider_is_armed_and_resumes(rig):
     """A provider with no ``active_handles`` is only reconciled when watched;
     the resume registration arms that watch itself."""
-    registration = await register_wait_resume_consumer(
+    result = await register_wait_resume_consumer(
         rig.agent, "run:7", consumer_id="workflows:wait:run-2"
     )
-    assert registration.source == "wait.complete"
+    assert result.registration.source == "wait.complete"
+    assert result.already_terminal is None
 
     rig.runs.states["7"] = Outcome.FAILED
     await rig.tick()

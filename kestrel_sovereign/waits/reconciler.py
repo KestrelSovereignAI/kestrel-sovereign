@@ -52,11 +52,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
-from kestrel_sdk.tools import MonitorableWaitable, ToolResult
+from kestrel_sdk.tools import MonitorableWaitable, ToolResult, WaitStatus
 
 from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
@@ -1144,6 +1145,21 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
     await _get_reconciler(agent)._store.start_watch(kind, handle)
 
 
+@dataclass(frozen=True)
+class WaitResumeRegistration:
+    """What :func:`register_wait_resume_consumer` established.
+
+    ``already_terminal`` is the handle's state as polled *after* the consumer
+    and watch were durably registered, when that state was already terminal;
+    ``None`` means the handle was still in flight at that point, so its
+    terminal transition happens after the registration and will be delivered
+    to ``registration.consumer_id``.
+    """
+
+    registration: DurableConsumerRegistration
+    already_terminal: Optional[WaitStatus]
+
+
 async def register_wait_resume_consumer(
     agent: Any,
     ref: str,
@@ -1151,7 +1167,7 @@ async def register_wait_resume_consumer(
     consumer_id: str,
     max_attempts: int = 0,
     lease_seconds: int = 60,
-) -> DurableConsumerRegistration:
+) -> WaitResumeRegistration:
     """Durably subscribe ``consumer_id`` to the wake announcing that ``ref``
     reached a terminal state (#3295).
 
@@ -1170,16 +1186,23 @@ async def register_wait_resume_consumer(
     than a provider field keeps it unique across every provider that shares
     ``wait.complete``, and a provider's poll data cannot redirect it.
 
-    Ordering is race-free: a wake committed before this registration is
-    backfilled into the new consumer (within the source's retention), and
-    one committed after it gets a delivery directly. Delivery is at least
-    once — a retried wake for the same transition is a second delivery.
+    The resume guarantee is the post-registration poll, not backfill.
+    After the consumer and watch are durable, the provider is polled once
+    more. If the handle is already terminal, that state is returned as
+    ``already_terminal`` and the caller must act on it directly: its wake
+    may have been committed before this registration in a form the selector
+    cannot match (EPHEMERAL/ISOLATED privacy persists only a marker in place
+    of the payload, and wakes older than ``payload.ref`` never carried it),
+    and the reconciler never re-announces a transition it already delivered.
+    Otherwise the terminal transition happens after the registration, and
+    its wake gets a delivery directly. A matchable wake committed earlier
+    is also backfilled, so a caller may see both ``already_terminal`` and a
+    delivery for the same transition. Delivery is at least once — a retried
+    wake for the same transition is a second delivery.
 
     A delivery is a *wake*, not a verdict. The consumer must poll the
-    provider for the handle's actual state on every delivery, and should
-    poll once before parking: a handle that went terminal before an
-    upgrade's wake carried ``payload.ref`` will never match. When the parked
-    work is finished, retire the subscription with
+    provider for the handle's actual state on every delivery. When the
+    parked work is finished, retire the subscription with
     ``dispatcher.deactivate_durable_consumer(consumer_id=...)``.
 
     ``max_attempts`` defaults to ``0`` (retain until acknowledged): this wake
@@ -1189,11 +1212,16 @@ async def register_wait_resume_consumer(
     existing behavior of every watched handle and is not suppressed here.
 
     Returns:
-        The registration that was stored.
+        The stored registration, and the handle's terminal state when it
+        was already terminal after registering.
 
     Raises:
         ValueError: on any :func:`register_wait_watch` validation failure,
             or when the agent has no durable signal dispatcher.
+        Exception: whatever the provider's post-registration ``poll``
+            raises. The registration stands, but whether the handle was
+            already terminal is unknown, so the caller must not park on it;
+            re-registering the same ``consumer_id`` is idempotent.
     """
     kind, handle, provider = await _resolve_owned_provider(agent, ref)
     register = getattr(
@@ -1214,4 +1242,8 @@ async def register_wait_resume_consumer(
     )
     await register(registration)
     await _get_reconciler(agent)._store.start_watch(kind, handle)
-    return registration
+    status = await provider.poll(handle)
+    return WaitResumeRegistration(
+        registration=registration,
+        already_terminal=status if status.outcome.is_terminal() else None,
+    )

@@ -490,9 +490,11 @@ parks instead and subscribes to the handle's wake (#3295):
 ```python
 from kestrel_sovereign.waits.reconciler import register_wait_resume_consumer
 
-await register_wait_resume_consumer(
+resume = await register_wait_resume_consumer(
     agent, "talon:job-42", consumer_id="workflows:wait:run-42"
 )
+if resume.already_terminal is not None:
+    ...  # finished before the park took effect: act on it now
 ```
 
 It validates the ref exactly like `wait(..., mode="signal")`, arms the same
@@ -501,11 +503,21 @@ source (`provider.signal`, else `wait.complete`) with the selector
 `payload.ref=<kind>:<handle>`. The reconciler writes `payload.ref` after
 spreading the provider's poll data, so a provider cannot point one handle's
 completion at another handle's parked work, and kinds sharing
-`wait.complete` never cross. A wake committed before the registration is
-backfilled; `max_attempts` defaults to `0` because the wake is the only thing
-that resumes the parked work. A delivery is a wake, not a verdict: poll the
-provider for the handle's state before parking and on every delivery, then
-deactivate the consumer when the parked work finishes.
+`wait.complete` never cross.
+
+The resume guarantee is the poll it makes *after* the consumer and watch are
+durable, not backfill. If the handle is already terminal, that `WaitStatus` is
+returned as `already_terminal` and the caller acts on it directly: a wake
+committed earlier may be unmatchable (EPHEMERAL/ISOLATED privacy persists only
+a marker in place of the payload), and the reconciler never re-announces a
+transition it already delivered. Otherwise the transition happens after the
+registration and is delivered directly. A matchable earlier wake is also
+backfilled, so the same transition can arrive both ways. A poll that raises
+propagates: the handle's state is unknown, so the caller must not park, and
+re-registering the same `consumer_id` is idempotent. `max_attempts` defaults
+to `0` because the wake is the only thing that resumes the parked work. A
+delivery is a wake, not a verdict: poll the provider for the handle's state on
+every delivery, then deactivate the consumer when the parked work finishes.
 
 The dispatcher permits durable registrations only for its own `agent.did`.
 Every claim, acknowledgement, retry, and observation query is selected by
