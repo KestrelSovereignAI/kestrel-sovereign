@@ -498,14 +498,21 @@ if resume.already_terminal is not None:
 ```
 
 It validates the ref exactly like `wait(..., mode="signal")`, arms the same
-reconciler watch, and registers a durable consumer on the provider's wake
-source (`provider.signal`, else `wait.complete`) with the selector
+reconciler watch, and only then registers a durable consumer on the provider's
+wake source (`provider.signal`, else `wait.complete`) with the selector
 `payload.ref=<kind>:<handle>`. The reconciler writes `payload.ref` after
 spreading the provider's poll data, so a provider cannot point one handle's
 completion at another handle's parked work, and kinds sharing
 `wait.complete` never cross.
 
-The resume guarantee is the poll it makes *after* the consumer and watch are
+The watch is armed before the consumer exists, and that order is load-bearing.
+An interruption between the two writes must never leave a durable consumer
+with no watch behind it: for a poll-only provider (Talon, CI) the reconciler
+would never poll that handle again, and the parked work would stall silently.
+A watch without a consumer only wakes the agent through the normal reconciler
+path, and retrying the idempotent registration completes it.
+
+The resume guarantee is the poll it makes *after* the watch and consumer are
 durable, not backfill. If the handle is already terminal, that `WaitStatus` is
 returned as `already_terminal` and the caller acts on it directly: a wake
 committed earlier may be unmatchable (EPHEMERAL/ISOLATED privacy persists only

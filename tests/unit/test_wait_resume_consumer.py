@@ -361,3 +361,74 @@ async def test_missing_durable_dispatcher_fails_closed(rig):
         await register_wait_resume_consumer(
             rig.agent, "job:42", consumer_id="workflows:wait:run-5"
         )
+
+
+async def _watching(agent, kind, handle) -> bool:
+    state = await agent._wait_reconciler._store.get(kind, handle)
+    return state is not None and state.watching == 1
+
+
+@pytest.mark.asyncio
+async def test_watch_is_armed_before_the_consumer_is_written(rig, monkeypatch):
+    """A consumer with no watch behind it is an unrecoverable stall for a
+    poll-only provider, so the watch must already be durable when the
+    consumer row is written."""
+    real_register = rig.dispatcher.register_durable_consumer
+    watched_at_register: list[bool] = []
+
+    async def observing_register(registration):
+        watched_at_register.append(await _watching(rig.agent, "run", "7"))
+        return await real_register(registration)
+
+    monkeypatch.setattr(
+        rig.dispatcher, "register_durable_consumer", observing_register
+    )
+    await register_wait_resume_consumer(
+        rig.agent, "run:7", consumer_id="workflows:wait:run-2"
+    )
+
+    assert watched_at_register == [True]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_consumer_write_leaves_the_watch_and_retry_recovers(
+    rig, monkeypatch
+):
+    """An interruption at the consumer write leaves only a harmless watch;
+    retrying the idempotent registration completes it and the parked work
+    still resumes."""
+    real_register = rig.dispatcher.register_durable_consumer
+
+    async def interrupted_register(registration):
+        raise RuntimeError("process stopped")
+
+    monkeypatch.setattr(
+        rig.dispatcher, "register_durable_consumer", interrupted_register
+    )
+    with pytest.raises(RuntimeError, match="process stopped"):
+        await register_wait_resume_consumer(
+            rig.agent, "run:7", consumer_id="workflows:wait:run-2"
+        )
+    assert await _watching(rig.agent, "run", "7")
+
+    monkeypatch.setattr(rig.dispatcher, "register_durable_consumer", real_register)
+    result = await register_wait_resume_consumer(
+        rig.agent, "run:7", consumer_id="workflows:wait:run-2"
+    )
+    assert result.already_terminal is None
+
+    rig.runs.states["7"] = Outcome.DONE
+    await rig.tick()
+    delivery = await _claim(rig.dispatcher, "workflows:wait:run-2")
+    assert delivery is not None
+    assert delivery.event.payload["ref"] == "run:7"
+
+
+@pytest.mark.asyncio
+async def test_missing_durable_dispatcher_arms_no_watch(rig):
+    rig.agent.dispatcher = SimpleNamespace()
+    with pytest.raises(ValueError, match="durable signal delivery unavailable"):
+        await register_wait_resume_consumer(
+            rig.agent, "run:7", consumer_id="workflows:wait:run-5"
+        )
+    assert not await _watching(rig.agent, "run", "7")

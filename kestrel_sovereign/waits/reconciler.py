@@ -1149,8 +1149,9 @@ async def register_wait_watch(agent: Any, ref: str) -> None:
 class WaitResumeRegistration:
     """What :func:`register_wait_resume_consumer` established.
 
-    ``already_terminal`` is the handle's state as polled *after* the consumer
-    and watch were durably registered, when that state was already terminal;
+    ``already_terminal`` is the handle's state as polled *after* the watch
+    and consumer were durably registered, when that state was already
+    terminal;
     ``None`` means the handle was still in flight at that point, so its
     terminal transition happens after the registration and will be delivered
     to ``registration.consumer_id``.
@@ -1187,7 +1188,7 @@ async def register_wait_resume_consumer(
     ``wait.complete``, and a provider's poll data cannot redirect it.
 
     The resume guarantee is the post-registration poll, not backfill.
-    After the consumer and watch are durable, the provider is polled once
+    After the watch and consumer are durable, the provider is polled once
     more. If the handle is already terminal, that state is returned as
     ``already_terminal`` and the caller must act on it directly: its wake
     may have been committed before this registration in a form the selector
@@ -1204,6 +1205,16 @@ async def register_wait_resume_consumer(
     provider for the handle's actual state on every delivery. When the
     parked work is finished, retire the subscription with
     ``dispatcher.deactivate_durable_consumer(consumer_id=...)``.
+
+    The watch is armed *before* the consumer exists, and that order is an
+    invariant. A consumer without a watch is an unrecoverable stall: an
+    interruption between the two writes (a crash, an OOM, a restart) would
+    leave a durable subscription for a poll-only provider (talon, CI) whose
+    handle the reconciler never polls again, so no wake ever comes and
+    nothing detects it. A watch without a consumer is harmless — it only
+    wakes the agent through the normal reconciler cognition path — and a
+    retry of this call, which is idempotent for the same ``consumer_id``,
+    completes the registration.
 
     ``max_attempts`` defaults to ``0`` (retain until acknowledged): this wake
     is the only thing that resumes the parked work, so a transient consumer
@@ -1240,8 +1251,8 @@ async def register_wait_resume_consumer(
         max_attempts=max_attempts,
         lease_seconds=lease_seconds,
     )
-    await register(registration)
     await _get_reconciler(agent)._store.start_watch(kind, handle)
+    await register(registration)
     status = await provider.poll(handle)
     return WaitResumeRegistration(
         registration=registration,
