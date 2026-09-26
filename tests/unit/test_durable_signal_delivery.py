@@ -37,6 +37,7 @@ from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
+    SignalWithDurableCorrelation,
     SourceRegistry,
 )
 from kestrel_sovereign.signals import dispatcher as dispatcher_module
@@ -6750,6 +6751,64 @@ async def test_anonymous_selector_uses_the_persisted_redacted_payload_before_and
         }
     finally:
         await _close(backend2, agent2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("correlated", (True, False))
+async def test_anonymous_projection_keeps_only_named_correlation_keys_verbatim(
+    tmp_path, correlated
+):
+    """A key a ``SignalWithDurableCorrelation`` names survives ANONYMOUS
+    storage so its selector still matches (#3295); every other value, and the
+    same key on an ordinary signal, is anonymized."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    agent_id = "did:agent:correlated"
+    workflow = "wf-12345"
+    backend, agent, dispatcher = await _dispatcher(
+        tmp_path / "correlated.db", agent_id
+    )
+    agent.privacy_config = get_privacy_preset("anonymous")
+    try:
+        await dispatcher.register_durable_consumer(
+            DurableConsumerRegistration(
+                consumer_id="workflow-wait",
+                source="provider.message",
+                agent_id=agent_id,
+                correlation_selector=f"payload.workflow={workflow}",
+            )
+        )
+        base = _signal(
+            agent_id=agent_id, message="customer@example.com", workflow=workflow
+        )
+        signal = (
+            SignalWithDurableCorrelation(
+                source=base.source,
+                kind=base.kind,
+                mode=base.mode,
+                payload=base.payload,
+                target_agent=base.target_agent,
+                durable_correlation_keys=frozenset({"workflow"}),
+            )
+            if correlated
+            else base
+        )
+        result = await dispatcher.dispatch_signal(signal)
+        assert result.status is Status.OK
+
+        row = await backend.fetch_one(
+            "SELECT payload FROM durable_signal_events WHERE agent_id = ?",
+            (agent_id,),
+        )
+        assert row is not None
+        assert json.loads(row[0]) == {
+            "message": "[EMAIL_REDACTED]",
+            "workflow": workflow if correlated else "wf-[ZIP_REDACTED]",
+        }
+        deliveries = await dispatcher.list_durable_deliveries()
+        assert len(deliveries) == (1 if correlated else 0)
+    finally:
+        await _close(backend, agent)
 
 
 @pytest.mark.asyncio

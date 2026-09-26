@@ -93,9 +93,8 @@ class _JobProvider:
 class _PollOnlyProvider:
     """A poll-only Waitable on the generic ``wait.complete`` source."""
 
-    kind = "run"
-
-    def __init__(self):
+    def __init__(self, kind: str = "run"):
+        self.kind = kind
         self.states: dict[str, Outcome] = {}
 
     async def poll(self, handle):
@@ -136,9 +135,11 @@ async def rig(tmp_path, sqlite_database_factory):
 
     jobs = _JobProvider()
     runs = _PollOnlyProvider()
+    checks = _PollOnlyProvider("ci")
     waits = WaitRegistry()
     waits.register(jobs)
     waits.register(runs)
+    waits.register(checks)
     db = await sqlite_database_factory(tmp_path / "agent.db")
     agent = SimpleNamespace(
         did=AGENT_DID,
@@ -162,6 +163,7 @@ async def rig(tmp_path, sqlite_database_factory):
         dispatcher=dispatcher,
         jobs=jobs,
         runs=runs,
+        checks=checks,
         tick=tick,
     )
     pending = [task for task in inner.tasks if not task.done()]
@@ -432,3 +434,72 @@ async def test_missing_durable_dispatcher_arms_no_watch(rig):
             rig.agent, "run:7", consumer_id="workflows:wait:run-5"
         )
     assert not await _watching(rig.agent, "run", "7")
+
+
+async def _ack(dispatcher, consumer_id, delivery):
+    assert await dispatcher.ack_durable_delivery(
+        consumer_id=consumer_id,
+        delivery_id=delivery.delivery_id,
+        lease_token=delivery.lease_token,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref, provider_name",
+    [("ci:owner/repo#12345", "checks"), ("job:job-12345", "jobs")],
+)
+async def test_anonymized_storage_keeps_the_wake_correlatable(
+    rig, ref, provider_name
+):
+    """ANONYMOUS storage persists a PII-anonymized payload, and selectors
+    match that stored projection. A 5-digit run in a handle reads as a ZIP
+    code, so an anonymized ``payload.ref`` would never match the consumer's
+    raw selector and the parked work would silently never resume."""
+    rig.dispatcher_agent.privacy_config = get_privacy_preset("anonymous")
+    kind, handle = ref.split(":", 1)
+    consumer_id = f"workflows:wait:{kind}"
+    result = await register_wait_resume_consumer(
+        rig.agent, ref, consumer_id=consumer_id
+    )
+    assert result.already_terminal is None
+
+    provider = getattr(rig, provider_name)
+    if provider_name == "jobs":
+        provider.set(handle, Outcome.DONE, {"status": "complete"})
+    else:
+        provider.states[handle] = Outcome.DONE
+    await rig.tick()
+
+    delivery = await _claim(rig.dispatcher, consumer_id)
+    assert delivery is not None
+    assert delivery.event.payload["ref"] == ref
+    # Only the correlation key is exempt: the rest is still anonymized.
+    assert delivery.event.payload["handle"] != handle
+    assert "[ZIP_REDACTED]" in delivery.event.payload["handle"]
+    await _ack(rig.dispatcher, consumer_id, delivery)
+
+    await rig.tick()
+    assert await _claim(rig.dispatcher, consumer_id) is None
+
+
+@pytest.mark.asyncio
+async def test_anonymized_wake_before_registration_is_backfilled(rig):
+    """Backfill reads the stored, anonymized event, so it too needs the
+    correlation key to survive the projection."""
+    rig.dispatcher_agent.privacy_config = get_privacy_preset("anonymous")
+    rig.jobs.set("job-12345", Outcome.DONE, {"status": "complete"})
+    await rig.tick()
+
+    result = await register_wait_resume_consumer(
+        rig.agent, "job:job-12345", consumer_id="workflows:wait:run-6"
+    )
+
+    assert result.already_terminal is not None
+    delivery = await _claim(rig.dispatcher, "workflows:wait:run-6")
+    assert delivery is not None
+    assert delivery.event.payload["ref"] == "job:job-12345"
+    await _ack(rig.dispatcher, "workflows:wait:run-6", delivery)
+
+    await rig.tick()
+    assert await _claim(rig.dispatcher, "workflows:wait:run-6") is None

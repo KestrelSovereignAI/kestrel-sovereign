@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, ToolResult, WaitStatus
 
+from kestrel_sovereign.signals.correlation import SignalWithDurableCorrelation
 from kestrel_sovereign.signals.dispatcher import (
     SURFACE_QUEUED,
     SURFACE_UNSURFACED_STATES,
@@ -927,7 +928,7 @@ class WaitReconciler:
             or getattr(self._agent, "agent_id", None)
             or ""
         )
-        return Signal(
+        return SignalWithDurableCorrelation(
             source=source,
             kind="inbound",
             mode=SignalMode.COGNITION,
@@ -950,6 +951,10 @@ class WaitReconciler:
                 f"{kind}:{handle}:{self._signaled_token(status)}:attempt-{attempts}"
                 + (f":deferral-{deferrals}" if deferrals else "")
             ),
+            # The ref is written by this reconciler, never by the provider,
+            # so ANONYMOUS storage keeps it verbatim for the resume
+            # consumer's selector (#3295).
+            durable_correlation_keys=frozenset({WAKE_REF_PAYLOAD_KEY}),
         )
 
 
@@ -1185,7 +1190,9 @@ async def register_wait_resume_consumer(
     a durable consumer on the provider's :func:`wake_source`, correlated on
     the wake's authoritative ``payload.ref``. Correlating on the ref rather
     than a provider field keeps it unique across every provider that shares
-    ``wait.complete``, and a provider's poll data cannot redirect it.
+    ``wait.complete``, and a provider's poll data cannot redirect it. The
+    wake names the ref as a durable correlation key, so ANONYMOUS storage
+    keeps it verbatim rather than anonymizing it out of the selector's reach.
 
     The resume guarantee is the post-registration poll, not backfill.
     After the watch and consumer are durable, the provider is polled once

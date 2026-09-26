@@ -132,6 +132,7 @@ from kestrel_sovereign.signals.constitution_metrics import (
     record_echo_missing,
     record_echo_verified,
 )
+from kestrel_sovereign.signals.correlation import durable_correlation_values
 from kestrel_sovereign.signals.durable import (
     ACKNOWLEDGED,
     FAILED,
@@ -429,7 +430,9 @@ class _DurableSignalProjection:
     normalized in-memory event to be materialized atomically at dispatch
     time; later registrations and restart backfill must see only the durable
     representation.  Anonymized payloads, conversely, are replayable and so
-    selectors must use that stored projection from the first delivery.
+    selectors must use that stored projection from the first delivery; the
+    keys a ``SignalWithDurableCorrelation`` names are exempt from
+    anonymization so a selector on them still matches.
     """
 
     signal: Signal
@@ -2895,13 +2898,24 @@ class SignalDispatcher:
                     anonymize_text,
                 )
 
+                # Correlation identifiers the producer wrote itself are
+                # persisted verbatim so a consumer's selector still matches
+                # the stored event (#3295); everything else is anonymized.
+                correlation = durable_correlation_values(signal)
+                payload = self._anonymize_durable_value(
+                    {
+                        key: value
+                        for key, value in signal.payload.items()
+                        if key not in correlation
+                    }
+                    if correlation
+                    else signal.payload,
+                    anonymize_text,
+                )
+                if correlation:
+                    payload.update(correlation)
                 return _DurableSignalProjection(
-                    signal=replace(
-                        signal,
-                        payload=self._anonymize_durable_value(
-                            signal.payload, anonymize_text
-                        ),
-                    ),
+                    signal=replace(signal, payload=payload),
                 )
         except Exception as exc:  # Privacy persistence must fail closed.
             logger.warning(

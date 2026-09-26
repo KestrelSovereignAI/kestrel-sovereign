@@ -505,6 +505,13 @@ spreading the provider's poll data, so a provider cannot point one handle's
 completion at another handle's parked work, and kinds sharing
 `wait.complete` never cross.
 
+Selectors match the *stored* event, and ANONYMOUS storage anonymizes it: a
+5-digit run in a handle reads as a ZIP code, so `ci:owner/repo#12345` would be
+stored as `ci:owner/repo#[ZIP_REDACTED]` and never match. The wake is therefore
+a `SignalWithDurableCorrelation` naming `ref` in `durable_correlation_keys`;
+the durable projection keeps those producer-written identifiers verbatim and
+anonymizes everything else. Payload-eliding modes still elide them.
+
 The watch is armed before the consumer exists, and that order is load-bearing.
 An interruption between the two writes must never leave a durable consumer
 with no watch behind it: for a poll-only provider (Talon, CI) the reconciler
