@@ -2043,6 +2043,89 @@ async def test_late_hold_refusal_preserves_durable_retry_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_drain_requested_mid_scan_is_not_lost(tmp_path):
+    """A wake that lands while a drainer scans a stale snapshot still drains.
+
+    The owner heartbeat requeues a dead runtime's lease and asks for a drain.
+    If the running drainer read its candidates before that commit, dropping
+    the request left the recovered row in ``retry`` until an unrelated event
+    arrived (the CI flake in ``test_crash_mid_submission_turn_...``).
+    """
+
+    from kestrel_sovereign.hold import HoldTurnRefusal
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "drain-rerun.db",
+        "did:agent:drain-rerun",
+    )
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    agent._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
+    agent.process_input = AsyncMock(
+        side_effect=HoldTurnRefusal(
+            agent_id=agent.did,
+            effective_state=_held_state(agent.did),
+        )
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, "drain-rerun"),
+            source_event_id="telegram:update:drain-rerun",
+            consumer_id=consumer.consumer_id,
+        )
+        await asyncio.wait_for(handle.wait(), timeout=1.0)
+        [delivery] = await dispatcher.list_durable_deliveries(
+            consumer_id=consumer.consumer_id
+        )
+        assert delivery.status == RETRY
+        agent.process_input = AsyncMock(return_value="resumed")
+
+        # Both reads of the first drain return the snapshot from before the
+        # row became retryable; the second blocks until the wake has landed.
+        real_list = dispatcher.list_durable_deliveries
+        stale_reads = 0
+        in_second_read = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stale_list(*args, **kwargs):
+            nonlocal stale_reads
+            if stale_reads < 2:
+                stale_reads += 1
+                if stale_reads == 2:
+                    in_second_read.set()
+                    await release.wait()
+                return []
+            return await real_list(*args, **kwargs)
+
+        dispatcher.list_durable_deliveries = stale_list
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        await asyncio.wait_for(in_second_read.wait(), timeout=1.0)
+        # The recovery wake arrives while that drainer is still running.
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        release.set()
+
+        for _ in range(200):
+            [delivery] = await real_list(consumer_id=consumer.consumer_id)
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exact_event", [False, True])
 async def test_public_claim_failed_hold_rollback_is_recovered_attempt_neutral(
     tmp_path,

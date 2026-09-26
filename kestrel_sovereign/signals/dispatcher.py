@@ -859,6 +859,11 @@ class SignalDispatcher:
         # dispatcher scans and drains the persisted consumer itself.
         self._durable_cognition_drainers: dict[str, asyncio.Task[None]] = {}
         self._durable_cognition_drain_timers: dict[str, asyncio.TimerHandle] = {}
+        # A drain requested while one is already running may be answering
+        # rows that drainer's snapshot predates (e.g. a lease recovery that
+        # committed mid-scan). The running drainer restarts once on exit
+        # rather than dropping that request.
+        self._durable_cognition_drain_rerun: set[str] = set()
         self._started_durable_cognition_consumers: set[str] = set()
         # Repeated one-second release probes must not turn one continuous Hold
         # into an unbounded metric stream. Each consumer records one edge and
@@ -1430,7 +1435,9 @@ class SignalDispatcher:
             return
         existing = self._durable_cognition_drainers.get(consumer_id)
         if existing is not None and not existing.done():
+            self._durable_cognition_drain_rerun.add(consumer_id)
             return
+        self._durable_cognition_drain_rerun.discard(consumer_id)
         timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
         if timer is not None:
             timer.cancel()
@@ -1453,6 +1460,9 @@ class SignalDispatcher:
                     exc_info=exc,
                 )
                 self._schedule_durable_cognition_drain(consumer_id, delay=1.0)
+                return
+            if consumer_id in self._durable_cognition_drain_rerun:
+                self._start_durable_cognition_drain(consumer_id)
 
         task.add_done_callback(complete)
 
@@ -1688,6 +1698,7 @@ class SignalDispatcher:
             self._started_durable_cognition_consumers.discard(consumer_id)
             self._held_durable_cognition_consumers.discard(consumer_id)
             self._held_durable_claim_consumers.discard(consumer_id)
+            self._durable_cognition_drain_rerun.discard(consumer_id)
             timer = self._durable_cognition_drain_timers.pop(consumer_id, None)
             if timer is not None:
                 timer.cancel()
@@ -2375,6 +2386,7 @@ class SignalDispatcher:
         for timer in self._durable_cognition_drain_timers.values():
             timer.cancel()
         self._durable_cognition_drain_timers.clear()
+        self._durable_cognition_drain_rerun.clear()
         self._started_durable_cognition_consumers.clear()
         self._held_durable_cognition_consumers.clear()
         self._held_durable_claim_consumers.clear()
