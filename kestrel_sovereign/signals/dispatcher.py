@@ -2779,6 +2779,7 @@ class SignalDispatcher:
             await self._recover_abandoned_initial_reservations()
             # This runtime's own first leases that expired unclaimed are not
             # stale-owner work, so the sweep above cannot see them (#3370).
+            # The release wakes each affected started drainer itself.
             self._discard_expired_transient_durable_handoffs()
             await self._release_expired_initial_handoffs()
             recovered = await self._recover_abandoned_leases()
@@ -2889,6 +2890,10 @@ class SignalDispatcher:
         acknowledged, terminal, or already-released delivery is untouched.
         A storage error keeps the capability for the next claim or owner
         heartbeat to retry.
+
+        A released row is new retry work that a durable cognition drainer
+        which already scanned and exited cannot see, so every release wakes
+        its started consumer here rather than relying on each caller to.
         """
         released = 0
         for delivery_id, (consumer_id, token) in tuple(
@@ -2904,6 +2909,8 @@ class SignalDispatcher:
                     reason=EXPIRED_INITIAL_HANDOFF_ERROR,
                 ):
                     released += 1
+                    if consumer_id in self._started_durable_cognition_consumers:
+                        self._start_durable_cognition_drain(consumer_id)
             except Exception:
                 logger.exception(
                     "Could not release expired initial durable handoff %s; "

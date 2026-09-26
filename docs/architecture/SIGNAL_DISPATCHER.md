@@ -619,7 +619,10 @@ dispatcher, so ordinary claim recovery deliberately never reclaims it. The
 emitting dispatcher therefore keeps that lease's opaque capability (never the
 payload) when it drops the expired sidecar, or when a transfer is refused.
 On the next claim, or its next owner heartbeat, it releases the row to
-`retry` with `last_error` set to `EXPIRED_INITIAL_HANDOFF_ERROR`. The
+`retry` with `last_error` set to `EXPIRED_INITIAL_HANDOFF_ERROR`. Each
+release also wakes that consumer's durable cognition drainer if it has been
+started, because a drainer that scanned while the row was still leased has
+already exited. The
 owner/token compare-and-set leaves a transferred, acknowledged, or terminal
 delivery untouched. Before #3370 the row stayed leased until the process
 stopped, and a late consumer claim silently returned nothing.

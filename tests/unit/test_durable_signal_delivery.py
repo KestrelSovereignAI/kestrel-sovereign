@@ -9506,3 +9506,72 @@ async def test_transferred_first_lease_is_not_released_when_its_sidecar_expires(
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ("heartbeat", "retention_purge"))
+async def test_release_of_expired_first_lease_wakes_an_idle_drainer(
+    tmp_path, trigger
+):
+    """#3370: the durable cognition drainer scanned while the first lease was
+    still the emitter's and exited. When the owner heartbeat (or the retention
+    sweep) releases that lease to retry, the delivery must be processed
+    without another event."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / f"release-wakes-{trigger}.db",
+        "did:agent:heartbeat-release-wakes",
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        live = _channel_signal(agent.did, "heartbeat-release")
+        # The retry carries only the privacy marker; recover the envelope the
+        # way sources with an authoritative store do.
+        agent.rehydrate_durable_cognition_signal = (
+            lambda event, *, dispatch_signal: live
+        )
+        result = await dispatcher.dispatch_signal(
+            live, source_event_id="telegram:update:heartbeat-release"
+        )
+        assert result.status is Status.OK
+        (reserved,) = await dispatcher.list_durable_deliveries()
+        assert reserved.status == LEASED
+        assert reserved.lease_owner == dispatcher._durable_delivery_owner
+
+        # The drainer sees no claimable row while the emitter holds it.
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        drainer = dispatcher._durable_cognition_drainers.get(consumer.consumer_id)
+        if drainer is not None:
+            await asyncio.wait_for(drainer, timeout=1.0)
+        assert consumer.consumer_id not in dispatcher._durable_cognition_drainers
+        assert consumer.consumer_id not in dispatcher._durable_cognition_drain_timers
+
+        agent.process_input = AsyncMock(return_value="resumed")
+        _expire_handoff(dispatcher, reserved.delivery_id)
+        if trigger == "heartbeat":
+            await dispatcher._heartbeat_runtime_owner()
+        else:
+            await dispatcher.purge_expired_durable_deliveries()
+
+        for _ in range(200):
+            (delivery,) = await dispatcher.list_durable_deliveries()
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        agent.process_input.assert_awaited_once()
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
