@@ -21,6 +21,7 @@ import pytest
 from kestrel_sovereign.hold import HoldAuthority, HoldStore
 from kestrel_sovereign.hold.state import (
     _HISTORY_ANCHOR_V2_MIGRATION,
+    _HISTORY_ANCHOR_V3_MIGRATION,
     _HOLD_SCHEMA_TABLES,
     _INITIALIZATION_WITNESS_PAYLOAD,
     _POSTGRES_HISTORY_ANCHOR_KEY,
@@ -178,17 +179,26 @@ def _active(seeded) -> set:
 
 
 async def _assert_migrated_to_v2(db, store) -> bytes:
-    """The upgrade committed the column and marker and published a v2 head."""
+    """The upgrade committed the column and markers and published a head.
+
+    A v1 host upgrades straight to the current format: the same transaction
+    records the v2 authority migration and the v3 mandate-scope migration
+    (#3168), and publishes one v3 head.
+    """
 
     assert await db.column_exists("hold_receipts", "authority")
     marker = await db.fetchall(
-        "SELECT name FROM hold_schema_migrations WHERE name = ?",
-        (_HISTORY_ANCHOR_V2_MIGRATION,),
+        "SELECT name FROM hold_schema_migrations WHERE name IN (?, ?) "
+        "ORDER BY name",
+        (_HISTORY_ANCHOR_V2_MIGRATION, _HISTORY_ANCHOR_V3_MIGRATION),
     )
-    assert [tuple(row) for row in marker] == [(_HISTORY_ANCHOR_V2_MIGRATION,)]
+    assert [tuple(row) for row in marker] == [
+        (_HISTORY_ANCHOR_V2_MIGRATION,),
+        (_HISTORY_ANCHOR_V3_MIGRATION,),
+    ]
     stable = await store._read_history_anchor()
     assert stable is not None
-    assert stable.startswith(_HistoryAnchorFormat.V2.header)
+    assert stable.startswith(_HistoryAnchorFormat.V3.header)
     assert stable == await store._current_history_anchor_payload()
     assert await store._read_external_history_candidate() is None
     if store._custody_control_path is not None:
@@ -281,9 +291,12 @@ async def test_rewritten_authority_is_caught_by_a_global_read_for_another_target
     assert await store.get_hold("agent", TARGET_B) == seeded["b"].current
     await store.list_receipts(target_id=TARGET_B, limit=10)
 
+    # Not a HoldAuthority member. ``mandate`` is one since #3168, and on this
+    # sovereign agent latch it is refused by its own authority rule, which
+    # ``test_hold_mandate`` covers.
     await db.execute(
         "UPDATE hold_receipts SET authority = ? WHERE operation_id = ?",
-        ("mandate", "anchor-hold-a"),
+        ("delegated", "anchor-hold-a"),
     )
 
     forged = "hold receipt has invalid typed fields"

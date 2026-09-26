@@ -18,7 +18,8 @@ Three rules carry the authority boundary:
 * **Role comes from provenance.** An actor's role is ``self`` when the actor is
   the subject, otherwise the authority its receipt recorded. It is never
   guessed from the shape of the actor string, and the raw actor identity is
-  never returned.
+  never returned. An ancestor's mandate latch (#3168) therefore reads as role
+  ``mandate``; its holder's DID is withheld like every other actor's.
 
 A failed read is reported as a typed ``unknown`` with its cause type, never as
 ``not_held``.
@@ -72,8 +73,9 @@ SELF_HOLD_REDACTION_POLICY: dict[str, str] = {
 
 SELF_ROLE = "self"
 
-# Continuation grammar: ``<host>:<agent>``, each position either ``new`` (that
-# scope has served nothing yet, so it starts at its newest receipt), ``end``
+# Continuation grammar: ``<host>:<agent>:<mandate>``, each position either
+# ``new`` (that scope has served nothing yet, so it starts at its newest
+# receipt), ``end``
 # (that scope is exhausted), or the decimal ``feed_seq`` of the last receipt
 # served from it. Bounded like the host receipt feed's cursor.
 _CURSOR_NEW = "new"
@@ -102,7 +104,7 @@ def actor_role(
 # A scope's position: ``None`` = from its newest receipt, ``_END`` = exhausted,
 # an int = strictly below that ``feed_seq``.
 _END = object()
-_SCOPES = (HoldScope.HOST, HoldScope.AGENT)
+_SCOPES = (HoldScope.HOST, HoldScope.AGENT, HoldScope.MANDATE)
 
 
 def _parse_position(token: str) -> Any:
@@ -195,14 +197,14 @@ async def _latch_view(
     }
 
 
-def _expected_target(scope: HoldScope, subject_did: str) -> str:
-    return subject_did if scope is HoldScope.AGENT else HOST_HOLD_TARGET
+def _expected_subject(scope: HoldScope, subject_did: str) -> str:
+    return HOST_HOLD_TARGET if scope is HoldScope.HOST else subject_did
 
 
 def _assert_subject_receipt(
     receipt: HoldReceipt, *, scope: HoldScope, subject_did: str
 ) -> None:
-    if receipt.scope is not scope or receipt.target_id != _expected_target(
+    if receipt.scope is not scope or receipt.subject_id != _expected_subject(
         scope, subject_did
     ):
         # The store filtered on exactly this key; a row outside it is not
@@ -230,10 +232,15 @@ async def _read_scope(
 ) -> _ScopeRead:
     if position is _END:
         return _ScopeRead(position=position, entries=(), has_more=False)
-    target_id = subject_did if scope is HoldScope.AGENT else None
+    key: dict[str, str | None]
+    if scope is HoldScope.MANDATE:
+        # Every ancestor's mandate latch on this subject, whoever holds it.
+        key = {"subject_id": subject_did}
+    else:
+        key = {"target_id": subject_did if scope is HoldScope.AGENT else None}
     page = await store.list_receipts(
         scope=scope,
-        target_id=target_id,
+        **key,
         after=position,
         limit=limit,
         newest_first=True,
@@ -295,7 +302,7 @@ def _unknown(failure: str, error: BaseException) -> dict[str, Any]:
         "state": "unknown",
         "held": None,
         "sources": [],
-        "latches": {"host": None, "agent": None},
+        "latches": {"host": None, "agent": None, "mandate": None},
         "history": None,
         "failure": failure,
         **_cause(error),
@@ -420,12 +427,16 @@ class SelfHoldSnapshot:
                 and receipt.disposition is HoldDisposition.APPLIED
             ) or receipt.receipt_id in ended:
                 continue
-            current = (
-                self.effective.host
-                if receipt.scope is HoldScope.HOST
-                else self.effective.agent
-            )
-            if current is not None and current.hold_receipt_id == receipt.receipt_id:
+            current_ids = {
+                latch.hold_receipt_id
+                for latch in (
+                    self.effective.host,
+                    self.effective.agent,
+                    *self.effective.mandates,
+                )
+                if latch is not None and latch.scope is receipt.scope
+            }
+            if receipt.receipt_id in current_ids:
                 status = "active"
             elif self.reads[receipt.scope].position is None:
                 # The latch was read AFTER this history, and no longer names
@@ -537,6 +548,10 @@ async def read_self_hold(
         agent_view = await _latch_view(
             store, effective.agent, subject_did=subject_did
         )
+        mandate_views = [
+            await _latch_view(store, latch, subject_did=subject_did)
+            for latch in effective.mandates
+        ]
     except HoldStateError as error:
         return _state_failure(error)
 
@@ -546,7 +561,11 @@ async def read_self_hold(
         "sources": [source.value for source in effective.sources],
         # Independent latches: a host hold never hides an agent hold, and
         # releasing one never reads as releasing the other.
-        "latches": {"host": host_view, "agent": agent_view},
+        "latches": {
+            "host": host_view,
+            "agent": agent_view,
+            "mandate": mandate_views,
+        },
         "redaction_policy": dict(SELF_HOLD_REDACTION_POLICY),
     }
     return SelfHoldSnapshot(

@@ -1457,6 +1457,144 @@ class SpawnFeature(Feature):
 
         return ToolResult.failed(error=f"Failed to terminate '{child_name}'")
 
+    def _descendant_hold_binding(self):
+        """The holder DID and Hold store the trusted runtime bound, or a refusal.
+
+        The holder is never a parameter: it is the DID this agent's own
+        turn-start latch is scoped to, so no caller can Hold as another agent.
+        """
+
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+        from kestrel_sovereign.hold.enforcement import bound_hold_store
+
+        try:
+            holder_did = resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable:
+            return None, None, ToolResult.failed(
+                error="This agent has no trusted identity to Hold under"
+            )
+        store = bound_hold_store(self.agent)
+        if store is None:
+            return None, None, ToolResult.failed(
+                error="Durable Hold state is unavailable"
+            )
+        return holder_did, store, None
+
+    async def _descendant_hold_call(self, operation, *, target_did, reason):
+        from uuid import uuid4
+
+        from kestrel_sovereign.hold import HoldStateError, MandateHoldRefusal
+
+        holder_did, store, refusal = self._descendant_hold_binding()
+        if refusal is not None:
+            return None, refusal
+        manager = await self._get_ready_agent_manager()
+        if manager is None:
+            return None, ToolResult.failed(error="No AgentManager available")
+        try:
+            mutation = await operation(
+                manager=manager,
+                store=store,
+                holder_did=holder_did,
+                target_did=target_did,
+                reason=reason,
+                operation_id=f"descendant-hold:{uuid4()}",
+            )
+        except MandateHoldRefusal as error:
+            return None, ToolResult.failed(
+                error=str(error), data={"refusal": error.code}
+            )
+        except ValueError as error:
+            return None, ToolResult.failed(error=str(error))
+        except HoldStateError as error:
+            return None, ToolResult.failed(
+                error="Durable Hold state could not be updated",
+                data={"cause_type": type(error).__name__},
+            )
+        return mutation, None
+
+    @tool(
+        name="hold_descendant",
+        description=(
+            "Hold one of this agent's own signed spawned descendants (a child "
+            "or any deeper descendant), identified by its DID: it will not "
+            "begin new turns until released. Authorized only by this agent's "
+            "verified signed spawn lineage; a parent, a peer, or any agent "
+            "outside that lineage is refused. The hold does not expire and "
+            "does not stop work already in flight."
+        ),
+        category=ToolCategory.AGENT_MANAGEMENT,
+    )
+    async def hold_descendant(self, target_did: str, reason: str) -> ToolResult:
+        """Latch a signed descendant under this agent's mandate (#3168)."""
+
+        from kestrel_sovereign.hold import (
+            hold_descendant,
+            hold_latch_payload,
+            hold_receipt_payload,
+        )
+
+        mutation, refusal = await self._descendant_hold_call(
+            hold_descendant, target_did=target_did, reason=reason
+        )
+        if refusal is not None:
+            return refusal
+        return ToolResult.ok(
+            f"Held descendant {target_did}.",
+            data={
+                "receipt": hold_receipt_payload(mutation.receipt),
+                "current": hold_latch_payload(mutation.current),
+            },
+        )
+
+    @tool(
+        name="release_descendant_hold",
+        description=(
+            "Release the hold THIS agent set on one of its signed descendants, "
+            "identified by its DID. It never releases a hold the sovereign or "
+            "another ancestor set, and it needs this agent's lineage to still "
+            "verify."
+        ),
+        category=ToolCategory.AGENT_MANAGEMENT,
+    )
+    async def release_descendant_hold(
+        self, target_did: str, reason: str
+    ) -> ToolResult:
+        """Release this agent's own mandate latch on a descendant (#3168)."""
+
+        from kestrel_sovereign.hold import (
+            HoldDisposition,
+            hold_latch_payload,
+            hold_receipt_payload,
+            release_descendant_hold,
+        )
+
+        mutation, refusal = await self._descendant_hold_call(
+            release_descendant_hold, target_did=target_did, reason=reason
+        )
+        if refusal is not None:
+            return refusal
+        if mutation is None:
+            return ToolResult.ok(
+                f"This agent holds no latch on {target_did}.",
+                data={"released": False, "held_by_this_agent": False},
+            )
+        data = {
+            "released": mutation.receipt.disposition is HoldDisposition.APPLIED,
+            "receipt": hold_receipt_payload(mutation.receipt),
+            "current": hold_latch_payload(mutation.current),
+        }
+        if not data["released"]:
+            return ToolResult.partial(
+                f"Did not release the hold on {target_did}.",
+                "the latch changed before this release committed; read it again.",
+                data=data,
+            )
+        return ToolResult.ok(f"Released this agent's hold on {target_did}.", data=data)
+
     async def _shutdown_standalone_after_delegated_tasks(
         self,
         manager,

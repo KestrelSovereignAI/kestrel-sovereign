@@ -609,7 +609,14 @@ function makeHoldControls(doc, item, ctx) {
         const agentHold = entry && entry.agent_hold;
         const sources = Array.isArray(entry && entry.sources) ? entry.sources : [];
         const held = !!(entry && entry.held === true);
-        const primary = agentHold || (sources.includes('host') ? state.hostHold : null);
+        // An ancestor's mandate latch (#3168) is its own latch, named with its
+        // holder. It shows when nothing the sovereign set is showing.
+        const mandateHolds = Array.isArray(entry && entry.mandate_holds)
+            ? entry.mandate_holds
+            : [];
+        const primary = agentHold
+            || (sources.includes('host') ? state.hostHold : null)
+            || (sources.includes('mandate') ? mandateHolds[0] || null : null);
 
         kebabBtn.disabled = !(state.entry && state.canHold);
         kebabBtn.title = kebabBtn.disabled
@@ -629,13 +636,17 @@ function makeHoldControls(doc, item, ctx) {
         badge.dataset.holdSources = sources.join(' ');
         if (unconfirmed) badge.dataset.holdStale = 'true';
         else delete badge.dataset.holdStale;
-        badgeLabel.textContent = sources.includes('agent') ? 'Held' : 'Held by host';
+        badgeLabel.textContent = sources.includes('agent')
+            ? 'Held'
+            : sources.includes('host') ? 'Held by host' : 'Held by ancestor';
         badgeReason.textContent = (primary && primary.reason) || '';
         badgeActor.textContent = (primary && primary.actor_id) || '';
         badgeTime.textContent = formatHoldTime(primary && primary.set_at);
         const scopeText = sources.includes('agent')
             ? 'Held'
-            : 'Held by the host-wide Hold';
+            : sources.includes('host')
+                ? 'Held by the host-wide Hold'
+                : `Held by ${mandateHolds.length} ancestor mandate hold(s)`;
         const detail = primary
             ? `${scopeText} by ${primary.actor_id} at ${primary.set_at} — ${primary.reason}`
             : scopeText;
@@ -1021,8 +1032,8 @@ export function mountAgentList(containerEl, config = {}) {
 
     // Write the latch a mutation committed into the state the cards render
     // from. `held`/`sources` are composed by the SAME rule the host applies
-    // (EffectiveHoldState): held if either independent latch is set, in
-    // host-then-agent order. The host latch is untouched by an agent mutation,
+    // (EffectiveHoldState): held if any independent latch is set, in
+    // host-agent-mandate order. The host latch is untouched by an agent mutation,
     // so the last reading of it remains the best evidence there is.
     function applyLatch(agentId, latch) {
         if (typeof agentId !== 'string' || !agentId) return;
@@ -1033,9 +1044,11 @@ export function mountAgentList(containerEl, config = {}) {
         // point take a higher sequence and are still free to confirm.
         holdSeq++;
         const previous = holdState.byAgent.get(agentId) || null;
+        const mandateHolds = (previous && previous.mandate_holds) || [];
         const sources = [];
         if (holdState.hostHold) sources.push('host');
         if (latch) sources.push('agent');
+        if (mandateHolds.length) sources.push('mandate');
         const byAgent = new Map(holdState.byAgent);
         byAgent.set(agentId, {
             ...(previous || {}),
@@ -1043,6 +1056,7 @@ export function mountAgentList(containerEl, config = {}) {
             held: sources.length > 0,
             sources,
             agent_hold: latch || null,
+            mandate_holds: mandateHolds,
         });
         // `composed`: a paint, not a reading. The badge may render it (that is
         // what it is for), but nothing may present it as the host's own answer
@@ -1070,15 +1084,18 @@ export function mountAgentList(containerEl, config = {}) {
         const byAgent = new Map();
         for (const [agentId, previous] of holdState.byAgent) {
             const agentHold = (previous && previous.agent_hold) || null;
+            const mandateHolds = (previous && previous.mandate_holds) || [];
             const sources = [];
             if (hostHold) sources.push('host');
             if (agentHold) sources.push('agent');
+            if (mandateHolds.length) sources.push('mandate');
             byAgent.set(agentId, {
                 ...(previous || {}),
                 agent_id: agentId,
                 held: sources.length > 0,
                 sources,
                 agent_hold: agentHold,
+                mandate_holds: mandateHolds,
             });
         }
         holdState = { ...holdState, loaded: true, composed: true, hostHold, byAgent };

@@ -727,6 +727,7 @@ ROUTED_MODULES = {
     "endpoints/restart_events.py",
     "features/audit_anchor/feature.py",
     "features/consent/feature.py",
+    "features/spawn/feature.py",  # the descendant-Hold holder's identity (#3168)
     "features/storage_access.py",  # the definition itself
     "hold/enforcement.py",  # the turn-start Hold latch's own scope
     "features/tasks/feature.py",

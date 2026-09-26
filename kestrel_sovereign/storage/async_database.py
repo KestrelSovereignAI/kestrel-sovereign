@@ -3227,6 +3227,17 @@ class AsyncDatabase:
             return False
         return _collapse_ws(expression) in _collapse_ws(row[0])
 
+    async def rebuild_sqlite_table(self, table: str, canonical_ddl: str) -> None:
+        """Rebuild ``table`` from ``canonical_ddl`` inside the caller's lock.
+
+        For a schema owner that changes a SQLite constraint no ``ALTER`` can
+        reach. The caller must already hold its ``migration_lock`` transaction.
+        """
+
+        if self.backend_type != "sqlite":
+            raise RuntimeError("rebuild_sqlite_table is SQLite-only")
+        await self._sqlite_rebuild_table(table, canonical_ddl)
+
     async def _sqlite_rebuild_table(self, table: str, canonical_ddl: str) -> None:
         """Rebuild a SQLite table into its canonical shape, preserving rows.
 

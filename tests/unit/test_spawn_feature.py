@@ -192,7 +192,7 @@ def _use_runtime_projection_as_authority_test_double(manager: AgentManager) -> N
 class TestSpawnFeatureTools:
     """Verify SpawnFeature exposes the correct tools."""
 
-    def test_has_five_tools(self):
+    def test_has_seven_tools(self):
         feature = _make_spawn_feature()
         tools = feature.get_tools()
         tool_names = {t.name for t in tools}
@@ -202,6 +202,8 @@ class TestSpawnFeatureTools:
             "delegate_task",
             "get_child_result",
             "terminate_child",
+            "hold_descendant",
+            "release_descendant_hold",
         }
 
     def test_tool_description(self):
