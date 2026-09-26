@@ -31,7 +31,12 @@ from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
-from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
+from kestrel_sovereign.features.scheduler.runner import (
+    ScheduledTask,
+    ScheduledTaskOwnerUnavailable,
+    SchedulerDispatchNotReady,
+    SchedulerRunner,
+)
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -224,8 +229,8 @@ class _StubJobFeature:
     an execution counter so a skipped tick is observable.
     """
 
-    def __init__(self):
-        self.name = "JobFeature"
+    def __init__(self, tool_name: str = "job", name: str = "JobFeature"):
+        self.name = name
         self.enabled = True
         self.calls = 0
 
@@ -234,7 +239,7 @@ class _StubJobFeature:
             return {"success": True, "ran": self.calls}
 
         tool = MagicMock()
-        tool.name = "job"
+        tool.name = tool_name
         tool.execute = AsyncMock(side_effect=_execute)
         self._tool = tool
 
@@ -2305,6 +2310,11 @@ class TestTaskExecutor:
     ):
         """The supported source contract is independent of auto-seeding."""
 
+        feature.agent.features = {
+            "StrategicMemoryFeature": _StubJobFeature(
+                "signal_dispatch", "StrategicMemoryFeature"
+            )
+        }
         feature.agent.dispatcher = MagicMock()
         feature.agent.dispatcher.dispatch_signal = AsyncMock(
             return_value=SignalResult(
@@ -2514,18 +2524,79 @@ class TestTaskExecutor:
             await feature._lookup_and_run_tool("job", {})
 
     @pytest.mark.asyncio
-    async def test_builtin_cron_task_skipped_when_feature_not_loaded(
+    async def test_builtin_cron_task_with_absent_owner_fails_honestly(
         self, feature,
     ):
-        """A persisted built-in cron task (e.g. restart_coordinator) can
-        fire on the first scheduler tick after a restart before its owning
-        feature has registered the tool — a transient startup-order race
-        (#1796). It must skip benignly, NOT raise 'Unknown task' (which
-        would record a spurious one-time failure)."""
+        """#2474: ticks run only after the post_all_features_loaded barrier,
+        so a built-in whose owning feature is still unresolvable is missing,
+        not late. It must fail with actionable evidence — never return the
+        old "skipped: ... transient startup-order race" string, which the
+        runner recorded as success while advancing the cron."""
         feature.agent.features = {}
-        result = await feature._lookup_and_run_tool("restart_coordinator", {})
-        assert result.startswith("skipped:")
-        assert "restart_coordinator" in result
+        with pytest.raises(ScheduledTaskOwnerUnavailable) as raised:
+            await feature._lookup_and_run_tool("restart_coordinator", {})
+        message = str(raised.value)
+        assert "restart_coordinator" in message
+        assert "not executed" in message
+        assert "Install or enable the feature" in message
+        assert "remove the schedule" in message
+
+    @pytest.mark.asyncio
+    async def test_absent_owner_is_refused_before_signal_dispatch(self, feature):
+        """The owner check runs before the dispatcher, so the runner receives
+        the typed failure instead of the source handler's content-free text."""
+        feature.agent.features = {}
+        feature.agent._post_all_features_loaded_complete = True
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with pytest.raises(ScheduledTaskOwnerUnavailable):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_owner_is_left_to_the_disabled_skip(self, feature):
+        """A disabled owner is not an absent one: dispatch proceeds and the
+        lookup's existing benign disabled-feature skip applies (#2522)."""
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        owner.enabled = False
+        feature.agent.features = {"RestartCoordinatorFeature": owner}
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock(
+            return_value=SignalResult(
+                signal_id="sig-disabled",
+                status=Status.OK,
+                mode=SignalMode.ACTION,
+                duration_ms=1,
+                action_result="skipped: disabled",
+            )
+        )
+
+        await feature._dispatch_scheduled_task("restart_coordinator", {})
+
+        feature.agent.dispatcher.dispatch_signal.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_before_feature_load_barrier_is_deferred(
+        self, feature,
+    ):
+        """#2474: no scheduled task may execute before the agent's
+        post_all_features_loaded barrier — not even a built-in whose owner is
+        present, and not through the direct no-dispatcher branch."""
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        feature.agent.features = {"RestartCoordinatorFeature": owner}
+        feature.agent._post_all_features_loaded_complete = False
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.dispatch_signal = AsyncMock()
+
+        with pytest.raises(SchedulerDispatchNotReady):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        feature.agent.dispatcher.dispatch_signal.assert_not_awaited()
+
+        feature.agent.dispatcher = None
+        with pytest.raises(SchedulerDispatchNotReady):
+            await feature._dispatch_scheduled_task("restart_coordinator", {})
+        assert owner.calls == 0
 
     @pytest.mark.asyncio
     async def test_disabled_feature_tool_is_not_executed(self, feature):

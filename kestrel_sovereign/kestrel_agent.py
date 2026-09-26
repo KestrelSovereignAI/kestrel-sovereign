@@ -1437,6 +1437,11 @@ class KestrelAgent(
         # on any phase failure. Readiness may only fire in READY.
         self._boot_state: BootPhaseState = BootPhaseState.NOT_STARTED
         self._boot_context: Optional[BootContext] = None
+        # The ``post_all_features_loaded`` lifecycle barrier: True only once
+        # every discovered feature finished cross-feature wiring. Work that
+        # resolves other features' tools (the scheduler, #2474) must not run
+        # before it, or an owner that loads later looks permanently absent.
+        self._post_all_features_loaded_complete = False
         # AgentManager installs this private hosted-boot boundary before
         # initialize().  It runs immediately after storage is available and
         # before providers, signals, or features can acquire active authority.
@@ -3429,6 +3434,7 @@ class KestrelAgent(
                         "could not finish cross-feature wiring",
                     ) from exc
                 raise
+        self._post_all_features_loaded_complete = True
         logging.info("post_all_features_loaded called for all features")
 
         # Feature references resolved lazily via properties
@@ -4101,6 +4107,7 @@ class KestrelAgent(
         registered on a dead agent (kestrel-sovereign#2522). Each feature is
         guarded so one stubborn teardown can't strand the rest.
         """
+        self._post_all_features_loaded_complete = False
         for name, feature in reversed(list(self.features.items())):
             try:
                 await self._unregister_feature_runtime(feature)

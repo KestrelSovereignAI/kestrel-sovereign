@@ -1535,3 +1535,62 @@ async def test_a_rejected_feature_is_absent_from_the_mandatory_readiness_check(t
         )
     finally:
         await _cleanup(agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_post_load", [False, True])
+async def test_post_all_features_loaded_barrier_flag(tmp_path, fail_after_post_load):
+    """#2474: the scheduler defers every tick until this barrier completes.
+
+    The flag is False while any feature is still in post-load wiring, True by
+    the time ready hooks run, and a later boot failure's rollback clears it so
+    a torn-down agent never reports its features as loaded.
+    """
+    from types import SimpleNamespace as _NS
+
+    from kestrel_sovereign.features.base import Feature as _SovereignFeature
+
+    observed: dict = {}
+
+    class _BarrierProbeFeature(_SovereignFeature):
+        tool_name = "barrier_probe_feature"
+        tool_description = "records the feature-load barrier as seen by hooks"
+
+        async def initialize(self):
+            return None
+
+        async def post_all_features_loaded(self, agent):
+            observed["post_load"] = agent._post_all_features_loaded_complete
+
+        async def on_agent_ready(self, agent):
+            observed["ready"] = agent._post_all_features_loaded_complete
+
+        def get_agent_card(self):
+            return _NS(name=self.name, skills=[])
+
+    agent = _make_agent(tmp_path)
+    assert agent._post_all_features_loaded_complete is False
+    boom = AsyncMock(side_effect=RuntimeError("injected@memory"))
+    try:
+        with _boot_mocks(), patch(
+            "kestrel_sovereign.kestrel_agent.discover_features",
+            side_effect=lambda a, **_kw: [_BarrierProbeFeature(a)],
+        ):
+            if fail_after_post_load:
+                with patch.object(
+                    agent, "_boot_phase_memory_bootstrap_context", boom
+                ):
+                    with pytest.raises(RuntimeError, match="injected@memory"):
+                        await agent.initialize()
+            else:
+                await agent.initialize()
+
+        assert observed["post_load"] is False
+        if fail_after_post_load:
+            assert agent._boot_state is BootPhaseState.FAILED
+            assert agent._post_all_features_loaded_complete is False
+        else:
+            assert observed["ready"] is True
+            assert agent._post_all_features_loaded_complete is True
+    finally:
+        await _cleanup(agent)
