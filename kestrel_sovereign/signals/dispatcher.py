@@ -2900,11 +2900,14 @@ class SignalDispatcher:
         which already scanned and exited cannot see, so every release wakes
         its started consumer here rather than relying on each caller to.
 
-        A release that raised may still have committed its RETRY update, in
-        which case the retry's compare-and-set finds no row under the token.
-        That miss is then indistinguishable from our own earlier release, so
-        the started consumer is woken conservatively; an idle drainer that
-        finds nothing to claim simply exits (#3372).
+        A release that raised may still have committed its RETRY update, so
+        the started consumer is woken at the fault itself: a concurrent
+        release may already have missed the compare-and-set on that same
+        row and dropped the capability, leaving no later retry to wake it.
+        A retry that does run finds no row under the token; that miss is
+        indistinguishable from our own earlier release, so it wakes the
+        consumer again. An idle drainer that finds nothing to claim simply
+        exits (#3372).
         """
         released = 0
         for delivery_id, (consumer_id, token) in tuple(
@@ -2920,12 +2923,15 @@ class SignalDispatcher:
                     reason=EXPIRED_INITIAL_HANDOFF_ERROR,
                 )
             except Exception:
-                self._faulted_initial_handoff_releases.add(delivery_id)
+                if delivery_id in self._expired_initial_handoffs:
+                    self._faulted_initial_handoff_releases.add(delivery_id)
                 logger.exception(
                     "Could not release expired initial durable handoff %s; "
                     "retrying on the next claim or owner heartbeat",
                     delivery_id,
                 )
+                if consumer_id in self._started_durable_cognition_consumers:
+                    self._start_durable_cognition_drain(consumer_id)
                 continue
             if abandoned:
                 released += 1

@@ -9582,9 +9582,10 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
     tmp_path, monkeypatch
 ):
     """#3372: the expired first lease's release committed its RETRY update
-    and then raised. The retry's compare-and-set finds no row under the
-    token and returns ``False``; the started drainer must still be woken
-    rather than leaving the retry parked until unrelated work arrives."""
+    and then raised. The started drainer must be woken rather than leaving
+    the retry parked until unrelated work arrives, and the later retry
+    whose compare-and-set finds no row under the token retires the
+    capability."""
     from kestrel_sovereign.privacy import get_privacy_preset
 
     backend, agent, dispatcher = await _channel_dispatcher(
@@ -9637,15 +9638,103 @@ async def test_committed_then_raised_release_still_wakes_the_idle_drainer(
         _expire_handoff(dispatcher, reserved.delivery_id)
 
         await dispatcher._heartbeat_runtime_owner()
-        (committed,) = await dispatcher.list_durable_deliveries()
-        assert committed.status == RETRY
+        assert outcomes == [True]
         assert reserved.delivery_id in dispatcher._expired_initial_handoffs
-        assert consumer.consumer_id not in dispatcher._durable_cognition_drainers
-        agent.process_input.assert_not_awaited()
+        assert reserved.delivery_id in dispatcher._faulted_initial_handoff_releases
+
+        for _ in range(200):
+            (delivery,) = await dispatcher.list_durable_deliveries()
+            if delivery.status == ACKNOWLEDGED:
+                break
+            await asyncio.sleep(0.01)
+        assert delivery.status == ACKNOWLEDGED
+        agent.process_input.assert_awaited_once()
 
         await dispatcher._heartbeat_runtime_owner()
         assert outcomes == [True, False]
         assert dispatcher._expired_initial_handoffs == {}
+        assert dispatcher._faulted_initial_handoff_releases == set()
+    finally:
+        monkeypatch.setattr(store, "abandon_initial_reservation", real_abandon)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_release_miss_before_commit_then_raise_still_wakes_drainer(
+    tmp_path, monkeypatch
+):
+    """#3372: two releases race on one expired first lease. The first commits
+    the RETRY update; the second's compare-and-set then misses and drops the
+    capability; only afterwards does the first raise. No later retry exists,
+    so the faulting release itself must wake the started drainer."""
+    from kestrel_sovereign.privacy import get_privacy_preset
+
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / "concurrent-release.db",
+        "did:agent:concurrent-release",
+    )
+    agent.privacy_config = get_privacy_preset("ephemeral")
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=agent.did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}="
+            f"{DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=0,
+    )
+    store = dispatcher._durable_store
+    real_abandon = store.abandon_initial_reservation
+    committed = asyncio.Event()
+    second_finished = asyncio.Event()
+    outcomes = []
+
+    async def commit_yield_then_raise_first(**kwargs):
+        abandoned = await real_abandon(**kwargs)
+        outcomes.append(abandoned)
+        if len(outcomes) == 1:
+            committed.set()
+            await second_finished.wait()
+            raise RuntimeError("connection lost after commit")
+        second_finished.set()
+        return abandoned
+
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        live = _channel_signal(agent.did, "concurrent-release")
+        agent.rehydrate_durable_cognition_signal = (
+            lambda event, *, dispatch_signal: live
+        )
+        result = await dispatcher.dispatch_signal(
+            live, source_event_id="telegram:update:concurrent-release"
+        )
+        assert result.status is Status.OK
+        (reserved,) = await dispatcher.list_durable_deliveries()
+        assert reserved.status == LEASED
+
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        drainer = dispatcher._durable_cognition_drainers.get(consumer.consumer_id)
+        if drainer is not None:
+            await asyncio.wait_for(drainer, timeout=1.0)
+        assert consumer.consumer_id not in dispatcher._durable_cognition_drainers
+
+        agent.process_input = AsyncMock(return_value="resumed")
+        monkeypatch.setattr(
+            store, "abandon_initial_reservation", commit_yield_then_raise_first
+        )
+        _expire_handoff(dispatcher, reserved.delivery_id)
+        dispatcher._discard_expired_transient_durable_handoffs()
+        assert reserved.delivery_id in dispatcher._expired_initial_handoffs
+
+        first = asyncio.create_task(dispatcher._release_expired_initial_handoffs())
+        await asyncio.wait_for(committed.wait(), timeout=1.0)
+        assert await dispatcher._release_expired_initial_handoffs() == 0
+        assert await asyncio.wait_for(first, timeout=1.0) == 0
+        assert outcomes == [True, False]
+        assert dispatcher._expired_initial_handoffs == {}
+        assert dispatcher._faulted_initial_handoff_releases == set()
 
         for _ in range(200):
             (delivery,) = await dispatcher.list_durable_deliveries()
