@@ -32,6 +32,10 @@ from tests.shared.postgres_requirement import (
     check_session as _check_postgres_requirement,
     fail_skipped_postgres_case as _fail_skipped_postgres_case,
 )
+from tests.shared.postgres_worker_isolation import (
+    isolate_xdist_worker as _isolate_xdist_worker,
+    release_worker_schema as _release_worker_schema,
+)
 from tests.utils.postgres_schema import postgres_test_url
 
 # Import feedback bridge for test-to-reflection integration
@@ -41,6 +45,7 @@ from tests.utils.feedback_bridge import (
 )
 
 FORCED_EXIT_GRACE_SECONDS = 10.0
+_WORKER_SCHEMA_KEY = pytest.StashKey()
 
 
 @pytest.fixture
@@ -134,6 +139,13 @@ def pytest_configure(config):
     _feedback_configure(config)
     # After .env: a local .env may supply TEST_POSTGRES_URL.
     _check_postgres_requirement()
+    # After the check: it must see the URL the job supplied (#3383).
+    config.stash[_WORKER_SCHEMA_KEY] = _isolate_xdist_worker()
+
+
+def pytest_unconfigure(config):
+    """Drop the PostgreSQL schema this xdist worker owned, if any."""
+    _release_worker_schema(config.stash.get(_WORKER_SCHEMA_KEY, None))
 
 
 @pytest.hookimpl(hookwrapper=True)
