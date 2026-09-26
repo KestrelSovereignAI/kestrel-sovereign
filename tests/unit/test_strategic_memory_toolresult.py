@@ -558,3 +558,77 @@ async def test_signal_dispatch_still_says_nothing_to_do_when_github_answered():
 
     assert result.status is ToolResultStatus.OK
     assert "No actionable issue found" in result.confirmation
+
+
+_IN_FLIGHT = {
+    "repo": "o/r",
+    "issue_number": 3310,
+    "reason": "open_pr",
+    "pull_requests": [{"repo": "o/r", "number": 3311, "draft": False, "days_idle": 0}],
+    "stalled_after_days": 3,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["execute", "suggest"])
+async def test_signal_dispatch_says_why_an_in_flight_issue_was_not_selected(mode):
+    """#3317 acceptance: a board whose only issue has an open linked PR selects
+    nothing, and the output names the skip -- "skipped o/r#3310 -- PR #3311
+    open" -- rather than leaving an orchestrator to infer it from silence."""
+    agent = _dispatch_agent(registration=SimpleNamespace(owner="feature:x"))
+    feat = _make_feature({}, agent=agent)
+
+    async def only_in_flight(view, diagnostics=None):
+        diagnostics.update(
+            blockers_checked=1, blockers_unreadable=0,
+            open_pr_exclusions=[dict(_IN_FLIGHT)],
+        )
+        return None
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=only_in_flight,
+    ):
+        result = await feat.signal_dispatch(mode=mode)
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["dispatched"] is False
+    assert result.data["skipped"] == [_IN_FLIGHT]
+    assert "No actionable issue found." in result.confirmation
+    assert "skipped o/r#3310 -- PR #3311 open" in result.confirmation
+    agent.execute_named_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_reports_skips_alongside_the_issue_it_dispatched():
+    registration = SimpleNamespace(owner="feature:fixture-dispatch")
+    agent = _dispatch_agent(registration=registration)
+    feat = _make_feature({}, agent=agent)
+
+    async def skip_then_pick(view, diagnostics=None):
+        diagnostics.update(open_pr_exclusions=[dict(_IN_FLIGHT)])
+        return dict(_TOP_ISSUE)
+
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=skip_then_pick,
+    ):
+        result = await feat.signal_dispatch()
+
+    assert result.data["dispatched"] is True
+    assert result.data["skipped"] == [_IN_FLIGHT]
+    assert "skipped o/r#3310 -- PR #3311 open" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_without_skips_reports_an_empty_list():
+    agent = _dispatch_agent(registration=None)
+    feat = _make_feature({}, agent=agent)
+    with patch(
+        "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
+        new=AsyncMock(return_value=_TOP_ISSUE),
+    ):
+        result = await feat.signal_dispatch(mode="suggest")
+
+    assert result.data["skipped"] == []
+    assert "Skipped" not in result.confirmation

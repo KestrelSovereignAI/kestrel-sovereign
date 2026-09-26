@@ -22,7 +22,7 @@ async def test_pick_top_issue_requires_scan_repositories(monkeypatch):
     assert await issue_selection.pick_top_issue({"morning_signal_config": {}}) is None
 
 
-def test_select_best_candidate_skips_blocked_and_prefers_unassigned_low_comment():
+def test_ranked_candidates_skip_blocked_and_prefer_unassigned_low_comment():
     issues = [
         {
             "number": 1,
@@ -35,7 +35,7 @@ def test_select_best_candidate_skips_blocked_and_prefers_unassigned_low_comment(
         {"number": 4, "labels": [], "assignees": [], "comments": 1},
     ]
 
-    assert issue_selection._select_best_candidate(issues)["number"] == 4
+    assert issue_selection._ranked_candidates(issues)[0]["number"] == 4
 
 
 @pytest.mark.asyncio
@@ -55,6 +55,9 @@ async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypat
             "assignees": [],
             "comments": 0,
         }]),
+    )
+    monkeypatch.setattr(
+        issue_selection, "_fetch_open_linked_pull_requests", AsyncMock(return_value=[])
     )
 
     picked = await issue_selection.pick_top_issue({
@@ -137,9 +140,32 @@ def _closed(number, title="t"):
     return {"number": number, "title": title, "state": "closed", "labels": []}
 
 
-def _stub_github(monkeypatch, responses, calls=None):
-    """Answer github_api_get from ``responses``; anything else is a 404."""
+def _stub_github(monkeypatch, responses, calls=None, linked_prs=None):
+    """Answer github_api_get from ``responses``; anything else is a 404.
+
+    The PR-linkage GraphQL read answers from ``linked_prs`` keyed by
+    ``(repo, number)``: a list of PR nodes, ``None`` for an unreadable read,
+    or an exception to raise. Absent means no PR links the issue.
+    """
     monkeypatch.setattr(issue_selection, "get_github_token", lambda: "token")
+    linked_prs = linked_prs or {}
+
+    async def fake_post(path, token, body):
+        assert path == "/graphql", path
+        variables = body["variables"]
+        key = (f"{variables['owner']}/{variables['name']}", variables["number"])
+        if calls is not None:
+            calls.append(("graphql",) + key)
+        value = linked_prs.get(key, [])
+        if isinstance(value, Exception):
+            raise value
+        if value is None:
+            return None
+        return {"data": {"repository": {"issue": {
+            "closedByPullRequestsReferences": {"nodes": value},
+        }}}}
+
+    monkeypatch.setattr(issue_selection, "github_api_post", fake_post)
 
     async def fake(path, token):
         if calls is not None:
@@ -359,6 +385,7 @@ async def test_diagnostics_say_when_nothing_could_be_confirmed(monkeypatch):
         "blockers_checked": 2,
         "blockers_unreadable": 2,
         "blockers_talon_owned": 0,
+        "open_pr_exclusions": [],
     }
 
 
@@ -375,7 +402,12 @@ async def test_a_closed_blocker_is_checked_but_not_unreadable(monkeypatch):
     diagnostics: dict = {}
 
     assert await issue_selection.pick_top_issue(data, diagnostics) is None
-    assert diagnostics == {"blockers_checked": 1, "blockers_unreadable": 0, "blockers_talon_owned": 0}
+    assert diagnostics == {
+        "blockers_checked": 1,
+        "blockers_unreadable": 0,
+        "blockers_talon_owned": 0,
+        "open_pr_exclusions": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -449,7 +481,10 @@ async def test_every_talon_state_label_withholds_dispatch(monkeypatch, label):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("label", ["agent-ready", "agent-complete", "tech-debt"])
 async def test_an_instruction_or_a_finished_run_does_not_withhold(monkeypatch, label):
-    """``agent-ready`` tells Talon to skip clarification; it must still dispatch."""
+    """``agent-ready`` tells Talon to skip clarification; it must still dispatch.
+
+    ``agent-complete`` with no open PR (one closed unmerged, say) is not in
+    flight. An open PR withholds the issue by itself -- see the #3317 tests."""
     _stub_github(monkeypatch, {"/repos/o/r/issues/1": _labelled(1, label)})
     data = {
         "morning_signal_config": {"scan_repos": ["o/r"]},
@@ -467,7 +502,7 @@ def test_backlog_scan_skips_talon_owned_issues_too():
         _labelled(2, "agent-claimed"),
         _open(3),
     ]
-    assert issue_selection._select_best_candidate(issues)["number"] == 3
+    assert [i["number"] for i in issue_selection._ranked_candidates(issues)] == [3]
 
 
 def test_talon_state_labels_match_talons_vocabulary():
@@ -481,3 +516,314 @@ def test_talon_state_labels_match_talons_vocabulary():
         "agent-failed",      # label_failed
     })
 
+
+
+# ---------------------------------------------------------------------------
+# #3317: an issue an open pull request already works is in flight, not idle
+# ---------------------------------------------------------------------------
+
+
+def _pr(number, *, updated_at="2026-09-22T12:00:00Z", repo=None, draft=False):
+    node = {
+        "number": number,
+        "state": "OPEN",
+        "isDraft": draft,
+        "updatedAt": updated_at,
+        "url": f"https://github.com/o/r/pull/{number}",
+    }
+    if repo is not None:
+        node["repository"] = {"nameWithOwner": repo}
+    return node
+
+
+def _fresh_now():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_the_live_shape_a_blocker_with_an_open_pr_is_not_re_picked(monkeypatch):
+    """09-22: #3310 was selected while PR #3311 -- ``Fixes #3310``, CI green,
+    awaiting review -- was open. The issue stays open by design until the PR
+    merges, so open-state and labels could not tell it from idle work."""
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/issues/3310": _labelled(3310, "bug", "agent-ready", "agent-complete"),
+            "/repos/o/r/issues/3312": _open(3312, "idle"),
+        },
+        linked_prs={("o/r", 3310): [_pr(3311, updated_at=_fresh_now())]},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [
+            {"severity": "critical", "issue": "o/r#3310", "title": "in flight"},
+            {"severity": "high", "issue": "o/r#3312", "title": "free"},
+        ],
+    }
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert picked is not None and picked["issue_number"] == 3312
+    [exclusion] = diagnostics["open_pr_exclusions"]
+    assert (exclusion["repo"], exclusion["issue_number"]) == ("o/r", 3310)
+    assert exclusion["reason"] == issue_selection.EXCLUDED_OPEN_PR
+    assert [pr["number"] for pr in exclusion["pull_requests"]] == [3311]
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/r#3310 -- PR #3311 open"
+    )
+    # A real GitHub answer, not an outage.
+    assert diagnostics["blockers_unreadable"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_backlog_scan_skips_an_issue_with_an_open_pr(monkeypatch):
+    """The fallback path ranks by assignees and comments; the best-ranked issue
+    is exactly the one a fresh PR is most likely to be working."""
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/issues?state=open&per_page=5&sort=updated": [
+                {**_open(1), "comments": 0, "assignees": []},
+                {**_open(2), "comments": 3, "assignees": []},
+            ],
+        },
+        linked_prs={("o/r", 1): [_pr(9, updated_at=_fresh_now())]},
+    )
+    diagnostics = {}
+
+    picked = await issue_selection.pick_top_issue(
+        {"morning_signal_config": {"scan_repos": ["o/r"]}}, diagnostics
+    )
+
+    assert picked is not None and picked["issue_number"] == 2
+    assert [e["issue_number"] for e in diagnostics["open_pr_exclusions"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_the_milestone_scan_skips_an_issue_with_an_open_pr(monkeypatch):
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/milestones?state=open&per_page=20": [
+                {"number": 4, "title": "Extraction"},
+            ],
+            "/repos/o/r/issues?milestone=4&state=open&per_page=10&sort=updated": [
+                _open(11), _open(12),
+            ],
+        },
+        linked_prs={("o/r", 11): [_pr(13, updated_at=_fresh_now())]},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "milestones": [
+            {"name": "Extraction", "status": "at_risk", "repos": ["o/r"]},
+        ],
+    }
+
+    picked = await issue_selection.pick_top_issue(data)
+
+    assert picked is not None and picked["issue_number"] == 12
+
+
+@pytest.mark.asyncio
+async def test_a_board_whose_only_candidate_has_an_open_pr_selects_nothing(monkeypatch):
+    """The acceptance criterion: not selected, and the reason is recorded."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/3310": _open(3310)},
+        linked_prs={("o/r", 3310): [_pr(3311, updated_at=_fresh_now())]},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#3310", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    # Read once, reported once -- the backlog pass does not see it again
+    # because the list endpoint is empty here, and the cache covers repeats.
+    assert len(diagnostics["open_pr_exclusions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_linkage_is_read_once_per_issue_across_passes(monkeypatch):
+    calls = []
+    _stub_github(
+        monkeypatch,
+        {
+            "/repos/o/r/issues/5": _open(5),
+            "/repos/o/r/issues?state=open&per_page=5&sort=updated": [_open(5)],
+        },
+        calls,
+        linked_prs={("o/r", 5): [_pr(6, updated_at=_fresh_now())]},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#5", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert calls.count(("graphql", "o/r", 5)) == 1, calls
+    assert len(diagnostics["open_pr_exclusions"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("502")])
+async def test_unreadable_pr_linkage_withholds_and_counts_as_unreadable(
+    monkeypatch, failure
+):
+    """Dispatch writes code into a worktree derived from the issue. "Could not
+    tell whether a run already owns it" is not "free", and a linkage outage
+    must still render as an outage rather than as nothing to do."""
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/7": _open(7)},
+        linked_prs={("o/r", 7): failure},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"]},
+        "blockers": [{"severity": "high", "issue": "o/r#7", "title": "x"}],
+    }
+    diagnostics = {}
+
+    assert await issue_selection.pick_top_issue(data, diagnostics) is None
+    assert diagnostics["blockers_checked"] == 1
+    assert diagnostics["blockers_unreadable"] == 1
+    [exclusion] = diagnostics["open_pr_exclusions"]
+    assert exclusion["reason"] == issue_selection.EXCLUDED_PR_LINKAGE_UNREADABLE
+    assert "could not say" in issue_selection.describe_exclusion(exclusion)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"errors": [{"message": "Could not resolve to a Repository"}]},
+        # A partial answer: GraphQL returns what it could alongside errors,
+        # and an empty ``nodes`` next to an error is not "no PRs".
+        {
+            "data": {"repository": {"issue": {
+                "closedByPullRequestsReferences": {"nodes": []},
+            }}},
+            "errors": [{"message": "Resource not accessible by integration"}],
+        },
+        {"data": {"repository": None}},
+        {"data": {"repository": {"issue": None}}},
+        [],
+    ],
+)
+async def test_a_graphql_answer_without_linkage_is_unreadable_not_empty(
+    monkeypatch, response
+):
+    """GraphQL reports failure inside a 200. Reading a missing ``nodes`` as
+    "no PRs" would be the permissive reading for the action that writes code."""
+    monkeypatch.setattr(
+        issue_selection, "github_api_post", AsyncMock(return_value=response)
+    )
+
+    assert await issue_selection._fetch_open_linked_pull_requests("o/r", 1, "t") is None
+
+
+@pytest.mark.asyncio
+async def test_only_open_linked_prs_withhold(monkeypatch):
+    nodes = [{**_pr(1), "state": "MERGED"}, {**_pr(2), "state": "CLOSED"}]
+    monkeypatch.setattr(
+        issue_selection,
+        "github_api_post",
+        AsyncMock(return_value={"data": {"repository": {"issue": {
+            "closedByPullRequestsReferences": {"nodes": nodes},
+        }}}}),
+    )
+
+    assert await issue_selection._fetch_open_linked_pull_requests("o/r", 1, "t") == []
+
+
+@pytest.mark.asyncio
+async def test_the_linkage_query_names_the_issue_it_is_asked_about(monkeypatch):
+    post = AsyncMock(return_value={"data": {"repository": {"issue": {
+        "closedByPullRequestsReferences": {"nodes": []},
+    }}}})
+    monkeypatch.setattr(issue_selection, "github_api_post", post)
+
+    assert await issue_selection._fetch_open_linked_pull_requests(
+        "Kestrel.AI/kestrel-x", 3310, "t"
+    ) == []
+    path, token, body = post.await_args.args
+    assert (path, token) == ("/graphql", "t")
+    assert body["variables"] == {"owner": "Kestrel.AI", "name": "kestrel-x", "number": 3310}
+    assert "closedByPullRequestsReferences" in body["query"]
+
+
+def test_a_pr_untouched_past_the_threshold_is_named_stalled():
+    """Still not a fresh claim -- a second run derives the colliding worktree
+    -- but the output says rescue, not silence."""
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 25, tzinfo=timezone.utc)
+    exclusion = issue_selection._open_pr_exclusion(
+        "o/r", 3310, [_pr(3311, updated_at="2026-09-20T00:00:00Z")], 3, now=now
+    )
+
+    assert exclusion["reason"] == issue_selection.EXCLUDED_STALLED_PR
+    assert exclusion["pull_requests"][0]["days_idle"] == 5
+    text = issue_selection.describe_exclusion(exclusion)
+    assert text.startswith("skipped o/r#3310 -- PR #3311 open but untouched for 5 day(s)")
+    assert "rescue" in text
+
+
+def test_one_moving_pr_or_an_unknown_timestamp_is_not_stalled():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 25, tzinfo=timezone.utc)
+    moving = issue_selection._open_pr_exclusion(
+        "o/r", 1,
+        [_pr(2, updated_at="2026-09-01T00:00:00Z"), _pr(3, updated_at="2026-09-24T00:00:00Z")],
+        3, now=now,
+    )
+    unknown = issue_selection._open_pr_exclusion(
+        "o/r", 1, [_pr(2, updated_at=None)], 3, now=now
+    )
+    fresh = issue_selection._open_pr_exclusion(
+        "o/r", 1, [_pr(2, updated_at="2026-09-23T00:00:00Z")], 3, now=now
+    )
+
+    assert moving["reason"] == unknown["reason"] == fresh["reason"] == (
+        issue_selection.EXCLUDED_OPEN_PR
+    )
+
+
+def test_no_linked_pr_is_no_exclusion():
+    assert issue_selection._open_pr_exclusion("o/r", 1, [], 3) is None
+
+
+def test_a_cross_repository_or_draft_pr_is_named_in_full():
+    exclusion = issue_selection._open_pr_exclusion(
+        "o/core", 1, [_pr(8, repo="o/feature", draft=True, updated_at=_fresh_now())], 3
+    )
+
+    assert issue_selection.describe_exclusion(exclusion) == (
+        "skipped o/core#1 -- PR o/feature#8 (draft) open"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured, expected", [(7, 7), (0, 3), ("5", 3), (True, 3)])
+async def test_the_stalled_threshold_is_configurable(monkeypatch, configured, expected):
+    _stub_github(
+        monkeypatch,
+        {"/repos/o/r/issues/1": _open(1)},
+        linked_prs={("o/r", 1): [_pr(2)]},
+    )
+    data = {
+        "morning_signal_config": {"scan_repos": ["o/r"], "stalled_pr_days": configured},
+        "blockers": [{"severity": "high", "issue": "o/r#1", "title": "x"}],
+    }
+    diagnostics = {}
+
+    await issue_selection.pick_top_issue(data, diagnostics)
+
+    assert diagnostics["open_pr_exclusions"][0]["stalled_after_days"] == expected
