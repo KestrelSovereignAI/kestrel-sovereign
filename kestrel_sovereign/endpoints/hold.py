@@ -61,7 +61,11 @@ router = APIRouter(prefix="/api/host", tags=["host"])
 MAX_HOLD_REASON_LENGTH = 1024
 MAX_HOLD_OPERATION_ID_LENGTH = 256
 MAX_HOLD_RECEIPT_ID_LENGTH = 256
-MAX_HOLD_TARGET_ID_LENGTH = 512
+# No length cap on target_id/holder_id (#3307): the read door lists every DID
+# the host inventory holds, and nothing below this door limits a DID's length.
+# An agent target is bound to the live inventory in _resolve_target, and a
+# mandate latch key is validated by the store; a transport-only cap here would
+# refuse an identity the same door advertises.
 
 
 def _non_blank(value: str | None, field: str) -> str | None:
@@ -78,16 +82,12 @@ class HoldBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scope: HoldScope
-    target_id: Annotated[
-        str | None, Field(min_length=1, max_length=MAX_HOLD_TARGET_ID_LENGTH)
-    ] = None
+    target_id: Annotated[str | None, Field(min_length=1)] = None
     reason: Annotated[str, Field(min_length=1, max_length=MAX_HOLD_REASON_LENGTH)]
     operation_id: Annotated[
         str, Field(min_length=1, max_length=MAX_HOLD_OPERATION_ID_LENGTH)
     ]
-    holder_id: Annotated[
-        str | None, Field(min_length=1, max_length=MAX_HOLD_TARGET_ID_LENGTH)
-    ] = None
+    holder_id: Annotated[str | None, Field(min_length=1)] = None
 
     @field_validator("target_id", "reason", "operation_id", "holder_id")
     @classmethod
@@ -437,9 +437,7 @@ async def host_hold_receipts(
                 code="receipt_filter_invalid",
                 message="scope must be 'host', 'agent' or 'mandate'.",
             ) from error
-    agent_filter = bounded_filter_text(
-        agent_id, "agent_id", max_length=MAX_HOLD_TARGET_ID_LENGTH
-    )
+    agent_filter = bounded_filter_text(agent_id, "agent_id", max_length=None)
     after = decode_cursor(cursor)
     page_size = resolve_page_size(limit)
     if agent_filter is not None:

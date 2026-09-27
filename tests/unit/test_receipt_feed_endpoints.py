@@ -272,7 +272,7 @@ class TestOnlyTheSovereignReadsReceipts:
             (hold_router, "/api/host/hold/receipts", {"scope": "turn"}),
             (hold_router, "/api/host/hold/receipts", {"cursor": ""}),
             (hold_router, "/api/host/hold/receipts", {"agent_id": ""}),
-            (hold_router, "/api/host/hold/receipts", {"agent_id": "d" * 600}),
+            (hold_router, "/api/host/hold/receipts", {"agent_id": "   "}),
             (hold_router, "/api/host/hold/receipts", {"until": "u" * 65}),
         ],
     )
@@ -304,7 +304,7 @@ class TestOnlyTheSovereignReadsReceipts:
             (stop_router, "/api/host/stop/receipts", {"since": "s" * 65}),
             (hold_router, "/api/host/hold/receipts", {"scope": "turn"}),
             (hold_router, "/api/host/hold/receipts", {"limit": "0"}),
-            (hold_router, "/api/host/hold/receipts", {"agent_id": "d" * 600}),
+            (hold_router, "/api/host/hold/receipts", {"agent_id": "   "}),
         ],
     )
     def test_the_sovereign_still_gets_a_400_for_a_malformed_filter(
