@@ -99,6 +99,23 @@ def _write_registry(path: Path, agents: dict[str, dict[str, object]]) -> Path:
     return path
 
 
+
+def _import_this_checkout(env: dict[str, str]) -> dict[str, str]:
+    """Pin a child interpreter's imports to the checkout this test is running.
+
+    A child started with another ``cwd`` would otherwise import whatever
+    ``kestrel_sovereign`` the virtualenv resolves -- possibly an editable
+    install of a different checkout -- and never exercise the code under test.
+    """
+
+    checkout = str(Path(paths.__file__).resolve().parents[1])
+    pinned = dict(env)
+    existing = pinned.get("PYTHONPATH")
+    pinned["PYTHONPATH"] = (
+        checkout if not existing else os.pathsep.join((checkout, existing))
+    )
+    return pinned
+
 def test_refusal_names_the_path_and_its_source(
     operator_home, storage_path_refusals
 ):
@@ -439,7 +456,7 @@ def test_a_kestrel_home_env_file_naming_an_outside_agent_root_is_refused(
             "from kestrel_sovereign.host_features.storage import host_database_path\n"
             "host_database_path()\n",
         ],
-        env=child,
+        env=_import_this_checkout(child),
         capture_output=True,
         text=True,
         timeout=60,
@@ -516,7 +533,7 @@ def test_a_spawned_child_inherits_the_guard(operator_home, allowed):
             "except paths.StoragePathOutsideTestRootsError as refusal:\n"
             "    print('refused', refusal.path)\n",
         ],
-        env=env,
+        env=_import_this_checkout(env),
         capture_output=True,
         text=True,
         timeout=60,
