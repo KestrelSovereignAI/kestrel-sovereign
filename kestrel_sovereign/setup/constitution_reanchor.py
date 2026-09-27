@@ -108,11 +108,10 @@ class ReanchorTarget:
     """The database a reanchor writes, whose agent it writes, and what a file
     backup can protect.
 
-    ``anchor_path`` is always the agent's local ``kestrel_prime.db``. It is
-    how a directory is known to be an agent (twelve existence checks across
-    seven modules — see #2843), where the birth record lives, and — on every
-    backend — where this agent's DID is read from. It is the *write* target
-    only when the runtime reads it, i.e. on a SQLite host.
+    ``anchor_path`` is the local ``kestrel_prime.db`` for managed agents. A
+    hosted PostgreSQL agent can instead be bound by its embedding host's
+    authoritative DID registry and has no local anchor at all. The path is a
+    write target only for SQLite.
 
     ``agent_did`` is not decoration. A PostgreSQL host holds every local
     agent in one ``graph_nodes`` table, and an unbound
@@ -121,7 +120,7 @@ class ReanchorTarget:
     reanchor of Emma.
     """
 
-    anchor_path: Path
+    anchor_path: Path | None
     backend: str
     agent_did: str
     dsn: str | None = None
@@ -132,6 +131,8 @@ class ReanchorTarget:
 
     def describe(self) -> str:
         if self.writes_to_anchor:
+            if self.anchor_path is None:
+                raise ReanchorTargetError("SQLite reanchor requires a local anchor")
             return f"sqlite:{self.anchor_path}"
         return f"{self.backend}:{_redacted_dsn(self.dsn)}"
 
@@ -166,6 +167,8 @@ class ReanchorTarget:
         answer a question about the wrong tenant.
         """
         if self.writes_to_anchor:
+            if self.anchor_path is None:
+                raise ReanchorTargetError("SQLite reanchor requires a local anchor")
             return AsyncStorage(
                 str(self.anchor_path),
                 backend="sqlite",
@@ -332,7 +335,7 @@ class ReanchorResult:
     """
 
     agent_name: str
-    db_path: Path
+    db_path: Path | None
     canonical_path: Path
     old_hash: str | None
     new_hash: str | None
@@ -358,8 +361,8 @@ class ReanchorResult:
     #: set inside its transaction before deleting anything.
     stale_edge_targets: tuple[str, ...] = ()
     #: The database this run read and (on a forced run) wrote — ``sqlite`` or
-    #: ``postgres``. ``db_path`` is the local anchor either way, so this is
-    #: what says whether the write landed where the runtime reads (#2890).
+    #: ``postgres``. Managed agents have a local ``db_path`` even when their
+    #: runtime uses PostgreSQL; hosted agents have none.
     target_backend: str = "sqlite"
     #: Human-readable target, DSN credentials redacted. Printed by the CLI so
     #: an operator can see which database a reanchor actually touched.
@@ -373,7 +376,7 @@ class ReanchorResult:
 async def reanchor_constitution(
     *,
     agent_name: str,
-    agent_dir: Path,
+    agent_dir: Path | None,
     canonical_path: Path,
     force: bool,
     authorization: str = "kestrel constitution reanchor",
@@ -382,6 +385,7 @@ async def reanchor_constitution(
     sovereign_trust_root_path: Path | None = None,
     runtime_backend: str | None = None,
     runtime_dsn: str | None = None,
+    hosted_agent_did: str | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
 
@@ -409,7 +413,8 @@ async def reanchor_constitution(
 
     Args:
         agent_name: Display name (used for messages and backup naming).
-        agent_dir: Agent's data directory (contains ``kestrel_prime.db``).
+        agent_dir: Managed agent's data directory (contains
+            ``kestrel_prime.db``); None for a hosted PostgreSQL agent.
         canonical_path: On-disk constitution to anchor against.
         force: Required for any write. Without it, drift is reported
             but the DB is not touched.
@@ -426,27 +431,67 @@ async def reanchor_constitution(
         sovereign_trust_root_path: Optional explicit operator-owned JSON DID
             document. The shared resolver also reads
             ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH`` and rejects conflicts.
+        hosted_agent_did: Exact DID from an embedding host's authoritative
+            tenant registry. It must be paired with an explicit PostgreSQL
+            DSN and no local agent directory. The host must independently
+            verify the DID-to-tenant binding before calling this API.
     """
-    db_path = agent_dir / "kestrel_prime.db"
-    try:
-        target = await resolve_reanchor_target(
-            agent_dir,
-            backend=runtime_backend,
+    db_path = agent_dir / "kestrel_prime.db" if agent_dir is not None else None
+    if hosted_agent_did is not None:
+        if (
+            agent_dir is not None
+            or runtime_backend != "postgres"
+            or not runtime_dsn
+            or not hosted_agent_did.startswith("did:")
+        ):
+            return ReanchorResult(
+                agent_name=agent_name,
+                db_path=db_path,
+                canonical_path=canonical_path,
+                old_hash=None,
+                new_hash=None,
+                backup_path=None,
+                error=(
+                    "Hosted reanchor requires an exact agent DID, no local "
+                    "agent directory, and an explicit PostgreSQL DSN."
+                ),
+            )
+        target = ReanchorTarget(
+            anchor_path=None,
+            backend="postgres",
+            agent_did=hosted_agent_did,
             dsn=runtime_dsn,
-            # Without --force this command returns a drift report and writes
-            # nothing, so it must not take a write lock to produce one.
-            cold=not force,
         )
-    except ReanchorTargetError as exc:
+    elif agent_dir is None:
         return ReanchorResult(
             agent_name=agent_name,
-            db_path=db_path,
+            db_path=None,
             canonical_path=canonical_path,
             old_hash=None,
             new_hash=None,
             backup_path=None,
-            error=str(exc),
+            error="Managed reanchor requires an agent directory.",
         )
+    else:
+        try:
+            target = await resolve_reanchor_target(
+                agent_dir,
+                backend=runtime_backend,
+                dsn=runtime_dsn,
+                # Without --force this command returns a drift report and writes
+                # nothing, so it must not take a write lock to produce one.
+                cold=not force,
+            )
+        except ReanchorTargetError as exc:
+            return ReanchorResult(
+                agent_name=agent_name,
+                db_path=db_path,
+                canonical_path=canonical_path,
+                old_hash=None,
+                new_hash=None,
+                backup_path=None,
+                error=str(exc),
+            )
 
     def _result(**kwargs) -> ReanchorResult:
         """Stamp every outcome with the database it describes.
@@ -533,7 +578,11 @@ async def reanchor_constitution(
     # sending the repair to SQLite would leave PostgreSQL unreadable and the
     # agent unbootable. Only a physically absent row is the state first-boot
     # replication fixes, so only that one retargets.
-    if not target.writes_to_anchor and await runtime_record_is_pending(target):
+    if (
+        target.anchor_path is not None
+        and not target.writes_to_anchor
+        and await runtime_record_is_pending(target)
+    ):
         # PostgreSQL has nothing for this agent. Boot does not fail there: it
         # copies the birth record out of the local anchor (#2871) and audits
         # *that*, so the bytes that will govern this agent at its next start
@@ -798,6 +847,7 @@ async def reanchor_constitution(
     backup_path: Path | None = None
     backup_unavailable_reason: str | None = None
     if target.writes_to_anchor:
+        assert db_path is not None
         backup_path = _backup_db(db_path)
         logger.info("Backed up agent DB to %s before reanchor", backup_path)
     else:

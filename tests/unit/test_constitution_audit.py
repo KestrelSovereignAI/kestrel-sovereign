@@ -638,6 +638,38 @@ async def test_overdue_audit_remains_due_across_restart_with_injected_clock(tmp_
 
 
 @pytest.mark.asyncio
+async def test_startup_integrity_failure_is_provider_free_across_restarts(tmp_path):
+    """A drifted persisted agent must not buy consent or event embeddings on boot."""
+    from kestrel_sovereign.agent.boot import BootPhaseState
+
+    db_path = tmp_path / "agent.db"
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+    for attempt in range(2):
+        agent, storage = await _open_durable_harness(
+            db_path, now + timedelta(minutes=attempt)
+        )
+        agent._boot_state = BootPhaseState.IN_PROGRESS
+        consent = MagicMock()
+        consent.request_consent = AsyncMock()
+        agent.features = {"ConsentFeature": consent}
+        agent._verify_constitution_integrity = AsyncMock(
+            return_value=(False, "governing bytes changed")
+        )
+        try:
+            await agent._audit_constitution_on_startup()
+            assert agent._safe_mode is True
+            consent.request_consent.assert_not_awaited()
+            agent.privacy_agent.add_conversation.assert_not_awaited()
+            persisted = await agent._constitution_state_store.load(agent.agent_id)
+            assert persisted.safe_mode is True
+            assert persisted.safe_mode_reason == (
+                "Startup constitution audit failed: governing bytes changed"
+            )
+        finally:
+            await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_interaction_deadline_survives_restart_and_audits_next_turn(tmp_path):
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
