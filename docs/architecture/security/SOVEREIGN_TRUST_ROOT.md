@@ -89,6 +89,24 @@ write. With `--force`, a signed artifact and external root are mandatory. A
 successful write stores the signed artifact and signer/verification details in
 the audit record. Reanchor never exits Safe Mode automatically.
 
+### Hosted PostgreSQL agents without a local anchor
+
+An embedding host that stores agent identities in PostgreSQL, with no local
+`kestrel_prime.db`, must not invent a local anchor to use the offline CLI. Its
+operator can call `reanchor_constitution` with `agent_dir=None`,
+`hosted_agent_did=` set to the exact DID from the host's authoritative tenant
+registry, `runtime_backend="postgres"`, and an explicit `runtime_dsn=`. The host
+must independently verify the selected DID belongs to the intended tenant;
+the API cannot infer that relationship from a caller-supplied display name.
+
+Stop hosted agent writers first, take a PostgreSQL snapshot, and run a
+`force=False` preview for each DID. A forced call still requires the same
+signed artifact and operator-owned trust root as the CLI. The write is
+transactional and DID-scoped, but **does not take a file backup**. Verify the
+result and subsequent integrity audit before restarting hosted agents. A
+missing or unowned agent node is a refusal, not a reason to create or retarget
+one. Never infer a DID from the first row in the shared graph table.
+
 ## Rotation
 
 Trust-root rotation is an operator ceremony, not a database migration:

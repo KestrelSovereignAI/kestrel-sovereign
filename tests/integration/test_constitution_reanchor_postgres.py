@@ -316,6 +316,74 @@ async def test_reanchor_writes_postgres_and_leaves_the_anchor_untouched(
     assert (agent_dir / "kestrel_prime.db").read_bytes() == anchor_bytes
 
 
+async def test_hosted_reanchor_uses_explicit_did_without_a_local_anchor(
+    pg, tmp_path, monkeypatch,
+):
+    """An embedding host can repair only its selected PostgreSQL tenant."""
+    old_hash = await _seed_runtime_agent(CONSTITUTION_V1)
+    neighbor_hash = await _seed_runtime_agent(CONSTITUTION_NEIGHBOUR, OTHER_DID)
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    artifact_path, root_path = _write_authority_files(tmp_path, CONSTITUTION_V2)
+
+    preview = await reanchor_constitution(
+        agent_name="HostedAgent",
+        agent_dir=None,
+        hosted_agent_did=AGENT_DID,
+        canonical_path=constitution_path,
+        force=False,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+    assert preview.drift_unforced is True
+    assert preview.old_hash == old_hash
+    assert preview.db_path is None
+    assert await _runtime_state(pg) == (old_hash, [old_hash])
+
+    result = await reanchor_constitution(
+        agent_name="HostedAgent",
+        agent_dir=None,
+        hosted_agent_did=AGENT_DID,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=root_path,
+        runtime_backend="postgres",
+        runtime_dsn=POSTGRES_URL,
+    )
+    new_hash = hashlib.sha256(CONSTITUTION_V2).hexdigest()
+    assert result.error is None, result.error
+    assert result.reanchored is True
+    assert result.db_path is None
+    assert result.backup_path is None
+    assert await _runtime_state(pg) == (new_hash, [new_hash])
+    assert await _runtime_state(pg, OTHER_DID) == (
+        neighbor_hash, [neighbor_hash]
+    )
+
+
+async def test_hosted_reanchor_refuses_ambient_or_local_target(
+    pg, tmp_path,
+):
+    """No explicit PostgreSQL DSN means no repair target, even with a DID."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    for agent_dir, dsn in ((None, None), (tmp_path / "agent", POSTGRES_URL)):
+        result = await reanchor_constitution(
+            agent_name="HostedAgent",
+            agent_dir=agent_dir,
+            hosted_agent_did=AGENT_DID,
+            canonical_path=constitution_path,
+            force=True,
+            runtime_backend="postgres",
+            runtime_dsn=dsn,
+        )
+        assert "Hosted reanchor requires" in (result.error or "")
+
+
 async def test_no_file_backup_is_claimed_for_a_postgres_target(
     pg, tmp_path, monkeypatch,
 ):
