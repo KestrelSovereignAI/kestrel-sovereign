@@ -19,10 +19,8 @@ state, not source-tree output.
 
 The baseline private host-data resolver is:
 
-1. `KESTREL_HOST_DATA_DIR` when explicitly set, naming the root itself so host
-   runtime can live on its own volume without moving the project home;
-2. `<KESTREL_HOME>/host-data` when `KESTREL_HOME` is explicitly set;
-3. `~/.kestrel/host-data` otherwise.
+1. `<KESTREL_HOME>/host-data` when `KESTREL_HOME` is explicitly set;
+2. `~/.kestrel/host-data` otherwise.
 
 This resolver deliberately ignores source markers and the current working
 directory. Launching from a clone does not make that clone a runtime-data root.

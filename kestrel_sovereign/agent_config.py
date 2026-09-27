@@ -17,13 +17,13 @@ The CLI reads this config and uses it for start/stop/status commands.
 """
 
 import logging
-import os
 import toml
 
 logger = logging.getLogger(__name__)
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 
 DEFAULT_PORT = 8888
@@ -155,7 +155,7 @@ def find_agent_dir(hint: Optional[str] = None) -> Optional[Path]:
             return path.parent
 
     # 2. Environment variable
-    env_path = os.environ.get("KESTREL_DB_PATH")
+    env_path = runtime_path_env(AGENT_DB_PATH_ENV)
     if env_path:
         path = Path(env_path).resolve()
         if path.is_dir() and (path / "kestrel_prime.db").exists():

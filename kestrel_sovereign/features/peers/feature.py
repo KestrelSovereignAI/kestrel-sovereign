@@ -51,6 +51,7 @@ from kestrel_sovereign.features.peers.directory import (
     PeerUnavailableError,
     iter_sse_events,
 )
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -394,7 +395,7 @@ class PeersFeature(Feature):
             return self.agent._agent_name
 
         # Fall back to data dir basename
-        db_path = os.environ.get("KESTREL_DB_PATH", "")
+        db_path = runtime_path_env(AGENT_DB_PATH_ENV, "")
         if db_path:
             return Path(db_path).name
 

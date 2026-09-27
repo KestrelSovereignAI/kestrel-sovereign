@@ -20,6 +20,7 @@ import weakref
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from kestrel_sovereign.paths import HOME_ENV, runtime_path_env
 
 
 _OPT_IN_ENV = "KESTREL_KITE_RELEASE_EVIDENCE"
@@ -151,7 +152,7 @@ def _assert_original_directory_components(path: Path, *, label: str) -> None:
 
 def _normalized_trusted_paths() -> tuple[Path, Path]:
     """Validate original absolute paths, then resolve their non-symlink form."""
-    home_value = os.environ.get("KESTREL_HOME")
+    home_value = runtime_path_env(HOME_ENV)
     root_value = os.environ.get(_TRUSTED_ROOT_ENV)
     if not home_value or not root_value:
         raise KiteEvidenceSigningError("Kite evidence trusted root and home are required")

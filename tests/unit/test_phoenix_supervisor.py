@@ -15,7 +15,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign import phoenix_supervisor as ps
-from kestrel_sovereign.paths import HOST_DATA_DIR_ENV
 
 
 def _mode(path):
@@ -145,7 +144,6 @@ def test_default_working_dir_is_outside_source_checkout(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.delenv("KESTREL_HOME", raising=False)
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
 
     assert ps.phoenix_working_dir() == (
         fake_home / ".kestrel" / "host-data" / "phoenix"
@@ -157,7 +155,6 @@ def test_working_dir_honours_explicit_home_and_override(tmp_path, monkeypatch):
     explicit_home = tmp_path / "explicit-home"
     monkeypatch.setenv("KESTREL_HOME", str(explicit_home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     assert ps.phoenix_working_dir() == (
         explicit_home / "host-data" / "phoenix"
     ).resolve()
@@ -165,17 +162,6 @@ def test_working_dir_honours_explicit_home_and_override(tmp_path, monkeypatch):
     override = tmp_path / "dedicated-phoenix-volume"
     monkeypatch.setenv(ps.PHOENIX_WORKING_DIR_ENV, str(override))
     assert ps.phoenix_working_dir() == override.resolve()
-
-
-def test_working_dir_follows_an_explicit_host_data_root(tmp_path, monkeypatch):
-    """``KESTREL_HOST_DATA_DIR`` outranks ``KESTREL_HOME`` for host runtime."""
-    monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "project-home"))
-    monkeypatch.setenv(HOST_DATA_DIR_ENV, str(tmp_path / "host-volume"))
-    monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-
-    assert ps.phoenix_working_dir() == (
-        tmp_path / "host-volume" / "phoenix"
-    ).resolve()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode contract")
@@ -328,7 +314,6 @@ def test_prepare_storage_migrates_legacy_project_store(tmp_path, monkeypatch):
     legacy.chmod(0o755)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
 
     sup = ps.PhoenixSupervisor()
     sup.prepare_storage()
@@ -355,7 +340,6 @@ def test_prepare_storage_cross_filesystem_migration_uses_private_staging(
     legacy.chmod(0o755)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     real_replace = ps.os.replace
 
     def _replace_with_one_cross_device_failure(source, destination):
@@ -387,7 +371,6 @@ def test_prepare_storage_fails_closed_when_legacy_and_destination_both_exist(
     (destination / "phoenix.db").write_text("new")
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
 
     with pytest.raises(ps.PhoenixStorageError, match="both legacy Phoenix storage"):
         ps.PhoenixSupervisor().prepare_storage()
@@ -413,7 +396,6 @@ def test_prepare_storage_contains_but_does_not_move_live_legacy_store(
     (legacy / "phoenix.pid").chmod(0o644)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
 
     with pytest.raises(ps.PhoenixStorageError, match="belongs to live PID"):
         ps.PhoenixSupervisor().prepare_storage()
@@ -742,7 +724,6 @@ def _legacy_home(tmp_path, monkeypatch, *, legacy_pid=None):
         (legacy / "phoenix.pid").write_text(str(legacy_pid))
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     return home, legacy
 
 
@@ -888,7 +869,6 @@ def test_repeat_boot_adopts_private_store_child(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
     monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
@@ -948,7 +928,6 @@ def test_adopt_or_reap_reaps_unknown_listener_after_legacy_migrated(
     home.mkdir()  # NO legacy store present (already migrated on a prior boot)
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
-    monkeypatch.delenv(HOST_DATA_DIR_ENV, raising=False)
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
     monkeypatch.setattr(
         ps.PhoenixSupervisor, "_port_listener_pids", lambda self: [4444]

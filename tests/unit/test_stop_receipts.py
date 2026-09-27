@@ -659,6 +659,35 @@ async def test_receipt_store_startup_failure_prevents_host_readiness(
 
 
 @pytest.mark.asyncio
+async def test_teardown_retires_a_failed_startup_error(monkeypatch):
+    """A failed startup's error must not outlive the lifespan that owned it.
+
+    ``server.app`` is reused across lifespans in one process. Before #3286 a
+    lifespan whose Stop evidence failed to open left its error behind, and a
+    later request served without that lifespan got ``503
+    stop_evidence_unavailable`` for a failure that was not its own.
+    """
+    from fastapi import FastAPI
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.host_features import storage
+
+    def fail_prepare():
+        raise RuntimeError("host store unavailable")
+
+    monkeypatch.setattr(storage, "prepare_host_database", fail_prepare)
+    app = FastAPI()
+
+    with pytest.raises(RuntimeError):
+        await server._initialize_stop_receipts(app)
+    assert app.state.stop_receipt_store_error == "RuntimeError"
+
+    await server._shutdown_stop_receipts(app)
+
+    assert app.state.stop_receipt_store_error == ""
+
+
+@pytest.mark.asyncio
 async def test_receipt_store_startup_cancellation_closes_unpublished_database(
     monkeypatch,
 ):

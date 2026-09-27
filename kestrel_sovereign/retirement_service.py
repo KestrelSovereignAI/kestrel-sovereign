@@ -18,7 +18,6 @@ Permanent agents deserve deliberation before ending.
 import logging
 import json
 import shutil
-import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -28,6 +27,7 @@ import asyncio
 from kestrel_sovereign.storage import GraphNode
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def _resolve_archive_dir(db_path: Path, archive_dir: Optional[str]) -> Path:
         return Path(archive_dir)
 
     # Prefer the mounted data volume when configured.
-    kestrel_db_path = Path(os.environ.get("KESTREL_DB_PATH", "")).expanduser()
+    kestrel_db_path = Path(runtime_path_env(AGENT_DB_PATH_ENV, "")).expanduser()
     if str(kestrel_db_path) and kestrel_db_path.exists():
         return kestrel_db_path / "archive" / "retired_agents"
 
@@ -345,7 +345,7 @@ async def list_retired_agents(archive_dir: Optional[str] = None) -> list[dict]:
     """List all retired test agents."""
     # Without a DB path, default to the configured data directory if available.
     if archive_dir is None:
-        kestrel_db_path = Path(os.environ.get("KESTREL_DB_PATH", "")).expanduser()
+        kestrel_db_path = Path(runtime_path_env(AGENT_DB_PATH_ENV, "")).expanduser()
         if str(kestrel_db_path) and kestrel_db_path.exists():
             archive_dir = kestrel_db_path / "archive" / "retired_agents"
         else:

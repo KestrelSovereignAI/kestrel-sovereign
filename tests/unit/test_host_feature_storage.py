@@ -27,14 +27,25 @@ from kestrel_sovereign.host_features.storage import (
     resolve_host_database_launch_context,
     validate_host_database_migration_readiness,
 )
-from kestrel_sovereign.paths import HOST_DATA_DIR_ENV
 
 # These tests are *about* default host-database resolution, so they set
 # HOME / KESTREL_HOME / KESTREL_HOST_DB_PATH themselves (or pass an explicit
 # path) and opt out of the suite-wide isolation in tests/conftest.py and
-# tests/unit/conftest.py (#3087, #3286). Every test below must keep doing so: without the fixture's
-# override, a test that forgot would resolve the operator's real database.
+# tests/unit/conftest.py (#3087, #3286). The fixture below points HOME and
+# KESTREL_HOME at temporary directories first, so a test that sets only an
+# explicit path resolves its defaults (the legacy database beside the project,
+# the ~/.kestrel fallback) somewhere harmless; a test about those defaults
+# re-points or removes them. The storage-root guard refuses anything outside
+# the test's temporary roots regardless.
 pytestmark = pytest.mark.owns_host_paths
+
+
+@pytest.fixture(autouse=True)
+def _harmless_default_roots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "default-home"))
+    project = tmp_path / "default-project"
+    project.mkdir()
+    monkeypatch.setenv("KESTREL_HOME", str(project))
 
 
 def _mode(path: Path) -> int:
@@ -667,45 +678,6 @@ def test_pinned_default_launch_keeps_default_path_custody(tmp_path):
         operator_home / ".kestrel" / "host-data" / HOST_FEATURE_DB_FILENAME
     )
     assert _mode(host_parent) == 0o700
-
-
-def test_explicit_host_data_root_is_the_default_and_previous_default(
-    tmp_path, monkeypatch,
-):
-    """One override moves every resolver of the default, live and described."""
-
-    host_volume = tmp_path / "host-volume"
-    described = {
-        "HOME": str(tmp_path / "operator-home"),
-        "KESTREL_HOME": str(tmp_path / "project-home"),
-        HOST_DATA_DIR_ENV: str(host_volume),
-    }
-    expected = host_volume / HOST_FEATURE_DB_FILENAME
-
-    assert host_database_path(env=described, base_dir=tmp_path) == (
-        expected,
-        True,
-    )
-    described["KESTREL_DB_PATH"] = str(tmp_path / "agent-data")
-    context = resolve_host_database_launch_context(
-        env=described, base_dir=tmp_path
-    )
-    assert context.previous_default == expected
-
-    for key, value in described.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.delenv(HOST_DB_PATH_ENV, raising=False)
-    monkeypatch.delenv(DERIVED_HOST_DB_PATH_ENV, raising=False)
-    host_volume.mkdir(mode=0o700)
-    with sqlite3.connect(expected) as connection:
-        connection.execute("CREATE TABLE prior_state (value TEXT)")
-    expected.chmod(0o600)
-
-    migrated = prepare_host_database()
-
-    assert migrated == tmp_path / "agent-data" / "host-data" / HOST_FEATURE_DB_FILENAME
-    assert migrated.exists()
-    assert not expected.exists()
 
 
 @pytest.mark.asyncio

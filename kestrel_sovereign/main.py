@@ -13,7 +13,12 @@ from kestrel_sovereign.kestrel_agent import (
     await_agent_shutdown_completion,
 )
 from kestrel_sovereign.llm.service import LLMService
-from kestrel_sovereign.paths import load_project_env, project_dir
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    load_project_env,
+    project_dir,
+    runtime_path_env,
+)
 import logging
 
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
@@ -148,7 +153,7 @@ async def get_agent_by_did(did: str) -> KestrelAgent:
     """
     Retrieves an agent instance based on its DID.
     """
-    storage_path = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+    storage_path = runtime_path_env(AGENT_DB_PATH_ENV, os.getcwd())
     llm_service = LLMService()
     agent = KestrelAgent(did=did, storage_path=storage_path, llm_service=llm_service)
     from kestrel_sovereign.hold import initialize_with_bound_hold_context
@@ -193,7 +198,7 @@ async def main():
     )
     args = parser.parse_args()
 
-    db_path = args.db_path or os.environ.get("KESTREL_DB_PATH")
+    db_path = args.db_path or runtime_path_env(AGENT_DB_PATH_ENV)
     if not db_path:
         print("❌ Error: Agent database path not specified.")
         return

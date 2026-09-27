@@ -46,6 +46,7 @@ import itsdangerous
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
+from kestrel_sovereign.paths import PHOENIX_WORKING_DIR_ENV, runtime_path_env
 from kestrel_sovereign.private_storage import (
     PRIVATE_DIRECTORY_MODE,
     PRIVATE_FILE_MODE,
@@ -71,11 +72,6 @@ DEFAULT_PHOENIX_GRPC_PORT = 4317
 
 #: Sub-path the UI is served under for same-origin embedding.
 PHOENIX_ROOT_PATH = "/phoenix"
-
-#: Explicit operator override for the trace-store working directory. This is
-#: deliberately separate from Phoenix's own environment variables: Kestrel is
-#: the custody owner and must validate the directory before it starts Phoenix.
-PHOENIX_WORKING_DIR_ENV = "KESTREL_PHOENIX_WORKING_DIR"
 
 PRIVATE_CHILD_UMASK = 0o077
 
@@ -192,9 +188,8 @@ def phoenix_grpc_port() -> int:
 def phoenix_host_data_root() -> Path:
     """Private host-runtime root used for Phoenix when no override is set.
 
-    An explicit ``KESTREL_HOST_DATA_DIR`` or ``KESTREL_HOME`` is an operator
-    custody decision and is honoured (see ``paths.host_data_dir``). Without
-    one, source-checkout discovery is intentionally ignored:
+    An explicit ``KESTREL_HOME`` is an operator custody decision and is
+    honoured. Without one, source-checkout discovery is intentionally ignored:
     trace data belongs under ``~/.kestrel/host-data``, never in a repository
     merely because Kestrel was launched from that repository.
     """
@@ -211,7 +206,7 @@ def phoenix_working_dir() -> Path:
     Resolution has no filesystem side effects; :meth:`PhoenixSupervisor.prepare_storage`
     owns secure creation, hardening, and migration.
     """
-    override = os.environ.get(PHOENIX_WORKING_DIR_ENV)
+    override = runtime_path_env(PHOENIX_WORKING_DIR_ENV)
     if override:
         return _absolute_without_following_leaf(Path(override))
     return phoenix_host_data_root() / "phoenix"
@@ -423,7 +418,7 @@ class PhoenixSupervisor:
         self.port = port if port is not None else phoenix_port()
         self.grpc_port = grpc_port if grpc_port is not None else phoenix_grpc_port()
         self._uses_default_working_dir = (
-            working_dir is None and not os.environ.get(PHOENIX_WORKING_DIR_ENV)
+            working_dir is None and not runtime_path_env(PHOENIX_WORKING_DIR_ENV)
         )
         self.working_dir = (
             _absolute_without_following_leaf(Path(working_dir))

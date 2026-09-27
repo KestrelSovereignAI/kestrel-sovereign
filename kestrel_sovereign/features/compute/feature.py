@@ -41,6 +41,7 @@ from .destructive_policy import DestructiveOperationPolicy
 from .trash_manager import TrashManager
 from .executors import BaseExecutor, UvExecutor, DockerExecutor, LocalExecutor
 from .security_hook import ComputeSecurityHook, ComputeDebugHook
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ class ComputeFeature(Feature):
         agent_data_dir = None
         if not db_path:
             # Fallback to agent_data directory for compute scripts
-            agent_data_dir = os.environ.get("KESTREL_DB_PATH", "./agent_data")
+            agent_data_dir = runtime_path_env(AGENT_DB_PATH_ENV, "./agent_data")
             os.makedirs(agent_data_dir, exist_ok=True)
             db_path = os.path.join(agent_data_dir, "compute_scripts.db")
         current_agent_data_path = (

@@ -78,7 +78,10 @@ def test_env_var_still_authoritative_without_an_agent_binding(tmp_path, monkeypa
     assert tracker._usage_db_path == os.path.join(str(env_dir), "llm_usage.db")
 
 
-def test_falls_back_to_historical_default_when_nothing_is_set():
+def test_falls_back_to_historical_default_when_nothing_is_set(tmp_path, monkeypatch):
+    # The default is cwd-relative; outside a temporary cwd it would name the
+    # checkout's own agent_data, which the storage-root guard refuses (#3286).
+    monkeypatch.chdir(tmp_path)
     tracker = _Tracker()
     tracker._init_usage_tracking()
 

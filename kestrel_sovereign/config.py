@@ -7,6 +7,7 @@ import toml
 from typing import Dict, Any, Optional
 from pathlib import Path
 import logging
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -260,7 +261,7 @@ def load_section(section: str) -> Dict[str, Any]:
         Dict of config values, or empty dict if section/file not found.
     """
     # Check agent-specific config first (KESTREL_DB_PATH/kestrel.toml)
-    db_path = os.environ.get("KESTREL_DB_PATH")
+    db_path = runtime_path_env(AGENT_DB_PATH_ENV)
     search_paths = []
     if db_path:
         search_paths.append(Path(db_path) / "kestrel.toml")
@@ -284,7 +285,7 @@ def load_section(section: str) -> Dict[str, Any]:
 # Trusted agent keys need to live in a writable location.
 # - In the sovereign Docker image, code lives under /app (read-only for non-root), while data lives under /data.
 # - In local dev, KESTREL_DB_PATH is often unset, so we keep the historical default under the repo.
-_KESTREL_DB_PATH = os.environ.get("KESTREL_DB_PATH")
+_KESTREL_DB_PATH = runtime_path_env(AGENT_DB_PATH_ENV)
 TRUSTED_AGENTS_DIR = (
     os.path.join(_KESTREL_DB_PATH, "trusted_agents")
     if _KESTREL_DB_PATH

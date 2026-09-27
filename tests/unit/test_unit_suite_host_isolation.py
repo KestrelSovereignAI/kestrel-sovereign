@@ -169,12 +169,13 @@ def test_the_opt_out_hands_enablement_back_to_the_test(tmp_path, monkeypatch):
     resolves — and a test that owns that dir gets exactly the host features it
     declares. Deliberately does not assert against the operator's real
     manifest: that would make the suite's result depend on their machine.
+    Unpinned, the project dir would be the checkout, which the storage-root
+    guard refuses (#3286), so the test names its own.
     """
-    assert ISOLATION_DIRNAME not in str(_lifespan_manifest_path())
-
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     paths.reset_cache()
     try:
+        assert ISOLATION_DIRNAME not in str(_lifespan_manifest_path())
         _lifespan_manifest_path().write_text(
             f'[[feature]]\nname = "{_StartsInUnitTests.name}"\n'
             f"host_scoped = true\nenabled = true\n",
@@ -200,4 +201,3 @@ def test_the_opt_out_marker_actually_releases_the_override():
     """
     assert ISOLATION_DIRNAME not in os.environ.get(HOST_DB_PATH_ENV, "")
     assert ISOLATION_DIRNAME not in os.environ.get("KESTREL_HOME", "")
-    assert ISOLATION_DIRNAME not in os.environ.get(paths.HOST_DATA_DIR_ENV, "")

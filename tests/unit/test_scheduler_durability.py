@@ -3057,7 +3057,7 @@ async def test_host_runner_preserves_claim_when_cold_load_lacks_scheduler_featur
     db = await _database(tmp_path / "host-cold-missing-scheduler-feature.db")
     agent_id = "did:scheduler:cold-missing-feature"
     config = LocalAgentConfig(data_dir="cold-missing", port=8801, autostart=False)
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     manager._seed_scheduler_authority({agent_id: ("Cold", config)})
     cold_agent = SimpleNamespace(did=agent_id, agent_id=agent_id, features={})
     manager._initialize_agent = AsyncMock(return_value=cold_agent)

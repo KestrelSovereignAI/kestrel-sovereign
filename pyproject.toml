@@ -422,7 +422,7 @@ markers = [
     "live: Tests that call live external providers when credentials exist",
     "slow: Slow-running tests",
     "bench: Performance benchmarks (the integration tier excludes these in CI; see .github/workflows/ci.yml)",
-    "owns_host_paths: Test resolves HOME/KESTREL_HOME/KESTREL_HOST_DB_PATH itself and opts out of the suite's host-runtime path isolation (tests/conftest.py, tests/unit/conftest.py); the host-data tripwire still applies",
+    "owns_host_paths: Test resolves HOME/KESTREL_HOME/KESTREL_HOST_DB_PATH itself and opts out of the suite-wide host-runtime path isolation (tests/conftest.py); the storage-root guard still applies",
     "anyio",
 ]
 

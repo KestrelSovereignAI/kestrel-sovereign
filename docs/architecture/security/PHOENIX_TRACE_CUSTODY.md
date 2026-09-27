@@ -20,15 +20,13 @@ source-tree output.
 Kestrel resolves the working directory in this order:
 
 1. `KESTREL_PHOENIX_WORKING_DIR`, when explicitly set;
-2. `<KESTREL_HOST_DATA_DIR>/phoenix`, when `KESTREL_HOST_DATA_DIR` is
-   explicitly set;
-3. `<KESTREL_HOME>/host-data/phoenix`, when `KESTREL_HOME` is explicitly set;
-4. `~/.kestrel/host-data/phoenix` otherwise.
+2. `<KESTREL_HOME>/host-data/phoenix`, when `KESTREL_HOME` is explicitly set;
+3. `~/.kestrel/host-data/phoenix` otherwise.
 
 The default intentionally does not use marker discovery or the current source
 checkout. Launching Kestrel from a clone must not make that clone a trace-data
-root. Set `KESTREL_HOST_DATA_DIR`, `KESTREL_HOME`, or
-`KESTREL_PHOENIX_WORKING_DIR` when an operator wants an explicit data volume.
+root. Set `KESTREL_HOME` or `KESTREL_PHOENIX_WORKING_DIR` when an operator wants
+an explicit data volume.
 
 ## Creation and startup gate
 

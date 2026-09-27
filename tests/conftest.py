@@ -19,6 +19,14 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Generator
 
+# First, before any package module is imported: allow every runtime-path
+# resolver only the test's temporary roots and pin the registered runtime-path
+# variables to a session root, so nothing frozen at import or resolved by a
+# session fixture can name operator state (#3286).
+from tests.shared import host_runtime_isolation as _host_runtime_isolation
+
+_SESSION_ISOLATION_ROOT = _host_runtime_isolation.install_session_guard()
+
 # Import shared test infrastructure for resource cleanup
 from tests.shared.pytest_cleanup_plugin import (
     pytest_configure as _cleanup_configure,
@@ -28,13 +36,16 @@ from tests.shared.pytest_cleanup_plugin import (
     cost_tracking,  # noqa: F401 - exposed as a pytest fixture
 )
 from tests.shared.resource_registry import registry
+from kestrel_sovereign import paths
+from kestrel_sovereign.agent import token_counter
 from tests.shared.host_runtime_isolation import (
     ISOLATION_DIRNAME,
     OWNS_HOST_PATHS_MARKER,
-    SPAWNED_ENV_PIN,
-    HostDataTripwire,
-    real_host_data_roots,
-    redirect_host_data_root,
+    PROJECT_HOME_DIRNAME,
+    REFUSAL_RECORDER,
+    allow_storage_roots,
+    isolate_host_runtime_paths,
+    refusal_failure_message,
 )
 
 # Import feedback bridge for test-to-reflection integration
@@ -44,10 +55,6 @@ from tests.utils.feedback_bridge import (
 )
 
 FORCED_EXIT_GRACE_SECONDS = 10.0
-
-#: Resolved at import, before any fixture edits the environment, so these are
-#: the operator's real host-data roots rather than a test's redirected ones.
-_HOST_DATA_TRIPWIRE = HostDataTripwire(real_host_data_roots())
 
 
 @pytest.fixture
@@ -116,8 +123,15 @@ def pytest_collection_modifyitems(config, items):
 
 def pytest_configure(config):
     """Configure pytest with all plugins and load .env for skipif conditions."""
+    REFUSAL_RECORDER.install()
+    # The allow-list's third root: an explicit --basetemp may lie outside the
+    # system temporary directory, and every tmp_path lives below it.
+    basetemp = config.option.basetemp
+    if basetemp:
+        allow_storage_roots((Path(os.path.abspath(basetemp)),))
     # Load .env EARLY so that skipif decorators (evaluated at collection time)
-    # can see API keys like ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.
+    # can see API keys like ANTHROPIC_API_KEY, OPENAI_API_KEY, etc. The
+    # runtime-path variables are already pinned, so it cannot restore them.
     try:
         from dotenv import load_dotenv
         # Try project root (relative to this conftest)
@@ -139,6 +153,12 @@ def pytest_configure(config):
 
     _cleanup_configure(config)
     _feedback_configure(config)
+
+
+def pytest_unconfigure(config):
+    """Remove the session isolation root this process created."""
+    if _SESSION_ISOLATION_ROOT is not None:
+        shutil.rmtree(_SESSION_ISOLATION_ROOT, ignore_errors=True)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -249,50 +269,77 @@ def setup_test_config():
         target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _real_host_data_tripwire():
-    """Fail the session if any test reached the real host-data root (#3286).
-
-    Isolation below is a convention; this enforces it. See
-    ``tests/shared/host_runtime_isolation.py`` for what is compared.
-    """
-    _HOST_DATA_TRIPWIRE.arm()
+@pytest.fixture(autouse=True)
+def _fail_on_swallowed_storage_path_refusal():
+    """Fail a test whose resolver refusal was swallowed on its way up."""
+    REFUSAL_RECORDER.drain()
     yield
-    findings = _HOST_DATA_TRIPWIRE.disarm()
-    if findings:
-        pytest.fail(HostDataTripwire.failure_message(findings), pytrace=False)
+    refusals = REFUSAL_RECORDER.drain()
+    if refusals:
+        pytest.fail(refusal_failure_message(refusals), pytrace=False)
 
 
-@pytest.fixture(scope="session")
-def _spawned_env_host_data_pin():
-    """Make the per-test host-data redirect survive a project ``.env`` merge.
-
-    See ``SpawnedEnvPin``: managed children are launched from
-    ``spawned_agent_env``, where the project ``.env`` outranks ``os.environ``.
-    """
-    SPAWNED_ENV_PIN.install()
-    yield SPAWNED_ENV_PIN
-    SPAWNED_ENV_PIN.uninstall()
+@pytest.fixture
+def storage_path_refusals():
+    """For a test that provokes refusals on purpose: they are its to inspect."""
+    yield REFUSAL_RECORDER
+    REFUSAL_RECORDER.drain()
 
 
 @pytest.fixture(autouse=True)
-def _isolate_host_runtime_paths(
-    request, tmp_path_factory, monkeypatch, _spawned_env_host_data_pin
-):
-    """Give every test its own host-data root (#3286).
+def _isolate_host_runtime_paths(request, tmp_path_factory, monkeypatch):
+    """Give every test its own host-runtime and agent-data roots (#3286).
 
-    Without this, a test that enters the real server lifespan resolves the
-    operator's ``~/.kestrel/host-data`` and can read, migrate, or move the live
-    host-feature database. Yields the temporary root, or ``None`` for a test
-    marked ``owns_host_paths``, which redirects the roots itself.
+    Yields the temporary root, or ``None`` for a test marked
+    ``owns_host_paths``, which redirects the roots itself. The resolver guard
+    applies either way.
     """
     if request.node.get_closest_marker(OWNS_HOST_PATHS_MARKER):
+        # A clean slate rather than the session pins: the test resolves the
+        # defaults itself, and the guard refuses any that name operator state.
+        for name in paths.RUNTIME_PATH_ENV_NAMES:
+            monkeypatch.delenv(name, raising=False)
+        paths.reset_cache()
         yield None
         return
 
     root = tmp_path_factory.mktemp(ISOLATION_DIRNAME)
-    redirect_host_data_root(root, monkeypatch)
-    yield root
+    isolate_host_runtime_paths(root, monkeypatch)
+    # ``token_counter`` freezes its cache path at import time, so no variable
+    # above can move it: without this, every test reads (and a discovery run
+    # rewrites) the operator's real ``~/.kestrel/discovered_context_limits.json``.
+    # Reset the one-time read too, so the redirect is what the next lookup sees.
+    #
+    # This is a point fix for the one import-time constant the suite was
+    # observed to write, NOT a general solution: more are frozen the same way
+    # and are deliberately left alone here (see ``tests/unit/conftest.py`` and
+    # #3104). Do not grow this into a patch list.
+    monkeypatch.setattr(
+        token_counter, "CACHE_FILE", root / "discovered_context_limits.json"
+    )
+    monkeypatch.setattr(token_counter, "_cached_limits", None)
+    try:
+        yield root
+    finally:
+        paths.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _seed_isolated_project_config(_isolate_host_runtime_paths, setup_test_config):
+    """Give the isolated project home the checkout's ``kestrel.toml``.
+
+    Before #3286 every tier but unit resolved ``project_dir()`` to the
+    checkout, and its LLM routes come from that ``kestrel.toml``. The unit tier
+    overrides this fixture: it starts from an empty project.
+    """
+    if _isolate_host_runtime_paths is None:
+        return
+    source = Path(__file__).parent.parent / "kestrel.toml"
+    if source.exists():
+        shutil.copyfile(
+            source,
+            _isolate_host_runtime_paths / PROJECT_HOME_DIRNAME / "kestrel.toml",
+        )
 
 
 @pytest.fixture

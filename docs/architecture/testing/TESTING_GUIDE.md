@@ -118,28 +118,6 @@ The project includes a comprehensive test runner with smart features:
 
 ## Writing Tests
 
-### Host-runtime isolation and the host-data tripwire
-
-Every test runs with `KESTREL_HOST_DATA_DIR` pointed at a per-test temporary
-directory (`tests/conftest.py`), so no test can resolve, migrate, or move the
-operator's real `~/.kestrel/host-data`. The unit tier also redirects `HOME`,
-`KESTREL_HOME`, and `KESTREL_HOST_DB_PATH` (`tests/unit/conftest.py`). The
-redirect is re-applied to every managed child's launch environment after the
-project `.env` merge, because that file otherwise outranks the test's value.
-
-A session-scoped tripwire enforces this. It watches the real host-data root
-with an in-process audit hook and a start/end filesystem snapshot, and it fails
-the session, naming the offending test, if the run touched that root. This
-check runs even when a production host is using the directory at the same time:
-only the files another process held open at session start (found with `lsof`)
-and live SQLite families are exempt from content comparison, and any process
-this session started that still holds a file there at the end is reported. One
-gap remains: a test's subprocess that changes the contents of one of those live
-files and exits is indistinguishable from the running host's own writes.
-A test that exercises path resolution itself opts out with
-`@pytest.mark.owns_host_paths` and must redirect `HOME`/`KESTREL_HOME` on its
-own. See `tests/shared/host_runtime_isolation.py`.
-
 ### SQLite WAL Mode Tests
 
 When testing SQLite sync features, remember that **WAL files are checkpointed when all connections close**. This means if you:

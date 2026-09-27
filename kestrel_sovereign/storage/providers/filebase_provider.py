@@ -41,6 +41,7 @@ from kestrel_sovereign.storage.providers.base import (
     StorageResult,
     StorageTier,
 )
+from kestrel_sovereign.paths import CACHE_DIR_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class FilebaseProvider(StorageProvider):
         if cache_dir:
             self.cache_dir = Path(cache_dir)
         else:
-            self.cache_dir = Path(os.environ.get("KESTREL_CACHE_DIR", "./storage_cache"))
+            self.cache_dir = Path(runtime_path_env(CACHE_DIR_ENV, "./storage_cache"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._index_file = self.cache_dir / "filebase_index.json"
 

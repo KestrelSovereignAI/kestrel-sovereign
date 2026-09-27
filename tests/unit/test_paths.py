@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -90,20 +91,6 @@ def test_host_data_dir_ignores_source_checkout(tmp_path, monkeypatch):
 
     assert paths.host_data_dir() == (home / ".kestrel" / "host-data").absolute()
     assert source not in paths.host_data_dir().parents
-
-
-def test_host_data_dir_override_outranks_kestrel_home(tmp_path, monkeypatch):
-    """``KESTREL_HOST_DATA_DIR`` names the root itself; the project home stays."""
-    monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "project-home"))
-    monkeypatch.setenv(paths.HOST_DATA_DIR_ENV, str(tmp_path / "host-volume"))
-
-    assert paths.host_data_dir() == (tmp_path / "host-volume").absolute()
-    assert paths.project_dir() == (tmp_path / "project-home").resolve()
-
-    monkeypatch.delenv(paths.HOST_DATA_DIR_ENV)
-    assert paths.host_data_dir() == (
-        tmp_path / "project-home" / "host-data"
-    ).absolute()
 
 
 def test_pip_install_with_no_markers_falls_back_to_home_kestrel(

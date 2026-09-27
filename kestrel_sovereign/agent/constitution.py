@@ -30,6 +30,7 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
 )
+from kestrel_sovereign.paths import PROJECT_ROOT_ENV, runtime_path_env
 
 
 class SafeModeCause(str, Enum):
@@ -482,7 +483,7 @@ class ConstitutionMixin:
         the default `compute_live_doctrine_bundle_hash` then
         gracefully reports None and drift detection is skipped.
         """
-        env_root = os.environ.get("KESTREL_PROJECT_ROOT")
+        env_root = runtime_path_env(PROJECT_ROOT_ENV)
         if env_root:
             p = Path(env_root)
             if p.exists():
