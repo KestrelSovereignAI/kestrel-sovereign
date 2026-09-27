@@ -185,23 +185,33 @@ def bounded_filter_text(
     value: Optional[str],
     field: str,
     *,
-    max_length: int,
+    max_length: Optional[int],
 ) -> Optional[str]:
     """Validate one raw identity filter after the gate, verbatim.
 
     The value is compared exactly against stored identities, so it is not
-    normalized — only refused when it cannot name anything.
+    normalized — only refused when it cannot name anything. ``max_length`` of
+    ``None`` imposes no cap, for a filter over identities the same API lists
+    without one (#3307).
     """
 
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or (max_length is not None and len(value) > max_length)
+    ):
         raise ApiHTTPException(
             status_code=400,
             code="receipt_filter_invalid",
             message=(
-                f"{field} must be non-empty text no longer than "
-                f"{max_length} characters."
+                f"{field} must be non-empty text"
+                + (
+                    f" no longer than {max_length} characters."
+                    if max_length is not None
+                    else "."
+                )
             ),
         )
     return value

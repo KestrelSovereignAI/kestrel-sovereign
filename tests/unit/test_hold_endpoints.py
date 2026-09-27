@@ -463,6 +463,76 @@ def test_hold_latches_the_agents_did_and_names_the_sovereign_actor():
     assert body["current"]["target_id"] == ALPHA
 
 
+def test_a_long_did_the_read_door_lists_can_be_held_released_and_filtered():
+    """The write doors accept every DID the read door advertises (#3307).
+
+    A DID longer than the old 512-character transport cap is listed by
+    ``GET /api/host/hold``; it must be holdable, releasable, and usable as a
+    receipt filter. Only the live inventory decides which agent is a target.
+    """
+
+    long_did = "did:test:" + "x" * 600
+    app, store = _app(agents=(("Longname", long_did),), caller=_sovereign())
+    client = TestClient(app)
+
+    listed = client.get("/api/host/hold").json()
+    assert [agent["agent_id"] for agent in listed["agents"]] == [long_did]
+
+    held = client.post(
+        "/api/host/hold",
+        json={
+            "scope": "agent",
+            "target_id": long_did,
+            "reason": "long identity",
+            "operation_id": "op-long",
+        },
+    )
+    assert held.status_code == 200, held.text
+    assert store.set_calls[-1]["target_id"] == long_did
+
+    released = client.post(
+        "/api/host/hold/release",
+        json={
+            "scope": "agent",
+            "target_id": long_did,
+            "reason": "done",
+            "operation_id": "op-long-release",
+            "expected_hold_receipt_id": held.json()["receipt"]["receipt_id"],
+        },
+    )
+    assert released.status_code == 200, released.text
+
+
+def test_the_hold_receipt_filter_takes_any_listed_did_but_never_a_blank():
+    from kestrel_sovereign.api_errors import ApiHTTPException
+    from kestrel_sovereign.endpoints.receipt_feed import bounded_filter_text
+
+    long_did = "did:test:" + "x" * 600
+    assert bounded_filter_text(long_did, "agent_id", max_length=None) == long_did
+    with pytest.raises(ApiHTTPException):
+        bounded_filter_text("   ", "agent_id", max_length=None)
+    # A caller that still passes a cap keeps it (the Stop feed does).
+    with pytest.raises(ApiHTTPException):
+        bounded_filter_text(long_did, "agent_id", max_length=512)
+
+
+def test_an_unhosted_target_is_still_refused_whatever_its_length():
+    app, store = _app(caller=_sovereign())
+
+    response = TestClient(app).post(
+        "/api/host/hold",
+        json={
+            "scope": "agent",
+            "target_id": "did:test:" + "y" * 600,
+            "reason": "not ours",
+            "operation_id": "op-unhosted",
+        },
+    )
+
+    assert response.status_code == 404
+    assert store.set_calls == []
+
+
 def test_hold_refuses_a_target_this_host_does_not_host():
     app, store = _app(caller=_sovereign())
 
