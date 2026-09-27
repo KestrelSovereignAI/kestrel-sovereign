@@ -47,6 +47,15 @@ from tests.shared.host_runtime_isolation import (
     isolate_host_runtime_paths,
     refusal_failure_message,
 )
+from tests.shared.postgres_requirement import (
+    check_session as _check_postgres_requirement,
+    fail_skipped_postgres_case as _fail_skipped_postgres_case,
+)
+from tests.shared.postgres_worker_isolation import (
+    isolate_xdist_worker as _isolate_xdist_worker,
+    release_worker_schema as _release_worker_schema,
+)
+from tests.utils.postgres_schema import postgres_test_url
 
 # Import feedback bridge for test-to-reflection integration
 from tests.utils.feedback_bridge import (
@@ -55,6 +64,7 @@ from tests.utils.feedback_bridge import (
 )
 
 FORCED_EXIT_GRACE_SECONDS = 10.0
+_WORKER_SCHEMA_KEY = pytest.StashKey()
 
 
 @pytest.fixture
@@ -153,12 +163,31 @@ def pytest_configure(config):
 
     _cleanup_configure(config)
     _feedback_configure(config)
+    # After .env: a local .env may supply TEST_POSTGRES_URL.
+    _check_postgres_requirement()
+    # After the check: it must see the URL the job supplied (#3383).
+    config.stash[_WORKER_SCHEMA_KEY] = _isolate_xdist_worker()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Fail, rather than skip, a PostgreSQL case in a job that provides one."""
+    outcome = yield
+    _fail_skipped_postgres_case(item, outcome.get_result())
 
 
 def pytest_unconfigure(config):
-    """Remove the session isolation root this process created."""
-    if _SESSION_ISOLATION_ROOT is not None:
-        shutil.rmtree(_SESSION_ISOLATION_ROOT, ignore_errors=True)
+    """Release this process's per-session test resources.
+
+    One hook: pytest keeps only the last module-level definition, so the
+    PostgreSQL worker schema (#3383) and the host-isolation root (#3286) must
+    be released here together.
+    """
+    try:
+        _release_worker_schema(config.stash.get(_WORKER_SCHEMA_KEY, None))
+    finally:
+        if _SESSION_ISOLATION_ROOT is not None:
+            shutil.rmtree(_SESSION_ISOLATION_ROOT, ignore_errors=True)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -795,11 +824,7 @@ async def db_backend(request, tmp_path):
             pytest.skip("PostgresBackend not available")
             return
 
-        postgres_url = (
-            os.environ.get("TEST_POSTGRES_URL")
-            or os.environ.get("KESTREL_DATABASE_URL")
-            or os.environ.get("DATABASE_URL")
-        )
+        postgres_url = postgres_test_url()
         if not postgres_url:
             pytest.skip(
                 "TEST_POSTGRES_URL, KESTREL_DATABASE_URL, or DATABASE_URL required for PostgreSQL tests.\n"
