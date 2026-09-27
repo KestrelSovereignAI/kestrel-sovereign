@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-09-26
-**Scope:** 2503 tracked files (1728 `.py`, 347 `.md`, 428 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-09-27
+**Scope:** 2515 tracked files (1739 `.py`, 347 `.md`, 429 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -603,7 +603,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/scheduler/outcome.py** — Structured outcomes returned by scheduled task executors.
   - `class ScheduledTaskOutcome`
 - **kestrel_sovereign/features/scheduler/runner.py** — Durable scheduler execution with claims, leases, and recovery.
-  - `class SchedulerRolloutQuiescenceRequired`; `class SchedulerProtocolVersionIncompatible`; `async def adopt_scheduler_registration_ownership(db)`; `class SchedulerFeatureUnavailable`; `class SchedulerAuthorityRevoked`; `def validate_schedule_idempotency_base(base)`; `class SchedulerExecution`; `class SchedulerTenantProtocolRegistration`; `…`
+  - `class SchedulerRolloutQuiescenceRequired`; `class SchedulerProtocolVersionIncompatible`; `async def adopt_scheduler_registration_ownership(db)`; `class SchedulerFeatureUnavailable`; `class SchedulerDispatchNotReady`; `class ScheduledTaskOwnerUnavailable`; `class SchedulerAuthorityRevoked`; `def validate_schedule_idempotency_base(base)`; `…`
 - **kestrel_sovereign/features/scheduler/status.py** — Canonical scheduler runtime and schedule-state reporting.
   - `def scheduler_tick_in_progress_limit_seconds()`; `def classify_disablement()`; `async def ensure_runtime_status_table(db)`; `def scheduler_status_parameters(feature)`; `async def emit_runtime_status(db)`; `async def mark_runtime_owner_stopped(db)`; `async def scheduler_status(db)`
 - **kestrel_sovereign/features/security/__init__.py** — Kestrel Security Feature - Permission management and approval queue.
@@ -649,7 +649,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/github_integration.py** — GitHub API integration helpers for Strategic Memory.
   - `class GitHubAuthError`; `def github_signal_prerequisite(data)`; `def get_github_token()`; `async def github_api_get(path, token)`; `async def github_api_post(path, token, body)`; `def short_repo(repo, all_repos)`; `async def fetch_github_signal(data)`
 - **kestrel_sovereign/features/strategic_memory/issue_selection.py** — Select the highest-priority actionable GitHub issue.
-  - `def parse_issue_ref(value)`; `async def pick_top_issue(data, diagnostics)`
+  - `def parse_issue_ref(value)`; `async def pick_top_issue(data, diagnostics)`; `def describe_exclusion(exclusion)`
 - **kestrel_sovereign/features/strategic_memory/ledger.py** — The strategy ledger: patterns and blockers, canonical but not prompt-injected.
   - `def pattern_row_id(entry)`; `def blocker_row_id(entry)`; `def assign_row_ids(rows, minter)`; `def is_active_pattern(row)`; `def is_active_blocker(row)`; `def active_patterns(rows)`; `def active_blockers(rows)`; `class LedgerSnapshot`; `…`
 - **kestrel_sovereign/features/strategic_memory/ledger_assertions.py** — Map strategy-ledger rows onto canonical semantic assertions (#3051).
@@ -751,10 +751,12 @@ Repo entry points and standard project files.
   - `class HoldEnforcementUnavailableError`; `class HeldWorkDisposition`; `class HoldTurnRefusal`; `def require_context_hold_store(context)`; `async def build_bound_host_context(agent)`; `async def close_bound_host_context(context)`; `async def initialize_with_bound_hold_context(agent)`; `def bound_hold_store(agent)`; `…`
 - **kestrel_sovereign/hold/introspection.py** — Self-scoped, read-only Hold introspection for an agent (#3166).
   - `class SelfHoldStateUnavailable`; `class InvalidHoldHistoryCursor`; `def actor_role()`; `def parse_history_cursor(cursor)`; `class SelfHoldSnapshot`; `async def read_self_hold(agent)`; `async def inspect_self_hold(agent)`
+- **kestrel_sovereign/hold/mandate.py** — Mandate-scoped Hold: an ancestor latches its signed descendants (#3168).
+  - `class MandateHoldRefusal`; `async def hold_descendant()`; `async def release_descendant_hold()`
 - **kestrel_sovereign/hold/metrics.py** — Bounded metrics for work dispositioned by durable Hold.
   - `def record_held_work_disposition()`
 - **kestrel_sovereign/hold/state.py** — Typed, durable host and agent Hold latches.
-  - `class HoldScope`; `class HoldAction`; `class HoldDisposition`; `class HoldAuthority`; `class HoldStateError`; `class HoldIdempotencyConflict`; `class HoldCorruptStateError`; `class PostgresHoldCustodySnapshot`; `…`
+  - `class HoldScope`; `class HoldAction`; `class HoldDisposition`; `class HoldAuthority`; `class HoldStateError`; `class HoldIdempotencyConflict`; `class HoldCorruptStateError`; `class HoldAuthorityMismatch`; `…`
 - **kestrel_sovereign/hooks/__init__.py** — Kestrel Hooks — HooksManager (framework implementation).
 - **kestrel_sovereign/hooks/decision_gate.py** — Shared PRE-hook decision gate.
   - `class BlockedDecision`; `def evaluate_blocking_decision(hook_output)`
@@ -1021,6 +1023,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
 - **kestrel_sovereign/prompts/test_instance_disclosure.md** — Test Instance Disclosure — This disclosure is prepended to the system prompt for test agents.
 - **kestrel_sovereign/prompts/user_prompt.md** — User Prompt Template — This template is used to format the current-turn user message sent to the LLM.
+- **kestrel_sovereign/py.typed** — —
 - **kestrel_sovereign/rate_limit.py** — Shared rate limiter instance for the Kestrel server.
   - `def durable_control_plane_rate_limit_key(request)`
 - **kestrel_sovereign/resume_monitor.py** — Host sleep/wake (suspend/resume) detection for Kestrel Sovereign (#1545).
@@ -1144,10 +1147,12 @@ Repo entry points and standard project files.
   - `def record_echo_verified(source)`; `def record_echo_missing(source)`; `def record_doctrine_bundle_drift(source)`
 - **kestrel_sovereign/signals/context.py** — Dispatch-scoped context: the Signal currently being dispatched.
   - `def get_current_signal()`; `def set_current_signal(signal)`; `def reset_current_signal(token)`; `def bind_current_signal(signal)`
+- **kestrel_sovereign/signals/correlation.py** — Durable correlation-key contract adapter.
+  - `class SignalWithDurableCorrelation`; `def durable_correlation_values(signal)`
 - **kestrel_sovereign/signals/delivery.py** — Terminal-delivery accounting for durable signal producers (#2532).
   - `class DeliveryOutcome`; `async def await_terminal_delivery(handle)`; `def supervise_terminal_delivery(feature, handle)`; `def harvest_detached_delivery(track, enqueue)`
 - **kestrel_sovereign/signals/dispatcher.py** — SignalDispatcher — the runtime engine.
-  - `class DurableAdmissionDisposition`; `class DurableAdmissionResult`; `class SignalDispatchHandle`; `class SignalLogWriteFailure`; `class SignalSurfaceRecord`; `def classify_event_receipt(receipt)`; `class DispatcherAgent`; `class SignalDispatcher`
+  - `class DurableAdmissionDisposition`; `class DurableAdmissionResult`; `class SignalDispatchHandle`; `class SignalLogWriteFailure`; `class SignalSurfaceRecord`; `def classify_event_receipt(receipt)`; `def elides_durable_payloads(config)`; `class DispatcherAgent`; `…`
 - **kestrel_sovereign/signals/durable.py** — Durable, scoped delivery for normalized signal envelopes.
   - `class SQLiteImmediateTransactionBackend`; `class PostgresAdvisoryLockBackend`; `class DurableConsumerRegistration`; `class DurableSignalEvent`; `class DurableSourceBoundary`; `class DurableEventPersistence`; `class DurableInitialDeliveryReservation`; `class DurableDelivery`; `…`
 - **kestrel_sovereign/signals/handlers.py** — Built-in helpers for source handlers.
@@ -1335,7 +1340,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/conversation_sessions.py** — The ``conversation_sessions`` projection (#2959).
   - `def watched_metadata_sql(backend_type, reference)`; `def active_history_predicate()`; `def archived_history_predicate()`; `def live_history_predicate()`; `def canonical_order(backend_type)`; `def canonical_order_index_columns(backend_type)`; `class SessionCursorError`; `def encode_offset_cursor(offset, view)`; `…`
 - **kestrel_sovereign/storage/database_clock.py** — Database-authoritative UTC clock helpers for durable shared state.
-  - `class TimestampBoundOutOfRange`; `def database_backend_type(db)`; `def database_now_sql(db)`; `def database_timestamp_bound_text(db, value)`; `async def database_clock(db)`
+  - `class TimestampBoundOutOfRange`; `def database_backend_type(db)`; `def database_now_sql(db)`; `def database_lease_cutoff_sql(db, lease_seconds)`; `def database_timestamp_bound_text(db, value)`; `async def database_clock(db)`
 - **kestrel_sovereign/storage/db/__init__.py** — Database Backend Factory
   - `def postgres_backend()`; `async def get_backend(config)`; `def create_backend(config)`
 - **kestrel_sovereign/storage/db/interface.py** — Database backend interface — sovereign-side re-export.
@@ -1498,7 +1503,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/waits/engine.py** — The generic wait poll loop and provider registry.
   - `def parse_ref(ref)`; `async def run_wait_loop(provider, handle)`; `class WaitRegistry`
 - **kestrel_sovereign/waits/reconciler.py** — The generic wait reconciler — Wave 2 of the unified-wait epic (#1860).
-  - `def compose_delivery_status(dispatch_status, visibility)`; `class WaitReconciler`; `async def run_wait_reconcile(agent)`; `async def list_undelivered_wakes(agent, limit)`; `async def register_wait_watch(agent, ref)`
+  - `def compose_delivery_status(dispatch_status, visibility)`; `def wake_source(provider)`; `class WaitReconciler`; `async def run_wait_reconcile(agent)`; `async def list_undelivered_wakes(agent, limit)`; `async def register_wait_watch(agent, ref)`; `class DurableResumeUnsupportedError`; `class WaitResumeRegistration`; `…`
 - **kestrel_sovereign/workflow_features.py** — Metadata-only ownership discovery for feature-contributed workflows.
   - `class WorkflowFeatureResolutionError`; `class WorkflowFeatureProvider`; `def resolve_workflow_feature_provider(workflow_name)`; `def resolve_workflow_feature(workflow_name)`
 
@@ -2052,7 +2057,7 @@ Repo entry points and standard project files.
 - **tests/README.md** — Kestrel Test Suite — Commands to run the various test categories for the Kestrel Sovereign AI Agent framework.
 - **tests/__init__.py** — —
 - **tests/conftest.py** — Pytest configuration and shared fixtures for Kestrel tests.
-  - `def isolated_process_rate_limiter()`; `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `def project_root()`; `async def sqlite_database_factory()`; `…`
+  - `def isolated_process_rate_limiter()`; `def pytest_addoption(parser)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_configure(config)`; `def pytest_unconfigure(config)`; `def pytest_runtest_makereport(item, call)`; `def pytest_sessionfinish(session, exitstatus)`; `def setup_test_config()`; `…`
 - **tests/e2e/playwright.config.cjs** — —
 - **tests/e2e/spawn/spawn-console.spec.cjs** — —
 - **tests/e2e/spawn/spawn-lifecycle.spec.cjs** — —
@@ -2422,6 +2427,8 @@ Repo entry points and standard project files.
   - `class MockStorageResult`; `class MockFilecoinAdapter`; `def temp_db()`; `async def test_sovereignty_export_v3_car(temp_db)`; `class MockLLMService`; `class MockWallet`; `async def test_agent_export_command(temp_db, skip_bootstrap)`
 - **tests/integration/test_spawned_by_restart_authority.py** — Durable spawned-by authority crosses a real SQLite restart boundary.
   - `async def test_spawned_by_restart_descendant_authority_round_trip_sqlite(tmp_path)`; `async def test_host_witness_repairs_crash_before_signed_child_edge_sqlite(tmp_path)`
+- **tests/integration/test_stop_claim_takeover.py** — A Stop claim carries its owner's lease; only a dead owner's is taken (#3356).
+  - `async def test_a_claim_records_its_owner_and_heartbeat(db_backend)`; `async def test_a_live_owners_claim_is_never_taken_over(db_backend)`; `async def test_an_expired_lease_is_taken_over_by_the_database_clock(db_backend)`; `async def test_renewal_cannot_revive_an_expired_claim(db_backend)`; `async def test_a_resumed_stale_owner_cannot_write_a_receipt(db_backend)`; `async def test_concurrent_retries_take_over_an_expired_claim_exactly_once(db_backend)`; `async def test_a_pre_liveness_claim_is_live_until_its_grace_ends(db_backend)`; `async def test_legacy_claim_table_gains_owner_columns_and_its_rows_are_retakable(tmp_path)`; `…`
 - **tests/integration/test_storage_backend_parity.py** — SQLite/PostgreSQL semantic parity contracts for storage seams.
   - `async def test_governed_artifact_erasure_lifecycle_has_backend_parity(db_backend, tmp_path)`; `async def test_empty_export_and_corpus_expiry_have_backend_parity(db_backend, tmp_path)`; `async def test_experimental_capability_selection_is_backend_neutral_and_non_migrating(db_backend, tmp_path)`; `async def test_semantic_maintenance_lease_precision_upgrade_is_backend_neutral(db_backend, tmp_path)`; `async def test_constitution_runtime_state_round_trips_on_both_backends(db_backend)`; `async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(db_backend, tmp_path)`; `async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backend, tmp_path)`; `async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parity(db_backend, tmp_path)`; `…`
 - **tests/integration/test_sync_layer.py** — Sync Layer Integration Tests
@@ -2463,6 +2470,10 @@ Repo entry points and standard project files.
   - `class ResourceUsage`; `class CostTracker`; `class track_cost`
 - **tests/shared/genesis_audit.py** — Deterministic genesis auditor for tests that exercise later boundaries.
   - `async def deterministic_safe_genesis_auditor(_prompt)`; `async def complete_deterministic_genesis_audit(agent)`
+- **tests/shared/postgres_requirement.py** — Make the PostgreSQL leg of dual-backend tests fail instead of skip (#3381).
+  - `def postgres_required(environ)`; `def check_session(environ)`; `def is_postgres_case(item)`; `def fail_skipped_postgres_case(item, report)`
+- **tests/shared/postgres_worker_isolation.py** — Give each xdist worker its own PostgreSQL schema (#3383).
+  - `class WorkerSchema`; `def worker_schema_name(worker_id)`; `def isolate_xdist_worker(environ)`; `def release_worker_schema(owned)`
 - **tests/shared/pytest_cleanup_plugin.py** — Pytest plugin for resource cleanup hooks.
   - `def pytest_configure(config)`; `def pytest_sessionstart(session)`; `def pytest_sessionfinish(session, exitstatus)`; `def pytest_keyboard_interrupt(excinfo)`; `def pytest_collection_modifyitems(config, items)`; `def pytest_runtest_setup(item)`; `def pytest_runtest_teardown(item)`; `def pytest_exception_interact(node, call, report)`; `…`
 - **tests/shared/resource_registry.py** — Global resource registry for test cleanup.
@@ -3193,6 +3204,8 @@ Repo entry points and standard project files.
   - `def test_read_composes_the_two_independent_latches_per_agent()`; `def test_the_inventory_costs_one_store_read_not_one_per_card()`; `async def test_one_snapshot_is_measured_against_the_real_store(tmp_path, monkeypatch)`; `async def test_a_host_resume_leaves_an_agents_own_hold_standing(tmp_path)`; `def test_read_reports_authority_without_refusing_the_view()`; `def test_read_refuses_rather_than_reporting_an_unreadable_store_as_unheld()`; `def test_hold_latches_the_agents_did_and_names_the_sovereign_actor()`; `def test_hold_refuses_a_target_this_host_does_not_host()`; `…`
 - **tests/unit/test_hold_introspection.py** — Self-scoped Hold introspection and the recorded Hold authority (#3166).
   - `async def hold_db(tmp_path)`; `async def test_released_hold_reads_back_as_an_episode_after_resume(hold_db)`; `async def test_tool_reports_the_episode_to_the_resumed_agent(hold_db)`; `async def test_non_applied_receipts_are_part_of_the_history(hold_db)`; `async def test_history_is_bounded_newest_first_and_offers_a_cursor(hold_db)`; `async def test_maximum_history_pages_within_the_orchestrator_cap(hold_db)`; `async def test_ordinary_25_hold_history_is_served_whole_not_cut(hold_db)`; `async def test_an_entry_too_large_for_the_channel_is_withheld_not_cut(hold_db, monkeypatch)`; `…`
+- **tests/unit/test_hold_mandate.py** — Mandate-scoped Hold: an ancestor latches its signed descendants (#3168).
+  - `async def hold_store(tmp_path)`; `async def test_parent_holds_direct_and_cascading_descendants(tmp_path, hold_store)`; `async def test_only_a_signed_ancestor_may_hold(tmp_path, hold_store, holder, target)`; `async def test_an_expired_mandate_confers_no_hold(tmp_path, hold_store, monkeypatch)`; `async def test_a_tampered_mandate_fails_closed(tmp_path, hold_store)`; `async def test_a_mandate_signed_by_the_wrong_parent_fails_closed(tmp_path, hold_store)`; `async def test_a_signed_cycle_fails_closed(tmp_path, hold_store)`; `async def test_an_ambiguous_descendant_graph_fails_closed(tmp_path, hold_store)`; `…`
 - **tests/unit/test_hold_state.py** — —
   - `async def hold_db(tmp_path)`; `async def test_postgres_advisory_lock_rejects_unvalidated_lock_session_cluster(monkeypatch)`; `async def test_postgres_operational_session_routes_queries_on_checked_connection()`; `async def test_postgres_operational_session_owned_child_reuses_checked_connection()`; `async def test_postgres_custody_locks_bind_each_session_to_probed_cluster()`; `async def test_postgres_custody_metadata_probe_is_bound_to_current_schema()`; `async def test_postgres_custody_snapshot_pins_one_operational_session()`; `def test_readiness_rejects_duplicate_rows_before_predicting_index_repair(tmp_path)`; `…`
 - **tests/unit/test_hold_turn_enforcement.py** — Turn-start Hold is unconditional, typed, and source-independent (#3162).
@@ -3483,6 +3496,8 @@ Repo entry points and standard project files.
   - `def network_export_sentinel(monkeypatch)`; `def test_autouse_fixture_disables_llm_tracing_by_default()`; `def test_llm_span_cycle_never_exports_over_network(network_export_sentinel)`; `def test_endpoint_set_run_uses_in_memory_exporter_not_network(monkeypatch, network_export_sentinel)`
 - **tests/unit/test_ownership_backfill_once.py** — Regression: #2649 ownership backfills must run once, not on every from_pool.
   - `async def db(tmp_path)`; `async def test_first_init_records_marker(db)`; `async def test_backfills_skip_when_marker_present(db, monkeypatch)`; `async def test_backfills_rerun_if_marker_absent(db, monkeypatch)`; `async def test_document_chunk_backfill_assigns_only_single_owner_files(db)`; `async def test_migration_lock_rolls_the_whole_body_back(db)`; `async def test_migration_lock_serializes_concurrent_holders(db)`; `async def test_migration_lock_takes_the_sqlite_writer_slot_up_front(db)`; `…`
+- **tests/unit/test_packaging_typed_marker.py** — The ``Typing :: Typed`` classifier must be backed by a PEP 561 marker (#2683).
+  - `def built_wheel(tmp_path_factory)`; `def test_pyproject_declares_typed_classifier()`; `def test_source_tree_carries_full_package_marker()`; `def test_wheel_contents_agree_with_its_metadata(built_wheel)`; `def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path)`
 - **tests/unit/test_path_identity.py** — Physical and spelling aliases cannot cross host custody boundaries.
   - `def test_future_descendants_below_aliased_existing_ancestors_overlap(tmp_path, monkeypatch, module, function_name)`; `def test_unicode_normalization_aliases_do_not_depend_on_case_behavior(tmp_path, monkeypatch, module, function_name)`; `def test_unknown_case_semantics_fail_closed_for_future_aliases(tmp_path, monkeypatch, module, function_name)`; `def test_equal_identity_fails_closed_when_case_semantics_are_unknown(tmp_path, monkeypatch)`; `def test_equal_identity_uses_aliased_ancestor_suffixes(tmp_path, monkeypatch)`; `def test_case_probe_uses_entry_inside_mount_root(tmp_path, monkeypatch, module)`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
@@ -3541,6 +3556,10 @@ Repo entry points and standard project files.
   - `class TestMemorySystemTagMessage`; `class TestMemoryManagerTagExchange`; `class TestUpdateMessageMetadataAtomicMerge`; `class TestEpisodeCreationThreshold`; `class TestPostResponsePipeline`
 - **tests/unit/test_postgres_birth_record.py** — #2878 — boot must refuse (never fabricate a placeholder) when on-disk identity material is present but the agent node is absent from the runtime database.
   - `def hybrid_env(monkeypatch)`; `async def test_boot_refuses_when_identity_present_but_node_absent(tmp_path, hybrid_env)`; `async def test_boot_fabricates_node_for_genuinely_new_agent(tmp_path, hybrid_env)`; `async def test_boot_returns_existing_node_without_refusing(tmp_path, hybrid_env)`; `def test_birth_record_refusal_message_is_public_safe(tmp_path, hybrid_env)`
+- **tests/unit/test_postgres_requirement.py** — The unit tier runs its PostgreSQL cases in CI, and cannot skip them (#3381).
+  - `def required(monkeypatch)`; `def test_a_required_run_without_the_url_refuses_to_start()`; `def test_the_gate_asks_for_the_url_every_fixture_reads()`; `def test_a_required_run_with_the_url_starts()`; `def test_an_unrequired_run_starts_without_a_url(value)`; `def test_an_unrecognised_requirement_is_refused_not_read_as_off(value)`; `def test_a_skipped_postgres_case_fails_when_required(required)`; `def test_any_fixture_parametrized_with_postgres_counts(required)`; `…`
+- **tests/unit/test_postgres_worker_isolation.py** — xdist workers do not race each other through PostgreSQL's catalogs (#3383).
+  - `def test_a_process_that_is_not_an_xdist_worker_keeps_its_url()`; `def test_a_worker_without_a_postgres_url_has_nothing_to_isolate()`; `def test_this_worker_runs_in_a_schema_of_its_own()`; `def test_worker_schema_names_are_unique_per_run_and_safe_identifiers()`; `def test_a_required_worker_that_cannot_create_its_schema_stops_the_session()`; `def test_an_unrequired_worker_keeps_its_url_so_its_cases_skip_as_before()`; `def test_a_schema_that_cannot_be_dropped_warns_instead_of_failing_the_run()`; `def test_releasing_nothing_is_a_no_op()`; `…`
 - **tests/unit/test_privacy_active_session_contracts.py** — Active-session privacy transition contracts.
   - `async def test_privacy_transition_waits_for_active_stream_before_switching_modes()`; `async def test_streaming_omits_briefing_after_session_was_briefed()`
 - **tests/unit/test_privacy_add_conversation_signature_contract.py** — Contract test: PrivacyAgent.add_conversation must accept every keyword that the storage-layer add_conversation accepts.
@@ -3778,7 +3797,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_shacl_validation.py** — Contracts for the governed, capability-pinned SHACL validation service.
   - `def test_core_constraint_fixture_reports_nonconformance_without_data_values()`; `def test_write_policy_is_explicit_by_source_for_a_violation(source, expected)`; `def test_failed_prepublication_report_cannot_claim_or_retain_an_assertion_identity()`; `def test_warning_is_accept_with_report_but_never_changes_violation_semantics()`; `def test_core_logical_qualified_property_and_compound_path_fixtures()`; `def test_qualified_value_shapes_disjoint_changes_the_qualified_count()`; `def test_deactivated_property_shapes_never_evaluate_their_path()`; `def test_incremental_focus_uses_full_graph_and_matches_full_audit_for_changed_node()`; `…`
 - **tests/unit/test_shared_content_node_ownership.py** — Co-ownership of a fleet-shared graph node — the two questions (#2893).
-  - `async def db(db_backend)`; `def artifact_bytes()`; `def constitution_bytes()`; `class TestAcceptanceDoesNotDependOnOrder`; `class TestCoOwnersMustAgree`; `class TestTheSwapDoorDeclinesSharedRows`; `class TestLegacyNormalisationIsNarrow`; `class TestTheShapeIsReadOffTheStoredRow`
+  - `async def db(db_backend)`; `async def sqlite_db(sqlite_backend)`; `def artifact_bytes()`; `def constitution_bytes()`; `class TestAcceptanceDoesNotDependOnOrder`; `class TestCoOwnersMustAgree`; `class TestTheSwapDoorDeclinesSharedRows`; `class TestLegacyNormalisationIsNarrow`; `…`
 - **tests/unit/test_shared_content_node_properties.py** — The key-set guard on properties a PostgreSQL fleet co-owns (#2893).
   - `class TestConstitutionAnchor`; `class TestAmendmentArtifact`; `def test_a_naive_signed_timestamp_is_still_shareable()`; `def test_an_unbounded_timestamp_is_still_refused()`
 - **tests/unit/test_shared_model_cache.py** — Tests for SharedModelCache — process-wide model discovery cache.
@@ -3904,7 +3923,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_strategic_memory_created_at_contract.py** — Strategic-memory projections stamp ``created_at`` under the graph contract (#3255).
   - `def test_contract_created_at(value, expected, new_york_clock)`; `def test_stamp_leaves_the_key_absent_when_nothing_is_known()`; `def test_every_writer_stamps_the_contract_shape()`; `def test_every_writer_leaves_the_key_absent_for_a_dateless_row()`; `async def test_reindex_rewrites_bare_date_and_empty_stamps(tmp_path)`
 - **tests/unit/test_strategic_memory_issue_selection.py** — Tests for provider-neutral strategic-memory issue selection.
-  - `async def test_pick_top_issue_requires_github_token(monkeypatch)`; `async def test_pick_top_issue_requires_scan_repositories(monkeypatch)`; `def test_select_best_candidate_skips_blocked_and_prefers_unassigned_low_comment()`; `async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypatch)`; `class TestReferencePrefixMustLookLikeARepository`; `async def test_the_live_host_shape_a_closed_issue_is_not_dispatched(monkeypatch)`; `async def test_a_closed_blocker_gives_way_to_the_open_one_behind_it(monkeypatch)`; `async def test_an_ambiguous_number_is_never_guessed_into_a_repository(monkeypatch)`; `…`
+  - `async def test_pick_top_issue_requires_github_token(monkeypatch)`; `async def test_pick_top_issue_requires_scan_repositories(monkeypatch)`; `def test_ranked_candidates_skip_blocked_and_prefer_unassigned_low_comment()`; `async def test_pick_top_issue_does_not_fetch_unused_morning_projection(monkeypatch)`; `class TestReferencePrefixMustLookLikeARepository`; `async def test_the_live_host_shape_a_closed_issue_is_not_dispatched(monkeypatch)`; `async def test_a_closed_blocker_gives_way_to_the_open_one_behind_it(monkeypatch)`; `async def test_an_ambiguous_number_is_never_guessed_into_a_repository(monkeypatch)`; `…`
 - **tests/unit/test_strategic_memory_ledger_assertions.py** — The strategy-ledger assertion producer, against the REAL governed store (#3051).
   - `def tenant_identity(tmp_path_factory)`; `async def governed(tenant_identity)`; `def ledger(tmp_path)`; `async def project(storage, book)`; `async def active(storage)`; `async def every(storage)`; `def seed(book)`; `def test_predicates_are_declared_terms_of_the_pinned_ontology()`; `…`
 - **tests/unit/test_strategic_memory_toolresult.py** — ToolResult contract tests for StrategicMemoryFeature (#1061 wave 12).
@@ -4043,6 +4062,8 @@ Repo entry points and standard project files.
   - `async def db(tmp_path, sqlite_database_factory)`; `async def test_task_watch_on_outbound_a2a_id_is_rejected(db)`; `async def test_valid_local_task_watch_is_accepted(db)`; `async def test_a2a_watch_on_owned_outbound_id_is_accepted(db)`; `async def test_a2a_watch_on_outbound_question_is_rejected(db)`; `async def test_a2a_watch_rearms_across_restart_and_completes_once(db)`; `async def test_ci_watch_rearms_across_restart_and_completes_once(db, monkeypatch)`
 - **tests/unit/test_wait_reconciler.py** — Tests for the generic wait reconciler (Wave 2 of #1860).
   - `def make_agent(tmp_path, sqlite_database_factory)`; `async def test_emits_one_signal_per_transition(make_agent)`; `async def test_no_signal_for_pending_handles(make_agent)`; `async def test_records_ok_as_persisted_and_locks_outcome(make_agent)`; `async def test_coalesced_counts_as_persisted(make_agent)`; `async def test_corrected_native_status_resignals_within_same_outcome(make_agent)`; `async def test_soft_fail_does_not_lock_and_retries_with_fresh_attempt(make_agent)`; `async def test_hard_fail_locks_signaled(make_agent)`; `…`
+- **tests/unit/test_wait_resume_consumer.py** — Durable resume on a wait handle's wake (#3295).
+  - `async def rig(tmp_path, sqlite_database_factory)`; `async def test_registration_targets_the_providers_own_wake(rig)`; `async def test_terminal_handle_resumes_its_parked_consumer(rig)`; `async def test_another_handles_wake_does_not_resume_it(rig)`; `async def test_poll_data_cannot_redirect_the_wake(rig)`; `async def test_wake_committed_before_registration_is_backfilled(rig)`; `async def test_elided_wake_before_registration_reports_terminal(rig, preset)`; `async def test_post_registration_poll_failure_is_not_reported_as_running(rig, monkeypatch)`; `…`
 - **tests/unit/test_wait_signal_store.py** — CRUD tests for ``WaitSignalStore`` (Wave 2 of #1860).
   - `def make_store(tmp_path, sqlite_database_factory)`; `async def test_get_missing_returns_none(make_store)`; `async def test_record_pending_then_get(make_store)`; `async def test_record_pending_preserves_signaled_outcome(make_store)`; `async def test_record_delivery_locks_outcome_and_clears_pending(make_store)`; `async def test_record_delivery_soft_fail_does_not_lock_outcome(make_store)`; `async def test_list_pending_filters_to_unharvested(make_store)`; `async def test_clear_pending_nulls_only_pending_fields(make_store)`; `…`
 - **tests/unit/test_wake_provider_deferral.py** — #3302: a wake retried through a provider's advised rate-limit wait.
@@ -4077,11 +4098,13 @@ Repo entry points and standard project files.
 - **tests/utils/feedback_bridge.py** — Test Result Feedback Bridge.
   - `class TestOutcome`; `class TestResult`; `class TestRunSummary`; `class TestResultCollector`; `def determine_severity(result, summary)`; `def determine_category(result)`; `def create_feedback_title(result)`; `def create_feedback_description(result, summary)`; `…`
 - **tests/utils/hold_history_v1.py** — Rewind a Hold store to the state a pre-``authority`` release left behind.
-  - `def v1_history_anchor(rows)`; `async def v1_receipt_rows(db)`; `async def publish_history_head(store, payload)`; `async def rewind_to_v1_history_anchor(db, store)`
+  - `def v1_history_anchor(rows)`; `async def v1_receipt_rows(db)`; `async def publish_history_head(store, payload)`; `async def rewind_to_v1_history_anchor(db, store)`; `def v2_history_anchor(rows)`; `async def rewind_to_v2_history_anchor(db, store)`
 - **tests/utils/legacy_conversation_history.py** — Seed a pre-#3009 ``conversation_history`` and open it (#3009).
   - `def write_legacy_history(path, rows)`; `async def open_legacy_history(path, rows)`
 - **tests/utils/parallel_support.py** — Parallel test execution support utilities.
   - `def get_worker_id()`; `def unique_email(prefix, domain)`; `def unique_name(prefix)`; `def worker_cleanup_pattern()`; `def redis_key(key)`; `class TestDataFactory`
+- **tests/utils/postgres_schema.py** — Disposable PostgreSQL schemas for tests that need a database of their own.
+  - `def postgres_test_url(environ)`; `def with_search_path(url, schema)`; `async def disposable_postgres_schema(admin, prefix)`
 - **tests/utils/test_result_analyzer.py** — Test Result Analyzer for Agent Reflection.
   - `class InsightType`; `class TestInsight`; `class TestPattern`; `class TestResultAnalyzer`
 
