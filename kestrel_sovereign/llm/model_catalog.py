@@ -238,14 +238,19 @@ def _read_kestrel_toml_route_caps(
         candidate_paths = [path]
     else:
         candidate_paths = []
+        # Late import to avoid pulling paths.py into model_catalog's
+        # already-busy import surface at module-load time.
+        from kestrel_sovereign.paths import (
+            AGENT_DB_PATH_ENV,
+            project_dir,
+            runtime_path_env,
+        )
+
         # Mirror config.load_section's order: KESTREL_DB_PATH first.
-        db_path = os.environ.get("KESTREL_DB_PATH")
+        db_path = runtime_path_env(AGENT_DB_PATH_ENV)
         if db_path:
             candidate_paths.append(Path(db_path) / "kestrel.toml")
         try:
-            # Late import to avoid pulling paths.py into model_catalog's
-            # already-busy import surface at module-load time.
-            from kestrel_sovereign.paths import project_dir
             candidate_paths.append(project_dir() / "kestrel.toml")
         except Exception as e:
             logger.debug(

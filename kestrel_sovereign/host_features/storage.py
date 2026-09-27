@@ -12,7 +12,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, MutableMapping, Optional
 
-from kestrel_sovereign.paths import host_data_dir, project_dir
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    DERIVED_HOST_DB_PATH_ENV,
+    HOME_ENV,
+    HOST_DB_LEGACY_PATH_ENV,
+    HOST_DB_PATH_ENV,
+    HOST_DB_PREVIOUS_DEFAULT_ENV,
+    host_data_dir,
+    project_dir,
+    guard_storage_path,
+    runtime_path_env,
+)
 from kestrel_sovereign.private_storage import (
     PRIVATE_FILE_MODE,
     PrivateStorageError,
@@ -28,12 +39,7 @@ from kestrel_sovereign.security.path_identity import (
     paths_equal_by_filesystem_identity,
 )
 
-HOST_DB_PATH_ENV = "KESTREL_HOST_DB_PATH"
-DERIVED_HOST_DB_PATH_ENV = "KESTREL_DERIVED_HOST_DB_PATH"
 HOST_DB_USES_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_USES_DEFAULT"
-HOST_DB_PREVIOUS_DEFAULT_ENV = "KESTREL_HOST_DB_LAUNCH_PREVIOUS_DEFAULT"
-HOST_DB_LEGACY_PATH_ENV = "KESTREL_HOST_DB_LAUNCH_LEGACY_PATH"
-AGENT_DB_PATH_ENV = "KESTREL_DB_PATH"
 HOST_FEATURE_DB_FILENAME = "host-features.db"
 LEGACY_HOST_DB_FILENAME = "kestrel_host.db"
 SQLITE_AUXILIARY_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -94,7 +100,7 @@ def _default_host_database_path(
 ) -> Path:
     """Resolve the private default from a described runtime, without mutating it."""
 
-    configured_home = env.get("KESTREL_HOME")
+    configured_home = runtime_path_env(HOME_ENV, environ=env, base=base_dir)
     if configured_home:
         root = _runtime_path(configured_home, env, base_dir)
     else:
@@ -104,7 +110,10 @@ def _default_host_database_path(
             if runtime_home
             else absolute_without_following_leaf(Path.home() / ".kestrel")
         )
-    return root / "host-data" / HOST_FEATURE_DB_FILENAME
+    return guard_storage_path(
+        root / "host-data" / HOST_FEATURE_DB_FILENAME,
+        source="default host database",
+    )
 
 
 def host_database_path(
@@ -122,15 +131,28 @@ def host_database_path(
 
     runtime_env = os.environ if env is None else env
     runtime_base = absolute_without_following_leaf(base_dir or Path.cwd())
-    explicit = db_path or runtime_env.get(HOST_DB_PATH_ENV)
+    explicit = db_path or runtime_path_env(
+        HOST_DB_PATH_ENV, environ=runtime_env, base=runtime_base
+    )
     if explicit:
-        return _runtime_path(explicit, runtime_env, runtime_base), False
-    agent_data_root = runtime_env.get(AGENT_DB_PATH_ENV)
+        return (
+            guard_storage_path(
+                _runtime_path(explicit, runtime_env, runtime_base),
+                source="host database",
+            ),
+            False,
+        )
+    agent_data_root = runtime_path_env(
+        AGENT_DB_PATH_ENV, environ=runtime_env, base=runtime_base
+    )
     if agent_data_root:
         return (
-            _runtime_path(agent_data_root, runtime_env, runtime_base)
-            / "host-data"
-            / HOST_FEATURE_DB_FILENAME,
+            guard_storage_path(
+                _runtime_path(agent_data_root, runtime_env, runtime_base)
+                / "host-data"
+                / HOST_FEATURE_DB_FILENAME,
+                source="agent-data-root host database",
+            ),
             False,
         )
     return _default_host_database_path(runtime_env, runtime_base), True
@@ -159,8 +181,12 @@ def resolve_host_database_launch_context(
         env=runtime_env,
         base_dir=runtime_base,
     )
-    configured_host_path = runtime_env.get(HOST_DB_PATH_ENV)
-    derived_host_path = runtime_env.get(DERIVED_HOST_DB_PATH_ENV)
+    configured_host_path = runtime_path_env(
+        HOST_DB_PATH_ENV, environ=runtime_env, base=runtime_base
+    )
+    derived_host_path = runtime_path_env(
+        DERIVED_HOST_DB_PATH_ENV, environ=runtime_env, base=runtime_base
+    )
     launcher_pin = bool(
         not db_path
         and configured_host_path
@@ -169,7 +195,9 @@ def resolve_host_database_launch_context(
     explicit_override = bool(
         db_path or (configured_host_path and not launcher_pin)
     )
-    configured_project_root = runtime_env.get("KESTREL_HOME")
+    configured_project_root = runtime_path_env(
+        HOME_ENV, environ=runtime_env, base=runtime_base
+    )
     launch_project_root = (
         _runtime_path(configured_project_root, runtime_env, runtime_base)
         if configured_project_root
@@ -185,14 +213,18 @@ def resolve_host_database_launch_context(
                     f"{HOST_DB_USES_DEFAULT_ENV} must be '0' or '1'"
                 )
             uses_default = pinned_uses_default == "1"
-        pinned_previous_default = runtime_env.get(HOST_DB_PREVIOUS_DEFAULT_ENV)
+        pinned_previous_default = runtime_path_env(
+            HOST_DB_PREVIOUS_DEFAULT_ENV, environ=runtime_env, base=runtime_base
+        )
         if pinned_previous_default:
             previous_default = _runtime_path(
                 pinned_previous_default,
                 runtime_env,
                 runtime_base,
             )
-        pinned_legacy_path = runtime_env.get(HOST_DB_LEGACY_PATH_ENV)
+        pinned_legacy_path = runtime_path_env(
+            HOST_DB_LEGACY_PATH_ENV, environ=runtime_env, base=runtime_base
+        )
         if pinned_legacy_path:
             legacy_database_path = _runtime_path(
                 pinned_legacy_path,
@@ -203,8 +235,12 @@ def resolve_host_database_launch_context(
         database_path=database_path,
         uses_default=uses_default,
         explicit_override=explicit_override,
-        previous_default=previous_default,
-        legacy_database_path=legacy_database_path,
+        previous_default=guard_storage_path(
+            previous_default, source="previous default host database"
+        ),
+        legacy_database_path=guard_storage_path(
+            legacy_database_path, source="legacy host database"
+        ),
         backend_environment=tuple(
             (name, runtime_env[name])
             for name in _HOST_BACKEND_ENV_NAMES
@@ -242,7 +278,10 @@ def pin_host_database_launch_context(
 
 def legacy_host_database_path() -> Path:
     """Return the pre-#2610 project-root host-feature database location."""
-    return absolute_without_following_leaf(project_dir() / LEGACY_HOST_DB_FILENAME)
+    return guard_storage_path(
+        absolute_without_following_leaf(project_dir() / LEGACY_HOST_DB_FILENAME),
+        source="legacy host database",
+    )
 
 
 def sqlite_family(path: Path) -> tuple[Path, ...]:
@@ -638,8 +677,8 @@ def prepare_host_database(
         raise ValueError("db_path and launch_context are mutually exclusive")
     if launch_context is None:
         destination, uses_default = host_database_path(db_path)
-        configured_host_path = os.environ.get(HOST_DB_PATH_ENV)
-        derived_host_path = os.environ.get(DERIVED_HOST_DB_PATH_ENV)
+        configured_host_path = runtime_path_env(HOST_DB_PATH_ENV)
+        derived_host_path = runtime_path_env(DERIVED_HOST_DB_PATH_ENV)
         launcher_derived_override = bool(
             not db_path
             and configured_host_path

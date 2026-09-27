@@ -9,7 +9,8 @@ This is what makes "TOKEMMA" alone generate the character without description.
 
 Environment Variables:
     LOCAL_MPS_MODEL_PATH: Path to SDXL model in diffusers format (required)
-    LOCAL_MPS_WORKING_DIR: Working directory for training (default: ~/models/local-training)
+    LOCAL_MPS_WORKING_DIR: Working directory for training
+        (default: $KESTREL_DATA_DIR/kestrel-training, else ~/kestrel-training)
     DIFFUSERS_PATH: Path to diffusers installation (required for training)
 """
 
@@ -37,6 +38,11 @@ from ..types import (
     GenerationResult,
     GenerationState,
 )
+from kestrel_sovereign.paths import (
+    DATA_DIR_ENV,
+    TRAINING_WORKING_DIR_ENV,
+    runtime_path_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +50,20 @@ logger = logging.getLogger(__name__)
 # RealVisXL V5.0 in diffusers format - photorealistic, top-rated SDXL model
 # Used for both training (with text encoder) and inference
 DEFAULT_MODEL_PATH = os.environ.get("LOCAL_MPS_MODEL_PATH", "")
-DEFAULT_WORKING_DIR = os.environ.get(
-    "LOCAL_MPS_WORKING_DIR",
-    os.path.join(
-        os.environ.get("KESTREL_DATA_DIR", os.path.expanduser("~")), "kestrel-training"
-    ),
-)
 DEFAULT_DIFFUSERS_PATH = os.environ.get("DIFFUSERS_PATH", "")
 
 GENERATION_TIMEOUT_SECONDS = 300
+
+
+def default_working_dir() -> str:
+    """The training working directory when the caller names none.
+
+    Resolved on call, not at import, so the environment in force when the
+    adapter is built decides it.
+    """
+    return runtime_path_env(TRAINING_WORKING_DIR_ENV) or os.path.join(
+        runtime_path_env(DATA_DIR_ENV, os.path.expanduser("~")), "kestrel-training"
+    )
 
 
 def _prepare_training_files(
@@ -247,9 +258,7 @@ class LocalMPSTrainingAdapter(TrainingProvider):
         self.model_path = Path(
             model_path or os.getenv("LOCAL_MPS_MODEL_PATH", DEFAULT_MODEL_PATH)
         )
-        self.working_dir = Path(
-            working_dir or os.getenv("LOCAL_MPS_WORKING_DIR", DEFAULT_WORKING_DIR)
-        )
+        self.working_dir = Path(working_dir or default_working_dir()).expanduser()
         self.diffusers_path = Path(
             diffusers_path or os.getenv("DIFFUSERS_PATH", DEFAULT_DIFFUSERS_PATH)
         )

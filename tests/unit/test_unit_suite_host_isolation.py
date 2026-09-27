@@ -39,7 +39,7 @@ from kestrel_sovereign.host_features.storage import (
     host_database_path,
 )
 
-from tests.unit.conftest import ISOLATION_DIRNAME
+from tests.shared.host_runtime_isolation import ISOLATION_DIRNAME
 
 
 def test_resolved_host_database_is_inside_the_isolation_root(
@@ -169,12 +169,13 @@ def test_the_opt_out_hands_enablement_back_to_the_test(tmp_path, monkeypatch):
     resolves — and a test that owns that dir gets exactly the host features it
     declares. Deliberately does not assert against the operator's real
     manifest: that would make the suite's result depend on their machine.
+    Unpinned, the project dir would be the checkout, which the storage-root
+    guard refuses (#3286), so the test names its own.
     """
-    assert ISOLATION_DIRNAME not in str(_lifespan_manifest_path())
-
     monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
     paths.reset_cache()
     try:
+        assert ISOLATION_DIRNAME not in str(_lifespan_manifest_path())
         _lifespan_manifest_path().write_text(
             f'[[feature]]\nname = "{_StartsInUnitTests.name}"\n'
             f"host_scoped = true\nenabled = true\n",

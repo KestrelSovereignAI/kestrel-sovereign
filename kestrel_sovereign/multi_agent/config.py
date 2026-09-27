@@ -22,7 +22,7 @@ from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did_sync,
 )
-from kestrel_sovereign.paths import spawned_agent_env
+from kestrel_sovereign.paths import guard_storage_path, spawned_agent_env
 from kestrel_sovereign.security.path_identity import (
     paths_equal_by_filesystem_identity,
     paths_overlap_by_filesystem_identity,
@@ -228,8 +228,10 @@ class LocalAgentConfig(BaseModel):
         """Resolve this agent's data root using the runtime project base."""
 
         if base_dir is None:
-            return self.data_dir.expanduser().resolve()
-        return (base_dir / self.data_dir.expanduser()).resolve()
+            resolved = self.data_dir.expanduser().resolve()
+        else:
+            resolved = (base_dir / self.data_dir.expanduser()).resolve()
+        return guard_storage_path(resolved, source="agent data_dir")
 
     def resolve_identity_export_dir(
         self,
@@ -241,8 +243,10 @@ class LocalAgentConfig(BaseModel):
             return None
         configured = self.identity_export_dir.expanduser()
         if configured.is_absolute():
-            return configured.resolve()
-        return (self.resolve_data_dir(base_dir) / configured).resolve()
+            resolved = configured.resolve()
+        else:
+            resolved = (self.resolve_data_dir(base_dir) / configured).resolve()
+        return guard_storage_path(resolved, source="agent identity_export_dir")
 
     def validate_runtime(self, base_dir: Optional[Path] = None) -> list[str]:
         """Validate that data_dir exists and contains a database.
@@ -507,7 +511,12 @@ class MultiAgentConfig(BaseModel):
         Returns:
             MultiAgentConfig with auto-discovered agents
         """
-        base_path = Path(base_dir)
+        # The scan root is read before any agent path is resolved (and
+        # guarded), so it is itself a storage path: the default is
+        # cwd-relative and names whichever checkout launched the host.
+        base_path = guard_storage_path(
+            Path(base_dir), source="multi-agent auto-discovery root"
+        )
         target_base = (
             project_base.resolve(strict=False)
             if project_base is not None
@@ -615,7 +624,13 @@ class MultiAgentConfig(BaseModel):
             MultiAgentConfig instance
         """
         if config_path is None:
-            config_path = Path.cwd() / MULTI_AGENT_CONFIG_FILENAME
+            # The ambient default: a registry in whatever directory the
+            # process runs from, which in an operator's checkout names the
+            # operator's agents. An explicit path is the caller's choice.
+            config_path = guard_storage_path(
+                Path.cwd() / MULTI_AGENT_CONFIG_FILENAME,
+                source=f"{MULTI_AGENT_CONFIG_FILENAME} in the current directory",
+            )
 
         path = Path(config_path)
 

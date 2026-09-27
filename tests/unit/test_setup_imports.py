@@ -18,9 +18,12 @@ already-imported test fixtures bound to stale references.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
+
+from kestrel_sovereign import paths
 
 
 def _run(script: str, cwd: str = "/tmp") -> subprocess.CompletedProcess:
@@ -118,7 +121,17 @@ def test_kestrel_setup_check_cli_runs_without_circular_import(tmp_path):
         capture_output=True,
         text=True,
         timeout=30,
-        env={"KESTREL_NONINTERACTIVE": "1", "PATH": "/usr/bin:/bin"},
+        # A scrubbed environment would drop HOME and KESTREL_HOME (so the
+        # child resolves the checkout or the operator's real ~/.kestrel) and
+        # the harness's storage-root guard; `setup --check` then read the live
+        # host database (#3286).
+        env={
+            "KESTREL_NONINTERACTIVE": "1",
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path / "home"),
+            paths.HOME_ENV: str(tmp_path),
+            paths.STORAGE_ROOTS_ENV: os.environ[paths.STORAGE_ROOTS_ENV],
+        },
     )
     combined = (result.stdout + result.stderr).lower()
     assert "circular import" not in combined

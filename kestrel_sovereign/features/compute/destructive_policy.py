@@ -17,7 +17,7 @@ import shlex
 from typing import Optional
 
 from kestrel_sovereign.host_features.storage import host_database_path
-from kestrel_sovereign.paths import project_dir
+from kestrel_sovereign.paths import TRASH_DIR_ENV, project_dir, runtime_path_env
 from kestrel_sovereign.security.path_identity import (
     is_multiply_linked_regular_file,
     paths_overlap_by_filesystem_identity,
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_TRASH_DIR = Path(
-    os.environ.get("KESTREL_TRASH_DIR", os.path.expanduser("~/.kestrel/trash"))
+    runtime_path_env(TRASH_DIR_ENV, os.path.expanduser("~/.kestrel/trash"))
 )
 
 # Each value denotes a parent plus a generated-directory name prefix, not an

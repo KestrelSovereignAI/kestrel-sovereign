@@ -31,6 +31,7 @@ from kestrel_sovereign.features.sovereignty.artifacts import (
     owned_content_hashes,
 )
 from kestrel_sovereign.hold import HoldTurnRefusal
+from kestrel_sovereign.paths import CACHE_DIR_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ router = APIRouter(prefix="/api", tags=["sovereignty"])
 # the package-relative path no longer matches the operator's cache,
 # so the file browser silently listed the wrong directory.
 STORAGE_CACHE_DIR = Path(
-    os.environ.get("KESTREL_CACHE_DIR") or "storage_cache"
+    runtime_path_env(CACHE_DIR_ENV) or "storage_cache"
 ).resolve()
 
 # Allowlist of valid storage tiers for sovereignty export. Each value here

@@ -3730,7 +3730,7 @@ async def test_terminate_child_keeps_tracking_when_quarantined_refund_restores_h
 
 
 @pytest.mark.asyncio
-async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles() -> None:
+async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(tmp_path) -> None:
     """A failed onboarding cannot hide caller cancellation behind cleanup work."""
 
     class BlockingCleanupAgent:
@@ -3746,7 +3746,7 @@ async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(
             self.cleanup_started.set()
             await self.allow_cleanup.wait()
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     agent = BlockingCleanupAgent()
     config = LocalAgentConfig(data_dir="batch-cancel", port=8801)
 
@@ -3771,10 +3771,10 @@ async def test_batch_onboarding_cancellation_wins_after_claimed_cleanup_settles(
 
 
 @pytest.mark.asyncio
-async def test_batch_claims_failed_onboarding_result_before_cleanup_failure() -> None:
+async def test_batch_claims_failed_onboarding_result_before_cleanup_failure(tmp_path) -> None:
     """One failed cleanup is aggregated once; it never gets a second shutdown."""
 
-    manager = AgentManager()
+    manager = AgentManager(base_data_dir=tmp_path)
     agent = SimpleNamespace(agent_id="did:test:batch-cleanup-once")
     config = LocalAgentConfig(data_dir="batch-once", port=8801)
     cleanup_calls = 0

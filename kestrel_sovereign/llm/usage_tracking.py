@@ -16,6 +16,7 @@ from kestrel_sovereign.security.host_authority import require_sovereign_caller
 from kestrel_sovereign.storage.db.postgres import (
     concurrent_write_retry_delay,
 )
+from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -104,7 +105,7 @@ class UsageTrackingMixin:
             db_path = (
                 os.fspath(agent_data_dir)
                 if agent_data_dir
-                else os.environ.get("KESTREL_DB_PATH", "./agent_data")
+                else runtime_path_env(AGENT_DB_PATH_ENV, "./agent_data")
             )
             self._usage_db_dir = db_path
             self._usage_db_path = os.path.join(db_path, "llm_usage.db")

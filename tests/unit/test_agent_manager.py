@@ -7159,10 +7159,11 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_batch_rejected_onboarding_withdraws_before_a2a_reader_or_cleanup(
         self,
+        tmp_path,
     ) -> None:
         """The ordered batch registrar has the same no-reader failure boundary."""
 
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         agent = _make_mock_agent("did:test:batch-rejected-onboarding")
         config = LocalAgentConfig(data_dir="batch-rejected", port=8801)
         hook_entered = asyncio.Event()
@@ -7275,10 +7276,11 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_load_from_config_cancellation_waiting_for_a2a_publication_cleans_every_unpublished_result(
         self,
+        tmp_path,
     ):
         """One blocked batch publication cannot strand any initialized sibling."""
 
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         manager.set_scheduler_polling_managed_by_host(True)
         configs = {
             "Alpha": LocalAgentConfig(data_dir="alpha", port=8801),
@@ -7346,10 +7348,11 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_load_from_config_cancellation_releases_every_batch_admission(
         self,
+        tmp_path,
     ) -> None:
         """Cancellation during the first final release cannot strand its peers."""
 
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         configs = {
             "Alpha": LocalAgentConfig(data_dir="alpha", port=8801),
             "Beta": LocalAgentConfig(data_dir="beta", port=8802),
@@ -7391,10 +7394,11 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_committed_load_returns_success_after_cancellation_during_admission_release(
         self,
+        tmp_path,
     ) -> None:
         """A completed load is success even when its final release sees cancel."""
 
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         agent = _make_mock_agent("did:test:committed-load")
         release_is_blocked = asyncio.Event()
 
@@ -10529,9 +10533,10 @@ class TestAgentManagerBasics:
     @pytest.mark.asyncio
     async def test_delete_serializes_real_executor_cold_wake_before_registration(
         self,
+        tmp_path,
     ):
         """DELETE cannot return 404 and lose a cold wake already holding its DID lock."""
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         agent_id = "did:pkh:cold-delete-race"
         config = LocalAgentConfig(data_dir="cold", port=8801, autostart=False)
         manager._seed_scheduler_authority({agent_id: ("Cold", config)})
@@ -10739,7 +10744,7 @@ class TestAgentManagerBasics:
         from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
 
         host = FastAPI()
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         host.state.agent_manager = manager
         host.state.agent = None
         host.state.demo_mode = False
@@ -13942,10 +13947,10 @@ class TestCreateAgent:
         assert manager.get_agent("BeforeShutdown") is replacement
 
     @pytest.mark.asyncio
-    async def test_concurrent_same_name_load_rejects_before_second_initialization(self):
+    async def test_concurrent_same_name_load_rejects_before_second_initialization(self, tmp_path):
         """Direct cold loads share the same admission, not just create_agent."""
 
-        manager = AgentManager()
+        manager = AgentManager(base_data_dir=tmp_path)
         initialized = asyncio.Event()
         allow_first = asyncio.Event()
         child = _make_mock_agent("did:test:single-load-owner")

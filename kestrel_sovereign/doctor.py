@@ -76,6 +76,14 @@ from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
 )
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    DERIVED_HOST_DB_PATH_ENV,
+    HOME_ENV,
+    HOST_DB_PATH_ENV,
+    guard_storage_path,
+    runtime_path_env,
+)
 from kestrel_sovereign.setup.env_file import read_env
 from kestrel_sovereign.setup.toml_file import read_toml
 
@@ -893,7 +901,7 @@ def _expand_runtime_user(value: str, env: dict[str, str]) -> Path:
 def _sqlite_default_host_database_path(env: dict[str, str], project_dir: Path) -> Path:
     """Resolve the pre-data-root default host database for this runtime."""
 
-    configured_home = env.get("KESTREL_HOME")
+    configured_home = runtime_path_env(HOME_ENV, environ=env, base=project_dir)
     if configured_home:
         base = _expand_runtime_user(configured_home, env)
         if not base.is_absolute():
@@ -905,24 +913,34 @@ def _sqlite_default_host_database_path(env: dict[str, str], project_dir: Path) -
             if runtime_home
             else Path.home() / ".kestrel"
         )
-    return Path(os.path.abspath(base / "host-data" / "host-features.db"))
+    return guard_storage_path(
+        Path(os.path.abspath(base / "host-data" / "host-features.db")),
+        source="Doctor default host database",
+    )
 
 
 def _sqlite_hold_database_path(env: dict[str, str], project_dir: Path) -> Path:
     """Resolve the host database exactly as its spawned runtime will."""
 
-    explicit = env.get("KESTREL_HOST_DB_PATH")
+    explicit = runtime_path_env(HOST_DB_PATH_ENV, environ=env, base=project_dir)
     if explicit:
         candidate = _expand_runtime_user(explicit, env)
         if not candidate.is_absolute():
             candidate = project_dir / candidate
-        return Path(os.path.abspath(candidate))
-    agent_data_root = env.get("KESTREL_DB_PATH")
+        return guard_storage_path(
+            Path(os.path.abspath(candidate)), source="Doctor host database"
+        )
+    agent_data_root = runtime_path_env(
+        AGENT_DB_PATH_ENV, environ=env, base=project_dir
+    )
     if agent_data_root:
         base = _expand_runtime_user(agent_data_root, env)
         if not base.is_absolute():
             base = project_dir / base
-        return Path(os.path.abspath(base / "host-data" / "host-features.db"))
+        return guard_storage_path(
+            Path(os.path.abspath(base / "host-data" / "host-features.db")),
+            source="Doctor agent-data-root host database",
+        )
     return _sqlite_default_host_database_path(env, project_dir)
 
 
@@ -946,8 +964,6 @@ def _check_sqlite_hold_readiness(
 
     from kestrel_sovereign.hold.state import validate_sqlite_hold_readiness
     from kestrel_sovereign.host_features.storage import (
-        DERIVED_HOST_DB_PATH_ENV,
-        HOST_DB_PATH_ENV,
         sqlite_family,
         validate_host_database_migration_readiness,
         validate_host_database_parent_readiness,
@@ -960,15 +976,22 @@ def _check_sqlite_hold_readiness(
 
     database = _sqlite_hold_database_path(env, project_dir)
     try:
-        configured_host_path = env.get(HOST_DB_PATH_ENV)
-        launcher_derived_path = env.get(DERIVED_HOST_DB_PATH_ENV)
+        configured_host_path = runtime_path_env(
+            HOST_DB_PATH_ENV, environ=env, base=project_dir
+        )
+        launcher_derived_path = runtime_path_env(
+            DERIVED_HOST_DB_PATH_ENV, environ=env, base=project_dir
+        )
+        agent_data_root = runtime_path_env(
+            AGENT_DB_PATH_ENV, environ=env, base=project_dir
+        )
         path_is_implicit = not configured_host_path or (
             launcher_derived_path == configured_host_path
         )
         readiness_database = database
         if path_is_implicit:
             sources: list[tuple[str, Path]] = []
-            if env.get("KESTREL_DB_PATH"):
+            if agent_data_root:
                 sources.append(
                     (
                         "previous default host database",
@@ -987,17 +1010,14 @@ def _check_sqlite_hold_readiness(
                 readiness_database,
                 runtime_hardens_parent=(
                     readiness_database == database
-                    and not bool(
-                        env.get("KESTREL_HOST_DB_PATH")
-                        or env.get("KESTREL_DB_PATH")
-                    )
+                    and not bool(configured_host_path or agent_data_root)
                 ),
             )
         else:
             validate_host_database_parent_readiness(
                 database,
                 runtime_hardens_parent=not bool(
-                    env.get("KESTREL_HOST_DB_PATH") or env.get("KESTREL_DB_PATH")
+                    configured_host_path or agent_data_root
                 ),
             )
         if _selected_hold_backend(env) != "sqlite" and any(

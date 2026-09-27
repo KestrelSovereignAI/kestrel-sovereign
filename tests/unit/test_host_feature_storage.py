@@ -30,10 +30,22 @@ from kestrel_sovereign.host_features.storage import (
 
 # These tests are *about* default host-database resolution, so they set
 # HOME / KESTREL_HOME / KESTREL_HOST_DB_PATH themselves (or pass an explicit
-# path) and opt out of the suite-wide isolation in tests/unit/conftest.py
-# (#3087). Every test below must keep doing so: without the fixture's
-# override, a test that forgot would resolve the operator's real database.
+# path) and opt out of the suite-wide isolation in tests/conftest.py and
+# tests/unit/conftest.py (#3087, #3286). The fixture below points HOME and
+# KESTREL_HOME at temporary directories first, so a test that sets only an
+# explicit path resolves its defaults (the legacy database beside the project,
+# the ~/.kestrel fallback) somewhere harmless; a test about those defaults
+# re-points or removes them. The storage-root guard refuses anything outside
+# the test's temporary roots regardless.
 pytestmark = pytest.mark.owns_host_paths
+
+
+@pytest.fixture(autouse=True)
+def _harmless_default_roots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "default-home"))
+    project = tmp_path / "default-project"
+    project.mkdir()
+    monkeypatch.setenv("KESTREL_HOME", str(project))
 
 
 def _mode(path: Path) -> int:

@@ -89,6 +89,11 @@ from kestrel_sovereign.logging_config import (
     agent_name_var,
     resolve_correlation_id,
 )
+from kestrel_sovereign.paths import (
+    AGENT_DB_PATH_ENV,
+    MULTI_AGENT_CONFIG_ENV,
+    runtime_path_env,
+)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -177,11 +182,13 @@ def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
         caller still uses ``.exists()`` to decide whether to enter
         multi-agent mode.
     """
-    multi_agent_path = Path(env.get("KESTREL_MULTI_AGENT_CONFIG", "multi_agent.toml"))
+    multi_agent_path = Path(
+        runtime_path_env(MULTI_AGENT_CONFIG_ENV, "multi_agent.toml", environ=env)
+    )
     demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
         "1", "true", "yes",
     )
-    multi_agent_explicit = "KESTREL_MULTI_AGENT_CONFIG" in env
+    multi_agent_explicit = MULTI_AGENT_CONFIG_ENV in env
     if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
         logger.warning(
             "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
@@ -2238,6 +2245,10 @@ async def _shutdown_stop_receipts(app: FastAPI) -> None:
     if registry is not None:
         await registry.close()
     db = getattr(app.state, "stop_receipt_db", None)
+    # Teardown retires a failed startup too. Left behind, its error would make
+    # an app reused without its lifespan answer 503 for a failure that belongs
+    # to a lifespan already gone (#3286).
+    app.state.stop_receipt_store_error = ""
     app.state.stop_receipt_store = None
     app.state.peer_stop_circuit = None
     app.state.stop_receipt_db = None
@@ -3546,7 +3557,7 @@ async def _lifespan_startup(app: FastAPI):
         try:
             db_backend = os.environ.get("KESTREL_DB_BACKEND", "sqlite")
             database_url = os.environ.get("KESTREL_DATABASE_URL")
-            storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
+            storage_dir = runtime_path_env(AGENT_DB_PATH_ENV, os.getcwd())
             db_path = os.path.join(storage_dir, "kestrel_prime.db")
 
             if db_backend.lower() == "postgres" and database_url:

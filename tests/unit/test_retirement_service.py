@@ -15,6 +15,9 @@ async def test_retirement_archives_under_agent_data_dir(tmp_path, monkeypatch):
     not under the code directory.
     """
     monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+    # Unset, KESTREL_DB_PATH defaults to a cwd-relative ``agent_data``; keep
+    # that inside the test's own directory rather than the checkout (#3286).
+    monkeypatch.chdir(tmp_path)
 
     await create_kestrel_identity_async(
         output_dir=str(tmp_path),
