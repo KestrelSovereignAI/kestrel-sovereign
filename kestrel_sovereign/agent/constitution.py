@@ -1455,9 +1455,23 @@ class ConstitutionMixin:
             self._feature_lifecycle_integrity_uncertain = True
             self._feature_lifecycle_repair_verified = False
 
-        # Record agent consent before entering safe mode
+        # Boot-time integrity enforcement must not depend on a provider. A
+        # consent reflection invokes an LLM (and model discovery), and the
+        # conversation event below requests a provider embedding. Replaying
+        # either on every cold restore both incurs cost and delays the safety
+        # latch. The durable constitution-state event is the startup audit
+        # record; retain the conversational notification only for a first
+        # transition after the agent is ready.
+        from kestrel_sovereign.agent.boot import BootPhaseState
+
+        was_already_safe = self._safe_mode
+        booting = getattr(self, "_boot_state", None) in (
+            BootPhaseState.NOT_STARTED,
+            BootPhaseState.IN_PROGRESS,
+        )
+        notify_conversation = not booting and not was_already_safe
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
-        if consent:
+        if notify_conversation and consent:
             try:
                 await consent.request_consent(
                     "safe_mode_entry",
@@ -1467,7 +1481,6 @@ class ConstitutionMixin:
                 pass  # Never block on consent failure -- safe mode is critical
 
         now = self._constitution_now()
-        was_already_safe = self._safe_mode
         self._safe_mode = True
         self._safe_mode_reason = reason
         self._safe_mode_cause = cause
@@ -1487,7 +1500,7 @@ class ConstitutionMixin:
         )
         logging.critical(f"ENTERING SAFE MODE: {reason}")
         privacy_agent = getattr(self, "privacy_agent", None)
-        if privacy_agent is not None:
+        if notify_conversation and privacy_agent is not None:
             try:
                 await privacy_agent.add_conversation(
                     role="system",
