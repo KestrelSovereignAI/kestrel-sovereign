@@ -627,6 +627,25 @@ owner/token compare-and-set leaves a transferred, acknowledged, or terminal
 delivery untouched. Before #3370 the row stayed leased until the process
 stopped, and a late consumer claim silently returned nothing.
 
+The capability does not decide an event's fate; its row does (#3283).
+Between an exact-event claim's row claim and its reservation transfer,
+another claimant may legitimately return the reservation (a generic claim
+deferred by Hold returns every volatile reservation of its consumer) or
+take it (an unheld generic claim transfers one to its executor). When
+`claim_durable_delivery_for_event` finds no reservation left to transfer, it
+releases any retired capability and claims the event's row once more. A
+returned row is `retry` and due now, so the emitting dispatch runs it with
+its live envelope. A row that another claimant owns, or one already settled,
+still misses, and the caller reads that outcome from the row. Before #3283
+the emitting dispatch treated the missing token as "delivery unavailable"
+and failed the first delivery. The drain cannot recover an elided row's
+caller, so a bounded consumer then lost the message.
+
+A Hold read that fails at the exact-event claim's own pre-check returns
+that event's reservation exactly as a Hold deferral would, then raises, as
+the post-claim fence already does. Terminal ingress deferred by Hold
+reports `HELD` admission, as cognition ingress does.
+
 Registration and persistence also serialize their handoff at the
 `(agent_id, source)` scope.  Thus an event racing a new workflow subscription
 is either committed first and backfilled by that registration, or sees the

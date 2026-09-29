@@ -9409,7 +9409,10 @@ async def test_failed_first_lease_transfer_is_released_on_the_next_claim(
     tmp_path, monkeypatch, exact_event
 ):
     """The store can see the first lease as expired before this process's
-    sidecar timer does. The refused transfer must still release the row."""
+    sidecar timer does. The refused transfer must still release the row.
+
+    The exact-event claim reads its event's fate from the released row in
+    the same call (#3283); a poll finds it on its next claim."""
     backend, agent, dispatcher, consumer, reserved = await _volatile_unclaimed_delivery(
         tmp_path, f"failed-transfer-{exact_event}"
     )
@@ -9431,8 +9434,15 @@ async def test_failed_first_lease_transfer_is_released_on_the_next_claim(
         monkeypatch.setattr(
             store, "now_utc", lambda: real_now() + timedelta(hours=1)
         )
-        assert await claim() is None
+        refused = await claim()
         assert reserved.delivery_id not in dispatcher._transient_durable_handoffs
+        if exact_event:
+            assert reserved.delivery_id not in dispatcher._expired_initial_handoffs
+            assert refused is not None
+            assert refused.delivery_id == reserved.delivery_id
+            assert refused.event.payload == {"_privacy_gated": "none"}
+            return
+        assert refused is None
         assert reserved.delivery_id in dispatcher._expired_initial_handoffs
         monkeypatch.setattr(store, "now_utc", real_now)
 
