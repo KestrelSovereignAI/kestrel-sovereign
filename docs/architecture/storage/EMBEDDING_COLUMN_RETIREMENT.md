@@ -224,6 +224,13 @@ kestrel embeddings backfill [--table saved_items|document_chunks|all] [--batch-s
   runs the `embedding_vec` startup migration, which would itself create an
   absent column and copy the legacy vectors into it. An absent column is
   reported as `ABSENT` and left for the agent's startup migration to create.
+- On SQLite, `verify` opens the file read-only through the cold-read
+  connection ([#3407](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3407)).
+  It never sets the journal mode. A checkpointed database (no `-wal`/`-shm`)
+  is opened `immutable=1`, which creates no file, so `verify` works on a
+  read-only file. A live agent's WAL is read with plain `mode=ro`. If a writer
+  commits while `verify` reads a checkpointed database, `verify` refuses to
+  report (exit `2`). `backfill` writes, and opens the database normally.
 
 **The phase-2 gate.** Before any reader switches to `embedding_vec`, run
 `kestrel embeddings backfill`, then `kestrel embeddings verify`, on every
@@ -235,7 +242,7 @@ does not affect the exit code.
 |---|---|
 | `0` | Gate met: every table has an `embedding_vec` column and `rows_missing_embedding_vec == rows_unbackfillable`. |
 | `3` | Gate not met: a table still has rows the backfill can copy, or its `embedding_vec` column is absent (even when the table is empty). |
-| `2` | Did not run: a usage error, an ambiguous or missing database, a failed connection, an unsupported backend, or a PostgreSQL `embedding_vec` that is not a `vector`. |
+| `2` | Did not run: a usage error, an ambiguous or missing database, a failed connection, an unsupported backend, a PostgreSQL `embedding_vec` that is not a `vector`, or a SQLite database that changed while `verify` was reading it. |
 | `1` | An unexpected error (an uncaught exception). |
 
 An absent column never meets the gate, however few rows the table holds.
