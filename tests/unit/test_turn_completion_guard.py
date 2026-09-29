@@ -544,3 +544,35 @@ async def test_feature_subagent_confirmed_answer_is_kept():
 
     assert result == answer
     assert agent.llm_service.generate_with_messages.await_count == 1
+
+
+def test_settled_repair_keeps_runtime_attributes():
+    """Adapters and the service attach non-field attributes to the response;
+    settling the content must not drop them (codex review r1 P1)."""
+    repaired = LLMResponse(content="[answer complete]", tool_calls=None)
+    repaired.model = "claude-opus-5-5"
+    repaired.provider = "anthropic:plan"
+
+    settled = OrchestratorEngineMixin._settle_repaired_turn(
+        _ENDS_WITH_PLAN, repaired, original_delivered=False,
+    )
+
+    assert settled.content == _ENDS_WITH_PLAN
+    assert settled.model == "claude-opus-5-5"
+    assert settled.provider == "anthropic:plan"
+
+
+def test_repair_that_ran_tools_inline_goes_on_as_the_turn():
+    """A codex-routed repair that executed tools inline acted; its answer and
+    its executed_tool_calls reach the breadcrumb path unchanged."""
+    executed = [{"name": "get_github_issue", "arguments": {}, "result": "ok"}]
+    repaired = LLMResponse(content="Issue 3380 is open.", tool_calls=None)
+    repaired.executed_tool_calls = executed
+
+    settled = OrchestratorEngineMixin._settle_repaired_turn(
+        _ENDS_WITH_PLAN, repaired, original_delivered=False,
+    )
+
+    assert settled is repaired
+    assert settled.content == "Issue 3380 is open."
+    assert settled.executed_tool_calls == executed

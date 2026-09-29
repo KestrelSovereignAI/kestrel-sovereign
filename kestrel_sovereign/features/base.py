@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-from dataclasses import is_dataclass, replace
 from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -415,12 +414,17 @@ class Feature(_SdkFeature):
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
-        # A repair that makes no tool call has confirmed the message was the
-        # subagent's answer: keep it, followed by anything the repair adds.
-        if is_dataclass(repaired) and not getattr(repaired, "tool_calls", None):
-            return replace(
-                repaired, content=settle_repaired_content(content, repaired.content),
-            )
+        # A repair that neither calls a tool nor ran one inline has confirmed
+        # the message was the subagent's answer: keep it, followed by anything
+        # the repair adds. Settled on the response itself, not a copy, so the
+        # runtime attributes adapters attach to it (``model``,
+        # ``executed_tool_calls``) survive.
+        if (
+            not isinstance(repaired, str)
+            and not getattr(repaired, "tool_calls", None)
+            and not getattr(repaired, "executed_tool_calls", None)
+        ):
+            repaired.content = settle_repaired_content(content, repaired.content)
         return repaired
 
     # =========================================================================
