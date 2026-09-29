@@ -552,6 +552,37 @@ class TurnLifecycleMixin:
             )
         return _normalize_session_id(live.session_id)
 
+    def owns_live_turn(self) -> bool:
+        """True when the CALLING task owns the turn that is live right now.
+
+        The POSITIVE half of :meth:`get_turn_bound_session_id`. That accessor
+        computes this exact ownership fact and then degrades it to a session
+        id, so its None means three different things — no turn, a live turn
+        with no chat session, or an agent double without the accessor. A
+        caller that needs "was this authored inside my own turn?" cannot ask
+        a session id, because a session-less turn answers the same None as no
+        turn at all (#3112 review).
+
+        Ownership is the same single test every live-turn gate uses,
+        :func:`_live_turn_binding`: the ``_BOUND_TURN_SESSION`` pairing for
+        this agent, whose ``turn_id`` is the turn holding CONVERSATION right
+        now. That covers both the lifecycle's own binding (published on the
+        task that entered the turn and inherited by its descendants) and a
+        pair explicitly re-presented across a task boundary, which is how the
+        inline tool executor is reached. The raw ``_CURRENT_TURN_ID`` is NOT
+        consulted: it is carried onto foreign tasks for observability (#3114)
+        and is not ownership. A task that merely INHERITED a finished turn's
+        binding fails, because ``_live_turn_id`` is cleared in the turn's
+        ``finally``.
+
+        Not a security boundary against a task spawned inside the agent's own
+        live turn: such a task inherits the lifecycle binding and is reported
+        as owning the turn. That is intended — it IS agent-authored work — but
+        it means this answers "agent-authored, in-turn" and not "is the
+        cognition turn itself".
+        """
+        return _live_turn_binding(self) is not None
+
     def _get_turn_bound_session_id(self) -> Optional[str]:
         """Compatibility alias for :meth:`get_turn_bound_session_id`.
 
