@@ -22,6 +22,11 @@ from kestrel_sovereign.storage.embedding_vec_backfill import (
     backfill_embedding_vec,
     verify_embedding_vec,
 )
+from tests.utils.postgres_schema import (
+    pgvector_schema,
+    quoted_search_path,
+    with_search_path,
+)
 
 
 def _pack(values):
@@ -246,12 +251,30 @@ def test_pgvector_text_repacks_to_the_stored_float32():
     assert _pgvector_text_to_bytes("[]") == b""
 
 
+async def _run_no_schema_ddl(db):
+    """Schema initializer for a connection opened after the core schema boot."""
+
+
 @pytest.fixture
 async def postgres_db():
     url = os.environ.get("TEST_POSTGRES_URL")
     if not url:
         pytest.skip("TEST_POSTGRES_URL is not set")
-    db = await AsyncDatabase.postgres(url)
+    # Boot the core schema on the worker's own search_path, then reconnect
+    # with pgvector's schema named after it. An xdist worker's path names only
+    # its own schema, and the extension lives wherever it was first
+    # installed, so neither this test's ``vector(4)`` DDL nor the helper's
+    # ``::vector`` cast would otherwise resolve the type (#3401).
+    boot = await AsyncDatabase.postgres(url)
+    try:
+        vector_schema = await pgvector_schema(boot)
+        (schemas,) = await boot.fetchone("SELECT current_schemas(false)", ())
+    finally:
+        await boot.close()
+    db = await AsyncDatabase.postgres(
+        with_search_path(url, quoted_search_path(*schemas, vector_schema)),
+        schema_initializer=_run_no_schema_ddl,
+    )
     file_hash = f"embedding-vec-backfill-{uuid4()}"
     try:
         yield db, file_hash
@@ -279,7 +302,6 @@ async def test_postgres_backfill_is_idempotent(postgres_db):
         absent = await verify_embedding_vec(db, "document_chunks")
         assert absent.embedding_vec_present is False
         assert absent.rows_backfilled == 0
-        await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
         await db.execute(
             "ALTER TABLE document_chunks ADD COLUMN embedding_vec vector(4)", ()
         )

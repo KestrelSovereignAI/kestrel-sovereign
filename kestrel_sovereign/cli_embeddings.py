@@ -1,6 +1,6 @@
 """``kestrel embeddings`` — operator visibility into stamped profiles (#1477).
 
-Two subcommands:
+Four subcommands:
 
 ``audit``
     Read-only. For each embedded table (``conversation_history``,
@@ -24,7 +24,19 @@ Two subcommands:
     resolved embedding dimension doesn't match the vector column width
     (with instructions for the required re-migration).
 
-Both subcommands open the same production :class:`AsyncDatabase` the
+``verify`` / ``backfill``
+    The phase-2 gate for retiring the legacy ``embedding`` column on
+    ``saved_items`` and ``document_chunks`` (#3405, parent #2684). ``verify``
+    reads only; ``backfill`` copies the legacy value into ``embedding_vec``
+    where it is NULL. Both print every ``EmbeddingVecReport`` field per table
+    (``--json`` for a script) and exit 0 only when every table has an
+    ``embedding_vec`` column and every row still missing it is one that
+    cannot be backfilled; otherwise they exit :data:`EXIT_GATE_NOT_MET`.
+    They open the database without running the startup schema initializer,
+    whose migration would itself create ``embedding_vec`` and copy legacy
+    vectors into it. An absent column is reported, never created.
+
+Every subcommand opens the same production :class:`AsyncDatabase` the
 agent/server open — ``KESTREL_DATABASE_URL`` for Postgres, otherwise
 ``KESTREL_DB_PATH/kestrel_prime.db`` (or the ``--agent-name`` /
 ``--data-dir`` selected agent's ``kestrel_prime.db``). In a
@@ -49,7 +61,8 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.paths import AGENT_DB_PATH_ENV, runtime_path_env
 
 logger = logging.getLogger(__name__)
@@ -60,6 +73,19 @@ _EMBEDDED_TABLES: Tuple[str, ...] = (
     "saved_items",
     "document_chunks",
 )
+
+# Tables that still carry the legacy ``embedding`` column. The canonical list
+# is ``storage.embedding_vec_backfill.LEGACY_EMBEDDING_TABLES`` (a unit test
+# pins the two together); importing it here would load the whole storage
+# package on every ``kestrel`` invocation just to build argparse choices.
+_LEGACY_EMBEDDING_TABLES: Tuple[str, ...] = ("saved_items", "document_chunks")
+
+_EMBEDDING_VEC_COMMANDS: Tuple[str, ...] = ("verify", "backfill")
+
+# ``verify`` / ``backfill`` exit when the phase-2 gate is not met. It is
+# distinct from 2, the refusal/error code every subcommand uses, and from 1,
+# an uncaught exception, so a script can tell "not ready" from "did not run".
+EXIT_GATE_NOT_MET = 3
 
 
 def _add_db_target_args(parser: argparse.ArgumentParser) -> None:
@@ -469,7 +495,56 @@ def add_embeddings_subparser(subparsers: argparse._SubParsersAction) -> None:
              "command only reports the dry-run scope.",
     )
 
+    verify_p = embed_sub.add_parser(
+        "verify",
+        help="Read-only: compare legacy embedding with embedding_vec and "
+             "check the phase-2 gate.",
+    )
+    _add_embedding_vec_args(verify_p)
+
+    backfill_p = embed_sub.add_parser(
+        "backfill",
+        help="Copy legacy embedding into embedding_vec where it is NULL, "
+             "then check the phase-2 gate.",
+    )
+    _add_embedding_vec_args(backfill_p)
+    backfill_p.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=None,
+        dest="batch_size",
+        help="Rows per batch; each batch commits in its own transaction "
+             "(default: 500).",
+    )
+
     parser.set_defaults(_handler=run)
+
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be positive, got {value}")
+    return value
+
+
+def _add_embedding_vec_args(parser: argparse.ArgumentParser) -> None:
+    """Register the options ``verify`` and ``backfill`` share."""
+    parser.add_argument(
+        "--table",
+        choices=(*_LEGACY_EMBEDDING_TABLES, "all"),
+        default="all",
+        help="Table to check (default: all).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print one JSON document instead of the text report.",
+    )
+    _add_db_target_args(parser)
 
 
 async def _audit(db: "Any", *, table: Optional[str], agent_id: Optional[str]) -> int:
@@ -775,10 +850,149 @@ async def _reindex(
     return 0
 
 
+async def _leave_schema_unchanged(db: Any) -> None:
+    """Schema initializer for ``verify`` / ``backfill``: run no DDL.
+
+    The default initializer runs the startup ``embedding_vec`` migration,
+    which creates the column and copies every legacy vector into it when
+    the column is absent. Run from ``verify`` that would be a write, and it
+    would hide the absent column these verbs exist to report (#3405).
+    """
+
+
+def _gate_met(report: Any) -> bool:
+    """Whether one table meets the phase-2 gate (#2684).
+
+    The ``embedding_vec`` column must exist, and every row still missing a
+    value in it must be one the backfill cannot copy. Phase 2b points
+    readers at ``embedding_vec``, so an absent column fails the gate however
+    few rows the table holds: PostgreSQL defers creating the column until a
+    legacy embedding exists, which leaves an empty table without it. The
+    helper also counts every legacy row as unbackfillable when the column is
+    absent, so the row equality alone would pass.
+    """
+    return bool(report.embedding_vec_present) and (
+        report.rows_missing_embedding_vec == report.rows_unbackfillable
+    )
+
+
+async def _embedding_vec(
+    db: Any,
+    *,
+    command: str,
+    table: str,
+    batch_size: Optional[int] = None,
+    as_json: bool = False,
+) -> int:
+    """Run ``verify`` or ``backfill`` over *table* (or ``"all"``) (#3405).
+
+    Returns 0 when every table meets :func:`_gate_met`,
+    :data:`EXIT_GATE_NOT_MET` when any does not, and 2 when the helper
+    refuses the database. ``rows_disagreeing`` is reported for review and
+    does not affect the exit code: after a reindex the two columns
+    legitimately differ.
+    """
+    from kestrel_sovereign.storage.embedding_vec_backfill import (
+        EmbeddingVecBackfillError,
+        backfill_embedding_vec,
+        verify_embedding_vec,
+    )
+
+    tables = _LEGACY_EMBEDDING_TABLES if table == "all" else (table,)
+    reports: List[Any] = []
+    for tname in tables:
+        try:
+            if command == "backfill":
+                if batch_size is None:
+                    report = await backfill_embedding_vec(db, tname)
+                else:
+                    report = await backfill_embedding_vec(
+                        db, tname, batch_size=batch_size
+                    )
+            else:
+                report = await verify_embedding_vec(db, tname)
+        except EmbeddingVecBackfillError as exc:
+            print(f"ERROR: {tname}: {exc}", file=sys.stderr)
+            return 2
+        reports.append(report)
+
+    gate_met = all(_gate_met(report) for report in reports)
+    if as_json:
+        print(json.dumps({
+            "command": command,
+            "gate_met": gate_met,
+            "tables": [
+                {**asdict(report), "gate_met": _gate_met(report)}
+                for report in reports
+            ],
+        }, indent=2))
+    else:
+        _print_embedding_vec_reports(command, reports, gate_met)
+    return 0 if gate_met else EXIT_GATE_NOT_MET
+
+
+def _print_embedding_vec_reports(
+    command: str, reports: List[Any], gate_met: bool
+) -> None:
+    title = "read-only" if command == "verify" else "writes embedding_vec"
+    print(f"# embeddings {command} ({title})")
+    for report in reports:
+        print(f"\n{report.table}:")
+        if not report.embedding_vec_present:
+            print(
+                "  embedding_vec column is ABSENT. Nothing was backfilled, and "
+                "nothing can be until the agent's startup migration creates "
+                "it (on PostgreSQL, only once the table holds a legacy "
+                "embedding); this command never creates it."
+            )
+        for field in (
+            "total_rows",
+            "rows_with_both",
+            "rows_missing_embedding_vec",
+            "rows_embedding_vec_only",
+            "rows_disagreeing",
+            "rows_backfilled",
+            "rows_unbackfillable",
+        ):
+            print(f"  {field:<28} {getattr(report, field):>8}")
+        if _gate_met(report):
+            print(f"  {'gate':<28} {'met':>8}")
+        elif not report.embedding_vec_present:
+            print(
+                f"  gate: NOT met — {report.table}.embedding_vec is missing, so "
+                "a reader switched to it would query a column that does not "
+                "exist."
+            )
+        else:
+            hint = (
+                "; `kestrel embeddings backfill` can copy the difference"
+                if command == "verify" else ""
+            )
+            print(
+                "  gate: NOT met — rows_missing_embedding_vec "
+                f"({report.rows_missing_embedding_vec}) != rows_unbackfillable "
+                f"({report.rows_unbackfillable}){hint}."
+            )
+        if report.rows_disagreeing:
+            print(
+                f"  note: {report.rows_disagreeing} row(s) disagree. Expected "
+                "after a reindex (embedding_vec is authoritative); review "
+                "before switching readers. Not part of the exit code."
+            )
+    verdict = "met" if gate_met else "NOT met"
+    print(
+        f"\nphase-2 gate: {verdict} (embedding_vec present and "
+        "rows_missing_embedding_vec == rows_unbackfillable on every table)"
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     """Dispatch the subcommand chosen on the CLI."""
     if not getattr(args, "embeddings_command", None):
-        print("usage: kestrel embeddings {audit|reindex} ...", file=sys.stderr)
+        print(
+            "usage: kestrel embeddings {audit|reindex|verify|backfill} ...",
+            file=sys.stderr,
+        )
         return 2
 
     # ``reindex`` constructs an LLMService and re-embeds stored content, so it
@@ -807,25 +1021,34 @@ def run(args: argparse.Namespace) -> int:
         if err is not None:
             print(f"ERROR: {err}", file=sys.stderr)
             return 2
-        # reindex/audit are maintenance verbs over an EXISTING corpus. If the
+        # These are maintenance verbs over an EXISTING corpus. If the
         # resolved SQLite file doesn't exist, refuse rather than let the driver
         # create a brand-new empty DB and truthfully count its zero rows —
         # that is the "confident false success against the wrong database" this
         # command must never produce (#2327).
         if not pg_url and (not sqlite_path or not os.path.exists(sqlite_path)):
             print(
-                f"ERROR: no database found at {sqlite_path!r} — reindex/audit "
-                "operate on an existing agent corpus and will not create a new "
-                "empty database. Point --data-dir / --agent-name (or "
-                "KESTREL_DB_PATH) at an existing kestrel_prime.db.",
+                f"ERROR: no database found at {sqlite_path!r} — embeddings "
+                "commands operate on an existing agent corpus and will not "
+                "create a new empty database. Point --data-dir / --agent-name "
+                "(or KESTREL_DB_PATH) at an existing kestrel_prime.db.",
                 file=sys.stderr,
             )
             return 2
+        schema_initializer = (
+            _leave_schema_unchanged
+            if args.embeddings_command in _EMBEDDING_VEC_COMMANDS
+            else None
+        )
         try:
             if pg_url:
-                db = await AsyncDatabase.postgres(pg_url)
+                db = await AsyncDatabase.postgres(
+                    pg_url, schema_initializer=schema_initializer
+                )
             else:
-                db = await AsyncDatabase.sqlite(sqlite_path)
+                db = await AsyncDatabase.sqlite(
+                    sqlite_path, schema_initializer=schema_initializer
+                )
         except Exception as exc:
             print(f"ERROR: could not connect to DB: {exc}", file=sys.stderr)
             return 2
@@ -841,6 +1064,14 @@ def run(args: argparse.Namespace) -> int:
                     rate_limit=args.rate_limit,
                     dry_run=args.dry_run,
                     apply=args.yes,
+                )
+            if args.embeddings_command in _EMBEDDING_VEC_COMMANDS:
+                return await _embedding_vec(
+                    db,
+                    command=args.embeddings_command,
+                    table=args.table,
+                    batch_size=getattr(args, "batch_size", None),
+                    as_json=args.as_json,
                 )
             print(
                 f"unknown subcommand: {args.embeddings_command}",

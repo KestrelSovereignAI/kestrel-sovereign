@@ -40,6 +40,33 @@ def with_search_path(url: str, schema: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
+def quoted_search_path(*schemas: str) -> str:
+    """A ``search_path`` value naming *schemas* in order, each quoted once."""
+
+    unique = dict.fromkeys(schemas)
+    return ",".join('"' + schema.replace('"', '""') + '"' for schema in unique)
+
+
+async def pgvector_schema(db) -> str:
+    """The schema holding pgvector's ``vector`` type, installing it if absent.
+
+    The extension is installed once per database, into whichever schema first
+    created it, and an xdist worker's ``search_path`` names only its own
+    schema (``tests/shared/postgres_worker_isolation.py``). So ``CREATE
+    EXTENSION IF NOT EXISTS vector`` can succeed while an unqualified
+    ``vector`` still does not resolve (#3401). Qualify the type with this
+    schema, or name it on the connection's ``search_path``.
+    """
+
+    await db.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    row = await db.fetchone(
+        "SELECT n.nspname FROM pg_extension e "
+        "JOIN pg_namespace n ON n.oid = e.extnamespace "
+        "WHERE e.extname = 'vector'"
+    )
+    return row[0]
+
+
 @asynccontextmanager
 async def disposable_postgres_schema(admin, prefix: str) -> AsyncIterator[str]:
     """Create a uniquely named schema through *admin*; drop it on exit.
