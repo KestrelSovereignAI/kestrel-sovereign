@@ -3429,10 +3429,11 @@ class OrchestratorEngineMixin:
                 return
 
             if not response.has_tool_calls:
+                streamed_text = "".join(iter_text_chunks)
                 repaired_missing_tool_call = (
                     bool(all_tools)
                     and OrchestratorEngineMixin._signals_unfinished_tool_work(
-                        "".join(iter_text_chunks) or response.content or ""
+                        streamed_text or response.content or ""
                     )
                 )
                 if repaired_missing_tool_call:
@@ -3446,7 +3447,7 @@ class OrchestratorEngineMixin:
                         streaming=True,
                         request_id=request_id,
                         invocation_context=invocation_context,
-                        original_delivered=True,
+                        original_delivered=bool(streamed_text),
                     )
                     if isinstance(response, str):
                         yield response
@@ -3454,11 +3455,14 @@ class OrchestratorEngineMixin:
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
-                    # Repair is non-streaming (buffered LLMResponse). The
-                    # repaired text was already streamed above, so this yields
-                    # only what the repair adds to it.
+                    # Repair is non-streaming (buffered LLMResponse). When the
+                    # repaired text was streamed above, this is only what the
+                    # repair adds to it; otherwise it is the whole answer.
                     if response.content:
-                        yield f"\n\n{response.content}"
+                        yield (
+                            f"\n\n{response.content}" if streamed_text
+                            else response.content
+                        )
                     return
                 # Text-only response: already streamed to user during the
                 # tool-detection pass. No second LLM round-trip needed —

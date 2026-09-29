@@ -576,3 +576,89 @@ def test_repair_that_ran_tools_inline_goes_on_as_the_turn():
     assert settled is repaired
     assert settled.content == "Issue 3380 is open."
     assert settled.executed_tool_calls == executed
+
+
+def _streaming_agent(stream_items, repair_reply):
+    agent = MagicMock()
+    agent.features = {}
+    agent._direct_tools = {}
+    agent._build_assistant_tool_history_msg = MagicMock(
+        return_value={"role": "assistant", "content": "", "tool_calls": []}
+    )
+    agent._execute_tool_batch = AsyncMock()
+    agent._execute_tool_batch_at_stop_boundary = (
+        OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
+    )
+    agent._build_all_tools = MagicMock(return_value=[_tool_schema()])
+    agent._visible_features_by_tool_name = MagicMock(return_value={})
+    agent._visible_known_tool_names = MagicMock(return_value=set())
+    agent._known_tool_names = MagicMock(return_value=set())
+    agent._make_inline_tool_executor = MagicMock(return_value=None)
+    agent._prune_orchestrator_messages = MagicMock(
+        side_effect=lambda msgs, _tools, **_kw: msgs
+    )
+    agent.is_request_cancelled = MagicMock(return_value=False)
+    _bind_turn_completion_helpers(agent)
+
+    async def _fake_stream(*_args, **_kwargs):
+        for item in stream_items:
+            yield item
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = _fake_stream
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content=repair_reply, tool_calls=None)
+    )
+    return agent
+
+
+async def _drain_streaming(agent):
+    handler = OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(agent)
+    chunks = []
+    async for chunk in handler(
+        response=LLMResponse(
+            content=None,
+            tool_calls=[ToolCall(id="call_1", name="example_tool", arguments={})],
+        ),
+        feature_tools=[_tool_schema()],
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-5-5",
+        user_message="what is your status?",
+        tool_events=[],
+        tool_results=[],
+        session_id="s-1",
+    ):
+        if isinstance(chunk, str):
+            chunks.append(chunk)
+    return "".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_streamed_answer_is_not_repeated_after_a_confirmed_repair():
+    agent = _streaming_agent(
+        [_ENDS_WITH_PLAN, LLMResponse(content=_ENDS_WITH_PLAN, tool_calls=None)],
+        "[answer complete]",
+    )
+
+    text = await _drain_streaming(agent)
+
+    assert agent.llm_service.generate_with_messages.await_count == 1
+    assert text.count(_ENDS_WITH_PLAN) == 1
+    assert "[answer complete]" not in text
+
+
+@pytest.mark.asyncio
+async def test_unstreamed_answer_is_delivered_after_a_confirmed_repair():
+    """A terminal response whose text never streamed as chunks has not reached
+    the client, so the confirmed answer is delivered whole (codex review r2)."""
+    agent = _streaming_agent(
+        [LLMResponse(content=_ENDS_WITH_PLAN, tool_calls=None)],
+        "[answer complete]",
+    )
+
+    text = await _drain_streaming(agent)
+
+    assert agent.llm_service.generate_with_messages.await_count == 1
+    assert _ENDS_WITH_PLAN in text
+    assert "[answer complete]" not in text
