@@ -161,7 +161,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
         "role": "assistant",
         "content": "Let me check the GitHub issue.",
     }
-    assert "did not emit a tool call" in repair_call["messages"][-1]["content"]
+    assert "made no tool call" in repair_call["messages"][-1]["content"]
     agent._execute_tool_batch.assert_awaited_once()
 
 
@@ -382,5 +382,165 @@ async def test_feature_subagent_no_tool_continuation_gets_repair_step():
         "role": "user",
         "content": "Task: claim issue 1237",
     }
-    assert "did not emit a tool call" in repair_call["messages"][-1]["content"]
+    assert "made no tool call" in repair_call["messages"][-1]["content"]
     tool.execute.assert_awaited_once_with()
+
+
+# --- A finished answer survives the repair --------------------------------
+#
+# Live case, 2026-09-29: an orchestrating agent answered a status request with
+# a full report whose body named its next steps ("when CI finishes I will run
+# the codex review"). The whole-body match fired the repair five times in one
+# turn, and each no-tool repair reply ("This turn is done...") replaced the
+# report, so the caller received only that reply and the report was lost.
+
+_STATUS_REPORT = (
+    "Nothing is running. #3380 is held until CI shows its PostgreSQL cases run.\n\n"
+    "When CI on #3380 finishes, I will run the codex review and then check the "
+    "merge guard against the head SHA.\n\n"
+    "Nothing is waiting on you."
+)
+
+
+def test_plan_inside_a_finished_answer_is_not_unfinished_work():
+    assert OrchestratorEngineMixin._signals_unfinished_tool_work(_STATUS_REPORT) is False
+    assert Feature._signals_unfinished_tool_work(_STATUS_REPORT) is False
+
+
+def test_a_message_that_ends_by_announcing_a_call_is_unfinished_work():
+    content = "The issue is open.\n\nLet me check the GitHub issue comments."
+    assert OrchestratorEngineMixin._signals_unfinished_tool_work(content) is True
+    assert Feature._signals_unfinished_tool_work(content) is True
+
+
+@pytest.mark.asyncio
+async def test_finished_report_is_answered_without_a_repair():
+    agent = MagicMock()
+    _bind_turn_completion_helpers(agent)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock()
+
+    handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+    result = await handler(
+        response=LLMResponse(content=_STATUS_REPORT, tool_calls=None),
+        feature_tools=[_tool_schema()],
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-5-5",
+        user_message="what is your status?",
+        session_id="session-123",
+    )
+
+    assert result == _STATUS_REPORT
+    agent.llm_service.generate_with_messages.assert_not_awaited()
+
+
+_ENDS_WITH_PLAN = (
+    "#3380 is held until CI is green.\n\n"
+    "When CI finishes, I will run the codex review on the new head."
+)
+
+
+async def _repair_no_tool(reply: str):
+    agent = MagicMock()
+    _bind_turn_completion_helpers(agent)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content=reply, tool_calls=None)
+    )
+    handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+    result = await handler(
+        response=LLMResponse(content=_ENDS_WITH_PLAN, tool_calls=None),
+        feature_tools=[_tool_schema()],
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-5-5",
+        user_message="what is your status?",
+        session_id="session-123",
+    )
+    return agent, result
+
+
+@pytest.mark.asyncio
+async def test_confirmed_answer_is_delivered_as_written():
+    agent, result = await _repair_no_tool("[answer complete]")
+
+    assert result == _ENDS_WITH_PLAN
+    assert agent.llm_service.generate_with_messages.await_count == 1
+    prompt = agent.llm_service.generate_with_messages.await_args.kwargs["messages"][-1]
+    assert prompt["role"] == "user"
+    assert "not a message from the user" in prompt["content"]
+    assert "[answer complete]" in prompt["content"]
+
+
+@pytest.mark.asyncio
+async def test_repair_reply_is_added_to_the_answer_not_substituted():
+    agent, result = await _repair_no_tool(
+        "[answer complete]\n\nThe watch on #3380 is set."
+    )
+
+    assert result == f"{_ENDS_WITH_PLAN}\n\nThe watch on #3380 is set."
+
+
+@pytest.mark.asyncio
+async def test_tool_call_markup_is_replaced_by_the_repaired_answer():
+    """Markup written as text executed nothing, so it is not kept as an answer."""
+    agent = MagicMock()
+    _bind_turn_completion_helpers(agent)
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content="I could not add the todo.", tool_calls=None)
+    )
+    handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
+    result = await handler(
+        response=LLMResponse(
+            content='<invoke name="todo_add"><parameter name="title">x</parameter></invoke>',
+            tool_calls=None,
+        ),
+        feature_tools=[_tool_schema("todo_add")],
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-5-5",
+        user_message="add a todo titled x",
+        session_id="session-123",
+    )
+
+    assert result == "I could not add the todo."
+
+
+@pytest.mark.asyncio
+async def test_already_streamed_answer_yields_only_the_addition():
+    repaired = LLMResponse(content="[answer complete]", tool_calls=None)
+    settled = OrchestratorEngineMixin._settle_repaired_turn(
+        _ENDS_WITH_PLAN, repaired, original_delivered=True,
+    )
+    assert settled.content == ""
+
+    repaired = LLMResponse(content="[answer complete] Watch set.", tool_calls=None)
+    settled = OrchestratorEngineMixin._settle_repaired_turn(
+        _ENDS_WITH_PLAN, repaired, original_delivered=True,
+    )
+    assert settled.content == "Watch set."
+
+
+@pytest.mark.asyncio
+async def test_feature_subagent_confirmed_answer_is_kept():
+    agent = MagicMock()
+    agent.hooks_manager = None
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content="[answer complete]", tool_calls=None)
+    )
+    feature = _FeatureForTurnCompletion(agent)
+    feature.get_tools = MagicMock(return_value=[])
+    answer = "The job is queued.\n\nWhen it finishes I will check the job log."
+
+    result = await feature._handle_feature_tool_calls(
+        response=LLMResponse(content=answer, tool_calls=None),
+        tools=[_tool_schema("launch_job")],
+        system_prompt="sys",
+        user_prompt="Task: report the job",
+    )
+
+    assert result == answer
+    assert agent.llm_service.generate_with_messages.await_count == 1

@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Union
 
 from kestrel_sovereign._async_ownership import (
@@ -33,6 +33,12 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     tool_result_size_bytes,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.turn_completion import (
+    ends_with_unfinished_intent,
+    repair_addition,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 from kestrel_sdk.llm import ToolCallStarted
 # Re-use streaming.py's in-band sentinel builders for follow-up
 # ToolCallStarted events so the chat UI's revise-on-tool semantic
@@ -145,12 +151,7 @@ TOOL_CALL_AS_TEXT_RE = re.compile(
 # markup raw, whereas documentation/examples of the markup live in code.
 _CODE_SPAN_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`]*`", re.DOTALL)
 
-TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
-
-Continue the same turn now:
-- If the work requires an available tool, emit the tool call now.
-- If no tool is needed or available, provide the final answer now.
-- Do not describe a future tool call without making it."""
+TURN_COMPLETION_REPAIR_PROMPT = turn_completion_repair_prompt("turn")
 
 TOOL_CALL_AS_TEXT_REPAIR_PROMPT = """Your previous message contained tool-call markup (for example <function_calls>/<invoke>/<tool_call>) written as plain text. That is NOT a real tool call — nothing was executed, so any result you described was fabricated.
 
@@ -465,8 +466,9 @@ class OrchestratorEngineMixin:
         Covers two no-structured-tool-call failure modes that both warrant a
         single repair turn:
 
-        * the model *narrates* a future tool call ("let me check the repo…")
-          but emits no ``tool_use`` block, and
+        * the model *ends* by narrating a tool call ("let me check the repo…")
+          but emits no ``tool_use`` block — read from the final paragraph only
+          (see :mod:`kestrel_sovereign.turn_completion`), and
         * the model writes tool-call *syntax* as literal text (e.g.
           ``<function_calls><invoke name="…">…``) instead of a structured
           call — which executes nothing and tends to be followed by
@@ -475,7 +477,7 @@ class OrchestratorEngineMixin:
         if not content:
             return False
         return bool(
-            CONTINUATION_INTENT_RE.search(content)
+            ends_with_unfinished_intent(content, CONTINUATION_INTENT_RE)
             or OrchestratorEngineMixin._tool_call_emitted_as_text(content)
         )
 
@@ -523,8 +525,14 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         request_id: Optional[str] = None,
         invocation_context=None,
+        original_delivered: bool = False,
     ) -> Union[str, LLMResponse]:
-        """Give the model one more step when it narrates continuing but emits no tool call."""
+        """Give the model one more step when it narrates continuing but emits no tool call.
+
+        ``original_delivered`` says the repaired message has already been
+        yielded to the client (the streaming tool loop streams text as it
+        arrives), so a finished answer needs only the repair's addition.
+        """
         content = response.content or ""
         if not tools or not OrchestratorEngineMixin._signals_unfinished_tool_work(content):
             return response
@@ -538,7 +546,7 @@ class OrchestratorEngineMixin:
         # identity as the original turn. Without this, an explicit-context
         # caller loses companion/user attribution on repair calls (there is
         # no ambient set_observability_context state to recover from).
-        return await self.llm_service.generate_with_messages(
+        repaired = await self.llm_service.generate_with_messages(
             messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
             tools=tools or None,
             force_local_only=force_local_only,
@@ -550,6 +558,35 @@ class OrchestratorEngineMixin:
                 if request_id else None
             ),
             invocation_context=invocation_context,
+        )
+        return OrchestratorEngineMixin._settle_repaired_turn(
+            content, repaired, original_delivered=original_delivered,
+        )
+
+    @staticmethod
+    def _settle_repaired_turn(
+        original: str,
+        repaired: Union[str, LLMResponse],
+        *,
+        original_delivered: bool,
+    ) -> Union[str, LLMResponse]:
+        """The repair's result, with a finished answer kept.
+
+        A repair that calls a tool continues the turn. A repair of tool-call
+        markup written as text replaces that text, which executed nothing and
+        was never an answer. Otherwise the model has said its message was the
+        answer, so the turn delivers that message followed by any addition,
+        never the reply to the runtime's check alone. When the message has
+        already reached the client, only the addition is left to deliver.
+        """
+        if isinstance(repaired, str) or repaired.has_tool_calls:
+            return repaired
+        if OrchestratorEngineMixin._tool_call_emitted_as_text(original):
+            return repaired
+        if original_delivered:
+            return replace(repaired, content=repair_addition(repaired.content))
+        return replace(
+            repaired, content=settle_repaired_content(original, repaired.content),
         )
 
     async def _execute_tool_with_hooks(
@@ -3400,6 +3437,7 @@ class OrchestratorEngineMixin:
                         streaming=True,
                         request_id=request_id,
                         invocation_context=invocation_context,
+                        original_delivered=True,
                     )
                     if isinstance(response, str):
                         yield response
@@ -3407,9 +3445,11 @@ class OrchestratorEngineMixin:
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
-                    # Repair is non-streaming (buffered LLMResponse); yield
-                    # its text so the user sees the repaired completion.
-                    yield response.content or ""
+                    # Repair is non-streaming (buffered LLMResponse). The
+                    # repaired text was already streamed above, so this yields
+                    # only what the repair adds to it.
+                    if response.content:
+                        yield f"\n\n{response.content}"
                     return
                 # Text-only response: already streamed to user during the
                 # tool-detection pass. No second LLM round-trip needed —

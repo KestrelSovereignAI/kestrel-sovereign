@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import is_dataclass, replace
 from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -39,6 +40,11 @@ from kestrel_sdk.features.ui import UIContributions
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
 from kestrel_sdk.features.base import tool, parse_docstring_params
+from kestrel_sovereign.turn_completion import (
+    ends_with_unfinished_intent,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +88,7 @@ CONTINUATION_INTENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this task is still in progress, but you did not emit a tool call.
-
-Continue the same task now:
-- If the work requires an available tool, emit the tool call now.
-- If no tool is needed or available, provide the final answer now.
-- Do not describe a future tool call without making it."""
+TURN_COMPLETION_REPAIR_PROMPT = turn_completion_repair_prompt("task")
 
 
 def is_flat_toolresult_envelope(value: Any) -> bool:
@@ -321,10 +322,8 @@ class Feature(_SdkFeature):
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
-        """Return True when assistant text promises more tool-backed work."""
-        if not content:
-            return False
-        return bool(CONTINUATION_INTENT_RE.search(content))
+        """Return True when assistant text ends by promising more tool-backed work."""
+        return ends_with_unfinished_intent(content, CONTINUATION_INTENT_RE)
 
     @staticmethod
     def _append_missing_tool_call_repair(messages: list, content: str) -> list:
@@ -409,13 +408,20 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
-        return await self.agent.llm_service.generate_with_messages(
+        repaired = await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
             tool_executor=tool_executor,
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
+        # A repair that makes no tool call has confirmed the message was the
+        # subagent's answer: keep it, followed by anything the repair adds.
+        if is_dataclass(repaired) and not getattr(repaired, "tool_calls", None):
+            return replace(
+                repaired, content=settle_repaired_content(content, repaired.content),
+            )
+        return repaired
 
     # =========================================================================
     # Lifecycle Methods
