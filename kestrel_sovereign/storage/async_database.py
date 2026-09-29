@@ -1104,11 +1104,23 @@ class AsyncDatabase:
         return await cls.from_connected_backend(backend)
     
     @classmethod
-    async def sqlite(cls, db_path: str) -> "AsyncDatabase":
-        """Create SQLite database at given path."""
+    async def sqlite(
+        cls,
+        db_path: str,
+        *,
+        schema_initializer: Optional[
+            Callable[["AsyncDatabase"], Awaitable[None]]
+        ] = None,
+    ) -> "AsyncDatabase":
+        """Create SQLite database at given path.
+
+        ``schema_initializer`` is passed to :meth:`from_connected_backend`.
+        """
         backend = SQLiteBackend(db_path)
         await backend.connect()
-        db = await cls.from_connected_backend(backend)
+        db = await cls.from_connected_backend(
+            backend, schema_initializer=schema_initializer
+        )
         logger.info(f"SQLite database connected: {db_path}")
         return db
     
@@ -1119,8 +1131,14 @@ class AsyncDatabase:
         *,
         min_pool_size: int = 2,
         max_pool_size: int = 10,
+        schema_initializer: Optional[
+            Callable[["AsyncDatabase"], Awaitable[None]]
+        ] = None,
     ) -> "AsyncDatabase":
-        """Create a PostgreSQL database with an explicitly bounded pool."""
+        """Create a PostgreSQL database with an explicitly bounded pool.
+
+        ``schema_initializer`` is passed to :meth:`from_connected_backend`.
+        """
         from .db.postgres import PostgresBackend
 
         backend = PostgresBackend(
@@ -1129,7 +1147,9 @@ class AsyncDatabase:
             max_pool_size=max_pool_size,
         )
         await backend.connect()
-        db = await cls.from_connected_backend(backend)
+        db = await cls.from_connected_backend(
+            backend, schema_initializer=schema_initializer
+        )
         logger.info("PostgreSQL database connected")
         return db
 

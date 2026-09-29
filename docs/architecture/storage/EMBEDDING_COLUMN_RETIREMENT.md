@@ -35,7 +35,10 @@ three phases:
 1. **This inventory plus an idempotent verify/backfill of `embedding_vec`**
    ([#3402](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3402)).
    No reader or writer changes.
-2. Move every legacy reader to `embedding_vec`.
+2. Pass the gate with `kestrel embeddings verify|backfill`
+   ([#3405](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3405),
+   see [How to run](#how-to-run)), then move every legacy reader to
+   `embedding_vec`.
 3. Stop the dual writes, then retire the legacy column.
 
 This page is the starting point for phases 2 and 3. Line numbers are against
@@ -58,8 +61,8 @@ with `scripts/`.
 | `storage/async_database.py:241-246` | `CREATE TABLE document_chunks (..., embedding BLOB)`. The legacy column is line 245. |
 | `storage/async_database.py:659-676` | `CREATE TABLE saved_items (..., embedding BLOB, ...)`. The legacy column is line 668. |
 | `storage/db/placeholder.py:224` | Rewrites `BLOB` to `BYTEA` when the schema is created on PostgreSQL. |
-| `storage/async_database.py:1486-1487` | Startup call to `migrate_saved_items_add_embedding_vec`. |
-| `storage/async_database.py:1505-1506` | Startup call to `migrate_document_chunks_add_embedding_vec`. |
+| `storage/async_database.py:1506-1507` | Startup call to `migrate_saved_items_add_embedding_vec`. |
+| `storage/async_database.py:1525-1526` | Startup call to `migrate_document_chunks_add_embedding_vec`. |
 | `storage/sqla/migrations.py:1323` | `migrate_saved_items_add_embedding_vec`. |
 | `storage/sqla/migrations.py:1401` | PG: reads `octet_length(embedding)` from one row to choose the `vector(N)` width. |
 | `storage/sqla/migrations.py:1446, 1466` | PG: reads every legacy `embedding` and writes `embedding_vec`. Rows whose width differs are skipped. |
@@ -201,6 +204,41 @@ Guarantees:
 - **No schema change and no deletion.** It never creates, drops or nulls a
   column, and it never modifies `embedding` or an existing `embedding_vec`.
 
-It has no CLI entry point yet. Phase 2 is expected to run it, and to require
-`rows_missing_embedding_vec == rows_unbackfillable` and a reviewed
-`rows_disagreeing`, before any reader switches columns.
+## How to run
+
+The helper is exposed as two `kestrel embeddings` subcommands
+([#3405](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3405)):
+
+```bash
+kestrel embeddings verify   [--table saved_items|document_chunks|all] [--json]
+kestrel embeddings backfill [--table saved_items|document_chunks|all] [--batch-size N] [--json]
+```
+
+- `verify` calls `verify_embedding_vec` and writes nothing. `backfill` calls
+  `backfill_embedding_vec` (default batch size 500). Both print every report
+  field above per table. `--json` prints one JSON document with a per-table
+  and an overall `gate_met`.
+- They select the database like `audit` and `reindex`: `--agent-name`,
+  `--data-dir`, `KESTREL_DB_PATH`, or `KESTREL_DATABASE_URL` for PostgreSQL.
+- They open it **without** the startup schema initializer. The default open
+  runs the `embedding_vec` startup migration, which would itself create an
+  absent column and copy the legacy vectors into it. An absent column is
+  reported as `ABSENT` and left for the agent's startup migration to create.
+
+**The phase-2 gate.** Before any reader switches to `embedding_vec`, run
+`kestrel embeddings backfill`, then `kestrel embeddings verify`, on every
+deployment. Proceed only when `verify` exits 0 and `rows_disagreeing` has been
+reviewed. A disagreement is expected after a reindex, so it is reported but
+does not affect the exit code.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Gate met: on every table, `rows_missing_embedding_vec == rows_unbackfillable`. |
+| `3` | Gate not met: a table still has rows the backfill can copy, or its `embedding_vec` column is absent while it holds legacy embeddings. |
+| `2` | Did not run: a usage error, an ambiguous or missing database, a failed connection, an unsupported backend, or a PostgreSQL `embedding_vec` that is not a `vector`. |
+| `1` | An unexpected error (an uncaught exception). |
+
+An absent column is the one case where the equality alone would mislead: the
+helper counts every legacy row as unbackfillable, so the counts match while no
+vector has moved. The gate treats it as met only when the table holds no
+legacy embeddings.

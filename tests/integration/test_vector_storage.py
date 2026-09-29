@@ -6,7 +6,7 @@ cases drive that real writer, then check that the verify/backfill helper
 agrees with it and repairs a row whose dual-write was lost.
 
 The PostgreSQL path of the helper is covered by
-``tests/unit/storage/test_embedding_vec_backfill.py``, which the CI unit
+``tests/unit/test_embedding_vec_backfill.py``, which the CI unit
 tier runs against PostgreSQL.
 """
 
