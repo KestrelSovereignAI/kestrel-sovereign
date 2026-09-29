@@ -34,7 +34,10 @@ Four subcommands:
     cannot be backfilled; otherwise they exit :data:`EXIT_GATE_NOT_MET`.
     They open the database without running the startup schema initializer,
     whose migration would itself create ``embedding_vec`` and copy legacy
-    vectors into it. An absent column is reported, never created.
+    vectors into it. An absent column is reported, never created. On SQLite
+    ``verify`` also opens read-only through the cold-read connection
+    (#3407): the normal open sets ``journal_mode=WAL``, which would rewrite a
+    rollback-journal database and fail on a read-only file.
 
 Every subcommand opens the same production :class:`AsyncDatabase` the
 agent/server open — ``KESTREL_DATABASE_URL`` for Postgres, otherwise
@@ -892,6 +895,7 @@ async def _embedding_vec(
     does not affect the exit code: after a reindex the two columns
     legitimately differ.
     """
+    from kestrel_sovereign.storage.db.sqlite import ColdReadUnavailable
     from kestrel_sovereign.storage.embedding_vec_backfill import (
         EmbeddingVecBackfillError,
         backfill_embedding_vec,
@@ -915,6 +919,19 @@ async def _embedding_vec(
             print(f"ERROR: {tname}: {exc}", file=sys.stderr)
             return 2
         reports.append(report)
+
+    # ``verify`` opens a quiescent SQLite database ``immutable=1``, which is
+    # blind to a writer that commits while it reads. Refuse to report on a
+    # database that changed underneath it (#3407); a no-op otherwise.
+    assert_unchanged = getattr(
+        getattr(db, "backend", None), "assert_cold_read_still_valid", None
+    )
+    if assert_unchanged is not None:
+        try:
+            assert_unchanged()
+        except ColdReadUnavailable as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
 
     gate_met = all(_gate_met(report) for report in reports)
     if as_json:
@@ -1046,8 +1063,14 @@ def run(args: argparse.Namespace) -> int:
                     pg_url, schema_initializer=schema_initializer
                 )
             else:
+                # ``verify`` reads through the cold-read connection. The normal
+                # open sets ``journal_mode=WAL``, which permanently converts a
+                # rollback-journal database and fails on a read-only one,
+                # whatever schema initializer it is given (#3407).
                 db = await AsyncDatabase.sqlite(
-                    sqlite_path, schema_initializer=schema_initializer
+                    sqlite_path,
+                    schema_initializer=schema_initializer,
+                    cold_read=args.embeddings_command == "verify",
                 )
         except Exception as exc:
             print(f"ERROR: could not connect to DB: {exc}", file=sys.stderr)
@@ -1085,5 +1108,10 @@ def run(args: argparse.Namespace) -> int:
                     await close()
                 except Exception:
                     pass
+            # A read-only connection can keep a live agent's WAL from being
+            # checkpointed away; the cold-read backend says so when it did.
+            warn = getattr(db.backend, "warn_if_wal_state_was_stranded", None)
+            if warn is not None:
+                warn()
 
     return asyncio.run(_runner())

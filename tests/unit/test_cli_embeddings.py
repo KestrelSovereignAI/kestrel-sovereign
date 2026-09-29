@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import struct
 import sys
+from contextlib import closing
 from dataclasses import fields
 from uuid import uuid4
 
@@ -67,7 +69,7 @@ def _connect(data_dir):
 
 
 def _insert_saved_item(data_dir, item_id, embedding=None, embedding_vec=None):
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         conn.execute(
             "INSERT INTO saved_items (id, agent_id, item_type, name, content, "
             "embedding, embedding_vec) "
@@ -77,7 +79,7 @@ def _insert_saved_item(data_dir, item_id, embedding=None, embedding_vec=None):
 
 
 def _insert_chunk(data_dir, content, embedding):
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         conn.execute(
             "INSERT INTO document_chunks (file_hash, content, embedding) "
             "VALUES (?, ?, ?)",
@@ -86,12 +88,12 @@ def _insert_chunk(data_dir, content, embedding):
 
 
 def _drop_chunk_embedding_vec(data_dir):
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         conn.execute("ALTER TABLE document_chunks DROP COLUMN embedding_vec")
 
 
 def _columns(data_dir, table, id_col, row_id):
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         return conn.execute(
             f"SELECT embedding, embedding_vec FROM {table} WHERE {id_col} = ?",
             (row_id,),
@@ -99,7 +101,7 @@ def _columns(data_dir, table, id_col, row_id):
 
 
 def _has_embedding_vec(data_dir, table):
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         return bool(conn.execute(
             f"SELECT 1 FROM pragma_table_info('{table}') "
             "WHERE name = 'embedding_vec'"
@@ -108,7 +110,7 @@ def _has_embedding_vec(data_dir, table):
 
 def _snapshot(data_dir):
     """Every row of both tables plus the whole schema."""
-    with _connect(data_dir) as conn:
+    with closing(_connect(data_dir)) as conn, conn:
         return {
             "saved_items": conn.execute(
                 "SELECT * FROM saved_items ORDER BY id"
@@ -261,6 +263,151 @@ def test_verify_writes_nothing(agent_dir, monkeypatch, capsys):
     assert rc == cli_embeddings.EXIT_GATE_NOT_MET
     assert _snapshot(agent_dir) == before
     assert "rows_backfilled" in capsys.readouterr().out
+
+
+def _use_rollback_journal(data_dir):
+    """Switch the fixture database from WAL to a ``DELETE`` rollback journal."""
+    with closing(_connect(data_dir)) as conn:
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+
+
+def _db_file(data_dir):
+    return data_dir / "kestrel_prime.db"
+
+
+def _sidecars(data_dir):
+    return sorted(p.name for p in data_dir.glob("kestrel_prime.db-*"))
+
+
+def _file_state(path):
+    return path.read_bytes(), path.stat().st_mtime_ns
+
+
+def _journal_mode(data_dir):
+    uri = f"{_db_file(data_dir).as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        return conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+
+def test_verify_leaves_a_rollback_journal_database_unchanged(
+    agent_dir, monkeypatch, capsys
+):
+    # The normal open runs ``PRAGMA journal_mode=WAL``, which permanently
+    # converts a rollback-journal database whatever schema initializer it is
+    # given (#3407).
+    _insert_saved_item(agent_dir, "legacy-only", embedding=_pack([1.0, 2.0]))
+    _use_rollback_journal(agent_dir)
+    db_file = _db_file(agent_dir)
+    # An mtime from long ago, so any write moves it however coarse the clock.
+    os.utime(db_file, ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+    before = _file_state(db_file)
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, "verify", agent_dir)
+
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    assert _table(payload, "saved_items")["rows_missing_embedding_vec"] == 1
+    assert _file_state(db_file) == before
+    assert _sidecars(agent_dir) == []
+    assert _journal_mode(agent_dir) == "delete"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+def test_verify_reports_on_a_read_only_database(
+    agent_dir, monkeypatch, capsys, journal_mode
+):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores permission bits")
+    _insert_saved_item(agent_dir, "legacy-only", embedding=_pack([1.0, 2.0]))
+    if journal_mode == "delete":
+        _use_rollback_journal(agent_dir)
+    # A stopped agent: a WAL database is checkpointed, with no sidecars.
+    assert _sidecars(agent_dir) == []
+    db_file = _db_file(agent_dir)
+    before = db_file.read_bytes()
+    # A read-only file in a read-only directory: nothing can be written to
+    # the database or created beside it, as on a read-only filesystem.
+    db_file.chmod(0o444)
+    agent_dir.chmod(0o555)
+    try:
+        rc = _kestrel(
+            monkeypatch, "embeddings", "verify", "--data-dir", str(agent_dir),
+            "--json",
+        )
+        captured = capsys.readouterr()
+    finally:
+        agent_dir.chmod(0o755)
+        db_file.chmod(0o644)
+
+    assert "ERROR" not in captured.err
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    payload = json.loads(captured.out)
+    assert payload["gate_met"] is False
+    assert _table(payload, "saved_items")["rows_missing_embedding_vec"] == 1
+    assert db_file.read_bytes() == before
+    assert _journal_mode(agent_dir) == journal_mode
+
+
+def test_verify_reads_rows_still_only_in_a_live_wal(
+    agent_dir, monkeypatch, capsys, caplog
+):
+    # A running agent keeps the database open in WAL mode. An ``immutable=1``
+    # read would ignore the WAL and miss the row it holds.
+    holder = _connect(agent_dir)
+    try:
+        holder.execute("PRAGMA wal_autocheckpoint=0")
+        holder.execute(
+            "INSERT INTO saved_items (id, agent_id, item_type, name, content, "
+            "embedding) VALUES ('in-wal', 'did:test:agent', 'stash', 'in-wal', "
+            "'c', ?)",
+            (_pack([1.0, 2.0]),),
+        )
+        holder.commit()
+        assert _sidecars(agent_dir), "setup must leave a live WAL"
+
+        with caplog.at_level(logging.WARNING):
+            rc, payload = _embeddings_json(
+                monkeypatch, capsys, "verify", agent_dir, "--table", "saved_items"
+            )
+    finally:
+        holder.close()
+
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    (entry,) = payload["tables"]
+    assert entry["rows_missing_embedding_vec"] == 1
+    # The agent's WAL outlived this read, which the cold-read backend reports.
+    assert "WAL sidecars still present" in caplog.text
+
+
+def test_verify_refuses_a_report_the_database_changed_under(
+    agent_dir, monkeypatch, capsys
+):
+    # With no WAL to read, verify opens ``immutable=1``, which cannot see a
+    # writer that commits while it reads. The report would describe a
+    # database that no longer exists, so verify must refuse to print it.
+    from kestrel_sovereign.storage import embedding_vec_backfill
+
+    assert _sidecars(agent_dir) == [], "setup must leave no WAL to read"
+    real_verify = embedding_vec_backfill.verify_embedding_vec
+
+    async def verify_then_write(db, table):
+        report = await real_verify(db, table)
+        _insert_saved_item(agent_dir, "late", embedding=_pack([9.0] * 4096))
+        return report
+
+    monkeypatch.setattr(
+        embedding_vec_backfill, "verify_embedding_vec", verify_then_write
+    )
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "verify", "--data-dir", str(agent_dir),
+        "--table", "saved_items",
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "changed while it was being read" in captured.err
+    assert "phase-2 gate" not in captured.out
 
 
 @pytest.mark.parametrize("command", ["verify", "backfill"])

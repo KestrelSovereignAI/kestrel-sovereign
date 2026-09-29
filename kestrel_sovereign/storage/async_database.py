@@ -1111,12 +1111,26 @@ class AsyncDatabase:
         schema_initializer: Optional[
             Callable[["AsyncDatabase"], Awaitable[None]]
         ] = None,
+        cold_read: bool = False,
     ) -> "AsyncDatabase":
         """Create SQLite database at given path.
 
         ``schema_initializer`` is passed to :meth:`from_connected_backend`.
+
+        ``cold_read`` opens an existing database read-only through
+        :class:`SQLiteBackend`'s cold-read connection: it never sets the
+        journal mode and fails on a database that does not exist rather than
+        creating it. A cold read must supply ``schema_initializer``, because the
+        default one runs DDL the connection cannot execute. The caller must
+        call the backend's ``assert_cold_read_still_valid`` before acting on
+        what it read.
         """
-        backend = SQLiteBackend(db_path)
+        if cold_read and schema_initializer is None:
+            raise ValueError(
+                "a cold read cannot run the default schema initializer; "
+                "pass a schema_initializer that issues no DDL"
+            )
+        backend = SQLiteBackend(db_path, cold_read=cold_read)
         await backend.connect()
         db = await cls.from_connected_backend(
             backend, schema_initializer=schema_initializer

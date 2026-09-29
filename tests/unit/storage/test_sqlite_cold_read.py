@@ -15,6 +15,7 @@ import sqlite3
 
 import pytest
 
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -246,3 +247,57 @@ def test_config_requested_cold_read_survives_a_backend_that_cannot_carry_it():
         agent_id="did:test",
     )
     assert storage.cold_read is True
+
+
+async def _no_schema_ddl(db):
+    """A schema initializer that issues nothing."""
+
+
+@pytest.mark.asyncio
+async def test_async_database_cold_read_refuses_the_default_schema_initializer(
+    tmp_path,
+):
+    """The default initializer runs DDL the read-only connection cannot run.
+
+    Refused before connecting, so the refusal cannot leave a file behind.
+    """
+    db = tmp_path / "never-opened.db"
+
+    with pytest.raises(ValueError, match="schema_initializer"):
+        await AsyncDatabase.sqlite(str(db), cold_read=True)
+
+    assert not db.exists()
+
+
+@pytest.mark.asyncio
+async def test_async_database_cold_read_leaves_a_rollback_journal_alone(tmp_path):
+    """The normal open sets ``journal_mode=WAL``, which rewrites the header.
+
+    ``kestrel embeddings verify`` reads through this path (#3407), so a
+    rollback-journal database must come out byte-for-byte as it went in.
+    """
+    db = tmp_path / "rollback.db"
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("CREATE TABLE t (v TEXT)")
+    conn.execute("INSERT INTO t VALUES ('committed')")
+    conn.commit()
+    conn.close()
+    before = db.read_bytes()
+
+    database = await AsyncDatabase.sqlite(
+        str(db), schema_initializer=_no_schema_ddl, cold_read=True
+    )
+    try:
+        assert await database.fetchone("SELECT v FROM t", ()) is not None
+        database.backend.assert_cold_read_still_valid()
+    finally:
+        await database.close()
+
+    assert db.read_bytes() == before
+    assert _sidecars(db) == []
+    check = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True)
+    try:
+        assert check.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    finally:
+        check.close()
