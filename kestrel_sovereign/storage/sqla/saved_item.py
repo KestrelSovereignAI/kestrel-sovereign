@@ -5,11 +5,14 @@ The table is created and managed by the raw-SQL ``AsyncDatabase`` /
 ORM view on top so :func:`SavedItemsStore.search` can hand the table
 to the generic vector backends in ``kestrel_sovereign.storage.vector``.
 
-The ``embedding`` column uses :class:`PortableVector` — ``vector(N)``
-on Postgres (via pgvector) and ``LargeBinary`` (BLOB) on SQLite. The
-Phase-2 PG migration in ``saved_items_pgvector_migration.py`` swaps
-existing BYTEA data to ``vector(N)`` on upgrade; SQLite is unchanged.
-See kestrel-sovereign #1447 / #1452.
+The ORM ``embedding`` attribute maps the parallel ``embedding_vec``
+column, a :class:`PortableVector` — ``vector(N)`` on Postgres (via
+pgvector) and ``LargeBinary`` (BLOB) on SQLite. The Phase-2 migration
+(``migrations.migrate_saved_items_add_embedding_vec``) adds it beside
+the legacy ``embedding`` BYTEA / BLOB column and copies existing
+vectors. See kestrel-sovereign #1447 / #1452, and
+``docs/architecture/storage/EMBEDDING_COLUMN_RETIREMENT.md`` for the
+legacy column's remaining consumers.
 """
 
 from __future__ import annotations

@@ -92,6 +92,12 @@ The current SQLAlchemy-mapped vector tables are:
 | `document_chunks` | `storage/sqla/document_chunk.py` | `embedding_vec` | Active RAG vector backend path with legacy `embedding` dual-write. |
 | `conversation_history` | `storage/sqla/conversation_message.py` | `embedding_vec` | Storage/schema groundwork landed; `MemoryRetriever` still uses keyword/concept overlap in the current tree. |
 
+`embedding_vec` is the canonical vector column. The legacy `embedding` column
+on `saved_items` and `document_chunks` is being retired (#2684). Every
+remaining legacy reader and writer, and the `embedding_vec` verify/backfill
+helper, are listed in
+[Legacy Embedding Column Inventory](EMBEDDING_COLUMN_RETIREMENT.md).
+
 ## Vector Search
 
 The vector backend factory dispatches by SQLAlchemy dialect:

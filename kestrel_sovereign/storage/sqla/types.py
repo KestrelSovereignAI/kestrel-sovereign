@@ -40,7 +40,7 @@ class PortableVector(TypeDecorator):
 
     The PG path requires the ``vector`` extension to be installed
     (``CREATE EXTENSION IF NOT EXISTS vector``). The sovereign-core
-    migration that swaps ``saved_items.embedding`` to this type runs
+    migrations that add the ``embedding_vec`` columns of this type run
     that statement guarded with ``IF NOT EXISTS``.
     """
 
