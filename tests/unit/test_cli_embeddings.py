@@ -17,6 +17,7 @@ import sqlite3
 import struct
 import sys
 from dataclasses import fields
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pytest
@@ -276,29 +277,103 @@ def test_absent_embedding_vec_column_is_reported_not_created(
     assert not _has_embedding_vec(agent_dir, "document_chunks")
     assert _snapshot(agent_dir) == before
     # The helper counts the legacy row as unbackfillable, so the equality
-    # holds, but no vector has anywhere to go: the gate is not met.
+    # holds, but there is no column for a reader to query: the gate is not met.
     assert rc == cli_embeddings.EXIT_GATE_NOT_MET
     out = capsys.readouterr().out
     assert "embedding_vec column is ABSENT" in out
     assert "never creates it" in out
-    assert "no embedding_vec column to move into" in out
+    assert "document_chunks.embedding_vec is missing" in out
     assert "phase-2 gate: NOT met" in out
 
 
-def test_absent_column_with_no_legacy_rows_meets_the_gate(
-    agent_dir, monkeypatch, capsys
+@pytest.mark.parametrize("command", ["verify", "backfill"])
+def test_absent_column_fails_the_gate_even_when_the_table_is_empty(
+    agent_dir, monkeypatch, capsys, command
 ):
+    # PostgreSQL defers creating embedding_vec until a legacy embedding
+    # exists, so an empty table is exactly where the column can be missing.
+    # A reader switched to it would fail, so the gate must not pass (#3405).
     _drop_chunk_embedding_vec(agent_dir)
 
     rc, payload = _embeddings_json(
-        monkeypatch, capsys, "verify", agent_dir, "--table", "document_chunks"
+        monkeypatch, capsys, command, agent_dir, "--table", "document_chunks"
     )
 
-    assert rc == 0
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    assert payload["gate_met"] is False
     (entry,) = payload["tables"]
+    assert entry["table"] == "document_chunks"
     assert entry["embedding_vec_present"] is False
-    assert entry["rows_missing_embedding_vec"] == 0
-    assert entry["gate_met"] is True
+    assert entry["total_rows"] == 0
+    assert entry["rows_missing_embedding_vec"] == entry["rows_unbackfillable"] == 0
+    assert entry["gate_met"] is False
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", command, "--data-dir", str(agent_dir),
+        "--table", "document_chunks",
+    )
+
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    out = capsys.readouterr().out
+    assert "embedding_vec column is ABSENT" in out
+    assert "gate: NOT met — document_chunks.embedding_vec is missing" in out
+    assert "phase-2 gate: NOT met" in out
+    assert not _has_embedding_vec(agent_dir, "document_chunks")
+
+
+def test_absent_column_on_one_table_fails_only_that_table(
+    agent_dir, monkeypatch, capsys
+):
+    item_vec = _pack([0.1, 0.2])
+    _insert_saved_item(agent_dir, "legacy-only", embedding=item_vec)
+    _drop_chunk_embedding_vec(agent_dir)
+
+    rc, payload = _embeddings_json(monkeypatch, capsys, "backfill", agent_dir)
+
+    # saved_items has its column and a clean backfill, so it meets the gate;
+    # the empty document_chunks has no column, which fails the whole run.
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    assert payload["gate_met"] is False
+    saved = _table(payload, "saved_items")
+    assert (saved["embedding_vec_present"], saved["rows_backfilled"]) == (True, 1)
+    assert saved["gate_met"] is True
+    chunks = _table(payload, "document_chunks")
+    assert (chunks["embedding_vec_present"], chunks["total_rows"]) == (False, 0)
+    assert chunks["gate_met"] is False
+
+    rc, payload = _embeddings_json(
+        monkeypatch, capsys, "verify", agent_dir, "--table", "saved_items"
+    )
+    assert rc == 0
+    assert payload["gate_met"] is True
+
+
+@pytest.mark.parametrize(
+    ("present", "missing", "unbackfillable", "met"),
+    [
+        (True, 0, 0, True),
+        (True, 2, 2, True),
+        (True, 2, 1, False),
+        (False, 0, 0, False),
+        (False, 3, 3, False),
+    ],
+)
+def test_gate_requires_the_column_and_every_missing_row_unbackfillable(
+    present, missing, unbackfillable, met
+):
+    report = EmbeddingVecReport(
+        table="saved_items",
+        embedding_vec_present=present,
+        total_rows=missing,
+        rows_with_both=0,
+        rows_missing_embedding_vec=missing,
+        rows_embedding_vec_only=0,
+        rows_disagreeing=0,
+        rows_backfilled=0,
+        rows_unbackfillable=unbackfillable,
+    )
+
+    assert cli_embeddings._gate_met(report) is met
 
 
 def test_text_report_prints_every_field_and_the_gate(agent_dir, monkeypatch, capsys):
@@ -477,6 +552,128 @@ def test_postgres_verify_changes_neither_the_column_nor_a_row(
         # Opening with the default initializer while this legacy row exists
         # would let the startup migration create the column.
         _on_postgres(postgres_url, delete_row, initialize_schema=False)
+
+
+@pytest.fixture
+def private_pg_schema(postgres_url, monkeypatch):
+    """A private schema the CLI resolves ``document_chunks`` in first.
+
+    The CLI's ``KESTREL_DATABASE_URL`` carries ``search_path=<schema>,public``
+    (asyncpg sends unknown DSN parameters as server settings), so the gate is
+    checked against a table this test owns. ``public`` stays on the path for
+    the pgvector type. The shared ``document_chunks`` column is never altered,
+    so no parallel test can observe it change.
+    """
+    schema = f"cli_embeddings_{uuid4().hex}"
+
+    async def create_schema(db):
+        await db.execute(f"CREATE SCHEMA {schema}", ())
+
+    _on_postgres(postgres_url, create_schema, initialize_schema=False)
+    parts = urlsplit(postgres_url)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k != "search_path"]
+    query.append(("search_path", f"{schema},public"))
+    monkeypatch.setenv(
+        "KESTREL_DATABASE_URL", urlunsplit(parts._replace(query=urlencode(query)))
+    )
+    try:
+        yield schema
+    finally:
+        async def remove_schema(db):
+            await db.execute(f"DROP SCHEMA {schema} CASCADE", ())
+
+        _on_postgres(postgres_url, remove_schema, initialize_schema=False)
+
+
+def _create_pg_chunks(url, schema, *, embedding_vec):
+    vec_column = ", embedding_vec vector(2)" if embedding_vec else ""
+
+    async def create(db):
+        if embedding_vec:
+            await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
+        await db.execute(
+            f"CREATE TABLE {schema}.document_chunks ("
+            "chunk_id SERIAL PRIMARY KEY, file_hash TEXT, content TEXT, "
+            f"embedding BYTEA{vec_column})",
+            (),
+        )
+
+    _on_postgres(url, create, initialize_schema=False)
+
+
+async def _pg_private_chunks_have_embedding_vec(db, schema):
+    column = await db.fetchone(
+        "SELECT 1 FROM pg_attribute "
+        f"WHERE attrelid = to_regclass('{schema}.document_chunks') "
+        "AND attname = 'embedding_vec' AND NOT attisdropped",
+        (),
+    )
+    return column is not None
+
+
+@pytest.mark.parametrize("command", ["verify", "backfill"])
+def test_postgres_absent_embedding_vec_on_an_empty_table_fails_the_gate(
+    postgres_url, private_pg_schema, monkeypatch, capsys, command
+):
+    # The startup migration defers the column until a legacy embedding
+    # exists, so an empty PostgreSQL table has none. A reader switched to it
+    # would fail, so the gate must not pass (#3405).
+    _create_pg_chunks(postgres_url, private_pg_schema, embedding_vec=False)
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", command, "--table", "document_chunks", "--json"
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == cli_embeddings.EXIT_GATE_NOT_MET
+    assert payload["gate_met"] is False
+    (entry,) = payload["tables"]
+    assert entry["table"] == "document_chunks"
+    assert entry["embedding_vec_present"] is False
+    assert entry["total_rows"] == 0
+    assert entry["gate_met"] is False
+    assert not _on_postgres(
+        postgres_url,
+        lambda db: _pg_private_chunks_have_embedding_vec(db, private_pg_schema),
+        initialize_schema=False,
+    )
+
+
+def test_postgres_clean_backfill_with_the_column_meets_the_gate(
+    postgres_url, private_pg_schema, monkeypatch, capsys
+):
+    _create_pg_chunks(postgres_url, private_pg_schema, embedding_vec=True)
+    legacy = _pack([0.5, -0.25])
+
+    async def insert(db):
+        await db.execute(
+            f"INSERT INTO {private_pg_schema}.document_chunks "
+            "(file_hash, content, embedding) VALUES (?, ?, ?)",
+            ("doc", "chunk", legacy),
+        )
+
+    _on_postgres(postgres_url, insert, initialize_schema=False)
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "backfill", "--table", "document_chunks",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["gate_met"] is True
+    (entry,) = payload["tables"]
+    assert entry["embedding_vec_present"] is True
+    assert (entry["total_rows"], entry["rows_backfilled"]) == (1, 1)
+    assert entry["rows_missing_embedding_vec"] == 0
+    assert entry["gate_met"] is True
+
+    rc = _kestrel(
+        monkeypatch, "embeddings", "verify", "--table", "document_chunks", "--json"
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["tables"][0]["rows_with_both"] == 1
 
 
 def _parse(*argv):

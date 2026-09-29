@@ -29,12 +29,12 @@ Four subcommands:
     ``saved_items`` and ``document_chunks`` (#3405, parent #2684). ``verify``
     reads only; ``backfill`` copies the legacy value into ``embedding_vec``
     where it is NULL. Both print every ``EmbeddingVecReport`` field per table
-    (``--json`` for a script) and exit 0 only when every row still missing
-    ``embedding_vec`` is one that cannot be backfilled; otherwise they exit
-    :data:`EXIT_GATE_NOT_MET`. They open the database without running the
-    startup schema initializer, whose migration would itself create
-    ``embedding_vec`` and copy legacy vectors into it. An absent column is
-    reported, never created.
+    (``--json`` for a script) and exit 0 only when every table has an
+    ``embedding_vec`` column and every row still missing it is one that
+    cannot be backfilled; otherwise they exit :data:`EXIT_GATE_NOT_MET`.
+    They open the database without running the startup schema initializer,
+    whose migration would itself create ``embedding_vec`` and copy legacy
+    vectors into it. An absent column is reported, never created.
 
 Every subcommand opens the same production :class:`AsyncDatabase` the
 agent/server open — ``KESTREL_DATABASE_URL`` for Postgres, otherwise
@@ -863,15 +863,17 @@ async def _leave_schema_unchanged(db: Any) -> None:
 def _gate_met(report: Any) -> bool:
     """Whether one table meets the phase-2 gate (#2684).
 
-    Every row still missing ``embedding_vec`` must be one the backfill
-    cannot copy. When the column is absent the helper counts every legacy
-    row as unbackfillable, which satisfies that equality without a single
-    vector having moved; an absent column therefore meets the gate only when
-    there is nothing to move.
+    The ``embedding_vec`` column must exist, and every row still missing a
+    value in it must be one the backfill cannot copy. Phase 2b points
+    readers at ``embedding_vec``, so an absent column fails the gate however
+    few rows the table holds: PostgreSQL defers creating the column until a
+    legacy embedding exists, which leaves an empty table without it. The
+    helper also counts every legacy row as unbackfillable when the column is
+    absent, so the row equality alone would pass.
     """
-    if report.rows_missing_embedding_vec != report.rows_unbackfillable:
-        return False
-    return report.embedding_vec_present or report.rows_missing_embedding_vec == 0
+    return bool(report.embedding_vec_present) and (
+        report.rows_missing_embedding_vec == report.rows_unbackfillable
+    )
 
 
 async def _embedding_vec(
@@ -940,7 +942,8 @@ def _print_embedding_vec_reports(
             print(
                 "  embedding_vec column is ABSENT. Nothing was backfilled, and "
                 "nothing can be until the agent's startup migration creates "
-                "it; this command never creates it."
+                "it (on PostgreSQL, only once the table holds a legacy "
+                "embedding); this command never creates it."
             )
         for field in (
             "total_rows",
@@ -956,8 +959,9 @@ def _print_embedding_vec_reports(
             print(f"  {'gate':<28} {'met':>8}")
         elif not report.embedding_vec_present:
             print(
-                f"  gate: NOT met — {report.rows_missing_embedding_vec} legacy "
-                "embedding(s) have no embedding_vec column to move into."
+                f"  gate: NOT met — {report.table}.embedding_vec is missing, so "
+                "a reader switched to it would query a column that does not "
+                "exist."
             )
         else:
             hint = (
@@ -977,8 +981,8 @@ def _print_embedding_vec_reports(
             )
     verdict = "met" if gate_met else "NOT met"
     print(
-        f"\nphase-2 gate: {verdict} (rows_missing_embedding_vec == "
-        "rows_unbackfillable on every table)"
+        f"\nphase-2 gate: {verdict} (embedding_vec present and "
+        "rows_missing_embedding_vec == rows_unbackfillable on every table)"
     )
 
 

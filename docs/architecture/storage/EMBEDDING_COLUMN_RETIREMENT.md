@@ -233,12 +233,16 @@ does not affect the exit code.
 
 | Exit code | Meaning |
 |---|---|
-| `0` | Gate met: on every table, `rows_missing_embedding_vec == rows_unbackfillable`. |
-| `3` | Gate not met: a table still has rows the backfill can copy, or its `embedding_vec` column is absent while it holds legacy embeddings. |
+| `0` | Gate met: every table has an `embedding_vec` column and `rows_missing_embedding_vec == rows_unbackfillable`. |
+| `3` | Gate not met: a table still has rows the backfill can copy, or its `embedding_vec` column is absent (even when the table is empty). |
 | `2` | Did not run: a usage error, an ambiguous or missing database, a failed connection, an unsupported backend, or a PostgreSQL `embedding_vec` that is not a `vector`. |
 | `1` | An unexpected error (an uncaught exception). |
 
-An absent column is the one case where the equality alone would mislead: the
-helper counts every legacy row as unbackfillable, so the counts match while no
-vector has moved. The gate treats it as met only when the table holds no
-legacy embeddings.
+An absent column never meets the gate, however few rows the table holds.
+Phase 2b points readers at `embedding_vec`, and they would query a column that
+does not exist. The row equality alone would not catch it: with the column
+absent, the helper counts every legacy row as unbackfillable, so the counts
+match while no vector has moved. On PostgreSQL the startup migration sizes
+`vector(N)` from an existing legacy embedding, so a table that has never held
+one has no column and cannot pass the gate until one exists and the agent
+restarts.
