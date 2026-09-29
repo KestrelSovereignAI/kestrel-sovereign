@@ -34,6 +34,7 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.turn_completion import (
+    confirms_complete,
     repair_addition,
     settle_repaired_content,
     turn_completion_repair_prompt,
@@ -573,11 +574,12 @@ class OrchestratorEngineMixin:
         A repair that acted, by a structured tool call or by tools an adapter
         ran inline (``executed_tool_calls``, the codex app-server), goes on as
         the turn. A repair of tool-call markup written as text replaces that
-        text, which executed nothing and was never an answer. Otherwise the
-        model has said its message was the answer, so the turn delivers that
-        message followed by any addition, never the reply to the runtime's
-        check alone. When the message has already reached the client, only the
-        addition is left to deliver.
+        text, which executed nothing and was never an answer, and so does a
+        reply that does not confirm completion: it is the model's new answer.
+        A confirming reply means the message was the answer, so the turn
+        delivers that message followed by any addition, never the reply to the
+        runtime's check alone. When the message has already reached the client,
+        only the addition is left to deliver.
 
         The content is settled on the repair's own response object rather than
         a copy: adapters and the service attach runtime attributes to it
@@ -589,6 +591,8 @@ class OrchestratorEngineMixin:
         if getattr(repaired, "executed_tool_calls", None):
             return repaired
         if OrchestratorEngineMixin._tool_call_emitted_as_text(original):
+            return repaired
+        if not confirms_complete(repaired.content):
             return repaired
         if original_delivered:
             repaired.content = repair_addition(repaired.content)

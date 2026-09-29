@@ -12,10 +12,11 @@ answer costs one model call and nothing else (#3397):
 
 * It asks rather than orders. The check says it is the runtime, not the user,
   and gives the model a truthful way to say the message was complete.
-* A repair that makes no tool call does not replace the message it repaired.
-  The model has confirmed the message was its answer, so the answer is the
-  original plus anything the model adds, never the model's reply to the
-  runtime's check alone.
+* A repair that confirms the message was complete does not replace it. The
+  answer is the original plus anything the model adds, never the model's reply
+  to the runtime's check alone. A repair that answers without confirming has
+  written a new answer, and that answer stands on its own: an announcement
+  followed by "I cannot do that" would contradict itself.
 """
 
 from __future__ import annotations
@@ -46,16 +47,24 @@ def turn_completion_repair_prompt(unit: str) -> str:
     )
 
 
+def confirms_complete(repaired: Optional[str]) -> bool:
+    """True when a repair reply says the repaired message was the answer."""
+    return REPAIR_COMPLETE_MARKER in (repaired or "")
+
+
 def repair_addition(repaired: Optional[str]) -> str:
-    """What a no-tool repair reply adds to the message it repaired."""
+    """What a confirming repair reply adds to the message it repaired."""
     return (repaired or "").replace(REPAIR_COMPLETE_MARKER, "").strip()
 
 
 def settle_repaired_content(original: Optional[str], repaired: Optional[str]) -> str:
     """The answer after a repair that made no tool call.
 
-    The original message, followed by whatever the repair reply adds.
+    A confirming reply keeps the original message, followed by whatever the
+    reply adds. Any other reply is the model's new answer.
     """
+    if not confirms_complete(repaired):
+        return repaired or ""
     kept = (original or "").rstrip()
     addition = repair_addition(repaired)
     if not addition:

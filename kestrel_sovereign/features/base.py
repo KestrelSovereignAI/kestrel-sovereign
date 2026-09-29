@@ -415,11 +415,11 @@ class Feature(_SdkFeature):
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
-        # A repair that neither calls a tool nor ran one inline has confirmed
-        # the message was the subagent's answer: keep it, followed by anything
-        # the repair adds. Settled on the response itself, not a copy, so the
-        # runtime attributes adapters attach to it (``model``,
-        # ``executed_tool_calls``) survive.
+        # A repair that neither calls a tool nor ran one inline either confirms
+        # the message was the subagent's answer (keep it, followed by anything
+        # the repair adds) or is a new answer. Settled on the response itself,
+        # not a copy, so the runtime attributes adapters attach to it
+        # (``model``, ``executed_tool_calls``) survive.
         if (
             not isinstance(repaired, str)
             and not getattr(repaired, "tool_calls", None)

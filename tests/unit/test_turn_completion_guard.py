@@ -489,6 +489,16 @@ async def test_repair_reply_is_added_to_the_answer_not_substituted():
 
 
 @pytest.mark.asyncio
+async def test_unconfirmed_repair_reply_is_the_new_answer():
+    """A reply without the marker is a new answer, not an addition: appending
+    "I cannot reach GitHub" to "I will run the review" would contradict itself
+    (codex review r4)."""
+    agent, result = await _repair_no_tool("I cannot reach GitHub right now.")
+
+    assert result == "I cannot reach GitHub right now."
+
+
+@pytest.mark.asyncio
 async def test_tool_call_markup_is_replaced_by_the_repaired_answer():
     """Markup written as text executed nothing, so it is not kept as an answer."""
     agent = MagicMock()
@@ -527,6 +537,12 @@ async def test_already_streamed_answer_yields_only_the_addition():
         _ENDS_WITH_PLAN, repaired, original_delivered=True,
     )
     assert settled.content == "Watch set."
+
+    repaired = LLMResponse(content="I cannot reach GitHub.", tool_calls=None)
+    settled = OrchestratorEngineMixin._settle_repaired_turn(
+        _ENDS_WITH_PLAN, repaired, original_delivered=True,
+    )
+    assert settled.content == "I cannot reach GitHub."
 
 
 @pytest.mark.asyncio
