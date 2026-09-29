@@ -22,6 +22,7 @@ counted, never repaired.
 from __future__ import annotations
 
 import logging
+import math
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
@@ -96,9 +97,10 @@ async def backfill_embedding_vec(
     ``UPDATE`` re-checks ``embedding_vec IS NULL``: a concurrent
     dual-write is never overwritten and a second run writes 0 rows.
 
-    Rows whose legacy bytes are not whole float32 values, or whose width
-    differs from a PostgreSQL ``vector(N)`` column, are left alone and
-    counted in ``rows_unbackfillable``. When ``embedding_vec`` does not
+    Rows whose legacy bytes are not whole float32 values, whose width
+    differs from a PostgreSQL ``vector(N)`` column, or that hold a NaN or
+    infinite component, are left alone and counted in
+    ``rows_unbackfillable``. When ``embedding_vec`` does not
     exist yet (PostgreSQL defers creating it until a legacy row exists),
     nothing is written: the startup migration owns creating the column.
     """
@@ -277,10 +279,10 @@ async def _backfill_missing(
             value = _backfill_value(bytes(blob), column, is_postgres)
             if value is None:
                 logger.warning(
-                    "%s row %s: legacy embedding of %d bytes cannot be copied "
-                    "into embedding_vec%s.",
+                    "%s row %s: legacy embedding of %d bytes is not a finite "
+                    "float32 vector%s; embedding_vec left NULL.",
                     table, row_id, len(blob),
-                    f" (column is vector({column.dimension}))"
+                    f" matching vector({column.dimension})"
                     if column.dimension else "",
                 )
                 unbackfillable += 1
@@ -295,15 +297,21 @@ async def _backfill_missing(
 
 
 def _backfill_value(blob: bytes, column: _VecColumn, is_postgres: bool) -> Any:
-    """The ``embedding_vec`` bind value for *blob*, or ``None`` if unusable."""
+    """The ``embedding_vec`` bind value for *blob*, or ``None`` if unusable.
+
+    pgvector rejects a NaN or infinite element, which would abort the
+    whole batch's transaction. SQLite would store one, but applies the same
+    rule so both backends report the same rows as unbackfillable.
+    """
     if not blob or len(blob) % 4:
         return None
     dimension = len(blob) // 4
-    if not is_postgres:
-        return blob
     if column.dimension is not None and dimension != column.dimension:
         return None
-    return _format_pgvector_text(struct.unpack(f"<{dimension}f", blob))
+    values = struct.unpack(f"<{dimension}f", blob)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    return _format_pgvector_text(values) if is_postgres else blob
 
 
 async def _count_disagreeing(

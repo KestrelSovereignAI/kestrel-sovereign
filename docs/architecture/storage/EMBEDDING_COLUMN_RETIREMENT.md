@@ -187,7 +187,7 @@ populates **from the legacy column**:
 | `rows_embedding_vec_only` | `embedding_vec` is set and legacy `embedding` is NULL (reindexed rows that had no vector). |
 | `rows_disagreeing` | Both are set and decode to different float32 vectors. |
 | `rows_backfilled` | Rows this call wrote (always 0 for `verify_embedding_vec`). |
-| `rows_unbackfillable` | Missing rows that cannot be copied: a byte length that is not a positive multiple of 4, a width that differs from the PG `vector(N)` column, or no `embedding_vec` column. |
+| `rows_unbackfillable` | Missing rows that cannot be copied: a byte length that is not a positive multiple of 4, a width that differs from the PG `vector(N)` column, a NaN or infinite component (pgvector rejects it, and SQLite applies the same rule), or no `embedding_vec` column. |
 
 Guarantees:
 

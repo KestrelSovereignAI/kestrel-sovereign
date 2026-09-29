@@ -94,6 +94,29 @@ async def test_backfill_copies_only_missing_rows_and_second_run_changes_nothing(
     ) == (7, 4, 1, 1, 1)
 
 
+async def test_non_finite_legacy_embedding_is_unbackfillable_not_fatal(sqlite_db):
+    db = sqlite_db
+    finite = _pack([0.5, -0.25])
+    nan = _pack([0.5, float("nan")])
+    await _insert_saved_item(db, "a-nan", embedding=nan)
+    await _insert_saved_item(db, "b-finite", embedding=finite)
+
+    first = await backfill_embedding_vec(db, "saved_items")
+
+    assert first.rows_backfilled == 1
+    assert first.rows_unbackfillable == 1
+    assert first.rows_missing_embedding_vec == 1
+    assert first.rows_with_both == 1
+    assert await _saved_item_columns(db, "b-finite") == (finite, finite)
+    assert await _saved_item_columns(db, "a-nan") == (nan, None)
+
+    second = await backfill_embedding_vec(db, "saved_items")
+
+    assert second.rows_backfilled == 0
+    assert second.rows_unbackfillable == 1
+    assert second.rows_missing_embedding_vec == 1
+
+
 async def test_verify_reports_without_writing(sqlite_db):
     db = sqlite_db
     legacy = _pack([1.0, 2.0])
@@ -202,6 +225,13 @@ def test_postgres_value_respects_the_declared_vector_width():
     assert _backfill_value(b"\x00\x00\x00", _VecColumn(True, None), True) is None
     assert _backfill_value(b"", _VecColumn(True, None), False) is None
     assert _backfill_value(blob, _VecColumn(True, None), False) == blob
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("is_postgres", [True, False])
+def test_non_finite_component_has_no_backfill_value(bad, is_postgres):
+    # pgvector rejects ``[nan]``/``[inf]``; SQLite applies the same rule.
+    assert _backfill_value(_pack([1.0, bad]), _VecColumn(True, None), is_postgres) is None
 
 
 def test_pgvector_text_repacks_to_the_stored_float32():
