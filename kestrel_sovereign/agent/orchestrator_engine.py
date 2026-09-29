@@ -33,6 +33,12 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     tool_result_size_bytes,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sovereign.turn_completion import (
+    confirms_complete,
+    repair_addition,
+    settle_repaired_content,
+    turn_completion_repair_prompt,
+)
 from kestrel_sdk.llm import ToolCallStarted
 # Re-use streaming.py's in-band sentinel builders for follow-up
 # ToolCallStarted events so the chat UI's revise-on-tool semantic
@@ -145,12 +151,7 @@ TOOL_CALL_AS_TEXT_RE = re.compile(
 # markup raw, whereas documentation/examples of the markup live in code.
 _CODE_SPAN_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`]*`", re.DOTALL)
 
-TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
-
-Continue the same turn now:
-- If the work requires an available tool, emit the tool call now.
-- If no tool is needed or available, provide the final answer now.
-- Do not describe a future tool call without making it."""
+TURN_COMPLETION_REPAIR_PROMPT = turn_completion_repair_prompt("turn")
 
 TOOL_CALL_AS_TEXT_REPAIR_PROMPT = """Your previous message contained tool-call markup (for example <function_calls>/<invoke>/<tool_call>) written as plain text. That is NOT a real tool call — nothing was executed, so any result you described was fabricated.
 
@@ -523,8 +524,14 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         request_id: Optional[str] = None,
         invocation_context=None,
+        original_delivered: bool = False,
     ) -> Union[str, LLMResponse]:
-        """Give the model one more step when it narrates continuing but emits no tool call."""
+        """Give the model one more step when it narrates continuing but emits no tool call.
+
+        ``original_delivered`` says the repaired message has already been
+        yielded to the client (the streaming tool loop streams text as it
+        arrives), so a finished answer needs only the repair's addition.
+        """
         content = response.content or ""
         if not tools or not OrchestratorEngineMixin._signals_unfinished_tool_work(content):
             return response
@@ -538,7 +545,7 @@ class OrchestratorEngineMixin:
         # identity as the original turn. Without this, an explicit-context
         # caller loses companion/user attribution on repair calls (there is
         # no ambient set_observability_context state to recover from).
-        return await self.llm_service.generate_with_messages(
+        repaired = await self.llm_service.generate_with_messages(
             messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
             tools=tools or None,
             force_local_only=force_local_only,
@@ -551,6 +558,47 @@ class OrchestratorEngineMixin:
             ),
             invocation_context=invocation_context,
         )
+        return OrchestratorEngineMixin._settle_repaired_turn(
+            content, repaired, original_delivered=original_delivered,
+        )
+
+    @staticmethod
+    def _settle_repaired_turn(
+        original: str,
+        repaired: Union[str, LLMResponse],
+        *,
+        original_delivered: bool,
+    ) -> Union[str, LLMResponse]:
+        """The repair's result, with a finished answer kept.
+
+        A repair that acted, by a structured tool call or by tools an adapter
+        ran inline (``executed_tool_calls``, the codex app-server), goes on as
+        the turn. A repair of tool-call markup written as text replaces that
+        text, which executed nothing and was never an answer, and so does a
+        reply that does not confirm completion: it is the model's new answer.
+        A confirming reply means the message was the answer, so the turn
+        delivers that message followed by any addition, never the reply to the
+        runtime's check alone. When the message has already reached the client,
+        only the addition is left to deliver.
+
+        The content is settled on the repair's own response object rather than
+        a copy: adapters and the service attach runtime attributes to it
+        (``executed_tool_calls``, ``model``, ``provider``) that are not
+        dataclass fields, and a copy would drop them.
+        """
+        if isinstance(repaired, str) or repaired.has_tool_calls:
+            return repaired
+        if getattr(repaired, "executed_tool_calls", None):
+            return repaired
+        if OrchestratorEngineMixin._tool_call_emitted_as_text(original):
+            return repaired
+        if not confirms_complete(repaired.content):
+            return repaired
+        if original_delivered:
+            repaired.content = repair_addition(repaired.content)
+        else:
+            repaired.content = settle_repaired_content(original, repaired.content)
+        return repaired
 
     async def _execute_tool_with_hooks(
         self,
@@ -3383,10 +3431,11 @@ class OrchestratorEngineMixin:
                 return
 
             if not response.has_tool_calls:
+                streamed_text = "".join(iter_text_chunks)
                 repaired_missing_tool_call = (
                     bool(all_tools)
                     and OrchestratorEngineMixin._signals_unfinished_tool_work(
-                        "".join(iter_text_chunks) or response.content or ""
+                        streamed_text or response.content or ""
                     )
                 )
                 if repaired_missing_tool_call:
@@ -3400,6 +3449,7 @@ class OrchestratorEngineMixin:
                         streaming=True,
                         request_id=request_id,
                         invocation_context=invocation_context,
+                        original_delivered=bool(streamed_text),
                     )
                     if isinstance(response, str):
                         yield response
@@ -3407,9 +3457,14 @@ class OrchestratorEngineMixin:
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
-                    # Repair is non-streaming (buffered LLMResponse); yield
-                    # its text so the user sees the repaired completion.
-                    yield response.content or ""
+                    # Repair is non-streaming (buffered LLMResponse). When the
+                    # repaired text was streamed above, this is only what the
+                    # repair adds to it; otherwise it is the whole answer.
+                    if response.content:
+                        yield (
+                            f"\n\n{response.content}" if streamed_text
+                            else response.content
+                        )
                     return
                 # Text-only response: already streamed to user during the
                 # tool-detection pass. No second LLM round-trip needed —
